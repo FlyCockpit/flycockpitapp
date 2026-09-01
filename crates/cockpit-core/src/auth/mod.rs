@@ -10,11 +10,14 @@
 //! `$VAR` references in their header values, so they don't need a flow.
 
 pub mod codex_oauth;
+pub(crate) mod command;
 pub mod copilot_setup;
+pub mod descriptor;
 #[cfg(feature = "remote")]
 pub mod flycockpit;
-mod refresh_guard;
+pub(crate) mod refresh_guard;
 pub mod subscription_ack;
+#[cfg(feature = "grok-subscription")]
 pub mod xai_oauth;
 
 /// Reserved provider-credential key for the Flycockpit account credential.

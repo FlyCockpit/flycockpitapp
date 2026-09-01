@@ -21,11 +21,10 @@ const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SSE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
-// Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
-// MiniMax, OpenCode Zen, generic openai-compatible, Ollama) speaks the
-// *Chat Completions* API — `/chat/completions`. We have to construct
-// the `CompletionsClient` variant instead, or every non-OpenAI-proper
-// endpoint 404s on the wrong path.
+// Most OpenAI-compatible providers in `src/providers/mod.rs` (z.ai, MiniMax,
+// OpenCode Zen, generic openai-compatible, Ollama) speak the *Chat
+// Completions* API, so `Model::OpenAi` retains a `CompletionsClient` and
+// selects its Responses view only when the configured wire is `responses`.
 pub(super) type OpenAiCompatClient = openai::CompletionsClient<UsageAliasHttpClient>;
 pub(super) type ChatGptResponsesModel = chatgpt::ResponsesCompletionModel<UsageAliasHttpClient>;
 pub(super) type AnthropicCompletionModel =
@@ -35,6 +34,8 @@ pub(super) type AnthropicCompletionModel =
 pub struct UsageAliasHttpClient {
     client: reqwest::Client,
     extra_headers: reqwest::header::HeaderMap,
+    strip_codex_headers: bool,
+    strip_x_api_key: bool,
 }
 
 impl Default for UsageAliasHttpClient {
@@ -47,12 +48,42 @@ impl fmt::Debug for UsageAliasHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UsageAliasHttpClient")
             .field("extra_headers", &self.extra_headers.len())
+            .field("strip_codex_headers", &self.strip_codex_headers)
+            .field("strip_x_api_key", &self.strip_x_api_key)
             .finish()
     }
 }
 
 impl UsageAliasHttpClient {
     pub(super) fn new(extra_headers: Vec<(String, String)>) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, false, false)
+    }
+
+    /// Rig's native Anthropic client requires an API key and therefore adds an
+    /// `x-api-key` header itself. Bearer-authenticated Anthropic-compatible
+    /// providers must never receive that synthetic header.
+    pub(super) fn for_anthropic_bearer(
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, false, true)
+    }
+
+    /// Requests sent over the generic Responses wire must not receive headers
+    /// that identify a ChatGPT/Codex subscription, whether they originate in
+    /// rig or provider configuration. A generic client may recover between
+    /// Completions and Responses without being rebuilt, so this is enforced
+    /// per request rather than at construction time.
+    pub(super) fn without_codex_headers(
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, true, false)
+    }
+
+    fn with_header_policy(
+        extra_headers: Vec<(String, String)>,
+        strip_codex_headers: bool,
+        strip_x_api_key: bool,
+    ) -> anyhow::Result<Self> {
         let extra_headers = with_canonical_user_agent(extra_headers);
         let mut validated = reqwest::header::HeaderMap::new();
         for (name, value) in extra_headers {
@@ -68,6 +99,8 @@ impl UsageAliasHttpClient {
         Ok(Self {
             client,
             extra_headers: validated,
+            strip_codex_headers,
+            strip_x_api_key,
         })
     }
 }
@@ -88,10 +121,25 @@ fn with_canonical_user_agent(mut headers: Vec<(String, String)>) -> Vec<(String,
 fn apply_extra_headers<T>(
     req: rig::http_client::Request<T>,
     headers: &reqwest::header::HeaderMap,
+    strip_codex_headers: bool,
+    strip_x_api_key: bool,
 ) -> rig::http_client::Request<T> {
     let (mut parts, body) = req.into_parts();
     for (name, value) in headers {
         parts.headers.insert(name.clone(), value.clone());
+    }
+    if strip_codex_headers && parts.uri.path().ends_with("/responses") {
+        for name in [
+            "chatgpt-account-id",
+            "originator",
+            "openai-beta",
+            "session_id",
+        ] {
+            parts.headers.remove(name);
+        }
+    }
+    if strip_x_api_key {
+        parts.headers.remove("x-api-key");
     }
     rig::http_client::Request::from_parts(parts, body)
 }
@@ -303,7 +351,12 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: Send + 'static,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers);
+        let req = apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+            self.strip_x_api_key,
+        );
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,
@@ -334,8 +387,12 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: From<bytes::Bytes>,
         U: Send + 'static,
     {
-        self.client
-            .send_multipart(apply_extra_headers(req, &self.extra_headers))
+        self.client.send_multipart(apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+            self.strip_x_api_key,
+        ))
     }
 
     fn send_streaming<T>(
@@ -348,7 +405,12 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         T: Into<bytes::Bytes> + Send,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers);
+        let req = apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+            self.strip_x_api_key,
+        );
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,

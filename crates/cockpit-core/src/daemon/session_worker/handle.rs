@@ -610,6 +610,16 @@ impl SessionConfigHandle {
         }
     }
 
+    /// A live reader over this handle's snapshot cell. Long-lived clients use
+    /// it to re-authorize executable configuration after their turn-pinned
+    /// construction snapshot may have become stale.
+    pub(crate) fn live(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            pinned: None,
+        }
+    }
+
     /// A detached, pinned handle over a fixed snapshot — for standalone/
     /// tool contexts with no worker behind them and for tests.
     pub fn detached(snapshot: SessionConfigSnapshot) -> Self {
@@ -1129,12 +1139,7 @@ pub(super) fn active_wire_api_for_session(
 ) -> (String, String, crate::config::providers::WireApi) {
     let provider = session.active_provider().unwrap_or_default();
     let model = session.active_model().unwrap_or_default();
-    let configured = providers.resolve_wire_api(&provider, &model);
-    let resolved = if configured.is_auto() {
-        crate::config::providers::WireApi::detect_for_provider(&provider, &model)
-    } else {
-        configured
-    };
+    let resolved = providers.resolve_wire_api(&provider, &model);
     (provider, model, resolved)
 }
 
@@ -1142,6 +1147,7 @@ pub(super) fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'s
     match wire_api {
         crate::config::providers::WireApi::Responses => "responses",
         crate::config::providers::WireApi::Completions => "completions",
+        crate::config::providers::WireApi::Anthropic => "anthropic",
         crate::config::providers::WireApi::Auto => "auto",
     }
 }
@@ -1669,7 +1675,7 @@ impl SessionWorkerHandle {
         let transition_bypass = matches!(
             &work,
             SessionWork::ReplaceConfigSnapshot { .. }
-                | SessionWork::Cancel
+                | SessionWork::Cancel { .. }
                 | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
         );
@@ -2302,7 +2308,12 @@ pub enum SessionWork {
         >,
     },
     RepublishQueue,
-    Cancel,
+    /// Explicit provenance for foreground cancellation. A turn retraction is
+    /// permitted only for an interactive `CancelTurn`; scheduler, lifecycle,
+    /// config, and invocation stops must cancel without user attribution.
+    Cancel {
+        origin: CancelOrigin,
+    },
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,
@@ -2371,7 +2382,7 @@ pub enum SessionWork {
     SetToolSurfaceOverride {
         override_json: String,
         persist_session: bool,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
@@ -2450,6 +2461,12 @@ pub enum SessionWork {
     Shutdown {
         pause_for_resume: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOrigin {
+    InteractiveTurn,
+    Noninteractive,
 }
 
 /// One-shot constructor: persist its initial redaction boundary, then spawn the

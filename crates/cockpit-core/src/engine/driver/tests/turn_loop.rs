@@ -2341,7 +2341,7 @@ async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
         driver
     });
     let _captured = provider.next_request().await;
-    cancel.cancel();
+    cancel.cancel_turn();
     let driver = handle.await.unwrap();
 
     let events = drain_events(&mut rx);
@@ -2363,6 +2363,289 @@ async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
     let events = session_events(&driver).await;
     assert!(!events.iter().any(|event| event.kind == "assistant_message"));
     assert_eq!(inference_request_statuses(&driver).await, vec!["cancelled"]);
+}
+
+/// The real chat-completions SSE shape for native reasoning before the stream
+/// stalls.  Keeping the connection open makes the cancellation boundary
+/// deterministic: the test must observe this delta before it requests cancel.
+fn reasoning_then_hang_sse() -> String {
+    let reasoning = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{ "delta": { "reasoning_content": "checking" }, "finish_reason": null }],
+        "usage": null
+    });
+    format!("data: {reasoning}\n\n")
+}
+
+fn text_then_hang_sse() -> String {
+    let text = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{ "delta": { "content": "visible answer" }, "finish_reason": null }],
+        "usage": null
+    });
+    format!("data: {text}\n\n")
+}
+
+fn enable_reasoning_retraction(driver: &mut Driver) {
+    let (_extended, mut providers) = driver.config.configs();
+    let active = providers
+        .active_model
+        .as_mut()
+        .expect("scripted driver has an active model");
+    active.thinking_mode = Some(crate::config::providers::ThinkingMode::High);
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("scripted driver has lmstudio")
+        .thinking_params
+        .0
+        .insert(
+            crate::config::providers::ThinkingMode::High,
+            serde_json::json!({"reasoning_effort": "high"}),
+        );
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                providers,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
+}
+
+#[tokio::test]
+async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSseThenHang(reasoning_then_hang_sse()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+
+    // The production predicate deliberately applies only to reasoning-capable
+    // models. Configure the live driver snapshot, rather than bypassing it,
+    // so this test traverses the same acceptance gate as a worker-owned turn.
+    enable_reasoning_retraction(&mut driver);
+    assert!(
+        driver.stack[0]
+            .agent
+            .model
+            .resolve_reasoning_params(&driver.config.providers())
+            .is_some(),
+        "the test must enter the reasoning-only retract eligibility path"
+    );
+
+    let cancel = driver.cancel_handle();
+    let (queue, tx, mut rx) = event_harness();
+    let run = tokio::spawn(async move {
+        driver
+            .run_user_input(UserSubmission::text("retract after thinking"), &queue, &tx)
+            .await
+            .unwrap();
+        driver
+    });
+    let _ = provider.next_request().await;
+
+    let saw_reasoning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                rx.recv().await,
+                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        saw_reasoning.is_ok(),
+        "the real provider reasoning delta must arrive before cancelling"
+    );
+    cancel.cancel_turn();
+    let driver = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .expect("interactive cancellation must unwind the worker-facing driver promptly")
+        .unwrap();
+
+    let events = drain_events(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::UserMessageRemoved { .. })),
+        "the durable retraction must be broadcast to attached clients: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::AssistantText { .. })),
+        "reasoning-only cancellation must not leave transcript text: {events:?}"
+    );
+    let persisted = session_events(&driver).await;
+    assert!(
+        !persisted.iter().any(|event| event.kind == "user_message"),
+        "the accepted user row must be removed from SQLite"
+    );
+    assert!(
+        persisted
+            .iter()
+            .any(|event| event.kind == "user_message_retracted"),
+        "remote reconciliation requires a durable retraction tombstone"
+    );
+}
+
+#[tokio::test]
+async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSseThenHang(reasoning_then_hang_sse()))
+        .turn(Turn::Text("resent after retract".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    enable_reasoning_retraction(&mut driver);
+    let cancel = driver.cancel_handle();
+    let (queue, tx, mut rx) = event_harness();
+    let run_queue = queue.clone();
+    let run_tx = tx.clone();
+    let run = tokio::spawn(async move {
+        driver
+            .run_user_input(UserSubmission::text("same resend"), &run_queue, &run_tx)
+            .await
+            .unwrap();
+        driver
+    });
+    let _ = provider.next_request().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                rx.recv().await,
+                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the cancellation follows actual reasoning output");
+    cancel.cancel_turn();
+    let mut driver = run.await.unwrap();
+    let first_request = provider.captured()[0].body.clone();
+    assert!(
+        first_request.to_string().contains("[time:"),
+        "the first request must consume a time prelude for this rollback regression"
+    );
+    let _ = drain_events(&mut rx);
+
+    driver
+        .run_user_input(UserSubmission::text("same resend"), &queue, &tx)
+        .await
+        .unwrap();
+    let captured = provider.captured();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        first_request, captured[1].body,
+        "retract + resend must preserve the exact provider request, including its cacheable prefix"
+    );
+}
+
+#[tokio::test]
+async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSseThenHang(text_then_hang_sse()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let cancel = driver.cancel_handle();
+    let (queue, tx, mut rx) = event_harness();
+    let run = tokio::spawn(async move {
+        driver
+            .run_user_input(UserSubmission::text("keep after visible text"), &queue, &tx)
+            .await
+            .unwrap();
+        driver
+    });
+    let _ = provider.next_request().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                rx.recv().await,
+                Some(TurnEvent::AssistantDisplayTextDelta { .. })
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("visible text must close the retraction window before cancellation");
+    cancel.cancel_turn();
+    let driver = run.await.unwrap();
+
+    let events = drain_events(&mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::UserMessageRemoved { .. })),
+        "a visible response must make cancel normal rather than retracting: {events:?}"
+    );
+    assert!(
+        session_events(&driver)
+            .await
+            .iter()
+            .any(|event| event.kind == "user_message"),
+        "the accepted user row remains durable after visible output"
+    );
+}
+
+#[test]
+fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let mut provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "read-before-cancel".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "fixture.txt" }),
+            })
+            .turn(Turn::Hang)
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        std::fs::write(tmp.path().join("fixture.txt"), "fixture body").unwrap();
+        let cancel = driver.cancel_handle();
+        let (queue, tx, mut rx) = event_harness();
+        let run = tokio::spawn(async move {
+            driver
+                .run_user_input(UserSubmission::text("read before cancel"), &queue, &tx)
+                .await
+                .unwrap();
+            driver
+        });
+        let _ = provider.next_request().await;
+        let _ = provider.next_request().await;
+        cancel.cancel_turn();
+        let driver = run.await.unwrap();
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(event, TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel")),
+            "the test must cancel only after the real tool call completed: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::UserMessageRemoved { .. })),
+            "a tool call must close the narrow retraction window: {events:?}"
+        );
+        assert!(
+            session_events(&driver)
+                .await
+                .iter()
+                .any(|event| event.kind == "user_message"),
+            "the accepted user row remains durable after a tool call"
+        );
+    });
 }
 
 #[tokio::test]
@@ -2830,7 +3113,7 @@ async fn root_stop_gate_not_entered_on_cancellation() {
         driver
     });
     let _captured = provider.next_request().await;
-    cancel.cancel();
+    cancel.cancel_turn();
     let driver = handle.await.unwrap();
 
     assert!(

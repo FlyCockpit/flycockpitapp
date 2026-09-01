@@ -45,6 +45,9 @@ pub(crate) enum SessionSetupOutcome {
     /// Whole-selection tool-surface replace for this session.
     SetToolSurface {
         override_json: String,
+        /// A change to the native provider schema was explicitly confirmed.
+        /// The app uses this to apply the same cache-break handling as `/tools`.
+        cache_break: bool,
     },
     /// Add an MCP server at an explicit scope.
     AddMcp {
@@ -163,6 +166,12 @@ enum Interaction {
         choices: Vec<ModelChoiceItem>,
         cursor: usize,
     },
+    /// A native-schema tool edit waits for explicit acknowledgement before it
+    /// changes the session snapshot or reaches the daemon.
+    ConfirmToolChange {
+        snapshot: SessionSetupSnapshotV1,
+        override_json: String,
+    },
     AddMcp(AddMcpForm),
 }
 
@@ -276,6 +285,16 @@ impl SessionSetupPane {
     /// Apply a daemon snapshot, rebuilding the flat rows and clamping the
     /// cursor to the first selectable row.
     pub(crate) fn apply_snapshot(&mut self, snapshot: SessionSetupSnapshotV1) {
+        // A concurrently refreshed daemon snapshot may have a different tool
+        // surface. Never let an acknowledgement apply the stale, locally
+        // staged native-schema edit over it.
+        if matches!(self.interaction, Interaction::ConfirmToolChange { .. }) {
+            self.interaction = Interaction::List;
+            self.notice = Some(
+                "Tool surface changed while confirmation was open; confirmation cancelled."
+                    .to_string(),
+            );
+        }
         let agent = snapshot.resolved_agent.clone();
         if self.tool_order.is_empty() || self.tool_order_agent != agent {
             self.tool_order = initial_tool_order(&snapshot.tools);
@@ -429,7 +448,7 @@ impl SessionSetupPane {
     }
 
     fn cycle_tool(&mut self, name: &str) -> SessionSetupOutcome {
-        let Some(snapshot) = self.snapshot.as_mut() else {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             return SessionSetupOutcome::Stay;
         };
         if !snapshot.root_foreground {
@@ -439,7 +458,7 @@ impl SessionSetupPane {
             );
             return SessionSetupOutcome::Stay;
         }
-        let Some(tool) = snapshot.tools.iter_mut().find(|tool| tool.name == name) else {
+        let Some(tool) = snapshot.tools.iter().find(|tool| tool.name == name) else {
             return SessionSetupOutcome::Stay;
         };
         if tool.locked {
@@ -459,16 +478,47 @@ impl SessionSetupPane {
         let current = ToolTier::from_label(&tool.tier).unwrap_or(ToolTier::Enabled);
         let index = legal.iter().position(|tier| *tier == current).unwrap_or(0);
         let next = legal[(index + 1) % legal.len()];
-        tool.tier = next.label().to_string();
-        match serde_json::to_string(&tool_selection_from_snapshot(snapshot)) {
+        let mut updated_snapshot = snapshot.clone();
+        let Some(updated_tool) = updated_snapshot
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+        else {
+            return SessionSetupOutcome::Stay;
+        };
+        updated_tool.tier = next.label().to_string();
+        match serde_json::to_string(&tool_selection_from_snapshot(&updated_snapshot)) {
             Ok(override_json) => {
-                self.rebuild_rows();
-                SessionSetupOutcome::SetToolSurface { override_json }
+                let cache_break = (current == ToolTier::Enabled) != (next == ToolTier::Enabled);
+                if cache_break {
+                    self.interaction = Interaction::ConfirmToolChange {
+                        snapshot: updated_snapshot,
+                        override_json,
+                    };
+                    SessionSetupOutcome::Stay
+                } else {
+                    self.apply_tool_surface_snapshot(updated_snapshot, override_json, false)
+                }
             }
             Err(error) => {
                 self.notice = Some(format!("Tool surface update failed — {error}."));
                 SessionSetupOutcome::Stay
             }
+        }
+    }
+
+    fn apply_tool_surface_snapshot(
+        &mut self,
+        snapshot: SessionSetupSnapshotV1,
+        override_json: String,
+        cache_break: bool,
+    ) -> SessionSetupOutcome {
+        self.snapshot = Some(snapshot);
+        self.notice = None;
+        self.rebuild_rows();
+        SessionSetupOutcome::SetToolSurface {
+            override_json,
+            cache_break,
         }
     }
 
@@ -479,6 +529,26 @@ impl SessionSetupPane {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SessionSetupOutcome {
+        if let Interaction::ConfirmToolChange {
+            snapshot,
+            override_json,
+        } = &self.interaction
+        {
+            let snapshot = snapshot.clone();
+            let override_json = override_json.clone();
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                    self.interaction = Interaction::List;
+                    self.notice = Some("Tool surface change cancelled.".to_string());
+                    SessionSetupOutcome::Stay
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.interaction = Interaction::List;
+                    self.apply_tool_surface_snapshot(snapshot, override_json, true)
+                }
+                _ => SessionSetupOutcome::Stay,
+            };
+        }
         if let Interaction::AddMcp(form) = &self.interaction {
             let form = form.clone();
             return self.handle_add_mcp_key(key, form);
@@ -832,6 +902,19 @@ impl SessionSetupPane {
                         self.color,
                     )));
                 }
+            }
+            Interaction::ConfirmToolChange { .. } => {
+                lines.push(Line::from(styled(
+                    "Confirm tool change".to_string(),
+                    RowKind::Section,
+                    self.color,
+                )));
+                lines.push(Line::from(styled(
+                    "Changing enabled tools will break prompt cache. Enter/y apply, Esc/n cancel."
+                        .to_string(),
+                    RowKind::CandidateLocked,
+                    self.color,
+                )));
             }
             Interaction::AddMcp(form) => {
                 lines.push(Line::from(styled(
@@ -2040,6 +2123,112 @@ mod tests {
     }
 
     #[test]
+    fn modes_session_setup_native_tool_change_requires_cache_break_confirmation() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![tool("read", "enabled", false)];
+        snap.root_foreground = true;
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(&row.payload, RowPayload::Tool { name, .. } if name == "read"),
+        ));
+
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        assert!(
+            pane.inline_lines()
+                .iter()
+                .any(|line| line.to_string().contains("will break prompt cache"))
+        );
+        assert_eq!(
+            pane.snapshot()
+                .and_then(|snapshot| snapshot.tools.first())
+                .map(|tool| tool.tier.as_str()),
+            Some("enabled"),
+            "the staged native change must not appear before confirmation"
+        );
+
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SetToolSurface {
+                cache_break: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            pane.snapshot()
+                .and_then(|snapshot| snapshot.tools.first())
+                .map(|tool| tool.tier.as_str()),
+            Some("discoverable")
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_monty_only_tool_change_applies_without_cache_confirmation() {
+        let mut snap = snapshot(vec![]);
+        snap.tools = vec![tool("bash", "discoverable", false)];
+        snap.root_foreground = true;
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(&row.payload, RowPayload::Tool { name, .. } if name == "bash"),
+        ));
+
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SetToolSurface {
+                cache_break: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            pane.snapshot()
+                .and_then(|snapshot| snapshot.tools.first())
+                .map(|tool| tool.tier.as_str()),
+            Some("disabled")
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_direct_native_tool_change_requires_cache_break_confirmation() {
+        let mut snap = snapshot(vec![]);
+        let mut media = tool("inspect_audio", "enabled", false);
+        media.legal_tiers = vec!["enabled".to_string(), "disabled".to_string()];
+        snap.tools = vec![media];
+        snap.root_foreground = true;
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap);
+        pane.list.select(pane.rows.iter().position(
+            |row| matches!(&row.payload, RowPayload::Tool { name, .. } if name == "inspect_audio"),
+        ));
+
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        assert!(
+            pane.inline_lines()
+                .iter()
+                .any(|line| line.to_string().contains("will break prompt cache"))
+        );
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SetToolSurface {
+                cache_break: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            pane.snapshot()
+                .and_then(|snapshot| snapshot.tools.first())
+                .map(|tool| tool.tier.as_str()),
+            Some("disabled")
+        );
+    }
+
+    #[test]
     fn modes_session_setup_mcp_groups_and_shadow() {
         let mut snap = snapshot(vec![]);
         snap.mcps = vec![
@@ -2151,16 +2340,26 @@ mod tests {
         pane.list.select(pane.rows.iter().position(
             |row| matches!(&row.payload, RowPayload::Tool { name, locked: false } if name == "read"),
         ));
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
-            SessionSetupOutcome::SetToolSurface { .. }
+            SessionSetupOutcome::SetToolSurface {
+                cache_break: true,
+                ..
+            }
         ));
         pane.list.select(pane.rows.iter().position(
             |row| matches!(&row.payload, RowPayload::Tool { name, locked: false } if name == "bash"),
         ));
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
-            SessionSetupOutcome::SetToolSurface { .. }
+            SessionSetupOutcome::SetToolSurface {
+                cache_break: false,
+                ..
+            }
         ));
         // Add MCP
         pane.list.select(

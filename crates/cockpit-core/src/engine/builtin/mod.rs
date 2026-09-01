@@ -101,6 +101,11 @@ pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use
 pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
 
+/// Uniform, cache-stable steering for every untrusted model. This intentionally
+/// depends only on the model's fixed trust posture, never on a turn's dynamic
+/// tool availability, so it remains stable in the cached system prefix.
+const UNTRUSTED_LEAK_REPORT_STEERING: &str = "Security: If you receive any secret, report it immediately with `report_leak` when that tool is available. Report the exact literal form you received, including base64, hexadecimal, URL-encoded, or any other encoded, transformed, or derived form. Do not decode, normalize, transform, repeat, or expose the material in text or another tool call.";
+
 /// Per-spawn knobs threaded from the driver.
 #[derive(Clone)]
 pub struct SpawnArgs {
@@ -1301,7 +1306,15 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
     compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
 }
 
-fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &SpawnArgs) -> String {
+/// Compose the model-specific cached system prompt used by every fresh or
+/// live-refreshed agent frame. The model's trust posture is part of this
+/// composition, so callers that replace an agent model must update this value
+/// in the same replacement.
+pub(crate) fn compose_system_prompt_for_model(
+    role_prompt: &str,
+    model: &Model,
+    args: &SpawnArgs,
+) -> String {
     let compiled_guidance = args.guidance_compiler.as_ref().map_or_else(
         || args.compiled_guidance.clone(),
         |compiler| compiler.compile(&args.cwd, model.provider_id(), model.model_id_ref()),
@@ -1323,7 +1336,7 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
     let model_prompt = args
         .model_system_prompt_snapshot
         .get(model.provider_id(), model.model_id_ref());
-    if let Some(model_prompt) = model_prompt {
+    let mut out = if let Some(model_prompt) = model_prompt {
         let role_system = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
         out.push_str(model_prompt);
@@ -1341,7 +1354,25 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         let mut out = compose_system_prompt(&role_prompt, &args.session_short_id, &args.cwd);
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
+    };
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    out
+}
+
+/// Add the uniform leak-report instruction to an untrusted agent's effective
+/// system prompt. Production agent constructors outside this module must use
+/// this helper when they synthesize a fresh system prompt rather than inheriting
+/// one from an existing agent.
+pub(crate) fn append_untrusted_leak_report_steering(system: &mut String, model_is_trusted: bool) {
+    if model_is_trusted {
+        return;
     }
+    if !system.ends_with('\n') {
+        system.push('\n');
+    }
+    system.push('\n');
+    system.push_str(UNTRUSTED_LEAK_REPORT_STEERING);
+    system.push('\n');
 }
 
 fn assistant_role_prompt(role_prompt: &str, prefix: Option<&str>) -> String {
@@ -1759,7 +1790,6 @@ pub(crate) fn effective_tool_tier(
     if tool == "transcribe_audio" {
         return match def.name.as_str() {
             "Build" => crate::agents::ToolTier::Enabled,
-            "Careful" | "builder" => crate::agents::ToolTier::Discoverable,
             _ => crate::agents::ToolTier::Disabled,
         };
     }
@@ -1841,8 +1871,15 @@ fn with_audio_video_tools(
         tb = match effective_tool_tier(def, name, false) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             // Source authority is direct-native only. A discoverable tier is
-            // MCP/Monty-backed, so it cannot safely represent these tools.
-            crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
+            // MCP/Monty-backed, so reject it rather than silently omitting
+            // the persisted projected tier.
+            crate::agents::ToolTier::Discoverable => {
+                bail!(
+                    "agent `{}` resolved direct-native tool `{name}` as discoverable",
+                    def.name
+                )
+            }
+            crate::agents::ToolTier::Disabled => tb,
         };
     }
     if args.media_availability.is_available() {
@@ -1851,7 +1888,10 @@ fn with_audio_video_tools(
                 add_tool_by_name(tb, "transcribe_audio", def, args)?
             }
             crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+                bail!(
+                    "agent `{}` resolved direct-native tool `transcribe_audio` as discoverable",
+                    def.name
+                )
             }
             crate::agents::ToolTier::Disabled => tb,
         };
@@ -1916,6 +1956,12 @@ fn add_discoverable_tool_by_name(
     def: &crate::agents::AgentDef,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
+    if !crate::agents::is_monty_builtin_adaptable(name) {
+        bail!(
+            "agent `{}` may not materialize direct-native tool `{name}` as discoverable",
+            def.name
+        );
+    }
     let scratch = materialize_tool_by_name(ToolBox::new(), name, Some(def), args)?;
     let Some(tool) = scratch.get_cloned(name) else {
         return Ok(tb);
@@ -2397,7 +2443,7 @@ fn compose_reposture_system(
     );
     let short_id = session.short_id();
     let role_system = compose_system_prompt(&role, &short_id, cwd);
-    match snapshot.get(model.provider_id(), model.model_id_ref()) {
+    let mut out = match snapshot.get(model.provider_id(), model.model_id_ref()) {
         Some(model_prompt) => {
             let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
             out.push_str(model_prompt);
@@ -2409,7 +2455,9 @@ fn compose_reposture_system(
             out
         }
         None => role_system,
-    }
+    };
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    out
 }
 
 /// Immutable, side-effect-free description of the execution surface a delegated
@@ -4773,6 +4821,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transcribe_audio_defaults_and_overrides_are_direct_native_only() {
+        use crate::{agents::ToolTier, tool_media_authority::MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.media_availability = MediaToolAvailability::available();
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let def = crate::agents::embedded_default(name).unwrap();
+            assert_ne!(
+                effective_tool_tier(&def, "transcribe_audio", false),
+                ToolTier::Discoverable,
+                "{name} must never default transcription to Monty discovery"
+            );
+            let agent = agent_from_def(&def, &args).unwrap();
+            assert!(
+                !agent
+                    .tools
+                    .discoverable_mcp_tool_names()
+                    .iter()
+                    .any(|tool| tool == "transcribe_audio"),
+                "{name} must never register transcription as Discoverable"
+            );
+        }
+
+        let mut invalid = crate::agents::embedded_default("Careful").unwrap();
+        invalid
+            .tool_tiers
+            .insert("transcribe_audio".to_string(), ToolTier::Discoverable);
+        assert!(crate::agents::validate_invariants(&invalid).is_err());
+        assert!(agent_from_def(&invalid, &args).is_err());
+    }
+
+    #[test]
     fn builtin_agent_grant_equivalence_to_embedded_defs() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -5737,7 +5818,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn monty_discoverability_invariant_covers_default_discoverable_tools() {
+    fn discoverable_tools_are_found_through_runtime_mcp_discovery() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         for &name in crate::agents::BUILTIN_AGENT_NAMES {
@@ -5752,12 +5833,43 @@ pub(crate) mod tests {
             for tool in agent.tools.discoverable_mcp_tool_names() {
                 assert!(
                     mcp_description.contains("grep_tool_names")
-                        || mcp_description.contains("grep_tool_definitions")
-                        || agent.role_prompt.contains(&tool),
-                    "`{name}` discoverable tool `{tool}` is not reachable through static MCP discovery or role prompt"
+                        || mcp_description.contains("grep_tool_definitions"),
+                    "`{name}` discoverable tool `{tool}` is not reachable through runtime MCP discovery"
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_agent_prompts_do_not_enumerate_discoverable_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &args).unwrap();
+            for tool in agent.tools.discoverable_mcp_tool_names() {
+                assert!(
+                    !prompt_contains_tool_identifier(&agent.role_prompt, &tool),
+                    "canonical `{name}` prompt enumerates discoverable tool `{tool}`: {}",
+                    agent.role_prompt
+                );
+            }
+        }
+    }
+
+    /// Tool names are identifier-shaped. Matching a complete identifier catches
+    /// plain prose, list entries, quoted names, and invocation examples without
+    /// treating an unrelated longer word (such as `codebase`) as a tool name.
+    fn prompt_contains_tool_identifier(prompt: &str, tool: &str) -> bool {
+        prompt.match_indices(tool).any(|(offset, _)| {
+            let before = prompt[..offset].chars().next_back();
+            let after = prompt[offset + tool.len()..].chars().next();
+            !before.is_some_and(is_tool_identifier_char)
+                && !after.is_some_and(is_tool_identifier_char)
+        })
+    }
+
+    fn is_tool_identifier_char(character: char) -> bool {
+        character.is_ascii_alphanumeric() || character == '_'
     }
 
     #[test]
@@ -8415,12 +8527,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compose_system_prompt_for_model_is_byte_identical_without_match() {
+    fn untrusted_system_prompt_includes_uniform_leak_report_steering() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
         let with_snapshot = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
-        assert_eq!(with_snapshot, existing);
+        assert!(
+            with_snapshot.starts_with(&existing),
+            "base prompt must be preserved: {with_snapshot}"
+        );
+        assert!(with_snapshot.contains("`report_leak`"));
+        for encoded_form in [
+            "base64",
+            "hexadecimal",
+            "URL-encoded",
+            "transformed",
+            "derived",
+        ] {
+            assert!(
+                with_snapshot.contains(encoded_form),
+                "untrusted steering must cover {encoded_form}: {with_snapshot}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_system_prompt_omits_leak_report_steering() {
+        use crate::config::providers::ModelTrust;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args_with_model_trust(tmp.path(), ModelTrust::Trusted);
+        let existing = compose_system_prompt("ROLE PROMPT", &args.session_short_id, &args.cwd);
+        let prompt = compose_system_prompt_for_model("ROLE PROMPT", &args.model, &args);
+        assert_eq!(prompt, existing);
+        assert!(!prompt.contains("`report_leak`"));
     }
 
     #[test]

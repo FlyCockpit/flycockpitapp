@@ -383,6 +383,19 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
                 def.name
             );
         }
+        let legal_tiers = crate::agents::legal_tool_tiers(tool);
+        if !legal_tiers.contains(tier) {
+            let legal = legal_tiers
+                .iter()
+                .map(|tier| tier.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "agent `{}` may not tier tool `{tool}` as `{}`; legal tiers are {legal}",
+                def.name,
+                tier.label()
+            );
+        }
     }
 
     let effective_tools = effective_grant_for_invariants(def);
@@ -654,6 +667,26 @@ mod grant_tests {
         validate_invariants(&with_mcp).expect("external-MCP grant remains valid");
         validate_invariants(&builtin).expect("enabled tier is directly reachable");
         validate_invariants(&disabled).expect("disabled tier is not discoverable");
+    }
+
+    #[test]
+    fn direct_native_tools_reject_discoverable_tiers() {
+        let def = tiered_def(
+            "custom-media",
+            &["read", "transcribe_audio"],
+            "transcribe_audio",
+            ToolTier::Discoverable,
+        );
+
+        let err = validate_invariants(&def)
+            .expect_err("direct-native tools cannot be Monty-discoverable")
+            .to_string();
+        assert!(err.contains("transcribe_audio"), "{err}");
+        assert!(err.contains("discoverable"), "{err}");
+        assert_eq!(
+            crate::agents::legal_tool_tiers("transcribe_audio"),
+            &[ToolTier::Enabled, ToolTier::Disabled]
+        );
     }
 
     #[test]

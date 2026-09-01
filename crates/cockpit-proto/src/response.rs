@@ -261,6 +261,12 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_model_state: Option<ActiveModelState>,
         history: Vec<HistoryEntry>,
+        /// Durable user-row identities removed by retractions before this
+        /// full snapshot was built. Clients apply these targeted removals
+        /// before merging the snapshot, rather than inferring deletion from
+        /// an entry merely being absent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed_user_message_seqs: Vec<i64>,
         #[serde(default)]
         paused_work: Vec<PausedWorkSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1360,6 +1366,7 @@ impl crate::CodeRootReadV1 {
             active_subagent: self.active_subagent,
             active_model_state: self.active_model_state,
             history: self.history,
+            removed_user_message_seqs: Vec::new(),
             paused_work: self.paused_work,
             repair_required: self.repair_required,
             // A Code-root read is an immutable projection, while this offer

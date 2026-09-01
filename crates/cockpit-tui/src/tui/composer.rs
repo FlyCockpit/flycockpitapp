@@ -743,6 +743,15 @@ impl Composer {
         &self.buffer
     }
 
+    /// Replace the complete document and put the cursor after the new text.
+    ///
+    /// Plain composers own no paste-block registry. Callers that do own one
+    /// must use `RegisteredComposer::replace_buffer` so both pieces of state
+    /// are updated together.
+    pub(crate) fn replace_buffer(&mut self, text: impl Into<String>) {
+        self.set_unregistered(text);
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }

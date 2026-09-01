@@ -891,7 +891,7 @@ impl Model {
                                     prompt.clone(),
                                     wire_tools,
                                     &attempt_params,
-                                    openai_additional_params(&attempt_params),
+                                    Some(openai_responses_additional_params(&attempt_params)),
                                 );
                                 drain_completion_stream(
                                     request,
@@ -1256,6 +1256,17 @@ impl Model {
                             tracing::warn!(%error, "serialize final wire tool definitions failed");
                             serde_json::Value::Array(Vec::new())
                         });
+                    let captured_params = match self {
+                        Model::OpenAi { .. } => params_for_openai_wire(&params, wire),
+                        Model::ChatGpt { .. } | Model::Anthropic { .. } => params.clone(),
+                    };
+                    captured["additional_params"] = serde_json::to_value(
+                        captured_additional_params(self.provider_label(), wire, &captured_params),
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "serialize final wire additional parameters failed");
+                        serde_json::Value::Null
+                    });
                     if let Some(path) = debug_last_message_path() {
                         write_dump(path, &captured);
                     }
@@ -1353,7 +1364,10 @@ impl Model {
                 provider_id
             }
             Model::OpenAi { .. } => "openai-compatible",
-            Model::ChatGpt { .. } => "codex-oauth",
+            // Responses is a wire, not a credential. Preserve the configured
+            // provider identity for custom Responses endpoints while the
+            // built-in Codex template naturally remains `codex-oauth`.
+            Model::ChatGpt { provider_id, .. } => provider_id,
             Model::Anthropic { .. } => "anthropic",
         }
     }
@@ -1469,7 +1483,7 @@ impl Model {
         endpoint_recovery_enabled: bool,
         // Optional per-attempt egress table override. The interactive turn
         // derives this by applying `with_sealed_replacements` to the model's own
-        // effective table when (and only when) an untrusted, interactive request
+        // effective table when an interactive request
         // with a callable `use_sealed_value` holds a live exact sealed grant, so
         // a sealed literal renders the actionable marker instead of the generic
         // placeholder. `None` uses the model's own effective table (the default
@@ -1501,20 +1515,16 @@ impl Model {
         let system = redact.scrub(stable_prefix);
         let mut history = history;
         let mut prompt = prompt.clone();
-        // Trusted raw custody sends raw bytes and skips the wire walk entirely.
-        // Every untrusted route runs the fail-closed walk even when the table
-        // has no entries (the string scrub is a byte-stable no-op; the walk
-        // still fails closed on any non-renderable media channel), so
-        // `redact.is_empty()` can never skip the untrusted policy.
-        if !self.is_trusted() {
-            history = history
-                .iter()
-                .map(|m| scrub_message(redact, m))
-                .collect::<std::result::Result<Vec<Message>, _>>()
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            prompt = scrub_message(redact, &prompt)
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-        }
+        // Every completion route runs the fail-closed wire walk, even when the
+        // table has no entries. Trust is capture/write capability, never a
+        // literal-read bypass.
+        history = history
+            .iter()
+            .map(|m| scrub_message(redact, m))
+            .collect::<std::result::Result<Vec<Message>, _>>()
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        prompt = scrub_message(redact, &prompt)
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         let identity_records =
             if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
                 match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
@@ -1537,10 +1547,16 @@ impl Model {
                 Vec::new()
             };
 
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_api = self.current_wire_api();
+        let params = match self {
+            Model::OpenAi { .. } => params_for_openai_wire(&params, wire_api),
+            Model::ChatGpt { .. } | Model::Anthropic { .. } => params,
+        };
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             &system,
             &history,
             &prompt,
@@ -1600,6 +1616,7 @@ impl Model {
         // model, but the session params outlive the recovery, so an
         // endpoint-scoped Responses control must not remain in a later Chat
         // Completions record.
+        let wire_api = self.current_wire_api();
         let params = match self {
             Model::OpenAi { client, .. } => params_for_openai_wire(
                 &params,
@@ -1609,24 +1626,19 @@ impl Model {
         };
         // Scrub identically to `complete_captured` so the pre-dispatch
         // `pending` record and the terminal captured record describe
-        // byte-identical requests (GOALS §7). A trusted raw-custody route keeps
-        // the raw history; an untrusted route runs the fail-closed wire walk
-        // and propagates a non-renderable channel as a typed prep failure.
+        // byte-identical requests (GOALS §7). Every route runs the fail-closed
+        // wire walk and propagates a non-renderable channel as a typed prep
+        // failure.
         let redact = self.redact();
         let history = self.prepare_history_for_request(history);
         let system = redact.scrub(system);
-        let (mut history, mut prompt): (Vec<Message>, Message) = if self.is_trusted() {
-            (history, prompt.clone())
-        } else {
-            let scrubbed_history = history
-                .iter()
-                .map(|m| scrub_message(redact, m))
-                .collect::<std::result::Result<Vec<Message>, _>>()
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            let scrubbed_prompt = scrub_message(redact, prompt)
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            (scrubbed_history, scrubbed_prompt)
-        };
+        let mut history = history
+            .iter()
+            .map(|m| scrub_message(redact, m))
+            .collect::<std::result::Result<Vec<Message>, _>>()
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        let mut prompt = scrub_message(redact, prompt)
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         let identity_metadata = if self.needs_responses_tool_identity_normalization(false) {
             match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
                 Ok(records) if !records.is_empty() => Some((
@@ -1650,10 +1662,11 @@ impl Model {
         } else {
             None
         };
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             &system,
             &history,
             &prompt,
@@ -1702,6 +1715,7 @@ impl Model {
         // endpoint. In particular, a session that recovered from Responses to
         // Chat Completions must not retain a Responses-only reasoning object in
         // the tandem record or replay it to the provider.
+        let wire_api = self.current_wire_api();
         let params = match self {
             Model::OpenAi { client, .. } => params_for_openai_wire(
                 &params,
@@ -1720,22 +1734,18 @@ impl Model {
         let stripped_raw = self.prepare_history_for_request(history);
         let system_scrubbed = redact.scrub(system);
         let system = system_scrubbed.as_str();
-        // Trusted tandem keeps raw custody; an untrusted tandem runs the
-        // fail-closed wire walk. A non-renderable channel is recorded as an
-        // errored tandem outcome rather than passed unscrubbed to the wire.
+        // Tandem always runs the fail-closed wire walk. A non-renderable
+        // channel is recorded as an errored tandem outcome rather than passed
+        // unscrubbed to the wire.
         let scrub_result: std::result::Result<(Vec<Message>, Message), UnrenderableWireField> =
-            if self.is_trusted() {
-                Ok((stripped_raw, prompt.clone()))
-            } else {
-                (|| {
-                    let history = stripped_raw
-                        .iter()
-                        .map(|m| scrub_message(redact, m))
-                        .collect::<std::result::Result<Vec<Message>, _>>()?;
-                    let prompt = scrub_message(redact, prompt)?;
-                    Ok((history, prompt))
-                })()
-            };
+            (|| {
+                let history = stripped_raw
+                    .iter()
+                    .map(|m| scrub_message(redact, m))
+                    .collect::<std::result::Result<Vec<Message>, _>>()?;
+                let prompt = scrub_message(redact, prompt)?;
+                Ok((history, prompt))
+            })();
         let (stripped, prompt_scrubbed) = match scrub_result {
             Ok(pair) => pair,
             Err(field) => {
@@ -1752,10 +1762,11 @@ impl Model {
             }
         };
         let prompt = &prompt_scrubbed;
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let request = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             system,
             &stripped,
             prompt,
@@ -1851,7 +1862,7 @@ impl Model {
                             prompt.clone(),
                             wire_tools,
                             &params,
-                            openai_additional_params(&params),
+                            Some(openai_responses_additional_params(&params)),
                         )
                         .send()
                         .await?;
@@ -1979,7 +1990,7 @@ async fn openai_text_completion(
                 Message::user(prompt),
                 &[],
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .send()
             .await
@@ -1987,7 +1998,8 @@ async fn openai_text_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system.unwrap_or(""),
@@ -2031,7 +2043,7 @@ async fn openai_tool_completion(
                 Message::user(prompt),
                 std::slice::from_ref(&wire_tool),
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .tool_choice(ToolChoice::Required)
             .send()
@@ -2040,7 +2052,8 @@ async fn openai_tool_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system,
@@ -2063,6 +2076,7 @@ async fn openai_tool_completion(
 pub(super) fn assembled_request(
     model_id: &str,
     provider: &str,
+    wire_api: crate::config::providers::WireApi,
     system: &str,
     history: &[Message],
     prompt: &Message,
@@ -2083,18 +2097,31 @@ pub(super) fn assembled_request(
         // computed the same way the live request computes it, so what's
         // recorded is what's sent:
         // - OpenAI-compat: vendor + native computer tools + prompt cache keys
+        // - generic Responses: the same plus enforced statelessness and
+        //   `reasoning_effort`'s Responses-wire translation
         // - codex-oauth (native ChatGPT): vendor + native computer tools only
-        // - anthropic: vendor + anthropic computer tools (per-block cache)
+        // - anthropic: vendor + Anthropic computer tools
         // Omitted when there's nothing to add.
-        "additional_params": match provider {
-            "anthropic" => anthropic_additional_params(params),
-            "codex-oauth" => chatgpt_additional_params(params),
-            _ => openai_additional_params(params),
-        },
+        "additional_params": captured_additional_params(provider, wire_api, params),
         "native_computer_beta_headers": native_computer_beta_headers(params),
         "history": history,
         "prompt": prompt,
     })
+}
+
+fn captured_additional_params(
+    provider: &str,
+    wire_api: crate::config::providers::WireApi,
+    params: &ModelParams,
+) -> Option<serde_json::Value> {
+    match provider {
+        "anthropic" => anthropic_additional_params(params),
+        "codex-oauth" => chatgpt_additional_params(params),
+        _ if wire_api == crate::config::providers::WireApi::Responses => {
+            Some(openai_responses_additional_params(params))
+        }
+        _ => openai_additional_params(params),
+    }
 }
 
 /// Write a pre-assembled request body to `path` for `--debug-last-message`.
@@ -2195,7 +2222,7 @@ fn redacted_json_debug(value: &serde_json::Value) -> String {
 }
 
 impl std::fmt::Debug for TandemOutcome {
-    /// `request` / `response` (and `usage`) are the raw trusted tandem bodies;
+    /// `request` / `response` (and `usage`) are still treated as sensitive;
     /// never print them verbatim. Show each field's structural descriptor plus
     /// the (non-body) terminal status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

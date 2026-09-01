@@ -96,7 +96,9 @@ pub(super) fn endpoint_observation(
     match endpoint {
         crate::config::providers::WireApi::Completions => state.completions,
         crate::config::providers::WireApi::Responses => state.responses,
-        crate::config::providers::WireApi::Auto => EndpointObservation::Unknown,
+        crate::config::providers::WireApi::Auto | crate::config::providers::WireApi::Anthropic => {
+            EndpointObservation::Unknown
+        }
     }
 }
 
@@ -141,7 +143,7 @@ pub(super) fn record_endpoint_observation_at(
             state.responses = observation;
             state.responses_observed_at = Some(now);
         }
-        crate::config::providers::WireApi::Auto => {}
+        crate::config::providers::WireApi::Auto | crate::config::providers::WireApi::Anthropic => {}
     }
     prune_endpoint_probes(&mut probes, now);
 }

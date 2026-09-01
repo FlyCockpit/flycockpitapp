@@ -91,6 +91,42 @@ function event(event: string, data: Record<string, unknown>) {
 }
 
 describe("remote session reducers", () => {
+  it("removes durable user rows from live and replayed retractions", () => {
+    const live = applyLiveEvent(
+      withDetail(),
+      event("user_message_removed", {
+        session_id: sessionId,
+        seq: 1,
+        client_submission_ids: [],
+      }),
+    );
+    expect(live.detailsBySession[sessionId].history.map((entry) => entry.id)).toEqual([
+      "assistant:2",
+    ]);
+
+    const replay = applyLiveEvent(
+      withDetail(),
+      event("history_replay", {
+        session_id: sessionId,
+        max_seq: 3,
+        removed_user_message_seqs: [1],
+        entries: [{ role: "assistant", seq: 2, agent: "Build", text: "I will inspect." }],
+      }),
+    );
+    expect(replay.detailsBySession[sessionId].history.map((entry) => entry.id)).toEqual([
+      "assistant:2",
+    ]);
+
+    const fullAttach = mergeAttach(withDetail(), {
+      ...attachFixture,
+      history: [{ role: "assistant", seq: 2, agent: "Build", text: "I will inspect." }],
+      removed_user_message_seqs: [1],
+    });
+    expect(fullAttach.detailsBySession[sessionId].history.map((entry) => entry.id)).toEqual([
+      "assistant:2",
+    ]);
+  });
+
   it("scopes an exact retry to its session and restores it after returning", () => {
     const retry = {
       sessionId,

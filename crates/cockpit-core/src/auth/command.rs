@@ -107,21 +107,46 @@ pub(crate) async fn resolve(
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
 ) -> Result<CommandCredential> {
-    let command = entry
-        .auth_command
-        .as_deref()
-        .context("provider has no auth_command")?;
-    let provider_configuration =
-        serde_json::to_vec(entry).context("serializing provider auth-command configuration")?;
-    resolve_with_executor_for_configuration(
+    let entry = entry.clone();
+    resolve_authorized_with_executor(
         provider_id,
-        command,
-        &provider_configuration,
         store,
         env_lookup,
         force_refresh,
         rejected_refresh_generation,
         Arc::new(SubprocessCommandExecutor),
+        move || Ok(entry),
+    )
+    .await
+    .map(|(_, credential)| credential)
+}
+
+/// Resolve a command credential from the provider entry authorized at its
+/// execution turn.  Long-lived clients use this for rejection-triggered
+/// refreshes: config can reload while they wait for another refresh, so a
+/// construction-time entry must never determine the executable that runs.
+pub(crate) async fn resolve_authorized<F>(
+    provider_id: &str,
+    store: CredentialStore,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
+    force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
+    authorize_entry: F,
+) -> Result<(
+    cockpit_config::config::providers::ProviderEntry,
+    CommandCredential,
+)>
+where
+    F: FnOnce() -> Result<cockpit_config::config::providers::ProviderEntry>,
+{
+    resolve_authorized_with_executor(
+        provider_id,
+        store,
+        env_lookup,
+        force_refresh,
+        rejected_refresh_generation,
+        Arc::new(SubprocessCommandExecutor),
+        authorize_entry,
     )
     .await
 }
@@ -137,34 +162,55 @@ async fn resolve_with_executor(
     rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
 ) -> Result<CommandCredential> {
-    resolve_with_executor_for_configuration(
+    let command = command.to_vec();
+    let entry = cockpit_config::config::providers::ProviderEntry {
+        url: provider_url.to_string(),
+        auth_command: Some(command),
+        ..cockpit_config::config::providers::ProviderEntry::default()
+    };
+    resolve_authorized_with_executor(
         provider_id,
-        command,
-        provider_url.as_bytes(),
         store,
         env_lookup,
         force_refresh,
         rejected_refresh_generation,
         executor,
+        move || Ok(entry),
     )
     .await
+    .map(|(_, credential)| credential)
 }
 
-async fn resolve_with_executor_for_configuration(
+async fn resolve_authorized_with_executor<F>(
     provider_id: &str,
-    command: &[String],
-    provider_configuration: &[u8],
     store: CredentialStore,
     env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
     force_refresh: bool,
     rejected_refresh_generation: Option<u64>,
     executor: Arc<dyn CommandSecretExecutor>,
-) -> Result<CommandCredential> {
-    let argv = resolve_argv(command, &store, env_lookup)?;
-    let configuration_identity = configuration_identity(&argv, provider_configuration);
+    authorize_entry: F,
+) -> Result<(
+    cockpit_config::config::providers::ProviderEntry,
+    CommandCredential,
+)>
+where
+    F: FnOnce() -> Result<cockpit_config::config::providers::ProviderEntry>,
+{
     let key = provider_id.to_string();
     let refresh_key = key.clone();
     crate::auth::refresh_guard::serialized_refresh(&key, move || async move {
+        // This is deliberately inside `serialized_refresh`: a queued refresh
+        // must re-read authorization only after it owns the execution turn.
+        // There is no await between the check and `executor.run` below.
+        let entry = authorize_entry()?;
+        let command = entry
+            .auth_command
+            .as_deref()
+            .context("provider has no auth_command")?;
+        let provider_configuration = serde_json::to_vec(&entry)
+            .context("serializing provider auth-command configuration")?;
+        let argv = resolve_argv(command, &store, env_lookup)?;
+        let configuration_identity = configuration_identity(&argv, &provider_configuration);
         let current = store.reopen()?;
         if let Some(cached) = load_cached(&current, &refresh_key, &configuration_identity)? {
             // A rejection is tied to the credential generation that actually
@@ -177,10 +223,13 @@ async fn resolve_with_executor_for_configuration(
             if another_waiter_refreshed
                 || (!force_refresh && !cached.credential.is_expired(unix_now()))
             {
-                return Ok(CommandCredential {
-                    refresh_generation: cached.refresh_generation,
-                    ..cached.credential
-                });
+                return Ok((
+                    entry,
+                    CommandCredential {
+                        refresh_generation: cached.refresh_generation,
+                        ..cached.credential
+                    },
+                ));
             }
         }
 
@@ -200,7 +249,7 @@ async fn resolve_with_executor_for_configuration(
             credential: credential.clone(),
         };
         current.save_record_merged(&refresh_key, serde_json::json!({ "auth_command": cached }))?;
-        Ok(credential)
+        Ok((entry, credential))
     })
     .await
 }
@@ -320,10 +369,15 @@ mod tests {
     }
 
     fn cached(token: &str, expires_at: Option<i64>) -> serde_json::Value {
+        let entry = cockpit_config::config::providers::ProviderEntry {
+            url: "https://example.test/v1".into(),
+            auth_command: Some(vec!["auth-helper".into()]),
+            ..cockpit_config::config::providers::ProviderEntry::default()
+        };
         serde_json::json!({
             "configuration_identity": configuration_identity(
                 &["auth-helper".to_string()],
-                b"https://example.test/v1",
+                &serde_json::to_vec(&entry).unwrap(),
             ),
             "refresh_generation": 1,
             "credential": { "token": token, "expires_at": expires_at, "headers": null }

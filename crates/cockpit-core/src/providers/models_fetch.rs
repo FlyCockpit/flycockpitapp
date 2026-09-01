@@ -274,6 +274,53 @@ pub async fn refresh_provider_request_async_with_store(
     .map(Some)
 }
 
+/// Re-resolve a long-lived command-authenticated request using the provider
+/// entry authorized after this refresh owns the serialized execution turn.
+///
+/// A live client supplies `authorize_entry` instead of a cloned entry because
+/// config can reload while the refresh waits behind another request.
+pub(crate) async fn refresh_provider_request_async_with_store_authorized<F>(
+    provider_id: &str,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
+    rejected_refresh_generation: Option<u64>,
+    authorize_entry: F,
+) -> Result<ResolvedRequest>
+where
+    F: FnOnce() -> Result<ProviderEntry>,
+{
+    let (entry, command_credential) = crate::auth::command::resolve_authorized(
+        provider_id,
+        store.clone(),
+        &env_lookup,
+        true,
+        rejected_refresh_generation,
+        authorize_entry,
+    )
+    .await?;
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential.refresh_generation;
+    let registry = ProviderRegistry::standard();
+    let credential = Some(OAuthCredential::Command(command_credential));
+    let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+    let request = resolve_provider_request_inner_with_sources(
+        provider_id,
+        &entry,
+        credential,
+        registry.provider_for(provider_id, &entry).request_kind(),
+        &env_lookup,
+        &secret_lookup,
+    )?;
+    #[cfg(not(test))]
+    {
+        let mut request = request;
+        request.command_credential_generation = Some(command_credential_generation);
+        return Ok(request);
+    }
+    #[cfg(test)]
+    Ok(request)
+}
+
 async fn resolve_provider_request_async_with_store_refresh(
     provider_id: &str,
     entry: &ProviderEntry,

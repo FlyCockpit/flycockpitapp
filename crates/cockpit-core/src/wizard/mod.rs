@@ -20,6 +20,7 @@ pub use apply::{
 pub const PROVIDER_WIZARD_ID: &str = "provider";
 pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
+pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -508,6 +509,37 @@ pub fn registry() -> Vec<WizardDescriptor> {
     ]
 }
 
+/// The small durable profile step shown on every fresh-install onboarding.
+/// An empty name is a deliberate skip, not an omitted screen.
+pub fn onboarding_profile_descriptor() -> WizardDescriptor {
+    WizardDescriptor {
+        id: ONBOARDING_PROFILE_WIZARD_ID,
+        title: "What should Cockpit call you?",
+        description: "Set an optional display name",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        steps: vec![
+            StepDescriptor {
+                id: "name",
+                prompt: "Your name (leave blank to skip)",
+                help: "This stays in your global Cockpit config and can be changed later.",
+                help_hook: None,
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(onboarding_name_prefill),
+                validate: Some(validate_onboarding_name),
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "profile-save",
+                "Continue to provider setup",
+                "Saving your profile…",
+            ),
+        ],
+    }
+}
+
 pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
     registry().into_iter().find(|wizard| wizard.id == id)
 }
@@ -568,6 +600,31 @@ pub fn model_descriptor_with_selection(
                 validate: Some(validate_model_ref_matches_provider),
                 write: None,
                 branch: None,
+            },
+            StepDescriptor {
+                id: "configuration",
+                prompt: "Model configuration",
+                help: "Smart defaults keep detected context, capabilities, modalities, compaction, and request-wire settings. Open Advanced only when you need an override.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "smart-defaults".into(),
+                            label: "Use smart defaults".into(),
+                            description: "Recommended; keep detected provider and model behavior".into(),
+                        },
+                        SelectOption {
+                            id: "advanced".into(),
+                            label: "Advanced".into(),
+                            description: "Review trust, capabilities, context, thinking, and delegation".into(),
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("smart-defaults".to_string())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(model_configuration_branch),
             },
             StepDescriptor {
                 id: "trust",
@@ -1417,10 +1474,24 @@ pub fn model_default_thinking_answer(
 }
 
 pub fn model_make_default_answer(run: &WizardRun) -> bool {
+    if matches!(
+        run.answer("configuration"),
+        Some(WizardAnswer::Select(value)) if value == "smart-defaults"
+    ) {
+        return true;
+    }
     matches!(
         run.answer("default-model"),
         Some(WizardAnswer::Confirm(true))
     )
+}
+
+pub fn onboarding_name_answer(run: &WizardRun) -> Option<String> {
+    let WizardAnswer::Text(value) = run.answer("name")? else {
+        return None;
+    };
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn model_system_prompt_answer(run: &WizardRun) -> Option<Option<String>> {
@@ -1506,6 +1577,31 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
         WizardAnswer::Select(value) if !value.is_empty() => Ok(()),
         _ => Err("choose one option".to_string()),
     }
+}
+
+fn onboarding_name_prefill(_: &WizardRun) -> Option<WizardAnswer> {
+    ["USER", "USERNAME"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .map(WizardAnswer::Text)
+}
+
+fn validate_onboarding_name(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(value) = answer else {
+        return Err("enter a name or leave it blank to skip".to_string());
+    };
+    if value.chars().count() > 80 {
+        return Err("name must be 80 characters or fewer".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("name cannot contain control characters".to_string());
+    }
+    Ok(())
 }
 
 fn validate_provider_template(
@@ -2011,6 +2107,13 @@ fn model_thinking_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static s
 fn model_system_prompt_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
     Some(match answer {
         WizardAnswer::Select(value) if value == "set" => "system-prompt",
+        _ => "model-save",
+    })
+}
+
+fn model_configuration_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    Some(match answer {
+        WizardAnswer::Select(value) if value == "advanced" => "trust",
         _ => "model-save",
     })
 }

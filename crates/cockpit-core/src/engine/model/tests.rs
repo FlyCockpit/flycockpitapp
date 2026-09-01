@@ -1777,7 +1777,7 @@ fn native_anthropic_model(redact: TestArc<RedactionTable>) -> Model {
 }
 
 #[test]
-fn native_anthropic_requires_x_api_key() {
+fn native_anthropic_requires_x_api_key_or_bearer_authorization() {
     use crate::config::providers::{CacheConfig, TimeoutConfig};
     use crate::providers::models_fetch::ResolvedRequest;
 
@@ -1802,12 +1802,13 @@ fn native_anthropic_requires_x_api_key() {
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     ) {
-        Ok(_) => panic!("missing x-api-key must reject native Anthropic provider"),
+        Ok(_) => panic!("missing Anthropic credentials must reject native provider"),
         Err(err) => err,
     };
 
     let message = err.to_string();
     assert!(message.contains("x-api-key"), "{message}");
+    assert!(message.contains("Authorization: Bearer"), "{message}");
     assert!(message.contains("anthropic"), "{message}");
 }
 
@@ -2017,6 +2018,7 @@ fn native_anthropic_dispatch_capture_matches_shared_assembly() {
     let expected = assembled_request(
         model.model_id(),
         model.provider_label(),
+        WireApi::Anthropic,
         "system",
         &history,
         &prompt,
@@ -2138,11 +2140,8 @@ async fn draining_gate_refuses_new_requests() {
     );
 }
 
-/// The extra-params merge supplies vendor keys only — it can never
-/// clobber the keys cockpit owns on the request
-/// (implementation note). A fragment that (wrongly)
-/// carried `temperature`/`messages`/etc. has those stripped before the
-/// merge; legitimate vendor keys survive.
+/// The generic extra-params merge strips only the request keys Cockpit owns on
+/// every wire. Responses-only state keys remain available to other providers.
 #[test]
 fn sanitized_extra_params_strips_cockpit_owned_keys() {
     let extra = json!({
@@ -2153,13 +2152,37 @@ fn sanitized_extra_params_strips_cockpit_owned_keys() {
         "tool_choice": "none",
         "max_tokens": 1,
         "stream": false,
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
         "thinking": { "type": "enabled" },
         "reasoning_effort": "high",
     });
     let cleaned = sanitized_extra_params(Some(&extra)).expect("vendor keys survive");
     assert_eq!(
         cleaned,
-        json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" }),
+        json!({
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "high",
+        }),
+    );
+}
+
+#[test]
+fn sanitized_openai_responses_extra_params_strips_stateful_controls() {
+    let extra = json!({
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
+        "vendor_knob": "on",
+    });
+
+    assert_eq!(
+        sanitized_openai_responses_extra_params(Some(&extra)),
+        Some(json!({ "vendor_knob": "on" })),
     );
 }
 
@@ -2197,6 +2220,7 @@ fn assembled_request_carries_sanitized_additional_params() {
     let body = assembled_request(
         "deepseek-reasoner",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2218,6 +2242,7 @@ fn assembled_request_additional_params_null_when_absent() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2482,6 +2507,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2519,6 +2545,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2553,6 +2580,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
         let body = assembled_request(
             "gpt",
             "openai-compatible",
+            WireApi::Responses,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2574,6 +2602,7 @@ fn computer_live_opened_geometry_is_not_sufficient_to_advertise() {
     let body = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2716,6 +2745,7 @@ fn assembled_request_task_tool_advertises_intent_envelope() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2756,6 +2786,7 @@ fn assembled_request_carries_trailing_system_injection() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYSTEM PROMPT",
         &history,
         &prompt,
@@ -2776,10 +2807,6 @@ fn assembled_request_carries_trailing_system_injection() {
     assert!(rendered.contains("+ new"));
 }
 
-/// The routing selector picks the native Anthropic path **only** for the
-/// `api.anthropic.com` host (prompt `prompt-caching-strategy.md`). Claude
-/// served by any other host (OpenRouter, Copilot, a local proxy) stays on
-/// the OpenAI-compat path; an unparseable URL is never native.
 /// `build_model` routes solely on `wire_api`: URL and provider id do not alter
 /// the selected model arm.
 #[test]
@@ -2834,6 +2861,40 @@ fn build_model_routes_from_wire_api() {
     );
     assert_eq!(model.provider_label(), "anthropic");
     assert_eq!(model.model_id(), "claude-opus-4-8");
+
+    let compatible_anthropic = ProviderEntry {
+        url: "https://anthropic.nahcrof.com/v1".into(),
+        headers: vec![HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer $ANTHROPIC_API_KEY".into(),
+        }],
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128_000),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let model = build_model(
+        "compatible-anthropic",
+        &compatible_anthropic,
+        "claude-opus-4-8",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        crate::config::providers::WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        std::sync::Arc::new(RedactionTable::empty()),
+        std::sync::Arc::new(RedactionTable::empty()),
+        |name| std::env::var(name).ok(),
+    )
+    .expect("third-party Anthropic wire must build without host detection");
+    assert!(matches!(model, Model::Anthropic { .. }));
 
     // Same Claude model id over OpenRouter → OpenAI-compat arm.
     let via_openrouter = ProviderEntry {
@@ -2903,8 +2964,14 @@ fn custom_provider_wire_api_selects_each_model_arm() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(response_model, Model::ChatGpt { .. }));
-    assert_eq!(response_model.provider_label(), "my-subscription");
+    assert!(matches!(
+        &response_model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
+    assert_eq!(response_model.provider_label(), "openai-compatible");
 
     let anthropic_entry = ProviderEntry {
         url: "https://subscription.example/v1".into(),
@@ -2976,6 +3043,48 @@ fn openai_additional_params_injects_prompt_cache_key() {
         ..ModelParams::default()
     };
     assert_eq!(openai_additional_params(&params), None);
+}
+
+#[test]
+fn openai_responses_additional_params_forces_stateless_reasoning_wire_shape() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_responses_additional_params(&params),
+        json!({
+            "reasoning": { "effort": "high" },
+            "store": false,
+        }),
+    );
+}
+
+#[test]
+fn openai_additional_params_preserves_non_responses_state_named_vendor_keys() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_additional_params(&params),
+        Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
+    );
 }
 
 #[test]
@@ -3121,8 +3230,9 @@ fn openai_additional_params_unchanged_when_retention_unset() {
 }
 
 /// The captured/as-sent body reflects the cache key for the OpenAI flavor
-/// but omits it for native Anthropic (per-block cache) and native ChatGPT/
-/// Codex subscription (`codex-oauth` — distinct backend, no OpenAI cache keys).
+/// but omits it for the Anthropic Messages wire (no top-level cache-key field)
+/// and native ChatGPT/Codex subscription (`codex-oauth` — distinct backend,
+/// no OpenAI cache keys).
 #[test]
 fn assembled_request_cache_key_is_openai_only() {
     let params = ModelParams {
@@ -3132,6 +3242,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3145,18 +3256,20 @@ fn assembled_request_cache_key_is_openai_only() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
         &[],
         &params,
     );
-    // No top-level cache key in the native Anthropic capture.
+    // No top-level cache key in the Anthropic Messages-wire capture.
     assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
 
     let chatgpt = assembled_request(
         "gpt-5.3-codex",
         "codex-oauth",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3206,6 +3319,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3224,6 +3338,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3954,7 +4069,7 @@ fn disabled_table() -> TestArc<RedactionTable> {
 }
 
 #[test]
-fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
+fn trusted_model_uses_enforced_effective_table_and_keeps_session_table() {
     let (_tmp, redact) = secret_table();
     assert!(
         !redact.is_empty(),
@@ -3986,8 +4101,8 @@ fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
     );
 
     let trusted = Model::for_provider(&cfg, "local", "trusted", redact.clone()).unwrap();
-    assert!(trusted.redact_table().is_empty());
-    assert_eq!(trusted.redact().scrub(SECRET), SECRET);
+    assert!(!trusted.redact_table().is_empty());
+    assert!(!trusted.redact().scrub(SECRET).contains(SECRET));
     assert!(!trusted.session_redact_table().is_empty());
 
     let remote =
@@ -5261,7 +5376,13 @@ fn wire_api_change_requires_a_model_rebuild() {
         |_| None,
     )
     .expect("Responses selection must rebuild into its dedicated model arm");
-    assert!(matches!(rebuilt, Model::ChatGpt { .. }));
+    assert!(matches!(
+        rebuilt,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
     assert_eq!(
         existing.resolve_live_wire_api_for_base_url(url),
         WireApi::Completions,
@@ -6619,22 +6740,16 @@ async fn streaming_usage_accepts_input_output_aliases() {
 }
 
 #[tokio::test]
-async fn native_anthropic_dispatch_sends_canonical_user_agent() {
+async fn native_anthropic_lowercase_bearer_auth_reaches_the_wire_without_x_api_key() {
     use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
     let mut provider = anthropic_capture_provider().await;
     let resolved = ResolvedRequest {
         base_url: provider.base_url(),
-        headers: vec![
-            ResolvedHeader {
-                name: "x-api-key".to_string(),
-                value: "anthropic-key".to_string(),
-            },
-            ResolvedHeader {
-                name: "Authorization".to_string(),
-                value: "Bearer gateway-token".to_string(),
-            },
-        ],
+        headers: vec![ResolvedHeader {
+            name: "Authorization".to_string(),
+            value: "bearer gateway-token".to_string(),
+        }],
         is_codex_credential: false,
     };
     let model = build_anthropic_model(
@@ -6663,8 +6778,161 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     );
     assert_eq!(
         request_header_value(&request.headers, "authorization"),
-        Some("Bearer gateway-token")
+        Some("bearer gateway-token")
     );
+    assert_eq!(
+        request_header_value(&request.headers, "x-api-key"),
+        None,
+        "Bearer-compatible gateways must not receive Rig's synthetic x-api-key"
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_x_api_key_auth_is_unchanged_on_the_wire() {
+    use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
+
+    let mut provider = anthropic_capture_provider().await;
+    let resolved = ResolvedRequest {
+        base_url: provider.base_url(),
+        headers: vec![ResolvedHeader {
+            name: "x-api-key".to_string(),
+            value: "anthropic-key".to_string(),
+        }],
+        is_codex_credential: false,
+    };
+    let model = build_anthropic_model(
+        "anthropic",
+        &resolved,
+        "claude-haiku",
+        128,
+        &crate::config::providers::CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .expect("native Anthropic model must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "x-api-key"),
+        Some("anthropic-key")
+    );
+}
+
+#[tokio::test]
+async fn custom_anthropic_wire_omits_prompt_caching_and_all_beta_headers_by_default() {
+    use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
+
+    let mut provider = anthropic_capture_provider().await;
+    let entry = ProviderEntry {
+        url: provider.base_url(),
+        headers: vec![
+            HeaderSpec {
+                name: "Authorization".to_string(),
+                value: "Bearer gateway-token".to_string(),
+            },
+            HeaderSpec {
+                name: "anthropic-beta".to_string(),
+                value: "gateway-configured-beta".to_string(),
+            },
+        ],
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let model = build_model(
+        "gateway",
+        &entry,
+        "claude-haiku",
+        &CacheConfig::default(),
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+        |_| None,
+    )
+    .expect("custom Anthropic-wire provider must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "anthropic-beta"),
+        None,
+        "the explicit beta gate must also suppress configured beta headers"
+    );
+    assert!(!request_body_string(&request).contains("cache_control"));
+}
+
+#[tokio::test]
+async fn first_party_anthropic_features_keep_extended_caching_enabled() {
+    use crate::config::providers::{
+        AnthropicFeatures, CacheConfig, HeaderSpec, ProviderCapabilities,
+    };
+
+    let mut provider = anthropic_capture_provider().await;
+    let entry = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        url: provider.base_url(),
+        headers: vec![HeaderSpec {
+            name: "x-api-key".to_string(),
+            value: "anthropic-key".to_string(),
+        }],
+        anthropic: Some(AnthropicFeatures::first_party()),
+        capabilities: ProviderCapabilities {
+            max_output_tokens: Some(128),
+            ..ProviderCapabilities::default()
+        },
+        ..ProviderEntry::default()
+    };
+    let cache = CacheConfig {
+        ttl_secs: 3_600,
+        ..CacheConfig::default()
+    };
+    let model = build_model(
+        "anthropic",
+        &entry,
+        "claude-haiku",
+        &cache,
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Anthropic,
+        true,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+        |_| None,
+    )
+    .expect("first-party Anthropic provider must build");
+
+    let _ = model.text_completion("hi").await;
+    let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "anthropic-beta"),
+        Some("extended-cache-ttl-2025-04-11")
+    );
+    assert!(request_body_string(&request).contains("cache_control"));
 }
 
 #[tokio::test]
@@ -6804,7 +7072,7 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
 }
 
 #[tokio::test]
-async fn non_codex_responses_wire_omits_codex_headers() {
+async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
     use crate::config::providers::{CacheConfig, HeaderSpec, WireApi};
 
     let mut provider = ScriptedProvider::builder()
@@ -6861,17 +7129,54 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(model, Model::ChatGpt { .. }));
-    assert_eq!(model.provider_label(), "custom-subscription");
+    assert!(matches!(
+        &model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
+    assert_eq!(model.provider_label(), "openai-compatible");
+
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &[Message::user("earlier turn")],
+            &Message::user("hi"),
+            &[],
+            &params,
+        )
+        .expect("custom Responses dispatch record must assemble");
+    assert_eq!(captured["additional_params"]["store"], json!(false));
+    assert_eq!(
+        captured["additional_params"]["reasoning"]["effort"],
+        json!("high")
+    );
+    assert!(
+        captured["additional_params"]
+            .get("reasoning_effort")
+            .is_none()
+    );
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    // The scripted Responses stream contains output text and completion items
+    // only: no reasoning output item is required for a successful turn.
     model
         .complete_captured(
             "system",
-            &[],
+            &[Message::user("earlier turn")],
             Message::user("hi"),
             &[],
-            ModelParams::default(),
+            params,
             "Build",
             Some(&tx),
             &CancellationToken::new(),
@@ -6881,6 +7186,10 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         .expect("custom Responses request must complete");
 
     let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer subscription-token")
+    );
     for header in [
         "chatgpt-account-id",
         "originator",
@@ -6893,6 +7202,28 @@ async fn non_codex_responses_wire_omits_codex_headers() {
             "{header}"
         );
     }
+    assert_eq!(request.body["store"], json!(false));
+    assert!(
+        request.body.get("previous_response_id").is_none(),
+        "generic Responses requests must not rely on server state: {}",
+        request.body
+    );
+    let input = request.body["input"]
+        .as_array()
+        .expect("Responses requests must carry the full conversation as input");
+    let input = serde_json::to_string(input).expect("input must serialize");
+    assert!(
+        input.contains("earlier turn"),
+        "history missing from input: {input}"
+    );
+    assert!(input.contains("hi"), "prompt missing from input: {input}");
+    assert!(request.body.get("background").is_none(), "{}", request.body);
+    assert_eq!(request.body["reasoning"]["effort"], json!("high"));
+    assert!(
+        request.body.get("reasoning_effort").is_none(),
+        "{}",
+        request.body
+    );
 }
 
 #[tokio::test]
@@ -7617,12 +7948,8 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
     }
 }
 
-// AC4b: EVERY non-renderable media source (`Raw`/`FileId`/`Unknown`) on an
-// untrusted dispatch fails closed with a typed prep failure and provably NO
-// provider I/O (a live `ScriptedProvider` captures zero requests); the identical
-// message on a trusted model gets past our prep gate (raw custody), and a
-// trusted renderable dispatch actually reaches the provider carrying its raw
-// content.
+// AC4b: EVERY non-renderable media source (`Raw`/`FileId`/`Unknown`) on every
+// dispatch fails closed with a typed prep failure and provably NO provider I/O.
 #[tokio::test]
 async fn untrusted_non_renderable_wire_field_fails_before_network() {
     use rig::message::{DocumentSourceKind, Image};
@@ -7694,10 +8021,8 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         // Drain guard: nothing was queued at the wire.
         assert!(provider.captured().is_empty());
 
-        // The identical message on a TRUSTED model (raw custody) does NOT trip
-        // OUR fail-closed gate: prep succeeds. (rig itself still rejects these
-        // non-renderable channels downstream of our gate — the point is our
-        // untrusted-only gate did not fire.)
+        // The identical message on a TRUSTED model also trips the fail-closed
+        // gate: trust never bypasses completion redaction.
         let trusted = build_openai_model_from_resolved(
             "p",
             &resolved_local_request(provider.base_url()),
@@ -7726,13 +8051,12 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
             None,
         );
         assert!(
-            trusted_prep.is_ok(),
-            "trusted raw custody must pass our prep gate for the identical message"
+            trusted_prep.is_err(),
+            "trusted dispatch must fail closed too"
         );
     }
 
-    // (c) A trusted model actually DISPATCHES to the provider: a renderable
-    // message carrying the raw sentinel reaches the wire under trusted custody.
+    // (c) A trusted model dispatches a renderable message only after scrubbing.
     let mut provider = sse_capture_provider().await;
     let trusted = build_openai_model_from_resolved(
         "p",
@@ -7748,8 +8072,16 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         0,
         0,
         false,
-        TestArc::new(RedactionTable::empty()),
-        TestArc::new(RedactionTable::empty()),
+        TestArc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "[redacted]".to_string())
+                .unwrap(),
+        ),
+        TestArc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "[redacted]".to_string())
+                .unwrap(),
+        ),
     )
     .unwrap();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
@@ -7773,8 +8105,8 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
         "trusted dispatch must reach the provider"
     );
     assert!(
-        body.contains(SECRET),
-        "trusted raw custody carries the literal to the wire: {body}"
+        !body.contains(SECRET),
+        "trusted completion must not carry the literal to the wire: {body}"
     );
 }
 

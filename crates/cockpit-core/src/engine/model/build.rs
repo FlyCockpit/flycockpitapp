@@ -59,11 +59,9 @@ impl Model {
             .providers
             .get(&active.provider)
             .with_context(|| format!("provider `{}` is not configured", active.provider))?;
-        // AC4: the active-model path is a potentially sensitive caller, so it
-        // declares custody through the typed request API rather than reading a
-        // trust flag. The route it gets back either carries a
-        // `TrustedCustodyGrant` for this exact target or it does not, and only
-        // a grant releases raw provider bytes.
+        // Route through the typed policy API before constructing the model.
+        // The route supplies an enforced egress table for every trust level;
+        // trust itself remains model metadata for capture/write policy.
         let custody_route =
             Self::configured_custody_route(cfg, &active.provider, &active.model, &redact).map_err(
                 |error| {
@@ -74,7 +72,9 @@ impl Model {
                     )
                 },
             )?;
-        let trusted = custody_route.trusted_custody_grant().is_some();
+        let trusted = cfg
+            .resolve_trust(&active.provider, &active.model)
+            .is_trusted();
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
         let hard_timeout_on_stall = true;
@@ -251,15 +251,13 @@ impl Model {
             .providers
             .get(provider_id)
             .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        // AC4, same boundary as [`Self::from_config_with_env`]: a utility /
-        // background target is still a potentially sensitive caller, so its
-        // custody is routed through the typed API instead of read off a trust
-        // flag.
+        // Utility/background targets use the same typed route and enforced
+        // egress table as foreground completions.
         let custody_route = Self::configured_custody_route(cfg, provider_id, model_id, &redact)
             .map_err(|error| {
                 anyhow::anyhow!("cannot route custody for `{provider_id}:{model_id}`: {error}")
             })?;
-        let trusted = custody_route.trusted_custody_grant().is_some();
+        let trusted = cfg.resolve_trust(provider_id, model_id).is_trusted();
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
         let hard_timeout_on_stall = true;
@@ -303,9 +301,10 @@ impl Model {
 }
 
 /// Route a `(provider, model)` build solely from its resolved `wire_api`.
-/// The `cache` config drives the Anthropic TTL mode (5-min vs 1h) and is
-/// unused on the OpenAI-compatible path (which relies on prefix stability +
-/// `prompt_cache_key`, set later via `ModelParams`).
+/// When the provider enables Anthropic prompt caching, the `cache` config
+/// drives its TTL mode (5-min vs 1h). It is unused on the OpenAI-compatible
+/// path, which relies on prefix stability plus `prompt_cache_key`, set later
+/// via `ModelParams`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_model(
@@ -392,26 +391,53 @@ pub(super) fn build_model_with_can_delegate(
     };
     let utility_token_limit = resolve_utility_token_limit(entry, model_id);
     match wire_api {
-        crate::config::providers::WireApi::Responses => build_chatgpt_model_with_utility_limit(
-            provider_id,
-            &resolved,
-            resolved.is_codex_credential,
-            model_id,
-            utility_token_limit,
-            timeout,
-            hard_timeout_on_stall,
-            trusted,
-            location,
-            quality_rank,
-            cost_rank,
-            subagent_invokable,
-            can_delegate,
-            session_redact,
-            redact,
-        ),
+        crate::config::providers::WireApi::Responses if resolved.is_codex_credential => {
+            build_chatgpt_model_with_utility_limit(
+                provider_id,
+                &resolved,
+                true,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
+        // Responses is a wire choice, not a Codex credential. Third-party
+        // Bearer providers use the generic OpenAI client and its `/responses`
+        // serializer; only the Codex credential may select `Model::ChatGpt`.
+        crate::config::providers::WireApi::Responses => {
+            build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+                provider_id,
+                &resolved,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                client_side_tools,
+                wire_api,
+                wire_api_explicit,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
         crate::config::providers::WireApi::Anthropic => {
             let max_tokens =
                 crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
+            let anthropic_features = entry.effective_anthropic_features();
             build_anthropic_model_with_can_delegate(
                 provider_id,
                 &resolved,
@@ -427,6 +453,7 @@ pub(super) fn build_model_with_can_delegate(
                 subagent_invokable,
                 can_delegate,
                 computer_use.as_ref(),
+                &anthropic_features,
                 session_redact,
                 redact,
             )
@@ -480,7 +507,8 @@ fn resolve_utility_token_limit(entry: &ProviderEntry, model_id: &str) -> Option<
 }
 
 /// Build the native Anthropic [`Model::Anthropic`] from an already-resolved
-/// request (api key from the `x-api-key` header, base URL from the resolver).
+/// request. Provider configuration may supply either `x-api-key` or
+/// `Authorization: Bearer` authentication.
 ///
 /// **TTL mapping (prompt `prompt-caching-strategy.md`, decisions 2 & 4):**
 /// the existing `cache.ttl_secs` lever selects the TTL mode — `>= 3600`
@@ -489,7 +517,8 @@ fn resolve_utility_token_limit(entry: &ProviderEntry, model_id: &str) -> Option<
 /// `with_automatic_caching_1h()` (rig's 1-hour mechanism; honors the
 /// no-serialization-fork rule); anything below enables per-block
 /// `with_prompt_caching()` (system prompt + last content block of the last
-/// message, 5-min ephemeral). No new config field — `ttl_secs` is the lever.
+/// message, 5-min ephemeral). The provider's explicit Anthropic feature gate
+/// controls whether either form, and the required beta header, is emitted.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_anthropic_model(
@@ -523,6 +552,7 @@ pub(super) fn build_anthropic_model(
         subagent_invokable,
         true,
         None,
+        &crate::config::providers::AnthropicFeatures::first_party(),
         session_redact,
         redact,
     )
@@ -544,22 +574,44 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     subagent_invokable: bool,
     can_delegate: bool,
     computer_use: Option<&crate::config::providers::ComputerUseCapability>,
+    anthropic_features: &crate::config::providers::AnthropicFeatures,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    // The anthropic template carries the key in `x-api-key`
-    // (`x-api-key: $ANTHROPIC_API_KEY`), not an `Authorization: Bearer`.
-    let api_key = resolved
+    let x_api_key = resolved
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("x-api-key"))
         .map(|h| h.value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .with_context(|| {
-            format!("native Anthropic provider `{provider_id}` is missing required `x-api-key` header/API key")
-        })?;
+        .filter(|value| !value.is_empty());
+    let bearer_auth = resolved
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+        .map(|h| h.value.trim())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let (api_key, uses_bearer_auth) = match (x_api_key, bearer_auth) {
+        // Preserve the first-party x-api-key behavior when both headers are
+        // present on an existing provider.
+        (Some(api_key), _) => (api_key, false),
+        // Rig requires an API key even though it is removed at the custom
+        // HTTP-client boundary before this request reaches the gateway.
+        (None, Some(_)) => ("flycockpit-anthropic-bearer-placeholder".to_string(), true),
+        (None, None) => anyhow::bail!(
+            "native Anthropic provider `{provider_id}` requires `x-api-key` or `Authorization: Bearer <token>`"
+        ),
+    };
 
-    let one_hour = cache.wants_one_hour_ttl();
+    let prompt_caching = anthropic_features.prompt_caching;
+    // Rig's 1-hour cache-control form requires the extended-cache beta. A
+    // provider may opt into portable 5-minute caching without beta support.
+    let one_hour = prompt_caching && anthropic_features.betas && cache.wants_one_hour_ttl();
     let mut builder = anthropic::Client::builder()
         .api_key(api_key)
         .base_url(&resolved.base_url);
@@ -567,33 +619,48 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         // The 1h extended cache requires the beta header on the client.
         builder = builder.anthropic_beta("extended-cache-ttl-2025-04-11");
     }
-    if let Some(contract) = computer_use.and_then(|capability| capability.contract) {
-        builder = match contract {
-            crate::config::providers::ComputerUseContract::Anthropic20251124 => {
-                builder.anthropic_beta("computer-use-2025-11-24")
-            }
-            crate::config::providers::ComputerUseContract::Anthropic20250124 => {
-                builder.anthropic_beta("computer-use-2025-01-24")
-            }
-            crate::config::providers::ComputerUseContract::OpenAiResponses => builder,
-        };
+    if anthropic_features.betas {
+        if let Some(contract) = computer_use.and_then(|capability| capability.contract) {
+            builder = match contract {
+                crate::config::providers::ComputerUseContract::Anthropic20251124 => {
+                    builder.anthropic_beta("computer-use-2025-11-24")
+                }
+                crate::config::providers::ComputerUseContract::Anthropic20250124 => {
+                    builder.anthropic_beta("computer-use-2025-01-24")
+                }
+                crate::config::providers::ComputerUseContract::OpenAiResponses => builder,
+            };
+        }
     }
     let extra_headers = resolved
         .headers
         .iter()
-        // Rig owns the `x-api-key` it builds from below. Every other resolved
-        // header, including Authorization, is part of the configured native
-        // Anthropic request and must reach compatible gateways unchanged.
-        .filter(|h| !h.name.eq_ignore_ascii_case("x-api-key"))
+        // Rig owns the x-api-key it builds from above. All other headers,
+        // including Bearer Authorization, go through the custom HTTP client,
+        // which removes Rig's synthetic x-api-key for the Bearer path.
+        // `anthropic-beta` is a native Anthropic extension, so configured
+        // headers must obey the same explicit provider gate as headers Rig
+        // generates for caching and computer-use.
+        .filter(|h| {
+            !h.name.eq_ignore_ascii_case("x-api-key")
+                && (anthropic_features.betas || !h.name.eq_ignore_ascii_case("anthropic-beta"))
+        })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
+    let http_client = if uses_bearer_auth {
+        UsageAliasHttpClient::for_anthropic_bearer(extra_headers)?
+    } else {
+        UsageAliasHttpClient::new(extra_headers)?
+    };
     let client = builder
-        .http_client(UsageAliasHttpClient::new(extra_headers)?)
+        .http_client(http_client)
         .build()
         .with_context(|| format!("building anthropic client for `{provider_id}`"))?;
 
     let completion = client.completion_model(model_id);
-    let completion = if one_hour {
+    let completion = if !prompt_caching {
+        completion
+    } else if one_hour {
         // 1h opt-in: top-level automatic caching (decision 4).
         completion.with_automatic_caching_1h()
     } else {
@@ -943,10 +1010,16 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
+    // A `CompletionsClient` can recover between the Chat Completions and
+    // Responses endpoints without being rebuilt. Keep the generic client
+    // fenced for its whole lifetime instead of tying the header policy to its
+    // initially resolved endpoint. The policy filters Codex subscription
+    // headers whenever this generic client selects `/responses`.
+    let http_client = UsageAliasHttpClient::without_codex_headers(extra_headers)?;
     let client = openai::CompletionsClient::builder()
         .api_key(token)
         .base_url(&resolved.base_url)
-        .http_client(UsageAliasHttpClient::new(extra_headers)?)
+        .http_client(http_client)
         .build()
         .with_context(|| format!("building openai-compatible client for `{provider_id}`"))?;
     Ok(Model::OpenAi {
@@ -1019,15 +1092,16 @@ pub struct ModelParams {
     /// (OpenAI Responses, GitHub Copilot, …) keeps hitting. Ignored by
     /// backends that don't honor it; zero risk. Set **only** on the main
     /// session worker's foreground model; background/utility models leave it
-    /// `None`. The native Anthropic arm ignores it entirely (it uses
-    /// provider-concrete per-block caching instead).
+    /// `None`. The Anthropic Messages-wire arm ignores it entirely because
+    /// that wire has no top-level cache-key field.
     pub prompt_cache_key: Option<String>,
     /// Opaque provider-defined prompt-cache retention policy for
     /// OpenAI-compatible backends, such as OpenAI's `"24h"`. `None` is the
     /// default and sends no retention key, so existing request bodies are
     /// unchanged. When set to a non-empty value, the OpenAI-compatible
     /// additional-params composition passes it through verbatim; native
-    /// Anthropic ignores it because it uses per-block caching.
+    /// Anthropic ignores it because its Messages wire has no top-level cache
+    /// key, whether or not provider-configured prompt caching is enabled.
     pub prompt_cache_retention: Option<String>,
     /// Provider-native computer-use tool overlay. This stays `None` by default;
     /// the gating prompt is responsible for attaching it only to approved
@@ -1176,9 +1250,9 @@ pub(super) fn build_openai_responses_completion_model(
     openai::responses_api::ResponsesCompletionModel::new(client, model_id).with_strict_tools()
 }
 
-/// Return the pre-built native Anthropic completion model. Its caching mode is
-/// selected while constructing the provider client above; request-specific
-/// system messages, tools, and parameters are configured through
+/// Return the pre-built Anthropic Messages-wire completion model. Its optional
+/// caching mode is selected while constructing the provider client above;
+/// request-specific system messages, tools, and parameters are configured through
 /// `CompletionModel::completion_request`.
 pub(super) fn build_anthropic_completion_model(
     model: AnthropicCompletionModel,
@@ -1209,7 +1283,17 @@ pub(super) fn build_chatgpt_completion_model(
 /// providers with no extra params and no cache params stay byte-for-byte
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
-    let vendor = chatgpt_additional_params(params);
+    openai_additional_params_with_vendor(chatgpt_additional_params(params), params)
+}
+
+/// Add generic OpenAI cache parameters to a wire-specific sanitized provider
+/// fragment. Responses passes its statefulness-aware sanitizer here while
+/// Chat Completions keeps its vendor fragment untouched beyond universal
+/// request-key collision protection.
+fn openai_additional_params_with_vendor(
+    vendor: Option<serde_json::Value>,
+    params: &ModelParams,
+) -> Option<serde_json::Value> {
     let cache_key = params
         .prompt_cache_key
         .as_ref()
@@ -1243,6 +1327,55 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
         );
     }
     Some(serde_json::Value::Object(map))
+}
+
+/// Compose the generic OpenAI **Responses**-wire extras.
+///
+/// Responses calls are deliberately stateless: Cockpit replays the complete
+/// conversation as `input`, always sends `store: false`, and does not permit a
+/// provider fragment to select `previous_response_id` or `background` (those
+/// fields are removed by [`sanitized_openai_responses_extra_params`]). Rig's
+/// Responses serializer models reasoning effort as `reasoning.effort`, whereas the
+/// generic catalog's OpenAI-compatible mapping supplies `reasoning_effort`.
+/// Translate that mapping at the wire boundary instead of silently letting
+/// Rig discard it as an unknown additional parameter.
+pub(super) fn openai_responses_additional_params(params: &ModelParams) -> serde_json::Value {
+    let vendor = merge_native_computer_tools(
+        sanitized_openai_responses_extra_params(params.additional_params.as_ref()),
+        params,
+        |contract| contract == crate::computer::ComputerToolContract::OpenAiResponses,
+    );
+    let mut map = match openai_additional_params_with_vendor(vendor, params) {
+        Some(serde_json::Value::Object(map)) => map,
+        // A scalar cannot be represented in Rig's typed Responses parameters.
+        // Place it in the typed `reasoning` slot so Rig rejects the malformed
+        // config instead of silently sending an unconstrained request body.
+        Some(other) => serde_json::Map::from_iter([("reasoning".into(), other)]),
+        None => serde_json::Map::new(),
+    };
+
+    if let Some(effort) = map.remove("reasoning_effort") {
+        match map.entry("reasoning".to_string()) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::json!({ "effort": effort }));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                serde_json::Value::Object(reasoning) => {
+                    reasoning.insert("effort".to_string(), effort);
+                }
+                // The catalog mapping is authoritative for this request. A
+                // malformed hand-authored `reasoning` shape cannot cause its
+                // selected effort to be silently dropped.
+                other => *other = serde_json::json!({ "effort": effort }),
+            },
+        }
+    }
+
+    // This is intentionally injected after vendor composition. The provider
+    // fragment cannot override it, and the typed Rig serializer therefore
+    // emits the key rather than applying a provider default by omission.
+    map.insert("store".to_string(), serde_json::Value::Bool(false));
+    serde_json::Value::Object(map)
 }
 
 /// Native ChatGPT/Codex subscription backend extras: sanitized vendor fragment

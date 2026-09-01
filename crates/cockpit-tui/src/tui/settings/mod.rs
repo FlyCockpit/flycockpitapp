@@ -89,7 +89,7 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
-    cwd_scoped_creatable_dirs, discover_config_dirs,
+    cwd_scoped_creatable_dirs, discover_config_dirs, global_config_dir,
 };
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
@@ -2688,6 +2688,9 @@ pub struct SetupWizardDialog {
     tool_surface_touched: bool,
     cwd: PathBuf,
     status: Option<String>,
+    dialog_id: uuid::Uuid,
+    queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
+    pending_operation_id: Option<uuid::Uuid>,
 }
 
 pub struct SettingsDialog {
@@ -2731,6 +2734,9 @@ fn setup_wizard_dialog(
         tool_surface_touched,
         cwd: cwd.to_path_buf(),
         status,
+        dialog_id: uuid::Uuid::new_v4(),
+        queued_daemon_effect: None,
+        pending_operation_id: None,
     })))
 }
 
@@ -5527,6 +5533,7 @@ impl Dialog {
     }
     pub(crate) fn has_unsettled_local_authority(&self) -> bool {
         matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
+            || matches!(self, Dialog::SetupWizard(wizard) if wizard.pending_operation_id.is_some())
     }
 
     pub(crate) fn handle_settings_pointer(
@@ -5789,32 +5796,27 @@ impl Dialog {
     }
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
-        // The provider wizard is the first-run destination, not the generic
-        // config-location picker. Opening (or cancelling) it must not create
-        // a config layer. The daemon creates the selected target atomically
-        // when the user first saves a provider.
-        let path = match discover_config_dirs(cwd).first() {
-            Some(dir) => Ok(dir.path.join(CONFIG_FILE)),
-            None => creatable_config_dirs()
-                .first()
-                .ok_or_else(|| std::io::Error::other("no Cockpit config directory is available"))
-                .map(|dir| dir.path.join(CONFIG_FILE)),
-        };
+        // The provider wizard is the first-run destination for the
+        // always-writable global layer, not the generic config-location
+        // picker. Opening (or cancelling) it must not create a config layer.
+        // The daemon creates the global target atomically when the user first
+        // saves a provider.
+        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
 
         match path {
-            Ok(path) => {
-                let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+            Ok((path, global_root)) => {
+                let mut s = SettingsDialog::open_from_picker(path, global_root);
                 let mut add = AddState::new();
                 add.error = status;
                 s.page = providers_page(ProvidersPage::Add(add));
                 Dialog::Settings(Box::new(s))
             }
             Err(error) => Dialog::CreateConfig {
-                choices: creatable_config_dirs(),
+                choices: Vec::new(),
                 cursor: 0,
                 cwd: cwd.to_path_buf(),
                 status: Some(format!(
-                    "could not select an initial Cockpit config: {error}"
+                    "could not resolve the global Cockpit config: {error}"
                 )),
             },
         }
@@ -5829,26 +5831,30 @@ impl Dialog {
     }
 
     pub fn open_setup_wizard(cwd: &std::path::Path, wizard_id: &str) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
         match wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
-                let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, cwd)
+                let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
-                setup_wizard_dialog(cwd, descriptor, None)
+                setup_wizard_dialog(&global_root, descriptor, None)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
     }
 
     pub fn open_model_setup_preselected(
-        cwd: &std::path::Path,
+        _cwd: &std::path::Path,
         provider_id: &str,
         model_id: &str,
         status: Option<String>,
     ) -> Result<Self, String> {
-        let descriptor =
-            cockpit_core::wizard::model_descriptor_for_cwd(cwd, Some((provider_id, model_id)));
-        setup_wizard_dialog(cwd, descriptor, status)
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = cockpit_core::wizard::model_descriptor_for_cwd(
+            &global_root,
+            Some((provider_id, model_id)),
+        );
+        setup_wizard_dialog(&global_root, descriptor, status)
     }
 
     pub fn open_model_setup_choice(
@@ -6221,6 +6227,7 @@ impl Dialog {
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
+            Dialog::SetupWizard(wizard) => wizard.queued_daemon_effect.take(),
             _ => None,
         }
     }
@@ -6250,13 +6257,15 @@ impl Dialog {
         &mut self,
         completion: SettingsDaemonEffectCompletion,
     ) {
-        let Dialog::Settings(settings) = self else {
-            return;
-        };
-        if completion.dialog_id != settings.cx.dialog_id {
-            return;
+        match self {
+            Dialog::SetupWizard(wizard) if completion.dialog_id == wizard.dialog_id => {
+                apply_setup_wizard_daemon_completion(wizard, completion);
+            }
+            Dialog::Settings(settings) if completion.dialog_id == settings.cx.dialog_id => {
+                settings.apply_daemon_completion(completion);
+            }
+            _ => {}
         }
-        settings.apply_daemon_completion(completion);
     }
 
     pub(crate) fn apply_settings_blocking_completion(
@@ -9206,9 +9215,15 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         multi_touched,
         tool_surface,
         tool_surface_touched,
-        cwd,
+        cwd: _,
         status,
+        dialog_id,
+        queued_daemon_effect,
+        pending_operation_id,
     } = wizard;
+    if pending_operation_id.is_some() {
+        return false;
+    }
     macro_rules! submit_answer {
         ($answer:expr $(,)?) => {
             let answer = $answer;
@@ -9283,39 +9298,40 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             _ => {}
         },
         cockpit_core::wizard::StepKind::Action { .. } => {
-            if step.id == "security-save" {
-                match cockpit_core::wizard::apply_security_answers(cwd, run) {
-                    Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
-                    Ok(None) => *status = Some("Security settings unchanged.".to_string()),
+            if matches!(step.id, "security-save" | "model-save") {
+                let answers_json = match run.answers_json() {
+                    Ok(answers_json) => answers_json,
                     Err(error) => {
-                        *status = Some(error.to_string());
+                        *status = Some(format!("Could not prepare setup answers: {error}"));
                         return false;
                     }
-                }
-            } else if step.id == "model-save" {
-                match cockpit_core::wizard::apply_model_answers(cwd, run) {
-                    Ok(outcome) if outcome.changed_nothing() => {
-                        *status = Some("No model-setting changes were needed.".to_string())
-                    }
-                    Ok(outcome) => {
-                        let mut parts = Vec::new();
-                        if let Some(path) = outcome.model_file.as_ref() {
-                            parts.push(format!("Saved model settings to {}.", path.display()));
-                        }
-                        // Layer-wide default policy names a safe scope label,
-                        // never a filesystem path.
-                        if let Some(scope) = outcome.default_scope.as_ref() {
-                            parts.push(format!(
-                                "Set the default model for new sessions ({scope}); running sessions are unchanged."
-                            ));
-                        }
-                        *status = Some(parts.join(" "));
-                    }
+                };
+                let project_root = match global_config_dir() {
+                    Ok(root) => root.display().to_string(),
                     Err(error) => {
-                        *status = Some(format!("Could not save model settings: {error}"));
+                        *status = Some(format!("Could not resolve global Cockpit config: {error}"));
                         return false;
                     }
-                }
+                };
+                let operation_id = uuid::Uuid::new_v4();
+                let target = SettingsEffectTarget {
+                    surface: "settings.setup-wizard-save",
+                    owner: run.descriptor().id.to_string(),
+                    revision: Some(operation_id.to_string()),
+                };
+                *queued_daemon_effect = Some(SettingsDaemonEffectRequest {
+                    dialog_id: *dialog_id,
+                    operation_id,
+                    target,
+                    work: SettingsDaemonEffectWork::Request(Request::ApplySetupWizard {
+                        project_root,
+                        wizard_id: run.descriptor().id.to_string(),
+                        answers_json,
+                    }),
+                });
+                *pending_operation_id = Some(operation_id);
+                *status = Some("Saving global setup through the daemon…".to_string());
+                return false;
             }
             submit_answer!(cockpit_core::wizard::WizardAnswer::Acknowledged);
         }
@@ -9428,6 +9444,59 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         cockpit_core::wizard::StepKind::Secret => {}
     }
     false
+}
+
+fn apply_setup_wizard_daemon_completion(
+    wizard: &mut SetupWizardDialog,
+    completion: SettingsDaemonEffectCompletion,
+) {
+    if wizard.pending_operation_id != Some(completion.operation_id)
+        || completion.target.surface != "settings.setup-wizard-save"
+        || completion.target.owner != wizard.run.descriptor().id
+    {
+        return;
+    }
+    wizard.pending_operation_id = None;
+    let status = match completion.response {
+        Ok(Response::SetupWizardApplied {
+            changed,
+            model_file_written,
+            default_scope,
+        }) => {
+            if let Err(error) = wizard
+                .run
+                .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
+            {
+                wizard.status = Some(format!(
+                    "Daemon saved setup, but could not advance wizard: {error}"
+                ));
+                return;
+            }
+            if !changed {
+                "Global setup is already up to date.".to_string()
+            } else if wizard.run.descriptor().id == cockpit_core::wizard::MODEL_WIZARD_ID {
+                let mut parts = Vec::new();
+                if model_file_written {
+                    parts.push("Saved global model settings.".to_string());
+                }
+                if let Some(scope) = default_scope {
+                    parts.push(format!(
+                        "Set the default model for new sessions ({scope}); running sessions are unchanged."
+                    ));
+                }
+                if parts.is_empty() {
+                    "Saved global model settings through the daemon.".to_string()
+                } else {
+                    parts.join(" ")
+                }
+            } else {
+                "Saved global security settings through the daemon.".to_string()
+            }
+        }
+        Ok(other) => format!("Daemon returned an unexpected setup response: {other:?}"),
+        Err(error) => format!("Could not save global setup through the daemon: {error}"),
+    };
+    wizard.status = Some(status);
 }
 
 struct SetupWizardInputs<'a> {
@@ -10058,7 +10127,6 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 fn kind_label(kind: &ConfigDirKind) -> &'static str {
     match kind {
         ConfigDirKind::HomeXdg => "(home / XDG)",
-        ConfigDirKind::HomeDot => "(home / dotfile)",
         ConfigDirKind::MachineLocal => "(machine-local, scoped to cwd)",
         ConfigDirKind::Project => "(project — shareable with team)",
     }

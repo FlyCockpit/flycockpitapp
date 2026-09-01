@@ -7230,7 +7230,11 @@ async fn handle_serialized_request_impl(
                     && let Some(session_id) = session_id
                     && let Some(handle) = ctx.registry.live_handle(session_id)
                 {
-                    let _ = handle.send_work(SessionWork::Cancel).await;
+                    let _ = handle
+                        .send_work(SessionWork::Cancel {
+                            origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                        })
+                        .await;
                 }
                 Ok(Response::RunInvocationCancelResult { result })
             } else {
@@ -10407,7 +10411,13 @@ async fn handle_serialized_request_impl(
                         return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                     crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => {}
                 }
-                if let Err(error) = att.handle.send_work(SessionWork::Cancel).await {
+                if let Err(error) = att
+                    .handle
+                    .send_work(SessionWork::Cancel {
+                        origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                    })
+                    .await
+                {
                     let unknown = serde_json::to_vec(&serde_json::json!({"outcome":"unknown"}))
                         .map_err(internal)?;
                     ctx.db
@@ -10444,7 +10454,9 @@ async fn handle_serialized_request_impl(
                 }
             }
             att.handle
-                .send_work(SessionWork::Cancel)
+                .send_work(SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                })
                 .await
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
@@ -13389,7 +13401,7 @@ async fn handle_serialized_request_impl(
         Request::SetToolSurfaceOverride {
             override_json,
             persist_session,
-            prune_after_switch,
+            cache_break_acknowledged,
             monty_nudge,
         } => {
             let att = require_attached(state)?;
@@ -13398,7 +13410,7 @@ async fn handle_serialized_request_impl(
                 let request = Request::SetToolSurfaceOverride {
                     override_json: override_json.clone(),
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge: monty_nudge.clone(),
                 };
                 if let Some(response) =
@@ -13415,7 +13427,7 @@ async fn handle_serialized_request_impl(
                 .send_work(SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge,
                     respond_to,
                 })
@@ -17010,7 +17022,6 @@ async fn handle_serialized_request_impl(
             .await
         }
 
-        #[cfg(feature = "remote")]
         Request::ApplySetupWizard {
             project_root,
             wizard_id,
@@ -19802,9 +19813,25 @@ async fn daemon_provider_config_with_warnings(
     ),
     ErrorPayload,
 > {
-    let cwd = std::path::PathBuf::from(project_root);
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
+    }
+    let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    if global_config_root(&cwd)? {
+        let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        let config = crate::config::providers::ConfigDoc::load(&global_config)
+            .map_err(daemon_config_error)?
+            .providers();
+        let root = crate::config::trust::resolve_trust_root(&cwd).map_err(internal)?;
+        return Ok((
+            cwd,
+            crate::config::trust::WorkspaceTrustPolicy {
+                root,
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            config,
+            Vec::new(),
+        ));
     }
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
@@ -19814,6 +19841,15 @@ async fn daemon_provider_config_with_warnings(
         .load_effective_for_daemon_with_provider_warnings(&cwd, &trust_policy)
         .map_err(daemon_config_error)?;
     Ok((cwd, trust_policy, config, warnings))
+}
+
+/// A catalog rooted at the canonical global config directory is onboarding
+/// authority, not a workspace setting. It is intentionally the only
+/// trust-free root accepted by the provider mutation capability path.
+fn global_config_root(root: &std::path::Path) -> std::result::Result<bool, ErrorPayload> {
+    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
+    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
+    Ok(root == canonical_global)
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -19868,11 +19904,18 @@ async fn provider_catalog_snapshot(
     // it just cannot mint an edit capability. Clients treat the absent
     // capability fields as read-only and an empty `layer_id` as "no editable
     // layer"; a later mutation attempt fails the capability lookup instead.
-    let target_path =
+    let target_path = if global_config_root(&cwd)? {
+        cockpit_config::config::dirs::global_config_file()
+            .ok()
+            .and_then(|config| {
+                crate::config::providers::provider_file_path_for_config(&config, "default").ok()
+            })
+    } else {
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
-        });
+        })
+    };
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -19906,22 +19949,27 @@ async fn provider_catalog_snapshot(
     } else {
         String::new()
     };
-    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-    let mcp_scope_targets = ["global", "workspace"]
-        .into_iter()
-        .filter_map(|scope| {
-            let target =
-                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                    cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
-                })?;
-            let path = target
-                .parent()?
-                .join(cockpit_config::config::dirs::MCP_FILE);
-            let path = canonical_mcp_target_path(&path).ok()?;
-            let revision = mcp_target_layer_revision(&path).ok()?;
-            Some((scope.to_string(), (path, revision)))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let (mcp, mcp_scope_targets) = if global_config_root(&cwd)? {
+        (None, std::collections::BTreeMap::new())
+    } else {
+        let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+        let targets = ["global", "workspace"]
+            .into_iter()
+            .filter_map(|scope| {
+                let target = crate::config::trust::with_workspace_trust_policy(
+                    trust_policy.clone(),
+                    || cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope),
+                )?;
+                let path = target
+                    .parent()?
+                    .join(cockpit_config::config::dirs::MCP_FILE);
+                let path = canonical_mcp_target_path(&path).ok()?;
+                let revision = mcp_target_layer_revision(&path).ok()?;
+                Some((scope.to_string(), (path, revision)))
+            })
+            .collect();
+        (mcp, targets)
+    };
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -21244,11 +21292,17 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
-    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        ctx.config_source()
-            .config_write_target_for_provider(&cwd, "default")
-    })
-    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = if global_config_root(&cwd)? {
+        let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        crate::config::providers::provider_file_path_for_config(&global, "default")
+            .map_err(internal)?
+    } else {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, "default")
+        })
+        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+    };
     let target = canonical_mcp_target_path(&target)?;
     if target != capability_target {
         return Err(ErrorPayload {
@@ -21267,12 +21321,17 @@ async fn stage_and_recover_provider_batch(
                 .map(|delete| delete.provider_id.as_str()),
         )
     {
-        let provider_target =
+        let provider_target = if global_config_root(&cwd)? {
+            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+            crate::config::providers::provider_file_path_for_config(&global, provider_id)
+                .map_err(internal)?
+        } else {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 ctx.config_source()
                     .config_write_target_for_provider(&cwd, provider_id)
             })
-            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+        };
         let provider_target = canonical_mcp_target_path(&provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(
@@ -27715,6 +27774,7 @@ async fn code_root_read_from_attached_response(
         active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: _,
         paused_work,
         repair_required,
         // The ACP Code-root projection deliberately does not transfer this
@@ -27877,6 +27937,41 @@ async fn code_root_read_snapshot(
             .map(btw_info_to_proto),
         attention,
     })
+}
+
+/// Drain events emitted after an attach's durable snapshot was read.
+///
+/// A broadcast gap makes that snapshot stale: the queued lag marker must be
+/// delivered before any retained post-gap events, so clients enter their normal
+/// durable reattach/reconcile path before applying them.
+pub(super) fn replay_attach_hydration_events(
+    event_rx: &mut crate::daemon::EventReceiver,
+    pending_replay: &mut Vec<proto::Event>,
+    session_id: Uuid,
+) {
+    loop {
+        match event_rx.try_recv() {
+            Ok(envelope) => pending_replay.push(envelope.event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                // The history snapshot predates this loss, so it cannot be
+                // treated as an authoritative attach projection. In
+                // particular, a dropped `UserMessageRemoved` would otherwise
+                // leave a retracted durable row rendered indefinitely. Match
+                // the live-forwarder contract: deliver a typed lag marker
+                // after the attach response so the client reattaches and
+                // reconciles from its durable cursor. Keep draining the
+                // receiver too, since events retained after the gap are still
+                // useful while that resync is in flight.
+                tracing::warn!(missed = n, %session_id, "attach hydration event replay lagged; reattach to resync");
+                pending_replay.push(proto::Event::EventStreamLagged {
+                    session_id: Some(session_id),
+                    dropped: n,
+                });
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28253,10 +28348,11 @@ pub(super) async fn attach(
     let db = ctx.db.clone();
     let extended_cfg_for_attach = extended_cfg.clone();
     let active_subagent_for_attach = foreground.active_subagent.clone();
-    let (mut history, paused_work, replay_max_seq): (
+    let (mut history, paused_work, replay_max_seq, removed_user_message_seqs): (
         Vec<proto::HistoryEntry>,
         Vec<proto::PausedWorkSummary>,
         Option<i64>,
+        Vec<i64>,
     ) = db
         .read(move |conn| {
             let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
@@ -28264,37 +28360,71 @@ pub(super) async fn attach(
                 session_id,
                 &extended_cfg_for_attach,
             );
-            let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
+            let (history, replay_max_seq, removed_user_message_seqs) = if let Some(since_seq) = since_seq {
                 let replay_rows =
                     crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
-                let replay_max_seq = replay_rows.into_iter().map(|row| row.seq).max();
-                let history =
-                    crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
-                        conn,
-                        session_id,
-                        &root_agent,
-                        active_subagent_for_attach.as_ref(),
-                        since_seq,
-                    )?;
-                (history, replay_max_seq)
-            } else {
-                let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
+                let replay_max_seq = replay_rows.iter().map(|row| row.seq).max();
+                // A retraction deletes its user row, so normal transcript
+                // projection has nothing to render for it. Preserve the
+                // tombstone's target identity as a narrow replay operation:
+                // clients remove only this proven-stale row and never infer
+                // deletion from an entry merely being absent from a snapshot.
+                let removed_user_message_seqs = replay_rows
+                    .iter()
+                    .filter(|row| row.kind == "user_message_retracted")
+                    .filter_map(|row| {
+                        row.data
+                            .get("retracted_seq")
+                            .and_then(serde_json::Value::as_i64)
+                    })
+                    .collect();
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
                     conn,
                     session_id,
                     &root_agent,
                     active_subagent_for_attach.as_ref(),
+                    replay_rows,
+                )?;
+                (history, replay_max_seq, removed_user_message_seqs)
+            } else {
+                // A full snapshot is merged with retained paged/live rows by
+                // remote clients, so it must carry all durable retraction
+                // targets as well. Absence from a snapshot is never treated
+                // as deletion: only these tombstone-backed identities remove
+                // a cached user row.
+                let snapshot_rows = crate::db::Db::list_session_events_conn(conn, session_id)?;
+                let removed_user_message_seqs = snapshot_rows
+                        .iter()
+                        .filter(|row| row.kind == "user_message_retracted")
+                        .filter_map(|row| {
+                            row.data
+                                .get("retracted_seq")
+                                .and_then(serde_json::Value::as_i64)
+                        })
+                        .collect();
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
+                    conn,
+                    session_id,
+                    &root_agent,
+                    active_subagent_for_attach.as_ref(),
+                    snapshot_rows,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
                     Vec::new()
                 });
-                (history, None)
+                (history, None, removed_user_message_seqs)
             };
             let paused_work = crate::db::Db::paused_session_work_conn(conn, session_id)?
                 .into_iter()
                 .map(paused_work_to_proto)
                 .collect();
-            Ok((history, paused_work, replay_max_seq))
+            Ok((
+                history,
+                paused_work,
+                replay_max_seq,
+                removed_user_message_seqs,
+            ))
         })
         .await
         .map_err(internal)?;
@@ -28306,17 +28436,7 @@ pub(super) async fn attach(
         );
     }
 
-    loop {
-        match event_rx.try_recv() {
-            Ok(envelope) => state.pending_replay.push(envelope.event),
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!(missed = n, "attach hydration event replay lagged");
-                break;
-            }
-            Err(broadcast::error::TryRecvError::Closed) => break,
-        }
-    }
+    replay_attach_hydration_events(&mut event_rx, &mut state.pending_replay, session_id);
     effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {
@@ -28325,16 +28445,17 @@ pub(super) async fn attach(
     } else {
         history
     };
+    let attached_removed_user_message_seqs = if replay_max_seq.is_none() {
+        removed_user_message_seqs.clone()
+    } else {
+        Vec::new()
+    };
     if let Some(max_seq) = replay_max_seq {
-        if !history.is_empty() {
-            let max_seq = history
-                .iter()
-                .map(history_entry_seq)
-                .max()
-                .unwrap_or(max_seq);
+        if !history.is_empty() || !removed_user_message_seqs.is_empty() {
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,
+                removed_user_message_seqs,
                 max_seq,
             });
         }
@@ -28359,6 +28480,7 @@ pub(super) async fn attach(
         active_subagent: foreground.active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: attached_removed_user_message_seqs,
         paused_work,
         repair_required: state
             .attached

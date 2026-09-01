@@ -433,6 +433,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state();
     pointer_add_oauth_skip_continue_sources_save_from_fresh_state();
     pointer_model_lifecycle_sources_dispatch_by_stable_identity();
+    pointer_add_wire_api_choices_render_and_dispatch_from_fresh_state();
     pointer_add_provider_id_field_renders_and_dispatches_from_fresh_state();
     pointer_add_url_field_renders_and_dispatches_from_fresh_state();
     pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state();
@@ -2388,6 +2389,62 @@ fn pointer_model_lifecycle_sources_dispatch_by_stable_identity() {
             }
             other => panic!("unexpected model lifecycle action: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn pointer_add_wire_api_choices_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut state = AddState::new();
+        state.enter_template_for_test(template_cursor("openai-compatible"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("wire-api"));
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        ProviderWizardStep::WireApi,
+                        WizardControlId::WireApi(_),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 4, "all request wire choices are rendered");
+
+    for action in actions {
+        let selection = match &action {
+            SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                ProviderWizardStep::WireApi,
+                WizardControlId::WireApi(selection),
+            )) => selection.clone(),
+            _ => unreachable!(),
+        };
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::Add(state))
+                if state.is_step("id")
+                    && state.run.answer("wire-api")
+                        == Some(&cockpit_core::wizard::WizardAnswer::Select(selection))
+        ));
     }
 }
 

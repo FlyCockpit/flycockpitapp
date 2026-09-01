@@ -172,12 +172,8 @@ fn spawn_all(session: &Arc<Session>, set: &TandemSet, dispatch: TandemDispatch) 
         // A per-(parent call, tandem model) row id.
         let row_id = format!("tandem-{}", Uuid::new_v4().simple());
 
-        // A tandem target runs on its OWN trust. A trusted target keeps raw
-        // custody, so its persisted request/response can carry a session-table
-        // literal that the main call (journaled against the main model's trust)
-        // never covers — journal it against the target's pre-policy session
-        // table (decision 10.2). An untrusted target sends/receives only the
-        // scrubbed body, so it journals nothing.
+        // A tandem target runs under its own trust metadata, but every tandem
+        // request/response is redacted before the provider wire.
         let target_trusted = target.handle.is_trusted();
         let target_session_table = target.handle.session_redact_table();
 

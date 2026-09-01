@@ -266,6 +266,18 @@ async fn encoded_report_installs_and_redacts_the_exact_reported_form() {
     assert_eq!(out.sensitive_results[0].model_output, "contained");
 }
 
+#[tokio::test]
+async fn sub_floor_report_is_discarded_before_containment_or_redaction_install() {
+    let host = FakeHost::contained();
+    let out = run_sensitive_turn_barrier(&host, vec![report_leak_call("abc")]).await;
+
+    assert_eq!(out.state, SensitiveTurnState::Discarded);
+    assert!(host.events().is_empty());
+    assert!(host.contained_args().is_empty());
+    assert!(host.installed().is_empty());
+    assert_eq!(out.sensitive_results[0].model_output, "failed");
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed: a redaction-install failure never acks `contained`.
 // ---------------------------------------------------------------------------

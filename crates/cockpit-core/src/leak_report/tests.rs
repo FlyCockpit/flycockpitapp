@@ -154,7 +154,7 @@ fn leak_report_schema_is_ingress_only() {
 #[test]
 fn parse_report_leak_rejects_unknown_keys() {
     let args = serde_json::json!({
-        "secret": "abc",
+        "secret": "abcd",
         "source": "model_output",
         "sealed_value_id": "should-be-rejected"
     });
@@ -164,7 +164,7 @@ fn parse_report_leak_rejects_unknown_keys() {
 #[test]
 fn parse_report_leak_rejects_unknown_source() {
     let args = serde_json::json!({
-        "secret": "abc",
+        "secret": "abcd",
         "source": "not_a_real_source"
     });
     assert!(parse_report_leak_args(&args).is_err());
@@ -180,16 +180,29 @@ fn parse_report_leak_rejects_empty_secret() {
 }
 
 #[test]
+fn parse_report_leak_rejects_literals_below_the_live_redaction_floor() {
+    for secret in ["a", "ab", "abc"] {
+        let args = serde_json::json!({
+            "secret": secret,
+            "source": "model_output"
+        });
+        let err = parse_report_leak_args(&args).unwrap_err().to_string();
+        assert!(err.contains("live-redaction minimum"), "{err}");
+        assert!(err.contains('4'), "{err}");
+    }
+}
+
+#[test]
 fn parse_report_leak_accepts_optional_category() {
     let args = serde_json::json!({
-        "secret": "abc",
+        "secret": "abcd",
         "source": "model_output"
     });
     let req = parse_report_leak_args(&args).unwrap();
     assert_eq!(req.category, LeakCategory::Secret);
 
     let args = serde_json::json!({
-        "secret": "abc",
+        "secret": "abcd",
         "source": "model_output",
         "category": "token"
     });

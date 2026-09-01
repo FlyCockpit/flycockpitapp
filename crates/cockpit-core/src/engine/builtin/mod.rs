@@ -1347,12 +1347,16 @@ fn compose_system_prompt_for_model(role_prompt: &str, model: &Model, args: &Spaw
         crate::computer::guidance::append_compiled_guidance(&mut out, &compiled_guidance);
         out
     };
-    append_untrusted_leak_report_steering(&mut out, model);
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
     out
 }
 
-fn append_untrusted_leak_report_steering(system: &mut String, model: &Model) {
-    if model.is_trusted() {
+/// Add the uniform leak-report instruction to an untrusted agent's effective
+/// system prompt. Production agent constructors outside this module must use
+/// this helper when they synthesize a fresh system prompt rather than inheriting
+/// one from an existing agent.
+pub(crate) fn append_untrusted_leak_report_steering(system: &mut String, model_is_trusted: bool) {
+    if model_is_trusted {
         return;
     }
     if !system.ends_with('\n') {
@@ -2389,7 +2393,7 @@ fn compose_reposture_system(
         }
         None => role_system,
     };
-    append_untrusted_leak_report_steering(&mut out, model);
+    append_untrusted_leak_report_steering(&mut out, model.is_trusted());
     out
 }
 

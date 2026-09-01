@@ -94,6 +94,7 @@ use crate::db::protected_leak_records::{
     LeakSource, insert_leak_record_conn, transition_leak_status_conn,
 };
 use crate::engine::message::ToolDefinition;
+use crate::redact::MIN_REDACTION_ENTRY_LENGTH;
 use crate::redact::protected_redaction_history::{
     MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
     RedactionKeyResolver, append_and_attach_conn,
@@ -506,7 +507,7 @@ pub fn report_leak_schema() -> Value {
         "properties": {
             "secret": {
                 "type": "string",
-                "description": "The literal secret value you received. Maximum 16 KiB UTF-8. This is contained and never returned to you."
+                "description": "The literal secret value you received. Between 4 bytes and 16 KiB UTF-8. This is contained and never returned to you."
             },
             "source": {
                 "type": "string",
@@ -581,8 +582,10 @@ pub fn route_advertises_report_leak(model_is_trusted: bool, tools: &[ToolDefinit
 /// Parse a `report_leak` argument object into the typed request.
 ///
 /// Rejects any key outside [`REPORT_LEAK_ARG_KEYS`] plus the optional
-/// `category`. Validates the closed `source` enum and the 16 KiB UTF-8 bound
-/// before the handler runs.
+/// `category`. Validates the closed `source` enum and live-redaction-safe
+/// 4-byte through 16 KiB UTF-8 bounds before the handler runs. This admission
+/// check precedes protected persistence, so `contained` can only be produced
+/// for a literal the live redaction table is able to install.
 pub fn parse_report_leak_args(args: &Value) -> Result<ReportLeakRequest> {
     use anyhow::{Context, bail};
 
@@ -598,8 +601,11 @@ pub fn parse_report_leak_args(args: &Value) -> Result<ReportLeakRequest> {
         .get("secret")
         .and_then(Value::as_str)
         .context("`report_leak` requires `secret` as a string")?;
-    if secret.is_empty() {
-        bail!("`report_leak` requires a non-empty `secret`");
+    if secret.len() < MIN_REDACTION_ENTRY_LENGTH {
+        bail!(
+            "`report_leak` secret length {} is below the live-redaction minimum {MIN_REDACTION_ENTRY_LENGTH}",
+            secret.len()
+        );
     }
     if secret.len() > MAX_LITERAL_LEN {
         bail!(

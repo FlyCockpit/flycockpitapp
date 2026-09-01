@@ -4,7 +4,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use cockpit_proto::SecretStorePlacement;
+use rand::Rng;
+use zeroize::{Zeroize, Zeroizing};
 
 use cockpit_host::private_fs::{
     PRIVATE_FS_POLICY, delete_private_file, ensure_private_dir, read_private_file,
@@ -12,14 +15,134 @@ use cockpit_host::private_fs::{
 };
 
 use super::error::SecureKeyError;
-use super::key_material::TempSecret;
+use super::key_material::{KEY_BYTE_LEN, SecureKeyBytes, TempSecret};
 use super::native_store::{KeyringNativeStore, NativeKeyStore};
 
 pub const KEK_SERVICE: &str = "dev.flycockpit.secret-vault";
+pub const PASSPHRASE_KDF_MEMORY_KIB: u32 = 19_456;
+pub const PASSPHRASE_KDF_ITERATIONS: u32 = 2;
+pub const PASSPHRASE_KDF_PARALLELISM: u32 = 1;
+pub const PASSPHRASE_KDF_SALT_LEN: usize = 16;
+
+/// Non-secret Argon2id metadata persisted beside a passphrase vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassphraseKdfParams {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+    pub salt: Vec<u8>,
+}
+
+impl PassphraseKdfParams {
+    pub fn owasp_default() -> Self {
+        let mut salt = vec![0_u8; PASSPHRASE_KDF_SALT_LEN];
+        rand::rng().fill_bytes(&mut salt);
+        Self {
+            memory_kib: PASSPHRASE_KDF_MEMORY_KIB,
+            iterations: PASSPHRASE_KDF_ITERATIONS,
+            parallelism: PASSPHRASE_KDF_PARALLELISM,
+            salt,
+        }
+    }
+
+    pub(crate) fn from_db(row: cockpit_db::secret_vault::SecretVaultPassphraseKdfRow) -> Self {
+        Self {
+            memory_kib: row.memory_kib,
+            iterations: row.iterations,
+            parallelism: row.parallelism,
+            salt: row.salt,
+        }
+    }
+
+    pub(crate) fn to_db(&self) -> cockpit_db::secret_vault::SecretVaultPassphraseKdfRow {
+        cockpit_db::secret_vault::SecretVaultPassphraseKdfRow {
+            memory_kib: self.memory_kib,
+            iterations: self.iterations,
+            parallelism: self.parallelism,
+            salt: self.salt.clone(),
+        }
+    }
+}
+
+/// Caller-owned passphrase bytes. This consumes the input allocation and
+/// zeroizes it on every return path; callers should avoid creating a `String`
+/// copy before handing bytes to this type.
+pub struct Passphrase(Zeroizing<Vec<u8>>);
+
+impl Passphrase {
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SecureKeyError> {
+        if bytes.is_empty() {
+            let mut bytes = bytes;
+            bytes.zeroize();
+            return Err(SecureKeyError::Invalid(
+                "passphrase vault requires a non-empty passphrase".into(),
+            ));
+        }
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Drop for Passphrase {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Passphrase([REDACTED])")
+    }
+}
+
+/// Explicit Argon2 workspace. The KDF crate's `zeroize` feature clears its
+/// transient stack buffers; this wrapper additionally clears all 19 MiB of
+/// caller-owned memory before it is returned to the allocator.
+struct Argon2WorkMemory(Vec<Block>);
+
+impl Argon2WorkMemory {
+    fn new(block_count: usize) -> Self {
+        Self(vec![Block::default(); block_count])
+    }
+}
+
+impl AsMut<[Block]> for Argon2WorkMemory {
+    fn as_mut(&mut self) -> &mut [Block] {
+        self.0.as_mut_slice()
+    }
+}
+
+impl Drop for Argon2WorkMemory {
+    fn drop(&mut self) {
+        for block in &mut self.0 {
+            block.as_mut().fill(0);
+        }
+    }
+}
 
 /// Injected KEK store. Production uses a `private_fs` file or one keyring item.
 pub trait KekStore: Send + Sync {
     fn placement(&self) -> SecretStorePlacement;
+
+    /// The durable file-vault mode, if this is a file-backed placement.
+    fn file_kek_mode(&self) -> Option<cockpit_db::secret_vault::SecretVaultFileKekMode> {
+        None
+    }
+
+    /// Non-secret parameters that must be stored atomically with a newly
+    /// initialized passphrase vault.
+    fn passphrase_kdf_params(&self) -> Option<PassphraseKdfParams> {
+        None
+    }
+
+    /// Material to wrap the first vault DEK with. The passphrase store returns
+    /// its single Argon2id-derived KEK; all other stores generate a random KEK.
+    fn initial_kek(&self) -> SecureKeyBytes {
+        super::key_material::generate_key_bytes()
+    }
 
     fn write_kek(&self, version: i64, bytes: &[u8]) -> Result<(), SecureKeyError>;
 
@@ -117,6 +240,10 @@ impl KekStore for FileKekStore {
         SecretStorePlacement::Database
     }
 
+    fn file_kek_mode(&self) -> Option<cockpit_db::secret_vault::SecretVaultFileKekMode> {
+        Some(cockpit_db::secret_vault::SecretVaultFileKekMode::MachineBound)
+    }
+
     fn write_kek(&self, version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {
         file_kek_supported()?;
         let path = kek_file_path(&self.dir, version);
@@ -184,6 +311,119 @@ impl KekStore for FileKekStore {
             }
         }
         out
+    }
+}
+
+/// Database/file-vault KEK derived once from an in-memory passphrase. No KEK
+/// bytes are written to disk: the database holds only wrapped vault keys and
+/// the non-secret Argon2id parameters/salt.
+pub struct PassphraseKekStore {
+    kek: SecureKeyBytes,
+    params: PassphraseKdfParams,
+}
+
+impl PassphraseKekStore {
+    pub fn new_first_run(passphrase: Passphrase) -> Result<Self, SecureKeyError> {
+        Self::from_passphrase(passphrase, PassphraseKdfParams::owasp_default())
+    }
+
+    pub fn open(
+        passphrase: Passphrase,
+        params: PassphraseKdfParams,
+    ) -> Result<Self, SecureKeyError> {
+        Self::from_passphrase(passphrase, params)
+    }
+
+    fn from_passphrase(
+        passphrase: Passphrase,
+        params: PassphraseKdfParams,
+    ) -> Result<Self, SecureKeyError> {
+        file_kek_supported()?;
+        let kek = derive_passphrase_kek(passphrase, &params)?;
+        Ok(Self { kek, params })
+    }
+
+    fn ensure_matches(&self, bytes: &[u8]) -> Result<(), SecureKeyError> {
+        if bytes != self.kek.as_ref() {
+            return Err(SecureKeyError::Corrupt(
+                "passphrase-derived KEK does not match vault initialization material".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn derive_passphrase_kek(
+    passphrase: Passphrase,
+    params: &PassphraseKdfParams,
+) -> Result<SecureKeyBytes, SecureKeyError> {
+    let argon_params = Params::new(
+        params.memory_kib,
+        params.iterations,
+        params.parallelism,
+        Some(KEY_BYTE_LEN),
+    )
+    .map_err(|error| {
+        SecureKeyError::Invalid(format!("invalid passphrase KDF parameters: {error}"))
+    })?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params.clone());
+    let mut output = Zeroizing::new([0_u8; KEY_BYTE_LEN]);
+    let mut memory = Argon2WorkMemory::new(argon_params.block_count());
+    argon
+        .hash_password_into_with_memory(
+            passphrase.as_bytes(),
+            &params.salt,
+            output.as_mut(),
+            &mut memory,
+        )
+        .map_err(|error| SecureKeyError::KekUnavailable {
+            reason: format!("deriving passphrase vault KEK: {error}"),
+            fix_command: None,
+        })?;
+    Ok(SecureKeyBytes::from_zeroizing_array(output))
+}
+
+impl fmt::Debug for PassphraseKekStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PassphraseKekStore")
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KekStore for PassphraseKekStore {
+    fn placement(&self) -> SecretStorePlacement {
+        SecretStorePlacement::Database
+    }
+
+    fn file_kek_mode(&self) -> Option<cockpit_db::secret_vault::SecretVaultFileKekMode> {
+        Some(cockpit_db::secret_vault::SecretVaultFileKekMode::Passphrase)
+    }
+
+    fn passphrase_kdf_params(&self) -> Option<PassphraseKdfParams> {
+        Some(self.params.clone())
+    }
+
+    fn initial_kek(&self) -> SecureKeyBytes {
+        self.kek.clone()
+    }
+
+    fn write_kek(&self, _version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {
+        self.ensure_matches(bytes)?;
+        Ok(())
+    }
+
+    fn write_kek_exclusive(&self, _version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {
+        self.ensure_matches(bytes)?;
+        Ok(())
+    }
+
+    fn read_kek(&self, _version: i64) -> Result<TempSecret, SecureKeyError> {
+        Ok(TempSecret::from_vec(self.kek.as_ref().to_vec()))
+    }
+
+    fn delete_kek(&self, _version: i64) -> Result<(), SecureKeyError> {
+        Ok(())
     }
 }
 
@@ -283,6 +523,11 @@ fn error_is_already_exists(error: &anyhow::Error) -> bool {
 impl KekStore for MemoryKekStore {
     fn placement(&self) -> SecretStorePlacement {
         self.placement
+    }
+
+    fn file_kek_mode(&self) -> Option<cockpit_db::secret_vault::SecretVaultFileKekMode> {
+        (self.placement == SecretStorePlacement::Database)
+            .then_some(cockpit_db::secret_vault::SecretVaultFileKekMode::MachineBound)
     }
 
     fn write_kek(&self, version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {

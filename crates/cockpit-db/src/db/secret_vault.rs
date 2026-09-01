@@ -21,6 +21,41 @@ pub enum SecretVaultPlacement {
     Keyring,
 }
 
+/// File KEK construction selected when the vault placement is `Database`.
+///
+/// The database only records non-secret KDF metadata. The passphrase and its
+/// derived KEK never leave daemon memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretVaultFileKekMode {
+    MachineBound,
+    Passphrase,
+}
+
+impl SecretVaultFileKekMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MachineBound => "machine_bound",
+            Self::Passphrase => "passphrase",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "machine_bound" => Ok(Self::MachineBound),
+            "passphrase" => Ok(Self::Passphrase),
+            other => bail!("unknown secret vault file KEK mode: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVaultPassphraseKdfRow {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+    pub salt: Vec<u8>,
+}
+
 impl SecretVaultPlacement {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -142,6 +177,7 @@ impl SecretVaultSagaPhase {
 pub struct SecretVaultAuthorityRow {
     pub intent: SecretVaultPlacement,
     pub active_placement: SecretVaultPlacement,
+    pub file_kek_mode: Option<SecretVaultFileKekMode>,
     pub kek_fingerprint: String,
     pub kek_version: i64,
     pub wrap_version: i64,
@@ -247,7 +283,7 @@ impl Db {
 
 pub fn load_authority_conn(conn: &rusqlite::Connection) -> Result<Option<SecretVaultAuthorityRow>> {
     conn.query_row(
-        "SELECT intent, active_placement, kek_fingerprint, kek_version, wrap_version,
+        "SELECT intent, active_placement, file_kek_mode, kek_fingerprint, kek_version, wrap_version,
                 updated_at
          FROM secret_vault_authority WHERE id = 1",
         [],
@@ -260,6 +296,7 @@ pub fn load_authority_conn(conn: &rusqlite::Connection) -> Result<Option<SecretV
 fn map_authority_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultAuthorityRow> {
     let intent: String = row.get(0)?;
     let placement: String = row.get(1)?;
+    let file_kek_mode: Option<String> = row.get(2)?;
     Ok(SecretVaultAuthorityRow {
         intent: SecretVaultPlacement::parse(&intent).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -275,11 +312,56 @@ fn map_authority_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultAut
                 Box::new(std::io::Error::other(e.to_string())),
             )
         })?,
-        kek_fingerprint: row.get(2)?,
-        kek_version: row.get(3)?,
-        wrap_version: row.get(4)?,
-        updated_at: row.get(5)?,
+        file_kek_mode: file_kek_mode
+            .as_deref()
+            .map(SecretVaultFileKekMode::parse)
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?,
+        kek_fingerprint: row.get(3)?,
+        kek_version: row.get(4)?,
+        wrap_version: row.get(5)?,
+        updated_at: row.get(6)?,
     })
+}
+
+pub fn load_passphrase_kdf_conn(
+    conn: &rusqlite::Connection,
+) -> Result<Option<SecretVaultPassphraseKdfRow>> {
+    conn.query_row(
+        "SELECT memory_kib, iterations, parallelism, salt
+         FROM secret_vault_passphrase_kdf WHERE id = 1",
+        [],
+        |row| {
+            Ok(SecretVaultPassphraseKdfRow {
+                memory_kib: row.get(0)?,
+                iterations: row.get(1)?,
+                parallelism: row.get(2)?,
+                salt: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .context("loading secret vault passphrase KDF parameters")
+}
+
+pub fn insert_passphrase_kdf_conn(
+    conn: &rusqlite::Connection,
+    row: &SecretVaultPassphraseKdfRow,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO secret_vault_passphrase_kdf
+             (id, algorithm, memory_kib, iterations, parallelism, salt)
+         VALUES (1, 'argon2id', ?1, ?2, ?3, ?4)",
+        params![row.memory_kib, row.iterations, row.parallelism, row.salt],
+    )
+    .context("inserting secret vault passphrase KDF parameters")?;
+    Ok(())
 }
 
 pub fn upsert_authority_conn(
@@ -290,15 +372,39 @@ pub fn upsert_authority_conn(
     kek_version: i64,
     wrap_version: i64,
 ) -> Result<()> {
+    upsert_authority_with_file_kek_mode_conn(
+        conn,
+        intent,
+        active_placement,
+        None,
+        kek_fingerprint,
+        kek_version,
+        wrap_version,
+    )
+}
+
+pub fn upsert_authority_with_file_kek_mode_conn(
+    conn: &rusqlite::Connection,
+    intent: SecretVaultPlacement,
+    active_placement: SecretVaultPlacement,
+    file_kek_mode: Option<SecretVaultFileKekMode>,
+    kek_fingerprint: &str,
+    kek_version: i64,
+    wrap_version: i64,
+) -> Result<()> {
+    if active_placement == SecretVaultPlacement::Keyring && file_kek_mode.is_some() {
+        bail!("keyring vault placement cannot have a file KEK mode");
+    }
     let now = Utc::now().timestamp();
     conn.execute(
         "INSERT INTO secret_vault_authority
-            (id, intent, active_placement, kek_fingerprint, kek_version, wrap_version,
+            (id, intent, active_placement, file_kek_mode, kek_fingerprint, kek_version, wrap_version,
              updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(id) DO UPDATE SET
             intent = excluded.intent,
             active_placement = excluded.active_placement,
+            file_kek_mode = excluded.file_kek_mode,
             kek_fingerprint = excluded.kek_fingerprint,
             kek_version = excluded.kek_version,
             wrap_version = excluded.wrap_version,
@@ -306,6 +412,7 @@ pub fn upsert_authority_conn(
         params![
             intent.as_str(),
             active_placement.as_str(),
+            file_kek_mode.map(SecretVaultFileKekMode::as_str),
             kek_fingerprint,
             kek_version,
             wrap_version,
@@ -1079,6 +1186,7 @@ mod tests {
         db.blocking_write_for_sync_maintenance(|conn| {
             for table in [
                 "secret_vault_authority",
+                "secret_vault_passphrase_kdf",
                 "secret_vault_keys",
                 "secret_vault_items",
                 "secret_vault_sagas",

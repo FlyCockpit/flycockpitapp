@@ -6778,19 +6778,30 @@ CREATE INDEX idx_protected_leak_records_history
 
 -- ---- wrap-key secret vault -------------------------------------------------
 -- Coordination + AEAD ciphertext + wrapped DEKs only. KEK bytes and DEK
--- plaintext never live in SQLite. First-run persists intent=keyring /
--- active_placement=keyring when the OS keyring probe is available, else
--- database. dest=database is rejected while the probe is available.
+-- plaintext never live in SQLite. First-run defaults to keyring when the OS
+-- keyring probe is available, but can explicitly choose the file vault.
 
 -- Installation-scoped authority singleton. No secret bytes.
 CREATE TABLE secret_vault_authority (
     id                    INTEGER PRIMARY KEY CHECK (id = 1),
     intent                TEXT    NOT NULL CHECK (intent IN ('database', 'keyring')),
     active_placement      TEXT    NOT NULL CHECK (active_placement IN ('database', 'keyring')),
+    file_kek_mode         TEXT    CHECK (file_kek_mode IN ('machine_bound', 'passphrase')),
     kek_fingerprint       TEXT    NOT NULL,
     kek_version           INTEGER NOT NULL CHECK (kek_version >= 1),
     wrap_version          INTEGER NOT NULL CHECK (wrap_version = 1),
     updated_at            INTEGER NOT NULL
+);
+
+-- Non-secret Argon2id metadata for the advanced passphrase file KEK. The
+-- passphrase and the derived KEK are never persisted.
+CREATE TABLE secret_vault_passphrase_kdf (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    algorithm   TEXT    NOT NULL CHECK (algorithm = 'argon2id'),
+    memory_kib  INTEGER NOT NULL CHECK (memory_kib >= 8),
+    iterations  INTEGER NOT NULL CHECK (iterations >= 1),
+    parallelism INTEGER NOT NULL CHECK (parallelism >= 1),
+    salt        BLOB    NOT NULL CHECK (length(salt) >= 8)
 );
 
 -- Wrapped DEKs. No KEK bytes. No DEK plaintext.

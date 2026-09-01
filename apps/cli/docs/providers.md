@@ -80,6 +80,20 @@ uses the compatible five-minute cache form. Third-party endpoints must support
 the Messages request and streaming response formats; third-party Anthropic
 OAuth or subscription login is not supported.
 
+## Third-Party OpenAI Responses Endpoints
+
+For a third-party endpoint that implements OpenAI's `/v1/responses` wire, add
+a custom provider and choose **responses** in the wizard's wire picker. Enter
+the endpoint's `/v1` base URL and configure the provider's documented Bearer
+authentication, for example `Authorization: Bearer $PROVIDER_API_KEY`.
+
+This is the generic OpenAI Responses path, not Codex OAuth: Cockpit sends the
+Bearer credential only and never sends `chatgpt-account-id`, `originator`, or
+the Codex `OpenAI-Beta` header. Responses requests are stateless: Cockpit sends
+the complete conversation in `input`, always uses `store: false`, and never
+sends `previous_response_id`, `background`, or server-side tools. Providers
+that support it also receive the configured reasoning-effort control.
+
 ## Credentials
 
 Provider config stores non-secret policy and references in layered `.cockpit/` config. Raw pasted secrets and OAuth tokens live in Cockpit's private credential store, not in project files. A project can name a provider or model, but workspace trust controls whether project config is loaded at all.

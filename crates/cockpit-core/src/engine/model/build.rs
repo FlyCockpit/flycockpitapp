@@ -391,23 +391,49 @@ pub(super) fn build_model_with_can_delegate(
     };
     let utility_token_limit = resolve_utility_token_limit(entry, model_id);
     match wire_api {
-        crate::config::providers::WireApi::Responses => build_chatgpt_model_with_utility_limit(
-            provider_id,
-            &resolved,
-            resolved.is_codex_credential,
-            model_id,
-            utility_token_limit,
-            timeout,
-            hard_timeout_on_stall,
-            trusted,
-            location,
-            quality_rank,
-            cost_rank,
-            subagent_invokable,
-            can_delegate,
-            session_redact,
-            redact,
-        ),
+        crate::config::providers::WireApi::Responses if resolved.is_codex_credential => {
+            build_chatgpt_model_with_utility_limit(
+                provider_id,
+                &resolved,
+                true,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
+        // Responses is a wire choice, not a Codex credential. Third-party
+        // Bearer providers use the generic OpenAI client and its `/responses`
+        // serializer; only the Codex credential may select `Model::ChatGpt`.
+        crate::config::providers::WireApi::Responses => {
+            build_openai_model_from_resolved_with_utility_limit_and_can_delegate(
+                provider_id,
+                &resolved,
+                model_id,
+                utility_token_limit,
+                timeout,
+                hard_timeout_on_stall,
+                client_side_tools,
+                wire_api,
+                wire_api_explicit,
+                trusted,
+                location,
+                quality_rank,
+                cost_rank,
+                subagent_invokable,
+                can_delegate,
+                session_redact,
+                redact,
+            )
+        }
         crate::config::providers::WireApi::Anthropic => {
             let max_tokens =
                 crate::config::providers::validate_anthropic_model_configuration(entry, model_id)?;
@@ -980,10 +1006,16 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
+    // A `CompletionsClient` can recover between the Chat Completions and
+    // Responses endpoints without being rebuilt. Keep the generic client
+    // fenced for its whole lifetime instead of tying the header policy to its
+    // initially resolved endpoint. The policy filters Codex subscription
+    // headers whenever this generic client selects `/responses`.
+    let http_client = UsageAliasHttpClient::without_codex_headers(extra_headers)?;
     let client = openai::CompletionsClient::builder()
         .api_key(token)
         .base_url(&resolved.base_url)
-        .http_client(UsageAliasHttpClient::new(extra_headers)?)
+        .http_client(http_client)
         .build()
         .with_context(|| format!("building openai-compatible client for `{provider_id}`"))?;
     Ok(Model::OpenAi {
@@ -1245,7 +1277,17 @@ pub(super) fn build_chatgpt_completion_model(
 /// providers with no extra params and no cache params stay byte-for-byte
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
-    let vendor = chatgpt_additional_params(params);
+    openai_additional_params_with_vendor(chatgpt_additional_params(params), params)
+}
+
+/// Add generic OpenAI cache parameters to a wire-specific sanitized provider
+/// fragment. Responses passes its statefulness-aware sanitizer here while
+/// Chat Completions keeps its vendor fragment untouched beyond universal
+/// request-key collision protection.
+fn openai_additional_params_with_vendor(
+    vendor: Option<serde_json::Value>,
+    params: &ModelParams,
+) -> Option<serde_json::Value> {
     let cache_key = params
         .prompt_cache_key
         .as_ref()
@@ -1279,6 +1321,55 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
         );
     }
     Some(serde_json::Value::Object(map))
+}
+
+/// Compose the generic OpenAI **Responses**-wire extras.
+///
+/// Responses calls are deliberately stateless: Cockpit replays the complete
+/// conversation as `input`, always sends `store: false`, and does not permit a
+/// provider fragment to select `previous_response_id` or `background` (those
+/// fields are removed by [`sanitized_openai_responses_extra_params`]). Rig's
+/// Responses serializer models reasoning effort as `reasoning.effort`, whereas the
+/// generic catalog's OpenAI-compatible mapping supplies `reasoning_effort`.
+/// Translate that mapping at the wire boundary instead of silently letting
+/// Rig discard it as an unknown additional parameter.
+pub(super) fn openai_responses_additional_params(params: &ModelParams) -> serde_json::Value {
+    let vendor = merge_native_computer_tools(
+        sanitized_openai_responses_extra_params(params.additional_params.as_ref()),
+        params,
+        |contract| contract == crate::computer::ComputerToolContract::OpenAiResponses,
+    );
+    let mut map = match openai_additional_params_with_vendor(vendor, params) {
+        Some(serde_json::Value::Object(map)) => map,
+        // A scalar cannot be represented in Rig's typed Responses parameters.
+        // Place it in the typed `reasoning` slot so Rig rejects the malformed
+        // config instead of silently sending an unconstrained request body.
+        Some(other) => serde_json::Map::from_iter([("reasoning".into(), other)]),
+        None => serde_json::Map::new(),
+    };
+
+    if let Some(effort) = map.remove("reasoning_effort") {
+        match map.entry("reasoning".to_string()) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::json!({ "effort": effort }));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                serde_json::Value::Object(reasoning) => {
+                    reasoning.insert("effort".to_string(), effort);
+                }
+                // The catalog mapping is authoritative for this request. A
+                // malformed hand-authored `reasoning` shape cannot cause its
+                // selected effort to be silently dropped.
+                other => *other = serde_json::json!({ "effort": effort }),
+            },
+        }
+    }
+
+    // This is intentionally injected after vendor composition. The provider
+    // fragment cannot override it, and the typed Rig serializer therefore
+    // emits the key rather than applying a provider default by omission.
+    map.insert("store".to_string(), serde_json::Value::Bool(false));
+    serde_json::Value::Object(map)
 }
 
 /// Native ChatGPT/Codex subscription backend extras: sanitized vendor fragment

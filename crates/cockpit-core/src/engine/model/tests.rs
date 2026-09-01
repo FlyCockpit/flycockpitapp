@@ -2018,6 +2018,7 @@ fn native_anthropic_dispatch_capture_matches_shared_assembly() {
     let expected = assembled_request(
         model.model_id(),
         model.provider_label(),
+        WireApi::Anthropic,
         "system",
         &history,
         &prompt,
@@ -2139,11 +2140,8 @@ async fn draining_gate_refuses_new_requests() {
     );
 }
 
-/// The extra-params merge supplies vendor keys only — it can never
-/// clobber the keys cockpit owns on the request
-/// (implementation note). A fragment that (wrongly)
-/// carried `temperature`/`messages`/etc. has those stripped before the
-/// merge; legitimate vendor keys survive.
+/// The generic extra-params merge strips only the request keys Cockpit owns on
+/// every wire. Responses-only state keys remain available to other providers.
 #[test]
 fn sanitized_extra_params_strips_cockpit_owned_keys() {
     let extra = json!({
@@ -2154,13 +2152,37 @@ fn sanitized_extra_params_strips_cockpit_owned_keys() {
         "tool_choice": "none",
         "max_tokens": 1,
         "stream": false,
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
         "thinking": { "type": "enabled" },
         "reasoning_effort": "high",
     });
     let cleaned = sanitized_extra_params(Some(&extra)).expect("vendor keys survive");
     assert_eq!(
         cleaned,
-        json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" }),
+        json!({
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "high",
+        }),
+    );
+}
+
+#[test]
+fn sanitized_openai_responses_extra_params_strips_stateful_controls() {
+    let extra = json!({
+        "store": true,
+        "previous_response_id": "response-123",
+        "background": true,
+        "vendor_knob": "on",
+    });
+
+    assert_eq!(
+        sanitized_openai_responses_extra_params(Some(&extra)),
+        Some(json!({ "vendor_knob": "on" })),
     );
 }
 
@@ -2198,6 +2220,7 @@ fn assembled_request_carries_sanitized_additional_params() {
     let body = assembled_request(
         "deepseek-reasoner",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2219,6 +2242,7 @@ fn assembled_request_additional_params_null_when_absent() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2483,6 +2507,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2520,6 +2545,7 @@ fn computer_final_request_snapshots_pin_anthropic_versions() {
         let body = assembled_request(
             "claude",
             "anthropic",
+            WireApi::Anthropic,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2554,6 +2580,7 @@ fn computer_final_request_snapshot_pins_openai_builtin_tool() {
         let body = assembled_request(
             "gpt",
             "openai-compatible",
+            WireApi::Responses,
             "SYS",
             &[],
             &Message::user("hi"),
@@ -2575,6 +2602,7 @@ fn computer_live_opened_geometry_is_not_sufficient_to_advertise() {
     let body = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2717,6 +2745,7 @@ fn assembled_request_task_tool_advertises_intent_envelope() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -2757,6 +2786,7 @@ fn assembled_request_carries_trailing_system_injection() {
     let body = assembled_request(
         "m",
         "openai-compatible",
+        WireApi::Completions,
         "SYSTEM PROMPT",
         &history,
         &prompt,
@@ -2934,8 +2964,14 @@ fn custom_provider_wire_api_selects_each_model_arm() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(response_model, Model::ChatGpt { .. }));
-    assert_eq!(response_model.provider_label(), "my-subscription");
+    assert!(matches!(
+        &response_model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
+    assert_eq!(response_model.provider_label(), "openai-compatible");
 
     let anthropic_entry = ProviderEntry {
         url: "https://subscription.example/v1".into(),
@@ -3007,6 +3043,48 @@ fn openai_additional_params_injects_prompt_cache_key() {
         ..ModelParams::default()
     };
     assert_eq!(openai_additional_params(&params), None);
+}
+
+#[test]
+fn openai_responses_additional_params_forces_stateless_reasoning_wire_shape() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_responses_additional_params(&params),
+        json!({
+            "reasoning": { "effort": "high" },
+            "store": false,
+        }),
+    );
+}
+
+#[test]
+fn openai_additional_params_preserves_non_responses_state_named_vendor_keys() {
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
+        ..ModelParams::default()
+    };
+
+    assert_eq!(
+        openai_additional_params(&params),
+        Some(json!({
+            "store": "vendor-retention-mode",
+            "previous_response_id": "vendor-cursor",
+            "background": { "priority": "low" },
+        })),
+    );
 }
 
 #[test]
@@ -3164,6 +3242,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3177,6 +3256,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3189,6 +3269,7 @@ fn assembled_request_cache_key_is_openai_only() {
     let chatgpt = assembled_request(
         "gpt-5.3-codex",
         "codex-oauth",
+        WireApi::Responses,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3238,6 +3319,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let openai = assembled_request(
         "gpt",
         "openai-compatible",
+        WireApi::Completions,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -3256,6 +3338,7 @@ fn captured_request_carries_prompt_cache_retention() {
     let anthropic = assembled_request(
         "claude",
         "anthropic",
+        WireApi::Anthropic,
         "SYS",
         &[],
         &Message::user("hi"),
@@ -5293,7 +5376,13 @@ fn wire_api_change_requires_a_model_rebuild() {
         |_| None,
     )
     .expect("Responses selection must rebuild into its dedicated model arm");
-    assert!(matches!(rebuilt, Model::ChatGpt { .. }));
+    assert!(matches!(
+        rebuilt,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
     assert_eq!(
         existing.resolve_live_wire_api_for_base_url(url),
         WireApi::Completions,
@@ -6983,7 +7072,7 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
 }
 
 #[tokio::test]
-async fn non_codex_responses_wire_omits_codex_headers() {
+async fn generic_responses_wire_is_stateless_and_omits_codex_headers() {
     use crate::config::providers::{CacheConfig, HeaderSpec, WireApi};
 
     let mut provider = ScriptedProvider::builder()
@@ -7040,17 +7129,54 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         |_| None,
     )
     .expect("custom Responses provider must build");
-    assert!(matches!(model, Model::ChatGpt { .. }));
-    assert_eq!(model.provider_label(), "custom-subscription");
+    assert!(matches!(
+        &model,
+        Model::OpenAi {
+            wire_api: WireApi::Responses,
+            ..
+        }
+    ));
+    assert_eq!(model.provider_label(), "openai-compatible");
+
+    let params = ModelParams {
+        additional_params: Some(json!({
+            "reasoning_effort": "high",
+            "store": true,
+            "previous_response_id": "response-123",
+            "background": true,
+        })),
+        ..ModelParams::default()
+    };
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &[Message::user("earlier turn")],
+            &Message::user("hi"),
+            &[],
+            &params,
+        )
+        .expect("custom Responses dispatch record must assemble");
+    assert_eq!(captured["additional_params"]["store"], json!(false));
+    assert_eq!(
+        captured["additional_params"]["reasoning"]["effort"],
+        json!("high")
+    );
+    assert!(
+        captured["additional_params"]
+            .get("reasoning_effort")
+            .is_none()
+    );
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    // The scripted Responses stream contains output text and completion items
+    // only: no reasoning output item is required for a successful turn.
     model
         .complete_captured(
             "system",
-            &[],
+            &[Message::user("earlier turn")],
             Message::user("hi"),
             &[],
-            ModelParams::default(),
+            params,
             "Build",
             Some(&tx),
             &CancellationToken::new(),
@@ -7060,6 +7186,10 @@ async fn non_codex_responses_wire_omits_codex_headers() {
         .expect("custom Responses request must complete");
 
     let request = provider.next_request().await;
+    assert_eq!(
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer subscription-token")
+    );
     for header in [
         "chatgpt-account-id",
         "originator",
@@ -7072,6 +7202,28 @@ async fn non_codex_responses_wire_omits_codex_headers() {
             "{header}"
         );
     }
+    assert_eq!(request.body["store"], json!(false));
+    assert!(
+        request.body.get("previous_response_id").is_none(),
+        "generic Responses requests must not rely on server state: {}",
+        request.body
+    );
+    let input = request.body["input"]
+        .as_array()
+        .expect("Responses requests must carry the full conversation as input");
+    let input = serde_json::to_string(input).expect("input must serialize");
+    assert!(
+        input.contains("earlier turn"),
+        "history missing from input: {input}"
+    );
+    assert!(input.contains("hi"), "prompt missing from input: {input}");
+    assert!(request.body.get("background").is_none(), "{}", request.body);
+    assert_eq!(request.body["reasoning"]["effort"], json!("high"));
+    assert!(
+        request.body.get("reasoning_effort").is_none(),
+        "{}",
+        request.body
+    );
 }
 
 #[tokio::test]

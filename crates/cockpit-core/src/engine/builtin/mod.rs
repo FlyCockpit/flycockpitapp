@@ -5576,7 +5576,7 @@ pub(crate) mod tests {
         let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(tmp.path(), r#"{"web":{"provider":"firecrawl"}}"#);
         let def = crate::agents::parse_agent(
-            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
             "reviewer",
             tmp.path().join("reviewer.md"),
         )
@@ -5968,7 +5968,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("my-reviewer.md"),
-            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/my-reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/my-reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         let args = test_spawn_args(tmp.path());
@@ -5989,19 +5989,19 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("custom-sub.md"),
-            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-sub\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-sub\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         std::fs::write(
             agents_dir.join("custom-primary.md"),
-            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-primary\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-primary\nroles: [assistant]\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
         )
         .unwrap();
         let assistant_home = tmp.path().join("assistant-home");
         std::fs::create_dir_all(&assistant_home).unwrap();
         std::fs::write(
             assistant_home.join("assistant.md"),
-            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\nassistant body\n",
+            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nroles: [assistant]\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\nassistant body\n",
         )
         .unwrap();
         let db = test_assistant_db();
@@ -7478,7 +7478,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&shadow_dir).unwrap();
         std::fs::write(
             shadow_dir.join("nested-child.md"),
-            "---\ndescription: workspace shadow\nschemaVersion: 1\nagentId: authored/nested-child\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
+            "---\ndescription: workspace shadow\nschemaVersion: 1\nagentId: authored/nested-child\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
         )
         .unwrap();
 

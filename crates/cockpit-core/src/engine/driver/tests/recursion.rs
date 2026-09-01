@@ -25,7 +25,7 @@ fn agent_vnext_runtime_uses_effective_grant_not_legacy_recursion_context() {
 description: Bounded root delegate
 schemaVersion: 1
 agentId: authored/root
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Delegate bounded work

@@ -8859,7 +8859,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_dir = home.path().join("home/.config/cockpit");
+        let global_dir = home.path().join("config/cockpit");
         let global_config = global_dir.join("config.json");
         std::fs::create_dir_all(&global_dir).expect("global config directory");
         std::fs::write(&global_config, r#"{"providers":{"global":{}}}"#).expect("global config");
@@ -8939,7 +8939,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let global_config = home.path().join("config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for config in [&global_config, &project_config] {
             std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
@@ -9005,7 +9005,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let global_config = home.path().join("config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for (config, name) in [(&global_config, "global"), (&project_config, "project")] {
             std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
@@ -9056,7 +9056,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("home/.config/cockpit/config.json");
+        let global_config = home.path().join("config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for (config, rounds, hook, name) in [
             (&global_config, 11, "global-hook", "global"),

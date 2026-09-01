@@ -373,7 +373,7 @@ mod tests {
                 cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
             crate::config::trust::clear_runtime_policy_for_tests();
             write_layer(
-                &tmp.path().join("home/.config/cockpit"),
+                &tmp.path().join("config/cockpit"),
                 Some(&selection("old", "a")),
             );
             let cwd = tmp.path().join("proj");
@@ -471,7 +471,7 @@ mod tests {
             cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         write_layer(
-            &tmp.path().join("home/.config/cockpit"),
+            &tmp.path().join("config/cockpit"),
             Some(&selection("old", "a")),
         );
         let cwd = tmp.path().join("proj");

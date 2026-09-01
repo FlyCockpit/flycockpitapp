@@ -245,6 +245,27 @@ fn action_request(action: &SealedActionCommand) -> Request {
             origin_id: origin_id.clone(),
             projection_id: projection_id.clone(),
         },
+        SealedActionCommand::CreateDeclared {
+            project_id,
+            description,
+            declaration_json,
+        } => match serde_json::from_str(declaration_json) {
+            Ok(declaration) => Request::CreateDeclaredSealedAction {
+                project_id: project_id.clone(),
+                description: description.as_str().to_string(),
+                declaration,
+            },
+            Err(_) => Request::CreateSealedAction {
+                // The server rejects the retired request without consuming an
+                // owner capability; this keeps the local parse failure safe
+                // until the overlay grows a typed declaration form.
+                kind_id: "invalid-declaration-json".to_string(),
+                project_id: project_id.clone(),
+                description: description.as_str().to_string(),
+                origin_id: "none".to_string(),
+                projection_id: "none".to_string(),
+            },
+        },
         SealedActionCommand::ReviseDescription {
             action_id,
             description,

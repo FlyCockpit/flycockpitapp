@@ -132,6 +132,44 @@ where
     Ok(value)
 }
 
+/// Owner-authored immutable sealed-action sink declaration. This crosses only
+/// the local owner RPC: it is never supplied by a model/action invocation.
+/// The daemon validates, identity-pins, and persists the declaration before it
+/// can become executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "sink", rename_all = "snake_case")]
+pub enum SealedActionDeclaration {
+    CommandArgument {
+        argv: Vec<String>,
+    },
+    CommandEnvironment {
+        argv: Vec<String>,
+        variable: String,
+    },
+    HttpsHeader {
+        origin: String,
+        path: String,
+        header_name: String,
+        projection_id: String,
+    },
+    HttpsBody {
+        origin: String,
+        path: String,
+        content_type: String,
+        projection_id: String,
+    },
+    FileRuntime {
+        filename: String,
+        consumer_argv: Vec<String>,
+    },
+    FilePinned {
+        path: String,
+        consumer_argv: Vec<String>,
+        persistent_acknowledged_at_ms: Option<i64>,
+        persistent_warning: Option<String>,
+    },
+}
+
 fn deserialize_lower_hex_sha256<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -817,6 +855,14 @@ pub enum Request {
         description: String,
         origin_id: String,
         projection_id: String,
+    },
+    /// Create an owner-declared real sealed-action sink. Unlike the legacy
+    /// catalog selector request this carries the fixed command/origin/path/file
+    /// declaration that the daemon pins into the immutable snapshot.
+    CreateDeclaredSealedAction {
+        project_id: String,
+        description: String,
+        declaration: SealedActionDeclaration,
     },
     /// Revise a sealed action instance's safe description (new revision).
     ReviseSealedActionDescription {
@@ -4279,6 +4325,7 @@ macro_rules! request_variants {
             (Request::EditSealedOwnerDescription { .. }, "edit_sealed_owner_description");
             (Request::ListSealedActions, "list_sealed_actions");
             (Request::CreateSealedAction { .. }, "create_sealed_action");
+            (Request::CreateDeclaredSealedAction { .. }, "create_declared_sealed_action");
             (Request::ReviseSealedActionDescription { .. }, "revise_sealed_action_description");
             (Request::ReviseSealedActionEnabled { .. }, "revise_sealed_action_enabled");
             (Request::RetireSealedAction { .. }, "retire_sealed_action");
@@ -4617,6 +4664,7 @@ macro_rules! command {
             (Request::EditSealedOwnerDescription { record_id, description }, "edit_sealed_owner_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "record_id:String|description:String", [record_id: String => param, description: String => param]);
             (Request::ListSealedActions, "list_sealed_actions", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::CreateSealedAction { kind_id, project_id, description, origin_id, projection_id }, "create_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "kind_id:String|project_id:String|description:String|origin_id:String|projection_id:String", [kind_id: String => param, project_id: String => param, description: String => param, origin_id: String => param, projection_id: String => param]);
+            (Request::CreateDeclaredSealedAction { project_id, description, declaration }, "create_declared_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_id:String|description:String|declaration:SealedActionDeclaration", [project_id: String => param, description: String => param, declaration: SealedActionDeclaration => param]);
             (Request::ReviseSealedActionDescription { action_id, description }, "revise_sealed_action_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|description:String", [action_id: String => param, description: String => param]);
             (Request::ReviseSealedActionEnabled { action_id, enabled }, "revise_sealed_action_enabled", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|enabled:bool", [action_id: String => param, enabled: bool => param]);
             (Request::RetireSealedAction { action_id, confirm }, "retire_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|confirm:String", [action_id: String => param, confirm: String => param]);

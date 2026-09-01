@@ -214,8 +214,26 @@ impl std::fmt::Debug for InjectedCommandCapture {
 pub(crate) async fn run_injected_process(
     argv: &[String],
     environment: Option<(&str, &str)>,
+    executable_identity: Option<crate::sealed::action_admin::local_executor::ExecutableIdentity>,
 ) -> Result<InjectedCommandCapture, CommandSecretError> {
     let (program, args) = argv.split_first().ok_or(CommandSecretError::EmptySpec)?;
+    let held_executable = if let Some(identity) = executable_identity {
+        open_identity_pinned_executable(program, identity)?
+    } else {
+        return Err(CommandSecretError::Io("identity_pin_missing".to_string()));
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let program = format!(
+        "/proc/self/fd/{}",
+        std::os::fd::AsRawFd::as_raw_fd(&held_executable)
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let program = {
+        let _ = held_executable;
+        return Err(CommandSecretError::Io(
+            "identity_pin_unsupported".to_string(),
+        ));
+    };
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -246,6 +264,39 @@ pub(crate) async fn run_injected_process(
         stdout,
         stderr,
     })
+}
+
+/// Open the approved executable without following its final component and
+/// prove its persisted object identity. The returned descriptor remains alive
+/// until the child has been spawned; Linux executes it through `/proc/self/fd`,
+/// so replacing the stored pathname after approval cannot redirect the child.
+fn open_identity_pinned_executable(
+    program: &str,
+    identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+) -> Result<std::fs::File, CommandSecretError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(program)
+            .map_err(map_spawn_error)?;
+        if !identity
+            .matches(&file)
+            .map_err(|error| CommandSecretError::Io(error.to_string()))?
+        {
+            return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (program, identity);
+        Err(CommandSecretError::Io(
+            "identity_pin_unsupported".to_string(),
+        ))
+    }
 }
 
 async fn run_subprocess(argv: &[String]) -> Result<String, CommandSecretError> {

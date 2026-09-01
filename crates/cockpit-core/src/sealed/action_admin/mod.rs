@@ -371,6 +371,7 @@ pub enum SealedActionKind {
     /// placeholder or one environment variable. No shell is involved.
     Command {
         argv_template: Vec<String>,
+        executable_identity: local_executor::ExecutableIdentity,
         injection: local_executor::CommandInjection,
         parameters: BTreeMap<String, SealedParamSpecJson>,
     },
@@ -380,6 +381,7 @@ pub enum SealedActionKind {
         destination: local_executor::FileDestination,
         persistence: local_executor::FilePersistence,
         consumer_argv: Vec<String>,
+        consumer_executable_identity: Option<local_executor::ExecutableIdentity>,
     },
     /// A local-only custody transfer to exactly one immutable KB attachment.
     /// It has no outbound destination and no model-supplied parameters.
@@ -478,14 +480,26 @@ impl SealedActionKind {
             }
             Self::Command {
                 argv_template,
+                executable_identity,
                 injection,
                 parameters,
-            } => local_executor::validate_command_kind(argv_template, injection, parameters),
+            } => local_executor::validate_command_kind(
+                argv_template,
+                executable_identity,
+                injection,
+                parameters,
+            ),
             Self::File {
                 destination,
                 persistence,
                 consumer_argv,
-            } => local_executor::validate_file_kind(destination, *persistence, consumer_argv),
+                consumer_executable_identity,
+            } => local_executor::validate_file_kind(
+                destination,
+                persistence.clone(),
+                consumer_argv,
+                consumer_executable_identity.as_ref(),
+            ),
         }
     }
 
@@ -895,15 +909,29 @@ impl SealedActionDirectory {
 /// persistence entry point, so direct internal callers cannot bypass it.
 fn pin_local_executables(kind: &mut SealedActionKind) -> Result<()> {
     match kind {
-        SealedActionKind::Command { argv_template, .. } => {
-            local_executor::pin_argv_executable(argv_template)
+        SealedActionKind::Command {
+            argv_template,
+            executable_identity,
+            ..
+        } => {
+            *executable_identity = local_executor::pin_argv_executable(argv_template)?;
+            Ok(())
         }
-        SealedActionKind::File { consumer_argv, .. } if !consumer_argv.is_empty() => {
-            local_executor::pin_argv_executable(consumer_argv)
+        SealedActionKind::File {
+            destination,
+            consumer_argv,
+            consumer_executable_identity,
+            ..
+        } => {
+            local_executor::pin_file_destination(destination)?;
+            *consumer_executable_identity = if consumer_argv.is_empty() {
+                None
+            } else {
+                Some(local_executor::pin_argv_executable(consumer_argv)?)
+            };
+            Ok(())
         }
-        SealedActionKind::File { .. }
-        | SealedActionKind::Https { .. }
-        | SealedActionKind::KnowledgeBaseCopy { .. } => Ok(()),
+        SealedActionKind::Https { .. } | SealedActionKind::KnowledgeBaseCopy { .. } => Ok(()),
     }
 }
 

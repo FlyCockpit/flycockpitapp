@@ -623,6 +623,18 @@ fn validate_text_artifact_graph(
                     SessionEventKind::ToolCall | SessionEventKind::ContextPruned
                 ) => {}
             (
+                TextArtifactKind::ToolResult,
+                CaptureReason::DisplayTruncation,
+                TextArtifactRelation::ToolResultDisplay,
+                Some(slot),
+            ) if slot >= 0 && event.kind == SessionEventKind::ToolCall => {}
+            (
+                TextArtifactKind::ToolResult,
+                CaptureReason::ExplicitAttachment,
+                TextArtifactRelation::ToolResultAttachment,
+                Some(slot),
+            ) if slot >= 0 && event.kind == SessionEventKind::ToolCall => {}
+            (
                 TextArtifactKind::UserInputSource,
                 CaptureReason::OversizedUserInput,
                 TextArtifactRelation::SourceUserInput,

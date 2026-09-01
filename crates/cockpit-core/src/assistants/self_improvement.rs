@@ -261,9 +261,14 @@ fn review_agent_from(root_agent: Agent) -> Agent {
     definition.prompt = REVIEW_SYSTEM.to_string();
     definition.prompt_overrides.clear();
     let definition = std::sync::Arc::new(definition);
+    // This production agent synthesizes a new system prompt instead of using
+    // the normal built-in factory. Preserve the raw role prompt for failover
+    // recomposition, but apply the same uniform untrusted-model steering to the
+    // effective prompt used by this inference turn.
+    let system = review_system_for_trust(root_agent.model.is_trusted());
     Agent {
         name: "background_review".to_string(),
-        system: REVIEW_SYSTEM.to_string(),
+        system,
         role_prompt: REVIEW_SYSTEM.to_string(),
         tools: review_tools(),
         model: root_agent.model,
@@ -283,6 +288,12 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         env_overlay: root_agent.env_overlay,
         definition: Some(definition),
     }
+}
+
+fn review_system_for_trust(model_is_trusted: bool) -> String {
+    let mut system = REVIEW_SYSTEM.to_string();
+    crate::engine::builtin::append_untrusted_leak_report_steering(&mut system, model_is_trusted);
+    system
 }
 
 fn review_tools() -> ToolBox {
@@ -443,5 +454,14 @@ mod tests {
         assert!(prompt.contains("first load the skill with `skill`"));
         assert!(prompt.contains("use `read` and `edit` or `write`"));
         assert!(REVIEW_SYSTEM.contains("`read`, `edit`, and `write`"));
+    }
+
+    #[test]
+    fn untrusted_background_review_system_includes_leak_report_steering() {
+        let system = review_system_for_trust(false);
+        assert!(system.starts_with(REVIEW_SYSTEM));
+        assert!(system.contains("`report_leak`"));
+        assert!(system.contains("base64"));
+        assert_eq!(review_system_for_trust(true), REVIEW_SYSTEM);
     }
 }

@@ -509,6 +509,7 @@ pub(crate) struct DeferredDelegateCall {
     session: Arc<Session>,
     tx: mpsc::Sender<TurnEvent>,
     agent_id: String,
+    mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     durable_permit: super::tool_dispatch::SchedulerDurablePermit,
 }
 
@@ -537,13 +538,14 @@ impl DeferredDelegateCall {
         &self,
         config: &crate::daemon::session_worker::SessionConfigHandle,
     ) -> Result<TurnOutcome> {
-        match phase_10_dispatch_one_call(
+        match phase_10_dispatch_one_call_with_registry(
             &self.agent,
             &self.session,
             config,
             &self.tx,
             &self.call,
             &self.resolved_name,
+            &self.mcp_builtin_registry,
         )
         .await?
         {
@@ -975,6 +977,7 @@ impl DeferredTurnPlan {
                         session: self.session.clone(),
                         tx: self.tx.clone(),
                         agent_id: self.tool_ctx.agent_id.clone(),
+                        mcp_builtin_registry: self.tool_ctx.mcp_builtin_registry.clone(),
                         durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
                             durable_order.clone(),
                             durable_ordinal,
@@ -993,13 +996,14 @@ impl DeferredTurnPlan {
             let scheduled = self.scheduler.calls[self.cursor].clone();
             self.cursor += 1;
             let tc = &self.calls[scheduled.source_index];
-            match phase_10_dispatch_one_call(
+            match phase_10_dispatch_one_call_with_registry(
                 agent,
                 &self.session,
                 &self.config,
                 &self.tx,
                 tc,
                 &scheduled.resolved_name,
+                &self.tool_ctx.mcp_builtin_registry,
             )
             .await?
             {
@@ -1012,7 +1016,7 @@ impl DeferredTurnPlan {
                     );
                     let terminal = match &outcome {
                         TurnOutcome::ToolResult { body, .. }
-                            if body.trim_start().starts_with("Error:") =>
+                            if structural_tool_result_is_refusal(body) =>
                         {
                             turn_scheduler::SchedulerTerminalOutcome::Refused
                         }
@@ -1328,6 +1332,7 @@ fn prompt_has_redundant_seed_tag(prompt: &str) -> bool {
         .any(|token| token.starts_with('@') || token.starts_with("/skill"))
 }
 
+#[cfg(test)]
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
@@ -1336,10 +1341,50 @@ pub(crate) async fn phase_10_dispatch_one_call(
     tc: &ToolCall,
     resolved_name: &str,
 ) -> Result<ControlFlow<TurnOutcome, ()>> {
+    let mcp_builtin_registry = agent.tools.mcp_builtin_registry_for_context(&agent.name);
+    phase_10_dispatch_one_call_with_registry(
+        agent,
+        session,
+        config,
+        tx,
+        tc,
+        resolved_name,
+        &mcp_builtin_registry,
+    )
+    .await
+}
+
+/// Structural calls leave the ordinary dispatcher before it can consult the
+/// guard. Keep that route on the exact registry installed in this turn's
+/// [`ToolCtx`], so a cache-reusing scoped context cannot bypass its execution
+/// boundary through `task`, `schedule`, `spawn`, or `return`.
+async fn phase_10_dispatch_one_call_with_registry(
+    agent: &Agent,
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    tx: &mpsc::Sender<TurnEvent>,
+    tc: &ToolCall,
+    resolved_name: &str,
+    mcp_builtin_registry: &crate::mcp::builtin::BuiltinRegistry,
+) -> Result<ControlFlow<TurnOutcome, ()>> {
     macro_rules! return_structural {
         ($outcome:expr) => {
             return Ok(ControlFlow::Break($outcome));
         };
+    }
+    if let Some(denial) = mcp_builtin_registry.capability_denial(resolved_name) {
+        return_structural!(TurnOutcome::ToolResult {
+            task_call_id: tc.id.to_string(),
+            task_provider_item_id: tc
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone()),
+            task_function_call_id: tc
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
+            body: denial.to_string(),
+        });
     }
     // `task` is special — it's a structural tool the driver
     // handles. For interactive subagents (builder) the driver
@@ -2170,6 +2215,14 @@ pub(crate) async fn phase_10_dispatch_one_call(
     }
 
     Ok(ControlFlow::Continue(()))
+}
+
+fn structural_tool_result_is_refusal(body: &str) -> bool {
+    body.trim_start().starts_with("Error:")
+        || serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("denied").and_then(Value::as_bool))
+            .unwrap_or(false)
 }
 
 /// Structural calls return to the driver before ordinary-tool dispatch gets a
@@ -4305,6 +4358,45 @@ mod tests {
                 assert_eq!(fields["result"], "ok");
             }
             other => panic!("expected structural return break, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_10_capability_guard_refuses_every_structural_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(4);
+        let registry = crate::mcp::builtin::BuiltinRegistry::scoped_fork(
+            "the session-rename micro-fork",
+            ["set_session_metadata"],
+            Vec::new(),
+        );
+
+        for tool in ["task", "schedule", "spawn", "return"] {
+            let call = tool_call(tool, serde_json::json!({}));
+            let flow = phase_10_dispatch_one_call_with_registry(
+                &agent,
+                &session,
+                &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+                &tx,
+                &call,
+                tool,
+                &registry,
+            )
+            .await
+            .unwrap();
+
+            match flow {
+                ControlFlow::Break(TurnOutcome::ToolResult { body, .. }) => {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap(),
+                        registry.capability_denial(tool).unwrap(),
+                        "{tool} must return the same structured guard denial"
+                    );
+                }
+                other => panic!("expected guarded structural refusal for `{tool}`, got {other:?}"),
+            }
         }
     }
 

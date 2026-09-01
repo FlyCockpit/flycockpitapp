@@ -57,6 +57,13 @@ impl CapabilityGuard {
     }
 }
 
+fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {
+    ToolOutput::canonical(vec![
+        crate::typed_media_result::CanonicalToolResultContent::Json { value: denial },
+    ])
+    .context("capability guard denial must form a canonical tool result")
+}
+
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
     crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
         .or_else(|| {
@@ -568,6 +575,7 @@ async fn authorize_btw_native_call(
 enum RevisedCallAuthorization {
     Ready { args: Value, recheck_result: bool },
     Refused(String),
+    GuardDenied(Value),
 }
 
 /// Re-enter every pre-host boundary whose decision depended on substituted
@@ -588,12 +596,7 @@ async fn authorize_revised_call(
         .mcp_builtin_registry
         .capability_denial(resolved_name)
     {
-        return Ok(RevisedCallAuthorization::Refused(
-            denial["message"]
-                .as_str()
-                .unwrap_or("capability denied")
-                .to_string(),
-        ));
+        return Ok(RevisedCallAuthorization::GuardDenied(denial));
     }
     let mut canonical =
         crate::engine::model::wire_schema::strip_wire_nulls(schema, proposed_args.clone());
@@ -1126,11 +1129,10 @@ async fn execute_ordinary_call_unscoped(
     // not let a stale repeated-call signature turn an unavailable capability
     // into an approval prompt or loop-guard refusal.
     let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
-    let capability_block = env
+    let capability_denial = env
         .ctx
         .mcp_builtin_registry
-        .capability_denial(resolved_name)
-        .and_then(|denial| denial["message"].as_str().map(str::to_string));
+        .capability_denial(resolved_name);
 
     // Loop guard (GOALS §1/§12): block a back-to-back identical tool
     // call (same name + canonical post-repair `wire_input`) pending
@@ -1155,7 +1157,7 @@ async fn execute_ordinary_call_unscoped(
         repair_outcome.valid
             && !placeholder_blocked
             && unavailable_call.is_none()
-            && capability_block.is_none(),
+            && capability_denial.is_none(),
     )
     .await?;
     let repeated_recoverable_tool_call = match &repeat_authorization {
@@ -1210,7 +1212,7 @@ async fn execute_ordinary_call_unscoped(
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
     let gate_block: Option<String> = if unavailable_call.is_none()
-        && capability_block.is_none()
+        && capability_denial.is_none()
         && !placeholder_blocked
         && repair_outcome.valid
         && !loop_guard_reject
@@ -1249,7 +1251,7 @@ async fn execute_ordinary_call_unscoped(
         recheck_result = true;
     }
     let cage_block: Option<String> = if unavailable_call.is_none()
-        && capability_block.is_none()
+        && capability_denial.is_none()
         && !placeholder_blocked
         && repair_outcome.valid
     {
@@ -1434,7 +1436,7 @@ async fn execute_ordinary_call_unscoped(
         || gate_blocked
         || cage_block.is_some()
         || unavailable_call.is_some()
-        || capability_block.is_some()
+        || capability_denial.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
         cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
@@ -1477,8 +1479,11 @@ async fn execute_ordinary_call_unscoped(
         (Err(invalid_input(msg)), 0)
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
-    } else if let Some(message) = capability_block {
-        (Err(invalid_input(message)), 0)
+    } else if let Some(denial) = capability_denial {
+        // A capability refusal is a structured model result, not a dispatcher
+        // error string. Monty's nested-native path returns this exact value,
+        // so direct native calls must retain the same classification fields.
+        (capability_guard_denial_output(denial), 0)
     } else if let Some(message) = unavailable_call {
         // The provider was told this tool exists, so a call is not a
         // hallucination. Return a normal call-time availability result without
@@ -1746,6 +1751,20 @@ async fn execute_ordinary_call_unscoped(
                         }
                         verification_blocked = true;
                         (Err(invalid_input(message)), 0)
+                    }
+                    RevisedCallAuthorization::GuardDenied(denial) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-revised-call-capability-guard-denied",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
+                        verification_blocked = true;
+                        (capability_guard_denial_output(denial), 0)
                     }
                     RevisedCallAuthorization::Ready {
                         args: authorized_args,
@@ -5547,7 +5566,7 @@ mod tests {
         let tools = ToolBox::new().with(edit.clone());
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
         let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
         ctx.mcp_builtin_registry = Arc::new(
             crate::mcp::builtin::BuiltinRegistry::from_functions(Vec::new()).with_capability_guard(
@@ -5573,11 +5592,21 @@ mod tests {
         execute_ordinary_call(&env, &mut history, &call, "edit", Recovery::Clean, None)
             .await
             .unwrap();
-        let native_message = loop {
-            if let Some(TurnEvent::ToolError { error, .. }) = rx.recv().await {
-                break error;
-            }
-        };
+        let native_denial = history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|part| match part {
+                    UserContent::ToolResult(result) if result.call == call.id => {
+                        result.content.iter().find_map(|part| match part {
+                            ToolResultContent::Json { value } => Some(value.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("direct native denial is a structured tool result");
 
         let MontyNativeAuthorization::Denied(monty_denial) =
             authorize_monty_native_call(edit.as_ref(), &call.function.arguments, &ctx)
@@ -5586,13 +5615,14 @@ mod tests {
         else {
             panic!("guarded Monty call must be denied");
         };
-        assert_eq!(monty_denial["kind"], "capability_guard_denied");
-        assert_eq!(
-            monty_denial["message"].as_str(),
-            Some(native_message.as_str())
+        assert_eq!(native_denial, monty_denial);
+        assert_eq!(native_denial["kind"], "capability_guard_denied");
+        assert!(
+            native_denial["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("the session-rename micro-fork")
+                    && message.contains("`set_session_metadata"))
         );
-        assert!(native_message.contains("the session-rename micro-fork"));
-        assert!(native_message.contains("`set_session_metadata`"));
         assert!(!called.load(Ordering::SeqCst));
     }
 

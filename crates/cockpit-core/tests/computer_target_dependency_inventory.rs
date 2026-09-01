@@ -169,6 +169,56 @@ fn platform_package_names(triple: &str) -> BTreeSet<&'static str> {
     s
 }
 
+fn target_condition_for_triple(triple: &str) -> &'static str {
+    match triple {
+        "aarch64-apple-darwin" => "cfg(target_os = \"macos\")",
+        "x86_64-pc-windows-msvc" => "cfg(target_os = \"windows\")",
+        "x86_64-unknown-linux-gnu" => "cfg(target_os = \"linux\")",
+        _ => panic!("unsupported inventory triple {triple}"),
+    }
+}
+
+/// Read the feature set selected on every direct, audited platform package.
+/// The fixture is a ratchet for this exact manifest surface, rather than a
+/// hand-maintained subset that a newly enabled feature could bypass.
+fn manifest_direct_features(manifest: &toml::Value, triple: &str) -> BTreeMap<String, Vec<String>> {
+    let dependencies = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get(target_condition_for_triple(triple)))
+        .and_then(toml::Value::as_table)
+        .and_then(|target| target.get("dependencies"))
+        .and_then(toml::Value::as_table)
+        .unwrap_or_else(|| panic!("missing target dependencies for {triple}"));
+
+    platform_package_names(triple)
+        .into_iter()
+        .filter_map(|package| {
+            let dependency = dependencies.get(package)?;
+            let mut features = dependency
+                .as_table()
+                .and_then(|table| table.get("features"))
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("{package} must declare a features array"))
+                .iter()
+                .map(|feature| {
+                    feature
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{package} has a non-string feature"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            features.sort();
+            assert_eq!(
+                features.len(),
+                features.iter().collect::<BTreeSet<_>>().len(),
+                "{package} declares a duplicate feature"
+            );
+            Some((package.to_string(), features))
+        })
+        .collect()
+}
+
 #[test]
 fn computer_target_dependency_inventory() {
     let root = workspace_root();
@@ -179,12 +229,36 @@ fn computer_target_dependency_inventory() {
     let fixture: InventoryFixture =
         serde_json::from_str(&fixture_raw).expect("fixture json schema");
 
+    let manifest_raw =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("cockpit-core Cargo.toml");
+    let manifest: toml::Value = manifest_raw.parse().expect("valid cockpit-core Cargo.toml");
+
     let checksums = lock_checksums(&root);
 
-    // Direct feature leaves from cockpit-core Cargo.toml (parsed lightly via fixture)
+    // The fixture must exactly inventory every direct feature enabled for the
+    // audited packages. This closes the omission class: a new Cargo.toml
+    // feature cannot escape the forbidden-feature checks below.
     let expected_direct = &fixture.direct_features;
 
     for triple in TRIPLES {
+        let manifest_direct = manifest_direct_features(&manifest, triple);
+        let mut fixture_direct = expected_direct
+            .get(*triple)
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture missing direct features for {triple}"));
+        for (package, features) in &mut fixture_direct {
+            features.sort();
+            assert_eq!(
+                features.len(),
+                features.iter().collect::<BTreeSet<_>>().len(),
+                "fixture declares a duplicate feature for {package}"
+            );
+        }
+        assert_eq!(
+            fixture_direct, manifest_direct,
+            "direct feature inventory drift for {triple}; update the fixture after auditing Cargo.toml"
+        );
         let meta = metadata_for_platform(&root, triple);
         let resolve_ids = resolve_cockpit_core_package_ids(&meta);
         let packages = meta["packages"].as_array().unwrap();
@@ -326,16 +400,6 @@ fn computer_target_dependency_inventory() {
                 assert_eq!(got.edition.as_deref(), Some("2024"));
                 assert!(got.rust_version.is_none());
             }
-            if exp.name == "x11rb" {
-                // Effective features must include randr and render
-                let feats = expected_direct
-                    .get(*triple)
-                    .and_then(|m| m.get("x11rb"))
-                    .cloned()
-                    .unwrap_or_default();
-                assert!(feats.contains(&"randr".to_string()));
-                assert!(feats.contains(&"render".to_string()));
-            }
         }
 
         // Forbid dangerous feature leaves on direct deps when declared in fixture
@@ -363,28 +427,27 @@ fn computer_target_dependency_inventory() {
     }
 
     // Manifest pins: exact versions in cockpit-core Cargo.toml
-    let manifest =
-        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .unwrap();
-    assert!(manifest.contains("mach2 = { version = \"=0.6.0\""));
-    assert!(manifest.contains("block2 = { version = \"=0.6.2\""));
-    assert!(manifest.contains("objc2-app-kit = { version = \"=0.3.2\""));
-    assert!(manifest.contains("objc2-application-services = { version = \"=0.3.2\""));
-    assert!(manifest.contains("objc2-core-foundation = { version = \"=0.3.2\""));
-    assert!(manifest.contains("objc2-core-graphics = { version = \"=0.3.2\""));
-    assert!(manifest.contains("objc2-color-sync = { version = \"=0.3.2\""));
-    assert!(manifest.contains("objc2-foundation = { version = \"=0.3.2\""));
-    assert!(manifest.contains("windows = { version = \"=0.62.2\""));
-    assert!(manifest.contains("x11rb = { version = \"=0.13.2\""));
-    assert!(manifest.contains("atspi = { version = \"=0.30.0\""));
-    assert!(manifest.contains("\"randr\""));
-    assert!(manifest.contains("Wdk_Foundation"));
-    assert!(manifest.contains("Wdk_Storage_FileSystem"));
-    assert!(manifest.contains("Win32_Storage_Packaging_Appx"));
-    assert!(manifest.contains("Win32_System_StationsAndDesktops"));
-    assert!(manifest.contains("CFFileDescriptor"));
-    assert!(manifest.contains("ColorSyncDevice"));
-    assert!(manifest.contains("HIServices"));
+    assert!(manifest_raw.contains("mach2 = { version = \"=0.6.0\""));
+    assert!(manifest_raw.contains("block2 = { version = \"=0.6.2\""));
+    assert!(manifest_raw.contains("objc2-app-kit = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("objc2-application-services = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("objc2-core-foundation = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("objc2-core-graphics = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("objc2-color-sync = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("objc2-foundation = { version = \"=0.3.2\""));
+    assert!(manifest_raw.contains("windows = { version = \"=0.62.2\""));
+    assert!(manifest_raw.contains("x11rb = { version = \"=0.13.2\""));
+    assert!(manifest_raw.contains("atspi = { version = \"=0.30.0\""));
+    assert!(manifest_raw.contains("\"randr\""));
+    assert!(manifest_raw.contains("Wdk_Foundation"));
+    assert!(manifest_raw.contains("Wdk_Storage_FileSystem"));
+    assert!(manifest_raw.contains("Win32_Storage_Packaging_Appx"));
+    assert!(manifest_raw.contains("Win32_System_StationsAndDesktops"));
+    assert!(manifest_raw.contains("CFArray"));
+    assert!(manifest_raw.contains("CFDictionary"));
+    assert!(manifest_raw.contains("CFFileDescriptor"));
+    assert!(manifest_raw.contains("ColorSyncDevice"));
+    assert!(manifest_raw.contains("HIServices"));
     // No private BSM / handwritten observer mentions in production target modules
     let macos_src = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/computer/platform/macos.rs"),

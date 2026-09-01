@@ -13,7 +13,7 @@
         "libc"
       ],
       "objc2-color-sync": ["std", "ColorSyncDevice"],
-      "objc2-core-foundation": ["std", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"],
+      "objc2-core-foundation": ["std", "CFArray", "CFDictionary", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"],
       "objc2-core-graphics": [
         "std",
         "CGDirectDisplay",
@@ -53,8 +53,7 @@
     },
     "x86_64-unknown-linux-gnu": {
       "atspi": ["connection", "proxies", "tokio"],
-      "x11rb": ["randr", "render"],
-      "x11rb-protocol": ["randr"]
+      "x11rb": ["randr"]
     }
   },
   "packages_by_platform": {

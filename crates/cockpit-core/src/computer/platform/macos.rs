@@ -941,6 +941,11 @@ impl MacOsTargetEvidenceAdapter {
         };
 
         let session = current_audit_session_id()?;
+        // CGEvent is host-wide, so the process's non-default audit session is
+        // not sufficient proof that it owns the displayed desktop. Capture a
+        // typed CGSession snapshot before querying focus and require the same
+        // active console session after the complete evidence bracket.
+        let login_session = current_active_login_session()?;
         let workspace = NSWorkspace::sharedWorkspace();
         let frontmost = workspace
             .frontmostApplication()
@@ -1206,6 +1211,7 @@ impl MacOsTargetEvidenceAdapter {
             },
             EvidenceSource::ColorSyncDisplayUuid,
         );
+        validate_current_login_session(&login_session)?;
         snapshot.synchronous_recheck = true;
         Ok(snapshot)
     }
@@ -1410,6 +1416,81 @@ fn current_audit_session_id() -> Result<u32, TargetUnavailableReason> {
     };
     extract_audit_session_id(status == KERN_SUCCESS, count, &token.val)
         .map_err(|_| TargetUnavailableReason::SessionInactive)
+}
+
+/// Capture the current login session and prove that it belongs to this
+/// process's effective UID and is the active, fully logged-in console session.
+///
+/// The caller retains the snapshot and passes it to
+/// [`validate_current_login_session`] after its evidence bracket. That second
+/// read rejects fast-user-switch and login transitions that occur while AX and
+/// CoreGraphics focus evidence is being gathered.
+#[cfg(target_os = "macos")]
+fn current_active_login_session() -> Result<CgSessionSnapshot, TargetUnavailableReason> {
+    use objc2_core_foundation::{CFBoolean, CFNumber};
+    use objc2_core_graphics::CGSessionCopyCurrentDictionary;
+
+    let dictionary =
+        CGSessionCopyCurrentDictionary().ok_or(TargetUnavailableReason::SessionInactive)?;
+    let snapshot = CgSessionSnapshot {
+        user_id: cg_session_value(&dictionary, CgSessionKey::UserId, |value| {
+            value
+                .downcast_ref::<CFNumber>()
+                .and_then(CFNumber::as_i64)
+                .and_then(|number| u32::try_from(number).ok())
+                .map(CgSessionValue::Number)
+        }),
+        console_set: cg_session_value(&dictionary, CgSessionKey::ConsoleSet, |value| {
+            value
+                .downcast_ref::<CFNumber>()
+                .and_then(CFNumber::as_i64)
+                .and_then(|number| u32::try_from(number).ok())
+                .map(CgSessionValue::Number)
+        }),
+        on_console: cg_session_value(&dictionary, CgSessionKey::OnConsole, |value| {
+            value
+                .downcast_ref::<CFBoolean>()
+                .map(|boolean| CgSessionValue::Bool(boolean.as_bool()))
+        }),
+        login_done: cg_session_value(&dictionary, CgSessionKey::LoginDone, |value| {
+            value
+                .downcast_ref::<CFBoolean>()
+                .map(|boolean| CgSessionValue::Bool(boolean.as_bool()))
+        }),
+    };
+    // SAFETY: `geteuid` has no preconditions and only reads this process's
+    // effective credentials.
+    let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    validate_cg_session(&snapshot, effective_uid, None)
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    Ok(snapshot)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_current_login_session(
+    previous: &CgSessionSnapshot,
+) -> Result<(), TargetUnavailableReason> {
+    let current = current_active_login_session()?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's
+    // effective credentials.
+    let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    validate_cg_session(&current, effective_uid, Some(previous))
+        .map(|_| ())
+        .map_err(|_| TargetUnavailableReason::SessionInactive)
+}
+
+#[cfg(target_os = "macos")]
+fn cg_session_value(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: CgSessionKey,
+    decode: impl FnOnce(&objc2_core_foundation::CFType) -> Option<CgSessionValue>,
+) -> CgSessionValue {
+    let key = objc2_core_foundation::CFString::from_static_str(key.as_static_str());
+    cg_dictionary_value(dictionary, &key).map_or(CgSessionValue::Missing, |value| {
+        decode(value).unwrap_or(CgSessionValue::WrongType)
+    })
 }
 
 #[cfg(target_os = "macos")]

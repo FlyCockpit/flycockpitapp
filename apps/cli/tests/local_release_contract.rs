@@ -129,6 +129,15 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 }
 
 #[test]
+fn official_release_never_enables_optional_cargo_features() {
+    let release = source(".github/workflows/release.yml");
+    assert!(release.contains("[ \"$default_features\" != \"[]\" ]"));
+    assert!(release.contains("official release default features must be empty"));
+    assert!(release.contains("(--all-features|--features|-F)"));
+    assert!(release.contains("cockpit-cli/(remote|grok-subscription)"));
+}
+
+#[test]
 fn public_v0_1_allowlist_is_exact_and_single_source() {
     let fixture: serde_json::Value = serde_json::from_str(&source(
         "apps/cli/tests/fixtures/public-v0.1-command-snapshot.json",

@@ -6420,6 +6420,40 @@ CREATE TABLE sealed_value_records (
     UNIQUE (scope, scope_key, name)
 );
 
+-- ---- trusted-child sealed acquisition audit -------------------------------
+-- Agent-acquired values occupy a separate namespace without widening the
+-- owner-authored record schema. Presence of a succeeded row is the namespace
+-- discriminator; the record itself remains an ordinary session-scoped sealed
+-- reference and therefore follows the existing session purge lifecycle.
+--
+-- Attempts are inserted before child dispatch and terminalized exactly once.
+-- No literal, output, command, prompt, value length, or destination argument is
+-- stored here. `record_id` is intentionally not a foreign key: failed attempts
+-- and session teardown must not erase the owner-visible audit trail.
+CREATE TABLE sealed_value_acquisition_audit (
+    acquisition_id     TEXT    PRIMARY KEY,
+    record_id          TEXT    NOT NULL,
+    session_id         TEXT    NOT NULL,
+    project_key        TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    description        TEXT    NOT NULL,
+    child_agent        TEXT    NOT NULL,
+    source_tool_call_id TEXT,
+    consent_mode       TEXT    NOT NULL CHECK (consent_mode IN ('audit_only', 'approval')),
+    outcome            TEXT    NOT NULL CHECK (outcome IN ('pending', 'sealed', 'requires_user', 'failed')),
+    created_at_ms      INTEGER NOT NULL,
+    completed_at_ms    INTEGER,
+    CHECK ((outcome = 'pending') = (completed_at_ms IS NULL)),
+    CHECK (outcome <> 'sealed' OR source_tool_call_id IS NOT NULL)
+);
+
+CREATE INDEX idx_sealed_value_acquisition_audit_session
+    ON sealed_value_acquisition_audit(session_id, created_at_ms DESC);
+
+CREATE UNIQUE INDEX idx_sealed_value_acquisition_succeeded_record
+    ON sealed_value_acquisition_audit(record_id)
+    WHERE outcome = 'sealed';
+
 
 -- Session-scope records follow their session out of existence. There is no
 -- foreign key because `scope_key` is polymorphic across the three scopes.

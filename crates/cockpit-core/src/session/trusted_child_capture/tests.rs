@@ -51,6 +51,26 @@ fn begin(reg: &TrustedChildCaptureRegistry, session: &Session) -> TrustedChildCa
     .expect("first acquisition is admitted")
 }
 
+async fn publish_audit(session: &Session) {
+    session
+        .db
+        .begin_sealed_value_acquisition_audit(
+            crate::db::sealed_scope::NewSealedValueAcquisitionAudit {
+                acquisition_id: RECORD_ID.to_owned(),
+                record_id: RECORD_ID.to_owned(),
+                session_id: session.id.to_string(),
+                project_key: session.project_id.clone(),
+                name: VALUE_ID.to_owned(),
+                description: REASON.to_owned(),
+                child_agent: "sealed-acquisition".to_owned(),
+                consent_mode: "audit_only".to_owned(),
+                created_at_ms: NOW_MS,
+            },
+        )
+        .await
+        .unwrap();
+}
+
 /// Assert the planted secret never reached the vault, the `sealed_values` row,
 /// or the live redaction table for `session`.
 async fn assert_no_store(session: &Session) {
@@ -105,6 +125,7 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
     let session = new_session();
     let reg = TrustedChildCaptureRegistry::new();
     let authority = begin(&reg, &session);
+    publish_audit(&session).await;
 
     // The minted authority derives project/session from the host session.
     assert_eq!(authority.project(), session.project_id);
@@ -340,6 +361,7 @@ async fn replay_after_consume_is_denied() {
     let reg = TrustedChildCaptureRegistry::new();
     let authority = begin(&reg, &session);
     let claim = authority.to_ingress();
+    publish_audit(&session).await;
 
     let first = reg
         .verify_and_capture(

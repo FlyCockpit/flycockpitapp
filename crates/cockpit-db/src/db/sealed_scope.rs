@@ -137,6 +137,39 @@ pub struct ReferenceableSealedValueMetadataRow {
     pub description: String,
 }
 
+/// Safe owner-visible metadata for a trusted-child acquisition attempt. This
+/// row never contains a command, prompt, tool output, literal, or value length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedValueAcquisitionAuditRow {
+    pub acquisition_id: String,
+    pub record_id: String,
+    pub session_id: String,
+    pub project_key: String,
+    pub name: String,
+    pub description: String,
+    pub child_agent: String,
+    pub source_tool_call_id: Option<String>,
+    pub consent_mode: String,
+    pub outcome: String,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+/// Host-authored pending acquisition metadata. The child receives none of the
+/// destination fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSealedValueAcquisitionAudit {
+    pub acquisition_id: String,
+    pub record_id: String,
+    pub session_id: String,
+    pub project_key: String,
+    pub name: String,
+    pub description: String,
+    pub child_agent: String,
+    pub consent_mode: String,
+    pub created_at_ms: i64,
+}
+
 /// Which lifecycle change a saga row is resuming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealedSagaKind {
@@ -503,6 +536,53 @@ pub fn create_session_sealed_value_conn(
     record_conn(conn, &record.record_id)?.context("created session sealed value record vanished")
 }
 
+/// Create an agent-acquired session value and terminalize its pre-published
+/// audit row in the same transaction. The ordinary scoped create uses INSERT
+/// (never UPSERT) for `sealed_value_records`, so an owner-authored or prior
+/// agent-acquired destination can never be replaced through this path.
+pub fn create_agent_acquired_session_sealed_value_conn(
+    conn: &Connection,
+    record: &NewSealedValueRecord,
+    literal: &str,
+    reason: &str,
+    origin: &str,
+    acquisition_id: &str,
+    source_tool_call_id: &str,
+    completed_at_ms: i64,
+) -> Result<SealedValueRecordRow> {
+    let legacy_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
+            params![record.scope_key, record.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking legacy sealed destination before agent acquisition")?;
+    if legacy_exists.is_some() {
+        bail!("agent-acquired sealed values are create-only");
+    }
+    let row = create_session_sealed_value_conn(conn, record, literal, reason, origin)?;
+    let changed = conn
+        .execute(
+            "UPDATE sealed_value_acquisition_audit
+                SET source_tool_call_id = ?2, outcome = 'sealed', completed_at_ms = ?3
+              WHERE acquisition_id = ?1 AND record_id = ?4 AND session_id = ?5
+                AND outcome = 'pending' AND completed_at_ms IS NULL",
+            params![
+                acquisition_id,
+                source_tool_call_id,
+                completed_at_ms,
+                record.record_id,
+                record.scope_key,
+            ],
+        )
+        .context("terminalizing sealed acquisition audit")?;
+    if changed != 1 {
+        bail!("sealed acquisition audit is not a matching pending attempt");
+    }
+    Ok(row)
+}
+
 /// Stage a session create at `active_version = 0` without promoting it.
 pub fn stage_session_sealed_create_conn(
     conn: &Connection,
@@ -599,6 +679,104 @@ pub fn rotate_session_sealed_value_conn(
 }
 
 impl Db {
+    /// Publish an owner-visible acquisition attempt before child dispatch.
+    pub async fn begin_sealed_value_acquisition_audit(
+        &self,
+        audit: NewSealedValueAcquisitionAudit,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            ensure_session_is_live_conn(conn, &audit.session_id)?;
+            conn.execute(
+                "INSERT INTO sealed_value_acquisition_audit
+                    (acquisition_id, record_id, session_id, project_key, name, description,
+                     child_agent, source_tool_call_id, consent_mode, outcome,
+                     created_at_ms, completed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 'pending', ?9, NULL)",
+                params![
+                    audit.acquisition_id,
+                    audit.record_id,
+                    audit.session_id,
+                    audit.project_key,
+                    audit.name,
+                    audit.description,
+                    audit.child_agent,
+                    audit.consent_mode,
+                    audit.created_at_ms,
+                ],
+            )
+            .context("publishing sealed acquisition audit")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Terminalize a non-sealed acquisition. A sealed outcome is committed by
+    /// `create_agent_acquired_session_sealed_value_conn` with the value create.
+    pub async fn finish_sealed_value_acquisition_audit(
+        &self,
+        acquisition_id: String,
+        outcome: String,
+        completed_at_ms: i64,
+    ) -> Result<bool> {
+        if !matches!(outcome.as_str(), "requires_user" | "failed") {
+            bail!("non-sealed acquisition outcome must be requires_user or failed");
+        }
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE sealed_value_acquisition_audit
+                        SET outcome = ?2, completed_at_ms = ?3
+                      WHERE acquisition_id = ?1 AND outcome = 'pending'
+                        AND completed_at_ms IS NULL",
+                    params![acquisition_id, outcome, completed_at_ms],
+                )
+                .context("terminalizing sealed acquisition audit")?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    /// Owner-only acquisition audit surface, newest first and bounded.
+    pub async fn list_sealed_value_acquisition_audit(
+        &self,
+        session_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<SealedValueAcquisitionAuditRow>> {
+        let limit = i64::try_from(limit.clamp(1, 500)).unwrap_or(500);
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT acquisition_id, record_id, session_id, project_key, name,
+                        description, child_agent, source_tool_call_id, consent_mode,
+                        outcome, created_at_ms, completed_at_ms
+                   FROM sealed_value_acquisition_audit
+                  WHERE (?1 IS NULL OR session_id = ?1)
+                  ORDER BY created_at_ms DESC, acquisition_id DESC
+                  LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id, limit], |row| {
+                    Ok(SealedValueAcquisitionAuditRow {
+                        acquisition_id: row.get(0)?,
+                        record_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        project_key: row.get(3)?,
+                        name: row.get(4)?,
+                        description: row.get(5)?,
+                        child_agent: row.get(6)?,
+                        source_tool_call_id: row.get(7)?,
+                        consent_mode: row.get(8)?,
+                        outcome: row.get(9)?,
+                        created_at_ms: row.get(10)?,
+                        completed_at_ms: row.get(11)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing sealed acquisition audit")?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Stage a new record. The record is inserted at `active_version = 0`, so
     /// it is not resolvable until its create saga commits.
     ///

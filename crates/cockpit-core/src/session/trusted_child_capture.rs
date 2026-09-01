@@ -53,7 +53,6 @@ use zeroize::Zeroizing;
 use super::Session;
 use crate::leak_report::ProtectedSensitiveIngress;
 use crate::redact::RedactionTable;
-use crate::sealed::OwnerAuthority;
 
 /// How long a minted acquisition stays live before it fails closed on expiry.
 /// A trusted-child round-trip is short; an authority older than this is stale
@@ -213,7 +212,6 @@ struct PendingCapture {
     source_tool_call_id: String,
     value_id: String,
     reason: String,
-    origin: String,
     expires_at_ms: i64,
 }
 
@@ -250,7 +248,7 @@ impl TrustedChildCaptureRegistry {
         record_id: &str,
         value_id: &str,
         reason: &str,
-        origin: &str,
+        _origin: &str,
         generation: i64,
         version: i64,
         source_tool_call_id: &str,
@@ -276,7 +274,6 @@ impl TrustedChildCaptureRegistry {
             source_tool_call_id: source_tool_call_id.to_owned(),
             value_id: value_id.to_owned(),
             reason: reason.to_owned(),
-            origin: origin.to_owned(),
             expires_at_ms: now_ms + TRUSTED_CHILD_CAPTURE_TTL_MS,
         };
         pending.insert(session_key.clone(), record);
@@ -347,13 +344,15 @@ impl TrustedChildCaptureRegistry {
         // MCP/Tool/event/transcript path sees it. A write failure fails closed
         // (the record is already consumed; the host must begin a new capture).
         match session
-            .set_sealed_value(
-                OwnerAuthority::for_owner_request(),
+            .create_agent_acquired_sealed_value(
                 redaction,
+                &proceed.record_id,
+                &proceed.record_id,
                 &proceed.value_id,
-                value.as_str(),
                 &proceed.reason,
-                &proceed.origin,
+                value.as_str(),
+                &proceed.source_tool_call_id,
+                now_ms,
             )
             .await
         {
@@ -424,7 +423,7 @@ impl TrustedChildCaptureRegistry {
             record_id: record.record_id,
             value_id: record.value_id,
             reason: record.reason,
-            origin: record.origin,
+            source_tool_call_id: record.source_tool_call_id,
         })
     }
 }
@@ -435,7 +434,7 @@ struct Proceed {
     record_id: String,
     value_id: String,
     reason: String,
-    origin: String,
+    source_tool_call_id: String,
 }
 
 #[cfg(test)]

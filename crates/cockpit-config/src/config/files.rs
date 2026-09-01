@@ -3132,9 +3132,15 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
             );
         }
         let entry_identity = super::TerminalIngressFileIdentity {
-            volume: stat.st_dev,
-            file: stat.st_ino,
-            links: stat.st_nlink.try_into().unwrap_or(u32::MAX),
+            // `dev_t` is u64 on Linux but i32 on Darwin, so widen explicitly.
+            // This matches what `MetadataExt::dev()` does internally, keeping
+            // both sides of the identity comparison byte-identical.
+            volume: stat.st_dev as u64,
+            file: stat.st_ino as u64,
+            // `u64::from` first: Darwin `nlink_t` is u16, which would make a
+            // direct `try_into` an infallible conversion there and trip
+            // clippy::unnecessary_fallible_conversions under -D warnings.
+            links: u32::try_from(u64::from(stat.st_nlink)).unwrap_or(u32::MAX),
         };
         if entry_identity != expected_identity {
             anyhow::bail!(

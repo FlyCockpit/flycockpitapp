@@ -286,7 +286,11 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn device_id_matches(stat_device: libc::dev_t, metadata_device: u64) -> bool {
-    u64::try_from(stat_device).is_ok_and(|device| device == metadata_device)
+    // Darwin `dev_t` is i32 and `MetadataExt::dev()` sign-extends it, so a
+    // negative device id must compare equal rather than fail conversion — a
+    // `try_from` here reports a false mismatch for a genuinely matching inode
+    // and trips the fail-closed substitution check. Matches every other site.
+    stat_device as u64 == metadata_device
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

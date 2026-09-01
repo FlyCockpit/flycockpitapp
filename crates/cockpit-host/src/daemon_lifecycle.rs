@@ -821,7 +821,11 @@ pub fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
+// Pure byte-splitting with no platform dependency. It must exist on every
+// unix target: `cfg(test)` is set only for the crate under test, so gating on
+// `test` left cockpit-core's unit tests importing a symbol that does not exist
+// when this crate is built as a plain dependency for macOS or Windows.
+#[cfg(unix)]
 pub fn split_proc_cmdline(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|byte| *byte == 0)

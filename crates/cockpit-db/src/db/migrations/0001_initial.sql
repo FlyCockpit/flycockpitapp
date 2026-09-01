@@ -294,17 +294,6 @@ CREATE TABLE sessions (
          AND description_model_trust IN ('trusted', 'untrusted'))
     ),
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
-    CHECK (
-        (description IS NULL
-         AND description_provider_id IS NULL
-         AND description_model_id IS NULL
-         AND description_model_trust IS NULL)
-        OR
-        (description IS NOT NULL
-         AND description_provider_id IS NOT NULL
-         AND description_model_id IS NOT NULL
-         AND description_model_trust IN ('trusted', 'untrusted'))
-    ),
     CHECK (fork_point_turn_id IS NULL OR (
         parent_session_id IS NOT NULL
         AND length(fork_point_turn_id) > 0

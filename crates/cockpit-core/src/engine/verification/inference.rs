@@ -42,6 +42,20 @@ fn verification_audit_projection(
     }))
 }
 
+/// Cache evidence belongs to the endpoint that produced this utility response,
+/// not to the session's active authoring model. Verification generators can
+/// use dedicated profile slots, so omitting this update would permanently
+/// prevent those slots from becoming eligible for cache-aware dispatch.
+fn note_verification_cache_hit(
+    session: &Session,
+    endpoint: crate::engine::model::CacheEndpointIdentity,
+    usage: Option<crate::tokens::TokenUsage>,
+) {
+    if let Some(usage) = usage {
+        session.note_cache_hit_for_endpoint(endpoint, usage);
+    }
+}
+
 pub(crate) struct VerificationInferenceInput<'a> {
     pub session: Arc<Session>,
     pub model: &'a Model,
@@ -249,6 +263,7 @@ pub(crate) async fn journaled_verification_inference(
             return Err(error);
         }
     };
+    note_verification_cache_hit(&input.session, input.model.cache_endpoint_identity(), usage);
     if input
         .session
         .advance_inference_request(
@@ -400,6 +415,38 @@ mod tests {
         assert_eq!(projected["projection"], "verification_inference_v1");
         assert_eq!(projected["classification"], "verification_adjudication");
         assert_eq!(projected["request_digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn verification_provider_usage_learns_cache_evidence_for_its_exact_endpoint() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let generator_endpoint =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "generator", 1);
+        let other_endpoint =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "author", 1);
+
+        note_verification_cache_hit(
+            &session,
+            generator_endpoint.clone(),
+            Some(crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            }),
+        );
+
+        assert!(session.has_observed_cache_hit_for_endpoint(&generator_endpoint));
+        assert!(
+            !session.has_observed_cache_hit_for_endpoint(&other_endpoint),
+            "verification usage must not authorize a different slot's endpoint"
+        );
     }
 
     #[tokio::test]

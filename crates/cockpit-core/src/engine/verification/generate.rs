@@ -591,29 +591,18 @@ fn cache_warm_is_eligible(cache_mode: CacheMode, observed_cache_hit: bool) -> bo
     cache_mode != CacheMode::None && observed_cache_hit
 }
 
-fn completed_dispatch_mode(
-    plan: &CandidateDispatchPlan,
-    warm_completed_provider_request: bool,
-) -> VerificationCandidateDispatch {
-    if fanout_is_released(plan, warm_completed_provider_request) {
-        VerificationCandidateDispatch::WarmThenFanout
-    } else {
-        VerificationCandidateDispatch::Parallel
-    }
-}
-
-/// The warm candidate is an execution fence, not a telemetry hint. Its
-/// provider inference must finish before sibling requests can use the prefix
-/// it established.
-fn fanout_is_released(plan: &CandidateDispatchPlan, warm_completed_provider_request: bool) -> bool {
-    plan.warm_candidate.is_some() && warm_completed_provider_request
+/// A warm candidate is an ordering fence, never an eligibility gate. Every
+/// scheduled candidate must retain the same opportunity to run as it has in
+/// parallel mode, even when the preceding request cannot populate the cache.
+fn fanout_follows_warm(plan: &CandidateDispatchPlan) -> bool {
+    plan.warm_candidate.is_some()
 }
 
 fn dispatched_cache_read_count(
-    actual_mode: VerificationCandidateDispatch,
+    warm_completed_provider_request: bool,
     fanout_provider_handoffs: impl IntoIterator<Item = bool>,
 ) -> usize {
-    if actual_mode == VerificationCandidateDispatch::WarmThenFanout {
+    if warm_completed_provider_request {
         fanout_provider_handoffs
             .into_iter()
             .filter(|reached_provider| *reached_provider)
@@ -645,11 +634,16 @@ where
             .iter()
             .find(|candidate| candidate_index(candidate) == warm_index)
             .expect("warm candidate must belong to its dispatch group");
-        let warm_execution = collect_one(warm, None).await?;
-        if let Some(candidate) = warm_execution.candidate {
-            collected.push((warm_index, candidate));
-        }
-        let actual_mode = completed_dispatch_mode(plan, warm_execution.completed_provider_request);
+        let (warm_completed_provider_request, mut dispatch_error) =
+            match collect_one(warm, None).await {
+                Ok(execution) => {
+                    if let Some(candidate) = execution.candidate {
+                        collected.push((warm_index, candidate));
+                    }
+                    (execution.completed_provider_request, None)
+                }
+                Err(error) => (false, Some(error)),
+            };
         let fanout = candidates
             .iter()
             .filter(|candidate| candidate_index(candidate) != warm_index)
@@ -661,7 +655,7 @@ where
             .iter()
             .map(|_| AtomicBool::new(false))
             .collect::<Vec<_>>();
-        if fanout_is_released(plan, warm_execution.completed_provider_request) {
+        if fanout_follows_warm(plan) {
             for result in join_all(fanout.iter().zip(fanout_handoffs.iter()).map(
                 |(candidate, handoff)| async move {
                     Ok::<_, anyhow::Error>((
@@ -672,14 +666,25 @@ where
             ))
             .await
             {
-                let (index, execution) = result?;
-                if let Some(candidate) = execution.candidate {
-                    collected.push((index, candidate));
+                match result {
+                    Ok((index, execution)) => {
+                        if let Some(candidate) = execution.candidate {
+                            collected.push((index, candidate));
+                        }
+                    }
+                    Err(error) => {
+                        if dispatch_error.is_none() {
+                            dispatch_error = Some(error);
+                        }
+                    }
                 }
             }
         }
+        if let Some(error) = dispatch_error {
+            return Err(error);
+        }
         let cache_read_candidate_count = dispatched_cache_read_count(
-            actual_mode,
+            warm_completed_provider_request,
             fanout_handoffs
                 .iter()
                 .map(|handoff| handoff.load(Ordering::Acquire)),
@@ -688,11 +693,12 @@ where
             collected,
             telemetry: serde_json::json!({
                 "slot": slot,
-                "actual_mode": match actual_mode {
+                "actual_mode": match plan.scheduled_mode {
                     VerificationCandidateDispatch::Parallel => "parallel",
                     VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
                 },
                 "candidate_count": candidate_count,
+                "warm_completed_provider_request": warm_completed_provider_request,
                 "cache_read_candidate_count": cache_read_candidate_count,
             }),
         });
@@ -1346,39 +1352,31 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_telemetry_requires_a_completed_warm_request_and_actual_fanout_handoffs() {
+    fn dispatch_telemetry_distinguishes_ordering_from_confirmed_cache_reads() {
         let plan =
             candidate_dispatch_plan(VerificationCandidateDispatch::WarmThenFanout, &[0, 1], true);
         assert_eq!(
-            completed_dispatch_mode(&plan, false),
-            VerificationCandidateDispatch::Parallel,
-            "a stream poll or pre-dispatch refusal must not be recorded as a completed cache warm"
-        );
-        assert!(
-            !fanout_is_released(&plan, false),
-            "a failed, cancelled, or pre-dispatch warm must not release siblings"
-        );
-        assert_eq!(
-            completed_dispatch_mode(&plan, true),
+            plan.scheduled_mode,
             VerificationCandidateDispatch::WarmThenFanout
         );
-        assert!(fanout_is_released(&plan, true));
-        assert_eq!(
-            dispatched_cache_read_count(
-                VerificationCandidateDispatch::WarmThenFanout,
-                [true, false]
-            ),
-            1,
-            "only fan-out siblings that crossed their own provider handoff are cache-read dispatches"
+        assert!(
+            fanout_follows_warm(&plan),
+            "a failed, cancelled, or pre-dispatch warm must not suppress sibling attempts"
         );
         assert_eq!(
-            dispatched_cache_read_count(VerificationCandidateDispatch::Parallel, [true, true]),
-            0
+            dispatched_cache_read_count(false, [true, false]),
+            0,
+            "a failed warm must not claim that its later sibling requests were cache reads"
+        );
+        assert_eq!(
+            dispatched_cache_read_count(true, [true, false]),
+            1,
+            "only fan-out siblings that crossed their own provider handoff are cache-read dispatches"
         );
     }
 
     #[tokio::test]
-    async fn collect_dispatch_group_keeps_siblings_behind_failed_warm_execution_fence() {
+    async fn collect_dispatch_group_attempts_siblings_after_unsuccessful_warm_execution() {
         for warm_outcome in ["failed", "cancelled", "timed_out", "pre_dispatch_refused"] {
             let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_attempts = attempted.clone();
@@ -1413,14 +1411,62 @@ mod tests {
 
             assert_eq!(
                 *attempted.lock().unwrap(),
-                vec![(0, false)],
-                "{warm_outcome} warm execution must not invoke a sibling collector/provider handoff"
+                vec![(0, false), (1, true), (2, true)],
+                "{warm_outcome} must preserve every sibling attempt while retaining its fan-out observation"
             );
             assert_eq!(
-                group.telemetry["actual_mode"], "parallel",
-                "{warm_outcome} warm execution must report that fan-out never ran"
+                group.telemetry["actual_mode"], "warm_then_fanout",
+                "{warm_outcome} still runs the requested warm-then-fanout ordering"
+            );
+            assert_eq!(
+                group.telemetry["cache_read_candidate_count"], 0,
+                "{warm_outcome} must not claim cache reads without a completed warm request"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn collect_dispatch_group_attempts_siblings_after_a_warm_collector_error() {
+        let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_attempts = attempted.clone();
+        let plan = candidate_dispatch_plan(
+            VerificationCandidateDispatch::WarmThenFanout,
+            &[0, 1, 2],
+            true,
+        );
+
+        let result = collect_dispatch_group(
+            "primary",
+            &[0, 1, 2],
+            &plan,
+            |candidate| *candidate,
+            move |candidate, provider_handoff| {
+                observed_attempts
+                    .lock()
+                    .unwrap()
+                    .push((*candidate, provider_handoff.is_some()));
+                Box::pin(async move {
+                    if *candidate == 0 {
+                        anyhow::bail!("warm collector failed")
+                    }
+                    Ok(CandidateExecution::not_dispatched())
+                })
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => {
+                panic!("the original warm collector error must still be reported after fan-out")
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("warm collector failed"));
+        assert_eq!(
+            *attempted.lock().unwrap(),
+            vec![(0, false), (1, true), (2, true)],
+            "a collector error must not suppress later scheduled candidates"
+        );
     }
 
     #[test]
@@ -1447,7 +1493,7 @@ mod tests {
         let plan =
             candidate_dispatch_plan(VerificationCandidateDispatch::WarmThenFanout, &[0, 1], true);
         assert!(
-            fanout_is_released(&plan, warm.completed_provider_request),
+            fanout_follows_warm(&plan),
             "payload parsing must not erase a completed warm request or suppress its fan-out"
         );
     }

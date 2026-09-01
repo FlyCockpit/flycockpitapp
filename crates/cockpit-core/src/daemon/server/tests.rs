@@ -8423,6 +8423,38 @@ fn provider_responses_over_interactive_limit_fail_without_partial_payload() {
 }
 
 #[test]
+fn provider_usage_wire_preserves_configured_window_labels() {
+    let ctx = test_ctx();
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .expect("credential store");
+    let config = crate::config::providers::ProvidersConfig::default();
+    let row = crate::providers::usage::ProviderUsageSnapshot {
+        provider_id: "custom".into(),
+        display_name: "Custom".into(),
+        fetched_at: chrono::Utc::now(),
+        availability: crate::providers::usage::UsageAvailability::Fetched {
+            source: "declarative_usage_api",
+            plan: None,
+            windows: vec![crate::providers::usage::UsageWindow {
+                label: "monthly quota".into(),
+                used_percent: Some(25.0),
+                reset_at: None,
+                detail: None,
+            }],
+            details: Vec::new(),
+        },
+    };
+
+    let view = provider_usage_view(row, &store, &config, &HashMap::new());
+    let crate::daemon::proto::ProviderUsageAvailabilityView::Fetched { windows, .. } =
+        view.availability
+    else {
+        panic!("expected fetched usage view");
+    };
+    assert_eq!(windows[0].label, "monthly quota");
+}
+
+#[test]
 fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
     // `provider_models_fetch` constructs this exact response and calls the
     // bound before its deferred config writes. Keep the regression payload on

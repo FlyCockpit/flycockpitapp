@@ -345,6 +345,36 @@ fn validate_credential_free_provider_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Declarative usage probes reuse a provider's resolved headers, so their
+/// endpoints must not carry a second credential channel. Root-relative paths
+/// are resolved at runtime against the configured provider origin.
+fn validate_credential_free_usage_probe_endpoint(endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    let parsed = if endpoint.starts_with('/') {
+        if endpoint.starts_with("//") {
+            return Err(
+                "usage probe endpoint path must not replace the provider origin".to_string(),
+            );
+        }
+        url::Url::parse("https://usage-probe.invalid")
+            .and_then(|origin| origin.join(endpoint))
+            .map_err(|_| "usage probe endpoint path is invalid".to_string())?
+    } else {
+        url::Url::parse(endpoint)
+            .map_err(|_| "usage probe endpoint must be an absolute URL or root path".to_string())?
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("usage probe endpoint must use HTTP or HTTPS".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("usage probe endpoint must not include credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("usage probe endpoint must not include a query string or fragment".to_string());
+    }
+    Ok(())
+}
+
 fn deserialize_owner_optional_model_id<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -3383,6 +3413,9 @@ impl Request {
                     return Err("provider entry exceeds maximum length".to_string());
                 }
                 validate_credential_free_provider_url(&entry.url)?;
+                if let Some(probe) = &entry.usage_probe {
+                    validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                }
                 cockpit_config::config::providers::validate_provider_headers(
                     provider_id,
                     &entry.headers,
@@ -3443,6 +3476,9 @@ impl Request {
                     return Err("provider entry exceeds maximum length".to_string());
                 }
                 validate_credential_free_provider_url(&entry.url)?;
+                if let Some(probe) = &entry.usage_probe {
+                    validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                }
                 for value in header_secrets.iter().flatten() {
                     if value.is_empty() || value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
                         return Err("provider header secret exceeds maximum length".to_string());
@@ -4129,6 +4165,9 @@ impl Request {
                         return Err("provider entry exceeds maximum length".into());
                     }
                     validate_credential_free_provider_url(&upsert.entry.url)?;
+                    if let Some(probe) = &upsert.entry.usage_probe {
+                        validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                    }
                     cockpit_config::config::providers::validate_provider_headers(
                         &upsert.provider_id,
                         &upsert.entry.headers,
@@ -6417,6 +6456,32 @@ mod tests {
         let error = request.validate_semantics().unwrap_err();
         assert!(error.contains("query string"));
         assert!(!error.contains("secret"));
+
+        for endpoint in [
+            "https://user:secret@usage.example.test/",
+            "https://usage.example.test/?key=secret",
+            "/usage?key=secret",
+        ] {
+            let request = Request::UpsertProviderConfig {
+                project_root: "/repo".into(),
+                provider_id: "custom".into(),
+                entry: cockpit_config::config::providers::ProviderEntry {
+                    url: "https://api.example.test/v1".into(),
+                    usage_probe: Some(cockpit_config::config::providers::UsageProbeSpec {
+                        endpoint: endpoint.into(),
+                        method: cockpit_config::config::providers::UsageProbeMethod::Get,
+                        fields: Vec::new().into(),
+                    }),
+                    ..Default::default()
+                },
+            };
+            let error = request.validate_semantics().unwrap_err();
+            assert!(
+                error.contains("credentials") || error.contains("query string"),
+                "{error}"
+            );
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 
     #[cfg(not(feature = "remote"))]

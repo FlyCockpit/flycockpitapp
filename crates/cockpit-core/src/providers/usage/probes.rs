@@ -216,7 +216,12 @@ impl DeclarativeUsageProbe {
             }
             None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
         };
-        let url = resolve_usage_endpoint(&self.spec.endpoint, &resolved.base_url)?;
+        let url = resolve_usage_endpoint(
+            &self.spec.endpoint,
+            &resolved.base_url,
+            provider_id,
+            entry.allow_insecure_http,
+        )?;
         let client = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()?;
@@ -235,10 +240,9 @@ impl DeclarativeUsageProbe {
         if !status.is_success() {
             anyhow::bail!("usage API returned {status}");
         }
-        let body = response
-            .json::<Value>()
-            .await
-            .context("parsing declarative usage JSON")?;
+        let body = models_fetch::read_success_body_limited(response, "usage API").await?;
+        let body =
+            serde_json::from_str::<Value>(&body).context("parsing declarative usage JSON")?;
         extract_usage_fields(&body, &self.spec)
     }
 }
@@ -251,7 +255,12 @@ impl ProviderUsageProbe for DeclarativeUsageProbe {
     }
 }
 
-fn resolve_usage_endpoint(endpoint: &str, provider_base_url: &str) -> Result<String> {
+fn resolve_usage_endpoint(
+    endpoint: &str,
+    provider_base_url: &str,
+    provider_id: &str,
+    allow_insecure_http: bool,
+) -> Result<String> {
     let endpoint = endpoint.trim();
     let url = if endpoint.starts_with('/') {
         if endpoint.starts_with("//") {
@@ -265,13 +274,15 @@ fn resolve_usage_endpoint(endpoint: &str, provider_base_url: &str) -> Result<Str
         }
         Url::parse(&origin)?.join(endpoint)?
     } else {
-        Url::parse(endpoint).with_context(|| {
-            format!("usage probe endpoint must be an absolute URL or root path: {endpoint}")
-        })?
+        Url::parse(endpoint).context("usage probe endpoint must be an absolute URL or root path")?
     };
-    if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("usage probe endpoint must use HTTP or HTTPS");
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("usage probe endpoint must not include credentials");
     }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("usage probe endpoint must not include a query string or fragment");
+    }
+    models_fetch::validate_provider_base_url(provider_id, url.as_str(), allow_insecure_http)?;
     Ok(url.to_string())
 }
 
@@ -606,7 +617,8 @@ mod tests {
     struct TestUsageResponse {
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
-        body: &'static str,
+        body: String,
+        chunked: bool,
     }
 
     impl TestUsageResponse {
@@ -614,7 +626,8 @@ mod tests {
             Self {
                 status: 200,
                 headers: Vec::new(),
-                body,
+                body: body.to_string(),
+                chunked: false,
             }
         }
 
@@ -622,7 +635,17 @@ mod tests {
             Self {
                 status,
                 headers: Vec::new(),
+                body: body.to_string(),
+                chunked: false,
+            }
+        }
+
+        fn oversized_chunked(body: String) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
                 body,
+                chunked: true,
             }
         }
 
@@ -663,11 +686,14 @@ mod tests {
                     "ERROR"
                 };
                 let mut raw = format!(
-                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                    response.status,
-                    status_text,
-                    response.body.len()
+                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\nconnection: close\r\n",
+                    response.status, status_text,
                 );
+                if response.chunked {
+                    raw.push_str("transfer-encoding: chunked\r\n");
+                } else {
+                    raw.push_str(&format!("content-length: {}\r\n", response.body.len()));
+                }
                 for (name, value) in response.headers {
                     raw.push_str(name);
                     raw.push_str(": ");
@@ -675,7 +701,15 @@ mod tests {
                     raw.push_str("\r\n");
                 }
                 raw.push_str("\r\n");
-                raw.push_str(response.body);
+                if response.chunked {
+                    raw.push_str(&format!(
+                        "{:X}\r\n{}\r\n0\r\n\r\n",
+                        response.body.len(),
+                        response.body
+                    ));
+                } else {
+                    raw.push_str(&response.body);
+                }
                 socket.write_all(raw.as_bytes()).await.unwrap();
             }
             requests
@@ -904,6 +938,87 @@ mod tests {
             }
             other => panic!("unexpected availability: {other:?}"),
         }
+    }
+
+    #[test]
+    fn declarative_usage_endpoint_rejects_credentials_query_and_unsafe_http() {
+        for endpoint in [
+            "https://user:secret@example.test/usage",
+            "https://example.test/usage?key=secret",
+            "/usage?key=secret",
+        ] {
+            let error =
+                resolve_usage_endpoint(endpoint, "https://example.test/v1", "custom", false)
+                    .expect_err("credential-bearing endpoint must be rejected");
+            assert!(
+                error.to_string().contains("credentials")
+                    || error.to_string().contains("query string"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains("secret"), "{error:#}");
+        }
+
+        let error = resolve_usage_endpoint(
+            "http://api.example.test/usage",
+            "https://example.test/v1",
+            "custom",
+            false,
+        )
+        .expect_err("unsafe HTTP endpoint must require an explicit opt-in");
+        assert!(error.to_string().contains("unsafe non-HTTPS"), "{error:#}");
+
+        resolve_usage_endpoint(
+            "http://127.0.0.1/usage",
+            "https://example.test/v1",
+            "custom",
+            false,
+        )
+        .expect("loopback HTTP endpoint remains available for local development");
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_oversized_content_length_before_json_parse() {
+        let mut body = String::from(r#"{"credits":1}"#);
+        body.push_str(&" ".repeat(models_fetch::MAX_PROVIDER_RESPONSE_BYTES));
+        let (usage_url, _handle) = serve_usage_responses(vec![TestUsageResponse {
+            status: 200,
+            headers: Vec::new(),
+            body,
+            chunked: false,
+        }])
+        .await;
+        let entry = declarative_entry("oversized", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("oversized", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("expected oversized response to fail");
+        };
+        assert!(
+            message.contains("usage API response body exceeded"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_probe_rejects_oversized_chunked_response_before_json_parse() {
+        let mut body = String::from(r#"{"credits":1}"#);
+        body.push_str(&" ".repeat(models_fetch::MAX_PROVIDER_RESPONSE_BYTES));
+        let (usage_url, _handle) =
+            serve_usage_responses(vec![TestUsageResponse::oversized_chunked(body)]).await;
+        let entry = declarative_entry("oversized", &usage_url, declarative_spec("/usage"));
+        let snapshot = DeclarativeUsageProbe::new(declarative_spec("/usage"))
+            .fetch("oversized", &entry)
+            .await;
+
+        let UsageAvailability::Error { message } = snapshot.availability else {
+            panic!("expected oversized response to fail");
+        };
+        assert!(
+            message.contains("usage API response body exceeded"),
+            "{message}"
+        );
     }
 
     #[test]

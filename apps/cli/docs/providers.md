@@ -48,7 +48,7 @@ cockpit models
 
 ## Declarative Usage Probes
 
-Providers can declare a `usage_probe` in their provider config to show API credits or quota with `cockpit provider usage` and `/usage`. The probe reuses the provider's resolved inference headers, so it must not contain a key or other credential. `endpoint` is either an absolute HTTP(S) URL or a root-relative path joined to the provider URL origin; `method` currently supports `get` and defaults to it. `fields` are JSON Pointer extractions in display order. Supported kinds are `credits`, `requests_remaining`, `percent`, and `text`; a `null` `requests_remaining` value is shown as pay-as-you-go.
+Providers can declare a `usage_probe` in their provider config to show API credits or quota with `cockpit provider usage` and `/usage`. The probe reuses the provider's resolved inference headers, so it must not contain a key or other credential. `endpoint` is either an absolute HTTP(S) URL or a root-relative path joined to the provider URL origin; endpoint URLs cannot contain userinfo, a query string, or a fragment. Absolute HTTP endpoints follow the provider's insecure-HTTP policy: use HTTPS unless the provider explicitly opts into insecure HTTP or the endpoint is local/loopback. `method` currently supports `get` and defaults to it. `fields` are JSON Pointer extractions in display order. Supported kinds are `credits`, `requests_remaining`, `percent`, and `text`; a `null` `requests_remaining` value is shown as pay-as-you-go.
 
 ```json
 {

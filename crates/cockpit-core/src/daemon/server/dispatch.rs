@@ -20063,6 +20063,7 @@ async fn apply_provider_mutation(
                 return Err(bad_request("provider mutation contains duplicate ids"));
             }
             validate_daemon_provider_url(&upsert.entry.url)?;
+            validate_daemon_usage_probe(&upsert.entry)?;
             validate_unique_provider_header_names(&upsert.entry.headers)?;
             if upsert.header_secrets.len() != upsert.entry.headers.len() {
                 return Err(bad_request(
@@ -21310,6 +21311,7 @@ async fn stage_and_recover_provider_batch(
             }
         }
         validate_daemon_provider_url(&upsert.entry.url)?;
+        validate_daemon_usage_probe(&upsert.entry)?;
         validate_unique_provider_header_names(&upsert.entry.headers)?;
         ensure_provider_credential_reference_available(ctx, &upsert.entry).await?;
         let staged_names = staged
@@ -22204,9 +22206,8 @@ fn provider_usage_view(
             plan: plan.map(|value| redact_provider_response_text(&value, store, config, env)),
             windows: windows
                 .into_iter()
-                .enumerate()
-                .map(|(index, window)| ProviderUsageWindowView {
-                    label: format!("window {}", index + 1),
+                .map(|window| ProviderUsageWindowView {
+                    label: redact_provider_response_text(&window.label, store, config, env),
                     used_percent: window.used_percent,
                     reset_at: window.reset_at,
                     detail: window
@@ -23316,6 +23317,7 @@ async fn recover_provider_journal_file_bounded(
                 })?)
                 .map_err(internal)?;
             validate_daemon_provider_url(&entry.url)?;
+            validate_daemon_usage_probe(&entry)?;
             validate_unique_provider_header_names(&entry.headers)?;
             ProviderJournalFileAction::Save {
                 path,
@@ -23377,6 +23379,7 @@ async fn recover_provider_journal_file_bounded(
                     return Err(bad_request("provider batch journal contains an empty id"));
                 }
                 validate_daemon_provider_url(&entry.url)?;
+                validate_daemon_usage_probe(&entry)?;
                 validate_unique_provider_header_names(&entry.headers)?;
             }
             ProviderJournalFileAction::Batch {
@@ -23774,6 +23777,7 @@ async fn provider_config_save_under_lock(
     // Defense in depth: typed in-process callers must not be able to bypass
     // the protocol ingress validator and journal a credential-bearing URL.
     validate_daemon_provider_url(&entry.url)?;
+    validate_daemon_usage_probe(&entry)?;
     validate_unique_provider_header_names(&entry.headers)?;
     recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
     if header_secrets.len() != entry.headers.len() {
@@ -26064,6 +26068,45 @@ fn validate_daemon_provider_url(url: &str) -> std::result::Result<(), ErrorPaylo
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(bad_request(
             "provider URL must not include a query string or fragment",
+        ));
+    }
+    Ok(())
+}
+
+/// Usage probe URLs carry no credentials of their own: the probe reuses the
+/// provider's resolved headers. Validate every daemon persistence path, while
+/// retaining runtime validation for hand-authored config that bypasses RPCs.
+fn validate_daemon_usage_probe(
+    entry: &crate::config::providers::ProviderEntry,
+) -> std::result::Result<(), ErrorPayload> {
+    let Some(probe) = &entry.usage_probe else {
+        return Ok(());
+    };
+    let endpoint = probe.endpoint.trim();
+    let parsed = if endpoint.starts_with('/') {
+        if endpoint.starts_with("//") {
+            return Err(bad_request(
+                "usage probe endpoint path must not replace the provider origin",
+            ));
+        }
+        reqwest::Url::parse("https://usage-probe.invalid")
+            .and_then(|origin| origin.join(endpoint))
+            .map_err(|_| bad_request("usage probe endpoint path is invalid"))?
+    } else {
+        reqwest::Url::parse(endpoint)
+            .map_err(|_| bad_request("usage probe endpoint must be an absolute URL or root path"))?
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(bad_request("usage probe endpoint must use HTTP or HTTPS"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(bad_request(
+            "usage probe endpoint must not include credentials",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(bad_request(
+            "usage probe endpoint must not include a query string or fragment",
         ));
     }
     Ok(())

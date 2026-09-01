@@ -18,22 +18,30 @@ fn mangen_generates_and_hides_hidden() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<std::collections::BTreeSet<_>>();
     for command in [
-        "ask", "run", "agent", "provider", "setup", "models", "daemon", "doctor", "session",
-        "trust", "export", "config", "init",
+        "ask",
+        "run",
+        "agent",
+        "code",
+        "assistant",
+        "computer",
+        "assistants",
+        "provider",
+        "setup",
+        "models",
+        "daemon",
+        "doctor",
+        "session",
+        "trust",
+        "export",
+        "config",
+        "init",
     ] {
         assert!(
             pages.contains(&format!("cockpit-{command}.1")),
             "missing {command} man page"
         );
     }
-    for internal in [
-        "assistant",
-        "invocation",
-        "mcp",
-        "schedule",
-        "skill",
-        "stats",
-    ] {
+    for internal in ["invocation", "mcp", "schedule", "skill", "stats"] {
         assert!(
             !pages.contains(&format!("cockpit-{internal}.1")),
             "unexpected public {internal} man page"

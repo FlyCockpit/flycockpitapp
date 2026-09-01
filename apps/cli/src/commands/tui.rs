@@ -79,6 +79,13 @@ pub async fn run_mode(
         return Ok(());
     }
 
+    // Onboarding is user-global state. Establish its persistent owner before
+    // workspace trust is consulted so the first-run configuration survives
+    // this TUI process and cannot be gated by the opened workspace.
+    crate::daemon::client::ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for interactive onboarding")?;
+
     let trust = prepare_tui_workspace_trust(project)?;
 
     let (lifecycle, lifecycle_task) = lifecycle_composition();

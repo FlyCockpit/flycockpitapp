@@ -3,7 +3,6 @@
   "profile": "local-v0.1",
   "remoteDaemonWorkers": ["org_sync", "remote_audit_upload", "connector", "remote_outbox_worker"],
   "localProtocolTagDenylist": [
-    "apply_setup_wizard",
     "delete_provider_config",
     "get_connector_state",
     "get_flycockpit_account",

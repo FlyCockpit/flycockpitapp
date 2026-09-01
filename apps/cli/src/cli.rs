@@ -91,6 +91,18 @@ pub enum PublicCommand {
     Run(RunArgs),
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Start an interactive Code session.
+    Code,
+    /// Start an interactive Assistant session.
+    Assistant,
+    /// Start an interactive Computer session.
+    Computer,
+    /// Manage legacy persistent assistant definitions and media accounting.
+    ///
+    /// This is deliberately separate from `cockpit assistant`, which is the
+    /// interactive Assistant-mode entry point.
+    #[command(subcommand)]
+    Assistants(AssistantCommand),
     #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
     Setup(SetupArgs),
@@ -135,6 +147,10 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Ask(args) => Command::Ask(args),
                 PublicCommand::Run(args) => Command::Run(args),
                 PublicCommand::Agent(args) => Command::Agent(args),
+                PublicCommand::Code => Command::Code,
+                PublicCommand::Assistant => Command::Assistant,
+                PublicCommand::Computer => Command::Computer,
+                PublicCommand::Assistants(args) => Command::Assistants(args),
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
@@ -1806,26 +1822,21 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_mode_entries_and_legacy_assistant_management_parse_distinctly() {
+    fn public_modes_and_legacy_assistant_management_map_to_runtime_commands() {
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "code"]).unwrap().command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "code"]).unwrap()).command,
             Some(Command::Code)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistant"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistant"]).unwrap()).command,
             Some(Command::Assistant)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "computer"])
-                .unwrap()
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "computer"]).unwrap()).command,
             Some(Command::Computer)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cockpit", "assistants", "list"])
-                .unwrap()
+            Cli::from(PublicCli::try_parse_from(["cockpit", "assistants", "list"]).unwrap())
                 .command,
             Some(Command::Assistants(AssistantCommand::List))
         ));

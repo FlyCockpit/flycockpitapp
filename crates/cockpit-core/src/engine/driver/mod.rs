@@ -743,27 +743,10 @@ const ID_INJECTION_EDIT: &str = "inj_edit";
 
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 
-/// Path to the global `config.json` to write override settings
-/// into: the first existing home-scoped config dir, else the first
-/// creatable one (scaffolded). Errors only when no home dir is locatable.
+/// Path to the user-owned global `config.json` for override settings.
+/// Workspace trust never selects or gates this file.
 fn global_extended_config_path() -> Result<std::path::PathBuf> {
-    use crate::config::dirs::{
-        CONFIG_FILE, ConfigDirKind, creatable_config_dirs, discover_config_dirs,
-    };
-    // Prefer an existing home-scoped layer.
-    if let Some(dir) = discover_config_dirs(std::path::Path::new("."))
-        .into_iter()
-        .find(|d| matches!(d.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
-    {
-        return Ok(dir.path.join(CONFIG_FILE));
-    }
-    // Otherwise scaffold the first creatable home location.
-    let dir = creatable_config_dirs()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no home directory to write global config into"))?;
-    std::fs::create_dir_all(&dir.path)?;
-    Ok(dir.path.join(CONFIG_FILE))
+    crate::config::dirs::global_config_file()
 }
 
 /// Handle the session worker keeps to cancel the in-flight user-message
@@ -9407,6 +9390,25 @@ impl Driver {
             self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
+        // `system` contains model-trust-dependent leak-report steering.  Build
+        // it before publishing the replacement agent so a later best-effort
+        // tool-surface rebuild cannot leave an untrusted model with the old
+        // trusted model's prompt.
+        let prompt_args = self.rebuild_frame_args(frame_idx, new_model.clone(), selection, None);
+        let role_prompt = refreshed.definition.as_ref().map_or_else(
+            || refreshed.role_prompt.clone(),
+            |definition| {
+                definition
+                    .resolved_prompt_for_model(new_model.provider_id(), new_model.model_id_ref())
+                    .to_string()
+            },
+        );
+        refreshed.system = crate::engine::builtin::compose_system_prompt_for_model(
+            &role_prompt,
+            new_model.as_ref(),
+            &prompt_args,
+        );
+        refreshed.role_prompt = role_prompt;
         refreshed.model = new_model;
         // Posture (tool_steering/capabilities/context_policy) comes from the
         // agent def and is model-independent, so a model swap preserves it.

@@ -17,7 +17,7 @@ use crate::engine::agent::{
     InferenceOutcomeRecord, TurnEvent, prepare_inference_journal, record_inference_outcome,
     settle_inference_journal_error, settle_inference_journal_success,
 };
-use crate::engine::message::{AssistantContent, Message, ToolDefinition};
+use crate::engine::message::{AssistantContent, Message, ToolDefinition, collect_tool_calls};
 use crate::engine::model::{Model, ModelParams, UtilityCallSite};
 use crate::session::{Session, SessionEventModelFrame};
 
@@ -46,6 +46,7 @@ pub(crate) struct VerificationInferenceInput<'a> {
     pub session: Arc<Session>,
     pub model: &'a Model,
     pub config: &'a crate::daemon::session_worker::SessionConfigHandle,
+    pub interrupts: &'a crate::engine::interrupt::InterruptHub,
     pub system: &'a str,
     pub history: &'a [Message],
     pub prompt: &'a str,
@@ -58,6 +59,36 @@ pub(crate) struct VerificationInferenceInput<'a> {
     /// the timeout so a deadline cannot drop a provider future while leaving
     /// either audit journal pending.
     pub deadline_unix_ms: Option<i64>,
+}
+
+/// Build the exact untrusted safety surface used by verification requests.
+///
+/// Keeping this materialization separate makes the pre-dispatch budget
+/// estimate use the same system prompt and tool definitions as the provider
+/// handoff below. The boolean is the single eligibility predicate used again
+/// when classifying the response through the sensitive-turn barrier.
+pub(crate) fn effective_verification_route(
+    system: &str,
+    model: &Model,
+    tools: &[ToolDefinition],
+) -> (String, Vec<ToolDefinition>, bool) {
+    effective_verification_route_for_trust(system, model.is_trusted(), tools)
+}
+
+fn effective_verification_route_for_trust(
+    system: &str,
+    model_is_trusted: bool,
+    tools: &[ToolDefinition],
+) -> (String, Vec<ToolDefinition>, bool) {
+    let mut system = system.to_string();
+    crate::engine::builtin::append_untrusted_leak_report_steering(&mut system, model_is_trusted);
+    let mut tools = tools.to_vec();
+    let report_leak_eligible =
+        crate::leak_report::route_advertises_report_leak(model_is_trusted, &tools);
+    if report_leak_eligible {
+        tools.push(crate::leak_report::report_leak_tool_definition());
+    }
+    (system, tools, report_leak_eligible)
 }
 
 pub(crate) async fn journaled_verification_inference(
@@ -76,25 +107,20 @@ pub(crate) async fn journaled_verification_inference(
     if input.site.pins_temperature_zero() {
         params.temperature = Some(0.0);
     }
+    let (system, tools, report_leak_eligible) =
+        effective_verification_route(input.system, input.model, input.tools);
     let prompt = Message::user(input.prompt);
-    let payload = input.model.assemble_dispatch_request(
-        input.system,
-        input.history,
-        &prompt,
-        input.tools,
-        &params,
-    )?;
+    let payload =
+        input
+            .model
+            .assemble_dispatch_request(&system, input.history, &prompt, &tools, &params)?;
     // Verification prompts intentionally contain raw candidate args and
     // critiques. They are provider-visible but must never become an ordinary
     // inference payload row or a protected-redaction-history literal. The
     // normal durable-before-handoff barrier receives this digest-only audit
     // projection; the provider call below still receives the raw inputs.
-    let audit_projection = verification_audit_projection(
-        &payload,
-        input.site,
-        input.history.len(),
-        input.tools.len(),
-    )?;
+    let audit_projection =
+        verification_audit_projection(&payload, input.site, input.history.len(), tools.len())?;
     let mut journal = prepare_inference_journal(
         &input.session,
         input.model,
@@ -143,10 +169,10 @@ pub(crate) async fn journaled_verification_inference(
     let completion = match tokio::time::timeout(
         timeout,
         input.model.complete_captured(
-            input.system,
+            &system,
             input.history,
             prompt,
-            input.tools,
+            &tools,
             params,
             input.agent_name,
             None,
@@ -174,7 +200,7 @@ pub(crate) async fn journaled_verification_inference(
         })),
     };
 
-    let ((_, choice, usage), _, timing) = match completion {
+    let ((_, mut choice, usage), _, timing) = match completion {
         Ok(completion) => completion,
         Err(error) => {
             let (tx, _rx) = mpsc::channel::<TurnEvent>(1);
@@ -217,6 +243,40 @@ pub(crate) async fn journaled_verification_inference(
     if !settle_inference_journal_success(&mut journal).await {
         tracing::warn!("verification inference journal reconciliation failed");
     }
+    let buffered_calls = collect_tool_calls(&choice);
+    if crate::engine::agent::sensitive_turn::sensitive_turn_engages(
+        report_leak_eligible,
+        &buffered_calls,
+    ) {
+        let key_resolver = input.session.redaction_key_resolver().clone();
+        let host = crate::engine::agent::sensitive_turn::LiveSensitiveContainmentHost {
+            db: &input.session.db,
+            key_resolver: key_resolver.as_ref(),
+            interrupts: input.interrupts,
+            session: input.session.as_ref(),
+            provenance: crate::db::protected_leak_records::LeakProvenance {
+                provider_id: Some(input.model.provider_id().to_owned()),
+                model_id: Some(input.model.model_id_ref().to_owned()),
+                generation: None,
+                connector_id: None,
+            },
+            session_id: input.session.id.to_string(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let outcome =
+            crate::engine::agent::sensitive_turn::run_sensitive_turn_barrier(&host, buffered_calls)
+                .await;
+        for result in outcome.sensitive_results {
+            tracing::info!(
+                target: "engine",
+                agent = input.agent_name,
+                state = ?outcome.state,
+                outcome = %result.model_output,
+                "verification report_leak containment barrier classified the turn"
+            );
+        }
+        choice.clear();
+    }
     if let Err(error) = input
         .session
         .record_event_with_model_frame(
@@ -257,6 +317,44 @@ mod tests {
     use super::*;
 
     const CANDIDATE_SENTINEL: &str = "candidate-body-S3NT1N3L-must-not-persist";
+
+    #[test]
+    fn untrusted_verification_route_adds_leak_steering_and_containment_tool() {
+        let original = ToolDefinition {
+            name: "verification_candidate".to_string(),
+            description: "return a candidate".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let (system, tools, eligible) =
+            effective_verification_route_for_trust("verification system", false, &[original]);
+
+        assert!(eligible);
+        assert!(system.contains("`report_leak`"));
+        assert!(system.contains("base64"));
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1].name, crate::leak_report::REPORT_LEAK_TOOL);
+    }
+
+    #[test]
+    fn trusted_verification_route_does_not_advertise_leak_containment() {
+        let original = ToolDefinition {
+            name: "verification_candidate".to_string(),
+            description: "return a candidate".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let (system, tools, eligible) = effective_verification_route_for_trust(
+            "verification system",
+            true,
+            &[original.clone()],
+        );
+
+        assert!(!eligible);
+        assert_eq!(system, "verification system");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, original.name);
+        assert_eq!(tools[0].description, original.description);
+        assert_eq!(tools[0].parameters, original.parameters);
+    }
 
     #[test]
     fn verification_audit_projection_contains_only_classification_digest_and_counts() {

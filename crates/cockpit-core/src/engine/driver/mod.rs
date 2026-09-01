@@ -776,6 +776,9 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
 #[derive(Clone)]
 pub struct CancelHandle {
     current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// The shared token is also used by deadlines and terminal invocation
+    /// state.  This bit is set only by an interactive CancelTurn.
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CancelHandle {
@@ -784,6 +787,8 @@ impl CancelHandle {
     /// and concurrently from multiple callers.
     pub fn cancel(&self) {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
+            self.user_requested
+                .store(true, std::sync::atomic::Ordering::Release);
             token.cancel();
         }
     }
@@ -795,11 +800,14 @@ impl CancelHandle {
 /// fresh first press.
 struct CancelSlotGuard {
     slot: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for CancelSlotGuard {
     fn drop(&mut self) {
         *crate::sync::lock_or_recover(&self.slot) = None;
+        self.user_requested
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1322,6 +1330,7 @@ pub struct Driver {
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_cancel_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Session-owned waiters for backgroundable tools that have yielded their
     /// foreground turn. Unlike `cancel_current`, this registry survives turn
     /// boundaries and is drained by the session worker.
@@ -2317,6 +2326,7 @@ impl Driver {
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
+            user_cancel_requested: self.user_cancel_requested.clone(),
             adopted_processes: self.adopted_processes.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
@@ -2688,6 +2698,7 @@ impl Driver {
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
+            user_cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
             approver: None,
             lsp: None,
@@ -4365,6 +4376,7 @@ impl Driver {
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
             current: self.cancel_current.clone(),
+            user_requested: self.user_cancel_requested.clone(),
         }
     }
 
@@ -4796,9 +4808,12 @@ impl Driver {
         self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -10033,9 +10048,12 @@ impl Driver {
         // scheduler owns this token too, so its callback timeout/drop aborts
         // the provider call instead of merely abandoning the response waiter.
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let active_target_id = self.active_queue_target_id();
@@ -11829,9 +11847,12 @@ impl Driver {
         // so a stale token can never affect a later run.
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         // Run-invocation deadline: child cancel token so expiry aborts provider/
@@ -11925,9 +11946,6 @@ impl Driver {
             .map(|stored| stored.source_text.clone())
             .unwrap_or_else(|| user_text.clone());
         let raw_user_text = canonical_user_text.clone();
-        let composer_restore_text = display_text
-            .clone()
-            .unwrap_or_else(|| raw_user_text.clone());
         let event_data = user_message_event_data(UserMessageEventData {
             text: &canonical_user_text,
             display_text: display_text.as_deref(),
@@ -12565,7 +12583,7 @@ impl Driver {
         // after the foreground prompt is assembled below, so its prefix is the
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
-        let title_progress_before_turn = self.session.title_progress_snapshot();
+        let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
         let (title_action, mut metadata_work) = if use_session_model_metadata {
@@ -13133,6 +13151,9 @@ impl Driver {
                             .model
                             .resolve_reasoning_params(&self.config.providers())
                             .is_some()
+                        && self
+                            .user_cancel_requested
+                            .load(std::sync::atomic::Ordering::Acquire)
                         && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
                     if retractable_direct_turn
                         && let Some(seq) = recorded_user_seq
@@ -13152,14 +13173,18 @@ impl Driver {
                         } else {
                             None
                         };
-                        self.session.restore_title_progress_after_retract(
+                        if let Err(error) = self.session.restore_title_progress_after_retract(
                             title_progress_before_turn,
                             generated_title.as_deref(),
-                        );
+                        ).await {
+                            tracing::warn!(%error, "auto_title: retract rollback lost");
+                        }
+                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
+                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                        }
                         let _ = tx
                             .send(TurnEvent::UserMessageRemoved {
                                 seq,
-                                text: composer_restore_text.clone(),
                             })
                             .await;
                     }

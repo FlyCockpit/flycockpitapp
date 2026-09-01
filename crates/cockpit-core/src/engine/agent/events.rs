@@ -357,8 +357,9 @@ pub enum TurnEvent {
         preflight_cleaned: Option<String>,
     },
     /// The latest durable user row was retracted by an initial-thinking
-    /// cancellation. Clients remove `seq` and restore the authored `text`.
-    UserMessageRemoved { seq: i64, text: String },
+    /// cancellation. Clients remove `seq`; the local optimistic row supplies
+    /// the composer text, so this event never fans out artifact-sized input.
+    UserMessageRemoved { seq: i64 },
     /// One or more daemon-queued user messages were drained and folded into
     /// the next model request. This is the authoritative transcript signal for
     /// queued folds; clients must not infer it from `ThinkingStarted`.

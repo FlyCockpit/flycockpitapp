@@ -1184,8 +1184,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::UserMessageRemoved {
             session_id: _,
             seq: _,
-            text,
-        } => scrub_string(text, redact),
+        } => {},
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
             text,

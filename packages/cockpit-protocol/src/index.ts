@@ -2852,7 +2852,6 @@ const userMessageRemovedDataSchema = z
   .object({
     session_id: uuidSchema,
     seq: safeI64NumberSchema,
-    text: z.string(),
   })
   .passthrough();
 export const userMessageTerminalDispositionSchema = z.enum([

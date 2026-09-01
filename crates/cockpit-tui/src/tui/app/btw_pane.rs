@@ -309,15 +309,17 @@ impl BtwPane {
                     .collect::<std::collections::HashSet<_>>();
                 remove_correlated_optimistic_user_history(&mut self.history, &ids);
             }
-            TurnEvent::UserMessageRemoved { seq, text } => {
-                remove_durable_user_history(&mut self.history, seq);
+            TurnEvent::UserMessageRemoved { seq } => {
+                let restored_text = remove_durable_user_history(&mut self.history, seq);
                 self.pending = None;
                 self.active_display_attempt_id = None;
-                let draft = self.composer.text().to_owned();
-                if draft.is_empty() {
-                    self.composer.replace_buffer(text);
-                } else {
-                    self.composer.replace_buffer(format!("{text}\n\n{draft}"));
+                if let Some(text) = restored_text {
+                    let draft = self.composer.text().to_owned();
+                    if draft.is_empty() {
+                        self.composer.replace_buffer(text);
+                    } else {
+                        self.composer.replace_buffer(format!("{text}\n\n{draft}"));
+                    }
                 }
             }
             TurnEvent::ThinkingStarted { agent, .. } => {

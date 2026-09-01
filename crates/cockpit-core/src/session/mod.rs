@@ -239,6 +239,8 @@ pub(crate) struct TitleProgressSnapshot {
     user_content_turns: usize,
     title_stage: u8,
     title_nudge_slot_pending: u8,
+    title_recovery_nudge_state: crate::db::sessions::TitleRecoveryNudgeState,
+    title_failure_noticed: bool,
 }
 
 /// Work due for the cache-reusing, same-model metadata fork. The title slots

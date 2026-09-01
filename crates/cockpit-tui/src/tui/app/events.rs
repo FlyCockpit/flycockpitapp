@@ -87,11 +87,18 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
 
 /// Remove the exact durable user row named by a retract event, together with
 /// its adjacent tag-expansion presentation rows.
-pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(history: &mut H, seq: i64) -> bool {
+pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(
+    history: &mut H,
+    seq: i64,
+) -> Option<String> {
     let Some(index) = history.entries().iter().position(
         |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
     ) else {
-        return false;
+        return None;
+    };
+    let text = match history.entries().get(index) {
+        Some(HistoryEntry::User { text, .. }) => text.clone(),
+        _ => return None,
     };
     while history
         .entries()
@@ -114,7 +121,7 @@ pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(history: &mut H,
         preceding -= 1;
         history.remove_entry(preceding);
     }
-    true
+    Some(text)
 }
 
 /// Merge a daemon replay into an already-rendered live transcript. Durable
@@ -1249,19 +1256,21 @@ impl App {
                     }
                 }
             }
-            TurnEvent::UserMessageRemoved { seq, text } => {
-                remove_durable_user_history(&mut self.history, seq);
+            TurnEvent::UserMessageRemoved { seq } => {
+                let restored_text = remove_durable_user_history(&mut self.history, seq);
                 // Reasoning is provisional and has no durable value in this
                 // cancel window. Drop it instead of finalizing a thinking chip
                 // when the following AgentIdle arrives.
                 self.pending = None;
                 self.active_display_attempt_id = None;
                 self.reconnect = None;
-                let draft = self.composer.text().to_owned();
-                if draft.is_empty() {
-                    self.replace_composer_buffer(text);
-                } else {
-                    self.replace_composer_buffer(format!("{text}\n\n{draft}"));
+                if let Some(text) = restored_text {
+                    let draft = self.composer.text().to_owned();
+                    if draft.is_empty() {
+                        self.replace_composer_buffer(text);
+                    } else {
+                        self.replace_composer_buffer(format!("{text}\n\n{draft}"));
+                    }
                 }
             }
             TurnEvent::SessionPersistFailed {
@@ -4398,10 +4407,7 @@ mod tests {
         });
         app.replace_composer_buffer("new draft");
 
-        app.apply_event(TurnEvent::UserMessageRemoved {
-            seq: 41,
-            text: "cancel me".to_string(),
-        });
+        app.apply_event(TurnEvent::UserMessageRemoved { seq: 41 });
         app.apply_event(TurnEvent::AgentIdle {
             turn_id: None,
             reason: cockpit_proto::IdleReason::Interrupted,

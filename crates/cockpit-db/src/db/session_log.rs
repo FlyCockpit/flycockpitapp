@@ -7,7 +7,7 @@
 //!   assembled request body keyed by the same `call_id` the
 //!   `inference_calls` metadata row uses.
 //! - [`Db::insert_session_event`] appends one row to the per-session
-//!   event timeline. `seq` (the AUTOINCREMENT rowid) is globally
+//!   event timeline. `seq` (the rowid) is globally
 //!   monotonic — the authoritative ordering across the whole fork tree —
 //!   and `ts_ms` is millisecond-resolution for human reading.
 //!
@@ -1378,9 +1378,31 @@ impl Db {
     /// message. This is the sole narrow exception to the append-only ledger:
     /// the caller has proved that the directly answering turn emitted neither
     /// response text nor a tool call. The predicate and delete are one SQL
-    /// statement so a concurrent newer human message makes it lose safely.
+    /// transaction so the cascade and every external-blob cleanup intent
+    /// commit together. SQLite may reuse the tail rowid on resend, which is
+    /// intentional: a cancelled/re-sent turn must have the same per-session
+    /// sequence shape as one send.
     pub async fn remove_latest_user_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
+            let mut blob_paths = std::collections::BTreeSet::new();
+            {
+                let mut statement = conn.prepare(
+                    "SELECT provenance_json FROM session_text_artifacts
+                      WHERE session_id=?1 AND owner_event_seq=?2",
+                )?;
+                for provenance in statement
+                    .query_map(params![session_id.to_string(), seq], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                {
+                    let provenance = provenance?;
+                    let value: Value = serde_json::from_str(&provenance)
+                        .context("parsing retract artifact provenance")?;
+                    if let Some(path) = value.get("blob_path").and_then(Value::as_str) {
+                        blob_paths.insert(path.to_owned());
+                    }
+                }
+            }
             let removed = conn
                 .execute(
                     "DELETE FROM session_events
@@ -1397,6 +1419,27 @@ impl Db {
                     params![session_id.to_string(), seq],
                 )
                 .context("removing latest retractable user message")?;
+            if removed == 1 {
+                for path in blob_paths {
+                    let has_survivor: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM session_text_artifacts
+                          WHERE json_extract(provenance_json, '$.blob_path')=?1)",
+                        [&path],
+                        |row| row.get(0),
+                    )?;
+                    if !has_survivor {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO text_artifact_blob_cleanup_intents
+                             (blob_path,session_id,created_at_unix_ms) VALUES(?1,?2,?3)",
+                            params![
+                                path,
+                                session_id.to_string(),
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                    }
+                }
+            }
             Ok(removed == 1)
         })
         .await
@@ -2042,7 +2085,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn retract_removes_only_the_latest_user_message_without_reusing_seq() {
+    async fn retract_removes_only_the_latest_user_message_and_reuses_the_tail_seq() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         let first = db
@@ -2055,30 +2098,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let notice = db
-            .insert_session_event(
-                session.session_id,
-                SessionEventKind::Notice,
-                Some("Build"),
-                None,
-                &json!({"text": "display-only"}),
-            )
-            .await
-            .unwrap();
-
         assert!(
             db.remove_latest_user_message(session.session_id, first)
                 .await
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             db.list_session_events(session.session_id)
                 .await
                 .unwrap()
-                .iter()
-                .map(|event| event.seq)
-                .collect::<Vec<_>>(),
-            vec![notice]
+                .is_empty()
         );
         let resent = db
             .insert_session_event(
@@ -2090,9 +2119,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            resent > notice,
-            "AUTOINCREMENT replay cursors must stay monotonic"
+        assert_eq!(
+            resent, first,
+            "a re-send must exactly replace its retract slot"
         );
 
         let newer = db

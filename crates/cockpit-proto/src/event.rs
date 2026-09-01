@@ -962,11 +962,11 @@ pub enum Event {
     },
     /// The latest durable user message was removed because its directly
     /// answering assistant turn was cancelled before visible text or a tool
-    /// call. `text` is the authored composer draft clients restore.
+    /// call. The cancelling client restores from its local optimistic row;
+    /// source text is deliberately absent from this broadcast.
     UserMessageRemoved {
         session_id: Uuid,
         seq: i64,
-        text: String,
     },
     /// One or more daemon-queued user messages were drained and folded into a
     /// model request. Carries stable queue ids plus the persisted timeline seq

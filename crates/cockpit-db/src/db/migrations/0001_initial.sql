@@ -2783,14 +2783,15 @@ CREATE INDEX packages_source_url ON packages(source_url);
 --     an export of a hung/failed turn still contains the attempt.
 --
 --   * session_events — a per-session event timeline. `seq` is a globally
---     monotonic INTEGER (AUTOINCREMENT rowid) — the authoritative sort
+--     monotonic INTEGER rowid — the authoritative sort
 --     and correlation key across the whole fork tree. `ts_ms` is
 --     millisecond resolution. The `type` discriminant aligns with the
 --     engine `TurnEvent` vocabulary; per-type fields ride in `data_json`
 --     so the schema stays stable as the event set grows.
 --     Rows are append-only except for the atomic cancel-before-response
---     retraction of the latest user_message. AUTOINCREMENT is intentionally
---     retained: removed ids are never reused, preserving replay cursors.
+--     retraction of the latest user_message. The tail rowid is deliberately
+--     reusable after that retraction so cancellation + resend is identical to
+--     one accepted send.
 
 -- One row per DISPATCHED TARGET ATTEMPT of a logical inference call. The
 -- primary attempt is ordinal 0; each backup/failover attempt shares the logical
@@ -2825,7 +2826,7 @@ CREATE INDEX idx_ireq_goal_provenance
     ON inference_requests (goal_id, goal_attempt_generation);
 
 CREATE TABLE session_events (
-    seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- globally monotonic order
+    seq         INTEGER PRIMARY KEY, -- globally monotonic except a retract tail
     session_id  TEXT    NOT NULL,
     ts_ms       INTEGER NOT NULL,                  -- epoch milliseconds
     type        TEXT    NOT NULL CHECK (type IN (

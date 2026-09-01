@@ -4433,7 +4433,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             client_submission_ids,
             preflight_cleaned,
         },
-        UserMessageRemoved { seq, text, .. } => TurnEvent::UserMessageRemoved { seq, text },
+        UserMessageRemoved { seq, .. } => TurnEvent::UserMessageRemoved { seq },
         QueuedUserMessagesFolded {
             text,
             display_text,
@@ -7070,13 +7070,12 @@ mod tests {
         let event = proto::Event::UserMessageRemoved {
             session_id,
             seq: 17,
-            text: "restore me".to_string(),
         };
         assert_eq!(event_session(&event), Some(session_id));
         assert_eq!(event_persisted_seq(&event), None);
         assert!(matches!(
             proto_event_to_turn_event(event),
-            Some(TurnEvent::UserMessageRemoved { seq: 17, text }) if text == "restore me"
+            Some(TurnEvent::UserMessageRemoved { seq: 17 })
         ));
     }
 

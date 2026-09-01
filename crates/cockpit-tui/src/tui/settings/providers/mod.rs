@@ -1088,7 +1088,15 @@ impl SettingsDialog {
         let onboarding_validation = self
             .page
             .downcast_ref::<ProvidersPage>()
-            .is_some_and(|page| matches!(page, ProvidersPage::Add(state) if state.onboarding && state.is_step("test-key")));
+            .is_some_and(|page| {
+                matches!(
+                    page,
+                    ProvidersPage::Add(state)
+                        if state.onboarding
+                            && state.is_step("test-key")
+                            && state.saved_provider_id.as_deref() == Some(provider_id)
+                )
+            });
         let live_validation_succeeded = matches!(
             &result,
             Ok(FetchOutcome::Models { .. } | FetchOutcome::Unsupported)
@@ -1154,17 +1162,22 @@ impl SettingsDialog {
         }) = result
         {
             if self.config.providers.contains_key(provider_id) {
-                self.clear_fetch_handle(provider_id);
-                self.page = super::providers_page(ProvidersPage::FetchFallbackPrompt(
-                    FetchFallbackPromptState {
-                        provider_id: provider_id.to_string(),
-                        models,
-                        catalog,
-                        reason: redact_model_fetch_reason(reason),
-                        cursor: 0,
-                    },
-                ));
-                return;
+                let reason = redact_model_fetch_reason(reason);
+                if onboarding_validation {
+                    message = format!("live validation unavailable: {reason}");
+                } else {
+                    self.clear_fetch_handle(provider_id);
+                    self.page = super::providers_page(ProvidersPage::FetchFallbackPrompt(
+                        FetchFallbackPromptState {
+                            provider_id: provider_id.to_string(),
+                            models,
+                            catalog,
+                            reason,
+                            cursor: 0,
+                        },
+                    ));
+                    return;
+                }
             }
         } else if self.config.providers.contains_key(provider_id) {
             match result {

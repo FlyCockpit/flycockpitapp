@@ -1224,7 +1224,9 @@ impl Session {
         provider_id: &str,
         model_id: &str,
         env: &std::collections::HashMap<String, String>,
-    ) -> Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>> {
+    ) -> anyhow::Result<
+        Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>>,
+    > {
         let resolved = crate::audio_transcription::transport::resolve_vetted_egress(
             self,
             config,
@@ -1232,7 +1234,7 @@ impl Session {
             model_id,
             env,
         )
-        .await
+        .await?
         .and_then(|egress| {
             self.external_journal().map(|journal| {
                 Arc::new(
@@ -1257,7 +1259,7 @@ impl Session {
                 dispatches.remove(&key);
             }
         }
-        resolved
+        Ok(resolved)
     }
 
     pub(crate) fn set_message_media_authority(
@@ -1475,6 +1477,49 @@ impl Session {
             }
         }
         reresolved_any
+    }
+
+    /// Force-refresh this provider's global auth command, if configured.
+    /// Unlike the legacy named-command boolean seam above, command execution
+    /// and JSON failures are returned so a rejected request surfaces the auth
+    /// failure instead of silently falling back to its original 401.
+    pub(crate) async fn refresh_provider_auth_command(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+        provider_id: &str,
+        env: &std::collections::HashMap<String, String>,
+        rejected_refresh_generation: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let Some(entry) = providers.providers.get(provider_id) else {
+            return Ok(false);
+        };
+        if entry.auth_command.is_none() {
+            return Ok(false);
+        }
+        let rejected_refresh_generation = {
+            #[cfg(not(test))]
+            {
+                Some(rejected_refresh_generation.context(
+                    "command-authenticated model is missing the credential generation used for its rejection",
+                )?)
+            }
+            #[cfg(test)]
+            {
+                rejected_refresh_generation
+            }
+        };
+        let store = self.provider_credential_store(providers)?;
+        crate::auth::command::resolve(
+            provider_id,
+            entry,
+            store,
+            &|name| env.get(name).cloned(),
+            true,
+            rejected_refresh_generation,
+        )
+        .await
+        .map_err(crate::auth::command::refresh_failure)?;
+        Ok(true)
     }
 
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]

@@ -449,7 +449,7 @@ pub(crate) async fn turn_toolbox(
             agent.model.model_id_ref(),
         );
         toolbox = toolbox.activate_dormant_direct_native_media(availability);
-        if session
+        match session
             .compose_transcription_dispatch(
                 config,
                 agent.model.provider_id(),
@@ -457,9 +457,15 @@ pub(crate) async fn turn_toolbox(
                 &env,
             )
             .await
-            .is_none()
         {
-            toolbox = toolbox.deactivate_direct_native_media_for_transcription_dispatch();
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                toolbox = toolbox.deactivate_direct_native_media_for_transcription_dispatch();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "transcription provider authentication is unavailable");
+                toolbox = toolbox.deactivate_direct_native_media_for_transcription_authentication();
+            }
         }
     } else {
         toolbox = toolbox.deactivate_direct_native_media_tools();

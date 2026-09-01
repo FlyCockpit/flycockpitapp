@@ -140,7 +140,9 @@ describe("native session event helpers", () => {
         session_id: sessionId,
         max_seq: 9,
         removed_user_message_seqs: [7],
-        entries: [{ role: "assistant", seq: 8, agent: "Build", text: "retained", ts_ms: 1700000000001 }],
+        entries: [
+          { role: "assistant", seq: 8, agent: "Build", text: "retained", ts_ms: 1700000000001 },
+        ],
       },
     });
     expect(replay.state.history.map((entry) => entry.id)).toEqual(["assistant:8"]);

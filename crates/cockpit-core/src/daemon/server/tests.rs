@@ -38658,6 +38658,7 @@ async fn daemon_startup_uses_trust_aware_daemon_loader() {
         |_cwd| {
             Ok(crate::daemon::config_source::DaemonConfigLoad {
                 providers: crate::config::providers::ProvidersConfig::default(),
+                provider_warnings: Vec::new(),
                 extended: crate::config::extended::ExtendedConfig::default(),
                 response_metrics_tokenizer_validation: Ok(()),
                 participating_layers: Vec::new(),

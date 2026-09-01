@@ -272,12 +272,12 @@ pub async fn turn_with_backup(
         // failover attempts from their primary.)
         // Credentials-rejected rebuild-and-retry (AC5). On a provider auth
         // failure classified `CredentialsRejected` (401/403) for THIS target, if
-        // the failing provider has an owner-scoped command-backed secret,
-        // re-resolve ONLY that provider's secret(s), rebuild a FRESH model client
+        // the failing provider has a global auth command or an owner-scoped
+        // command-backed secret, refresh ONLY that provider, rebuild a FRESH model client
         // under a REFRESHED redaction table so the new token is scrubbed, and
         // retry the SAME target ONCE. The `credentials_rebuild_used` latch (above
         // the failover loop) permits at most ONE such rebuild across the whole
-        // logical dispatch. A provider with no command-backed secret is NOT
+        // logical dispatch. A provider with no command-based auth is NOT
         // rebuilt-and-retried (its original auth error surfaces immediately).
         // `CredentialsRejected` does not engage backup failover, so this runs
         // before the failover selection below.
@@ -368,7 +368,7 @@ pub async fn turn_with_backup(
             .await
             {
                 Ok(Some(rebuilt)) => {
-                    // A command-backed secret was re-resolved and a fresh client
+                    // Command-based auth was refreshed and a fresh client
                     // built: spend the latch and retry the same target once. The
                     // retry is a DISTINCT physical dispatch of the same logical
                     // call, so advance the ordinal to avoid colliding with the
@@ -380,15 +380,18 @@ pub async fn turn_with_backup(
                     attempt_ordinal += 1;
                 }
                 Ok(None) => {
-                    // Provider has no command-backed secret: not eligible. No
+                    // Provider has no command-based auth: not eligible. No
                     // exec, no rebuild, no retry — surface the original auth
                     // error unchanged.
                     break result;
                 }
                 Err(rebuild_err) => {
-                    // Rebuild failed (unconfigured provider / bad id / store
-                    // error): surface the ORIGINAL auth failure and take no
-                    // further retry.
+                    if crate::auth::command::is_refresh_failure(&rebuild_err) {
+                        break Err(rebuild_err);
+                    }
+                    // A failed external auth command is the actionable auth
+                    // failure and surfaces directly. Other rebuild failures
+                    // preserve the established original-401 behavior.
                     tracing::warn!(
                         %rebuild_err,
                         provider = %current_model.provider_id(),

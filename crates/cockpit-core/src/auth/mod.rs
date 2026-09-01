@@ -10,10 +10,11 @@
 //! `$VAR` references in their header values, so they don't need a flow.
 
 pub mod codex_oauth;
+pub(crate) mod command;
 pub mod copilot_setup;
 #[cfg(feature = "remote")]
 pub mod flycockpit;
-mod refresh_guard;
+pub(crate) mod refresh_guard;
 pub mod subscription_ack;
 pub mod xai_oauth;
 

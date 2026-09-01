@@ -980,7 +980,11 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
     ) {
         let referenced = crate::secret_ref::provider_named_secret_references(providers_cfg);
-        if referenced.is_empty() {
+        let has_auth_commands = providers_cfg
+            .providers
+            .values()
+            .any(|entry| entry.auth_command.is_some());
+        if referenced.is_empty() && !has_auth_commands {
             return;
         }
         let store = match session.provider_credential_store(providers_cfg) {
@@ -993,6 +997,32 @@ impl SessionRegistry {
                 return;
             }
         };
+        // Resolve global provider auth commands before redaction and model
+        // construction. Successful token/header output is now in the
+        // CredentialStore when the session redaction table inventories it;
+        // malformed/failed commands remain uncached and the selected model's
+        // request build surfaces the same auth error fail-closed.
+        for (provider_id, entry) in &providers_cfg.providers {
+            if entry.auth_command.is_none() {
+                continue;
+            }
+            if let Err(error) = crate::auth::command::resolve(
+                provider_id,
+                entry,
+                store.clone(),
+                &|name| std::env::var(name).ok(),
+                false,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %provider_id,
+                    %error,
+                    "provider auth-command pre-resolution failed"
+                );
+            }
+        }
         self.resolve_referenced_from_store(&store, &referenced, false)
             .await;
     }

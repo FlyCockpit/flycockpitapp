@@ -443,6 +443,35 @@ impl CredentialStore {
         entries.into_iter()
     }
 
+    /// Auth-command output is host-authentication material even when a
+    /// provider labels it with an ordinary header name such as `Cookie` or
+    /// `X-Tenant`.  Its token and every returned header value therefore join
+    /// the session redaction table independently of the generic
+    /// secret-shaped-key heuristic above.
+    pub(crate) fn provider_auth_command_entries(&self) -> impl Iterator<Item = (String, String)> {
+        let mut entries = Vec::new();
+        for (provider, record) in &self.records {
+            let Some(command) = record.get("auth_command").and_then(Value::as_object) else {
+                continue;
+            };
+            // Current command records wrap the result in `credential`; accept
+            // the previous direct shape too so an existing cache is redacted
+            // before the next command execution replaces it.
+            let credential = command
+                .get("credential")
+                .and_then(Value::as_object)
+                .unwrap_or(command);
+            let origin = format!("$credentials:{provider}.auth_command");
+            if let Some(token) = credential.get("token") {
+                collect_all_strings(token, &format!("{origin}.token"), &mut entries);
+            }
+            if let Some(headers) = credential.get("headers") {
+                collect_all_strings(headers, &format!("{origin}.headers"), &mut entries);
+            }
+        }
+        entries.into_iter()
+    }
+
     /// Return every string leaf in a provider credential record.
     ///
     /// Provider records are opaque JSON owned by integrations. The narrower
@@ -1593,6 +1622,45 @@ mod tests {
             !entries
                 .iter()
                 .any(|(_, value)| value == "not-a-credential.test")
+        );
+    }
+
+    #[test]
+    fn auth_command_entries_include_non_secret_shaped_header_values() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        store.set(
+            "provider",
+            serde_json::json!({
+                "auth_command": {
+                    "configuration_identity": "digest",
+                    "refresh_generation": 1,
+                    "credential": {
+                        "token": "command-token-123456",
+                        "headers": {
+                            "Cookie": "session-cookie-123456",
+                            "X-Tenant": "tenant-credential-123456"
+                        }
+                    }
+                }
+            }),
+        );
+
+        let entries: Vec<_> = store.provider_auth_command_entries().collect();
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "command-token-123456")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "session-cookie-123456")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "tenant-credential-123456")
         );
     }
 

@@ -610,6 +610,16 @@ impl SessionConfigHandle {
         }
     }
 
+    /// A live reader over this handle's snapshot cell. Long-lived clients use
+    /// it to re-authorize executable configuration after their turn-pinned
+    /// construction snapshot may have become stale.
+    pub(crate) fn live(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            pinned: None,
+        }
+    }
+
     /// A detached, pinned handle over a fixed snapshot — for standalone/
     /// tool contexts with no worker behind them and for tests.
     pub fn detached(snapshot: SessionConfigSnapshot) -> Self {

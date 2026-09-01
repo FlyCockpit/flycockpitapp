@@ -1795,6 +1795,7 @@ pub fn provider_entry_for_template_with_wire_api(
         allow_insecure_http: false,
         credential_ref,
         auth,
+        auth_command: None,
         trust: None,
         location: None,
         quality_rank: None,

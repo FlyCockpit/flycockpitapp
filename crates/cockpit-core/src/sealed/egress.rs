@@ -1,8 +1,8 @@
-//! Deriving the active sealed-value set for interactive untrusted egress.
+//! Deriving the active sealed-value set for interactive completion egress.
 //!
 //! This is the seam the interactive completion chokepoint reads to decide which
-//! sealed literals may render their actionable `use_sealed_value` marker on an
-//! untrusted wire. It answers exactly one question: *which sealed value ids hold
+//! sealed literals may render their actionable `use_sealed_value` marker on a
+//! completion wire. It answers exactly one question: *which sealed value ids hold
 //! a live exact grant in this session generation?* — reusing the existing
 //! grant-liveness logic ([`SealedMarkerPredicate::active_capability`] plus the
 //! grant row's revocation/expiry), never a reimplementation of it.
@@ -119,7 +119,7 @@ pub async fn active_sealed_value_ids(
 ///
 /// Returns `Some(table)` — the model's effective table with sealed entries
 /// re-rendered as their actionable `use_sealed_value` marker — WHEN AND ONLY
-/// WHEN every gate holds: the target is untrusted, the request is interactive,
+/// WHEN every gate holds: the request is interactive,
 /// this request's tool roster exposes a callable `use_sealed_value`, and at
 /// least one sealed entry holds a live exact grant in this session generation.
 /// Otherwise returns `None`, and the caller uses the model's own effective
@@ -127,10 +127,10 @@ pub async fn active_sealed_value_ids(
 /// marker then generic), the `Model` never gets a DB handle (the caller derives
 /// this and passes the table to `prepare_completion_request`), and a DB error
 /// falls back to `None` — fail closed to safe generic rendering, never to a
-/// stale marker, a raw literal, or a dispatch error. Trusted targets keep raw
-/// custody (`None`).
+/// stale marker, a raw literal, or a dispatch error. Trust never bypasses this
+/// derivation: every model receives a reference-only rendering.
 #[allow(clippy::too_many_arguments)]
-pub async fn derive_untrusted_interactive_sealed_egress(
+pub async fn derive_interactive_sealed_egress(
     model: &crate::engine::model::Model,
     interactive: bool,
     tools: &[crate::engine::message::ToolDefinition],
@@ -140,8 +140,7 @@ pub async fn derive_untrusted_interactive_sealed_egress(
     session_generation: u64,
     now_ms: i64,
 ) -> Option<std::sync::Arc<crate::redact::RedactionTable>> {
-    if model.is_trusted()
-        || !interactive
+    if !interactive
         || !tools
             .iter()
             .any(|tool| tool.name == super::USE_SEALED_VALUE_TOOL)
@@ -156,7 +155,7 @@ pub async fn derive_untrusted_interactive_sealed_egress(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "sealed grant derivation failed; untrusted egress stays generic"
+                "sealed grant derivation failed; completion egress stays generic"
             );
             None
         }

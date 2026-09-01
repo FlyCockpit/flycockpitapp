@@ -509,7 +509,6 @@ pub(crate) struct DeferredDelegateCall {
     session: Arc<Session>,
     tx: mpsc::Sender<TurnEvent>,
     agent_id: String,
-    mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     durable_permit: super::tool_dispatch::SchedulerDurablePermit,
 }
 
@@ -538,14 +537,13 @@ impl DeferredDelegateCall {
         &self,
         config: &crate::daemon::session_worker::SessionConfigHandle,
     ) -> Result<TurnOutcome> {
-        match phase_10_dispatch_one_call_with_registry(
+        match phase_10_dispatch_one_call(
             &self.agent,
             &self.session,
             config,
             &self.tx,
             &self.call,
             &self.resolved_name,
-            &self.mcp_builtin_registry,
         )
         .await?
         {
@@ -977,7 +975,6 @@ impl DeferredTurnPlan {
                         session: self.session.clone(),
                         tx: self.tx.clone(),
                         agent_id: self.tool_ctx.agent_id.clone(),
-                        mcp_builtin_registry: self.tool_ctx.mcp_builtin_registry.clone(),
                         durable_permit: super::tool_dispatch::SchedulerDurablePermit::new(
                             durable_order.clone(),
                             durable_ordinal,
@@ -996,14 +993,13 @@ impl DeferredTurnPlan {
             let scheduled = self.scheduler.calls[self.cursor].clone();
             self.cursor += 1;
             let tc = &self.calls[scheduled.source_index];
-            match phase_10_dispatch_one_call_with_registry(
+            match phase_10_dispatch_one_call(
                 agent,
                 &self.session,
                 &self.config,
                 &self.tx,
                 tc,
                 &scheduled.resolved_name,
-                &self.tool_ctx.mcp_builtin_registry,
             )
             .await?
             {
@@ -1016,7 +1012,7 @@ impl DeferredTurnPlan {
                     );
                     let terminal = match &outcome {
                         TurnOutcome::ToolResult { body, .. }
-                            if structural_tool_result_is_refusal(body) =>
+                            if body.trim_start().starts_with("Error:") =>
                         {
                             turn_scheduler::SchedulerTerminalOutcome::Refused
                         }
@@ -1253,6 +1249,22 @@ pub(crate) fn new_display_attempt_slot(
     })
 }
 
+pub(crate) fn new_display_attempt_slot_with_window(
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    response_window_closed: Arc<std::sync::atomic::AtomicBool>,
+) -> crate::engine::model::DisplayAttemptSlot {
+    crate::engine::model::DisplayAttemptSlot::new_with_response_window(
+        crate::engine::DisplayClassifierConfig {
+            inline_think: inline_think_enabled(session, config),
+            translation_enabled: config.extended().translation.is_active(),
+            encoding: config.extended().response_metrics_tokenizer,
+            force_tokenization_failure: false,
+        },
+        response_window_closed,
+    )
+}
+
 async fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
     if let Err(e) = session
         .record_tool_rejected(&agent.name, &tc.id, "task", "task_unknown_agent")
@@ -1332,7 +1344,6 @@ fn prompt_has_redundant_seed_tag(prompt: &str) -> bool {
         .any(|token| token.starts_with('@') || token.starts_with("/skill"))
 }
 
-#[cfg(test)]
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
@@ -1341,56 +1352,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
     tc: &ToolCall,
     resolved_name: &str,
 ) -> Result<ControlFlow<TurnOutcome, ()>> {
-    let mcp_builtin_registry = agent.tools.mcp_builtin_registry_for_context(&agent.name);
-    phase_10_dispatch_one_call_with_registry(
-        agent,
-        session,
-        config,
-        tx,
-        tc,
-        resolved_name,
-        &mcp_builtin_registry,
-    )
-    .await
-}
-
-/// Structural calls leave the ordinary dispatcher before it can consult the
-/// guard. Keep that route on the exact registry installed in this turn's
-/// [`ToolCtx`], so a cache-reusing scoped context cannot bypass its execution
-/// boundary through `task`, `schedule`, `spawn`, or `return`.
-async fn phase_10_dispatch_one_call_with_registry(
-    agent: &Agent,
-    session: &Arc<Session>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    tx: &mpsc::Sender<TurnEvent>,
-    tc: &ToolCall,
-    resolved_name: &str,
-    mcp_builtin_registry: &crate::mcp::builtin::BuiltinRegistry,
-) -> Result<ControlFlow<TurnOutcome, ()>> {
     macro_rules! return_structural {
         ($outcome:expr) => {
             return Ok(ControlFlow::Break($outcome));
         };
-    }
-    // Ordinary calls must continue into `execute_ordinary_call_unscoped`,
-    // which produces the canonical structured capability denial shared with
-    // Monty's nested-native path. Only calls consumed by this phase need a
-    // guard here, before they leave the ordinary dispatcher.
-    if is_structural_dispatch_call(agent, resolved_name)
-        && let Some(denial) = mcp_builtin_registry.capability_denial(resolved_name)
-    {
-        return_structural!(TurnOutcome::ToolResult {
-            task_call_id: tc.id.to_string(),
-            task_provider_item_id: tc
-                .provider
-                .as_ref()
-                .and_then(|provider| provider.item_id.clone()),
-            task_function_call_id: tc
-                .provider
-                .as_ref()
-                .map(|provider| provider.call_id.clone()),
-            body: denial.to_string(),
-        });
     }
     // `task` is special — it's a structural tool the driver
     // handles. For interactive subagents (builder) the driver
@@ -2223,23 +2188,6 @@ async fn phase_10_dispatch_one_call_with_registry(
     Ok(ControlFlow::Continue(()))
 }
 
-/// Whether this phase consumes the call instead of passing it to ordinary tool
-/// dispatch. `schedule` is ordinary inside a fork loop, where the fork-only
-/// `note` tool is present; see the dispatch branch above for the ownership
-/// distinction.
-fn is_structural_dispatch_call(agent: &Agent, resolved_name: &str) -> bool {
-    matches!(resolved_name, "task" | "spawn" | "return")
-        || (resolved_name == "schedule" && agent.tools.get("note").is_none())
-}
-
-fn structural_tool_result_is_refusal(body: &str) -> bool {
-    body.trim_start().starts_with("Error:")
-        || serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|value| value.get("denied").and_then(Value::as_bool))
-            .unwrap_or(false)
-}
-
 /// Structural calls return to the driver before ordinary-tool dispatch gets a
 /// chance to repair the just-stored assistant history. Keep their replay form
 /// aligned with the canonical structural result name while preserving both
@@ -2399,7 +2347,7 @@ pub(crate) async fn run_turn(
                                     "Chat Completions"
                                 }
                                 crate::config::providers::WireApi::Responses => "Responses",
-                                crate::config::providers::WireApi::Anthropic => "Messages",
+                                crate::config::providers::WireApi::Anthropic => "Anthropic",
                                 crate::config::providers::WireApi::Auto => "auto",
                             };
                             let set = crate::daemon::proto::InterruptQuestionSet {
@@ -2475,23 +2423,22 @@ pub(crate) async fn run_turn(
     // export's file-per-call pass picks up the record either way without
     // double-counting. Best-effort: auditing must never break a live turn (same
     // posture as the existing post-success write).
-    // Sealed marker wired to real grants (`sealed-value-untrusted-inference-
-    // marker`): derive the per-attempt egress table so that a sealed literal an
-    // untrusted interactive turn received renders the actionable
+    // Sealed marker wired to real grants: derive the per-attempt egress table
+    // so that a sealed literal in any interactive turn renders the actionable
     // `use_sealed_value` marker instead of the generic placeholder. All gating
     // and derivation live in ONE production seam
-    // (`derive_untrusted_interactive_sealed_egress`, extracted so the chokepoint
+    // (`derive_interactive_sealed_egress`, extracted so the chokepoint
     // is drivable end-to-end in tests — removing the derivation there fails a
-    // test): it fires ONLY when untrusted custody, an interactive attachment, a
+    // test): it fires ONLY when an interactive attachment, a
     // callable `use_sealed_value` in THIS request's tool roster, and a live exact
     // grant for that value in this session generation all hold. Derivation is
     // fresh per attempt (a grant revoked between primary and failover renders the
     // marker then generic), the `Model` never gets a DB handle (we derive here
     // and pass the table to `prepare_completion_request`), and a DB error falls
     // back to `None` / the generic table — fail closed to safe rendering, never
-    // to a stale marker, a raw literal, or a dispatch error. Trusted targets and
-    // noninteractive egress (utility/tandem/embeddings, which never reach here)
-    // are untouched.
+    // to a stale marker, a raw literal, or a dispatch error. Trust does not
+    // bypass sealed egress; noninteractive egress (utility/tandem/embeddings,
+    // which never reach here) keeps generic redaction.
     // Rebuild the live sealed-action registry from this session's database,
     // scoped to this session's project (no install-once OnceLock; cross-project
     // actions are never resolvable). A build failure falls back to an empty
@@ -2504,7 +2451,7 @@ pub(crate) async fn run_turn(
     .await
     .unwrap_or_else(|_| crate::sealed::action::SealedActionRegistry::empty());
     let sealed_egress: Option<Arc<RedactionTable>> =
-        crate::sealed::egress::derive_untrusted_interactive_sealed_egress(
+        crate::sealed::egress::derive_interactive_sealed_egress(
             model,
             interrupts.is_interactive_attached(),
             &tools,
@@ -2968,7 +2915,13 @@ pub(crate) async fn run_turn(
         .native_computer
         .as_ref()
         .is_some_and(|config| config.geometry.is_some());
-    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice)
+    let emitted_calls = collect_tool_calls(&choice);
+    if !emitted_calls.is_empty()
+        && let Some(display_slot) = display_slot.as_ref()
+    {
+        display_slot.close_response_window();
+    }
+    let buffered_calls: Vec<ToolCall> = emitted_calls
         .into_iter()
         .filter(|call| {
             !(native_computer_open
@@ -3526,7 +3479,7 @@ pub(crate) async fn run_turn(
                 .map(str::to_string)
                 .collect(),
         ),
-        mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
+        mcp_builtin_registry: active_tools.mcp_builtin_registry(),
         has_tree: agent.tools.get("code").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`read` waiting indicator routes its
@@ -4378,45 +4331,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_10_capability_guard_refuses_every_structural_tool() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent = test_agent();
-        let session = test_session(tmp.path());
-        let (tx, _rx) = mpsc::channel(4);
-        let registry = crate::mcp::builtin::BuiltinRegistry::scoped_fork(
-            "the session-rename micro-fork",
-            ["set_session_metadata"],
-            Vec::new(),
-        );
-
-        for tool in ["task", "schedule", "spawn", "return"] {
-            let call = tool_call(tool, serde_json::json!({}));
-            let flow = phase_10_dispatch_one_call_with_registry(
-                &agent,
-                &session,
-                &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
-                &tx,
-                &call,
-                tool,
-                &registry,
-            )
-            .await
-            .unwrap();
-
-            match flow {
-                ControlFlow::Break(TurnOutcome::ToolResult { body, .. }) => {
-                    assert_eq!(
-                        serde_json::from_str::<Value>(&body).unwrap(),
-                        registry.capability_denial(tool).unwrap(),
-                        "{tool} must return the same structured guard denial"
-                    );
-                }
-                other => panic!("expected guarded structural refusal for `{tool}`, got {other:?}"),
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn phase_10_ordinary_tool_continues() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = test_agent();
@@ -4436,37 +4350,6 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
-    }
-
-    #[tokio::test]
-    async fn phase_10_guarded_ordinary_tool_reaches_ordinary_dispatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent = test_agent();
-        let session = test_session(tmp.path());
-        let (tx, _rx) = mpsc::channel(1);
-        let registry = crate::mcp::builtin::BuiltinRegistry::scoped_fork(
-            "the session-rename micro-fork",
-            ["set_session_metadata"],
-            Vec::new(),
-        );
-        let call = tool_call("edit", serde_json::json!({ "text": "blocked" }));
-
-        let flow = phase_10_dispatch_one_call_with_registry(
-            &agent,
-            &session,
-            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
-            &tx,
-            &call,
-            "edit",
-            &registry,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            matches!(flow, ControlFlow::Continue(())),
-            "ordinary calls must reach the canonical guard denial in ordinary dispatch"
-        );
     }
 
     fn identified_task_call(call_id: &str, provider_call_id: &str, args: Value) -> ToolCall {

@@ -3405,6 +3405,11 @@ impl Db {
     pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now_unix_ms = Utc::now().timestamp_millis();
         self.transaction(move |conn| {
+            crate::db::sealed_scope::purge_session_sealed_values_conn(
+                conn,
+                &session_id.to_string(),
+                now_unix_ms,
+            )?;
             conn.execute(
                 "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
                 params![now_unix_ms, session_id.to_string()],

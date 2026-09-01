@@ -35,6 +35,7 @@
 //! security claim.
 
 use std::path::Path;
+use std::{ffi::OsStr, path::PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -213,6 +214,75 @@ pub const PRIVATE_FS_POLICY: PrivateFsPolicy = PrivateFsPolicy {
     link_count_verified: cfg!(unix) || cfg!(windows),
     directory_fsync_available: cfg!(unix),
 };
+
+/// Resolve the platform's best private runtime root for ephemeral secret
+/// materialization. Linux/Android semantics stay strict: use only
+/// `$XDG_RUNTIME_DIR`. macOS falls back only to the OS-provided per-user
+/// Darwin temp root when XDG is absent. Other platforms report no suitable
+/// runtime root.
+pub fn private_runtime_root() -> Option<PathBuf> {
+    private_runtime_root_from(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        darwin_user_temp_dir(),
+    )
+}
+
+fn private_runtime_root_from(
+    xdg_runtime_dir: Option<&OsStr>,
+    darwin_user_temp_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    absolute_non_empty_path(xdg_runtime_dir).or_else(|| {
+        #[cfg(target_os = "macos")]
+        {
+            darwin_user_temp_dir
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = darwin_user_temp_dir;
+            None
+        }
+    })
+}
+
+fn absolute_non_empty_path(value: Option<&OsStr>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if length == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; length];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    let without_nul = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    let path = OsStr::from_bytes(&buffer[..without_nul]);
+    absolute_non_empty_path(Some(path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    None
+}
 
 #[cfg(target_os = "macos")]
 fn device_id_matches(stat_device: libc::dev_t, metadata_device: u64) -> bool {
@@ -1904,6 +1974,26 @@ pub fn write_private_file_in_dir_fd(
     )
 }
 
+/// Same fd-anchored private publication as [`write_private_file_in_dir_fd`],
+/// but fail if `name` already exists. Callers that retain a directory authority
+/// across an ephemeral secret's full lifetime use this to avoid re-resolving
+/// the parent pathname.
+#[cfg(unix)]
+pub fn write_private_file_exclusive_in_dir_fd(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    write_private_file_in_held_dir(
+        dir_fd,
+        name,
+        display_path,
+        bytes,
+        PrivateWritePublish::Exclusive,
+    )
+}
+
 #[cfg(unix)]
 fn write_private_file_in_held_dir(
     dir_handle: &std::fs::File,
@@ -2789,6 +2879,7 @@ pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     // -- pure verdict (platform-independent) ------------------------------
 
@@ -2939,6 +3030,29 @@ mod tests {
                 Err(PrivateFsError::Containment(_))
             ));
         }
+    }
+
+    #[test]
+    fn private_runtime_root_prefers_absolute_xdg_runtime_dir() {
+        let resolved = private_runtime_root_from(
+            Some(OsStr::new("/xdg-runtime")),
+            Some(PathBuf::from("/darwin-temp")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/xdg-runtime")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_runtime_root_uses_only_darwin_temp_root_when_xdg_is_absent() {
+        let resolved = private_runtime_root_from(None, Some(PathBuf::from("/darwin-temp")));
+        assert_eq!(resolved, Some(PathBuf::from("/darwin-temp")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn private_runtime_root_fails_closed_without_absolute_xdg_runtime_dir() {
+        let resolved = private_runtime_root_from(None, Some(PathBuf::from("/darwin-temp")));
+        assert_eq!(resolved, None);
     }
 
     /// Compare `windows_dacl_enforced` to real apply/verify, not the constant.

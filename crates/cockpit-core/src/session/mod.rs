@@ -229,6 +229,24 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Exact per-turn accounting captured before one retractable user turn.
+/// Restoring it makes a cancelled/re-sent message consume the same title slot
+/// and time-prelude state as a single send.
+pub(crate) struct TitleProgressSnapshot {
+    title: Option<String>,
+    user_renamed: bool,
+    user_content_tokens: usize,
+    user_content_turns: usize,
+    title_stage: u8,
+    title_nudge_slot_pending: u8,
+    title_recovery_nudge_state: crate::db::sessions::TitleRecoveryNudgeState,
+    title_failure_noticed: bool,
+    /// `with_time_prelude` consumes this stamp while assembling the first
+    /// provider request. A successful user-message retract must put it back
+    /// so the resend produces the same request/cache prefix.
+    last_time_prelude: Option<DateTime<Utc>>,
+}
+
 /// Work due for the cache-reusing, same-model metadata fork. The title slots
 /// refine both fields; later slots refresh the richer description while still
 /// requiring the atomic combined metadata call.
@@ -1206,7 +1224,9 @@ impl Session {
         provider_id: &str,
         model_id: &str,
         env: &std::collections::HashMap<String, String>,
-    ) -> Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>> {
+    ) -> anyhow::Result<
+        Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>>,
+    > {
         let resolved = crate::audio_transcription::transport::resolve_vetted_egress(
             self,
             config,
@@ -1214,7 +1234,7 @@ impl Session {
             model_id,
             env,
         )
-        .await
+        .await?
         .and_then(|egress| {
             self.external_journal().map(|journal| {
                 Arc::new(
@@ -1239,7 +1259,7 @@ impl Session {
                 dispatches.remove(&key);
             }
         }
-        resolved
+        Ok(resolved)
     }
 
     pub(crate) fn set_message_media_authority(
@@ -1459,6 +1479,49 @@ impl Session {
         reresolved_any
     }
 
+    /// Force-refresh this provider's global auth command, if configured.
+    /// Unlike the legacy named-command boolean seam above, command execution
+    /// and JSON failures are returned so a rejected request surfaces the auth
+    /// failure instead of silently falling back to its original 401.
+    pub(crate) async fn refresh_provider_auth_command(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+        provider_id: &str,
+        env: &std::collections::HashMap<String, String>,
+        rejected_refresh_generation: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let Some(entry) = providers.providers.get(provider_id) else {
+            return Ok(false);
+        };
+        if entry.auth_command.is_none() && entry.oauth.is_none() {
+            return Ok(false);
+        }
+        let rejected_refresh_generation = {
+            #[cfg(not(test))]
+            {
+                Some(rejected_refresh_generation.context(
+                    "dynamically authenticated model is missing the credential generation used for its rejection",
+                )?)
+            }
+            #[cfg(test)]
+            {
+                rejected_refresh_generation
+            }
+        };
+        let store = self.provider_credential_store(providers)?;
+        crate::providers::models_fetch::refresh_provider_request_async_with_store(
+            provider_id,
+            entry,
+            store,
+            |name| env.get(name).cloned(),
+            rejected_refresh_generation,
+        )
+        .await
+        .and_then(|request| request.context("dynamic provider authentication was not refreshable"))
+        .map_err(crate::auth::command::refresh_failure)?;
+        Ok(true)
+    }
+
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]
     /// (the comprehensive view used for redaction and inventory), this restricts
     /// the resolvable `$secret:` names to those owned by (provider, this
@@ -1470,18 +1533,18 @@ impl Session {
         &self,
         providers: &crate::config::providers::ProvidersConfig,
     ) -> anyhow::Result<crate::credentials::CredentialStore> {
-        let mut store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+        let canonical_root =
+            crate::secret_ownership::canonical_owner_root(&self.project_root.display().to_string());
+        let mut store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
             self.secret_vault.clone(),
-            crate::secret_ownership::OWNER_KIND_PROVIDER,
-            &crate::secret_ownership::canonical_owner_root(
-                &self.project_root.display().to_string(),
-            ),
+            &canonical_root,
             &crate::secret_ref::provider_named_secret_references(providers),
             // The session boundary has no cross-config scan, so sole-ownership of
             // an unclaimed legacy name is unprovable here: never lazily claim
             // (fail closed on unclaimed). The daemon's provider settings paths
             // establish ownership with a scan; already-owned names still resolve.
             None,
+            &crate::secret_ref::provider_credential_record_references(providers),
         )?;
         // Inject resolved command outputs from the daemon cache. The store is
         // owner-scoped, so only (provider, this-workspace)-owned command names
@@ -2038,17 +2101,8 @@ impl ToolCallProviderIdentity {
         provider_item_id: String,
         provider_call_id: Option<String>,
     ) -> Self {
-        let wire_api = resolved_wire_api.or_else(|| {
-            let provider = provider?;
-            let model = model?;
-            Some(
-                providers
-                    .map(|providers| providers.resolve_wire_api_or_detect(provider, model))
-                    .unwrap_or_else(|| {
-                        crate::config::providers::WireApi::detect_for_provider(provider, model)
-                    }),
-            )
-        });
+        let wire_api =
+            resolved_wire_api.or_else(|| providers?.resolve_wire_api(provider?, model?).into());
         let is_responses = matches!(wire_api, Some(crate::config::providers::WireApi::Responses));
         let is_completions = matches!(
             wire_api,
@@ -2080,7 +2134,7 @@ fn wire_api_label(wire_api: crate::config::providers::WireApi) -> Option<&'stati
     match wire_api {
         crate::config::providers::WireApi::Responses => Some("responses"),
         crate::config::providers::WireApi::Completions => Some("completions"),
-        crate::config::providers::WireApi::Anthropic => Some("messages"),
+        crate::config::providers::WireApi::Anthropic => Some("anthropic"),
         // `Auto` is a configuration directive, not an observed wire endpoint.
         // Preserve that uncertainty as SQL/JSON null instead of inventing a
         // string label.

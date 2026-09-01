@@ -40,7 +40,7 @@ const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
 pub const COPILOT_TOKEN_CREDENTIAL_KEY: &str = "copilot-github-token";
 const COPILOT_API_URL_ENV: &str = "COPILOT_API_URL";
 const ERROR_BODY_SNIPPET_CHARS: usize = 256;
-const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_LIST_CLIENT_VERSION: &str = "0.0.0";
 
 pub(crate) fn codex_model_list_client_version() -> &'static str {
@@ -72,6 +72,16 @@ impl fmt::Debug for ResolvedHeader {
 pub struct ResolvedRequest {
     pub base_url: String,
     pub headers: Vec<ResolvedHeader>,
+    /// True only when Cockpit resolved a Codex OAuth credential for this
+    /// request. Header names are request data and must not be used to infer
+    /// credential ownership.
+    pub(crate) is_codex_credential: bool,
+    /// Generation of the command credential that authenticated this exact
+    /// request. A 401/403 retry must present this value to the refresh path so
+    /// a late rejection can reuse a concurrent winner instead of re-running
+    /// the user's command.
+    #[cfg(not(test))]
+    pub(crate) command_credential_generation: Option<u64>,
     #[cfg(not(test))]
     pub(crate) origin: ResolvedProviderOrigin,
 }
@@ -81,10 +91,26 @@ impl fmt::Debug for ResolvedRequest {
         let mut debug = f.debug_struct("ResolvedRequest");
         debug
             .field("base_url", &self.base_url)
-            .field("headers", &self.headers);
+            .field("headers", &self.headers)
+            .field("is_codex_credential", &self.is_codex_credential);
         #[cfg(not(test))]
         debug.field("origin", &self.origin);
         debug.finish()
+    }
+}
+
+impl ResolvedRequest {
+    /// Returns the command-credential generation bound to this request. Unit
+    /// test literals intentionally omit production-only request provenance.
+    pub(crate) fn command_credential_generation(&self) -> Option<u64> {
+        #[cfg(not(test))]
+        {
+            self.command_credential_generation
+        }
+        #[cfg(test)]
+        {
+            None
+        }
     }
 }
 
@@ -135,9 +161,12 @@ pub fn resolve_provider_request(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
+    if entry.oauth.is_some() {
+        anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store");
+    }
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = provider.auth_resolution_error(false) {
         anyhow::bail!(message);
     }
     provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
@@ -151,6 +180,9 @@ pub fn resolve_provider_request_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    if entry.oauth.is_some() {
+        anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store");
+    }
     resolve_provider_request_with_sources(provider_id, entry, lookup, |_| None)
 }
 
@@ -166,7 +198,7 @@ where
 {
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = provider.auth_resolution_error(false) {
         anyhow::bail!(message);
     }
     resolve_provider_request_inner_with_sources(
@@ -183,46 +215,211 @@ pub async fn resolve_provider_request_async(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
+    if entry.auth_command.is_some() || entry.oauth.is_some() {
+        anyhow::bail!(
+            "provider `{provider_id}` configured authentication requires an injected credential store"
+        );
+    }
     let registry = ProviderRegistry::standard();
-    if registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_some()
+    let provider = registry.provider_for(provider_id, entry);
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(false)
     {
+        anyhow::bail!(message);
+    }
+    if provider.credential_kind().is_some() {
         anyhow::bail!("Codex/Grok OAuth requires an injected credential store");
     }
-    registry
-        .provider_for(provider_id, entry)
-        .request(provider_id, entry, None, &|name| std::env::var(name).ok())
+    provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
 }
 
 pub async fn resolve_provider_request_async_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
     store: crate::credentials::CredentialStore,
-    env_lookup: impl Fn(&str) -> Option<String>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<ResolvedRequest> {
+    resolve_provider_request_async_with_store_refresh(
+        provider_id,
+        entry,
+        store,
+        &env_lookup,
+        false,
+        None,
+    )
+    .await
+}
+
+/// Re-resolve a dynamically authenticated request after an explicit provider
+/// rejection. The environment lookup remains caller-supplied because it is
+/// part of an auth-command argv identity; descriptors ignore it.
+pub async fn refresh_provider_request_async_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
+    rejected_refresh_generation: Option<u64>,
+) -> Result<Option<ResolvedRequest>> {
+    if entry.auth_command.is_none() && entry.oauth.is_none() {
+        return Ok(None);
+    }
+    let rejected_refresh_generation = {
+        #[cfg(not(test))]
+        {
+            Some(rejected_refresh_generation.context(
+                "dynamically authenticated request is missing the credential generation used for its rejection",
+            )?)
+        }
+        #[cfg(test)]
+        {
+            rejected_refresh_generation
+        }
+    };
+    resolve_provider_request_async_with_store_refresh(
+        provider_id,
+        entry,
+        store,
+        &env_lookup,
+        true,
+        rejected_refresh_generation,
+    )
+    .await
+    .map(Some)
+}
+
+/// Re-resolve a long-lived command-authenticated request using the provider
+/// entry authorized after this refresh owns the serialized execution turn.
+///
+/// A live client supplies `authorize_entry` instead of a cloned entry because
+/// config can reload while the refresh waits behind another request.
+pub(crate) async fn refresh_provider_request_async_with_store_authorized<F>(
+    provider_id: &str,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
+    rejected_refresh_generation: Option<u64>,
+    authorize_entry: F,
+) -> Result<ResolvedRequest>
+where
+    F: FnOnce() -> Result<ProviderEntry>,
+{
+    let (entry, command_credential) = crate::auth::command::resolve_authorized(
+        provider_id,
+        store.clone(),
+        &env_lookup,
+        true,
+        rejected_refresh_generation,
+        authorize_entry,
+    )
+    .await?;
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential.refresh_generation;
     let registry = ProviderRegistry::standard();
-    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
-    let credential = match credential_kind {
-        Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
-        )),
-        Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
-        )),
+    let credential = Some(OAuthCredential::Command(command_credential));
+    let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+    let request = resolve_provider_request_inner_with_sources(
+        provider_id,
+        &entry,
+        credential,
+        registry.provider_for(provider_id, &entry).request_kind(),
+        &env_lookup,
+        &secret_lookup,
+    )?;
+    #[cfg(not(test))]
+    {
+        let mut request = request;
+        request.command_credential_generation = Some(command_credential_generation);
+        return Ok(request);
+    }
+    #[cfg(test)]
+    Ok(request)
+}
+
+async fn resolve_provider_request_async_with_store_refresh(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
+    force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
+) -> Result<ResolvedRequest> {
+    anyhow::ensure!(
+        entry.auth_command.is_none() || entry.oauth.is_none(),
+        "provider `{provider_id}` cannot configure both auth_command and oauth"
+    );
+    let registry = ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(true)
+    {
+        anyhow::bail!(message);
+    }
+    let command_credential = match entry.auth_command.as_deref() {
+        Some(_) => Some(
+            crate::auth::command::resolve(
+                provider_id,
+                entry,
+                store.clone(),
+                env_lookup,
+                force_refresh,
+                rejected_refresh_generation,
+            )
+            .await?,
+        ),
         None => None,
     };
-    let env_lookup = |name: &str| env_lookup(name);
+    let descriptor_credential = match entry.oauth.as_ref() {
+        Some(descriptor) if command_credential.is_none() => Some(
+            crate::auth::descriptor::resolve(
+                provider_id,
+                descriptor,
+                store.clone(),
+                force_refresh,
+                rejected_refresh_generation,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential
+        .as_ref()
+        .map(|credential| credential.refresh_generation)
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = if let Some(credential) = command_credential {
+        Some(OAuthCredential::Command(credential))
+    } else if let Some(credential) = descriptor_credential {
+        Some(OAuthCredential::Descriptor(credential))
+    } else {
+        match credential_kind {
+            Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
+                crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
+            )),
+            #[cfg(feature = "grok-subscription")]
+            Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
+                crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
+            )),
+            None => None,
+        }
+    };
     let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
-    resolve_provider_request_inner_with_sources(
+    let mut request = resolve_provider_request_inner_with_sources(
         provider_id,
         entry,
         credential,
         registry.provider_for(provider_id, entry).request_kind(),
-        &env_lookup,
+        env_lookup,
         &secret_lookup,
-    )
+    )?;
+    #[cfg(not(test))]
+    {
+        request.command_credential_generation = command_credential_generation;
+    }
+    Ok(request)
 }
 
 async fn resolve_model_list_request_async(
@@ -230,7 +427,10 @@ async fn resolve_model_list_request_async(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
 ) -> Result<ResolvedRequest> {
-    resolve_model_list_request_async_with_store(provider_id, entry, resolved, None).await
+    resolve_model_list_request_async_with_store(provider_id, entry, resolved, None, &|name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
 async fn resolve_model_list_request_async_with_store(
@@ -238,29 +438,94 @@ async fn resolve_model_list_request_async_with_store(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
     store: Option<crate::credentials::CredentialStore>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
-    let credential = match (credential_kind, store) {
-        (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential_from_store(store).await?,
-        )),
-        (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token_from_store(store).await?,
-        )),
-        (Some(ProviderCredentialKind::CodexOAuth), None) => {
-            anyhow::bail!("Codex OAuth requires an injected credential store")
-        }
-        (Some(ProviderCredentialKind::XaiOAuth), None) => {
-            anyhow::bail!("Grok OAuth requires an injected credential store")
+    if entry.oauth.is_none()
+        && let Some(message) = registry
+            .provider_for(provider_id, entry)
+            .auth_resolution_error(store.is_some())
+    {
+        anyhow::bail!(message);
+    }
+    let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
+        (Some(_), Some(store)) => Some(
+            crate::auth::command::resolve(
+                provider_id,
+                entry,
+                store.clone(),
+                env_lookup,
+                false,
+                None,
+            )
+            .await?,
+        ),
+        (Some(_), None) => {
+            anyhow::bail!(
+                "provider `{provider_id}` auth_command requires an injected credential store"
+            )
         }
         (None, _) => None,
     };
-    registry
+    let descriptor_credential = match (entry.oauth.as_ref(), store.as_ref()) {
+        (Some(descriptor), Some(store)) if command_credential.is_none() => Some(
+            crate::auth::descriptor::resolve(
+                provider_id,
+                descriptor,
+                (*store).clone(),
+                false,
+                None,
+            )
+            .await?,
+        ),
+        (Some(_), None) => {
+            anyhow::bail!("provider `{provider_id}` OAuth requires an injected credential store")
+        }
+        _ => None,
+    };
+    #[cfg(not(test))]
+    let command_credential_generation = command_credential
+        .as_ref()
+        .map(|credential| credential.refresh_generation)
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = if let Some(credential) = command_credential {
+        Some(OAuthCredential::Command(credential))
+    } else if let Some(credential) = descriptor_credential {
+        Some(OAuthCredential::Descriptor(credential))
+    } else {
+        match (credential_kind, store) {
+            (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => {
+                Some(OAuthCredential::Codex(
+                    crate::auth::codex_oauth::credential_from_store(store).await?,
+                ))
+            }
+            #[cfg(feature = "grok-subscription")]
+            (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
+                crate::auth::xai_oauth::bearer_token_from_store(store).await?,
+            )),
+            (Some(ProviderCredentialKind::CodexOAuth), None) => {
+                anyhow::bail!("Codex OAuth requires an injected credential store")
+            }
+            #[cfg(feature = "grok-subscription")]
+            (Some(ProviderCredentialKind::XaiOAuth), None) => {
+                anyhow::bail!("Grok OAuth requires an injected credential store")
+            }
+            (None, _) => None,
+        }
+    };
+    let mut request = registry
         .provider_for(provider_id, entry)
-        .model_list_request(provider_id, entry, resolved, credential, &|name| {
-            std::env::var(name).ok()
-        })
+        .model_list_request(provider_id, entry, resolved, credential, env_lookup)?;
+    #[cfg(not(test))]
+    {
+        request.command_credential_generation = command_credential_generation;
+    }
+    Ok(request)
 }
 
 pub fn resolve_provider_request_blocking(
@@ -268,10 +533,12 @@ pub fn resolve_provider_request_blocking(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && entry.oauth.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         return resolve_provider_request(provider_id, entry);
     }
@@ -328,10 +595,12 @@ where
     S: Fn(&str) -> Option<String>,
 {
     let registry = ProviderRegistry::standard();
-    if registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && entry.oauth.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
     }
@@ -345,13 +614,15 @@ pub fn resolve_provider_request_blocking_with_store<F>(
     store: crate::credentials::CredentialStore,
 ) -> Result<ResolvedRequest>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<String> + Send + Sync,
 {
     let registry = ProviderRegistry::standard();
-    if registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_none()
+    if entry.auth_command.is_none()
+        && entry.oauth.is_none()
+        && registry
+            .provider_for(provider_id, entry)
+            .credential_kind()
+            .is_none()
     {
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
         return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
@@ -369,20 +640,23 @@ where
                 ))
             })
         }
-        Ok(_) => std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("build subscription-auth runtime")?
-                .block_on(resolve_provider_request_async_with_store(
-                    &provider_id_owned,
-                    &entry,
-                    store,
-                    |name| std::env::var(name).ok(),
-                ))
-        })
-        .join()
-        .map_err(|_| anyhow!("subscription-auth worker panicked"))?,
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("build subscription-auth runtime")?
+                        .block_on(resolve_provider_request_async_with_store(
+                            &provider_id_owned,
+                            &entry,
+                            store,
+                            |name| lookup(name),
+                        ))
+                })
+                .join()
+                .map_err(|_| anyhow!("subscription-auth worker panicked"))?
+        }),
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -421,6 +695,18 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)?;
+    }
+    if matches!(
+        entry.auth,
+        Some(crate::config::providers::AuthKind::Command)
+    ) && entry.auth_command.is_none()
+    {
+        anyhow::bail!(
+            "provider `{provider_id}` uses command authentication but no global auth_command is configured"
+        );
+    }
     crate::config::providers::validate_provider_headers(provider_id, &entry.headers)?;
     let origin = ProviderRegistry::standard().resolve_origin(provider_id, entry)?;
     let is_copilot = request_kind == ProviderRequestKind::Copilot;
@@ -477,34 +763,44 @@ fn resolve_provider_request_inner_with_sources(
         );
     }
 
-    if let Some(credential) = oauth_credential {
+    let is_codex_credential = matches!(&oauth_credential, Some(OAuthCredential::Codex(_)));
+    if let Some(OAuthCredential::Descriptor(credential)) = oauth_credential {
+        for (name, value) in credential.headers {
+            merge_header_override(&mut headers, ResolvedHeader { name, value });
+        }
+    } else if let Some(credential) = oauth_credential {
         let token = credential.access_token().to_string();
         headers.push(ResolvedHeader {
             name: "Authorization".to_string(),
             value: format!("Bearer {token}"),
         });
-        if let OAuthCredential::Codex(mut tokens) = credential {
-            let account_id = tokens.account_id.take().ok_or_else(|| {
-                anyhow!(
-                    "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
-                )
-            })?;
-            headers.push(ResolvedHeader {
-                name: "chatgpt-account-id".to_string(),
-                value: account_id,
-            });
-            headers.push(ResolvedHeader {
-                name: "originator".to_string(),
-                value: "cockpit".to_string(),
-            });
-            headers.push(ResolvedHeader {
-                name: "OpenAI-Beta".to_string(),
-                value: "responses=experimental".to_string(),
-            });
-            headers.push(ResolvedHeader {
-                name: "session_id".to_string(),
-                value: uuid::Uuid::new_v4().to_string(),
-            });
+        match credential {
+            OAuthCredential::Codex(mut tokens) => {
+                let account_id = tokens.account_id.take().ok_or_else(|| {
+                    anyhow!(
+                        "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
+                    )
+                })?;
+                headers.push(ResolvedHeader {
+                    name: "chatgpt-account-id".to_string(),
+                    value: account_id,
+                });
+                headers.push(ResolvedHeader {
+                    name: "originator".to_string(),
+                    value: "cockpit".to_string(),
+                });
+                headers.push(ResolvedHeader {
+                    name: "OpenAI-Beta".to_string(),
+                    value: "responses=experimental".to_string(),
+                });
+            }
+            OAuthCredential::Command(command) => {
+                for (name, value) in command.headers.unwrap_or_default() {
+                    merge_header_override(&mut headers, ResolvedHeader { name, value });
+                }
+            }
+            OAuthCredential::Bearer(_) => {}
+            OAuthCredential::Descriptor(_) => unreachable!(),
         }
     } else if let Some(auth) = auth_header {
         headers.push(auth);
@@ -550,9 +846,23 @@ fn resolve_provider_request_inner_with_sources(
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, env_lookup)?,
         headers,
+        is_codex_credential,
+        #[cfg(not(test))]
+        command_credential_generation: None,
         #[cfg(not(test))]
         origin,
     })
+}
+
+fn merge_header_override(headers: &mut Vec<ResolvedHeader>, replacement: ResolvedHeader) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|header| header.name.eq_ignore_ascii_case(&replacement.name))
+    {
+        *existing = replacement;
+    } else {
+        headers.push(replacement);
+    }
 }
 
 fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHeader]) -> Result<()> {
@@ -595,6 +905,9 @@ pub(crate) fn resolve_codex_model_list_request(
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, false, lookup)?,
         headers,
+        is_codex_credential: true,
+        #[cfg(not(test))]
+        command_credential_generation: None,
         #[cfg(not(test))]
         origin: ProviderRegistry::standard().resolve_origin(provider_id, entry)?,
     })
@@ -680,7 +993,7 @@ async fn fetch_models_at_detailed(
         anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
     }
 
-    let body = read_success_body_limited(resp).await?;
+    let body = read_success_body_limited(resp, "/models").await?;
     let body_nonempty = !body.trim().is_empty();
     let models = parse_models_body_with_abi(&body, catalog_abi)?;
     Ok(FetchModelsAtResult {
@@ -753,7 +1066,10 @@ pub async fn fetch_models_for_provider(
     resolved: &ResolvedRequest,
     timeout: Duration,
 ) -> Result<FetchOutcome> {
-    fetch_models_for_provider_with_store(provider_id, entry, resolved, timeout, None).await
+    fetch_models_for_provider_with_store(provider_id, entry, resolved, timeout, None, |name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
 pub async fn fetch_models_for_provider_with_store(
@@ -762,22 +1078,59 @@ pub async fn fetch_models_for_provider_with_store(
     resolved: &ResolvedRequest,
     timeout: Duration,
     store: Option<crate::credentials::CredentialStore>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<FetchOutcome> {
-    let request =
-        resolve_model_list_request_async_with_store(provider_id, entry, resolved, store).await?;
+    let auth_store = store.clone();
+    let request = resolve_model_list_request_async_with_store(
+        provider_id,
+        entry,
+        resolved,
+        store,
+        &env_lookup,
+    )
+    .await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    let url = provider.models_url(entry, &request.base_url);
+    let mut url = provider.models_url(entry, &request.base_url);
     let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
-    let outcome = fetch_models_at_detailed(
+    let mut outcome = fetch_models_at_detailed(
         &url,
         &request.headers,
         timeout,
         ModelCatalogAbi::from(provider.request_kind()),
     )
     .await
-    .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
+    .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
+    if outcome
+        .as_ref()
+        .is_err_and(|error| auth_rejection_error(error))
+        && (entry.auth_command.is_some() || entry.oauth.is_some())
+        && let Some(store) = auth_store
+    {
+        let rejected_generation = request.command_credential_generation().context(
+            "dynamically authenticated model-list request is missing its credential generation",
+        )?;
+        let refreshed = resolve_provider_request_async_with_store_refresh(
+            provider_id,
+            entry,
+            store.clone(),
+            &env_lookup,
+            true,
+            Some(rejected_generation),
+        )
+        .await?;
+        let refreshed_url = provider.models_url(entry, &refreshed.base_url);
+        outcome = fetch_models_at_detailed(
+            &refreshed_url,
+            &refreshed.headers,
+            timeout,
+            ModelCatalogAbi::from(provider.request_kind()),
+        )
+        .await
+        .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
+        url = refreshed_url;
+    }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
@@ -830,16 +1183,21 @@ pub async fn fetch_models_for_provider_with_store(
     }
 }
 
+fn auth_rejection_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("returned 401") || message.contains("returned 403")
+}
+
 fn validate_anthropic_fetch_result(
+    provider_id: &str,
     entry: &ProviderEntry,
-    base_url: &str,
     result: FetchModelsAtResult,
 ) -> Result<FetchModelsAtResult> {
-    if !crate::config::providers::is_anthropic_native_base_url(base_url) {
-        return Ok(result);
-    }
     if let FetchOutcome::Models { models, .. } = &result.outcome {
         for fetched in models {
+            if entry.resolve_wire_api(provider_id, &fetched.id) != WireApi::Anthropic {
+                continue;
+            }
             let mut candidate_model = fetched.clone();
             if let Some(existing) = entry.models.iter().find(|model| model.id == fetched.id) {
                 candidate_model.capability_overrides = existing.capability_overrides.clone();
@@ -859,17 +1217,32 @@ fn validate_anthropic_fetch_result(
     Ok(result)
 }
 
-async fn read_success_body_limited(mut resp: reqwest::Response) -> Result<String> {
+/// Read a provider success response while retaining a strict upper bound for
+/// both declared and chunked bodies. Configurable provider endpoints must not
+/// be able to exhaust the daemon before their response is parsed.
+pub(crate) async fn read_success_body_limited(
+    mut resp: reqwest::Response,
+    response_name: &str,
+) -> Result<String> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!(
+            "{response_name} response body exceeded {} byte limit",
+            MAX_PROVIDER_RESPONSE_BYTES
+        );
+    }
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .context("reading /models response body")?
+        .with_context(|| format!("reading {response_name} response body"))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
             anyhow::bail!(
-                "/models response body exceeded {} byte limit",
-                MAX_MODELS_RESPONSE_BYTES
+                "{response_name} response body exceeded {} byte limit",
+                MAX_PROVIDER_RESPONSE_BYTES
             );
         }
         body.extend_from_slice(&chunk);
@@ -1105,6 +1478,7 @@ fn context_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
 
 fn max_output_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
     numeric_field(obj, "max_output_tokens")
+        .or_else(|| numeric_field(obj, "max_completion_tokens"))
         .or_else(|| numeric_field(obj, "output_token_limit"))
         .or_else(|| numeric_field(obj, "max_tokens"))
 }
@@ -1606,7 +1980,7 @@ fn resolve_provider_base_url_with_env(
     Ok(url)
 }
 
-fn validate_provider_base_url(
+pub(crate) fn validate_provider_base_url(
     provider_id: &str,
     base_url: &str,
     allow_insecure_http: bool,
@@ -1769,6 +2143,43 @@ mod tests {
         let body = r#"[{"id":"foo"},{"id":"bar"}]"#;
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parses_crofai_models_metadata_and_completion_limit() {
+        let body = r#"{
+            "data": [{
+                "id": "crofai/example-model",
+                "name": "Example Model",
+                "context_length": 262144,
+                "max_completion_tokens": 16384,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "quantization": "fp8",
+                "speed": "fast"
+            }]
+        }"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.context_length, Some(262144));
+        assert_eq!(model.capabilities.context_tokens, Some(262144));
+        assert_eq!(model.capabilities.max_output_tokens, Some(16384));
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("pricing")
+                .and_then(Value::as_object)
+                .and_then(|pricing| pricing.get("prompt"))
+                .and_then(Value::as_str),
+            Some("0.000001")
+        );
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("quantization")
+                .and_then(Value::as_str),
+            Some("fp8")
+        );
     }
 
     #[test]
@@ -2135,12 +2546,17 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        let anthropic_wire_provider = ProviderEntry {
+            url: "https://anthropic-compatible.example/v1".to_string(),
+            wire_api: WireApi::Anthropic,
+            ..ProviderEntry::default()
+        };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
-            Ok(_) => panic!("OpenAI-shaped native Anthropic mapping must be rejected"),
+            Ok(_) => panic!("OpenAI-shaped Anthropic-wire mapping must be rejected"),
             Err(error) => format!("{error:#}"),
         };
         assert!(error.contains("rejecting invalid Anthropic catalog entry"));
@@ -2182,8 +2598,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("unknown adaptive Anthropic targets must be rejected"),
@@ -2210,8 +2626,8 @@ mod tests {
             body_nonempty: true,
         };
         let error = match validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
+            "third-party-anthropic",
+            &anthropic_wire_provider,
             result,
         ) {
             Ok(_) => panic!("manual Anthropic mapping without an output limit must be rejected"),
@@ -2239,10 +2655,37 @@ mod tests {
             status: Some(StatusCode::OK),
             body_nonempty: true,
         };
+        validate_anthropic_fetch_result("third-party-anthropic", &anthropic_wire_provider, result)
+            .unwrap();
+
+        let first_party_host_on_openai_wire = ProviderEntry {
+            url: "https://api.anthropic.com/v1".to_string(),
+            wire_api: WireApi::Completions,
+            ..ProviderEntry::default()
+        };
+        let openai_shaped = parse_models_body(
+            r#"{"data":[{
+                "id":"openai-wire-model",
+                "max_output_tokens":8192,
+                "capabilities":{"reasoning_effort":{
+                    "values":[{"value":"high"}],
+                    "default":"high",
+                    "request_mapping":{"type":"json_field","field":"reasoning_effort"}
+                }}
+            }]}"#,
+        )
+        .unwrap();
         validate_anthropic_fetch_result(
-            &ProviderEntry::default(),
-            "https://api.anthropic.com/v1",
-            result,
+            "first-party-host-openai-wire",
+            &first_party_host_on_openai_wire,
+            FetchModelsAtResult {
+                outcome: FetchOutcome::Models {
+                    models: openai_shaped,
+                    catalog: ProviderModelCatalog::Live,
+                },
+                status: Some(StatusCode::OK),
+                body_nonempty: true,
+            },
         )
         .unwrap();
     }
@@ -2301,6 +2744,69 @@ mod tests {
 
         assert!(missing.is_empty());
         assert_eq!(resolved[0].value, "Bearer sk-request-secret");
+    }
+
+    #[test]
+    fn command_headers_override_static_and_bearer_headers() {
+        let entry = ProviderEntry {
+            url: "https://api.example.test/v1".into(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["auth-helper".into()]),
+            headers: vec![
+                HeaderSpec {
+                    name: "X-Tenant".into(),
+                    value: "static".into(),
+                },
+                HeaderSpec {
+                    name: "X-Static".into(),
+                    value: "kept".into(),
+                },
+            ],
+            ..ProviderEntry::default()
+        };
+        let credential = OAuthCredential::Command(crate::auth::command::CommandCredential {
+            token: "default-token".into(),
+            expires_at: None,
+            headers: Some(BTreeMap::from([
+                ("authorization".into(), "Token override".into()),
+                ("x-tenant".into(), "returned".into()),
+            ])),
+            refresh_generation: 0,
+        });
+        let request = resolve_provider_request_inner_with_sources(
+            "custom",
+            &entry,
+            Some(credential),
+            ProviderRequestKind::Template,
+            &|_| None,
+            &|_| None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved_header_value(&request, "Authorization"),
+            Some("Token override")
+        );
+        assert_eq!(
+            resolved_header_value(&request, "X-Tenant"),
+            Some("returned")
+        );
+        assert_eq!(resolved_header_value(&request, "X-Static"), Some("kept"));
+    }
+
+    #[test]
+    fn command_auth_always_uses_template_provider_fallback() {
+        let entry = ProviderEntry {
+            url: crate::auth::codex_oauth::DEFAULT_BASE_URL.into(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["auth-helper".into()]),
+            ..ProviderEntry::default()
+        };
+
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("codex-oauth", &entry),
+            "template"
+        );
     }
 
     #[test]
@@ -2614,6 +3120,7 @@ mod tests {
                 name: "Authorization".into(),
                 value: "Bearer fixture-secret-token".into(),
             }],
+            is_codex_credential: false,
         };
 
         let rendered = format!("{resolved:?}");
@@ -2804,6 +3311,29 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn official_build_rejects_grok_oauth_shaped_entries_before_request_construction() {
+        let entry = ProviderEntry {
+            url: "https://api.x.ai/v1".into(),
+            auth: Some(AuthKind::OAuth),
+            ..ProviderEntry::default()
+        };
+        let registry = ProviderRegistry::standard();
+        assert_eq!(
+            registry.provider_for("custom-grok", &entry).id(),
+            "grok-oauth-unavailable"
+        );
+        let error = resolve_provider_request_with_env("custom-grok", &entry, |_| None)
+            .expect_err("official build must not send a Grok OAuth-shaped request unauthenticated");
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable in this official build")
+        );
+    }
+
+    #[cfg(feature = "grok-subscription")]
     #[test]
     fn grok_oauth_sync_resolver_requires_login() {
         let entry = ProviderEntry {
@@ -2821,6 +3351,7 @@ mod tests {
         assert!(err.to_string().contains("Grok subscription auth required"));
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[tokio::test]
     async fn grok_oauth_async_resolver_injects_stored_bearer() {
         let env = crate::test_env::lock_async().await;
@@ -2875,7 +3406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_oauth_async_resolver_injects_stored_bearer_and_codex_headers() {
+    async fn codex_oauth_async_resolver_marks_credential_and_injects_codex_headers() {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
         env.set_var("XDG_STATE_HOME", tmp.path());
@@ -2929,11 +3460,13 @@ mod tests {
                 .any(|h| h.name.eq_ignore_ascii_case("OpenAI-Beta")
                     && h.value == "responses=experimental")
         );
+        assert!(resolved.is_codex_credential);
         assert!(
-            resolved
+            !resolved
                 .headers
                 .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("session_id") && !h.value.is_empty())
+                .any(|h| h.name.eq_ignore_ascii_case("session_id")),
+            "Rig owns the per-request session_id"
         );
     }
 
@@ -2986,6 +3519,46 @@ mod tests {
         assert!(
             !crate::credentials::default_path().unwrap().exists(),
             "models_fetch must read named secrets from the vault"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_request_rejects_legacy_reserved_ref_without_loading_reserved_victim() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let victim = crate::auth::descriptor::credential_record_id("victim");
+        vault
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &victim,
+                b"{not-json-reserved-victim",
+            )
+            .unwrap();
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://example.test/v1".into(),
+            auth: Some(crate::config::providers::AuthKind::OAuth),
+            credential_ref: Some(victim.clone()),
+            ..crate::config::providers::ProviderEntry::default()
+        };
+        let providers = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([("attacker".into(), entry.clone())]),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
+            vault,
+            "/ws/test",
+            &crate::secret_ref::provider_named_secret_references(&providers),
+            Some(&std::collections::BTreeSet::new()),
+            &crate::secret_ref::provider_credential_record_references(&providers),
+        )
+        .unwrap();
+
+        let error = resolve_provider_request_async_with_store("attacker", &entry, store, |_| None)
+            .await
+            .expect_err("legacy reserved refs must be rejected at the request boundary");
+        assert!(
+            error.to_string().contains("reserved namespace"),
+            "request must fail on the reserved ref, not while loading an unrelated reserved record: {error:#}"
         );
     }
 
@@ -3220,6 +3793,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
 
             let outcome = fetch_models_for_provider_with_store(
@@ -3228,6 +3802,7 @@ mod tests {
                 &resolved,
                 Duration::from_secs(5),
                 Some(crate::credentials::CredentialStore::open_default().unwrap()),
+                |_| None,
             )
             .await
             .unwrap();
@@ -3285,6 +3860,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3316,6 +3892,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider_with_store(
@@ -3324,6 +3901,7 @@ mod tests {
             &resolved,
             Duration::from_secs(5),
             Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            |_| None,
         )
         .await
         .unwrap();
@@ -3357,6 +3935,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
 
             let err = fetch_models_for_provider_with_store(
@@ -3365,6 +3944,7 @@ mod tests {
                 &resolved,
                 Duration::from_secs(5),
                 Some(crate::credentials::CredentialStore::open_default().unwrap()),
+                |_| None,
             )
             .await
             .unwrap_err();
@@ -3376,7 +3956,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_success_response_body_errors_before_parse() {
         let mut body = String::from(r#"{"data":[]}"#);
-        body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+        body.push_str(&" ".repeat(MAX_PROVIDER_RESPONSE_BYTES));
         let (base_url, request_handle) = serve_models_once(body).await;
         let entry = ProviderEntry {
             url: base_url.clone(),
@@ -3386,6 +3966,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let err = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3399,7 +3980,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(&MAX_MODELS_RESPONSE_BYTES.to_string()),
+            message.contains(&MAX_PROVIDER_RESPONSE_BYTES.to_string()),
             "{message}"
         );
     }
@@ -3419,6 +4000,7 @@ mod tests {
         let resolved = ResolvedRequest {
             base_url,
             headers: Vec::new(),
+            is_codex_credential: false,
         };
 
         let outcome = fetch_models_for_provider("local", &entry, &resolved, Duration::from_secs(5))
@@ -3511,6 +4093,7 @@ mod tests {
                 format_hint: "synthetic key",
                 console_url: "https://synthetic.example/keys",
             }),
+            usage_probe: None,
             auth_check: crate::providers::AuthCheckKind::ModelsEndpoint,
         };
         let entry = ProviderEntry {
@@ -3549,6 +4132,7 @@ mod tests {
                 },
                 crate::auth::codex_oauth::CREDENTIAL_KEY,
             ),
+            #[cfg(feature = "grok-subscription")]
             (
                 "grok-oauth",
                 ProviderEntry {
@@ -3693,6 +4277,7 @@ mod tests {
                 name: "Authorization".into(),
                 value: "Bearer bt-test".into(),
             }],
+            is_codex_credential: false,
         };
 
         let outcome =
@@ -3753,7 +4338,7 @@ mod tests {
         // Bounded success body: oversized payloads error before parse/merge.
         {
             let mut body = String::from(r#"{"data":[{"id":"too-big"}]}"#);
-            body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+            body.push_str(&" ".repeat(MAX_PROVIDER_RESPONSE_BYTES));
             let (base_url, _) = serve_models_once(body).await;
             let mut entry = ProviderEntry {
                 url: base_url.clone(),
@@ -3769,6 +4354,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -3966,6 +4552,7 @@ mod tests {
                     name: "Authorization".into(),
                     value: "Bearer SECRETKEY".into(),
                 }],
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4002,6 +4589,7 @@ mod tests {
                     name: "Authorization".into(),
                     value: "Bearer SECRETKEY".into(),
                 }],
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4032,6 +4620,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
@@ -4063,6 +4652,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_millis(50))
@@ -4090,6 +4680,7 @@ mod tests {
             let resolved = ResolvedRequest {
                 base_url,
                 headers: Vec::new(),
+                is_codex_credential: false,
             };
             let err =
                 fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(2))

@@ -639,6 +639,7 @@ mod tests {
             rationale: None,
             author_suggested: false,
             exact_alias_match: false,
+            requires_trust_confirmation: false,
         }
     }
 

@@ -43,6 +43,7 @@ remote = [
     "dep:tokio-tungstenite",
     "dep:flycockpit-relay-protocol",
 ]
+grok-subscription = ["cockpit-core/grok-subscription", "cockpit-tui/grok-subscription"]
 
 [[bin]]
 name = "cockpit"

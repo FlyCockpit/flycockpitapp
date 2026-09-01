@@ -11,7 +11,6 @@ use serde_json::json;
 
 use crate::config::providers::{
     CapabilitySource, ModelEntry, ProvidersConfig, WireApi, WireApiProvenance,
-    is_anthropic_native_base_url,
 };
 use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
@@ -180,7 +179,7 @@ fn wire_api_label(wire: WireApi) -> &'static str {
         WireApi::Auto => "auto",
         WireApi::Completions => "completions",
         WireApi::Responses => "responses",
-        WireApi::Anthropic => "messages",
+        WireApi::Anthropic => "anthropic",
     }
 }
 
@@ -266,6 +265,16 @@ pub struct HttpDeepfetchProbeClient {
 impl HttpDeepfetchProbeClient {
     pub fn new(resolved: BTreeMap<String, ResolvedRequest>, timeout: Duration) -> Self {
         Self { resolved, timeout }
+    }
+
+    pub fn replace_resolved(&mut self, provider_id: String, request: ResolvedRequest) {
+        self.resolved.insert(provider_id, request);
+    }
+
+    pub fn command_credential_generation(&self, provider_id: &str) -> Option<u64> {
+        self.resolved
+            .get(provider_id)
+            .and_then(ResolvedRequest::command_credential_generation)
     }
 }
 
@@ -521,7 +530,7 @@ pub fn collect_deepfetch_targets(
         {
             continue;
         }
-        if is_anthropic_native_base_url(&entry.url) {
+        if cfg.resolve_wire_api(provider_id, "") == WireApi::Anthropic {
             continue;
         }
         if provider_id == "codex-oauth" {
@@ -559,14 +568,7 @@ pub fn collect_deepfetch_targets(
                 },
                 inherited_wire_api: entry.wire_api,
                 supported_wire_apis: model.capabilities.supported_wire_apis.clone(),
-                automatic_wire_api: {
-                    let resolved = cfg.resolve_wire_api(provider_id, &model.id);
-                    if resolved.is_auto() {
-                        WireApi::detect_for_provider_entry(provider_id, entry, &model.id)
-                    } else {
-                        resolved
-                    }
-                },
+                automatic_wire_api: cfg.resolve_wire_api(provider_id, &model.id),
                 direct_model_scope: scope.provider.is_some() && scope.model.is_some(),
             });
         }

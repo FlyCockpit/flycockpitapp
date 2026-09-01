@@ -843,7 +843,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -999,12 +998,14 @@ mod tests {
         pane.def.as_mut().unwrap().vnext = Some(cockpit_core::agents::VnextAgentDef {
             schema_version: cockpit_core::agents::SCHEMA_VERSION,
             agent_id: "local:test".to_string(),
-            execution_kind: cockpit_core::agents::ExecutionKind::Coding,
+            roles: vec![cockpit_core::agents::AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: BTreeMap::new(),
             delegation: cockpit_core::agents::DelegationPolicy::default(),
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         });
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));

@@ -13,6 +13,8 @@
 //! /sealed replace <record-id>
 //! /sealed rotate <record-id>
 //! /sealed delete <record-id> --confirm <record-id>
+//! /sealed reset <record-id> --confirm <record-id>
+//! /sealed promote <record-id> --scope <project|global>
 //! /sealed recover <record-id>
 //! /sealed action list
 //! /sealed action create <kind-id> --project <id> --description <safe-text> --origin-id <id> --projection-id <id>
@@ -65,6 +67,18 @@ pub enum SealedCommand {
         record_id: SealedRecordId,
         confirm: SealedRecordId,
     },
+    /// `/sealed reset <record-id> --confirm <record-id>` — removes a
+    /// session-scoped value through its version-bound owner control frame.
+    Reset {
+        record_id: SealedRecordId,
+        confirm: SealedRecordId,
+    },
+    /// `/sealed promote <record-id> --scope <project|global>` — retains a
+    /// session-scoped value beyond session end in the selected ambient scope.
+    Promote {
+        record_id: SealedRecordId,
+        target_scope: SealedScopeKind,
+    },
     /// `/sealed recover <record-id>` — opens an ephemeral foreground reveal.
     Recover { record_id: SealedRecordId },
     /// `/sealed action ...`
@@ -85,6 +99,14 @@ pub enum SealedActionCommand {
         description: SealedDescription,
         origin_id: String,
         projection_id: String,
+    },
+    /// `/sealed action create-declared --project <id> --description <safe-text>
+    /// --declaration-json <owner-authored-json>`. The declaration is parsed by
+    /// the local owner RPC into a typed sink; models never receive this payload.
+    CreateDeclared {
+        project_id: String,
+        description: SealedDescription,
+        declaration_json: String,
     },
     /// `/sealed action revise <action-id> --description <safe-text>`
     ReviseDescription {
@@ -114,6 +136,8 @@ pub fn parse_sealed_command(tokens: &[&str]) -> Result<SealedCommand> {
         "replace" => parse_replace(&tokens[1..]),
         "rotate" => parse_rotate(&tokens[1..]),
         "delete" => parse_delete(&tokens[1..]),
+        "reset" => parse_reset(&tokens[1..]),
+        "promote" => parse_promote(&tokens[1..]),
         "recover" => parse_recover(&tokens[1..]),
         "action" => parse_action(&tokens[1..]).map(SealedCommand::Action),
         "list" => parse_list(&tokens[1..]),
@@ -260,6 +284,63 @@ fn parse_delete(tokens: &[&str]) -> Result<SealedCommand> {
     Ok(SealedCommand::Delete { record_id, confirm })
 }
 
+fn parse_reset(tokens: &[&str]) -> Result<SealedCommand> {
+    let record_id = SealedRecordId::parse(
+        tokens
+            .first()
+            .context("`/sealed reset` requires a record id")?,
+    )?;
+    let mut confirm = None;
+    let mut i = 1;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--confirm" => {
+                i += 1;
+                confirm = Some(SealedRecordId::parse(
+                    tokens.get(i).context("--confirm requires a value")?,
+                )?);
+            }
+            _ => bail!("unknown `/sealed reset` flag: `{}`", tokens[i]),
+        }
+        i += 1;
+    }
+    let confirm = confirm.context("`/sealed reset` requires --confirm")?;
+    if record_id != confirm {
+        bail!("`/sealed reset` confirmation must exactly match the record id");
+    }
+    Ok(SealedCommand::Reset { record_id, confirm })
+}
+
+fn parse_promote(tokens: &[&str]) -> Result<SealedCommand> {
+    let record_id = SealedRecordId::parse(
+        tokens
+            .first()
+            .context("`/sealed promote` requires a record id")?,
+    )?;
+    let mut target_scope = None;
+    let mut i = 1;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--scope" => {
+                i += 1;
+                target_scope = Some(parse_scope(
+                    tokens.get(i).context("--scope requires a value")?,
+                )?);
+            }
+            _ => bail!("unknown `/sealed promote` flag: `{}`", tokens[i]),
+        }
+        i += 1;
+    }
+    let target_scope = target_scope.context("`/sealed promote` requires --scope")?;
+    if !target_scope.is_persistent_compartment() {
+        bail!("`/sealed promote --scope` must be `project` or `global`");
+    }
+    Ok(SealedCommand::Promote {
+        record_id,
+        target_scope,
+    })
+}
+
 fn parse_recover(tokens: &[&str]) -> Result<SealedCommand> {
     let record_id = SealedRecordId::parse(
         tokens
@@ -284,6 +365,7 @@ fn parse_action(tokens: &[&str]) -> Result<SealedActionCommand> {
             Ok(SealedActionCommand::List)
         }
         "create" => parse_action_create(&tokens[1..]),
+        "create-declared" => parse_action_create_declared(&tokens[1..]),
         "revise" => parse_action_revise(&tokens[1..]),
         "retire" => parse_action_retire(&tokens[1..]),
         _ => bail!("unknown `/sealed action` subcommand: `{}`", tokens[0]),
@@ -349,6 +431,53 @@ fn parse_action_create(tokens: &[&str]) -> Result<SealedActionCommand> {
         description,
         origin_id,
         projection_id,
+    })
+}
+
+fn parse_action_create_declared(tokens: &[&str]) -> Result<SealedActionCommand> {
+    let mut project_id = None;
+    let mut description = None;
+    let mut declaration_json = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--project" => {
+                i += 1;
+                project_id = Some(
+                    tokens
+                        .get(i)
+                        .context("--project requires a value")?
+                        .to_string(),
+                );
+            }
+            "--description" => {
+                i += 1;
+                description = Some(SealedDescription::parse(
+                    tokens.get(i).context("--description requires a value")?,
+                )?);
+            }
+            "--declaration-json" => {
+                i += 1;
+                declaration_json = Some(
+                    tokens
+                        .get(i)
+                        .context("--declaration-json requires a value")?
+                        .to_string(),
+                );
+            }
+            _ => bail!(
+                "unknown `/sealed action create-declared` flag: `{}`",
+                tokens[i]
+            ),
+        }
+        i += 1;
+    }
+    Ok(SealedActionCommand::CreateDeclared {
+        project_id: project_id.context("`/sealed action create-declared` requires --project")?,
+        description: description
+            .context("`/sealed action create-declared` requires --description")?,
+        declaration_json: declaration_json
+            .context("`/sealed action create-declared` requires --declaration-json")?,
     })
 }
 
@@ -591,6 +720,45 @@ mod tests {
     fn delete_rejects_missing_confirm() {
         let id = SealedRecordId::generate();
         assert!(parse_sealed_command(&["delete", &id.to_string()]).is_err());
+    }
+
+    #[test]
+    fn reset_requires_exact_confirm() {
+        let id = SealedRecordId::generate();
+        let cmd = parse_sealed_command(&["reset", &id.to_string(), "--confirm", &id.to_string()])
+            .unwrap();
+        match cmd {
+            SealedCommand::Reset { record_id, confirm } => {
+                assert_eq!(record_id, id);
+                assert_eq!(confirm, id);
+            }
+            _ => panic!("expected Reset"),
+        }
+    }
+
+    #[test]
+    fn reset_rejects_mismatched_confirm() {
+        let id1 = SealedRecordId::generate();
+        let id2 = SealedRecordId::generate();
+        assert!(
+            parse_sealed_command(&["reset", &id1.to_string(), "--confirm", &id2.to_string()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn promote_parses_only_persistent_target_scopes() {
+        let id = SealedRecordId::generate();
+        let cmd =
+            parse_sealed_command(&["promote", &id.to_string(), "--scope", "project"]).unwrap();
+        assert_eq!(
+            cmd,
+            SealedCommand::Promote {
+                record_id: id,
+                target_scope: SealedScopeKind::Project,
+            }
+        );
+        assert!(parse_sealed_command(&["promote", &id.to_string(), "--scope", "session"]).is_err());
     }
 
     #[test]

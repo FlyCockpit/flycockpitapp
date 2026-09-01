@@ -1,10 +1,10 @@
 //! AC6 `built_in_and_monty_sealed_reference_matrix`
 //!
 //! Every built-in and Monty sealed-use path accepts only
-//! `{sealed_value_id, action_id, bounded_params}`. Untrusted callers cannot
-//! receive a literal; trusted callers follow `ModelTrust` raw inference
-//! custody **without** gaining a literal-returning tool API. Steering posture
-//! never widens custody (issue #75).
+//! `{sealed_value_id, action_id, bounded_params}`; the separate no-argument
+//! listing path returns scoped safe metadata only. No caller can receive a
+//! literal; `ModelTrust` controls host-mediated capture only and never widens
+//! sealed-value use. Steering posture never widens custody (issue #75).
 //!
 //! Two tests, and the split is deliberate:
 //!
@@ -28,10 +28,12 @@ use crate::sealed::custody::ALL_MODEL_TRUSTS;
 use crate::sealed::runtime::{RecordingRedactionSink, SealedRuntime};
 use crate::sealed::store::IssueSealedGrant;
 use crate::sealed::{
-    SEALED_USE_DENIED_MESSAGE, SealedActionId, SealedActionRevision, SealedCustodyRequest,
-    USE_SEALED_VALUE_ARG_KEYS, USE_SEALED_VALUE_TOOL, UseSealedValueRequest,
-    parse_use_sealed_value_args, use_sealed_value_schema,
+    LIST_SEALED_VALUE_DESCRIPTIONS_TOOL, SEALED_USE_DENIED_MESSAGE, SealedActionId,
+    SealedActionRevision, SealedCustodyRequest, USE_SEALED_VALUE_ARG_KEYS, USE_SEALED_VALUE_TOOL,
+    UseSealedValueRequest, list_sealed_value_descriptions_schema, parse_use_sealed_value_args,
+    use_sealed_value_schema,
 };
+use crate::tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool;
 use crate::tools::use_sealed_value::UseSealedValueTool;
 
 /// Drive both model-facing sealed-use entry points end to end.
@@ -437,13 +439,13 @@ async fn built_in_and_monty_sealed_reference_matrix() {
     );
 
     // =====================================================================
-    // Trusted callers gain no literal-returning tool API.
+    // Trusted callers remain reference-only and gain no literal-returning API.
     // =====================================================================
     assert!(
         SealedCustodyRequest::new(ModelTrust::Trusted)
             .custody()
-            .permits_raw_literal(),
-        "a trusted caller keeps its ordinary raw inference custody"
+            .is_reference_only(),
+        "a trusted caller is reference-only too"
     );
     // …but the tool surface is identical for both, and there is no sibling
     // tool that returns a literal.
@@ -454,8 +456,8 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         .collect();
     assert_eq!(
         sealed_named_tools,
-        vec![USE_SEALED_VALUE_TOOL],
-        "there is exactly one sealed tool, and it is the reference-only one"
+        vec![LIST_SEALED_VALUE_DESCRIPTIONS_TOOL, USE_SEALED_VALUE_TOOL],
+        "the sealed surface is scoped safe metadata plus reference-only use"
     );
 
     // =====================================================================
@@ -466,6 +468,10 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         ("store", include_str!("../store.rs")),
         ("grant", include_str!("../grant.rs")),
         ("marker", include_str!("../marker.rs")),
+        (
+            "listing tool",
+            include_str!("../../tools/list_sealed_value_descriptions.rs"),
+        ),
         ("tool", include_str!("../../tools/use_sealed_value.rs")),
     ] {
         for line in source.lines() {
@@ -502,9 +508,18 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         );
     }
     assert!(
-        monty_production.contains("UseSealedValueTool"),
-        "Monty reaches sealed values only through the sanctioned mechanism"
+        monty_production.contains("ListSealedValueDescriptionsTool")
+            && monty_production.contains("UseSealedValueTool"),
+        "Monty exposes scoped safe metadata and the sanctioned use mechanism"
     );
+
+    let listing = ListSealedValueDescriptionsTool;
+    assert_eq!(listing.name(), LIST_SEALED_VALUE_DESCRIPTIONS_TOOL);
+    assert_eq!(
+        listing.parameters(),
+        list_sealed_value_descriptions_schema()
+    );
+    assert_eq!(listing.effect(), crate::engine::tool::ToolEffect::ReadOnly);
 
     // =====================================================================
     // The built-in tool renders the single content-free denial.

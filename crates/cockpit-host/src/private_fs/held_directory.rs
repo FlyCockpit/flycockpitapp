@@ -263,6 +263,17 @@ impl HeldWorkspaceDirectoryAuthority {
         self.imp.open_regular_file(components)
     }
 
+    /// Return a pathname whose directory component is this already-held
+    /// authority.  Linux procfs resolves `/proc/self/fd/N/name` from the live
+    /// directory descriptor, so a concurrent rename or symlink substitution of
+    /// the original spelling cannot redirect a pathname-only child process.
+    /// Other platforms fail closed until they provide an equivalent retained
+    /// directory execution capability.
+    pub fn retained_relative_path(&self, name: &str) -> Result<PathBuf> {
+        validate_component(name)?;
+        self.imp.retained_relative_path(name)
+    }
+
     /// Return the stable platform identity selected by a metadata-only path
     /// lookup. The lookup never acquires content-read access and refuses a
     /// final symlink/reparse point.
@@ -792,6 +803,18 @@ mod imp {
                 dir,
                 diagnostic_path: walked,
             })
+        }
+
+        pub(super) fn retained_relative_path(&self, name: &str) -> Result<PathBuf> {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                Ok(PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd())).join(name))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                let _ = name;
+                anyhow::bail!("retained pathname execution is unsupported on this platform")
+            }
         }
 
         pub(super) fn identity(&self) -> Result<DirectoryIdentity> {
@@ -1828,6 +1851,9 @@ mod imp {
         diagnostic_path: PathBuf,
     }
     impl HeldDirectory {
+        pub(super) fn retained_relative_path(&self, _: &str) -> Result<PathBuf> {
+            anyhow::bail!("retained pathname execution is unsupported on Windows")
+        }
         pub(super) fn open_existing(path: &Path) -> Result<Self> {
             Self::open_existing_with_policy(path, true)
         }
@@ -3170,6 +3196,9 @@ mod imp {
     #[derive(Debug)]
     pub(super) struct HeldDirectory;
     impl HeldDirectory {
+        pub(super) fn retained_relative_path(&self, _: &str) -> Result<PathBuf> {
+            anyhow::bail!("retained pathname execution is unsupported")
+        }
         pub(super) fn open_existing(_: &Path) -> Result<Self> {
             anyhow::bail!("held directory authority is unavailable")
         }

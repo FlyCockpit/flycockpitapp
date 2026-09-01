@@ -5,13 +5,14 @@ use reqwest::Url;
 
 use crate::config::providers::{AuthKind, ModelEntry, ProviderEntry, ProviderModelCatalog};
 use crate::providers::models_fetch::{self, ResolvedRequest};
-use crate::providers::usage::probes::{
-    CodexOAuthUsageProbe, GrokOAuthUsageProbe, ProviderUsageProbe,
-};
+#[cfg(feature = "grok-subscription")]
+use crate::providers::usage::probes::GrokOAuthUsageProbe;
+use crate::providers::usage::probes::{CodexOAuthUsageProbe, ProviderUsageProbe};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderCredentialKind {
     CodexOAuth,
+    #[cfg(feature = "grok-subscription")]
     XaiOAuth,
 }
 
@@ -37,6 +38,8 @@ impl ResolvedProviderOrigin {
 pub(crate) enum OAuthCredential {
     Bearer(String),
     Codex(crate::auth::codex_oauth::StoredTokens),
+    Command(crate::auth::command::CommandCredential),
+    Descriptor(crate::auth::descriptor::DescriptorCredential),
 }
 
 impl OAuthCredential {
@@ -44,6 +47,10 @@ impl OAuthCredential {
         match self {
             OAuthCredential::Bearer(token) => token,
             OAuthCredential::Codex(tokens) => &tokens.access_token,
+            OAuthCredential::Command(credential) => &credential.token,
+            OAuthCredential::Descriptor(_) => {
+                unreachable!("descriptor credentials map headers directly")
+            }
         }
     }
 }
@@ -67,7 +74,10 @@ pub(crate) trait Provider: Send + Sync {
         None
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
+    /// Return an error when this provider cannot resolve credentials in the
+    /// supplied context. A credential store makes built-in OAuth providers
+    /// usable, but never makes a provider unavailable in this build usable.
+    fn auth_resolution_error(&self, _has_credential_store: bool) -> Option<&'static str> {
         None
     }
 
@@ -158,8 +168,9 @@ impl Provider for CodexProvider {
         Some(ProviderCredentialKind::CodexOAuth)
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
-        Some("Codex subscription auth required — set up OAuth in /settings → Providers.")
+    fn auth_resolution_error(&self, has_credential_store: bool) -> Option<&'static str> {
+        (!has_credential_store)
+            .then_some("Codex subscription auth required — set up OAuth in /settings → Providers.")
     }
 
     fn model_list_request(
@@ -208,10 +219,12 @@ impl Provider for CodexProvider {
     }
 }
 
+#[cfg(feature = "grok-subscription")]
 pub(crate) struct GrokProvider {
     usage: GrokOAuthUsageProbe,
 }
 
+#[cfg(feature = "grok-subscription")]
 impl Default for GrokProvider {
     fn default() -> Self {
         Self {
@@ -220,28 +233,63 @@ impl Default for GrokProvider {
     }
 }
 
+#[cfg(feature = "grok-subscription")]
 impl Provider for GrokProvider {
     fn id(&self) -> &'static str {
         crate::auth::xai_oauth::CREDENTIAL_KEY
     }
 
     fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
-        provider_id.eq_ignore_ascii_case(crate::auth::xai_oauth::CREDENTIAL_KEY)
-            || entry.credential_ref.as_deref() == Some(crate::auth::xai_oauth::CREDENTIAL_KEY)
-            || (matches!(entry.auth, Some(AuthKind::OAuth)) && entry.url.contains("api.x.ai"))
+        is_grok_oauth_identity(provider_id, entry)
     }
 
     fn credential_kind(&self) -> Option<ProviderCredentialKind> {
         Some(ProviderCredentialKind::XaiOAuth)
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
-        Some("Grok subscription auth required — set up OAuth in /settings → Providers.")
+    fn auth_resolution_error(&self, has_credential_store: bool) -> Option<&'static str> {
+        (!has_credential_store)
+            .then_some("Grok subscription auth required — set up OAuth in /settings → Providers.")
     }
 
     fn usage_probe(&self) -> Option<&dyn ProviderUsageProbe> {
         Some(&self.usage)
     }
+}
+
+/// The official build recognizes Grok OAuth-shaped entries so they fail before
+/// request construction. Omitting this provider would let an existing
+/// `auth = "oauth"` entry fall through to the unauthenticated template path.
+#[cfg(not(feature = "grok-subscription"))]
+pub(crate) struct UnavailableGrokOAuthProvider;
+
+#[cfg(not(feature = "grok-subscription"))]
+impl Provider for UnavailableGrokOAuthProvider {
+    fn id(&self) -> &'static str {
+        "grok-oauth-unavailable"
+    }
+
+    fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
+        is_grok_oauth_identity(provider_id, entry)
+    }
+
+    fn auth_resolution_error(&self, _has_credential_store: bool) -> Option<&'static str> {
+        Some(
+            "Grok subscription OAuth is unavailable in this official build pending xAI authorization; use a custom OpenAI-compatible provider with auth_command instead.",
+        )
+    }
+}
+
+fn is_grok_oauth_identity(provider_id: &str, entry: &ProviderEntry) -> bool {
+    const GROK_OAUTH_CREDENTIAL_KEY: &str = "grok-oauth";
+
+    provider_id.eq_ignore_ascii_case(GROK_OAUTH_CREDENTIAL_KEY)
+        || entry.credential_ref.as_deref() == Some(GROK_OAUTH_CREDENTIAL_KEY)
+        || (matches!(entry.auth, Some(AuthKind::OAuth))
+            && Url::parse(&entry.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host.eq_ignore_ascii_case("api.x.ai")))
 }
 
 pub(crate) struct CopilotProvider;
@@ -279,14 +327,26 @@ impl ProviderRegistry {
     }
 
     pub fn standard() -> Self {
-        Self::new(vec![
-            Arc::new(CodexProvider::default()),
-            Arc::new(GrokProvider::default()),
-            Arc::new(CopilotProvider),
-        ])
+        let mut special: Vec<Arc<dyn Provider>> = vec![Arc::new(CodexProvider::default())];
+        #[cfg(feature = "grok-subscription")]
+        special.push(Arc::new(GrokProvider::default()));
+        #[cfg(not(feature = "grok-subscription"))]
+        special.push(Arc::new(UnavailableGrokOAuthProvider));
+        special.push(Arc::new(CopilotProvider));
+        Self::new(special)
     }
 
     pub(crate) fn provider_for(&self, provider_id: &str, entry: &ProviderEntry) -> &dyn Provider {
+        // Command authentication is deliberately provider-generic and always
+        // stays on the OpenAI-compatible template path. A custom entry may
+        // reuse a well-known id or URL without accidentally selecting one of
+        // Cockpit's built-in OAuth implementations.
+        if entry.auth_command.is_some()
+            || entry.oauth.is_some()
+            || matches!(entry.auth, Some(AuthKind::Command))
+        {
+            return self.template.as_ref();
+        }
         let mut matches = self
             .special
             .iter()
@@ -306,6 +366,12 @@ impl ProviderRegistry {
         provider_id: &str,
         entry: &ProviderEntry,
     ) -> Result<ResolvedProviderOrigin> {
+        #[cfg(not(feature = "grok-subscription"))]
+        if self.provider_for(provider_id, entry).id() == "grok-oauth-unavailable" {
+            return Err(anyhow!(
+                "provider `{provider_id}` uses disabled Grok subscription OAuth; use a custom OpenAI-compatible provider with auth_command"
+            ));
+        }
         let Some(template_id) = entry.template.as_deref() else {
             return Ok(ResolvedProviderOrigin::default());
         };

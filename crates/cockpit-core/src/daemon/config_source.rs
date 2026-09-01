@@ -46,6 +46,8 @@ pub struct ConfigWatchPaths {
 
 pub struct DaemonConfigLoad {
     pub providers: ProvidersConfig,
+    /// Stable, secret-free provider-layer enforcement warnings.
+    pub provider_warnings: Vec<String>,
     pub extended: ExtendedConfig,
     pub response_metrics_tokenizer_validation:
         std::result::Result<(), crate::config::extended::InvalidResponseMetricsTokenizer>,
@@ -82,6 +84,8 @@ impl ConfigWatchPaths {
 /// [`with_workspace_trust_policy`](crate::config::trust::with_workspace_trust_policy)
 /// (via [`Self::load_with_trust`]) so workspace-trust gating of project
 /// layers applies identically to the production source and any injected one.
+/// The canonical global config directory is user-owned and remains available
+/// under every workspace policy; only project `.cockpit/` layers are filtered.
 #[derive(Clone)]
 pub struct ConfigSource {
     load: Arc<LoadFn>,
@@ -134,6 +138,7 @@ impl ConfigSource {
                 let (providers, extended) = daemon_source(cwd)?;
                 Ok(DaemonConfigLoad {
                     providers,
+                    provider_warnings: Vec::new(),
                     extended,
                     response_metrics_tokenizer_validation: Ok(()),
                     participating_layers: Vec::new(),
@@ -143,6 +148,7 @@ impl ConfigSource {
                 let (providers, extended) = workspace_daemon_source(cwd)?;
                 Ok(DaemonConfigLoad {
                     providers,
+                    provider_warnings: Vec::new(),
                     extended,
                     response_metrics_tokenizer_validation: Ok(()),
                     participating_layers: Vec::new(),
@@ -203,6 +209,7 @@ impl ConfigSource {
             let extended = crate::config::extended::load_for_cwd_for_daemon_contract(cwd)?;
             Ok(DaemonConfigLoad {
                 providers: extended.providers,
+                provider_warnings: extended.provider_warnings,
                 extended: extended.config,
                 response_metrics_tokenizer_validation: extended
                     .response_metrics_tokenizer_validation,
@@ -227,6 +234,7 @@ impl ConfigSource {
                 )?;
                 Ok(DaemonConfigLoad {
                     providers: extended.providers,
+                    provider_warnings: extended.provider_warnings,
                     extended: extended.config,
                     response_metrics_tokenizer_validation: extended
                         .response_metrics_tokenizer_validation,
@@ -303,6 +311,7 @@ impl ConfigSource {
             move |_cwd| {
                 Ok(DaemonConfigLoad {
                     providers: daemon_providers.clone(),
+                    provider_warnings: Vec::new(),
                     extended: daemon_extended.clone(),
                     response_metrics_tokenizer_validation: Ok(()),
                     participating_layers: Vec::new(),
@@ -336,11 +345,22 @@ impl ConfigSource {
         cwd: &Path,
         policy: &WorkspaceTrustPolicy,
     ) -> Result<(ProvidersConfig, ExtendedConfig)> {
+        self.load_effective_for_daemon_with_provider_warnings(cwd, policy)
+            .map(|(providers, extended, _)| (providers, extended))
+    }
+
+    /// Daemon config load with the user-visible provider-layer warnings that
+    /// arose during the same authoritative projection.
+    pub fn load_effective_for_daemon_with_provider_warnings(
+        &self,
+        cwd: &Path,
+        policy: &WorkspaceTrustPolicy,
+    ) -> Result<(ProvidersConfig, ExtendedConfig, Vec<String>)> {
         crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
             let load = (self.daemon_load)(cwd)?;
             load.response_metrics_tokenizer_validation
                 .map_err(anyhow::Error::new)?;
-            Ok((load.providers, load.extended))
+            Ok((load.providers, load.extended, load.provider_warnings))
         })
     }
 

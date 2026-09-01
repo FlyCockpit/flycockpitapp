@@ -51,6 +51,12 @@ pub use cockpit_client::presentation::ResponsePerformance;
 ///
 /// No provider usage or model tokenizer participates.
 impl DisplayStreamClassifier {
+    /// Whether classification has observed any assistant response body text.
+    /// Reasoning-only chunks deliberately leave this false.
+    pub(crate) fn has_response_text(&self) -> bool {
+        !self.accumulated_body.is_empty()
+    }
+
     /// Build a snapshot from the classifier's measured instants and the
     /// final presentation text. Returns `None` when the response has no
     /// visible body, no first-presentation instant, or zero duration with

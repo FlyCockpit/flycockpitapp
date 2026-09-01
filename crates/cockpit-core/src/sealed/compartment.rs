@@ -165,7 +165,7 @@ pub struct SealedLiteralHandle<'a> {
 }
 
 impl SealedLiteralHandle<'_> {
-    /// The single raw-custody read point for a compiled host action.
+    /// The single host-only plaintext read point for a compiled action.
     pub fn expose(&self) -> &str {
         self.literal
     }

@@ -186,7 +186,7 @@ fn responses_reasoning_effort_mapping_serializes_a_nested_json_path() {
     );
     assert_eq!(
         cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
-        WireApi::Responses
+        WireApi::Completions
     );
 }
 
@@ -1487,77 +1487,69 @@ fn merge_preserves_model_override_fields_on_matching_fetched_id() {
 
 // --- wire-API endpoint routing (implementation note)
 
-/// Layer 2 name auto-detect: `gpt-5*` (case-insensitive) is responses-only;
-/// everything else (including `gpt-4o`, `gpt-50`, a too-short id) is
-/// completions — today's default for every existing model.
 #[test]
-fn wire_api_detect_heuristic_is_gpt5_prefix_case_insensitive() {
-    use WireApi::{Completions, Responses};
-    assert_eq!(WireApi::detect("gpt-5"), Responses);
-    assert_eq!(WireApi::detect("gpt-5.4-mini"), Responses);
-    assert_eq!(WireApi::detect("gpt-5o"), Responses);
-    // Case-insensitive on the prefix.
-    assert_eq!(WireApi::detect("GPT-5.4-mini"), Responses);
-    assert_eq!(WireApi::detect("Gpt-5"), Responses);
-    // Everything else → completions.
-    assert_eq!(WireApi::detect("gpt-4o-mini"), Completions);
-    assert_eq!(WireApi::detect("claude-opus-4-7"), Completions);
-    assert_eq!(WireApi::detect("glm-4.6"), Completions);
-    // A non-`gpt-5` id that merely shares a shorter prefix is completions.
-    assert_eq!(WireApi::detect("gpt-4"), Completions);
-    // Too-short ids never panic and default to completions.
-    assert_eq!(WireApi::detect("gpt"), Completions);
-    assert_eq!(WireApi::detect(""), Completions);
-}
-
-#[test]
-fn grok_providers_default_to_responses_wire_api() {
+fn wire_api_template_defaults_are_total_and_identity_based() {
     assert_eq!(
-        WireApi::detect_for_provider("grok", "grok-4.3"),
+        default_wire_api_for_template(Some("anthropic")),
+        WireApi::Anthropic
+    );
+    assert_eq!(
+        default_wire_api_for_template(Some("codex-oauth")),
         WireApi::Responses
     );
     assert_eq!(
-        WireApi::detect_for_provider("grok-oauth", "grok-4.3"),
-        WireApi::Responses
-    );
-}
-
-#[test]
-fn codex_oauth_defaults_to_responses_wire_api() {
-    assert_eq!(
-        WireApi::detect_for_provider("codex-oauth", "gpt-5.5"),
-        WireApi::Responses
-    );
-}
-
-#[test]
-fn copilot_gpt5_fallback_defaults_to_responses_wire_api() {
-    assert_eq!(
-        WireApi::detect_for_provider("copilot", "gpt-5.6-terra"),
-        WireApi::Responses
-    );
-    assert_eq!(
-        WireApi::detect_for_provider("copilot", "gpt-4o"),
+        default_wire_api_for_template(Some("crofai")),
         WireApi::Completions
     );
+    assert_eq!(
+        default_wire_api_for_template(Some("openai-compatible")),
+        WireApi::Completions
+    );
+    assert_eq!(default_wire_api_for_template(None), WireApi::Completions);
+
+    let mut cfg = ProvidersConfig::default();
+    for (id, template, expected) in [
+        ("custom", None, WireApi::Completions),
+        ("anthropic-work", Some("anthropic"), WireApi::Anthropic),
+        ("codex-work", Some("codex-oauth"), WireApi::Responses),
+    ] {
+        cfg.providers.insert(
+            id.to_string(),
+            ProviderEntry {
+                template: template.map(str::to_string),
+                ..ProviderEntry::default()
+            },
+        );
+        assert_eq!(cfg.resolve_wire_api(id, "any-model"), expected);
+    }
 }
 
 #[test]
-fn renamed_copilot_gpt5_fallback_uses_template_identity() {
+fn crofai_template_uses_normal_wire_resolution() {
     let mut cfg = ProvidersConfig::default();
+    let mut responses_model = model("responses-model", false);
+    responses_model.capabilities.supported_wire_apis = vec![WireApi::Responses];
+    let mut explicitly_routed_model = model("explicitly-routed-model", false);
+    explicitly_routed_model.wire_api = WireApi::Responses;
     cfg.providers.insert(
-        "team-github".into(),
+        "renamed-crofai".into(),
         ProviderEntry {
-            template: Some("copilot".into()),
-            models: vec![model("gpt-5.6-terra", false)],
+            template: Some("crofai".into()),
+            models: vec![responses_model, explicitly_routed_model],
             ..ProviderEntry::default()
         },
     );
 
+    // The template is only a wizard prefill: live catalog capabilities never
+    // select a request endpoint. A model can still opt into Responses through
+    // the ordinary explicit per-model configuration.
     assert_eq!(
-        cfg.resolve_wire_api("team-github", "gpt-5.6-terra"),
-        WireApi::Responses,
-        "a renamed Copilot connection must retain the Copilot GPT-5 fallback"
+        cfg.resolve_wire_api("renamed-crofai", "responses-model"),
+        WireApi::Completions
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("renamed-crofai", "explicitly-routed-model"),
+        WireApi::Responses
     );
 }
 
@@ -1570,10 +1562,8 @@ fn wire_api_opposite_is_bidirectional() {
     assert_eq!(WireApi::Auto.opposite(), WireApi::Responses);
 }
 
-/// Layer 1 (explicit config) wins over layer 2 (auto-detect): a pinned
-/// `completions`/`responses` is returned verbatim; an `auto` (or unknown
-/// provider/model) returns `Auto` so the build path falls through to
-/// `detect`.
+/// Explicit config wins over the template default; an unset model/provider
+/// resolves deterministically to the template or generic default.
 #[test]
 fn resolve_wire_api_explicit_config_wins() {
     let mut cfg = ProvidersConfig::default();
@@ -1581,9 +1571,8 @@ fn resolve_wire_api_explicit_config_wins() {
         url: "https://x".into(),
         ..ProviderEntry::default()
     };
-    // A `gpt-5` model that the heuristic would route to responses, but is
-    // explicitly pinned to completions: the pin must win even when the live
-    // catalog advertises Responses.
+    // An explicit model pin wins even when catalog metadata advertises a
+    // different endpoint.
     let mut pinned = model("gpt-5.4-mini", false);
     pinned.wire_api = WireApi::Completions;
     pinned.capabilities.supported_wire_apis = vec![WireApi::Responses];
@@ -1592,17 +1581,14 @@ fn resolve_wire_api_explicit_config_wins() {
     entry.models.push(model("gpt-4o", false));
     cfg.providers.insert("p".into(), entry);
 
-    // Explicit pin returned verbatim (caller will NOT auto-detect).
     assert_eq!(
         cfg.resolve_wire_api("p", "gpt-5.4-mini"),
         WireApi::Completions
     );
-    // `auto` model → Auto (caller auto-detects).
-    assert_eq!(cfg.resolve_wire_api("p", "gpt-4o"), WireApi::Auto);
-    // Unknown model / provider → Auto.
-    assert_eq!(cfg.resolve_wire_api("p", "missing"), WireApi::Auto);
-    assert_eq!(cfg.resolve_wire_api("nope", "x"), WireApi::Auto);
-    assert!(!cfg.is_wire_api_explicit("p", "gpt-4o"));
+    assert_eq!(cfg.resolve_wire_api("p", "gpt-4o"), WireApi::Completions);
+    assert_eq!(cfg.resolve_wire_api("p", "missing"), WireApi::Completions);
+    assert_eq!(cfg.resolve_wire_api("nope", "x"), WireApi::Completions);
+    assert!(cfg.is_wire_api_explicit("p", "gpt-4o"));
     assert!(cfg.is_wire_api_explicit("p", "gpt-5.4-mini"));
 }
 
@@ -1780,7 +1766,7 @@ fn live_catalog_supersedes_recovered_wire_api_but_not_user_pin() {
     );
     assert_eq!(
         cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
-        WireApi::Responses
+        WireApi::Completions
     );
 
     let mut user_pinned = model("gpt-5.6-terra", false);

@@ -1,4 +1,4 @@
-//! Closed, declarative v2 agent-definition schema.
+//! Closed, declarative launch-v1 agent-definition schema.
 //!
 //! This module deliberately contains no provider, credential, tool-grant, or
 //! sandbox binding.  Those are host-owned inputs to a later effective-grant
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u8 = 2;
+use super::ToolTier;
+
+pub const SCHEMA_VERSION: u8 = 1;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
 /// Explicit self-invocation token in `delegation.allowedChildren`. Counted
@@ -871,7 +873,7 @@ impl VnextHostPolicy {
     /// Construct the daemon's session-owned policy snapshot. This is the
     /// single core seam that turns ordinary session configuration into vNext
     /// ceilings; markdown never supplies these values. It intentionally does
-    /// not reuse the legacy per-agent recursion map: v2 tree admission is
+    /// not reuse the legacy per-agent recursion map: launch-v1 tree admission is
     /// governed exclusively by [`EffectiveVnextGrant`].
     pub fn for_session_config(config: &crate::config::extended::ExtendedConfig) -> Self {
         let max_concurrent_children = u16::try_from(config.delegation.max_parallel)
@@ -1010,8 +1012,13 @@ pub struct VnextAgentDef {
     pub schema_version: u8,
     #[serde(rename = "agentId")]
     pub agent_id: String,
-    #[serde(rename = "executionKind")]
-    pub execution_kind: ExecutionKind,
+    /// Semantic roles this definition can fill. Roles are composable: one
+    /// definition may be both a coding agent and a personal assistant.
+    pub roles: Vec<AgentRole>,
+    /// Author-declared capabilities. These are requests which remain bounded
+    /// by host policy; notably, `computerUse` does not authorize a backend.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub capabilities: BTreeSet<crate::agents::AgentCapability>,
     #[serde(rename = "modelSlots")]
     pub model_slots: BTreeMap<String, ModelSlot>,
     #[serde(default, skip_serializing_if = "DelegationPolicy::is_off")]
@@ -1028,6 +1035,15 @@ pub struct VnextAgentDef {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_knowledge_bases: Option<BTreeSet<String>>,
+    /// The author's preferred placement for host-granted tools. This chooses
+    /// only between direct native schemas and Monty discovery; it is never a
+    /// tool grant and host/session policy remains authoritative.
+    #[serde(
+        rename = "toolTierPreferences",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub tool_tier_preferences: BTreeMap<String, ToolTier>,
 }
 
 impl VnextAgentDef {
@@ -1036,6 +1052,12 @@ impl VnextAgentDef {
             bail!("schemaVersion must be exactly {SCHEMA_VERSION}");
         }
         validate_agent_id(&self.agent_id)?;
+        if self.roles.is_empty() {
+            bail!("roles must contain at least one of `code` or `assistant`");
+        }
+        if self.roles.iter().copied().collect::<BTreeSet<_>>().len() != self.roles.len() {
+            bail!("roles must be unique");
+        }
         if !self.model_slots.contains_key("primary") {
             bail!("modelSlots must contain required `primary` slot");
         }
@@ -1044,7 +1066,7 @@ impl VnextAgentDef {
             slot.validate(slot_id)?;
         }
         self.delegation
-            .validate(&self.agent_id, self.execution_kind)?;
+            .validate(&self.agent_id, self.execution_kind())?;
         if let Some(questions) = &self.questions {
             questions.validate(&self.model_slots)?;
         }
@@ -1056,7 +1078,46 @@ impl VnextAgentDef {
                 validate_knowledge_base_id(id)?;
             }
         }
+        for (tool, tier) in &self.tool_tier_preferences {
+            if !crate::agents::known_tool_names().contains(&tool.as_str()) {
+                bail!("toolTierPreferences names unknown tool `{tool}`");
+            }
+            if !matches!(tier, ToolTier::Enabled | ToolTier::Discoverable) {
+                bail!(
+                    "toolTierPreferences for `{tool}` must be `enabled` or `discoverable`, not `{}`",
+                    tier.label()
+                );
+            }
+            if !crate::agents::legal_tool_tiers(tool).contains(tier) {
+                bail!(
+                    "toolTierPreferences may not place `{tool}` at `{}`",
+                    tier.label()
+                );
+            }
+            if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
+                bail!("toolTierPreferences may not name host-placement tool `{tool}`");
+            }
+        }
         Ok(())
+    }
+
+    pub fn has_role(&self, role: AgentRole) -> bool {
+        self.roles.contains(&role)
+    }
+
+    pub fn supports_computer_use(&self) -> bool {
+        self.capabilities
+            .contains(&crate::agents::AgentCapability::ComputerUse)
+    }
+
+    /// Existing runtime snapshots still require a single launch lane. This is
+    /// a projection of the unified definition, not an authored schema axis.
+    pub fn execution_kind(&self) -> ExecutionKind {
+        if self.has_role(AgentRole::Code) {
+            ExecutionKind::Coding
+        } else {
+            ExecutionKind::Assistant
+        }
     }
 
     /// Apply the trusted loader's origin boundary after structural schema
@@ -1137,7 +1198,9 @@ impl VnextAgentDef {
             .map(|policy| policy.compile_with_slots(&self.model_slots));
         Ok(EffectiveVnextGrant {
             agent_id: self.agent_id.clone(),
-            execution_kind: self.execution_kind,
+            roles: self.roles.clone(),
+            capabilities: self.capabilities.clone(),
+            execution_kind: self.execution_kind(),
             delegation,
             questions,
             verification,
@@ -1157,7 +1220,7 @@ impl VnextAgentDef {
         parent: &EffectiveVnextGrant,
         parent_ref: &AllowedChild,
     ) -> Result<EffectiveVnextGrant> {
-        if !parent.permits_child(parent_ref, self.execution_kind) {
+        if !parent.permits_child_definition(parent_ref, self) {
             bail!("parent effective vNext grant does not permit this child");
         }
         let mut child = self.resolve_grant(host)?;
@@ -1318,6 +1381,10 @@ pub struct EffectiveVnextGrant {
     /// prevents a same-kind grant from one vNext definition being replayed
     /// against another selected definition.
     pub agent_id: String,
+    pub roles: Vec<AgentRole>,
+    pub capabilities: BTreeSet<crate::agents::AgentCapability>,
+    /// Runtime projection retained while the session snapshot migrates to
+    /// composable roles. It is not part of the authoring schema.
     pub execution_kind: ExecutionKind,
     pub delegation: Option<EffectiveDelegationGrant>,
     pub questions: Option<EffectiveQuestionPolicy>,
@@ -1332,6 +1399,10 @@ pub struct EffectiveVnextGrant {
 }
 
 impl EffectiveVnextGrant {
+    pub fn execution_kind(&self) -> ExecutionKind {
+        self.execution_kind
+    }
+
     pub fn computer_delegation_enabled(&self) -> bool {
         self.computer_delegation_enabled
     }
@@ -1352,6 +1423,15 @@ impl EffectiveVnextGrant {
                     self.computer_delegation_enabled,
                 )
         })
+    }
+
+    pub fn permits_child_definition(
+        &self,
+        child_ref: &AllowedChild,
+        child: &VnextAgentDef,
+    ) -> bool {
+        (!child.supports_computer_use() || self.computer_delegation_enabled)
+            && self.permits_child(child_ref, child.execution_kind())
     }
 
     /// Resolve verification against this grant's snapshotted compiled policy
@@ -1593,6 +1673,13 @@ pub enum ExecutionKind {
     Computer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRole {
+    Assistant,
+    Code,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSlot {
@@ -1735,6 +1822,27 @@ pub struct ModelRecommendation {
     pub author_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+    /// An author may suggest that the selected model be trusted, but this is
+    /// advisory metadata only. Applying it always requires a separate,
+    /// explicit user confirmation, regardless of definition provenance.
+    #[serde(
+        rename = "trustSuggestion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trust_suggestion: Option<ModelTrustSuggestion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTrustSuggestion {
+    Trusted,
+}
+
+impl ModelRecommendation {
+    pub fn requires_trust_confirmation(&self) -> bool {
+        self.trust_suggestion.is_some()
+    }
 }
 
 impl ModelRecommendation {
@@ -2728,9 +2836,10 @@ mod tests {
 
     fn valid() -> VnextAgentDef {
         VnextAgentDef {
-            schema_version: 2,
+            schema_version: SCHEMA_VERSION,
             agent_id: "acme/reviewer".to_string(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![AgentRole::Code],
+            capabilities: BTreeSet::new(),
             model_slots: BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -2747,7 +2856,39 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn unified_roles_and_computer_use_are_composable() {
+        let mut definition = valid();
+        definition.roles = vec![AgentRole::Code, AgentRole::Assistant];
+        definition
+            .capabilities
+            .insert(crate::agents::AgentCapability::ComputerUse);
+
+        definition.validate().expect("dual-role computer agent");
+        assert!(definition.has_role(AgentRole::Assistant));
+        assert!(definition.has_role(AgentRole::Code));
+        assert!(definition.supports_computer_use());
+
+        definition.roles.clear();
+        assert!(definition.validate().is_err());
+    }
+
+    #[test]
+    fn trusted_model_recommendations_are_confirmation_only() {
+        let recommendation = ModelRecommendation {
+            recommendation_id: "trusted-candidate".into(),
+            upstream_identity: "vendor/model".into(),
+            provider_aliases: Vec::new(),
+            author_label: None,
+            rationale: None,
+            trust_suggestion: Some(ModelTrustSuggestion::Trusted),
+        };
+
+        assert!(recommendation.requires_trust_confirmation());
     }
 
     fn agent_def(name: &str, vnext: VnextAgentDef) -> crate::agents::AgentDef {
@@ -2763,7 +2904,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: Some(vnext),
@@ -3176,7 +3316,7 @@ mod tests {
         };
         let root_grant = root.resolve_grant(&host).unwrap();
         let child_ref = root_grant.delegation.as_ref().unwrap().allowed_children[0].clone();
-        assert!(root_grant.permits_child(&child_ref, child.execution_kind));
+        assert!(root_grant.permits_child(&child_ref, child.execution_kind()));
         let child_grant = child
             .resolve_child_grant(&host, &root_grant, &child_ref)
             .unwrap();
@@ -3237,7 +3377,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: Some(selected.clone()),
@@ -3269,7 +3408,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: Some(selected),
@@ -3370,7 +3508,7 @@ mod tests {
         let grant = definition.resolve_grant(&host()).unwrap();
         assert!(grant.permits_child(
             &AllowedChild::portable_ref(SELF_CHILD_REF),
-            definition.execution_kind
+            definition.execution_kind()
         ));
         assert_eq!(
             grant.delegation.as_ref().unwrap().default_child.as_deref(),

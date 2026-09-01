@@ -1013,10 +1013,9 @@ mod tests {
     /// loop. [`swarm_dispatch_never_sends_a_secret_to_an_untrusted_child`]
     /// covers the loop end to end.
     ///
-    /// A self-hosted (trusted) parent must not silently lose raw briefs — its
-    /// inherited-custody children carry the parent's own class, so the brief
-    /// arrives unchanged. An untrusted (cloud) child gets the session
-    /// redaction-table rendering.
+    /// Every child receives the enforced session redaction-table rendering.
+    /// Trust affects host-mediated capture eligibility, never the child's
+    /// brief.
     #[test]
     fn swarm_child_brief_is_rendered_for_the_childs_custody_class() {
         use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
@@ -1051,7 +1050,7 @@ mod tests {
         let composed = compose_child_brief(&spec);
         assert!(composed.contains(SECRET), "the composed brief carries it");
 
-        // Trusted (self-hosted / no-log) parent → raw brief reaches the child.
+        // Trusted (capture-capable) parent → redacted brief reaches the child.
         let trusted_parent = Arc::new(
             crate::engine::model::Model::for_provider(&cfg, "selfhosted", "worker", table.clone())
                 .unwrap(),
@@ -1066,10 +1065,8 @@ mod tests {
             crate::config::providers::ModelCustody::Trusted
         );
         let rendered = swarm_child_brief(&spec, &trusted_custody);
-        assert_eq!(
-            rendered, composed,
-            "a self-hosted swarm must not silently lose raw briefs"
-        );
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert_eq!(rendered, table.scrub(&composed));
 
         // Untrusted (cloud) child → session redaction-table rendering.
         let untrusted_child = Arc::new(

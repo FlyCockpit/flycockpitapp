@@ -2072,7 +2072,8 @@ mod tests {
         let def = VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "acme/orchestrator".into(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![crate::agents::AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: std::collections::BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -2097,6 +2098,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         def.resolve_grant(&host()).unwrap()
     }
@@ -2481,13 +2483,13 @@ mod tests {
             &AllowedChild::PortableRef {
                 portable_agent_ref: "acme/implementer".into(),
             },
-            implementer.execution_kind,
+            implementer.execution_kind(),
         ));
         assert!(worktree_orchestrator.permits_child(
             &AllowedChild::PortableRef {
                 portable_agent_ref: "acme/reviewer".into(),
             },
-            reviewer.execution_kind,
+            reviewer.execution_kind(),
         ));
         for parent in [&mut implementer, &mut reviewer] {
             parent.delegation.as_mut().unwrap().allowed_children =
@@ -2510,7 +2512,8 @@ mod tests {
         let leaf = VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "acme/minimal".into(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![crate::agents::AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: std::collections::BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -2527,6 +2530,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         };
         let leaf_grant = leaf.resolve_grant(&host()).unwrap();
         assert!(

@@ -502,9 +502,9 @@ impl FlycockpitClient {
 
 pub fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlycockpitCredential> {
     let raw = store
-        .get(CREDENTIAL_KEY)
+        .get_owned(CREDENTIAL_KEY)?
         .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit account login`"))?;
-    serde_json::from_value(raw.clone()).context("parsing stored Flycockpit account credential")
+    serde_json::from_value(raw).context("parsing stored Flycockpit account credential")
 }
 
 pub fn load_credential_from_vault(
@@ -517,8 +517,9 @@ pub fn maybe_load_credential_from_store(
     store: &CredentialStore,
 ) -> Option<StoredFlycockpitCredential> {
     store
-        .get(CREDENTIAL_KEY)
-        .cloned()
+        .get_owned(CREDENTIAL_KEY)
+        .ok()
+        .flatten()
         .and_then(|raw| serde_json::from_value(raw).ok())
 }
 

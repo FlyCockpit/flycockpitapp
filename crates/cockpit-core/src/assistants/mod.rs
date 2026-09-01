@@ -311,7 +311,7 @@ fn private_assistant_agent(
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description.clone(),
-        // These retained in-memory fields are ignored by schemaVersion 2.
+        // These retained in-memory fields are ignored by schemaVersion 1.
         // They cannot be configured from the assistant specification.
         mode: AgentMode::Primary,
         model: None,
@@ -322,13 +322,12 @@ fn private_assistant_agent(
         scan_tool_results: None,
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
-        capabilities: None,
         tool_steering: None,
         context_policy: None,
         // Assistant homes are daemon-owned definition locations, so they are
         // the sole constructor allowed to use the local publisher. Tool/model
         // selections from the legacy wizard remain host-side setup inputs and
-        // are intentionally absent from the serialized v2 definition.
+        // are intentionally absent from the serialized launch-v1 definition.
         vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt.clone(),
         prompt_overrides: std::collections::BTreeMap::new(),
@@ -507,7 +506,7 @@ async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<Assist
         .context("built-in Assistant identity definition has no vNext provenance")?;
     anyhow::ensure!(
         vnext.agent_id == format!("local/{PRIMARY_ASSISTANT_INSTALLATION_ID}")
-            && vnext.execution_kind == ExecutionKind::Assistant,
+            && vnext.has_role(crate::agents::AgentRole::Assistant),
         "built-in Assistant identity definition provenance does not match its daemon installation"
     );
     Ok(row)
@@ -535,14 +534,15 @@ fn validate_primary_assistant_config(row: &AssistantRow, home: &Path) -> Result<
     Ok(config)
 }
 
-/// The sole daemon-owned v2 template for private assistants.  CLI-side
+/// The sole daemon-owned launch-v1 template for private assistants.  CLI-side
 /// creation reuses it so both persistence paths produce the same provenance
 /// and never serialize the retired tool/model/mode contract.
 pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
     VnextAgentDef {
         schema_version: crate::agents::SCHEMA_VERSION,
         agent_id: format!("local/{installation_id}"),
-        execution_kind: ExecutionKind::Assistant,
+        roles: vec![crate::agents::AgentRole::Assistant],
+        capabilities: std::collections::BTreeSet::new(),
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {
@@ -559,6 +559,7 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
         questions: None,
         verification: None,
         allowed_knowledge_bases: None,
+        tool_tier_preferences: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1565,7 +1566,7 @@ mod tests {
         assert_eq!(def.description, "Helps with tests");
         assert_eq!(def.prompt, "Stay focused.");
         assert_eq!(
-            def.vnext.as_ref().map(|v| v.execution_kind),
+            def.vnext.as_ref().map(|v| v.execution_kind()),
             Some(ExecutionKind::Assistant)
         );
         assert!(def.tools.is_none());

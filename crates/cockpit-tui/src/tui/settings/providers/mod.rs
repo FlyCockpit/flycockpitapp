@@ -32,7 +32,7 @@ pub(super) use fetch::{
 pub(crate) use oauth_flow::CodexOAuthOption;
 #[cfg(test)]
 use oauth_flow::handle_oauth_flow_key_with;
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
     OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
@@ -112,9 +112,8 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
     let registry = templates::ProviderRegistry::standard();
     match registry.provider_id_for(provider_id, entry) {
         "copilot" => actions.push(EditAction::CopilotAuth),
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY => {
-            actions.push(EditAction::OAuthAuth(OAuthProvider::Grok))
-        }
+        #[cfg(feature = "grok-subscription")]
+        "grok-oauth" => actions.push(EditAction::OAuthAuth(OAuthProvider::Grok)),
         cockpit_core::auth::codex_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Codex))
         }
@@ -182,7 +181,7 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
         WireApi::Auto => {}
         WireApi::Completions => summary.push_str(" · wire completions"),
         WireApi::Responses => summary.push_str(" · wire responses"),
-        WireApi::Anthropic => summary.push_str(" · wire messages"),
+        WireApi::Anthropic => summary.push_str(" · wire anthropic"),
     }
     if entry.backup.is_some() {
         summary.push_str(" · backup set");
@@ -956,6 +955,7 @@ fn copy_oauth_url_with(
 pub(super) struct AddState {
     pub(super) run: WizardRun,
     pub(super) template_cursor: usize,
+    pub(super) wire_api_cursor: usize,
     pub(super) template: Option<&'static ProviderTemplate>,
     pub(super) id_field: TextField,
     pub(super) url_field: TextField,
@@ -994,6 +994,7 @@ impl AddState {
             run: WizardRun::new(cockpit_core::wizard::provider_descriptor())
                 .expect("built-in provider wizard descriptor is valid"),
             template_cursor: 0,
+            wire_api_cursor: 0,
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -1036,10 +1037,12 @@ fn provider_entry_from_add(
     template: &'static ProviderTemplate,
     headers: Vec<HeaderSpec>,
 ) -> ProviderEntry {
-    cockpit_core::wizard::provider_entry_for_template(
+    let wire_api = cockpit_core::wizard::provider_wire_api_for_template(&s.run, template);
+    cockpit_core::wizard::provider_entry_for_template_with_wire_api(
         template,
         s.url_field.text().trim_end_matches('/').to_string(),
         headers,
+        wire_api,
     )
 }
 
@@ -1526,6 +1529,10 @@ impl SettingsCx {
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     let t = &templates::TEMPLATES[s.template_cursor];
+                    if let Some(reason) = t.disabled_reason() {
+                        s.error = Some(reason.to_string());
+                        return Nav::Stay;
+                    }
                     s.template = Some(t);
                     // Pre-fill id only for templates that map 1:1 to a
                     // single vendor; for `openai-compatible` the user
@@ -1546,6 +1553,7 @@ impl SettingsCx {
                             .or_else(|| t.env_var_candidates.first().copied())
                             .unwrap_or("API_KEY"),
                     );
+                    s.wire_api_cursor = 0;
                     s.error = None;
                     s.run
                         .submit(WizardAnswer::Select(t.id.to_string()))
@@ -1553,6 +1561,29 @@ impl SettingsCx {
                 }
                 _ => {}
             },
+            Some("wire-api") => {
+                const WIRE_APIS: [&str; 4] = ["auto", "completions", "responses", "anthropic"];
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        s.wire_api_cursor =
+                            crate::tui::nav::wrap_prev(s.wire_api_cursor, WIRE_APIS.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        s.wire_api_cursor =
+                            crate::tui::nav::wrap_next(s.wire_api_cursor, WIRE_APIS.len());
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if let Err(error) = s.run.submit(WizardAnswer::Select(
+                            WIRE_APIS[s.wire_api_cursor].to_string(),
+                        )) {
+                            s.error = Some(error);
+                        } else {
+                            s.error = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Some("id") => match key.code {
                 KeyCode::Enter => {
                     let id = s.id_field.text().trim().to_string();
@@ -1588,6 +1619,7 @@ impl SettingsCx {
                                 Some("copilot-auth") => {
                                     s.copilot_auth = Some(CopilotSetupState::new());
                                 }
+                                #[cfg(feature = "grok-subscription")]
                                 Some("grok-oauth") => {
                                     s.oauth_auth =
                                         Some(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
@@ -1879,7 +1911,7 @@ impl SettingsCx {
 
     fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> Option<bool> {
         let provider_id = match provider {
-            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Grok => "grok-oauth",
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         };
         // The inventory is deliberately metadata-only. Rendering consumes a
@@ -1901,7 +1933,7 @@ impl SettingsCx {
 
     fn logout_provider_oauth(&mut self, provider: OAuthProvider) -> Result<(), String> {
         let provider_id = match provider {
-            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Grok => "grok-oauth",
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         }
         .to_string();
@@ -3286,7 +3318,9 @@ impl SettingsCx {
                 lines.push(Line::default());
                 for (i, t) in templates::TEMPLATES.iter().enumerate() {
                     let marker = if i == s.template_cursor { "▸ " } else { "  " };
-                    let style = if i == s.template_cursor {
+                    let style = if t.is_disabled() {
+                        muted.add_modifier(Modifier::DIM)
+                    } else if i == s.template_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
@@ -3294,16 +3328,53 @@ impl SettingsCx {
                     controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
-                        Span::styled(t.display.to_string(), style),
+                        Span::styled(t.display_label().into_owned(), style),
                         Span::raw("  "),
                         Span::styled(format!("({})", t.id), muted),
                     ]));
                 }
                 if let Some(t) = templates::TEMPLATES.get(s.template_cursor)
-                    && let Some(hint) = t.hint
+                    && let Some(hint) = t.display_hint()
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
+                }
+            }
+            Some("wire-api") => {
+                lines.push(Line::from(Span::styled(
+                    "Which request wire does this endpoint accept?".to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::default());
+                for (index, (label, description)) in [
+                    ("Auto", "let Cockpit select the request wire"),
+                    (
+                        "Chat Completions",
+                        "use the OpenAI-compatible /chat/completions API",
+                    ),
+                    ("Responses", "use the OpenAI Responses API"),
+                    ("Anthropic", "use Anthropic's native Messages API"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let marker = if index == s.wire_api_cursor {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    let style = if index == s.wire_api_cursor {
+                        yellow.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    controls.push((lines.len(), index));
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled((*label).to_string(), style),
+                        Span::raw(" — "),
+                        Span::styled((*description).to_string(), muted),
+                    ]));
                 }
             }
             Some("id" | "url" | "auth-method" | "api-key" | "env-var" | "headers") => {
@@ -3383,7 +3454,7 @@ impl SettingsCx {
                     }
                 }
                 if s.is_step("url")
-                    && let Some(hint) = t.hint
+                    && let Some(hint) = t.display_hint()
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
@@ -5099,6 +5170,9 @@ fn provider_add_pointer_action(
         WizardStepId::Template => {
             WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
         }
+        WizardStepId::WireApi => WizardControlId::WireApi(
+            (*["auto", "completions", "responses", "anthropic"].get(index)?).to_string(),
+        ),
         WizardStepId::AuthMethod => WizardControlId::AuthMethod(
             *[
                 WizardAuthMethod::PasteKey,
@@ -5722,6 +5796,7 @@ impl SettingsPage for ProvidersPage {
                 Some("template") if index < templates::TEMPLATES.len() => {
                     state.template_cursor = index;
                 }
+                Some("wire-api") if index < 4 => state.wire_api_cursor = index,
                 Some("auth-method") if index < 3 => state.auth_method_cursor = index,
                 Some("headers") if !state.headers.is_editing() => {
                     let last = state

@@ -1301,6 +1301,11 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 let now_ms = Utc::now().timestamp_millis();
+                cockpit_db::db::sealed_scope::purge_session_sealed_values_conn(
+                    conn,
+                    &session_id.to_string(),
+                    now_ms,
+                )?;
                 conn.execute(
                     "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
                     params![now_ms, session_id.to_string()],

@@ -101,7 +101,54 @@ pub async fn generate_session_title(
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tx: mpsc::Sender<TurnEvent>,
 ) {
-    match generate_inner(
+    let session_for_persist = Arc::clone(&session);
+    generate_session_title_with_persist(
+        session,
+        extended,
+        providers,
+        redact,
+        content_prefix,
+        action,
+        shutdown_gate,
+        tx,
+        move |slug, action| {
+            let stored = if matches!(action, TitleAction::Explicit) {
+                session_for_persist.set_explicit_auto_title(slug)
+            } else {
+                session_for_persist.set_auto_title(slug)
+            };
+            let updated = stored?;
+            if updated && matches!(action, TitleAction::Eager) {
+                // The eager title stuck — advance past an unclaimed slot 1 for
+                // compatibility with older callers.
+                session_for_persist.mark_eager_titled();
+            }
+            Ok(())
+        },
+    )
+    .await;
+}
+
+/// Run an automatic title pass while delegating the final durable write to the
+/// caller. This is used when a foreground operation must atomically decide
+/// whether the generated title belongs to a retractable user message before it
+/// can be persisted. The callback is invoked only after a usable slug exists;
+/// it owns the write and any associated cancellation fence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn generate_session_title_with_persist<F>(
+    session: Arc<Session>,
+    extended: ExtendedConfig,
+    providers: ProvidersConfig,
+    redact: Arc<crate::redact::RedactionTable>,
+    content_prefix: String,
+    action: TitleAction,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
+    tx: mpsc::Sender<TurnEvent>,
+    persist: F,
+) where
+    F: FnOnce(&str, TitleAction) -> Result<()>,
+{
+    match generate_slug_inner(
         &session,
         extended,
         providers,
@@ -112,8 +159,12 @@ pub async fn generate_session_title(
     )
     .await
     {
-        Ok(TitleOutcome::Titled(_)) => {}
-        Ok(TitleOutcome::Deferred) => {
+        Ok(Some(slug)) => {
+            if let Err(error) = persist(&slug, action) {
+                tracing::warn!(error = %error, "auto_title: persist failed");
+            }
+        }
+        Ok(None) => {
             // The eager pass got no usable slug from a working model
             // (e.g. a trivial/slash-only first message). Not a failure, but the
             // session is still unnamed — arm the durable Monty title-recovery

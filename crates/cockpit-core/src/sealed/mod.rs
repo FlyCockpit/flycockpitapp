@@ -2,15 +2,14 @@
 //!
 //! # The invariant
 //!
-//! A raw sensitive value must never reach an untrusted model. The invariant is
-//! one-directional: [`ModelTrust`](crate::config::providers::ModelTrust) is
-//! the *sole* custody gate for releasing a raw literal, and harness-steering
-//! posture is an independent axis that never widens custody. See [`custody`].
+//! A raw sealed value must never reach any model. Every model uses a sealed
+//! value through `use_sealed_value` plus an exact grant; trust governs capture
+//! authority and never releases a literal. See [`custody`].
 //!
 //! # The shape
 //!
 //! * [`identity`] — canonical typed identity. Safe metadata only.
-//! * [`custody`] — the raw-literal custody predicate.
+//! * [`custody`] — the reference-only custody predicate.
 //! * [`compartment`] — the sealed-value-only credential compartment holding
 //!   Project and Global literals under random opaque exact keys. Session
 //!   literals stay in SQLite.
@@ -154,6 +153,18 @@ pub fn use_sealed_value_schema() -> serde_json::Value {
 
 /// The model-facing name of the sole sealed use mechanism.
 pub const USE_SEALED_VALUE_TOOL: &str = "use_sealed_value";
+
+/// The agent-facing safe metadata listing for scoped sealed values.
+pub const LIST_SEALED_VALUE_DESCRIPTIONS_TOOL: &str = "list_sealed_value_descriptions";
+
+/// The exact no-argument schema for [`LIST_SEALED_VALUE_DESCRIPTIONS_TOOL`].
+pub fn list_sealed_value_descriptions_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
 
 /// The three argument keys `use_sealed_value` accepts, and the only three.
 pub const USE_SEALED_VALUE_ARG_KEYS: [&str; 3] = ["sealed_value_id", "action_id", "parameters"];

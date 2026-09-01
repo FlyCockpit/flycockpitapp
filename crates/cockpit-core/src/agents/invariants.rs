@@ -218,7 +218,7 @@ pub fn validate_grant(
 
 /// Validate the issue-#75 posture fields (`capabilities`, `toolSteering`,
 /// `contextPolicy`) declared on an [`AgentDef`]. These are additive in Stage 1
-/// and apply to both legacy and v2 definitions. Unknown capability names are
+/// and apply to both legacy and launch-v1 definitions. Unknown capability names are
 /// already rejected by serde (the enum is closed), so this checks the
 /// `autoCompactPct` range and emits a lint-level warning (returned via the
 /// load-warning channel by the caller) when `forkContext` or
@@ -227,12 +227,6 @@ pub fn validate_grant(
 pub(crate) fn validate_posture_fields(def: &AgentDef) -> Result<()> {
     if let Some(policy) = &def.context_policy {
         validate_context_policy(policy)?;
-    }
-    if let Some(caps) = &def.capabilities {
-        // The enum is closed (serde rejects unknown names), so the only
-        // set-level check is the small-model lint below. Capability names
-        // are already constrained to the four variants.
-        let _ = caps;
     }
     Ok(())
 }
@@ -266,7 +260,7 @@ fn validate_context_policy(policy: &ContextPolicy) -> Result<()> {
 /// load.
 pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
     use super::AgentCapability;
-    let caps = def.capabilities.as_ref()?;
+    let caps = &def.vnext.as_ref()?.capabilities;
     if !caps.contains(&AgentCapability::ForkContext)
         && !caps.contains(&AgentCapability::ScopedParallelWrite)
     {
@@ -305,7 +299,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     validate_posture_fields(def)?;
     validate_read_image_tier_override(def)?;
     if let Some(vnext) = &def.vnext {
-        // v2 declarations are deliberately authority-free. Their own closed
+        // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
         // tool/role checks below must not accidentally reinterpret them.
         return vnext.validate();
@@ -493,7 +487,7 @@ fn validate_discoverable_tools_have_mcp(_def: &AgentDef, _tools: &[String]) -> R
 mod grant_tests {
     use super::*;
     use crate::agents::{
-        AgentMode, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
+        AgentCapability, AgentMode, AgentRole, DelegationPolicy, DelegationTarget, ModelCapability,
         ModelLocality, ModelSlot, VnextAgentDef,
     };
 
@@ -521,7 +515,6 @@ mod grant_tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -707,7 +700,8 @@ mod grant_tests {
         def.vnext = Some(VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "acme/reviewer".to_string(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: std::collections::BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -724,13 +718,14 @@ mod grant_tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         });
-        // A v2 definition has no user-authored tool authority, so legacy tool
+        // A launch-v1 definition has no user-authored tool authority, so legacy tool
         // validation must not reinterpret its ignored internal fields.
         validate_invariants(&def).unwrap();
 
         let vnext = def.vnext.as_mut().unwrap();
-        vnext.execution_kind = ExecutionKind::Computer;
+        vnext.capabilities.insert(AgentCapability::ComputerUse);
         vnext.delegation = DelegationPolicy {
             allowed_children: vec![],
             max_descendant_depth: Some(1),

@@ -229,7 +229,7 @@ cockpit packages prune --dry-run
 | `cockpit agent install OWNER/REPO[@REV]:PATH --scope global\|workspace-private\|workspace` | Ask the daemon to install a versioned agent definition. |
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
-| `cockpit assistant list` | List persistent assistants. |
+| `cockpit assistants list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
@@ -689,7 +689,7 @@ cockpit provider-catalog-status
 
 Provider and model entries can carry policy metadata used by routing, diagnostics, and export safety:
 
-- `trust`: model trust is the sole model data-custody setting and is separate from workspace trust. Inference requests to a `trusted` model may be sent raw, including secrets and environment values; inference requests to an `untrusted` model are redacted. `trusted` is meant for an endpoint you are content to hold raw content — typically a self-hosted or contractually no-log provider — and raw content reaching one is the intended outcome. Missing trust resolves to the conservative `untrusted`. Marking an external provider trusted sends that provider raw secrets and environment values in inference requests — permitted, but it is your decision. Exports and client display stay redacted regardless of trust.
+- `trust`: model trust is the host-mediated capture/write setting and is separate from workspace trust. Every inference request receives redacted, reference-only sealed values. A `trusted` model may participate in host-mediated capture; an `untrusted` model may not. Missing trust resolves to the conservative `untrusted`. Trust never sends a provider raw secrets or environment values. Exports and client display stay redacted regardless of trust.
 - Harness mode (agent-definition posture) never changes provider eligibility, data custody, or redaction. Trust and mode are independent, and every combination is valid — no mode, and no locality, implies trust.
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
@@ -710,7 +710,7 @@ cockpit config export-policy -o cockpit-policy.json
 cockpit config import-policy cockpit-policy.json
 ```
 
-Debug exports are permanently redacted using the active redaction table. Every `cockpit export` archive is a portable, shareable diagnostic artifact: sealed values, environment values, credential values, and contained leak values are scrubbed even when a trusted provider received raw values during the session. There is no unredacted export path.
+Debug exports are permanently redacted using the active redaction table. Every `cockpit export` archive is a portable, shareable diagnostic artifact: sealed values, environment values, credential values, and contained leak values are scrubbed for every model trust level. There is no unredacted export path.
 
 See [Redaction](docs/redaction.md) for `min_secret_length`, allowlist, denylist, and filesystem-path protection details.
 
@@ -805,7 +805,7 @@ current CLI behavior, not a future privacy policy.
 
 | Destination | What can leave | When | Default |
 | --- | --- | --- | --- |
-| Configured model provider | Prompts, conversation history, and tool results; inference requests are redacted for the default untrusted models, and may be sent raw — including secrets and environment values — for a model marked trusted | You send a message to a configured remote model | Opt-in: you configure and select the provider |
+| Configured model provider | Prompts, conversation history, and tool results with sealed literals redacted; sealed-value use is reference-only through `use_sealed_value` | You send a message to a configured remote model | Opt-in: you configure and select the provider |
 | [Firecrawl](https://firecrawl.dev/) (`api.firecrawl.dev`) | A model-authored web-search query or URL | The built-in `websearch` or `webfetch` tool runs | Default-on for the built-in web tools; the keyless tier is attributed to your IP |
 | [TinyFish](https://tinyfish.ai/) (`api.search.tinyfish.ai`, `api.fetch.tinyfish.ai`) | A web-search query or URL and its configured API credential | You select TinyFish and configure `TINYFISH_API_KEY` | Opt-in; without its key Cockpit falls back to Firecrawl keyless tier |
 | crates.io, npm, and PyPI | A package name | The docs/package workflow resolves a package official source repository | Default-on when that model-triggered workflow runs |
@@ -841,12 +841,35 @@ open lease row alone and leaves encrypted payload orphaned.
 
 Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are permanently redacted regardless of provider trust.
 
+### Sealed reference injection
+
+An Owner-declared sealed action can inject a granted sealed value into one
+fixed command argument, one process environment variable, an HTTPS header or
+body, or a pinned file sink. The model names only the value reference, action,
+and bounded declared parameters; it cannot choose the command, environment
+key, endpoint, header, request template, file path, persistence, or output
+projection. Command output is scrubbed before it can be projected, and each
+injection is durably audited before the sink receives plaintext.
+
+Argument and environment injection are preferred because they leave no
+plaintext on disk. File actions use mode 0600, reject symlink targets, prefer a
+private runtime directory when the consumer accepts a path, and refuse a
+Git-tracked or non-ignored destination. Ephemeral actions delete the file after
+their fixed consumer exits (including error exits). Persistent materialization
+is a separate Owner-approved downgrade.
+
+The persistent-file approval must be treated honestly: once plaintext is
+materialized, its consumer can transform or exfiltrate it (for example by
+encoding it). Redaction remains defense in depth, not a containment boundary.
+Approve only the declared action and pinned destination, and remove persistent
+material promptly when it is no longer needed.
+
 ### Limits of the protections
 
-Redaction is best-effort pattern matching. Inference requests to untrusted
-models are redacted by default; inference requests to trusted models may be
-sent raw, including secrets and environment values. That is a data-custody
-choice on the model, not something harness mode or locality implies. Exports
+Redaction is best-effort pattern matching. Inference requests to every model
+are redacted for sealed literals; sealed-value use is reference-only through
+`use_sealed_value`. Trusted is a host-mediated capture capability, not a
+raw-read capability, and neither harness mode nor locality implies it. Exports
 and client display stay redacted regardless of trust. It has an
 allowlist and denylist. Automatic candidates default to an eight-character
 minimum; every redaction entry has a hard four-byte minimum. Treat it as a
@@ -854,14 +877,14 @@ safeguard, not a guarantee that every secret is removed.
 
 External harnesses (claude, codex, opencode, copilot, goose, grok, and custom
 harnesses) are OS processes, not trusted inference providers. They are
-untrusted by default: an explicit per-harness `trust` field opts into raw
-prompt delivery only, never inferred from model name, locality, command, or
-mode. An untrusted harness receives a redacted prompt (the mandatory sensitive
-baseline, unaffected by `redact.enabled = false`); a trusted harness receives
-its raw prompt only after explicit configuration. No harness, trusted or
-untrusted, receives Cockpit-provided secret environment values — the former
-`auth_env_vars` field is retired. Harness custody is separate from
-provider/model `ModelTrust` and from agent-definition posture.
+untrusted by default: an explicit per-harness `trust` field permits only
+host-mediated capture, never raw prompt delivery, and is never inferred from
+model name, locality, command, or mode. Every harness receives a redacted,
+reference-only prompt (the mandatory sensitive baseline, unaffected by
+`redact.enabled = false`). No harness, trusted or untrusted, receives
+Cockpit-provided secret environment values — the former `auth_env_vars` field
+is retired. Harness trust is separate from provider/model `ModelTrust` and
+from agent-definition posture.
 
 The shell sandbox is filesystem-only and does not restrict network access. It
 has no native Windows backend: Windows shell commands are unconfined and require

@@ -884,8 +884,23 @@ enum ProviderOAuthFlow {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum ProviderOAuthReady {
+    #[cfg(feature = "grok-subscription")]
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
+    Descriptor(DescriptorOAuthLogin),
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DescriptorOAuthLogin {
+    provider_id: String,
+    login: DescriptorOAuthLoginState,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "flow", rename_all = "snake_case")]
+enum DescriptorOAuthLoginState {
+    DeviceCode(crate::auth::descriptor::DeviceCodeLogin),
+    PkceBrowser(crate::auth::descriptor::PkceBrowserLogin),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -910,6 +925,7 @@ enum DurableOAuthFlow {
         completion_request_hash: [u8; 32],
         completion_fencing_generation: i64,
         claimed_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
     },
     Mcp {
         owner: String,
@@ -1005,9 +1021,9 @@ fn durable_oauth_expired(flow: &DurableOAuthFlow, now_unix_ms: i64) -> bool {
             expires_at_unix_ms, ..
         } => now_unix_ms >= *expires_at_unix_ms,
         DurableOAuthFlow::ProviderExchanging {
-            claimed_at_unix_ms, ..
-        }
-        | DurableOAuthFlow::McpExchanging {
+            expires_at_unix_ms, ..
+        } => now_unix_ms >= *expires_at_unix_ms,
+        DurableOAuthFlow::McpExchanging {
             claimed_at_unix_ms, ..
         } => now_unix_ms >= oauth_expiry_ms(*claimed_at_unix_ms),
         DurableOAuthFlow::ProviderCommitted {
@@ -1256,7 +1272,7 @@ async fn purge_durable_oauth_flows(
     }
     flows.sort_by_key(|(_, _, created, _, _, _, _)| *created);
 
-    // A Ready flow has a hard ten-minute lifetime. Its begin receipt is
+    // A Ready flow has a hard device-code-compatible lifetime. Its begin receipt is
     // rewritten to the exact terminal expiry outcome in the same transaction
     // that removes the sealed verifier, so an abandoned receipt cannot protect
     // capacity forever or replay a dead authorize instruction.
@@ -2021,7 +2037,10 @@ fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<
     Ok(())
 }
 
-const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+// Provider device-code descriptors may poll for up to fifteen minutes. Keep
+// their daemon-owned state alive through that advertised lifetime plus a
+// bounded final token/commit margin.
+const OAUTH_FLOW_TTL: Duration = Duration::from_secs(16 * 60);
 const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
 const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 
@@ -2083,9 +2102,21 @@ impl OAuthFlowStore {
         }
     }
 
+    fn trip_provider_cancellation(flow: &ProviderOAuthFlow) {
+        if let ProviderOAuthFlow::Completing { cancelled } = flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn purge_provider(flows: &mut std::collections::HashMap<String, StoredProviderOAuthFlow>) {
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+        flows.retain(|_, flow| {
+            let keep = now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL;
+            if !keep {
+                Self::trip_provider_cancellation(&flow.flow);
+            }
+            keep
+        });
     }
 
     fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
@@ -2123,7 +2154,9 @@ impl OAuthFlowStore {
             .min_by_key(|(_, flow)| flow.created_at)
             .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
     }
 
@@ -2162,7 +2195,9 @@ impl OAuthFlowStore {
                 .min_by_key(|(_, flow)| flow.created_at)
                 .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
         flows.insert(
             id,
@@ -7230,7 +7265,11 @@ async fn handle_serialized_request_impl(
                     && let Some(session_id) = session_id
                     && let Some(handle) = ctx.registry.live_handle(session_id)
                 {
-                    let _ = handle.send_work(SessionWork::Cancel).await;
+                    let _ = handle
+                        .send_work(SessionWork::Cancel {
+                            origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                        })
+                        .await;
                 }
                 Ok(Response::RunInvocationCancelResult { result })
             } else {
@@ -8387,6 +8426,16 @@ async fn handle_serialized_request_impl(
                     .apply(owner, &directory, now_ms)
                     .await
                 }
+                crate::sealed::owner::SensitiveFrameKind::Control => {
+                    if literal.is_some() {
+                        return Err(bad_request(
+                            "a reset or promote apply must not carry a literal".to_string(),
+                        ));
+                    }
+                    crate::sealed::owner::SensitiveOwnerFrame::for_control(&stored.capability)
+                        .apply(owner, &directory, now_ms)
+                        .await
+                }
             };
             // The capability is spent whether the operation succeeded or failed
             // (the compare-and-swap fired inside `apply`), so drop the table
@@ -8399,6 +8448,11 @@ async fn handle_serialized_request_impl(
             let outcome = outcome.map_err(|error| bad_request(error.to_string()))?;
             match outcome {
                 crate::sealed::owner::SensitiveFrameOutcome::Contained { .. } => {
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: None,
+                    })
+                }
+                crate::sealed::owner::SensitiveFrameOutcome::Reset => {
                     Ok(Response::SealedOwnerOperationApplied {
                         revealed_literal: None,
                     })
@@ -8508,18 +8562,16 @@ async fn handle_serialized_request_impl(
                 .collect();
             Ok(Response::sealed_actions(actions))
         }
-        Request::CreateSealedAction {
-            kind_id,
+        Request::CreateSealedAction { .. } => Err(bad_request(
+            "catalog sealed-action creation is retired; submit an owner-declared sink".to_string(),
+        )),
+        Request::CreateDeclaredSealedAction {
             project_id,
             description,
-            origin_id,
-            projection_id,
+            declaration,
         } => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            // Resolve the three closed-lookup ids to a compiled action kind and
-            // parse the safe fields FIRST. An unknown id / unsafe field is
-            // rejected here, before any persist.
-            let kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+            let kind = compile_owner_declared_sealed_action(declaration)
                 .map_err(|error| bad_request(error.to_string()))?;
             let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
@@ -8527,7 +8579,6 @@ async fn handle_serialized_request_impl(
                 return Err(bad_request("project id must not be empty".to_string()));
             }
             let project_key = crate::sealed::identity::SealedProjectKey::from_canonical(project_id);
-            let now_ms = chrono::Utc::now().timestamp_millis();
             let summary = sealed_action_directory(ctx)
                 .create(
                     owner,
@@ -8536,7 +8587,7 @@ async fn handle_serialized_request_impl(
                         description,
                         project_key,
                     },
-                    now_ms,
+                    chrono::Utc::now().timestamp_millis(),
                 )
                 .await
                 .map_err(internal)?;
@@ -10407,7 +10458,13 @@ async fn handle_serialized_request_impl(
                         return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                     crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => {}
                 }
-                if let Err(error) = att.handle.send_work(SessionWork::Cancel).await {
+                if let Err(error) = att
+                    .handle
+                    .send_work(SessionWork::Cancel {
+                        origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                    })
+                    .await
+                {
                     let unknown = serde_json::to_vec(&serde_json::json!({"outcome":"unknown"}))
                         .map_err(internal)?;
                     ctx.db
@@ -10444,7 +10501,9 @@ async fn handle_serialized_request_impl(
                 }
             }
             att.handle
-                .send_work(SessionWork::Cancel)
+                .send_work(SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                })
                 .await
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
@@ -14657,9 +14716,26 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            if provider_id != crate::auth::xai_oauth::CREDENTIAL_KEY
-                && provider_id != crate::auth::codex_oauth::CREDENTIAL_KEY
-            {
+            let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+            let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                .await?
+                .2
+                .providers
+                .get(&provider_id)
+                .and_then(|entry| entry.oauth.clone());
+            let supported_provider = descriptor.is_some()
+                || provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY
+                || {
+                    #[cfg(feature = "grok-subscription")]
+                    {
+                        provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
+                    }
+                    #[cfg(not(feature = "grok-subscription"))]
+                    {
+                        false
+                    }
+                };
+            if !supported_provider {
                 return Err(bad_request("unsupported provider OAuth flow"));
             }
             let owner = oauth_owner(state);
@@ -14831,8 +14907,9 @@ async fn handle_serialized_request_impl(
                     return Ok(response);
                 }
                 let flow_id = uuid::Uuid::new_v4().to_string();
-                let (flow, authorize_url, user_code) = match provider_id.as_str() {
-                    crate::auth::xai_oauth::CREDENTIAL_KEY => {
+                let (flow, authorize_url, user_code) = match (provider_id.as_str(), descriptor) {
+                    #[cfg(feature = "grok-subscription")]
+                    (crate::auth::xai_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::xai_oauth::begin_manual_login().await {
                             Ok(login) => login,
                             Err(cause) => return Err(internal(cause)),
@@ -14844,7 +14921,7 @@ async fn handle_serialized_request_impl(
                             None,
                         )
                     }
-                    crate::auth::codex_oauth::CREDENTIAL_KEY => {
+                    (crate::auth::codex_oauth::CREDENTIAL_KEY, _) => {
                         let login = match crate::auth::codex_oauth::begin_device_code_login().await
                         {
                             Ok(login) => login,
@@ -14858,6 +14935,42 @@ async fn handle_serialized_request_impl(
                             user_code,
                         )
                     }
+                    (_, Some(descriptor)) => match descriptor.flow {
+                        crate::config::providers::OAuthFlowKind::DeviceCode => {
+                            let login =
+                                crate::auth::descriptor::begin_device_code_login(&descriptor)
+                                    .await
+                                    .map_err(internal)?;
+                            let authorize_url = login.verification_uri.clone();
+                            let user_code = Some(login.user_code.clone());
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::DeviceCode(login),
+                                    },
+                                )),
+                                authorize_url,
+                                user_code,
+                            )
+                        }
+                        crate::config::providers::OAuthFlowKind::PkceBrowser => {
+                            let login =
+                                crate::auth::descriptor::begin_pkce_browser_login(&descriptor)
+                                    .map_err(internal)?;
+                            let authorize_url = login.authorize_url.clone();
+                            (
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Descriptor(
+                                    DescriptorOAuthLogin {
+                                        provider_id: provider_id.clone(),
+                                        login: DescriptorOAuthLoginState::PkceBrowser(login),
+                                    },
+                                )),
+                                authorize_url,
+                                None,
+                            )
+                        }
+                    },
                     _ => unreachable!("provider OAuth kind was validated before ledger admission"),
                 };
                 let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
@@ -15012,18 +15125,22 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(terminal_response.as_ref().clone());
                 }
-                let durable_begin_client_operation_id = match &durable_flow {
-                    Some(DurableOAuthFlow::Provider {
-                        owner: durable_owner,
-                        begin_client_operation_id,
-                        ..
-                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
-                    _ => {
-                        return Err(bad_request(
-                            "provider OAuth flow is unknown or belongs to another owner",
-                        ));
-                    }
-                };
+                let (durable_begin_client_operation_id, durable_expires_at_unix_ms) =
+                    match &durable_flow {
+                        Some(DurableOAuthFlow::Provider {
+                            owner: durable_owner,
+                            begin_client_operation_id,
+                            expires_at_unix_ms,
+                            ..
+                        }) if durable_owner == &owner => {
+                            (begin_client_operation_id.clone(), *expires_at_unix_ms)
+                        }
+                        _ => {
+                            return Err(bad_request(
+                                "provider OAuth flow is unknown or belongs to another owner",
+                            ));
+                        }
+                    };
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
                 // lookup instead of issuing another token set. Restore only when
@@ -15063,8 +15180,21 @@ async fn handle_serialized_request_impl(
                         })?,
                 };
                 let provider_id = match &ready {
+                    #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
+                    ProviderOAuthReady::Descriptor(login) => login.provider_id.as_str(),
+                };
+                // Descriptor initial login, refresh, and logout share one
+                // fence. Acquire it before the network exchange as well as
+                // the durable flow/credential transaction, so a logout
+                // acknowledged while this login is in flight cannot be
+                // overwritten afterward.
+                let _descriptor_lock = match &ready {
+                    ProviderOAuthReady::Descriptor(_) => {
+                        Some(crate::auth::descriptor::credential_mutation_lock(provider_id).await)
+                    }
+                    _ => None,
                 };
                 claim_oauth_exchange(
                     ctx,
@@ -15082,10 +15212,12 @@ async fn handle_serialized_request_impl(
                         completion_request_hash: request_hash,
                         completion_fencing_generation: fencing_generation,
                         claimed_at_unix_ms: oauth_wall_ms(),
+                        expires_at_unix_ms: durable_expires_at_unix_ms,
                     },
                 )
                 .await?;
                 let exchange = match ready {
+                    #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(login) => {
                         let Some(callback) = input.as_deref() else {
                             return Err(bad_request(
@@ -15097,7 +15229,13 @@ async fn handle_serialized_request_impl(
                             .map_err(internal)
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
-                                    .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
+                                    .map(|record| {
+                                        (
+                                            crate::auth::xai_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
+                                    })
                                     .map_err(internal)
                             })
                     }
@@ -15113,17 +15251,105 @@ async fn handle_serialized_request_impl(
                             .and_then(|tokens| {
                                 serde_json::to_vec(&tokens)
                                     .map(|record| {
-                                        (crate::auth::codex_oauth::CREDENTIAL_KEY, record)
+                                        (
+                                            crate::auth::codex_oauth::CREDENTIAL_KEY.to_string(),
+                                            record,
+                                            None,
+                                        )
                                     })
                                     .map_err(internal)
                             })
                     }
+                    ProviderOAuthReady::Descriptor(login) => {
+                        let oauth_config_root = ctx.canonical_cwd.to_string_lossy().into_owned();
+                        let descriptor = daemon_provider_config(ctx, &oauth_config_root)
+                            .await
+                            .and_then(|(_, _, config)| {
+                                config
+                                    .providers
+                                    .get(&login.provider_id)
+                                    .and_then(|entry| entry.oauth.clone())
+                                    .ok_or_else(|| {
+                                        bad_request(format!(
+                                            "provider `{}` no longer has an OAuth descriptor",
+                                            login.provider_id
+                                        ))
+                                    })
+                            });
+                        let descriptor = descriptor?;
+                        let token = match login.login {
+                            DescriptorOAuthLoginState::DeviceCode(login) => {
+                                if input.is_some() {
+                                    return Err(bad_request(
+                                        "device-code OAuth does not accept callback input",
+                                    ));
+                                }
+                                let remaining = Duration::from_millis(
+                                    u64::try_from(
+                                        durable_expires_at_unix_ms.saturating_sub(oauth_wall_ms()),
+                                    )
+                                    .unwrap_or(0),
+                                );
+                                crate::auth::descriptor::complete_device_code_login_unpersisted_for(
+                                    &descriptor,
+                                    &login,
+                                    remaining,
+                                    Some(cancellation_fence.as_ref()),
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                            DescriptorOAuthLoginState::PkceBrowser(login) => {
+                                let callback = input.as_deref().ok_or_else(|| {
+                                    bad_request(
+                                        "PKCE OAuth completion requires a callback URL or code",
+                                    )
+                                })?;
+                                crate::auth::descriptor::complete_pkce_browser_login_unpersisted(
+                                    &descriptor,
+                                    &login,
+                                    callback,
+                                )
+                                .await
+                                .map_err(internal)?
+                            }
+                        };
+                        serde_json::to_vec(&token)
+                            .map(|record| (login.provider_id, record, Some(descriptor)))
+                            .map_err(internal)
+                    }
                 };
-                let (provider_id, record) = exchange?;
-                let record = zeroize::Zeroizing::new(record);
+                let (provider_id, record, descriptor) = exchange?;
+                let credential_record_id = descriptor.as_ref().map_or_else(
+                    || provider_id.clone(),
+                    |_| crate::auth::descriptor::credential_record_id(&provider_id),
+                );
+                let record = match descriptor {
+                    Some(descriptor) => {
+                        let store = crate::credentials::CredentialStore::from_vault(
+                            ctx.secret_vault.clone(),
+                        )
+                        .map_err(internal)?;
+                        let token = serde_json::from_slice(&record).map_err(internal)?;
+                        let record = crate::auth::descriptor::initial_record(
+                            &provider_id,
+                            &descriptor,
+                            &store,
+                            token,
+                        )
+                        .map_err(internal)?;
+                        zeroize::Zeroizing::new(serde_json::to_vec(&record).map_err(internal)?)
+                    }
+                    None => zeroize::Zeroizing::new(record),
+                };
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));
+                }
+                if oauth_wall_ms() >= durable_expires_at_unix_ms {
+                    return Err(conflict(
+                        "the OAuth flow expired before token persistence; start a new login",
+                    ));
                 }
                 let terminal_response = Response::ProviderOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
@@ -15148,11 +15374,15 @@ async fn handle_serialized_request_impl(
                 let vault = ctx.secret_vault.clone();
                 let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let provider_id_owned = provider_id.to_owned();
+                let credential_record_id_owned = credential_record_id;
                 let receipt_owner = owner.clone();
                 let receipt_operation_id = client_operation_id.clone();
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        if chrono::Utc::now().timestamp_millis() >= durable_expires_at_unix_ms {
+                            anyhow::bail!("provider OAuth flow expired before token persistence");
+                        }
                         let marker = vault
                             .get_item_on_conn(
                                 conn,
@@ -15169,12 +15399,14 @@ async fn handle_serialized_request_impl(
                                 completion_client_operation_id: marker_operation,
                                 completion_request_hash: marker_hash,
                                 completion_fencing_generation: marker_fence,
+                                expires_at_unix_ms: marker_expiry,
                                 ..
                             } if marker_owner == receipt_owner
                                 && marker_provider == provider_id_owned
                                 && marker_operation == receipt_operation_id
                                 && marker_hash == request_hash
                                 && marker_fence == fencing_generation
+                                && marker_expiry == durable_expires_at_unix_ms
                         );
                         if !owns_exact_exchange {
                             anyhow::bail!(
@@ -15185,7 +15417,7 @@ async fn handle_serialized_request_impl(
                             .mutate_item_on_conn(
                                 conn,
                                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                                &provider_id_owned,
+                                &credential_record_id_owned,
                                 Some(&record),
                             )
                             .map_err(|error| anyhow::anyhow!(error))?;
@@ -16541,6 +16773,14 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+            // Provider-model resolution runs under the config-publication lock
+            // and can refresh a descriptor credential. Keep that order, then
+            // take the descriptor fence before the secret-owner lock. This
+            // makes an acknowledged logout the last mutation of a descriptor
+            // record: a refresh either finishes before this delete or reloads
+            // after it and fails closed as logged out.
+            let _descriptor_lock =
+                crate::auth::descriptor::credential_mutation_lock(&provider_id).await;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             // A CLI identifies a configured provider, never a hidden vault
             // record name. Resolve that reference only inside the daemon so a
@@ -16562,15 +16802,25 @@ async fn handle_serialized_request_impl(
                     let provider = config.providers.get(&provider_id).ok_or_else(|| {
                         bad_request(format!("provider `{provider_id}` is not configured"))
                     })?;
-                    if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
-                        return Err(bad_request(
-                            "provider credential logout is only available for OAuth providers",
-                        ));
-                    }
-                    let credential_record_id =
-                        provider.credential_ref.clone().ok_or_else(|| {
+                    // Declarative OAuth owns a reserved record derived from
+                    // the configured provider id. Legacy OAuth uses an
+                    // explicit credential reference, so preserve that
+                    // separate path.
+                    let credential_record_id = if provider.oauth.is_some() {
+                        crate::auth::descriptor::credential_record_id(&provider_id)
+                    } else {
+                        if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                            return Err(bad_request(
+                                "provider credential logout is only available for OAuth providers",
+                            ));
+                        }
+                        let reference = provider.credential_ref.clone().ok_or_else(|| {
                             bad_request(format!("provider `{provider_id}` has no credential_ref"))
                         })?;
+                        crate::auth::descriptor::ensure_public_credential_record_id(&reference)
+                            .map_err(|error| bad_request(error.to_string()))?;
+                        reference
+                    };
                     let credential_present = match ctx.secret_vault.get_item(
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                         &credential_record_id,
@@ -16801,6 +17051,17 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
+                && !is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                )
+            {
+                return Err(bad_request(
+                    "provider dynamic authentication may only be configured by the local host owner",
+                ));
+            }
             #[cfg(feature = "remote")]
             let request = Request::UpsertProviderConfig {
                 project_root: project_root.clone(),
@@ -16834,6 +17095,17 @@ async fn handle_serialized_request_impl(
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
+                && !is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                )
+            {
+                return Err(bad_request(
+                    "provider dynamic authentication may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]
@@ -16988,7 +17260,6 @@ async fn handle_serialized_request_impl(
             .await
         }
 
-        #[cfg(feature = "remote")]
         Request::ApplySetupWizard {
             project_root,
             wizard_id,
@@ -19715,6 +19986,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else if serde_json::from_str::<serde_json::Value>(record.as_str()).is_err() {
@@ -19730,6 +20002,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else {
@@ -19761,18 +20034,62 @@ async fn daemon_provider_config(
     ),
     ErrorPayload,
 > {
-    let cwd = std::path::PathBuf::from(project_root);
+    daemon_provider_config_with_warnings(ctx, project_root)
+        .await
+        .map(|(cwd, policy, config, _)| (cwd, policy, config))
+}
+
+/// Same authoritative load as [`daemon_provider_config`], retaining the
+/// stable provider-layer warnings for a client-facing catalog snapshot.
+async fn daemon_provider_config_with_warnings(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<
+    (
+        std::path::PathBuf,
+        crate::config::trust::WorkspaceTrustPolicy,
+        crate::config::providers::ProvidersConfig,
+        Vec<String>,
+    ),
+    ErrorPayload,
+> {
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
+    }
+    let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    if global_config_root(&cwd)? {
+        let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        let config = crate::config::providers::ConfigDoc::load(&global_config)
+            .map_err(daemon_config_error)?
+            .providers();
+        let root = crate::config::trust::resolve_trust_root(&cwd).map_err(internal)?;
+        return Ok((
+            cwd,
+            crate::config::trust::WorkspaceTrustPolicy {
+                root,
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            config,
+            Vec::new(),
+        ));
     }
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
-    let (config, _) = ctx
+    let (config, _, warnings) = ctx
         .config_source()
-        .load_effective_for_daemon(&cwd, &trust_policy)
+        .load_effective_for_daemon_with_provider_warnings(&cwd, &trust_policy)
         .map_err(daemon_config_error)?;
-    Ok((cwd, trust_policy, config))
+    Ok((cwd, trust_policy, config, warnings))
+}
+
+/// A catalog rooted at the canonical global config directory is onboarding
+/// authority, not a workspace setting. It is intentionally the only
+/// trust-free root accepted by the provider mutation capability path.
+fn global_config_root(root: &std::path::Path) -> std::result::Result<bool, ErrorPayload> {
+    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
+    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
+    Ok(root == canonical_global)
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -19805,7 +20122,8 @@ async fn provider_catalog_snapshot(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
-    let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    let (cwd, trust_policy, mut config, provider_warnings) =
+        daemon_provider_config_with_warnings(ctx, project_root).await?;
     // The CAS covers the complete effective provider projection even when the
     // caller asks to render only one row. A sibling provider edit therefore
     // invalidates this capability instead of being overwritten by a partial
@@ -19826,11 +20144,18 @@ async fn provider_catalog_snapshot(
     // it just cannot mint an edit capability. Clients treat the absent
     // capability fields as read-only and an empty `layer_id` as "no editable
     // layer"; a later mutation attempt fails the capability lookup instead.
-    let target_path =
+    let target_path = if global_config_root(&cwd)? {
+        cockpit_config::config::dirs::global_config_file()
+            .ok()
+            .and_then(|config| {
+                crate::config::providers::provider_file_path_for_config(&config, "default").ok()
+            })
+    } else {
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
-        });
+        })
+    };
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -19864,22 +20189,27 @@ async fn provider_catalog_snapshot(
     } else {
         String::new()
     };
-    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-    let mcp_scope_targets = ["global", "workspace"]
-        .into_iter()
-        .filter_map(|scope| {
-            let target =
-                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                    cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
-                })?;
-            let path = target
-                .parent()?
-                .join(cockpit_config::config::dirs::MCP_FILE);
-            let path = canonical_mcp_target_path(&path).ok()?;
-            let revision = mcp_target_layer_revision(&path).ok()?;
-            Some((scope.to_string(), (path, revision)))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let (mcp, mcp_scope_targets) = if global_config_root(&cwd)? {
+        (None, std::collections::BTreeMap::new())
+    } else {
+        let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+        let targets = ["global", "workspace"]
+            .into_iter()
+            .filter_map(|scope| {
+                let target = crate::config::trust::with_workspace_trust_policy(
+                    trust_policy.clone(),
+                    || cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope),
+                )?;
+                let path = target
+                    .parent()?
+                    .join(cockpit_config::config::dirs::MCP_FILE);
+                let path = canonical_mcp_target_path(&path).ok()?;
+                let revision = mcp_target_layer_revision(&path).ok()?;
+                Some((scope.to_string(), (path, revision)))
+            })
+            .collect();
+        (mcp, targets)
+    };
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -19927,6 +20257,7 @@ async fn provider_catalog_snapshot(
         false
     };
     let mut view = crate::secret_ref::redact_provider_view(&config);
+    view.configuration_warnings = provider_warnings;
     if minted_edit_capability {
         view.mcp_scope_revisions = mcp_scope_revisions;
     }
@@ -20063,6 +20394,7 @@ async fn apply_provider_mutation(
                 return Err(bad_request("provider mutation contains duplicate ids"));
             }
             validate_daemon_provider_url(&upsert.entry.url)?;
+            validate_daemon_usage_probe(&upsert.entry)?;
             validate_unique_provider_header_names(&upsert.entry.headers)?;
             if upsert.header_secrets.len() != upsert.entry.headers.len() {
                 return Err(bad_request(
@@ -21201,11 +21533,17 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
-    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        ctx.config_source()
-            .config_write_target_for_provider(&cwd, "default")
-    })
-    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = if global_config_root(&cwd)? {
+        let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        crate::config::providers::provider_file_path_for_config(&global, "default")
+            .map_err(internal)?
+    } else {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, "default")
+        })
+        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+    };
     let target = canonical_mcp_target_path(&target)?;
     if target != capability_target {
         return Err(ErrorPayload {
@@ -21224,12 +21562,17 @@ async fn stage_and_recover_provider_batch(
                 .map(|delete| delete.provider_id.as_str()),
         )
     {
-        let provider_target =
+        let provider_target = if global_config_root(&cwd)? {
+            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+            crate::config::providers::provider_file_path_for_config(&global, provider_id)
+                .map_err(internal)?
+        } else {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 ctx.config_source()
                     .config_write_target_for_provider(&cwd, provider_id)
             })
-            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+        };
         let provider_target = canonical_mcp_target_path(&provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(
@@ -21310,6 +21653,7 @@ async fn stage_and_recover_provider_batch(
             }
         }
         validate_daemon_provider_url(&upsert.entry.url)?;
+        validate_daemon_usage_probe(&upsert.entry)?;
         validate_unique_provider_header_names(&upsert.entry.headers)?;
         ensure_provider_credential_reference_available(ctx, &upsert.entry).await?;
         let staged_names = staged
@@ -21802,12 +22146,12 @@ async fn provider_models_fetch(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let selected_policy = on_unlisted
@@ -21858,6 +22202,7 @@ async fn provider_models_fetch(
                 &resolved,
                 std::time::Duration::from_secs(15),
                 Some(store.clone()),
+                |name| env.get(name).cloned(),
             )
             .await;
             let outcome = match fetched {
@@ -22068,7 +22413,38 @@ async fn daemon_deep_provider_fetch(
         if failures.contains_key(&target.provider_id) {
             continue;
         }
-        if let Err(error) = probe_target(&mut client, config, target).await {
+        let mut probe = probe_target(&mut client, config, target).await;
+        if matches!(
+            &probe,
+            Ok(crate::providers::deepfetch::DeepfetchApplyReport::Entitlement { .. })
+        ) && let Some(entry) = config.providers.get(&target.provider_id)
+        {
+            match crate::providers::models_fetch::refresh_provider_request_async_with_store(
+                &target.provider_id,
+                entry,
+                store.clone(),
+                |name| env.get(name).cloned(),
+                client.command_credential_generation(&target.provider_id),
+            )
+            .await
+            {
+                Ok(Some(request)) => {
+                    client.replace_resolved(target.provider_id.clone(), request);
+                    probe = probe_target(&mut client, config, target).await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failures.insert(
+                        target.provider_id.clone(),
+                        crate::config::providers::redact_model_fetch_reason(
+                            crate::auth::command::refresh_failure(error).to_string(),
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
+        if let Err(error) = probe {
             failures.insert(
                 target.provider_id.clone(),
                 crate::config::providers::redact_model_fetch_reason(error.to_string()),
@@ -22130,12 +22506,12 @@ async fn provider_usage_snapshot(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
@@ -22185,7 +22561,7 @@ fn validate_unique_provider_header_names(
     Ok(())
 }
 
-fn provider_usage_view(
+pub(super) fn provider_usage_view(
     row: crate::providers::usage::ProviderUsageSnapshot,
     store: &crate::credentials::CredentialStore,
     config: &crate::config::providers::ProvidersConfig,
@@ -22204,9 +22580,8 @@ fn provider_usage_view(
             plan: plan.map(|value| redact_provider_response_text(&value, store, config, env)),
             windows: windows
                 .into_iter()
-                .enumerate()
-                .map(|(index, window)| ProviderUsageWindowView {
-                    label: format!("window {}", index + 1),
+                .map(|window| ProviderUsageWindowView {
+                    label: redact_provider_response_text(&window.label, store, config, env),
                     used_percent: window.used_percent,
                     reset_at: window.reset_at,
                     detail: window
@@ -22509,6 +22884,64 @@ mod provider_atomic_authority_tests {
     }
 
     #[test]
+    fn descriptor_credential_mutations_use_a_private_record_namespace() {
+        let source = include_str!("dispatch.rs");
+        let completion = source
+            .split("Request::CompleteProviderOAuth {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::CancelProviderOAuth {").next())
+            .expect("complete-provider-oauth dispatch arm");
+        let completion_descriptor_lock = completion
+            .find("credential_mutation_lock(provider_id)")
+            .expect("descriptor completion shares the credential fence");
+        let claim_exchange = completion
+            .find("claim_oauth_exchange(")
+            .expect("descriptor completion claims its exchange");
+        assert!(
+            completion_descriptor_lock < claim_exchange,
+            "descriptor completion must take the credential fence before its exchange"
+        );
+        assert!(
+            completion.contains("credential_record_id(&provider_id)"),
+            "descriptor completion must persist under its private record id"
+        );
+
+        let put = source
+            .split("Request::PutProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetLocalOperationSettlement").next())
+            .expect("put-provider-credential dispatch arm");
+        assert!(
+            !put.contains("credential_mutation_lock(&provider_id)"),
+            "generic provider writes must not reach descriptor-owned records"
+        );
+
+        let delete = source
+            .split("Request::DeleteProviderCredential {")
+            .nth(1)
+            .and_then(|tail| tail.split("Request::GetProviderCatalogSnapshot").next())
+            .expect("delete-provider-credential dispatch arm");
+        let delete_config_lock = delete
+            .find("CONFIG_PUBLICATION_RPC_LOCK.lock().await")
+            .expect("delete takes the config-publication lock");
+        let delete_descriptor_lock = delete
+            .find("credential_mutation_lock(&provider_id)")
+            .expect("delete shares the descriptor credential fence");
+        let delete_secret_owner_lock = delete
+            .find("SECRET_OWNER_RPC_LOCK.lock().await")
+            .expect("delete takes the secret-owner lock");
+        assert!(
+            delete_config_lock < delete_descriptor_lock
+                && delete_descriptor_lock < delete_secret_owner_lock,
+            "delete lock order must be config publication, descriptor fence, then secret owner"
+        );
+        assert!(
+            delete.contains("credential_record_id(&provider_id)"),
+            "configured descriptor logout must resolve the private record id"
+        );
+    }
+
+    #[test]
     fn provider_batch_journal_is_the_only_prepublication_durable_intent() {
         let source = include_str!("dispatch.rs");
         let batch = source
@@ -22776,7 +23209,15 @@ fn provider_owned_secret_references(
         .flat_map(|header| crate::envref::referenced_names(&header.value))
         .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
         .collect();
-    let credentials = entry.credential_ref.iter().cloned().collect();
+    // A manually authored legacy config must never grant cleanup ownership of
+    // a descriptor token record. Descriptor records are selected exclusively
+    // from `oauth` plus the provider id at their dedicated mutation boundary.
+    let credentials = entry
+        .credential_ref
+        .iter()
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
+        .cloned()
+        .collect();
     (named, credentials)
 }
 
@@ -22839,18 +23280,21 @@ async fn ensure_provider_credential_reference_available(
     ctx: &DaemonContext,
     entry: &crate::config::providers::ProviderEntry,
 ) -> std::result::Result<(), ErrorPayload> {
-    if let Some(reference) = entry.credential_ref.as_deref()
-        && ctx
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)
+            .map_err(|error| bad_request(error.to_string()))?;
+        if ctx
             .secret_vault
             .get_item(
                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                 reference,
             )
             .is_err()
-    {
-        return Err(bad_request(format!(
-            "provider credential reference `{reference}` is not present in the daemon vault"
-        )));
+        {
+            return Err(bad_request(format!(
+                "provider credential reference `{reference}` is not present in the daemon vault"
+            )));
+        }
     }
     Ok(())
 }
@@ -23138,6 +23582,9 @@ async fn recover_provider_config_journals_inner(
             delete_owned_named_secret(ctx, &name, "provider", &project_root).await?;
         }
         for reference in credentials {
+            if crate::auth::descriptor::is_credential_record_id(&reference) {
+                continue;
+            }
             let sole_claim =
                 release_credential_ownership(ctx, &reference, &journal.provider_id, &project_root)
                     .await?;
@@ -23167,6 +23614,9 @@ async fn recover_provider_config_journals_inner(
                     .map(|entry| provider_owned_secret_references(entry).1)
                     .unwrap_or_default();
                 for reference in references {
+                    if crate::auth::descriptor::is_credential_record_id(&reference) {
+                        continue;
+                    }
                     if retained_by_same_pair.contains(&reference) {
                         continue;
                     }
@@ -23316,6 +23766,7 @@ async fn recover_provider_journal_file_bounded(
                 })?)
                 .map_err(internal)?;
             validate_daemon_provider_url(&entry.url)?;
+            validate_daemon_usage_probe(&entry)?;
             validate_unique_provider_header_names(&entry.headers)?;
             ProviderJournalFileAction::Save {
                 path,
@@ -23377,6 +23828,7 @@ async fn recover_provider_journal_file_bounded(
                     return Err(bad_request("provider batch journal contains an empty id"));
                 }
                 validate_daemon_provider_url(&entry.url)?;
+                validate_daemon_usage_probe(&entry)?;
                 validate_unique_provider_header_names(&entry.headers)?;
             }
             ProviderJournalFileAction::Batch {
@@ -23774,6 +24226,7 @@ async fn provider_config_save_under_lock(
     // Defense in depth: typed in-process callers must not be able to bypass
     // the protocol ingress validator and journal a credential-bearing URL.
     validate_daemon_provider_url(&entry.url)?;
+    validate_daemon_usage_probe(&entry)?;
     validate_unique_provider_header_names(&entry.headers)?;
     recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
     if header_secrets.len() != entry.headers.len() {
@@ -25053,6 +25506,7 @@ fn provider_credential_references_for_root(
         .providers
         .values()
         .filter_map(|provider| provider.credential_ref.clone())
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
         .collect())
 }
 
@@ -26064,6 +26518,45 @@ fn validate_daemon_provider_url(url: &str) -> std::result::Result<(), ErrorPaylo
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(bad_request(
             "provider URL must not include a query string or fragment",
+        ));
+    }
+    Ok(())
+}
+
+/// Usage probe URLs carry no credentials of their own: the probe reuses the
+/// provider's resolved headers. Validate every daemon persistence path, while
+/// retaining runtime validation for hand-authored config that bypasses RPCs.
+fn validate_daemon_usage_probe(
+    entry: &crate::config::providers::ProviderEntry,
+) -> std::result::Result<(), ErrorPayload> {
+    let Some(probe) = &entry.usage_probe else {
+        return Ok(());
+    };
+    let endpoint = probe.endpoint.trim();
+    let parsed = if endpoint.starts_with('/') {
+        if endpoint.starts_with("//") {
+            return Err(bad_request(
+                "usage probe endpoint path must not replace the provider origin",
+            ));
+        }
+        reqwest::Url::parse("https://usage-probe.invalid")
+            .and_then(|origin| origin.join(endpoint))
+            .map_err(|_| bad_request("usage probe endpoint path is invalid"))?
+    } else {
+        reqwest::Url::parse(endpoint)
+            .map_err(|_| bad_request("usage probe endpoint must be an absolute URL or root path"))?
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(bad_request("usage probe endpoint must use HTTP or HTTPS"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(bad_request(
+            "usage probe endpoint must not include credentials",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(bad_request(
+            "usage probe endpoint must not include a query string or fragment",
         ));
     }
     Ok(())
@@ -27640,6 +28133,7 @@ async fn code_root_read_from_attached_response(
         active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: _,
         paused_work,
         repair_required,
         // The ACP Code-root projection deliberately does not transfer this
@@ -27802,6 +28296,41 @@ async fn code_root_read_snapshot(
             .map(btw_info_to_proto),
         attention,
     })
+}
+
+/// Drain events emitted after an attach's durable snapshot was read.
+///
+/// A broadcast gap makes that snapshot stale: the queued lag marker must be
+/// delivered before any retained post-gap events, so clients enter their normal
+/// durable reattach/reconcile path before applying them.
+pub(super) fn replay_attach_hydration_events(
+    event_rx: &mut crate::daemon::EventReceiver,
+    pending_replay: &mut Vec<proto::Event>,
+    session_id: Uuid,
+) {
+    loop {
+        match event_rx.try_recv() {
+            Ok(envelope) => pending_replay.push(envelope.event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                // The history snapshot predates this loss, so it cannot be
+                // treated as an authoritative attach projection. In
+                // particular, a dropped `UserMessageRemoved` would otherwise
+                // leave a retracted durable row rendered indefinitely. Match
+                // the live-forwarder contract: deliver a typed lag marker
+                // after the attach response so the client reattaches and
+                // reconciles from its durable cursor. Keep draining the
+                // receiver too, since events retained after the gap are still
+                // useful while that resync is in flight.
+                tracing::warn!(missed = n, %session_id, "attach hydration event replay lagged; reattach to resync");
+                pending_replay.push(proto::Event::EventStreamLagged {
+                    session_id: Some(session_id),
+                    dropped: n,
+                });
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28178,10 +28707,11 @@ pub(super) async fn attach(
     let db = ctx.db.clone();
     let extended_cfg_for_attach = extended_cfg.clone();
     let active_subagent_for_attach = foreground.active_subagent.clone();
-    let (mut history, paused_work, replay_max_seq): (
+    let (mut history, paused_work, replay_max_seq, removed_user_message_seqs): (
         Vec<proto::HistoryEntry>,
         Vec<proto::PausedWorkSummary>,
         Option<i64>,
+        Vec<i64>,
     ) = db
         .read(move |conn| {
             let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
@@ -28189,37 +28719,71 @@ pub(super) async fn attach(
                 session_id,
                 &extended_cfg_for_attach,
             );
-            let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
+            let (history, replay_max_seq, removed_user_message_seqs) = if let Some(since_seq) = since_seq {
                 let replay_rows =
                     crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
-                let replay_max_seq = replay_rows.into_iter().map(|row| row.seq).max();
-                let history =
-                    crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
-                        conn,
-                        session_id,
-                        &root_agent,
-                        active_subagent_for_attach.as_ref(),
-                        since_seq,
-                    )?;
-                (history, replay_max_seq)
-            } else {
-                let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
+                let replay_max_seq = replay_rows.iter().map(|row| row.seq).max();
+                // A retraction deletes its user row, so normal transcript
+                // projection has nothing to render for it. Preserve the
+                // tombstone's target identity as a narrow replay operation:
+                // clients remove only this proven-stale row and never infer
+                // deletion from an entry merely being absent from a snapshot.
+                let removed_user_message_seqs = replay_rows
+                    .iter()
+                    .filter(|row| row.kind == "user_message_retracted")
+                    .filter_map(|row| {
+                        row.data
+                            .get("retracted_seq")
+                            .and_then(serde_json::Value::as_i64)
+                    })
+                    .collect();
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
                     conn,
                     session_id,
                     &root_agent,
                     active_subagent_for_attach.as_ref(),
+                    replay_rows,
+                )?;
+                (history, replay_max_seq, removed_user_message_seqs)
+            } else {
+                // A full snapshot is merged with retained paged/live rows by
+                // remote clients, so it must carry all durable retraction
+                // targets as well. Absence from a snapshot is never treated
+                // as deletion: only these tombstone-backed identities remove
+                // a cached user row.
+                let snapshot_rows = crate::db::Db::list_session_events_conn(conn, session_id)?;
+                let removed_user_message_seqs = snapshot_rows
+                        .iter()
+                        .filter(|row| row.kind == "user_message_retracted")
+                        .filter_map(|row| {
+                            row.data
+                                .get("retracted_seq")
+                                .and_then(serde_json::Value::as_i64)
+                        })
+                        .collect();
+                let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
+                    conn,
+                    session_id,
+                    &root_agent,
+                    active_subagent_for_attach.as_ref(),
+                    snapshot_rows,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
                     Vec::new()
                 });
-                (history, None)
+                (history, None, removed_user_message_seqs)
             };
             let paused_work = crate::db::Db::paused_session_work_conn(conn, session_id)?
                 .into_iter()
                 .map(paused_work_to_proto)
                 .collect();
-            Ok((history, paused_work, replay_max_seq))
+            Ok((
+                history,
+                paused_work,
+                replay_max_seq,
+                removed_user_message_seqs,
+            ))
         })
         .await
         .map_err(internal)?;
@@ -28231,17 +28795,7 @@ pub(super) async fn attach(
         );
     }
 
-    loop {
-        match event_rx.try_recv() {
-            Ok(envelope) => state.pending_replay.push(envelope.event),
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!(missed = n, "attach hydration event replay lagged");
-                break;
-            }
-            Err(broadcast::error::TryRecvError::Closed) => break,
-        }
-    }
+    replay_attach_hydration_events(&mut event_rx, &mut state.pending_replay, session_id);
     effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {
@@ -28250,16 +28804,17 @@ pub(super) async fn attach(
     } else {
         history
     };
+    let attached_removed_user_message_seqs = if replay_max_seq.is_none() {
+        removed_user_message_seqs.clone()
+    } else {
+        Vec::new()
+    };
     if let Some(max_seq) = replay_max_seq {
-        if !history.is_empty() {
-            let max_seq = history
-                .iter()
-                .map(history_entry_seq)
-                .max()
-                .unwrap_or(max_seq);
+        if !history.is_empty() || !removed_user_message_seqs.is_empty() {
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,
+                removed_user_message_seqs,
                 max_seq,
             });
         }
@@ -28284,6 +28839,7 @@ pub(super) async fn attach(
         active_subagent: foreground.active_subagent,
         active_model_state,
         history,
+        removed_user_message_seqs: attached_removed_user_message_seqs,
         paused_work,
         repair_required: state
             .attached
@@ -29092,7 +29648,7 @@ fn validate_sealed_begin_shape(
             // key. Presence (possibly empty) is required so the wire is explicit.
             scope_key.context("create begin requires a scope key field")?;
         }
-        "replace" | "rotate" | "recover" => {
+        "replace" | "rotate" | "recover" | "reset" => {
             let record_id = record_id.context("this disposition requires a record id")?;
             crate::sealed::identity::SealedRecordId::parse(record_id)?;
             if name.is_some()
@@ -29100,11 +29656,24 @@ fn validate_sealed_begin_shape(
                 || scope_kind.is_some()
                 || scope_key.is_some()
             {
-                anyhow::bail!("replace/rotate/recover begin must carry only a record id");
+                anyhow::bail!("replace/rotate/recover/reset begin must carry only a record id");
             }
         }
+        "promote" => {
+            let record_id = record_id.context("promote requires a record id")?;
+            crate::sealed::identity::SealedRecordId::parse(record_id)?;
+            if name.is_some() || description.is_some() {
+                anyhow::bail!("promote begin must not carry a name or description");
+            }
+            let scope_kind = scope_kind.context("promote requires a target scope kind")?;
+            let target_kind = parse_sealed_owner_scope_kind(scope_kind)?;
+            if !target_kind.is_persistent_compartment() {
+                anyhow::bail!("promote target scope must be project or global");
+            }
+            scope_key.context("promote requires a target scope key field")?;
+        }
         other => anyhow::bail!(
-            "disposition must be `create`, `replace`, `rotate`, or `recover`, got `{other}`"
+            "disposition must be `create`, `replace`, `rotate`, `reset`, `promote`, or `recover`, got `{other}`"
         ),
     }
     Ok(())
@@ -29213,6 +29782,13 @@ fn build_begin_sensitive_input(
         "recover" => Ok(BeginSensitiveInput::Recover {
             record_id: SealedRecordId::parse(&record_id.context("recover requires a record id")?)?,
         }),
+        "reset" => Ok(BeginSensitiveInput::Reset {
+            record_id: SealedRecordId::parse(&record_id.context("reset requires a record id")?)?,
+        }),
+        "promote" => Ok(BeginSensitiveInput::Promote {
+            record_id: SealedRecordId::parse(&record_id.context("promote requires a record id")?)?,
+            target_scope: build_sealed_scope_ref(scope_kind, scope_key)?,
+        }),
         other => anyhow::bail!("unknown sealed-owner disposition `{other}`"),
     }
 }
@@ -29244,63 +29820,101 @@ fn sealed_record_row_to_inventory_item(
     }
 }
 
-/// The closed server-side catalog that resolves the three `CreateSealedAction`
-/// ids to a compiled [`SealedActionKind`].
-///
-/// The ids are closed lookups, never free-form payloads: `kind_id` selects a
-/// builtin kind template (a fixed origin allowlist, credential placement, path
-/// template, and parameter specs — all host-owned, never on the wire),
-/// `origin_id` indexes into that template's allowlist, and `projection_id`
-/// selects the fixed projection. Any unknown id is rejected here, before any
-/// persist. The builtin catalog is intentionally small; the persistence sibling
-/// installs the durable action directory that these snapshots are written to.
-fn resolve_sealed_action_kind(
-    kind_id: &str,
-    origin_id: &str,
-    projection_id: &str,
+/// Compile the owner-authored local declaration into the same closed runtime
+/// enum persisted by the action directory. The owner may select a real fixed
+/// sink, but the model later sees only action ids and cannot modify any field.
+fn compile_owner_declared_sealed_action(
+    declaration: proto::SealedActionDeclaration,
 ) -> anyhow::Result<crate::sealed::action_admin::SealedActionKind> {
     use crate::sealed::action_admin::{
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
+        local_executor::{
+            CommandInjection, ExecutableIdentity, FileDestination, FilePersistence,
+            FileSystemIdentity, PersistentFileApproval, SEALED_FILE_PATH_PLACEHOLDER,
+            SEALED_VALUE_ARG_PLACEHOLDER,
+        },
     };
 
-    // Closed builtin kind templates. Each entry is a fixed, host-owned template;
-    // the wire never supplies an origin URL, header, or path.
-    struct KindTemplate {
-        origins: &'static [&'static str],
-        header_name: &'static str,
-        path_template: &'static str,
+    let unpinned_executable = ExecutableIdentity::unpinned;
+    match declaration {
+        proto::SealedActionDeclaration::CommandArgument { mut argv } => {
+            if !argv.iter().any(|arg| arg == SEALED_VALUE_ARG_PLACEHOLDER) {
+                anyhow::bail!("command argument declaration must contain {{sealed_value}}");
+            }
+            Ok(SealedActionKind::Command {
+                argv_template: std::mem::take(&mut argv),
+                executable_identity: unpinned_executable(),
+                injection: CommandInjection::Argument,
+                parameters: std::collections::BTreeMap::new(),
+            })
+        }
+        proto::SealedActionDeclaration::CommandEnvironment { argv, variable } => {
+            Ok(SealedActionKind::Command {
+                argv_template: argv,
+                executable_identity: unpinned_executable(),
+                injection: CommandInjection::Environment { variable },
+                parameters: std::collections::BTreeMap::new(),
+            })
+        }
+        proto::SealedActionDeclaration::HttpsHeader {
+            origin,
+            path,
+            header_name,
+            projection_id,
+        } => Ok(SealedActionKind::Https {
+            origins: HttpsOriginAllowlist::from_raw(&[&origin])?,
+            credential_placement: HttpsCredentialPlacement::Header { header_name },
+            path_template: path,
+            projection: SealedProjectionId::parse(&projection_id)?,
+            parameters: std::collections::BTreeMap::new(),
+        }),
+        proto::SealedActionDeclaration::HttpsBody {
+            origin,
+            path,
+            content_type,
+            projection_id,
+        } => Ok(SealedActionKind::Https {
+            origins: HttpsOriginAllowlist::from_raw(&[&origin])?,
+            credential_placement: HttpsCredentialPlacement::Body { content_type },
+            path_template: path,
+            projection: SealedProjectionId::parse(&projection_id)?,
+            parameters: std::collections::BTreeMap::new(),
+        }),
+        proto::SealedActionDeclaration::FileRuntime {
+            filename,
+            consumer_argv,
+        } => Ok(SealedActionKind::File {
+            destination: FileDestination::PrivateRuntime { filename },
+            persistence: FilePersistence::Ephemeral,
+            consumer_argv,
+            consumer_executable_identity: None,
+        }),
+        proto::SealedActionDeclaration::FilePinned {
+            path,
+            consumer_argv,
+            persistent_acknowledged_at_ms,
+            persistent_warning,
+        } => {
+            let persistence = match (persistent_acknowledged_at_ms, persistent_warning) {
+                (None, None) => FilePersistence::Ephemeral,
+                (Some(at_ms), Some(warning)) => FilePersistence::PersistentOwnerApproved(
+                    PersistentFileApproval::acknowledge(at_ms, &warning)?,
+                ),
+                _ => anyhow::bail!(
+                    "persistent sealed-file approval requires timestamp and exact warning"
+                ),
+            };
+            Ok(SealedActionKind::File {
+                destination: FileDestination::Pinned {
+                    path: path.into(),
+                    parent_identity: FileSystemIdentity::unpinned(),
+                },
+                persistence,
+                consumer_argv,
+                consumer_executable_identity: None,
+            })
+        }
     }
-    // `origin_id` selects one origin from the template's allowlist by index.
-    let template = match kind_id {
-        "https.notify" => KindTemplate {
-            origins: &[
-                "https://api.deploy.example.com",
-                "https://api.deploy-staging.example.com",
-            ],
-            header_name: "X-Deploy-Key",
-            path_template: "/v1/notify",
-        },
-        other => anyhow::bail!("unknown sealed action kind id: `{other}`"),
-    };
-
-    let index: usize = origin_id
-        .parse()
-        .map_err(|_| anyhow::anyhow!("origin id must be a non-negative index"))?;
-    if index >= template.origins.len() {
-        anyhow::bail!("origin id `{origin_id}` is out of range for kind `{kind_id}`");
-    }
-    // The compiled kind carries the SELECTED origin only.
-    let origins = HttpsOriginAllowlist::from_raw(&[template.origins[index]])?;
-    let projection = SealedProjectionId::parse(projection_id)?;
-    Ok(SealedActionKind::Https {
-        origins,
-        credential_placement: HttpsCredentialPlacement::Header {
-            header_name: template.header_name.to_string(),
-        },
-        path_template: template.path_template.to_string(),
-        projection,
-        parameters: std::collections::BTreeMap::new(),
-    })
 }
 
 async fn ensure_project_note_member(

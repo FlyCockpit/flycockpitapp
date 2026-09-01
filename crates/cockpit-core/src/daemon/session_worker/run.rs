@@ -5711,7 +5711,7 @@ impl StartupWorkInbox {
         self.pending.iter().any(|work| {
             !matches!(
                 work,
-                SessionWork::Cancel | SessionWork::CancelAll | SessionWork::Shutdown { .. }
+                SessionWork::Cancel { .. } | SessionWork::CancelAll | SessionWork::Shutdown { .. }
             )
         })
     }
@@ -5838,7 +5838,7 @@ fn reject_unstarted_startup_work(work: SessionWork) {
                 },
             ));
         }
-        SessionWork::Cancel
+        SessionWork::Cancel { .. }
         | SessionWork::Shutdown { .. }
         | SessionWork::WakeGoal
         | SessionWork::RepublishQueue
@@ -5897,7 +5897,7 @@ mod startup_work_inbox_tests {
     fn work_text(work: &SessionWork) -> Option<&str> {
         match work {
             SessionWork::UserMessage { submission, .. } => Some(submission.text.as_str()),
-            SessionWork::Cancel => Some("cancel"),
+            SessionWork::Cancel { .. } => Some("cancel"),
             SessionWork::CancelAll => Some("cancel all"),
             SessionWork::Shutdown { .. } => Some("shutdown"),
             _ => None,
@@ -5911,7 +5911,10 @@ mod startup_work_inbox_tests {
         let (second, mut second_rx) = user_message_work("second queued");
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
-        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Cancel {
+            origin: CancelOrigin::InteractiveTurn,
+        })
+        .unwrap();
         tx.try_send(SessionWork::Shutdown {
             pause_for_resume: false,
         })
@@ -5948,7 +5951,10 @@ mod startup_work_inbox_tests {
     #[test]
     fn startup_stop_without_live_work_rejects_nothing_and_aborts() {
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(SessionWork::Cancel).unwrap();
+        tx.try_send(SessionWork::Cancel {
+            origin: CancelOrigin::InteractiveTurn,
+        })
+        .unwrap();
         tx.try_send(SessionWork::Shutdown {
             pause_for_resume: false,
         })
@@ -6384,8 +6390,9 @@ pub(super) async fn run_worker(
             // backends (prompt `prompt-caching-strategy.md`, decision 3),
             // held constant across the session so per-key prefix caching keeps
             // hitting. Only the main session worker's foreground model sets
-            // it; background/utility models leave it `None`. The native
-            // Anthropic arm ignores it (it caches per-block instead).
+            // it; background/utility models leave it `None`. The Anthropic
+            // Messages-wire arm ignores it because the wire has no top-level
+            // cache-key field.
             prompt_cache_key: Some(session_id.to_string()),
             ..ModelParams::default()
         },
@@ -11585,13 +11592,14 @@ pub(super) async fn run_worker(
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
                 }
-                work @ (SessionWork::Cancel | SessionWork::CancelAll) => {
-                    // User ctrl+c (`CancelTurn`). Fire the in-flight run's
+                work @ (SessionWork::Cancel { .. } | SessionWork::CancelAll) => {
+                    // Cancellation provenance is explicit: only an interactive
+                    // CancelTurn can open the user-message retract path.
                     // cancellation token: the driver's `turn` aborts the
                     // streaming inference (returning an `InferenceCancelled`
                     // sentinel that unwinds the run cleanly), and any running
                     // `bash` subprocess is killed via its process group. Safe
-                    // and idempotent at idle / mid-cancel — `CancelHandle::cancel`
+                    // and idempotent at idle / mid-cancel — the cancel handle
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
@@ -11600,7 +11608,16 @@ pub(super) async fn run_worker(
                     // interval therefore inherits a cancelled token; the fence
                     // then either owns its registry entry or invalidates its
                     // enqueue generation. Both happen before durable cleanup.
-                    cancel_handle.cancel();
+                    if matches!(
+                        work,
+                        SessionWork::Cancel {
+                            origin: CancelOrigin::InteractiveTurn
+                        }
+                    ) {
+                        cancel_handle.cancel_turn();
+                    } else {
+                        cancel_handle.cancel_noninteractive();
+                    }
                     adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =

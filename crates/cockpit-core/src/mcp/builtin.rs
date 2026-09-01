@@ -364,9 +364,8 @@ impl McpChildDispatch {
     ) -> Self {
         let tool = tool.into();
         // Arguments are recorded as given. No builtin accepts a sealed literal
-        // as an argument any more — the only sealed surface is
-        // `use_sealed_value`, which takes opaque ids — so there is nothing left
-        // to strip here.
+        // as an argument: the scoped listing takes no arguments, and
+        // `use_sealed_value` takes opaque ids. There is nothing left to strip.
         Self {
             kind,
             server,
@@ -1194,8 +1193,10 @@ fn default_functions() -> Vec<BuiltinFunction> {
     let mut funcs = control_functions();
     for tool in [
         Arc::new(crate::tools::session_search::HistorySearchTool) as Arc<dyn Tool>,
-        // The sole sealed-value mechanism. Monty and the native registry share
-        // one implementation, so the two surfaces cannot drift.
+        // The sealed metadata listing and reference-only use mechanism. Monty
+        // and the native registry share each implementation, so their
+        // surfaces cannot drift.
+        Arc::new(crate::tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool),
         Arc::new(crate::tools::use_sealed_value::UseSealedValueTool::new()),
     ] {
         if let Ok(func) = ToolOutputBuiltinAdapter::new(tool).into_function() {
@@ -1773,7 +1774,8 @@ mod tests {
     /// answered `created` on a first write and `overwritten` on a second,
     /// which is a direct existence oracle over the sealed inventory: probe a
     /// name, read the status branch. Acquisition belongs to the trusted-child
-    /// coordinator; use belongs to `use_sealed_value`.
+    /// coordinator; agents can list scoped safe metadata and use a value only
+    /// through `use_sealed_value`.
     #[test]
     fn monty_exposes_no_sealed_lifecycle_or_existence_oracle() {
         let registry = BuiltinRegistry::default_with(Vec::new());
@@ -1788,10 +1790,19 @@ mod tests {
             );
         }
 
-        // The sanctioned mechanism is present, and takes opaque ids only.
+        // The scoped metadata listing is present and takes no selectors.
+        let listing = registry
+            .get(crate::sealed::LIST_SEALED_VALUE_DESCRIPTIONS_TOOL)
+            .expect("the scoped metadata listing is on the Monty surface");
+        assert_eq!(
+            (listing.input_schema)(),
+            crate::sealed::list_sealed_value_descriptions_schema()
+        );
+
+        // The sanctioned use mechanism is present and takes opaque ids only.
         let sanctioned = registry
             .get(crate::sealed::USE_SEALED_VALUE_TOOL)
-            .expect("the sole sealed mechanism is on the Monty surface");
+            .expect("the sealed use mechanism is on the Monty surface");
         let schema = (sanctioned.input_schema)();
         let properties = schema["properties"]
             .as_object()

@@ -12210,7 +12210,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 task_provider_item_id,
                 task_function_call_id,
             } if agent.vnext_grant.is_some() => {
-                // A v2 child can itself be a noninteractive orchestrator.
+                // A launch-v1 child can itself be a noninteractive orchestrator.
                 // vNext task parsing routes here rather than through the
                 // legacy interactive handoff, preserving cwd and write_scope
                 // for the recursive child admission.
@@ -12750,7 +12750,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 task_provider_item_id,
                 task_function_call_id,
             } if agent.vnext_grant.is_some() => {
-                // Recursive v2 batches stay in-process rather than re-entering
+                // Recursive launch-v1 batches stay in-process rather than re-entering
                 // the driver background lifecycle.  Preflight every entry before
                 // admitting any slot or starting any inference, then keep the
                 // whole reservation alive until each direct child completes.

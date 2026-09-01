@@ -484,9 +484,11 @@ pub enum AsyncActionPayload {
     OAuthCodexComplete {
         logged_in: bool,
     },
+    #[cfg(feature = "grok-subscription")]
     OAuthGrokBegin {
         login: cockpit_core::auth::xai_oauth::ManualLogin,
     },
+    #[cfg(feature = "grok-subscription")]
     OAuthGrokComplete {
         logged_in: bool,
     },

@@ -2955,7 +2955,7 @@ fn effective_vnext_grant_for(
 /// derived from the host's role defaults.
 pub(crate) fn resolved_tool_grant(
     def: &crate::agents::AgentDef,
-    cwd: &Path,
+    _cwd: &Path,
     is_assistant: bool,
 ) -> Vec<String> {
     match &def.tools {
@@ -2963,17 +2963,13 @@ pub(crate) fn resolved_tool_grant(
         None if is_assistant => default_assistant_tools(),
         None => {
             #[cfg(test)]
-            if let Some(tools) = test_host_tool_surface(cwd, &def.name) {
+            if let Some(tools) = test_host_tool_surface(_cwd, &def.name) {
                 return tools;
             }
             crate::agents::embedded_default(&def.name)
                 .and_then(|definition| definition.tools)
                 .unwrap_or_else(default_custom_tools)
         }
-        #[cfg(not(test))]
-        None => crate::agents::embedded_default(&def.name)
-            .and_then(|definition| definition.tools)
-            .unwrap_or_else(default_custom_tools),
     }
 }
 
@@ -5521,6 +5517,8 @@ pub(crate) mod tests {
     #[test]
     fn vnext_preferences_are_bounded_by_the_resolved_host_grant() {
         let tmp = tempfile::tempdir().unwrap();
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        write_project_config(tmp.path(), r#"{"web":{"provider":"firecrawl"}}"#);
         let def = crate::agents::parse_agent(
             "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
             "reviewer",
@@ -5529,7 +5527,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let agent = agent_from_def(&def, &test_spawn_args(tmp.path())).unwrap();
-        let projected = agent.definition.expect("pinned definition");
+        let projected = agent.definition.as_ref().expect("pinned definition");
         assert_eq!(
             projected.tool_tiers.get("code"),
             Some(&crate::agents::ToolTier::Discoverable)
@@ -5545,6 +5543,11 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 .contains(&"webfetch".to_string()),
             "the derived custom-agent grant must remain authoritative"
+        );
+        let names = agent.tools.names();
+        assert!(
+            names.contains(&"webfetch"),
+            "an ungranted discoverable preference must not suppress a configured tool: {names:?}"
         );
     }
 

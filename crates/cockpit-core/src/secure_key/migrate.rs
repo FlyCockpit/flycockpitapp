@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use cockpit_db::secret_vault::{
     SecretVaultPlacement, SecretVaultSagaPhase, insert_saga_conn, list_open_sagas_conn,
-    load_authority_conn, set_saga_phase_conn, upsert_authority_conn,
+    load_authority_conn, set_saga_phase_conn, upsert_authority_with_file_kek_mode_conn,
 };
 use cockpit_proto::FeatureCapabilityState;
 use uuid::Uuid;
@@ -176,6 +176,7 @@ fn run_migrate_from_prepared(
     }
     let probe_vault = SecretVault::open(db.clone(), dest.clone(), installation.clone())?;
     let _ = probe_vault.unwrap_active_dek_with(&dest_kek)?;
+    let dest_file_kek_mode = dest.file_kek_mode();
 
     fault.check(VaultFaultPoint::BeforeActivation)?;
     db.blocking_write_for_sync_maintenance({
@@ -185,10 +186,11 @@ fn run_migrate_from_prepared(
         move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let result = (|| {
-                upsert_authority_conn(
+                upsert_authority_with_file_kek_mode_conn(
                     conn,
                     dest_placement,
                     dest_placement,
+                    dest_file_kek_mode,
                     &fingerprint,
                     authority_kek_version,
                     1,

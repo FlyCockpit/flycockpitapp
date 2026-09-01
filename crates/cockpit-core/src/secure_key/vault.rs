@@ -9,8 +9,9 @@ use cockpit_db::secret_vault::{
     SecretVaultItemRow, SecretVaultKind, SecretVaultPlacement, VAULT_ALGORITHM, VAULT_NONCE_LEN,
     VAULT_TAG_LEN, VAULT_WRAP_VERSION, VAULT_WRAPPED_DEK_LEN, count_active_keys_conn,
     deactivate_key_conn, delete_item_conn, ensure_inventory_generation_conn, insert_key_conn,
-    is_unique_constraint, list_inventory_page_conn, list_item_ids_conn, load_active_key_conn,
-    load_authority_conn, load_item_conn, upsert_item_conn,
+    insert_passphrase_kdf_conn, is_unique_constraint, list_inventory_page_conn, list_item_ids_conn,
+    load_active_key_conn, load_authority_conn, load_item_conn,
+    upsert_authority_with_file_kek_mode_conn, upsert_item_conn,
 };
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::Rng;
@@ -266,7 +267,7 @@ impl SecretVault {
         key_version: i64,
         placement: SecretVaultPlacement,
     ) -> Result<Self, SecureKeyError> {
-        let kek = generate_key_bytes();
+        let kek = kek_store.initial_kek();
         kek_store.write_kek_exclusive(kek_version, kek.as_ref())?;
         let kek_store_for_cleanup = kek_store.clone();
         let db_for_cleanup = db.clone();
@@ -288,6 +289,8 @@ impl SecretVault {
                 )));
             }
             let fingerprint = fingerprint_key(&kek);
+            let file_kek_mode = kek_store.file_kek_mode();
+            let passphrase_kdf = kek_store.passphrase_kdf_params();
             db.blocking_write_for_sync_maintenance({
                 let fingerprint = fingerprint.clone();
                 move |conn| {
@@ -300,14 +303,18 @@ impl SecretVault {
                         if load_authority_conn(conn)?.is_some() {
                             anyhow::bail!("secret vault authority already exists");
                         }
-                        cockpit_db::secret_vault::upsert_authority_conn(
+                        upsert_authority_with_file_kek_mode_conn(
                             conn,
                             placement,
                             placement,
+                            file_kek_mode,
                             &fingerprint,
                             kek_version,
                             VAULT_WRAP_VERSION,
                         )?;
+                        if let Some(params) = passphrase_kdf {
+                            insert_passphrase_kdf_conn(conn, &params.to_db())?;
+                        }
                         insert_key_conn(
                             conn,
                             key_version,

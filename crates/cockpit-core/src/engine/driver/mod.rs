@@ -9722,6 +9722,18 @@ impl Driver {
                     "native tool-surface changes require cache-break acknowledgement before applying"
                 );
             }
+            // A native-schema transition must prune the old cached context
+            // before it becomes live. Persist-on-re-entry temporarily owns
+            // started-but-unsettled sibling results, so every history
+            // rewriter (including that required prune) is fenced until their
+            // paired terminal bodies commit. Refuse instead of installing a
+            // surface whose mandatory prune would be deferred; the worker
+            // then cannot persist an unpruned acknowledged transition.
+            if native_schema_changed && self.persist_on_reentry_owns_started_unsettled_siblings() {
+                anyhow::bail!(
+                    "native tool-surface changes are unavailable while persist-on-re-entry owns sibling results"
+                );
+            }
             if !native_schema_changed {
                 rebuilt
                     .tools

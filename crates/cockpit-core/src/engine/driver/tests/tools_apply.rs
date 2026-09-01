@@ -17,6 +17,31 @@ fn install_pinned_build_definition(driver: &mut Driver) {
     );
 }
 
+#[test]
+fn native_tool_surface_change_checks_reentry_fence_before_installing_surface() {
+    let driver = include_str!("../mod.rs");
+    let set_tool_surface_override = driver
+        .split("async fn set_tool_surface_override")
+        .nth(1)
+        .expect("set_tool_surface_override must exist")
+        .split("/// Decide the cache-aware reuse-vs-fresh path")
+        .next()
+        .expect("set_tool_surface_override must end before follow-up cache logic");
+    let native_schema_changed = set_tool_surface_override
+        .find("let native_schema_changed")
+        .expect("tool surface override must classify native schema changes");
+    let reentry_fence = set_tool_surface_override
+        .find("native_schema_changed\n                && self.persist_on_reentry_owns_started_unsettled_siblings()")
+        .expect("native changes must be fenced while required pruning is unsafe");
+    let install = set_tool_surface_override
+        .find("self.stack[0].agent = Arc::new(updated)")
+        .expect("tool surface override must install its rebuilt root agent");
+    assert!(
+        native_schema_changed < reentry_fence && reentry_fence < install,
+        "the re-entry fence must reject a native change before it can become live without its mandatory prune"
+    );
+}
+
 #[tokio::test]
 async fn tools_apply_rebuilds_root_and_prunes() {
     let (mut driver, tmp) = test_driver_without_network(1);

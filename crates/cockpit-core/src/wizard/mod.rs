@@ -1695,6 +1695,7 @@ pub fn provider_entry_for_template(
     ProviderEntry {
         name: Some(template.display.to_string()),
         template: Some(template.id.to_string()),
+        usage_probe: None,
         url,
         headers,
         models_fetched_at: None,

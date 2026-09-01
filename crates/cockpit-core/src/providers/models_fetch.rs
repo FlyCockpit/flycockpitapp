@@ -1109,6 +1109,7 @@ fn context_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
 
 fn max_output_tokens_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
     numeric_field(obj, "max_output_tokens")
+        .or_else(|| numeric_field(obj, "max_completion_tokens"))
         .or_else(|| numeric_field(obj, "output_token_limit"))
         .or_else(|| numeric_field(obj, "max_tokens"))
 }
@@ -1773,6 +1774,43 @@ mod tests {
         let body = r#"[{"id":"foo"},{"id":"bar"}]"#;
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parses_crofai_models_metadata_and_completion_limit() {
+        let body = r#"{
+            "data": [{
+                "id": "crofai/example-model",
+                "name": "Example Model",
+                "context_length": 262144,
+                "max_completion_tokens": 16384,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "quantization": "fp8",
+                "speed": "fast"
+            }]
+        }"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = &entries[0];
+        assert_eq!(model.context_length, Some(262144));
+        assert_eq!(model.capabilities.context_tokens, Some(262144));
+        assert_eq!(model.capabilities.max_output_tokens, Some(16384));
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("pricing")
+                .and_then(Value::as_object)
+                .and_then(|pricing| pricing.get("prompt"))
+                .and_then(Value::as_str),
+            Some("0.000001")
+        );
+        assert_eq!(
+            model
+                .provider_metadata
+                .get("quantization")
+                .and_then(Value::as_str),
+            Some("fp8")
+        );
     }
 
     #[test]
@@ -3524,6 +3562,7 @@ mod tests {
                 format_hint: "synthetic key",
                 console_url: "https://synthetic.example/keys",
             }),
+            usage_probe: None,
             auth_check: crate::providers::AuthCheckKind::ModelsEndpoint,
         };
         let entry = ProviderEntry {

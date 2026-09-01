@@ -23,7 +23,10 @@ pub use registry::ProviderRegistry;
 
 use std::env;
 
-use crate::config::providers::{AuthKind, HeaderSpec, ThinkingMode, WireApi};
+use crate::config::providers::{
+    AuthKind, HeaderSpec, ThinkingMode, UsageProbeField, UsageProbeFieldKind, UsageProbeMethod,
+    UsageProbeSpec, WireApi,
+};
 use serde_json::{Value, json};
 
 /// One picker entry in the Add Provider wizard.
@@ -61,9 +64,29 @@ pub struct ProviderTemplate {
     pub default_wire_api: WireApi,
     /// API-key entry metadata for the key-first setup wizard.
     pub api_key: Option<ApiKeyTemplate>,
+    /// Optional declarative usage endpoint inherited by entries that use this
+    /// template unless their config declares an override.
+    pub usage_probe: Option<&'static UsageProbeSpec>,
     /// User-visible setup/doctor credential check for this template.
     pub auth_check: AuthCheckKind,
 }
+
+static CROFAI_USAGE_PROBE: UsageProbeSpec = UsageProbeSpec {
+    endpoint: std::borrow::Cow::Borrowed("/usage_api/"),
+    method: UsageProbeMethod::Get,
+    fields: std::borrow::Cow::Borrowed(&[
+        UsageProbeField {
+            pointer: std::borrow::Cow::Borrowed("/credits"),
+            label: std::borrow::Cow::Borrowed("credits"),
+            kind: UsageProbeFieldKind::Credits,
+        },
+        UsageProbeField {
+            pointer: std::borrow::Cow::Borrowed("/usable_requests"),
+            label: std::borrow::Cow::Borrowed("requests left today"),
+            kind: UsageProbeFieldKind::RequestsRemaining,
+        },
+    ]),
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiKeyTemplate {
@@ -117,6 +140,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "OpenAI-compatible API key",
             console_url: "https://platform.openai.com/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -139,6 +163,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with sk-",
             console_url: "https://platform.openai.com/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -156,6 +181,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
         api_key: None,
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -178,6 +204,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with xai- or a provider-issued xAI key",
             console_url: "https://console.x.ai/team/default/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -195,6 +222,30 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
         api_key: None,
+        usage_probe: None,
+        auth_check: AuthCheckKind::ModelsEndpoint,
+    },
+    ProviderTemplate {
+        id: "crofai",
+        display: "CrofAI",
+        url: "https://crof.ai/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("CROF_API_KEY"),
+        env_var_candidates: &["CROF_API_KEY", "CROFAI_API_KEY"],
+        default_headers: &[("Authorization", "Bearer $CROF_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some(
+            "OpenAI Chat Completions and Responses on /v1 with reasoning_effort. Anthropic host: https://anthropic.nahcrof.com. Generate a key at https://crof.ai/settings.",
+        ),
+        use_id_as_default: true,
+        default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "CrofAI API key",
+            console_url: "https://crof.ai/settings",
+        }),
+        usage_probe: Some(&CROFAI_USAGE_PROBE),
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -215,6 +266,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "Z.AI API key or JWT token",
             console_url: "https://z.ai/manage-apikey/apikey-list",
         }),
+        usage_probe: None,
         // Z.AI documents API-key auth via `Authorization: Bearer` and
         // `POST /chat/completions` as the authenticated HTTP API path:
         // https://docs.z.ai/api-reference/llm/chat-completion
@@ -244,6 +296,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "Nous Research API key",
             console_url: "https://portal.nousresearch.com/api-docs",
         }),
+        usage_probe: None,
         // Official OpenAPI (2026-08-05) exposes POST /chat/completions only:
         // https://portal.nousresearch.com/api/openapi
         auth_check: AuthCheckKind::ChatCompletions {
@@ -272,6 +325,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "Baseten API key",
             console_url: "https://app.baseten.co/settings/api_keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -292,6 +346,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "MiniMax API key",
             console_url: "https://platform.minimaxi.com/",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -316,6 +371,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "OpenCode Zen token",
             console_url: "https://opencode.ai/zen",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -338,6 +394,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "GitHub token with Copilot access",
             console_url: "https://github.com/settings/tokens",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -358,6 +415,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with sk-or-",
             console_url: "https://openrouter.ai/keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -378,6 +436,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with sk-",
             console_url: "https://platform.deepseek.com/api_keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -403,6 +462,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with sk-ant-",
             console_url: "https://console.anthropic.com/settings/keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -430,6 +490,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "Xiaomi MiMo API key",
             console_url: "https://api.xiaomimimo.com/",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
 ];
@@ -727,17 +788,16 @@ mod tests {
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
-            assert!(
-                !t.default_wire_api.is_auto(),
-                "template {} must define a concrete wire default",
-                t.id
-            );
-            assert_eq!(
-                t.default_wire_api,
-                crate::config::providers::default_wire_api_for_template(Some(t.id)),
-                "template {} and config resolution must agree",
-                t.id
-            );
+            if t.default_wire_api.is_auto() {
+                assert_eq!(t.id, "crofai", "only CrofAI has an auto wire default");
+            } else {
+                assert_eq!(
+                    t.default_wire_api,
+                    crate::config::providers::default_wire_api_for_template(Some(t.id)),
+                    "template {} and config resolution must agree",
+                    t.id
+                );
+            }
         }
     }
 
@@ -787,6 +847,7 @@ mod tests {
         assert!(template_by_id("codex-oauth").is_some());
         assert!(template_by_id("grok").is_some());
         assert!(template_by_id("grok-oauth").is_some());
+        assert!(template_by_id("crofai").is_some());
         assert!(template_by_id("z-ai").is_some());
         assert!(template_by_id("nous-research").is_some());
         assert!(template_by_id("baseten").is_some());
@@ -858,6 +919,28 @@ mod tests {
         assert!(oauth.default_headers.is_empty());
         assert!(oauth.env_var_candidates.is_empty());
         assert_eq!(oauth.default_wire_api, WireApi::Responses);
+    }
+
+    #[test]
+    fn crofai_template_is_configured_for_openai_apis_and_usage() {
+        let crofai = template_by_id("crofai").expect("CrofAI template");
+        assert_eq!(crofai.display, "CrofAI");
+        assert_eq!(crofai.url, "https://crof.ai/v1");
+        assert_eq!(crofai.auth, AuthKind::ApiKey);
+        assert_eq!(crofai.default_env_var, Some("CROF_API_KEY"));
+        assert_eq!(
+            crofai.env_var_candidates,
+            &["CROF_API_KEY", "CROFAI_API_KEY"]
+        );
+        assert_eq!(
+            crofai.default_headers,
+            &[("Authorization", "Bearer $CROF_API_KEY")]
+        );
+        assert!(crofai.supports_models_endpoint);
+        assert_eq!(crofai.default_wire_api, WireApi::Auto);
+        let probe = crofai.usage_probe.expect("CrofAI usage probe");
+        assert_eq!(probe.endpoint, "/usage_api/");
+        assert_eq!(probe.fields.len(), 2);
     }
 
     #[test]

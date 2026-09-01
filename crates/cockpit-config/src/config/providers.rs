@@ -44,6 +44,7 @@
 //! }
 //! ```
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -100,6 +101,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "capabilities",
     "provider_metadata",
     "last_model_fetch",
+    "usage_probe",
 ];
 
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
@@ -434,6 +436,12 @@ pub struct ProviderEntry {
     /// establishes immutable vendor identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+
+    /// Optional declarative API usage probe. When absent, built-in templates
+    /// may supply their own default probe. The probe always reuses this
+    /// provider's resolved inference headers; it never stores a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_probe: Option<UsageProbeSpec>,
 
     /// Base URL. The `/models` endpoint is `{url}/models`; chat lives at
     /// `{url}/chat/completions`. Stored without a trailing slash.
@@ -1006,6 +1014,44 @@ impl CacheRetentionProfile {
 pub struct HeaderSpec {
     pub name: String,
     pub value: String,
+}
+
+/// A provider usage endpoint that can be fetched without vendor-specific
+/// Rust code. `endpoint` is either an absolute URL or a root-relative path;
+/// root-relative paths are resolved against the provider URL's origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageProbeSpec {
+    pub endpoint: Cow<'static, str>,
+    #[serde(default)]
+    pub method: UsageProbeMethod,
+    pub fields: Cow<'static, [UsageProbeField]>,
+}
+
+/// HTTP method for a declarative usage probe. The initial declarative probe
+/// contract intentionally supports only GET.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageProbeMethod {
+    #[default]
+    Get,
+}
+
+/// One JSON Pointer extraction from a declarative usage response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageProbeField {
+    pub pointer: Cow<'static, str>,
+    pub label: Cow<'static, str>,
+    pub kind: UsageProbeFieldKind,
+}
+
+/// Rendering target for an extracted declarative usage field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageProbeFieldKind {
+    Credits,
+    RequestsRemaining,
+    Percent,
+    Text,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

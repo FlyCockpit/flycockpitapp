@@ -14469,13 +14469,6 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            // A direct owner write may target a descriptor credential. Share
-            // its per-provider mutation fence with descriptor refresh and
-            // initial login before taking the secret-owner lock, so an
-            // acknowledged replacement cannot be overwritten by a refresh
-            // that had loaded the prior record.
-            let _descriptor_lock =
-                crate::auth::descriptor::credential_mutation_lock(&provider_id).await;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let consumed_vault_generation = match ctx.secret_vault.current_inventory_generation() {
                 Ok(generation) => generation,
@@ -15168,11 +15161,11 @@ async fn handle_serialized_request_impl(
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Descriptor(login) => login.provider_id.as_str(),
                 };
-                // Descriptor initial-login, refresh, and every owner-directed
-                // write of this record share one fence. Acquire it before the
-                // network exchange as well as the durable flow/credential
-                // transaction, so a replacement or logout acknowledged while
-                // this login is in flight cannot be overwritten afterward.
+                // Descriptor initial login, refresh, and logout share one
+                // fence. Acquire it before the network exchange as well as
+                // the durable flow/credential transaction, so a logout
+                // acknowledged while this login is in flight cannot be
+                // overwritten afterward.
                 let _descriptor_lock = match &ready {
                     ProviderOAuthReady::Descriptor(_) => {
                         Some(crate::auth::descriptor::credential_mutation_lock(provider_id).await)
@@ -15303,6 +15296,10 @@ async fn handle_serialized_request_impl(
                     }
                 };
                 let (provider_id, record, descriptor) = exchange?;
+                let credential_record_id = descriptor.as_ref().map_or_else(
+                    || provider_id.clone(),
+                    |_| crate::auth::descriptor::credential_record_id(&provider_id),
+                );
                 let record = match descriptor {
                     Some(descriptor) => {
                         let store = crate::credentials::CredentialStore::from_vault(
@@ -15353,6 +15350,7 @@ async fn handle_serialized_request_impl(
                 let vault = ctx.secret_vault.clone();
                 let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let provider_id_owned = provider_id.to_owned();
+                let credential_record_id_owned = credential_record_id;
                 let receipt_owner = owner.clone();
                 let receipt_operation_id = client_operation_id.clone();
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
@@ -15395,7 +15393,7 @@ async fn handle_serialized_request_impl(
                             .mutate_item_on_conn(
                                 conn,
                                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                                &provider_id_owned,
+                                &credential_record_id_owned,
                                 Some(&record),
                             )
                             .map_err(|error| anyhow::anyhow!(error))?;
@@ -16780,11 +16778,12 @@ async fn handle_serialized_request_impl(
                     let provider = config.providers.get(&provider_id).ok_or_else(|| {
                         bad_request(format!("provider `{provider_id}` is not configured"))
                     })?;
-                    // Declarative OAuth owns the credential record under the
-                    // configured provider id. Legacy OAuth uses an explicit
-                    // credential reference, so preserve that separate path.
+                    // Declarative OAuth owns a reserved record derived from
+                    // the configured provider id. Legacy OAuth uses an
+                    // explicit credential reference, so preserve that
+                    // separate path.
                     let credential_record_id = if provider.oauth.is_some() {
-                        provider_id.clone()
+                        crate::auth::descriptor::credential_record_id(&provider_id)
                     } else {
                         if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
                             return Err(bad_request(
@@ -19961,6 +19960,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else if serde_json::from_str::<serde_json::Value>(record.as_str()).is_err() {
@@ -19976,6 +19976,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id contains NUL")
             } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+                || crate::auth::descriptor::is_credential_record_id(provider_id)
             {
                 Some("provider id is reserved")
             } else {
@@ -22808,7 +22809,7 @@ mod provider_atomic_authority_tests {
     }
 
     #[test]
-    fn descriptor_owner_credential_writes_share_the_refresh_fence() {
+    fn descriptor_credential_mutations_use_a_private_record_namespace() {
         let source = include_str!("dispatch.rs");
         let completion = source
             .split("Request::CompleteProviderOAuth {")
@@ -22825,21 +22826,19 @@ mod provider_atomic_authority_tests {
             completion_descriptor_lock < claim_exchange,
             "descriptor completion must take the credential fence before its exchange"
         );
+        assert!(
+            completion.contains("credential_record_id(&provider_id)"),
+            "descriptor completion must persist under its private record id"
+        );
 
         let put = source
             .split("Request::PutProviderCredential {")
             .nth(1)
             .and_then(|tail| tail.split("Request::GetLocalOperationSettlement").next())
             .expect("put-provider-credential dispatch arm");
-        let put_descriptor_lock = put
-            .find("credential_mutation_lock(&provider_id)")
-            .expect("put shares the descriptor credential fence");
-        let put_secret_owner_lock = put
-            .find("SECRET_OWNER_RPC_LOCK.lock().await")
-            .expect("put takes the secret-owner lock");
         assert!(
-            put_descriptor_lock < put_secret_owner_lock,
-            "put must take the descriptor fence before the secret-owner lock"
+            !put.contains("credential_mutation_lock(&provider_id)"),
+            "generic provider writes must not reach descriptor-owned records"
         );
 
         let delete = source
@@ -22860,6 +22859,10 @@ mod provider_atomic_authority_tests {
             delete_config_lock < delete_descriptor_lock
                 && delete_descriptor_lock < delete_secret_owner_lock,
             "delete lock order must be config publication, descriptor fence, then secret owner"
+        );
+        assert!(
+            delete.contains("credential_record_id(&provider_id)"),
+            "configured descriptor logout must resolve the private record id"
         );
     }
 

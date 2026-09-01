@@ -3244,6 +3244,7 @@ impl Request {
                     return Err("provider id exceeds maximum length".to_string());
                 }
                 if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id.starts_with(RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX)
                     || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
                 {
                     return Err("provider id namespace is reserved".to_string());
@@ -3357,6 +3358,7 @@ impl Request {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id.starts_with(RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX)
                     || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
                 {
                     return Err("provider id namespace is reserved".to_string());
@@ -5828,7 +5830,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_validation_reserves_flycockpit_provider_credential_key() {
+    fn semantic_validation_reserves_internal_provider_credential_keys() {
         for request in [
             Request::PutProviderCredential {
                 client_operation_id: "reserved-provider-put".into(),
@@ -5838,6 +5840,16 @@ mod tests {
             Request::DeleteProviderCredential {
                 client_operation_id: "reserved-provider-delete".into(),
                 provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
+                project_root: None,
+            },
+            Request::PutProviderCredential {
+                client_operation_id: "reserved-descriptor-put".into(),
+                provider_id: format!("{RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX}custom"),
+                record: "{}".to_string().into(),
+            },
+            Request::DeleteProviderCredential {
+                client_operation_id: "reserved-descriptor-delete".into(),
+                provider_id: format!("{RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX}custom"),
                 project_root: None,
             },
         ] {

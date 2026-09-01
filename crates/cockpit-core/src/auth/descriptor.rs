@@ -30,6 +30,22 @@ const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// their error and token documents comfortably below the RPC payload ceiling.
 const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Reserved vault-record namespace owned exclusively by declarative OAuth.
+///
+/// Provider ids are user-facing configuration names and are also used by
+/// unrelated credential owners. They must never be used as the durable
+/// identity of a descriptor token record.
+pub(crate) const CREDENTIAL_RECORD_PREFIX: &str =
+    cockpit_proto::RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX;
+
+pub(crate) fn credential_record_id(provider_id: &str) -> String {
+    format!("{CREDENTIAL_RECORD_PREFIX}{provider_id}")
+}
+
+pub(crate) fn is_credential_record_id(record_id: &str) -> bool {
+    record_id.starts_with(CREDENTIAL_RECORD_PREFIX)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredCredential {
     configuration_identity: String,
@@ -337,6 +353,7 @@ pub(crate) async fn resolve(
     validate_descriptor(descriptor, descriptor.flow)?;
     let identity = configuration_identity(descriptor)?;
     let refresh_key = format!("oauth:{provider_id}");
+    let credential_record_id = credential_record_id(provider_id);
     crate::auth::refresh_guard::serialized_refresh(&refresh_key, || async move {
         let current = store.reopen()?;
         let cached = load_cached(&current, provider_id, &identity)?
@@ -380,7 +397,7 @@ pub(crate) async fn resolve(
                 if load_cached(&latest, provider_id, &identity)?.is_some_and(|latest| {
                     latest.token.get("refresh_token").and_then(Value::as_str) == Some(refresh_token)
                 }) {
-                    latest.remove_record_merged(provider_id)?;
+                    latest.remove_record_merged(&credential_record_id)?;
                 }
             }
             return Err(error);
@@ -399,7 +416,10 @@ pub(crate) async fn resolve(
             expires_at: token_expiry(&merged),
             token: merged,
         };
-        current.save_record_merged(provider_id, serde_json::json!({ "oauth": refreshed }))?;
+        current.save_record_merged(
+            &credential_record_id,
+            serde_json::json!({ "oauth": refreshed }),
+        )?;
         render_credential(descriptor, refreshed)
     })
     .await
@@ -416,7 +436,7 @@ async fn persist_initial(
     serialized_credential_mutation(&provider_id, || async move {
         let store = store.reopen()?;
         let record = initial_record(&provider_id, &descriptor, &store, token)?;
-        store.save_record_merged(&provider_id, record)
+        store.save_record_merged(&credential_record_id(&provider_id), record)
     })
     .await
 }
@@ -466,7 +486,7 @@ fn load_cached(
     identity: &str,
 ) -> Result<Option<StoredCredential>> {
     store
-        .get(provider_id)
+        .get(&credential_record_id(provider_id))
         .and_then(|record| record.get("oauth"))
         .cloned()
         .map(serde_json::from_value::<StoredCredential>)
@@ -848,7 +868,9 @@ mod tests {
         let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
         let login = begin_device_code_login(&descriptor).await.unwrap();
         assert_eq!(login.user_code, "ABCD");
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         complete_device_code_login_in("custom", &descriptor, login, store.clone())
             .await
             .unwrap();
@@ -861,7 +883,7 @@ mod tests {
         let resolved = crate::providers::models_fetch::resolve_provider_request_async_with_store(
             "custom",
             &entry,
-            store,
+            store.clone(),
             |_| None,
         )
         .await
@@ -878,6 +900,10 @@ mod tests {
                 .headers
                 .iter()
                 .any(|header| header.name == "X-Account" && header.value == "acct-1")
+        );
+        assert_eq!(
+            store.reopen().unwrap().api_key("custom").as_deref(),
+            Some("unrelated-api-key")
         );
         let requests = server.await.unwrap();
         assert!(requests[0].contains("client_id=test-client"));
@@ -897,14 +923,20 @@ mod tests {
             "http://127.0.0.1:8765/callback?code=approved&state={}",
             login.state
         );
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         complete_pkce_browser_login_in("custom", &descriptor, login, &callback, store.clone())
             .await
             .unwrap();
-        let credential = resolve("custom", &descriptor, store, false, None)
+        let credential = resolve("custom", &descriptor, store.clone(), false, None)
             .await
             .unwrap();
         assert_eq!(credential.headers["Authorization"], "Bearer pkce-access");
+        assert_eq!(
+            store.reopen().unwrap().api_key("custom").as_deref(),
+            Some("unrelated-api-key")
+        );
         let requests = server.await.unwrap();
         assert!(requests[0].contains("code=approved"));
         assert!(requests[0].contains("code_verifier="));
@@ -915,7 +947,9 @@ mod tests {
         let (base, server) =
             response_server(vec![r#"{"access_token":"fresh-access","expires_in":3600}"#]).await;
         let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         persist_initial(
             "custom",
             &descriptor,
@@ -931,12 +965,16 @@ mod tests {
         .await
         .unwrap();
 
-        let credential = resolve("custom", &descriptor, store, false, None)
+        let credential = resolve("custom", &descriptor, store.clone(), false, None)
             .await
             .unwrap();
         assert_eq!(credential.headers["Authorization"], "Bearer fresh-access");
         assert_eq!(credential.headers["X-Account"], "preserved-account");
         assert_eq!(credential.refresh_generation, 2);
+        assert_eq!(
+            store.reopen().unwrap().api_key("custom").as_deref(),
+            Some("unrelated-api-key")
+        );
         let requests = server.await.unwrap();
         assert!(requests[0].contains("refresh_token=rotate-me"));
     }
@@ -959,14 +997,22 @@ mod tests {
                 .to_string()
                 .contains("OAuth token response is malformed")
         );
-        assert!(store.reopen().unwrap().get("custom").is_none());
+        assert!(
+            store
+                .reopen()
+                .unwrap()
+                .get(&credential_record_id("custom"))
+                .is_none()
+        );
         assert_eq!(server.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn rendered_invalid_header_fails_closed_before_initial_persistence() {
         let descriptor = descriptor("https://example.test", OAuthFlowKind::DeviceCode);
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         let error = persist_initial(
             "custom",
             &descriptor,
@@ -980,7 +1026,17 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("invalid header"));
-        assert!(store.reopen().unwrap().get("custom").is_none());
+        assert!(
+            store
+                .reopen()
+                .unwrap()
+                .get(&credential_record_id("custom"))
+                .is_none()
+        );
+        assert_eq!(
+            store.reopen().unwrap().api_key("custom").as_deref(),
+            Some("unrelated-api-key")
+        );
     }
 
     #[tokio::test]
@@ -990,7 +1046,9 @@ mod tests {
         ])
         .await;
         let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         persist_initial(
             "custom",
             &descriptor,
@@ -1010,7 +1068,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid header"));
-        let stored = store.reopen().unwrap().get("custom").cloned().unwrap();
+        let stored = store
+            .reopen()
+            .unwrap()
+            .get(&credential_record_id("custom"))
+            .cloned()
+            .unwrap();
         assert_eq!(
             stored["oauth"]["token"]["access_token"],
             serde_json::json!("working-access")
@@ -1022,7 +1085,9 @@ mod tests {
     async fn terminal_refresh_failure_removes_revoked_credential() {
         let base = error_response_server(r#"{"error":"invalid_grant"}"#).await;
         let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
-        let (_temp, store) = store();
+        let (_temp, mut store) = store();
+        store.set_api_key("custom", "unrelated-api-key");
+        store.save().unwrap();
         persist_initial(
             "custom",
             &descriptor,
@@ -1042,6 +1107,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("rejected"));
-        assert!(store.reopen().unwrap().get("custom").is_none());
+        assert!(
+            store
+                .reopen()
+                .unwrap()
+                .get(&credential_record_id("custom"))
+                .is_none()
+        );
+        assert_eq!(
+            store.reopen().unwrap().api_key("custom").as_deref(),
+            Some("unrelated-api-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_records_are_isolated_from_raw_provider_credentials() {
+        let descriptor = descriptor("https://example.test", OAuthFlowKind::DeviceCode);
+        let (_temp, mut store) = store();
+        store.set_api_key("firecrawl", "web-key");
+        store.save().unwrap();
+
+        persist_initial(
+            "firecrawl",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({
+                "access_token": "oauth-access",
+                "account_id": "account"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let reloaded = store.reopen().unwrap();
+        assert_eq!(reloaded.api_key("firecrawl").as_deref(), Some("web-key"));
+        assert!(reloaded.get(&credential_record_id("firecrawl")).is_some());
     }
 }

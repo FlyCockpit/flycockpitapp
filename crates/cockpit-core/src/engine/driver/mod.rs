@@ -15139,7 +15139,19 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent = self.stack.last().expect("stack never empty");
+        let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
+            && self.model_override.as_ref().is_some_and(|override_model| {
+                override_model.provider_id() == parent.agent.model.provider_id()
+                    && override_model.model_id_ref() == parent.agent.model.model_id_ref()
+            });
+        let model_override = if inherited_vnext_root_pin {
+            // A vNext root's reconstructed running model is provenance for
+            // that root only.  Its child must resolve its own prepared slot.
+            // A distinct driver override is explicit host runtime policy and
+            // remains a valid child selection input.
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()
@@ -15211,7 +15223,17 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
-        let model_override = if recursion.same_model_only {
+        let parent = self.stack.last().expect("stack never empty");
+        let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
+            && self.model_override.as_ref().is_some_and(|override_model| {
+                override_model.provider_id() == parent.agent.model.provider_id()
+                    && override_model.model_id_ref() == parent.agent.model.model_id_ref()
+            });
+        let model_override = if inherited_vnext_root_pin {
+            // See `spawn_args_delegated`: suppress only the inherited root
+            // pin, never a distinct host-selected runtime override.
+            None
+        } else if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
             self.model_override.clone()

@@ -1730,6 +1730,7 @@ pub fn provider_entry_for_template(
         credential_ref,
         auth,
         auth_command: None,
+        oauth: None,
         trust: None,
         location: None,
         quality_rank: None,

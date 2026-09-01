@@ -472,6 +472,30 @@ impl CredentialStore {
         entries.into_iter()
     }
 
+    /// Token documents produced by declarative OAuth are authentication
+    /// material regardless of provider-selected field names. Include every
+    /// string leaf in the forced redaction inventory.
+    pub(crate) fn provider_oauth_descriptor_entries(
+        &self,
+    ) -> impl Iterator<Item = (String, String)> {
+        let mut entries = Vec::new();
+        for (provider, record) in &self.records {
+            let Some(token) = record
+                .get("oauth")
+                .and_then(Value::as_object)
+                .and_then(|oauth| oauth.get("token"))
+            else {
+                continue;
+            };
+            collect_all_strings(
+                token,
+                &format!("$credentials:{provider}.oauth.token"),
+                &mut entries,
+            );
+        }
+        entries.into_iter()
+    }
+
     /// Return every string leaf in a provider credential record.
     ///
     /// Provider records are opaque JSON owned by integrations. The narrower

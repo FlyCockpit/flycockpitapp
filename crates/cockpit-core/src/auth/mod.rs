@@ -12,6 +12,7 @@
 pub mod codex_oauth;
 pub(crate) mod command;
 pub mod copilot_setup;
+pub mod descriptor;
 #[cfg(feature = "remote")]
 pub mod flycockpit;
 mod refresh_guard;

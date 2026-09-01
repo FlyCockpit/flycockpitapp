@@ -16813,7 +16813,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
-            if entry.auth_command.is_some()
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
                 && !is_local_owner_action(
                     state,
                     #[cfg(feature = "remote")]
@@ -16821,7 +16821,7 @@ async fn handle_serialized_request_impl(
                 )
             {
                 return Err(bad_request(
-                    "provider auth_command may only be configured by the local host owner",
+                    "provider dynamic authentication may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]
@@ -16859,7 +16859,7 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
-            if entry.auth_command.is_some()
+            if (entry.auth_command.is_some() || entry.oauth.is_some())
                 && !is_local_owner_action(
                     state,
                     #[cfg(feature = "remote")]
@@ -16867,7 +16867,7 @@ async fn handle_serialized_request_impl(
                 )
             {
                 return Err(bad_request(
-                    "provider auth_command may only be configured by the local host owner",
+                    "provider dynamic authentication may only be configured by the local host owner",
                 ));
             }
             #[cfg(feature = "remote")]

@@ -130,7 +130,8 @@ pub fn redact_provider_view(
             .map(|(id, entry)| {
                 let credential_configured = entry.credential_ref.is_some()
                     || !entry.headers.is_empty()
-                    || entry.auth_command.is_some();
+                    || entry.auth_command.is_some()
+                    || entry.oauth.is_some();
                 let headers = entry
                     .headers
                     .iter()

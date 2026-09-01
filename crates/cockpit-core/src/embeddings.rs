@@ -60,11 +60,11 @@ impl CommandRefresh {
             .providers
             .providers
             .get(&self.provider_id)
-            .filter(|entry| entry.auth_command.is_some())
+            .filter(|entry| entry.auth_command.is_some() || entry.oauth.is_some())
             .cloned()
             .with_context(|| {
                 format!(
-                    "provider `{}` no longer has a global auth_command authorized for embedding refresh",
+                    "provider `{}` no longer has global dynamic authentication authorized for embedding refresh",
                     self.provider_id
                 )
             })
@@ -187,7 +187,7 @@ impl OpenAiCompatEmbedder {
                 .with_command_refresh(
                     store
                         .zip(config)
-                        .filter(|_| entry.auth_command.is_some())
+                        .filter(|_| entry.auth_command.is_some() || entry.oauth.is_some())
                         .map(|(store, config)| {
                             Arc::new(CommandRefresh {
                                 provider_id: provider_id.to_string(),

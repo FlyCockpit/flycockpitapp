@@ -1475,14 +1475,14 @@ impl Session {
         let Some(entry) = providers.providers.get(provider_id) else {
             return Ok(false);
         };
-        if entry.auth_command.is_none() {
+        if entry.auth_command.is_none() && entry.oauth.is_none() {
             return Ok(false);
         }
         let rejected_refresh_generation = {
             #[cfg(not(test))]
             {
                 Some(rejected_refresh_generation.context(
-                    "command-authenticated model is missing the credential generation used for its rejection",
+                    "dynamically authenticated model is missing the credential generation used for its rejection",
                 )?)
             }
             #[cfg(test)]
@@ -1491,15 +1491,15 @@ impl Session {
             }
         };
         let store = self.provider_credential_store(providers)?;
-        crate::auth::command::resolve(
+        crate::providers::models_fetch::refresh_provider_request_async_with_store(
             provider_id,
             entry,
             store,
-            &|name| env.get(name).cloned(),
-            true,
+            |name| env.get(name).cloned(),
             rejected_refresh_generation,
         )
         .await
+        .and_then(|request| request.context("dynamic provider authentication was not refreshable"))
         .map_err(crate::auth::command::refresh_failure)?;
         Ok(true)
     }

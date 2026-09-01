@@ -1,0 +1,739 @@
+//! Config-driven OAuth for custom providers.
+//!
+//! The provider descriptor is the authority for endpoints and header mapping;
+//! credential records contain only the resulting token document plus cache
+//! metadata. No provider-supplied code is executed.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use cockpit_config::config::providers::{OAuthDescriptor, OAuthFlowKind};
+use rand::Rng;
+use reqwest::{StatusCode, Url};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
+
+use crate::credentials::CredentialStore;
+
+const REFRESH_SKEW_SECS: i64 = 120;
+const DEFAULT_DEVICE_INTERVAL_SECS: u64 = 5;
+const MIN_DEVICE_INTERVAL_SECS: u64 = 1;
+const MAX_DEVICE_POLL_SECS: u64 = 15 * 60;
+const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredCredential {
+    configuration_identity: String,
+    refresh_generation: u64,
+    token: Map<String, Value>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DescriptorCredential {
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) refresh_generation: u64,
+}
+
+impl std::fmt::Debug for DescriptorCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DescriptorCredential")
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("refresh_generation", &self.refresh_generation)
+            .finish()
+    }
+}
+
+/// Serializable state returned while a device-code authorization is pending.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DeviceCodeLogin {
+    pub verification_uri: String,
+    pub user_code: String,
+    device_code: String,
+    interval_secs: u64,
+    expires_in_secs: u64,
+    configuration_identity: String,
+}
+
+impl std::fmt::Debug for DeviceCodeLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCodeLogin")
+            .field("verification_uri", &self.verification_uri)
+            .field("user_code", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DeviceCodeLogin {
+    fn drop(&mut self) {
+        self.user_code.zeroize();
+        self.device_code.zeroize();
+        self.configuration_identity.zeroize();
+    }
+}
+
+/// Serializable state returned while a PKCE browser authorization is pending.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PkceBrowserLogin {
+    pub authorize_url: String,
+    state: String,
+    verifier: String,
+    configuration_identity: String,
+}
+
+impl std::fmt::Debug for PkceBrowserLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PkceBrowserLogin")
+            .field("authorize_url", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PkceBrowserLogin {
+    fn drop(&mut self) {
+        self.authorize_url.zeroize();
+        self.state.zeroize();
+        self.verifier.zeroize();
+        self.configuration_identity.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    #[serde(default)]
+    verification_uri: Option<String>,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+pub async fn begin_device_code_login(descriptor: &OAuthDescriptor) -> Result<DeviceCodeLogin> {
+    validate_descriptor(descriptor, OAuthFlowKind::DeviceCode)?;
+    let endpoint = descriptor.device_endpoint.as_deref().unwrap();
+    let mut params = vec![("client_id", descriptor.client_id.as_str())];
+    let scopes = descriptor.scopes.join(" ");
+    if !scopes.is_empty() {
+        params.push(("scope", scopes.as_str()));
+    }
+    let response = oauth_client()?
+        .post(endpoint)
+        .form(&params)
+        .send()
+        .await
+        .context("requesting OAuth device code")?
+        .error_for_status()
+        .context("OAuth device-code request failed")?;
+    let parsed: DeviceAuthorizationResponse = response
+        .json()
+        .await
+        .context("OAuth device-code response is malformed")?;
+    ensure_nonempty(&parsed.device_code, "device_code")?;
+    ensure_nonempty(&parsed.user_code, "user_code")?;
+    let verification_uri = parsed
+        .verification_uri_complete
+        .or(parsed.verification_uri)
+        .or_else(|| descriptor.authorize_endpoint.clone())
+        .filter(|value| !value.is_empty())
+        .context("OAuth device-code response is missing verification_uri")?;
+    validate_endpoint(&verification_uri, true)?;
+    Ok(DeviceCodeLogin {
+        verification_uri,
+        user_code: parsed.user_code,
+        device_code: parsed.device_code,
+        interval_secs: parsed
+            .interval
+            .unwrap_or(DEFAULT_DEVICE_INTERVAL_SECS)
+            .max(MIN_DEVICE_INTERVAL_SECS),
+        expires_in_secs: parsed.expires_in.unwrap_or(MAX_DEVICE_POLL_SECS),
+        configuration_identity: configuration_identity(descriptor)?,
+    })
+}
+
+pub async fn complete_device_code_login_in(
+    provider_id: &str,
+    descriptor: &OAuthDescriptor,
+    login: DeviceCodeLogin,
+    store: CredentialStore,
+) -> Result<()> {
+    validate_login_identity(descriptor, &login.configuration_identity)?;
+    let deadline = std::time::Instant::now()
+        + Duration::from_secs(login.expires_in_secs.min(MAX_DEVICE_POLL_SECS));
+    let mut interval = login.interval_secs;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("OAuth device-code login timed out; try again");
+        }
+        let response = token_post(
+            &descriptor.token_endpoint,
+            &[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", login.device_code.as_str()),
+                ("client_id", descriptor.client_id.as_str()),
+            ],
+        )
+        .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            let token = parse_token_response(&body)?;
+            return persist_initial(provider_id, descriptor, store, token);
+        }
+        let error = oauth_error_code(&body);
+        match error.as_deref() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval = interval.saturating_add(5).min(30),
+            _ => return Err(token_endpoint_error(status, &body)),
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+pub fn begin_pkce_browser_login(descriptor: &OAuthDescriptor) -> Result<PkceBrowserLogin> {
+    validate_descriptor(descriptor, OAuthFlowKind::PkceBrowser)?;
+    let verifier = random_urlsafe(32);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let state = random_urlsafe(32);
+    let mut url = Url::parse(descriptor.authorize_endpoint.as_deref().unwrap())
+        .context("OAuth authorize_endpoint is not a URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &descriptor.client_id)
+            .append_pair("redirect_uri", descriptor.redirect_uri.as_deref().unwrap())
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        if !descriptor.scopes.is_empty() {
+            query.append_pair("scope", &descriptor.scopes.join(" "));
+        }
+    }
+    Ok(PkceBrowserLogin {
+        authorize_url: url.to_string(),
+        state,
+        verifier,
+        configuration_identity: configuration_identity(descriptor)?,
+    })
+}
+
+pub async fn complete_pkce_browser_login_in(
+    provider_id: &str,
+    descriptor: &OAuthDescriptor,
+    login: PkceBrowserLogin,
+    callback_or_code: &str,
+    store: CredentialStore,
+) -> Result<()> {
+    validate_login_identity(descriptor, &login.configuration_identity)?;
+    let code = parse_callback(callback_or_code, &login.state)?;
+    let response = token_post(
+        &descriptor.token_endpoint,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", descriptor.client_id.as_str()),
+            ("code", code.as_str()),
+            ("redirect_uri", descriptor.redirect_uri.as_deref().unwrap()),
+            ("code_verifier", login.verifier.as_str()),
+        ],
+    )
+    .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(token_endpoint_error(status, &body));
+    }
+    persist_initial(
+        provider_id,
+        descriptor,
+        store,
+        parse_token_response(&body)?,
+    )
+}
+
+pub(crate) async fn resolve(
+    provider_id: &str,
+    descriptor: &OAuthDescriptor,
+    store: CredentialStore,
+    force_refresh: bool,
+    rejected_refresh_generation: Option<u64>,
+) -> Result<DescriptorCredential> {
+    validate_descriptor(descriptor, descriptor.flow)?;
+    let identity = configuration_identity(descriptor)?;
+    let refresh_key = format!("oauth:{provider_id}");
+    crate::auth::refresh_guard::serialized_refresh(&refresh_key, || async move {
+        let current = store.reopen()?;
+        let cached = load_cached(&current, provider_id, &identity)?
+            .with_context(|| format!("provider `{provider_id}` requires OAuth login"))?;
+        let another_waiter_refreshed = force_refresh
+            && rejected_refresh_generation
+                .is_some_and(|rejected| rejected != cached.refresh_generation);
+        if another_waiter_refreshed || (!force_refresh && !needs_refresh(&cached)) {
+            return render_credential(descriptor, cached);
+        }
+        let refresh_token = cached
+            .token
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("stored OAuth credential cannot refresh: refresh_token is missing")?;
+        let refresh_endpoint = descriptor
+            .refresh_endpoint
+            .as_deref()
+            .unwrap_or(&descriptor.token_endpoint);
+        let response = token_post(
+            refresh_endpoint,
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", descriptor.client_id.as_str()),
+                ("refresh_token", refresh_token),
+            ],
+        )
+        .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(token_endpoint_error(status, &body));
+        }
+        let mut merged = cached.token;
+        merged.extend(parse_token_response(&body)?);
+        validate_token_mapping(descriptor, &merged)?;
+        let refreshed = StoredCredential {
+            configuration_identity: identity,
+            refresh_generation: cached.refresh_generation.saturating_add(1),
+            expires_at: token_expiry(&merged),
+            token: merged,
+        };
+        current.save_record_merged(provider_id, serde_json::json!({ "oauth": refreshed }))?;
+        render_credential(descriptor, refreshed)
+    })
+    .await
+}
+
+fn persist_initial(
+    provider_id: &str,
+    descriptor: &OAuthDescriptor,
+    store: CredentialStore,
+    token: Map<String, Value>,
+) -> Result<()> {
+    validate_token_mapping(descriptor, &token)?;
+    let cached = StoredCredential {
+        configuration_identity: configuration_identity(descriptor)?,
+        refresh_generation: 1,
+        expires_at: token_expiry(&token),
+        token,
+    };
+    store.save_record_merged(provider_id, serde_json::json!({ "oauth": cached }))
+}
+
+fn load_cached(
+    store: &CredentialStore,
+    provider_id: &str,
+    identity: &str,
+) -> Result<Option<StoredCredential>> {
+    store
+        .get(provider_id)
+        .and_then(|record| record.get("oauth"))
+        .cloned()
+        .map(serde_json::from_value::<StoredCredential>)
+        .transpose()
+        .context("stored OAuth credential is malformed")
+        .map(|cached| cached.filter(|cached| cached.configuration_identity == identity))
+}
+
+fn render_credential(
+    descriptor: &OAuthDescriptor,
+    cached: StoredCredential,
+) -> Result<DescriptorCredential> {
+    let mut headers = BTreeMap::new();
+    let mut normalized_names = std::collections::BTreeSet::new();
+    for mapping in &descriptor.headers {
+        let value = render_template(&mapping.value, &cached.token)?;
+        anyhow::ensure!(
+            reqwest::header::HeaderName::from_bytes(mapping.name.as_bytes()).is_ok()
+                && reqwest::header::HeaderValue::from_str(&value).is_ok(),
+            "OAuth header mapping produced an invalid header"
+        );
+        anyhow::ensure!(
+            normalized_names.insert(mapping.name.to_ascii_lowercase()),
+            "OAuth header mapping contains duplicate header names"
+        );
+        headers.insert(mapping.name.clone(), value);
+    }
+    Ok(DescriptorCredential {
+        headers,
+        refresh_generation: cached.refresh_generation,
+    })
+}
+
+fn validate_token_mapping(descriptor: &OAuthDescriptor, token: &Map<String, Value>) -> Result<()> {
+    for header in &descriptor.headers {
+        render_template(&header.value, token)?;
+    }
+    Ok(())
+}
+
+fn render_template(template: &str, token: &Map<String, Value>) -> Result<String> {
+    let mut rendered = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        rendered.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let close = after_open
+            .find('}')
+            .context("OAuth header mapping contains an unclosed placeholder")?;
+        let field = &after_open[..close];
+        anyhow::ensure!(
+            !field.is_empty() && !field.contains('{'),
+            "OAuth header mapping contains an invalid placeholder"
+        );
+        let value = token
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("OAuth token response is missing string field `{field}`"))?;
+        rendered.push_str(value);
+        rest = &after_open[close + 1..];
+    }
+    anyhow::ensure!(
+        !rest.contains('}'),
+        "OAuth header mapping contains an unmatched closing brace"
+    );
+    rendered.push_str(rest);
+    Ok(rendered)
+}
+
+fn validate_descriptor(descriptor: &OAuthDescriptor, expected: OAuthFlowKind) -> Result<()> {
+    descriptor.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(descriptor.flow == expected, "OAuth flow kind does not match operation");
+    validate_endpoint(&descriptor.token_endpoint, false)?;
+    if let Some(endpoint) = descriptor.refresh_endpoint.as_deref() {
+        validate_endpoint(endpoint, false)?;
+    }
+    if let Some(endpoint) = descriptor.device_endpoint.as_deref() {
+        validate_endpoint(endpoint, false)?;
+    }
+    if let Some(endpoint) = descriptor.authorize_endpoint.as_deref() {
+        validate_endpoint(endpoint, true)?;
+    }
+    if let Some(redirect_uri) = descriptor.redirect_uri.as_deref() {
+        validate_endpoint(redirect_uri, true)?;
+    }
+    Ok(())
+}
+
+fn validate_endpoint(endpoint: &str, browser_facing: bool) -> Result<()> {
+    let url = Url::parse(endpoint).context("OAuth endpoint is not a URL")?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    });
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "OAuth endpoints must use HTTPS (HTTP is allowed only on loopback)"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
+        "OAuth endpoint contains forbidden URL components"
+    );
+    if !browser_facing {
+        anyhow::ensure!(url.query().is_none(), "OAuth POST endpoint must not contain a query");
+    }
+    Ok(())
+}
+
+async fn token_post(endpoint: &str, params: &[(&str, &str)]) -> Result<reqwest::Response> {
+    oauth_client()?
+        .post(endpoint)
+        .form(params)
+        .send()
+        .await
+        .with_context(|| format!("POST OAuth token endpoint {endpoint}"))
+}
+
+fn oauth_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(OAUTH_CONNECT_TIMEOUT)
+        .timeout(OAUTH_TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building OAuth HTTP client")
+}
+
+fn parse_token_response(body: &str) -> Result<Map<String, Value>> {
+    let Value::Object(token) = serde_json::from_str(body).context("OAuth token response is malformed")? else {
+        anyhow::bail!("OAuth token response must be a JSON object");
+    };
+    Ok(token)
+}
+
+fn token_expiry(token: &Map<String, Value>) -> Option<i64> {
+    token
+        .get("expires_at")
+        .and_then(Value::as_i64)
+        .or_else(|| token.get("expires_in").and_then(Value::as_i64).map(|ttl| unix_now().saturating_add(ttl)))
+}
+
+fn needs_refresh(cached: &StoredCredential) -> bool {
+    cached
+        .expires_at
+        .is_some_and(|expires_at| expires_at.saturating_sub(unix_now()) <= REFRESH_SKEW_SECS)
+}
+
+fn parse_callback(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if !trimmed.contains('?') && !trimmed.contains('=') {
+        anyhow::ensure!(!trimmed.is_empty(), "OAuth callback is missing `code`");
+        return Ok(trimmed.to_string());
+    }
+    let query = trimmed
+        .split_once('?')
+        .map_or(trimmed, |(_, query)| query)
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    let values: BTreeMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+    anyhow::ensure!(!values.contains_key("error"), "OAuth authorization failed");
+    if let Some(state) = values.get("state") {
+        anyhow::ensure!(state == expected_state, "OAuth state mismatch (possible CSRF)");
+    }
+    values
+        .get("code")
+        .filter(|code| !code.is_empty())
+        .cloned()
+        .context("OAuth callback is missing `code`")
+}
+
+fn configuration_identity(descriptor: &OAuthDescriptor) -> Result<String> {
+    let bytes = serde_json::to_vec(descriptor).context("serializing OAuth descriptor")?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn validate_login_identity(descriptor: &OAuthDescriptor, identity: &str) -> Result<()> {
+    anyhow::ensure!(
+        configuration_identity(descriptor)? == identity,
+        "OAuth provider configuration changed while login was pending"
+    );
+    Ok(())
+}
+
+fn oauth_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_string))
+}
+
+fn token_endpoint_error(status: StatusCode, body: &str) -> anyhow::Error {
+    let code = oauth_error_code(body).unwrap_or_else(|| "unknown_error".to_string());
+    anyhow!("OAuth token endpoint rejected the request ({status}, {code})")
+}
+
+fn ensure_nonempty(value: &str, field: &str) -> Result<()> {
+    anyhow::ensure!(!value.is_empty(), "OAuth response field `{field}` is empty");
+    Ok(())
+}
+
+fn random_urlsafe(bytes: usize) -> String {
+    let mut raw = vec![0_u8; bytes];
+    rand::rng().fill_bytes(&mut raw);
+    URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cockpit_config::config::providers::{OAuthHeaderMapping, ProviderEntry};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn descriptor(base: &str, flow: OAuthFlowKind) -> OAuthDescriptor {
+        OAuthDescriptor {
+            flow,
+            authorize_endpoint: (flow == OAuthFlowKind::PkceBrowser)
+                .then(|| format!("{base}/authorize")),
+            device_endpoint: (flow == OAuthFlowKind::DeviceCode)
+                .then(|| format!("{base}/device")),
+            token_endpoint: format!("{base}/token"),
+            refresh_endpoint: Some(format!("{base}/refresh")),
+            client_id: "test-client".to_string(),
+            scopes: vec!["openid".to_string(), "offline_access".to_string()],
+            redirect_uri: (flow == OAuthFlowKind::PkceBrowser)
+                .then(|| "http://127.0.0.1:8765/callback".to_string()),
+            headers: vec![
+                OAuthHeaderMapping {
+                    name: "Authorization".to_string(),
+                    value: "Bearer {access_token}".to_string(),
+                },
+                OAuthHeaderMapping {
+                    name: "X-Account".to_string(),
+                    value: "{account_id}".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, CredentialStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(temp.path().join("credentials.json")).unwrap();
+        (temp, store)
+    }
+
+    async fn response_server(responses: Vec<&'static str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|value| value.parse::<usize>().ok()))
+                            .unwrap_or(0);
+                        if bytes.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&bytes).into_owned());
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn device_code_happy_path_persists_and_maps_headers() {
+        let (base, server) = response_server(vec![
+            r#"{"device_code":"device","user_code":"ABCD","verification_uri":"https://example.test/verify","interval":1}"#,
+            r#"{"access_token":"device-access","refresh_token":"refresh","expires_in":3600,"account_id":"acct-1"}"#,
+        ])
+        .await;
+        let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
+        let login = begin_device_code_login(&descriptor).await.unwrap();
+        assert_eq!(login.user_code, "ABCD");
+        let (_temp, store) = store();
+        complete_device_code_login_in("custom", &descriptor, login, store.clone())
+            .await
+            .unwrap();
+
+        let entry = ProviderEntry {
+            url: "https://api.example.test/v1".to_string(),
+            oauth: Some(descriptor),
+            ..ProviderEntry::default()
+        };
+        let resolved = crate::providers::models_fetch::resolve_provider_request_async_with_store(
+            "custom",
+            &entry,
+            store,
+            |_| None,
+        )
+        .await
+        .unwrap();
+        assert!(resolved.headers.iter().any(|header| header.name == "Authorization" && header.value == "Bearer device-access"));
+        assert!(resolved.headers.iter().any(|header| header.name == "X-Account" && header.value == "acct-1"));
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("client_id=test-client"));
+        assert!(requests[1].contains("device_code=device"));
+    }
+
+    #[tokio::test]
+    async fn pkce_happy_path_binds_state_and_exchanges_code() {
+        let (base, server) = response_server(vec![
+            r#"{"access_token":"pkce-access","refresh_token":"refresh","expires_in":3600,"account_id":"acct-2"}"#,
+        ])
+        .await;
+        let descriptor = descriptor(&base, OAuthFlowKind::PkceBrowser);
+        let login = begin_pkce_browser_login(&descriptor).unwrap();
+        assert!(login.authorize_url.contains("code_challenge_method=S256"));
+        let callback = format!("http://127.0.0.1:8765/callback?code=approved&state={}", login.state);
+        let (_temp, store) = store();
+        complete_pkce_browser_login_in("custom", &descriptor, login, &callback, store.clone())
+            .await
+            .unwrap();
+        let credential = resolve("custom", &descriptor, store, false, None).await.unwrap();
+        assert_eq!(credential.headers["Authorization"], "Bearer pkce-access");
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("code=approved"));
+        assert!(requests[0].contains("code_verifier="));
+    }
+
+    #[tokio::test]
+    async fn expired_credential_refreshes_and_preserves_omitted_fields() {
+        let (base, server) = response_server(vec![
+            r#"{"access_token":"fresh-access","expires_in":3600}"#,
+        ])
+        .await;
+        let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
+        let (_temp, store) = store();
+        persist_initial(
+            "custom",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({
+                "access_token": "expired-access",
+                "refresh_token": "rotate-me",
+                "expires_in": 0,
+                "account_id": "preserved-account"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let credential = resolve("custom", &descriptor, store, false, None).await.unwrap();
+        assert_eq!(credential.headers["Authorization"], "Bearer fresh-access");
+        assert_eq!(credential.headers["X-Account"], "preserved-account");
+        assert_eq!(credential.refresh_generation, 2);
+        let requests = server.await.unwrap();
+        assert!(requests[0].contains("refresh_token=rotate-me"));
+    }
+
+    #[test]
+    fn malformed_token_response_fails_closed_without_persisting() {
+        let descriptor = descriptor("http://127.0.0.1:1", OAuthFlowKind::DeviceCode);
+        let (_temp, store) = store();
+        let error = persist_initial(
+            "custom",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({ "refresh_token": "only-refresh" })).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing string field `access_token`"));
+        assert!(store.reopen().unwrap().get("custom").is_none());
+    }
+}

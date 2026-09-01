@@ -763,6 +763,12 @@ impl ConfigDoc {
                     "attached workspace config",
                     &mut warnings,
                 );
+                strip_project_oauth_descriptor(
+                    id,
+                    &mut provider,
+                    "attached workspace config",
+                    &mut warnings,
+                );
             }
             providers.insert(id.clone(), Value::Object(provider));
         }
@@ -1692,6 +1698,12 @@ fn merge_provider_files_for_layer(
                         "project provider config",
                         warnings,
                     );
+                    strip_project_oauth_descriptor(
+                        &id,
+                        &mut provider,
+                        "project provider config",
+                        warnings,
+                    );
                 }
                 let url_changed = provider.get("url").is_some_and(|new_url| {
                     merged
@@ -1715,6 +1727,7 @@ fn merge_provider_files_for_layer(
                     provider
                         .entry("auth_command".to_string())
                         .or_insert(Value::Null);
+                    provider.entry("oauth".to_string()).or_insert(Value::Null);
                 }
                 let mut layer = Map::new();
                 let mut providers = Map::new();
@@ -1763,6 +1776,27 @@ fn strip_project_auth_command(
     );
     warnings.push(
         "ignored project-scoped provider auth_command; executable authentication is global-only"
+            .to_string(),
+    );
+    true
+}
+
+fn strip_project_oauth_descriptor(
+    provider_id: &str,
+    provider: &mut Map<String, Value>,
+    source: &'static str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if provider.remove("oauth").is_none() {
+        return false;
+    }
+    tracing::warn!(
+        provider = %provider_id,
+        source,
+        "ignored project-scoped provider OAuth descriptor; token endpoints are global-only"
+    );
+    warnings.push(
+        "ignored project-scoped provider OAuth descriptor; token endpoints are global-only"
             .to_string(),
     );
     true
@@ -1843,7 +1877,7 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
 mod atomic_write_tests {
     use serde_json::{Map, Value};
 
-    use super::strip_project_auth_command;
+    use super::{strip_project_auth_command, strip_project_oauth_descriptor};
 
     #[test]
     fn project_auth_command_is_ignored_and_reported() {
@@ -1877,6 +1911,41 @@ mod atomic_write_tests {
             [
                 "ignored project-scoped provider auth_command; executable authentication is global-only"
             ]
+        );
+    }
+
+    #[test]
+    fn project_oauth_descriptor_is_ignored_and_reported() {
+        let mut provider = Map::from_iter([
+            (
+                "url".into(),
+                Value::String("https://example.test/v1".into()),
+            ),
+            (
+                "oauth".into(),
+                serde_json::json!({
+                    "flow": "device_code",
+                    "device_endpoint": "https://attacker.test/device",
+                    "token_endpoint": "https://attacker.test/token",
+                    "client_id": "client",
+                    "headers": [{"name":"Authorization","value":"Bearer {access_token}"}]
+                }),
+            ),
+        ]);
+
+        let mut warnings = Vec::new();
+        let warned = strip_project_oauth_descriptor(
+            "custom",
+            &mut provider,
+            "test project config",
+            &mut warnings,
+        );
+
+        assert!(warned);
+        assert!(!provider.contains_key("oauth"));
+        assert_eq!(
+            warnings,
+            ["ignored project-scoped provider OAuth descriptor; token endpoints are global-only"]
         );
     }
 

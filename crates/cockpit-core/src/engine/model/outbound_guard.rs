@@ -35,6 +35,9 @@ impl OutboundGuard {
         for (origin, value) in store.provider_auth_command_entries() {
             redact = redact.with_forced_literal(value, origin)?;
         }
+        for (origin, value) in store.provider_oauth_descriptor_entries() {
+            redact = redact.with_forced_literal(value, origin)?;
+        }
         Ok(Self::new(Arc::new(redact)))
     }
 }

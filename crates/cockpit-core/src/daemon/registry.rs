@@ -980,11 +980,11 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
     ) {
         let referenced = crate::secret_ref::provider_named_secret_references(providers_cfg);
-        let has_auth_commands = providers_cfg
+        let has_dynamic_auth = providers_cfg
             .providers
             .values()
-            .any(|entry| entry.auth_command.is_some());
-        if referenced.is_empty() && !has_auth_commands {
+            .any(|entry| entry.auth_command.is_some() || entry.oauth.is_some());
+        if referenced.is_empty() && !has_dynamic_auth {
             return;
         }
         let store = match session.provider_credential_store(providers_cfg) {

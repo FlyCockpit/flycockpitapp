@@ -231,8 +231,10 @@ pub fn is_logged_in() -> bool {
 
 pub fn is_logged_in_in(store: &CredentialStore) -> bool {
     store
-        .get(CREDENTIAL_KEY)
-        .and_then(|raw| serde_json::from_value::<StoredTokens>(raw.clone()).ok())
+        .get_owned(CREDENTIAL_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_value::<StoredTokens>(raw).ok())
         .is_some()
 }
 

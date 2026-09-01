@@ -55,13 +55,13 @@ async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_fail
     }
 }
 
-/// Workspace-authored v2 coding definition used by positive on-disk fixtures.
+/// Workspace-authored launch-v1 coding definition used by positive on-disk fixtures.
 /// Tool authority deliberately stays out of these documents; tests that need a
 /// constrained host surface write a `.tools.json` sidecar (see
 /// [`write_host_tool_surface`]) instead of reviving `tools:`.
 fn vnext_coding_agent_document(agent_id: &str, description: &str, body: &str) -> String {
     format!(
-        "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/{agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{agent_id}\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
     )
 }
 
@@ -4056,7 +4056,7 @@ fn dmh_build_child(
 
 /// A host-selected target model is runtime policy, not authored markdown.
 /// Keep the custody test's selection axis explicit by constructing the
-/// otherwise-v2 built-in definition at the trusted host boundary.
+/// otherwise-launch-v1 built-in definition at the trusted host boundary.
 fn dmh_build_host_selected_child(
     driver: &Driver,
     child_agent: &str,
@@ -4298,7 +4298,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         std::fs::create_dir_all(&agents_dir).unwrap();
                         std::fs::write(
                             agents_dir.join("explore.md"),
-                            "---\ndescription: probe\nschemaVersion: 2\nagentId: cockpit/explore\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nInvestigate read-only.\n",
+                            "---\ndescription: probe\nschemaVersion: 1\nagentId: cockpit/explore\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nInvestigate read-only.\n",
                         )
                         .unwrap();
                         driver.refresh_config_from_disk_for_tests();
@@ -4306,7 +4306,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         // the child model inherits it by trust class.
                         dmh_inject_session_secret(&mut driver);
                         // The target model is host-selected runtime policy.  Do
-                        // not put a selector back into v2 markdown: the
+                        // not put a selector back into launch-v1 markdown: the
                         // driver's model override is propagated into the child
                         // SpawnArgs and preserves the provider's trusted-vs-
                         // untrusted custody classification. Carry the session

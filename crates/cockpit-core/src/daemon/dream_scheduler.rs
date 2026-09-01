@@ -20,7 +20,7 @@ use crate::config::providers::ActiveModelRef;
 use crate::daemon::config_source::ConfigSource;
 use crate::daemon::proto::{EnvSnapshotSource, QueueDeliveryClass};
 use crate::daemon::registry::SessionRegistry;
-use crate::daemon::session_worker::{SessionWork, TurnOutcome};
+use crate::daemon::session_worker::{CancelOrigin, SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::env_snapshot::EnvSnapshot;
@@ -592,7 +592,9 @@ async fn await_dream_turn_terminal(
             .context("observing Dream turn terminal outcome"),
         Err(_) => {
             handle
-                .send_work(SessionWork::Cancel)
+                .send_work(SessionWork::Cancel {
+                    origin: CancelOrigin::Noninteractive,
+                })
                 .await
                 .context("cancelling timed-out Dream turn")?;
             match tokio::time::timeout(DREAM_CANCEL_SETTLE_TIMEOUT, handle.watch_turn(turn_id))
@@ -1201,7 +1203,12 @@ mod tests {
         });
 
         tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(matches!(work_rx.recv().await, Some(SessionWork::Cancel)));
+        assert!(matches!(
+            work_rx.recv().await,
+            Some(SessionWork::Cancel {
+                origin: CancelOrigin::Noninteractive
+            })
+        ));
         handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
             session_id: handle.session_id,
             turn_id: Some("turn-1".to_string()),
@@ -1246,7 +1253,12 @@ mod tests {
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(matches!(work_rx.recv().await, Some(SessionWork::Cancel)));
+        assert!(matches!(
+            work_rx.recv().await,
+            Some(SessionWork::Cancel {
+                origin: CancelOrigin::Noninteractive
+            })
+        ));
         tokio::time::advance(DREAM_CANCEL_SETTLE_TIMEOUT).await;
         tokio::task::yield_now().await;
         tokio::time::advance(crate::daemon::registry::DESTRUCTIVE_STOP_TIMEOUT).await;

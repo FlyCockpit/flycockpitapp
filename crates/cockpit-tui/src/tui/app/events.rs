@@ -85,6 +85,45 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
     Some(first)
 }
 
+/// Remove the exact durable user row named by a retract event, together with
+/// its adjacent tag-expansion presentation rows.
+pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(
+    history: &mut H,
+    seq: i64,
+) -> Option<String> {
+    let Some(index) = history.entries().iter().position(
+        |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
+    ) else {
+        return None;
+    };
+    let text = match history.entries().get(index) {
+        Some(HistoryEntry::User { text, .. }) => text.clone(),
+        _ => return None,
+    };
+    while history
+        .entries()
+        .get(index + 1)
+        .is_some_and(is_optimistic_tag_expansion)
+    {
+        history.remove_entry(index + 1);
+    }
+    history.remove_entry(index);
+    // Auto-selected skill chips are inserted immediately before the user row
+    // they decorate. They are presentation for this prompt, so retaining them
+    // would make cancel + resend differ from a single send.
+    let mut preceding = index;
+    while preceding > 0
+        && matches!(
+            history.entries().get(preceding - 1),
+            Some(HistoryEntry::SkillAutoInjected { .. })
+        )
+    {
+        preceding -= 1;
+        history.remove_entry(preceding);
+    }
+    Some(text)
+}
+
 /// Merge a daemon replay into an already-rendered live transcript. Durable
 /// receipt ids replace matching optimistic rows in place instead of appending
 /// a second copy after reconnect or lag resync. A multi-id folded row replaces
@@ -92,7 +131,12 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
 pub(super) fn reconcile_history_replay<H: FoldedUserHistory>(
     history: &mut H,
     wire: Vec<cockpit_proto::HistoryEntry>,
-) {
+    removed_user_message_seqs: Vec<i64>,
+) -> Vec<(i64, String)> {
+    let removed_rows = removed_user_message_seqs
+        .into_iter()
+        .filter_map(|seq| remove_durable_user_history(history, seq).map(|text| (seq, text)))
+        .collect();
     let replayed_ids = wire
         .iter()
         .flat_map(|entry| match entry {
@@ -111,6 +155,7 @@ pub(super) fn reconcile_history_replay<H: FoldedUserHistory>(
             entry,
         );
     }
+    removed_rows
 }
 
 pub(super) fn reconcile_folded_user_history<H: FoldedUserHistory>(
@@ -699,8 +744,22 @@ impl App {
             TurnEvent::ResumeRepairRequired { state } => {
                 self.maybe_prompt_resume_repair(state);
             }
-            TurnEvent::HistoryReplay { entries } => {
-                reconcile_history_replay(&mut self.history, entries);
+            TurnEvent::HistoryReplay {
+                entries,
+                removed_user_message_seqs,
+            } => {
+                for (seq, text) in
+                    reconcile_history_replay(&mut self.history, entries, removed_user_message_seqs)
+                {
+                    if self.local_user_submission_ids_by_seq.remove(&seq).is_some() {
+                        let draft = self.composer.text().to_owned();
+                        if draft.is_empty() {
+                            self.replace_composer_buffer(text);
+                        } else {
+                            self.replace_composer_buffer(format!("{text}\n\n{draft}"));
+                        }
+                    }
+                }
             }
             TurnEvent::QueueUpdated { queue } => {
                 self.reconcile_queue_update(queue);
@@ -1187,6 +1246,7 @@ impl App {
                 // (implementation note), also record the cleaned
                 // body so the row renders the cleaned text + `⚙ preflighted`
                 // chip while the reveal shows the original typed input.
+                let mut local_submission_id = None;
                 for entry in self.history.iter_mut().rev() {
                     if let HistoryEntry::User {
                         seq: s @ None,
@@ -1200,6 +1260,7 @@ impl App {
                         && optimistic_submission_id
                             .is_some_and(|id| client_submission_ids.contains(&id))
                     {
+                        local_submission_id = *optimistic_submission_id;
                         *s = Some(seq);
                         if preflight_cleaned.is_some() {
                             *cleaned = preflight_cleaned;
@@ -1214,6 +1275,40 @@ impl App {
                         *persist_failed = false;
                         *optimistic_submission_id = None;
                         break;
+                    }
+                }
+                if let Some(client_submission_id) = local_submission_id {
+                    self.local_user_submission_ids_by_seq
+                        .entry(seq)
+                        .or_default()
+                        .insert(client_submission_id);
+                }
+            }
+            TurnEvent::UserMessageRemoved {
+                seq,
+                client_submission_ids,
+            } => {
+                let restore_composer = self
+                    .local_user_submission_ids_by_seq
+                    .remove(&seq)
+                    .is_some_and(|local_ids| {
+                        client_submission_ids
+                            .iter()
+                            .any(|id| local_ids.contains(id))
+                    });
+                let restored_text = remove_durable_user_history(&mut self.history, seq);
+                // Reasoning is provisional and has no durable value in this
+                // cancel window. Drop it instead of finalizing a thinking chip
+                // when the following AgentIdle arrives.
+                self.pending = None;
+                self.active_display_attempt_id = None;
+                self.reconnect = None;
+                if restore_composer && let Some(text) = restored_text {
+                    let draft = self.composer.text().to_owned();
+                    if draft.is_empty() {
+                        self.replace_composer_buffer(text);
+                    } else {
+                        self.replace_composer_buffer(format!("{text}\n\n{draft}"));
                     }
                 }
             }
@@ -1906,6 +2001,8 @@ impl App {
                 }
                 self.apply_idle_reason_status(reason);
                 self.reconnect = None;
+                // A completed/failed turn can no longer retract its user row.
+                self.local_user_submission_ids_by_seq.clear();
                 self.finalize_pending();
                 // AgentIdle is turn-boundary chrome, not a stack unwind.
                 // Foreground enqueue/path follow `ForegroundInputTarget`
@@ -4328,6 +4425,76 @@ mod tests {
         };
         assert_eq!(calls[0].state, ToolCallState::Success);
         assert!(calls[0].progress.is_none());
+    }
+
+    #[test]
+    fn initial_thinking_retract_removes_row_merges_draft_and_drops_reasoning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let client_submission_id = uuid::Uuid::new_v4();
+        app.history.push(HistoryEntry::User {
+            text: "cancel me".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(41),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.local_user_submission_ids_by_seq
+            .insert(41, [client_submission_id].into_iter().collect());
+        app.apply_event(TurnEvent::AssistantDisplayReasoningDelta {
+            agent: "Build".to_string(),
+            attempt_id: cockpit_client::presentation::AssistantAttemptId::new(9),
+            delta: "private thought".to_string(),
+        });
+        app.replace_composer_buffer("new draft");
+
+        app.apply_event(TurnEvent::UserMessageRemoved {
+            seq: 41,
+            client_submission_ids: vec![client_submission_id],
+        });
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: cockpit_proto::IdleReason::Interrupted,
+        });
+
+        assert!(
+            !app.history
+                .iter()
+                .any(|entry| matches!(entry, HistoryEntry::User { seq: Some(41), .. }))
+        );
+        assert_eq!(app.composer.text(), "cancel me\n\nnew draft");
+        assert!(app.pending.is_none());
+        assert!(!app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Agent { reasoning, .. } if reasoning.contains("private thought"))
+        ));
+    }
+
+    #[test]
+    fn remote_retract_removes_the_shared_row_without_restoring_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.history.push(HistoryEntry::User {
+            text: "other client message".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(42),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.replace_composer_buffer("my draft");
+
+        app.apply_event(TurnEvent::UserMessageRemoved {
+            seq: 42,
+            client_submission_ids: vec![uuid::Uuid::new_v4()],
+        });
+
+        assert!(app.history.is_empty());
+        assert_eq!(app.composer.text(), "my draft");
     }
 
     #[test]

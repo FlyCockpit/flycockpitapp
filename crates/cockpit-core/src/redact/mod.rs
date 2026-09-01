@@ -437,10 +437,13 @@ const DISABLE_MARKER: &str = "COCKPIT_DISABLE_REDACT";
 /// uppercase hex, and percent/URL encoding (see [`encoded_secret_variants`]).
 const MAX_FORCED_SECRET_VARIANTS: usize = 4;
 
-/// Hard lower bound for every redaction pattern. Values below this length can
-/// corrupt unrelated output (for example, a timeout rendered as `120s`) and are
-/// therefore never safe to register, regardless of their source.
-const MIN_REDACTION_ENTRY_LENGTH: usize = 4;
+/// Hard lower bound for every redaction pattern, shared with report-leak
+/// admission. Values below this length can corrupt unrelated output (for
+/// example, a timeout rendered as `120s`) and are therefore never safe to
+/// register, regardless of their source. A literal below this
+/// size cannot be installed safely, so it must never be acknowledged as
+/// contained by a path that promises live redaction.
+pub(crate) const MIN_REDACTION_ENTRY_LENGTH: usize = 4;
 
 /// PEM private-key opening headers. A file under the SSH dir is treated as a
 /// private key — and its content registered as a forced secret — iff its
@@ -1074,6 +1077,8 @@ impl RedactionTable {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<Vec<_>>();
         entries.extend(store.provider_credential_entries());
+        entries.extend(store.provider_auth_command_entries());
+        entries.extend(store.provider_oauth_descriptor_entries());
         Self::build_with_env_and_secrets(cfg, cwd, env, entries)
     }
 

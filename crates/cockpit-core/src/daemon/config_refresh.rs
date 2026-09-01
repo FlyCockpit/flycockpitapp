@@ -2,7 +2,9 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 
 use crate::daemon::config_source::ConfigSource;
-use crate::daemon::session_worker::{SessionConfigSnapshot, SessionWork, SessionWorkerHandle};
+use crate::daemon::session_worker::{
+    CancelOrigin, SessionConfigSnapshot, SessionWork, SessionWorkerHandle,
+};
 use crate::db::Db;
 
 const CONFIG_REFRESH_FAILURE_PREFIX: &str = "Config refresh failed; keeping the last good snapshot";
@@ -30,7 +32,13 @@ async fn stop_exact_worker_after_replacement_timeout(handle: &SessionWorkerHandl
     // never re-enumerate the registry after a timeout, where a successor may
     // already own the reusable session id.
     let deadline = tokio::time::Instant::now() + CONFIG_REPLACEMENT_DEADLINE;
-    let _ = tokio::time::timeout_at(deadline, handle.send_work(SessionWork::Cancel)).await;
+    let _ = tokio::time::timeout_at(
+        deadline,
+        handle.send_work(SessionWork::Cancel {
+            origin: CancelOrigin::Noninteractive,
+        }),
+    )
+    .await;
     let _ = tokio::time::timeout_at(
         deadline,
         handle.send_work(SessionWork::Shutdown {

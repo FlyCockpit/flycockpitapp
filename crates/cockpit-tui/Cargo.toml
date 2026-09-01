@@ -17,6 +17,7 @@ default = []
 extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-core/extended", "cockpit-proto/extended"]
 remote = ["cockpit-client/remote", "cockpit-core/remote", "cockpit-proto/remote"]
 test-support = ["cockpit-core/test-support"]
+grok-subscription = ["cockpit-core/grok-subscription"]
 
 [[test]]
 name = "response_performance_e2e"

@@ -1413,9 +1413,13 @@ mod safety_gate_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(ToolOutput {
                 content: crate::engine::tool::CanonicalToolResultContents::text("done"),
+                display_content: None,
                 repeat_guard: None,
                 truncated: false,
                 text_artifact_capture: None,
+                text_artifact_model_ephemeral: false,
+                text_artifact_captures: Vec::new(),
+                notices: Vec::new(),
                 recovery: None,
                 canonical_args: None,
                 sandbox: None,

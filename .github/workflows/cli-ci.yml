@@ -131,7 +131,7 @@ jobs:
           cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
-        run: cargo nextest run --locked --workspace --exclude tenant-authority
+        run: cargo nextest run --locked --workspace --exclude tenant-authority --no-default-features
 
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
@@ -150,11 +150,11 @@ jobs:
 
       - name: Clippy
         if: contains(matrix.os, 'windows') == false
-        run: cargo clippy --locked --workspace --exclude tenant-authority --tests -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --no-default-features -- -D warnings
 
       - name: Clippy Windows target
         if: contains(matrix.os, 'windows')
-        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --target x86_64-pc-windows-msvc -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --no-default-features --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Clippy examples
         if: contains(matrix.os, 'windows') == false
@@ -166,6 +166,45 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  grok-subscription:
+    name: SuperGrok subscription feature
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-subscription
+          workspaces: . -> target
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # Keep the retained implementation compiling and lint-clean even though
+      # official release artifacts leave this feature disabled.
+      - name: Build with SuperGrok subscription support
+        run: cargo build --locked -p cockpit-cli --features grok-subscription
+
+      - name: Test with SuperGrok subscription support
+        run: >
+          cargo nextest run --locked
+          -p cockpit-core -p cockpit-tui -p cockpit-cli
+          --features grok-subscription
+
+      - name: Clippy with SuperGrok subscription support
+        run: >
+          cargo clippy --locked
+          -p cockpit-core -p cockpit-tui -p cockpit-cli
+          --features grok-subscription --tests -- -D warnings
 
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)

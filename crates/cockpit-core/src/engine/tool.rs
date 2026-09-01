@@ -40,8 +40,8 @@ pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 ///   their own model-history insertion boundaries in `agent::turn_phases`;
 /// - structured built-in and native/custom results are projected at the same
 ///   boundary and the projected canonical result is the restart authority;
-/// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
-///   participate in this host-owned marker contract;
+/// - external MCP schemas/results remain unchanged, while Monty's host-owned
+///   `show` lane is carried by `ToolOutput` display metadata marked below;
 /// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
 ///   exclusions are expressed by `ToolOutput::result_metadata_schema` below.
 ///
@@ -663,7 +663,8 @@ mod model_ephemeral_tests {
             "sandbox": { "enabled": true },
             "resource": { "cpu": 1 },
             "exit_code": 1,
-            "output_sidecar": { "stdout": "full" }
+            "output_sidecar": { "stdout": "full" },
+            "display": "timeline only"
         });
         assert_eq!(
             strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
@@ -1104,6 +1105,11 @@ pub trait Tool: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: CanonicalToolResultContents,
+    /// Optional display-only text for the durable timeline and live UI. The
+    /// model projection remains [`Self::content`]; this field is governed by
+    /// [`MODEL_EPHEMERAL_SCHEMA_KEY`] in [`Self::result_metadata_schema`], so
+    /// replay cannot accidentally promote it into model history.
+    pub display_content: Option<String>,
     /// Optional short-circuit guidance for an immediately repeated call with
     /// the same final semantic input. A tool sets this when its *result* was a
     /// recoverable dead-end the model should not repeat verbatim. The
@@ -1117,6 +1123,17 @@ pub struct ToolOutput {
     /// the dispatcher turns it into an immutable text artifact together with
     /// the owning event.
     pub text_artifact_capture: Option<TextArtifactCapture>,
+    /// Whether `text_artifact_capture` belongs only to the display projection.
+    /// Such an artifact is retained with the durable event but must never
+    /// replace the model result in live or rehydrated history.
+    pub text_artifact_model_ephemeral: bool,
+    /// Additional lane-tagged captures. This preserves the legacy singular
+    /// capture API while allowing an envelope-producing tool to retain every
+    /// independently spilled lane in the same owning event.
+    pub text_artifact_captures: Vec<ToolTextArtifactCapture>,
+    /// Host-owned human-only notices. The dispatcher publishes these only
+    /// after the same result-injection recheck that governs the tool result.
+    pub notices: Vec<String>,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -1344,6 +1361,30 @@ pub struct TextArtifactCapture {
     pub stored_source_bytes: usize,
 }
 
+/// The projection lane that owns a retained tool body. Only model-lane
+/// artifacts may replace a tool result in model history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArtifactLane {
+    Model,
+    Display,
+    Attachment,
+}
+
+impl ToolArtifactLane {
+    pub const fn is_model_ephemeral(self) -> bool {
+        !matches!(self, Self::Model)
+    }
+}
+
+/// A retained tool body together with its projection lane. `explicit` means
+/// the tool requested retention even below the context spill threshold.
+#[derive(Debug, Clone)]
+pub struct ToolTextArtifactCapture {
+    pub lane: ToolArtifactLane,
+    pub capture: TextArtifactCapture,
+    pub explicit: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutputSidecar {
     pub payload: serde_json::Value,
@@ -1503,7 +1544,8 @@ impl ToolOutput {
                 "sandbox": { "x-cockpit-model-ephemeral": true },
                 "resource": { "x-cockpit-model-ephemeral": true },
                 "exit_code": { "x-cockpit-model-ephemeral": true },
-                "output_sidecar": { "x-cockpit-model-ephemeral": true }
+                "output_sidecar": { "x-cockpit-model-ephemeral": true },
+                "display": { "x-cockpit-model-ephemeral": true }
             }
         })
     }
@@ -1532,15 +1574,22 @@ impl ToolOutput {
         if let Some(sidecar) = &self.output_sidecar {
             metadata.insert("output_sidecar".to_string(), sidecar.payload.clone());
         }
+        if let Some(display) = &self.display_content {
+            metadata.insert("display".to_string(), Value::String(display.clone()));
+        }
         metadata
     }
 
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1554,9 +1603,13 @@ impl ToolOutput {
     pub fn truncated_text(content: impl Into<String>) -> Self {
         Self {
             content: CanonicalToolResultContents::text(content),
+            display_content: None,
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1584,6 +1637,41 @@ impl ToolOutput {
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
         self.text_artifact_capture = Some(capture);
+        self
+    }
+
+    pub fn with_model_ephemeral_text_artifact_capture(
+        mut self,
+        capture: TextArtifactCapture,
+    ) -> Self {
+        self.text_artifact_capture = Some(capture);
+        self.text_artifact_model_ephemeral = true;
+        self
+    }
+
+    pub fn with_text_artifact_lane(
+        mut self,
+        lane: ToolArtifactLane,
+        capture: TextArtifactCapture,
+        explicit: bool,
+    ) -> Self {
+        self.text_artifact_captures.push(ToolTextArtifactCapture {
+            lane,
+            capture,
+            explicit,
+        });
+        self
+    }
+
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
+        self
+    }
+
+    /// Supply the timeline/UI projection while retaining `content` as the
+    /// only model-facing result.
+    pub fn with_model_ephemeral_display(mut self, display: impl Into<String>) -> Self {
+        self.display_content = Some(display.into());
         self
     }
 
@@ -2204,6 +2292,7 @@ enum DirectNativeMediaUnavailable {
     AuthorityUnavailable,
     Availability(crate::tool_media_authority::MediaToolAvailabilityReason),
     TranscriptionDispatchUnavailable,
+    TranscriptionAuthenticationFailed,
 }
 
 impl DirectNativeMediaUnavailable {
@@ -2233,6 +2322,9 @@ impl DirectNativeMediaUnavailable {
             Self::TranscriptionDispatchUnavailable => {
                 "no authorized transcription dispatch is available for this session and current model"
             }
+            Self::TranscriptionAuthenticationFailed => {
+                "provider authentication failed while preparing transcription"
+            }
         }
     }
 }
@@ -2244,27 +2336,7 @@ struct McpBuiltinToolEntry {
 }
 
 pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
-    if crate::tool_media_authority::is_media_tool_name(name) {
-        return false;
-    }
-    !matches!(
-        name,
-        "question"
-            | "return"
-            | "schedule"
-            | "task"
-            | "spawn"
-            | "defer_to_orchestrator"
-            | "raise"
-            | "start_build"
-            | "mcp"
-            | "read_image"
-            | "inspect_audio"
-            | "inspect_video"
-            | "extract_video_clip"
-            | "extract_audio"
-            | "transcribe_audio"
-    )
+    crate::agents::is_monty_builtin_adaptable(name)
 }
 
 impl ToolBox {
@@ -2362,6 +2434,15 @@ impl ToolBox {
         self.deactivate_direct_native_media(
             "transcribe_audio",
             DirectNativeMediaUnavailable::TranscriptionDispatchUnavailable,
+        )
+    }
+
+    /// Keep transcription's stable schema while surfacing a failed provider
+    /// auth command as authentication failure at the model-visible call site.
+    pub(crate) fn deactivate_direct_native_media_for_transcription_authentication(self) -> Self {
+        self.deactivate_direct_native_media(
+            "transcribe_audio",
+            DirectNativeMediaUnavailable::TranscriptionAuthenticationFailed,
         )
     }
 
@@ -2465,8 +2546,48 @@ impl ToolBox {
                 },
             );
         }
-        self.definition_cache.lock().unwrap().clear();
+        // Discoverable tools are runtime-only Monty catalog entries. They do
+        // not enter `tools`, so neither the native function schema nor its
+        // rendered-definition cache changes.
         self
+    }
+
+    /// Retain rendered native-schema entries in a rebuilt toolbox only when
+    /// their freshly rendered definitions are identical to the previous ones.
+    ///
+    /// A tool-surface refresh reconstructs the Monty catalog as well as the
+    /// direct-native tools. Discoverable catalog changes must not invalidate a
+    /// matching native schema, but matching names alone is insufficient: tool
+    /// implementations, description overrides, and capability projection can
+    /// all change a same-named definition. Rendering the rebuilt toolbox before
+    /// comparison also gives it independent cache ownership, so a still-live
+    /// previous toolbox cannot populate its cache after the rebuild.
+    pub(crate) fn preserve_definition_cache_if_native_schema_matches(
+        &mut self,
+        previous: &Self,
+    ) -> bool {
+        let previous_entries = previous.definition_cache.lock().unwrap().clone();
+        self.definition_cache.lock().unwrap().clear();
+        previous_entries
+            .iter()
+            .all(|(steering, previous_definitions)| {
+                self.definitions(*steering) == *previous_definitions
+            })
+    }
+
+    /// Whether the provider-visible native schema is unchanged for the
+    /// steering used by an active agent. Discoverable MCP tools are absent
+    /// from this projection, so their catalog-only transitions compare equal.
+    ///
+    /// This is intentionally separate from `definition_cache`: an empty
+    /// rendered-definition cache must not make a native-schema transition look
+    /// cache-neutral.
+    pub(crate) fn native_schema_matches(
+        &self,
+        previous: &Self,
+        steering: crate::agents::ToolSteering,
+    ) -> bool {
+        self.advertised_definitions(steering) == previous.advertised_definitions(steering)
     }
 
     pub fn mcp_builtin_registry(&self) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
@@ -2780,34 +2901,13 @@ mod capability_tests {
     /// (undeclared) set enables none of the four capabilities.
     #[test]
     fn declared_grants_control_capabilities() {
-        use crate::agents::{AgentCapability, AgentDef};
+        use crate::agents::AgentCapability;
         let mut grants = BTreeSet::new();
         grants.insert(AgentCapability::ForkContext);
         // A def that declares forkContext: the grant is on; undeclared
         // capabilities stay off.
-        let mut def = AgentDef {
-            name: "test".into(),
-            description: "d".into(),
-            mode: crate::agents::AgentMode::Primary,
-            model: None,
-            temperature: None,
-            tools: None,
-            tool_tiers: std::collections::BTreeMap::new(),
-            tool_descriptions: std::collections::BTreeMap::new(),
-            scan_tool_results: None,
-            goal_supervision: crate::agents::GoalSettingsOverride::default(),
-            permission: None,
-            capabilities: Some(grants.clone()),
-            tool_steering: None,
-            context_policy: None,
-            vnext: None,
-            prompt: String::new(),
-            prompt_overrides: std::collections::BTreeMap::new(),
-            package_files: None,
-            mcp_bindings: Vec::new(),
-            private_subagents: std::collections::BTreeMap::new(),
-            source: std::path::PathBuf::new(),
-        };
+        let mut def = crate::agents::embedded_default("Build").unwrap();
+        def.vnext.as_mut().unwrap().capabilities = grants.clone();
         let posture = PostureResolution::from_def(&def);
         assert!(
             Capability::ForkContext.enabled(&posture),
@@ -2819,7 +2919,7 @@ mod capability_tests {
         );
 
         // Empty grant set disables everything.
-        def.capabilities = Some(BTreeSet::new());
+        def.vnext.as_mut().unwrap().capabilities.clear();
         let posture_empty = PostureResolution::from_def(&def);
         assert!(!Capability::ForkContext.enabled(&posture_empty));
         assert!(!Capability::FollowupSeed.enabled(&posture_empty));
@@ -2828,7 +2928,7 @@ mod capability_tests {
         // seam consults the same posture).
         let mut escalate_grants = BTreeSet::new();
         escalate_grants.insert(AgentCapability::SandboxEscalate);
-        def.capabilities = Some(escalate_grants);
+        def.vnext.as_mut().unwrap().capabilities = escalate_grants;
         let posture_escalate = PostureResolution::from_def(&def);
         assert!(Capability::SandboxEscalate.enabled(&posture_escalate));
         assert!(!Capability::FollowupSeed.enabled(&posture_escalate));
@@ -3106,13 +3206,15 @@ mod definition_cache_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingTool {
+        name: &'static str,
         calls: Arc<AtomicUsize>,
+        parameters: Value,
     }
 
     #[async_trait]
     impl Tool for CountingTool {
         fn name(&self) -> &str {
-            "counting"
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -3121,7 +3223,7 @@ mod definition_cache_tests {
 
         fn parameters(&self) -> Value {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            json!({ "type": "object", "properties": {} })
+            self.parameters.clone()
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -3133,7 +3235,9 @@ mod definition_cache_tests {
     fn definitions_build_schema_once_per_steering() {
         let calls = Arc::new(AtomicUsize::new(0));
         let toolbox = ToolBox::new().with(Arc::new(CountingTool {
+            name: "counting",
             calls: calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
         }));
 
         let first = toolbox.definitions(crate::agents::ToolSteering::Terse);
@@ -3144,6 +3248,136 @@ mod definition_cache_tests {
         // A different steering is a different cache key → rebuild.
         let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn discoverable_catalog_change_preserves_native_schema_cache() {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let discoverable_calls = Arc::new(AtomicUsize::new(0));
+        let native = Arc::new(CountingTool {
+            name: "native_counting",
+            calls: native_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let discoverable = Arc::new(CountingTool {
+            name: "discoverable_counting",
+            calls: discoverable_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let previous = ToolBox::new().with(native.clone());
+        let previous_definitions = previous.definitions(crate::agents::ToolSteering::Terse);
+        let provider_schema = serde_json::to_vec(
+            &previous.advertised_definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+
+        let mut rebuilt = ToolBox::new()
+            .with(native)
+            .with_discoverable_mcp(discoverable);
+        assert!(rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        assert_eq!(
+            serde_json::to_vec(&rebuilt.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
+            serde_json::to_vec(&previous_definitions).unwrap(),
+            "Discoverable tools must not change the cached native schema"
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &rebuilt.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            provider_schema,
+            "Discoverable tools must not change the provider cache key's tool schema"
+        );
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(
+            native_calls.load(Ordering::SeqCst),
+            4,
+            "the rebuilt toolbox must cache its own verified native schema"
+        );
+        let _ = previous.definitions(crate::agents::ToolSteering::Verbose);
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Verbose);
+        assert_eq!(
+            native_calls.load(Ordering::SeqCst),
+            6,
+            "rebuilt caches must not alias a still-live previous toolbox"
+        );
+        assert_eq!(
+            discoverable_calls.load(Ordering::SeqCst),
+            0,
+            "discoverable tools must not be assembled into the native schema"
+        );
+    }
+
+    #[test]
+    fn enabled_membership_change_does_not_preserve_native_schema_cache() {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let added_calls = Arc::new(AtomicUsize::new(0));
+        let native = Arc::new(CountingTool {
+            name: "native_counting",
+            calls: native_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let added = Arc::new(CountingTool {
+            name: "added_counting",
+            calls: added_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let previous = ToolBox::new().with(native.clone());
+        let provider_schema = serde_json::to_vec(
+            &previous.advertised_definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+        let _ = previous.definitions(crate::agents::ToolSteering::Terse);
+
+        let mut rebuilt = ToolBox::new().with(native).with(added);
+        assert!(!rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        assert_ne!(
+            serde_json::to_vec(
+                &rebuilt.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            provider_schema,
+            "an Enabled membership change must change the provider schema"
+        );
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(added_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn same_named_schema_change_does_not_preserve_definition_cache() {
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let rebuilt_calls = Arc::new(AtomicUsize::new(0));
+        let previous = ToolBox::new().with(Arc::new(CountingTool {
+            name: "task",
+            calls: previous_calls.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "old_target": { "type": "string" } }
+            }),
+        }));
+        let previous_definitions = previous.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+
+        let mut rebuilt = ToolBox::new().with(Arc::new(CountingTool {
+            name: "task",
+            calls: rebuilt_calls.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "new_target": { "type": "string" } }
+            }),
+        }));
+        assert!(!rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        let rebuilt_definitions = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(rebuilt_calls.load(Ordering::SeqCst), 1);
+        assert_ne!(rebuilt_definitions, previous_definitions);
+        assert!(
+            rebuilt_definitions[0].parameters["properties"]
+                .get("new_target")
+                .is_some(),
+            "the rebuilt schema must come from the current same-named tool implementation"
+        );
     }
 
     struct DormantMediaTool(&'static str);

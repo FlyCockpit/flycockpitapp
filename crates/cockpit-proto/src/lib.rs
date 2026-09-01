@@ -51,8 +51,8 @@ pub use acp::{
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
-    AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
-    AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
+    AgentInstallationOperationKind, AgentInstallationReadV1, AgentInstallationReceiptStatusV1,
+    AgentInstallationRecordV1, AgentInstallationResultV1, AgentInstallationRoleV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
@@ -407,6 +407,10 @@ pub struct ProviderConfigView {
     pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    /// Stable, secret-free warnings raised while loading provider layers.
+    /// Clients display these rather than relying on daemon tracing output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration_warnings: Vec<String>,
     /// Optional daemon-redacted MCP layer projection. The string is JSON so
     /// the MCP config crate remains a client/core implementation detail; it
     /// contains no header/env literals or credential values.
@@ -1345,6 +1349,10 @@ pub const MAX_OWNER_SECRET_VALUE_BYTES: usize = 256 * 1024;
 pub const MAX_OWNER_PROVIDER_ID_BYTES: usize = 256;
 pub const MAX_OWNER_PROVIDER_RECORD_BYTES: usize = 512 * 1024;
 pub const RESERVED_OWNER_PROVIDER_ID_PREFIX: &str = "subscription-oauth-ack:";
+/// Reserved for daemon-owned declarative OAuth token records. Generic provider
+/// credential mutations receive user-facing provider ids and must not reach
+/// this private record namespace.
+pub const RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX: &str = "descriptor-oauth:";
 /// Inventory item ids include the reserved subscription-ack prefix. Keep the
 /// cursor decoder large enough for the longest valid id in any inventory kind.
 pub const MAX_OWNER_INVENTORY_ITEM_ID_BYTES: usize =
@@ -7715,7 +7723,7 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 lease_id: Uuid::nil().to_string(),
                 markdown: Some(SensitiveWirePayload::new(
-                    "---\nschemaVersion: 2\n---\nBe helpful.\n".into(),
+                    "---\nschemaVersion: 1\n---\nBe helpful.\n".into(),
                 )),
             },
             Request::GetAgentEditorLeaseSettlement {

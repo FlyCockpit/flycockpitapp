@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 
-use crate::cli::{ProviderAddArgs, ProviderLogoutArgs, ProvidersCommand, ProvidersUsageArgs};
+use crate::cli::{
+    ProviderAddArgs, ProviderLoginArgs, ProviderLogoutArgs, ProvidersCommand, ProvidersUsageArgs,
+};
 #[cfg(test)]
 use crate::config::providers::{AuthKind, ProviderEntry, ProvidersConfig};
 #[cfg(test)]
@@ -10,16 +12,22 @@ use crate::daemon::proto::{ProviderUsageAvailabilityView, Request, Response};
 #[cfg(test)]
 use std::path::Path;
 
+// Descriptor device-code grants can remain pending for fifteen minutes. Leave
+// a small bounded margin for the last token response and durable commit.
+pub(crate) const OAUTH_COMPLETION_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(16 * 60);
+
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
         ProvidersCommand::List => {
             println!("Built-in provider templates (configure with `cockpit provider add`):");
             for t in crate::providers::TEMPLATES {
-                println!("  {} — {}", t.id, t.display);
+                println!("  {} — {}", t.id, t.display_label());
             }
             Ok(())
         }
         ProvidersCommand::Add(args) => add(args).await,
+        ProvidersCommand::Login(args) => login(args).await,
         ProvidersCommand::Logout(args) => logout(args).await,
         ProvidersCommand::Usage(args) => usage(args).await,
     }
@@ -27,6 +35,88 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
 
 async fn add(args: ProviderAddArgs) -> Result<()> {
     crate::commands::setup::run_provider_add(args.template).await
+}
+
+async fn login(args: ProviderLoginArgs) -> Result<()> {
+    if args.provider == crate::auth::codex_oauth::CREDENTIAL_KEY || {
+        #[cfg(feature = "grok-subscription")]
+        {
+            args.provider == crate::auth::xai_oauth::CREDENTIAL_KEY
+        }
+        #[cfg(not(feature = "grok-subscription"))]
+        {
+            false
+        }
+    } {
+        bail!(
+            "built-in subscription OAuth uses `cockpit setup`; `cockpit provider login` is for configured OAuth descriptors"
+        );
+    }
+    let daemon = ensure_persistent_daemon()
+        .await
+        .map_err(|error| anyhow!("starting persistent daemon for provider login: {error}"))?;
+    let started = daemon
+        .client
+        .request(Request::BeginProviderOAuth {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            provider_id: args.provider.clone(),
+        })
+        .await
+        .map_err(|error| anyhow!("provider OAuth begin RPC failed: {error}"))?
+        .map_err(|error| anyhow!("daemon rejected provider OAuth login: {error}"))?;
+    let Response::ProviderOAuthStarted {
+        flow_id,
+        authorize_url,
+        user_code,
+        ..
+    } = started
+    else {
+        bail!("daemon returned unexpected response to provider OAuth begin: {started:?}");
+    };
+    println!("Open this URL and approve access:\n{authorize_url}");
+    let device_code_flow = user_code.is_some();
+    if let Some(user_code) = user_code {
+        println!("Enter code: {user_code}");
+    }
+    if !crate::sysinfo::is_ssh() {
+        let _ = crate::browser::open(&authorize_url);
+    }
+    let input = if device_code_flow {
+        None
+    } else {
+        use std::io::Write as _;
+        print!("Paste the callback URL or code: ");
+        std::io::stdout().flush()?;
+        let mut callback = String::new();
+        std::io::stdin().read_line(&mut callback)?;
+        Some(cockpit_proto::SensitiveWirePayload::new(
+            callback.trim().to_owned(),
+        ))
+    };
+    let completed = daemon
+        .client
+        .request_with_timeout(
+            Request::CompleteProviderOAuth {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                flow_id,
+                input,
+            },
+            OAUTH_COMPLETION_REQUEST_TIMEOUT,
+        )
+        .await
+        .map_err(|error| anyhow!("provider OAuth completion RPC failed: {error}"))?
+        .map_err(|error| anyhow!("daemon rejected provider OAuth completion: {error}"))?;
+    if !matches!(
+        completed,
+        Response::ProviderOAuthCompleted {
+            logged_in: true,
+            ..
+        }
+    ) {
+        bail!("daemon returned unexpected response to provider OAuth completion: {completed:?}");
+    }
+    println!("signed in `{}`", args.provider);
+    Ok(())
 }
 
 async fn logout(args: ProviderLogoutArgs) -> Result<()> {
@@ -116,6 +206,7 @@ pub(crate) fn logout_configured_provider(
     let credential_ref = oauth_credential_ref(provider_id, entry)?;
     let was_present = credential_record_exists(credential_ref, store_path)?;
     match credential_ref {
+        #[cfg(feature = "grok-subscription")]
         crate::auth::xai_oauth::CREDENTIAL_KEY => match store_path {
             Some(path) => crate::auth::xai_oauth::logout_at(Some(path))?,
             None => {
@@ -304,6 +395,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[test]
     fn provider_logout_preserves_unrelated_credentials() {
         let tmp = tempfile::tempdir().unwrap();

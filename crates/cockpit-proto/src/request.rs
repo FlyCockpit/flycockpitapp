@@ -383,6 +383,36 @@ fn validate_credential_free_provider_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Declarative usage probes reuse a provider's resolved headers, so their
+/// endpoints must not carry a second credential channel. Root-relative paths
+/// are resolved at runtime against the configured provider origin.
+fn validate_credential_free_usage_probe_endpoint(endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    let parsed = if endpoint.starts_with('/') {
+        if endpoint.starts_with("//") {
+            return Err(
+                "usage probe endpoint path must not replace the provider origin".to_string(),
+            );
+        }
+        url::Url::parse("https://usage-probe.invalid")
+            .and_then(|origin| origin.join(endpoint))
+            .map_err(|_| "usage probe endpoint path is invalid".to_string())?
+    } else {
+        url::Url::parse(endpoint)
+            .map_err(|_| "usage probe endpoint must be an absolute URL or root path".to_string())?
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("usage probe endpoint must use HTTP or HTTPS".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("usage probe endpoint must not include credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("usage probe endpoint must not include a query string or fragment".to_string());
+    }
+    Ok(())
+}
+
 fn deserialize_owner_optional_model_id<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -1662,8 +1692,11 @@ pub enum Request {
         override_json: String,
         #[serde(default = "default_true")]
         persist_session: bool,
-        #[serde(default)]
-        prune_after_switch: bool,
+        /// Confirms that the caller warned the user that a native-schema
+        /// change breaks the provider prompt cache. The daemon independently
+        /// detects that change and always invalidates cached context; this is
+        /// an acknowledgement gate, never a caller-controlled prune switch.
+        cache_break_acknowledged: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         monty_nudge: Option<String>,
     },
@@ -2103,7 +2136,6 @@ pub enum Request {
     /// Apply the security or model setup wizard through the daemon owner.
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
-    #[cfg(feature = "remote")]
     ApplySetupWizard {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -3290,6 +3322,7 @@ impl Request {
                     return Err("provider id exceeds maximum length".to_string());
                 }
                 if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id.starts_with(RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX)
                     || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
                 {
                     return Err("provider id namespace is reserved".to_string());
@@ -3309,9 +3342,6 @@ impl Request {
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
-                if !matches!(provider_id.as_str(), "grok-oauth" | "codex-oauth") {
-                    return Err("provider OAuth is only available for Grok or Codex".to_string());
-                }
             }
             Self::CompleteProviderOAuth {
                 client_operation_id,
@@ -3406,6 +3436,7 @@ impl Request {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id.starts_with(RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX)
                     || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
                 {
                     return Err("provider id namespace is reserved".to_string());
@@ -3429,6 +3460,9 @@ impl Request {
                     return Err("provider entry exceeds maximum length".to_string());
                 }
                 validate_credential_free_provider_url(&entry.url)?;
+                if let Some(probe) = &entry.usage_probe {
+                    validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                }
                 cockpit_config::config::providers::validate_provider_headers(
                     provider_id,
                     &entry.headers,
@@ -3489,6 +3523,9 @@ impl Request {
                     return Err("provider entry exceeds maximum length".to_string());
                 }
                 validate_credential_free_provider_url(&entry.url)?;
+                if let Some(probe) = &entry.usage_probe {
+                    validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                }
                 for value in header_secrets.iter().flatten() {
                     if value.is_empty() || value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
                         return Err("provider header secret exceeds maximum length".to_string());
@@ -3509,7 +3546,6 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
-            #[cfg(feature = "remote")]
             Self::ApplySetupWizard {
                 project_root,
                 wizard_id,
@@ -4175,6 +4211,9 @@ impl Request {
                         return Err("provider entry exceeds maximum length".into());
                     }
                     validate_credential_free_provider_url(&upsert.entry.url)?;
+                    if let Some(probe) = &upsert.entry.usage_probe {
+                        validate_credential_free_usage_probe_endpoint(&probe.endpoint)?;
+                    }
                     cockpit_config::config::providers::validate_provider_headers(
                         &upsert.provider_id,
                         &upsert.entry.headers,
@@ -4477,7 +4516,6 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { .. }, "save_provider_config");
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
-            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
             (Request::GetAgentInventory { .. }, "get_agent_inventory");
@@ -4770,7 +4808,7 @@ macro_rules! command {
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, local_only, none, serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
             (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>", [selection_id: Uuid => param, provider: String => provider_model_left(model), model: String => provider_model_right(provider), persist_as_default: bool => param, trigger: ActiveModelSwitchTrigger => param, reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param]);
             (Request::SetAgent { name }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String", [name: String => param]);
-            (Request::SetToolSurfaceOverride { override_json, persist_session, prune_after_switch, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, prune_after_switch: bool => param, monty_nudge: Option<String> => param]);
+            (Request::SetToolSurfaceOverride { override_json, persist_session, cache_break_acknowledged, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:String|persist_session:bool|cache_break_acknowledged:bool|monty_nudge:Option<String>", [override_json: String => param, persist_session: bool => param, cache_break_acknowledged: bool => param, monty_nudge: Option<String> => param]);
             (Request::SetGoalSettingsOverride { override_json, persist_session }, "set_goal_settings_override", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "override_json:Option<String>|persist_session:bool", [override_json: Option<String> => param, persist_session: bool => param]);
             (Request::SetApprovalMode { mode }, "set_approval_mode", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "mode:ApprovalMode", [mode: ApprovalMode => param]);
             (Request::SetDelegationRecursion { enabled, default_depth }, "set_delegation_recursion", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "enabled:bool|default_depth:u32", [enabled: bool => param, default_depth: u32 => param]);
@@ -4823,7 +4861,6 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
-            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
@@ -5425,6 +5462,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_oauth_begin_accepts_a_configured_provider_id() {
+        Request::BeginProviderOAuth {
+            client_operation_id: "provider-oauth-begin".into(),
+            provider_id: "custom-device-oauth".into(),
+        }
+        .validate_semantics()
+        .expect("configured provider OAuth ids must reach daemon descriptor validation");
+    }
+
+    #[test]
     fn agent_interrupt_response_rejects_the_same_empty_shapes_as_typescript() {
         for response in [
             AgentInterruptResponse::Multi {
@@ -5869,7 +5916,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_validation_reserves_flycockpit_provider_credential_key() {
+    fn semantic_validation_reserves_internal_provider_credential_keys() {
         for request in [
             Request::PutProviderCredential {
                 client_operation_id: "reserved-provider-put".into(),
@@ -5879,6 +5926,16 @@ mod tests {
             Request::DeleteProviderCredential {
                 client_operation_id: "reserved-provider-delete".into(),
                 provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
+                project_root: None,
+            },
+            Request::PutProviderCredential {
+                client_operation_id: "reserved-descriptor-put".into(),
+                provider_id: format!("{RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX}custom"),
+                record: "{}".to_string().into(),
+            },
+            Request::DeleteProviderCredential {
+                client_operation_id: "reserved-descriptor-delete".into(),
+                provider_id: format!("{RESERVED_DESCRIPTOR_OAUTH_PROVIDER_ID_PREFIX}custom"),
                 project_root: None,
             },
         ] {
@@ -6465,6 +6522,32 @@ mod tests {
         let error = request.validate_semantics().unwrap_err();
         assert!(error.contains("query string"));
         assert!(!error.contains("secret"));
+
+        for endpoint in [
+            "https://user:secret@usage.example.test/",
+            "https://usage.example.test/?key=secret",
+            "/usage?key=secret",
+        ] {
+            let request = Request::UpsertProviderConfig {
+                project_root: "/repo".into(),
+                provider_id: "custom".into(),
+                entry: cockpit_config::config::providers::ProviderEntry {
+                    url: "https://api.example.test/v1".into(),
+                    usage_probe: Some(cockpit_config::config::providers::UsageProbeSpec {
+                        endpoint: endpoint.into(),
+                        method: cockpit_config::config::providers::UsageProbeMethod::Get,
+                        fields: Vec::new().into(),
+                    }),
+                    ..Default::default()
+                },
+            };
+            let error = request.validate_semantics().unwrap_err();
+            assert!(
+                error.contains("credentials") || error.contains("query string"),
+                "{error}"
+            );
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 
     #[cfg(not(feature = "remote"))]
@@ -6475,7 +6558,6 @@ mod tests {
             "save_provider_config",
             "delete_provider_config",
             "set_provider_layer_metadata",
-            "apply_setup_wizard",
         ] {
             let wire = serde_json::json!({ "request": tag, "params": {} });
             assert!(

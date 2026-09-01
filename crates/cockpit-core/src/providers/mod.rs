@@ -21,9 +21,13 @@ pub mod usage;
 
 pub use registry::ProviderRegistry;
 
+use std::borrow::Cow;
 use std::env;
 
-use crate::config::providers::{AuthKind, HeaderSpec, ThinkingMode, WireApi};
+use crate::config::providers::{
+    AuthKind, HeaderSpec, ThinkingMode, UsageProbeField, UsageProbeFieldKind, UsageProbeMethod,
+    UsageProbeSpec, WireApi,
+};
 use serde_json::{Value, json};
 
 /// One picker entry in the Add Provider wizard.
@@ -61,8 +65,69 @@ pub struct ProviderTemplate {
     pub default_wire_api: WireApi,
     /// API-key entry metadata for the key-first setup wizard.
     pub api_key: Option<ApiKeyTemplate>,
+    /// Optional declarative usage endpoint inherited by entries that use this
+    /// template unless their config declares an override.
+    pub usage_probe: Option<&'static UsageProbeSpec>,
     /// User-visible setup/doctor credential check for this template.
     pub auth_check: AuthCheckKind,
+}
+
+static CROFAI_USAGE_PROBE: UsageProbeSpec = UsageProbeSpec {
+    endpoint: Cow::Borrowed("/usage_api/"),
+    method: UsageProbeMethod::Get,
+    fields: Cow::Borrowed(&[
+        UsageProbeField {
+            pointer: Cow::Borrowed("/credits"),
+            label: Cow::Borrowed("credits"),
+            kind: UsageProbeFieldKind::Credits,
+        },
+        UsageProbeField {
+            pointer: Cow::Borrowed("/usable_requests"),
+            label: Cow::Borrowed("requests left today"),
+            kind: UsageProbeFieldKind::RequestsRemaining,
+        },
+    ]),
+};
+
+impl ProviderTemplate {
+    /// Display label after applying feature-dependent availability state.
+    pub fn display_label(&self) -> Cow<'static, str> {
+        if self.is_disabled() {
+            Cow::Owned(format!(
+                "{} — disabled pending xAI authorization",
+                self.display
+            ))
+        } else {
+            Cow::Borrowed(self.display)
+        }
+    }
+
+    /// Whether this template is visible for discoverability but unavailable in
+    /// the current binary. Disabled templates cannot be materialized by the
+    /// wizard; callers should render [`Self::disabled_reason`] as muted help.
+    pub fn is_disabled(&self) -> bool {
+        self.id == "grok-oauth" && !cfg!(feature = "grok-subscription")
+    }
+
+    /// User-facing reason and custom-provider escape hatch for a disabled
+    /// built-in template.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        self.is_disabled().then_some(
+            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
+        )
+    }
+
+    /// Feature-aware picker help. An enabled login must not retain the
+    /// disabled/pending-authorization warning.
+    pub fn display_hint(&self) -> Option<&'static str> {
+        if self.id == "grok-oauth" && !self.is_disabled() {
+            Some(
+                "Standalone SuperGrok browser login at accounts.x.ai; no XAI_API_KEY required. X Premium+ does not include xAI API access; HTTP 403/tier denial means use Grok (xAI API).",
+            )
+        } else {
+            self.hint
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,13 +175,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generic OpenAI-compatible endpoint. You can add as many of these as you want; each one needs a unique id.",
         ),
         use_id_as_default: false,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "OpenAI-compatible API key",
             console_url: "https://platform.openai.com/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -132,13 +198,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate a key at https://platform.openai.com/api-keys. GPT-5-family models use the Responses API.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Responses,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "starts with sk-",
             console_url: "https://platform.openai.com/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -156,6 +223,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
         api_key: None,
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -178,6 +246,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             format_hint: "starts with xai- or a provider-issued xAI key",
             console_url: "https://console.x.ai/team/default/api-keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -190,11 +259,35 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_headers: &[],
         supports_models_endpoint: true,
         hint: Some(
-            "Standalone SuperGrok browser login at accounts.x.ai; no XAI_API_KEY required. X Premium+ does not include xAI API access; HTTP 403/tier denial means use Grok (xAI API).",
+            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
         api_key: None,
+        usage_probe: None,
+        auth_check: AuthCheckKind::ModelsEndpoint,
+    },
+    ProviderTemplate {
+        id: "crofai",
+        display: "CrofAI",
+        url: "https://crof.ai/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("CROF_API_KEY"),
+        env_var_candidates: &["CROF_API_KEY", "CROFAI_API_KEY"],
+        default_headers: &[("Authorization", "Bearer $CROF_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some(
+            "OpenAI Chat Completions and Responses on /v1 with reasoning_effort. Anthropic host: https://anthropic.nahcrof.com. Generate a key at https://crof.ai/settings.",
+        ),
+        use_id_as_default: true,
+        default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "CrofAI API key",
+            console_url: "https://crof.ai/settings",
+        }),
+        usage_probe: Some(&CROFAI_USAGE_PROBE),
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -208,13 +301,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: false,
         hint: Some("Generate a key at https://z.ai/manage-apikey/apikey-list"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "Z.AI API key or JWT token",
             console_url: "https://z.ai/manage-apikey/apikey-list",
         }),
+        usage_probe: None,
         // Z.AI documents API-key auth via `Authorization: Bearer` and
         // `POST /chat/completions` as the authenticated HTTP API path:
         // https://docs.z.ai/api-reference/llm/chat-completion
@@ -237,13 +331,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate a key at https://portal.nousresearch.com/api-docs. Chat Completions only; no published /models endpoint.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "Nous Research API key",
             console_url: "https://portal.nousresearch.com/api-docs",
         }),
+        usage_probe: None,
         // Official OpenAPI (2026-08-05) exposes POST /chat/completions only:
         // https://portal.nousresearch.com/api/openapi
         auth_check: AuthCheckKind::ChatCompletions {
@@ -265,13 +360,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "Baseten API key",
             console_url: "https://app.baseten.co/settings/api_keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -285,13 +381,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://platform.minimaxi.com/"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "MiniMax API key",
             console_url: "https://platform.minimaxi.com/",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -309,13 +406,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a token at https://opencode.ai/zen"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "OpenCode Zen token",
             console_url: "https://opencode.ai/zen",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -331,13 +429,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Auth uses GitHub's documented tokens. Set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN to a GitHub OAuth/App/fine-grained token with Copilot access (a token from the `copilot` CLI works). COPILOT_API_URL overrides the base URL.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "GitHub token with Copilot access",
             console_url: "https://github.com/settings/tokens",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -351,13 +450,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://openrouter.ai/keys"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "starts with sk-or-",
             console_url: "https://openrouter.ai/keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -371,13 +471,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://platform.deepseek.com/api_keys"),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "starts with sk-",
             console_url: "https://platform.deepseek.com/api_keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -396,13 +497,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Generate an API key at https://console.anthropic.com/settings/keys. Browser subscription login is not available for this provider.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Anthropic,
         api_key: Some(ApiKeyTemplate {
             header_name: "x-api-key",
             value_template: "{key}",
             format_hint: "starts with sk-ant-",
             console_url: "https://console.anthropic.com/settings/keys",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
     ProviderTemplate {
@@ -423,13 +525,14 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             "Xiaomi MiMo open platform. Generate a key at https://api.xiaomimimo.com/. Flagship is MiMo-V2.5-Pro (1M context); MiMo-V2-Flash is the cheap-fast tier.",
         ),
         use_id_as_default: true,
-        default_wire_api: WireApi::Auto,
+        default_wire_api: WireApi::Completions,
         api_key: Some(ApiKeyTemplate {
             header_name: "Authorization",
             value_template: "Bearer {key}",
             format_hint: "Xiaomi MiMo API key",
             console_url: "https://api.xiaomimimo.com/",
         }),
+        usage_probe: None,
         auth_check: AuthCheckKind::ModelsEndpoint,
     },
 ];
@@ -585,7 +688,7 @@ mod tests {
         assert!(t.default_headers.iter().all(|(n, _)| {
             !n.eq_ignore_ascii_case("x402") && !n.to_ascii_lowercase().contains("payment")
         }));
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.supports_models_endpoint);
         // No built-in thinking params for nous-research (reasoning is model config).
         assert!(builtin_thinking_params("nous-research", ThinkingMode::High).is_none());
@@ -612,7 +715,7 @@ mod tests {
             );
         }
         assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.url.contains("embeddings"));
         assert!(!t.url.contains("audio"));
         assert!(!t.url.contains("images"));
@@ -662,7 +765,7 @@ mod tests {
             t.default_headers,
             &[("Authorization", "Bearer $BASETEN_API_KEY")]
         );
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(t.supports_models_endpoint);
         assert!(t.use_id_as_default);
         assert_eq!(
@@ -695,7 +798,7 @@ mod tests {
             t.default_headers,
             &[("Authorization", "Bearer $NOUS_API_KEY")]
         );
-        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert_eq!(t.default_wire_api, WireApi::Completions);
         assert!(!t.supports_models_endpoint);
         assert!(t.use_id_as_default);
         let api_key = t.api_key.expect("api key metadata");
@@ -727,6 +830,14 @@ mod tests {
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
+            if !t.default_wire_api.is_auto() {
+                assert_eq!(
+                    t.default_wire_api,
+                    crate::config::providers::default_wire_api_for_template(Some(t.id)),
+                    "template {} and config resolution must agree",
+                    t.id
+                );
+            }
         }
     }
 
@@ -776,6 +887,7 @@ mod tests {
         assert!(template_by_id("codex-oauth").is_some());
         assert!(template_by_id("grok").is_some());
         assert!(template_by_id("grok-oauth").is_some());
+        assert!(template_by_id("crofai").is_some());
         assert!(template_by_id("z-ai").is_some());
         assert!(template_by_id("nous-research").is_some());
         assert!(template_by_id("baseten").is_some());
@@ -815,7 +927,7 @@ mod tests {
             openai.default_headers,
             &[("Authorization", "Bearer $OPENAI_API_KEY")]
         );
-        assert_eq!(openai.default_wire_api, WireApi::Auto);
+        assert_eq!(openai.default_wire_api, WireApi::Responses);
 
         let codex = template_by_id("codex-oauth").expect("codex-oauth template");
         assert_eq!(codex.url, "https://chatgpt.com/backend-api/codex");
@@ -847,6 +959,143 @@ mod tests {
         assert!(oauth.default_headers.is_empty());
         assert!(oauth.env_var_candidates.is_empty());
         assert_eq!(oauth.default_wire_api, WireApi::Responses);
+        #[cfg(not(feature = "grok-subscription"))]
+        assert_eq!(
+            oauth.disabled_reason(),
+            Some(
+                "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead."
+            )
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn official_build_keeps_grok_oauth_visible_but_disabled() {
+        let template = template_by_id("grok-oauth").expect("grok-oauth template");
+        assert!(template.is_disabled());
+        assert!(template.disabled_reason().is_some());
+        assert_eq!(
+            template.display_label(),
+            "Grok (SuperGrok) — disabled pending xAI authorization"
+        );
+
+        let entry = crate::config::providers::ProviderEntry {
+            url: template.url.to_string(),
+            auth: Some(AuthKind::OAuth),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-oauth", &entry),
+            "grok-oauth-unavailable"
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn hand_written_grok_oauth_shapes_fail_closed_before_request_resolution() {
+        for (provider_id, entry) in [
+            (
+                "grok-oauth",
+                crate::config::providers::ProviderEntry {
+                    url: "https://example.test/v1".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom",
+                crate::config::providers::ProviderEntry {
+                    url: "https://api.x.ai/v1".into(),
+                    auth: Some(AuthKind::OAuth),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom",
+                crate::config::providers::ProviderEntry {
+                    url: "https://example.test/v1".into(),
+                    credential_ref: Some("grok-oauth".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = crate::providers::models_fetch::resolve_provider_request_with_env(
+                provider_id,
+                &entry,
+                |_| None,
+            )
+            .expect_err("disabled Grok OAuth identity must not reach generic inference");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unavailable in this official build")
+            );
+        }
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn custom_grok_auth_command_stays_on_the_generic_provider_path() {
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://api.x.ai/v1".to_string(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["/Users/you/bin/grok-subscription-token".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-subscription", &entry),
+            "template"
+        );
+    }
+
+    #[cfg(feature = "grok-subscription")]
+    #[test]
+    fn grok_subscription_feature_restores_the_builtin_provider() {
+        let template = template_by_id("grok-oauth").expect("grok-oauth template");
+        assert!(!template.is_disabled());
+
+        let entry = crate::config::providers::ProviderEntry {
+            url: template.url.to_string(),
+            auth: Some(AuthKind::OAuth),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-oauth", &entry),
+            "grok-oauth"
+        );
+        let materialized = crate::wizard::provider_entry_for_template(
+            template,
+            template.url.to_string(),
+            Vec::new(),
+        );
+        assert_eq!(materialized.credential_ref.as_deref(), Some("grok-oauth"));
+        assert!(
+            !template
+                .display_hint()
+                .expect("enabled Grok hint")
+                .contains("pending xAI authorization")
+        );
+    }
+
+    #[test]
+    fn crofai_template_is_configured_for_openai_apis_and_usage() {
+        let crofai = template_by_id("crofai").expect("CrofAI template");
+        assert_eq!(crofai.display, "CrofAI");
+        assert_eq!(crofai.url, "https://crof.ai/v1");
+        assert_eq!(crofai.auth, AuthKind::ApiKey);
+        assert_eq!(crofai.default_env_var, Some("CROF_API_KEY"));
+        assert_eq!(
+            crofai.env_var_candidates,
+            &["CROF_API_KEY", "CROFAI_API_KEY"]
+        );
+        assert_eq!(
+            crofai.default_headers,
+            &[("Authorization", "Bearer $CROF_API_KEY")]
+        );
+        assert!(crofai.supports_models_endpoint);
+        assert_eq!(crofai.default_wire_api, WireApi::Auto);
+        let probe = crofai.usage_probe.expect("CrofAI usage probe");
+        assert_eq!(probe.endpoint, "/usage_api/");
+        assert_eq!(probe.fields.len(), 2);
     }
 
     #[test]

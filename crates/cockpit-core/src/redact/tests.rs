@@ -2560,6 +2560,7 @@ async fn untrusted_embedding_chokepoint_stays_generic_with_live_grant() {
         ResolvedRequest {
             base_url: provider.base_url(),
             headers: vec![],
+            is_codex_credential: false,
         },
         "text-embedding-3-small".into(),
         None,

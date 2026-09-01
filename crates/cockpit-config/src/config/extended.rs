@@ -2062,6 +2062,8 @@ fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedCon
 #[derive(Debug)]
 pub struct DaemonExtendedConfigLoad {
     pub providers: crate::config::providers::ProvidersConfig,
+    /// Stable, secret-free warnings from provider-layer enforcement.
+    pub provider_warnings: Vec<String>,
     pub config: ExtendedConfig,
     pub response_metrics_tokenizer_validation:
         std::result::Result<(), InvalidResponseMetricsTokenizer>,
@@ -2088,13 +2090,14 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     } else {
         config_file_paths_for_load(cwd)
     };
-    let (ambient_providers, captured) =
+    let (ambient_providers, captured, mut provider_warnings) =
         crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
     let mut merged_providers = serde_json::to_value(ambient_providers)
         .context("serializing ambient provider configuration")?;
     for layer in &workspace.layers {
-        let workspace_providers =
-            crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshot(layer)?;
+        let (workspace_providers, warnings) =
+            crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshot_with_warnings(layer)?;
+        provider_warnings.extend(warnings);
         let workspace_provider_value = serde_json::to_value(workspace_providers)
             .context("serializing retained workspace provider configuration")?;
         deep_merge_value(&mut merged_providers, &workspace_provider_value);
@@ -2133,6 +2136,7 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
         .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
+        provider_warnings,
         config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
@@ -2159,7 +2163,7 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     // capture every readable participating config layer once; providers,
     // extended settings, strict validation, and provenance are all projected
     // from that one trust-filtered snapshot.
-    let (providers, captured) =
+    let (providers, captured, provider_warnings) =
         crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
     let docs: Vec<_> = captured
         .into_iter()
@@ -2189,6 +2193,7 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
         .context("invalid knowledge-base trust configuration")?;
     Ok(DaemonExtendedConfigLoad {
         providers,
+        provider_warnings,
         config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
@@ -2435,7 +2440,7 @@ pub fn guidance_proposal_doc_layers_from_snapshot_chain(
         let doc = extended_doc_from_workspace_snapshot(layer)?;
         let value = guidance_proposal_field_from_doc(&doc);
         match layer.origin.as_ref() {
-            Some(ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot) => {
+            Some(ConfigDirKind::HomeXdg) => {
                 out.global = fold_enablement_value(out.global, value);
             }
             Some(ConfigDirKind::MachineLocal | ConfigDirKind::Project) | None => {
@@ -2482,8 +2487,8 @@ fn guidance_proposal_field_from_doc(doc: &ExtendedConfigDoc) -> Option<bool> {
 /// Resolve the global and canonical machine-local project doc layers of
 /// `allow_computer_guidance_proposals` for `cwd`.
 ///
-/// Home-scoped directories (`~/.config/cockpit`, `~/.cockpit`) fold into the
-/// global slot; the machine-local per-cwd directory and any project
+/// The platform global config directory folds into the global slot; the
+/// machine-local per-cwd directory and any project
 /// `.cockpit` directories fold into the project slot. When `COCKPIT_CONFIG`
 /// selects a single file, that file is the effective (most-specific) layer and
 /// its value is treated as the project slot.
@@ -2528,7 +2533,7 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
         };
         let value = guidance_proposal_field_from_doc(&doc);
         match dir.kind {
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot => {
+            ConfigDirKind::HomeXdg => {
                 layers.global = fold_enablement_value(layers.global, value);
             }
             ConfigDirKind::MachineLocal | ConfigDirKind::Project => {

@@ -843,7 +843,6 @@ mod tests {
             scan_tool_results: None,
             goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -900,6 +899,12 @@ mod tests {
         let mut pane = pane_with_tools(&["read"], &[]);
         pane.draft.set_granted("read", false);
         assert!(pane.cache_break_delta());
+        pane.start_confirm(ToolsSaveTarget::Session);
+        assert!(
+            pane.status
+                .as_deref()
+                .is_some_and(|status| status.contains("will break prompt cache"))
+        );
     }
 
     #[test]
@@ -911,6 +916,27 @@ mod tests {
             .insert("code".to_string(), ToolTier::Disabled);
         assert!(!pane.cache_break_delta());
         assert!(pane.monty_delta());
+        pane.start_confirm(ToolsSaveTarget::Session);
+        assert!(
+            pane.status
+                .as_deref()
+                .is_some_and(|status| !status.contains("will break prompt cache"))
+        );
+    }
+
+    #[test]
+    fn tools_treat_direct_native_media_as_schema_affecting() {
+        let mut pane = pane_with_tools(&["inspect_audio"], &[]);
+        focus_tool(&mut pane, "inspect_audio");
+
+        pane.handle_key(KeyEvent::from(KeyCode::Char('t')));
+
+        assert_eq!(pane.draft.tier("inspect_audio"), ToolTier::Disabled);
+        assert!(pane.cache_break_delta());
+        assert_eq!(
+            cockpit_core::agents::legal_tool_tiers("inspect_audio"),
+            &[ToolTier::Enabled, ToolTier::Disabled]
+        );
     }
 
     #[test]
@@ -972,12 +998,14 @@ mod tests {
         pane.def.as_mut().unwrap().vnext = Some(cockpit_core::agents::VnextAgentDef {
             schema_version: cockpit_core::agents::SCHEMA_VERSION,
             agent_id: "local:test".to_string(),
-            execution_kind: cockpit_core::agents::ExecutionKind::Coding,
+            roles: vec![cockpit_core::agents::AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: BTreeMap::new(),
             delegation: cockpit_core::agents::DelegationPolicy::default(),
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         });
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));

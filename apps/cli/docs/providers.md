@@ -39,17 +39,111 @@ cockpit models
 - OpenAI Platform API: API key from `https://platform.openai.com/api-keys`; defaults to `$OPENAI_API_KEY`.
 - Codex OAuth: browser/device-code login for ChatGPT Plus/Pro quota; no API key.
 - Grok xAI API: API key from the xAI console; defaults to `$XAI_API_KEY`.
-- Grok SuperGrok: browser login for SuperGrok; no API key.
+- Grok SuperGrok: shown as disabled pending xAI authorization. Follow the petition/learn-more link in the picker; the official binary does not include its browser OAuth flow.
+- CrofAI (`crofai`): OpenAI Chat Completions and Responses at `https://crof.ai/v1`; defaults to `Authorization: Bearer $CROF_API_KEY` and also recognizes `CROFAI_API_KEY`. Models are fetched from `/v1/models`; select the Responses wire explicitly for a model that uses it. CrofAI's Anthropic host (`https://anthropic.nahcrof.com`) is documented as a setup hint, not a separate provider template.
 - z.ai, MiniMax, OpenCode Zen, OpenRouter, DeepSeek, Anthropic, Xiaomi MiMo, and Nous Research: API-key templates with provider-specific default environment variable names and headers.
 - Nous Research (`nous-research`): Chat Completions at `https://inference-api.nousresearch.com/v1` with `NOUS_API_KEY` / `Authorization: Bearer $NOUS_API_KEY`. There is no published `/models` endpoint — add models with `cockpit provider add nous-research` or `/setup model`. Failed credential checks report a sanitized status and the portal docs link (`https://portal.nousresearch.com/api-docs`), never a raw provider response body or key material. Automatic x402 payment and non-chat Nous services are not supported.
 - Baseten Model APIs (`baseten`): Chat Completions at `https://inference.baseten.co/v1` with `BASETEN_API_KEY` / `Authorization: Bearer $BASETEN_API_KEY`. Live catalog via `cockpit fetch-models baseten` (`GET /v1/models`). Input capabilities (vision/audio) stay model-dependent and conservatively Unknown until mapped; custom Baseten deployments use a separate custom/OpenAI-compatible provider entry, not this template.
 - GitHub Copilot: OAuth-backed provider setup.
+
+## Declarative Usage Probes
+
+Providers can declare a `usage_probe` in their provider config to show API credits or quota with `cockpit provider usage` and `/usage`. The probe reuses the provider's resolved inference headers, so it must not contain a key or other credential. `endpoint` is either an absolute HTTP(S) URL or a root-relative path joined to the provider URL origin; endpoint URLs cannot contain userinfo, a query string, or a fragment. Absolute HTTP endpoints follow the provider's insecure-HTTP policy: use HTTPS unless the provider explicitly opts into insecure HTTP or the endpoint is local/loopback. `method` currently supports `get` and defaults to it. `fields` are JSON Pointer extractions in display order. Supported kinds are `credits`, `requests_remaining`, `percent`, and `text`; a `null` `requests_remaining` value is shown as pay-as-you-go.
+
+```json
+{
+  "url": "https://api.example.com/v1",
+  "headers": [{ "name": "Authorization", "value": "Bearer $EXAMPLE_API_KEY" }],
+  "usage_probe": {
+    "endpoint": "/usage",
+    "fields": [
+      { "pointer": "/credits", "label": "credits", "kind": "credits" },
+      { "pointer": "/requests_remaining", "label": "requests left today", "kind": "requests_remaining" }
+    ]
+  }
+}
+```
+
+The CrofAI template includes this descriptor for `GET https://crof.ai/usage_api/`, displaying `credits` and `usable_requests`. A pay-as-you-go CrofAI account reports `usable_requests: null` and is rendered accordingly.
+
+## Anthropic-Compatible Endpoints
+
+For a third-party endpoint that implements Anthropic's Messages wire (for
+example, a proxy or aggregator rather than `api.anthropic.com`), add a custom
+provider and choose **anthropic** in the wizard's wire picker. Enter the
+endpoint's `/v1` base URL and the auth shape it documents:
+
+- `x-api-key: $PROVIDER_API_KEY`
+- `Authorization: Bearer $PROVIDER_API_KEY`
+
+Bearer-authenticated endpoints receive `Authorization` only; Cockpit removes
+the native client's required internal `x-api-key` header before the request is
+sent. Keep `anthropic-version` as a normal provider header when the endpoint
+requires it (the first-party Anthropic template uses `2023-06-01`).
+
+Custom Anthropic-wire providers default to the portable Messages API. They do
+not send `cache_control` blocks or `anthropic-beta` headers unless the gateway
+explicitly supports those Anthropic extensions. Opt in per provider only after
+confirming support:
+
+```json
+{
+  "anthropic": {
+    "prompt_caching": true,
+    "betas": true
+  }
+}
+```
+
+`prompt_caching` enables prompt-cache blocks. `betas` permits the extended
+cache-TTL and computer-use beta headers; without it, a one-hour cache setting
+uses the compatible five-minute cache form. Third-party endpoints must support
+the Messages request and streaming response formats; third-party Anthropic
+OAuth or subscription login is not supported.
+
+## Third-Party OpenAI Responses Endpoints
+
+For a third-party endpoint that implements OpenAI's `/v1/responses` wire, add
+a custom provider and choose **responses** in the wizard's wire picker. Enter
+the endpoint's `/v1` base URL and configure the provider's documented Bearer
+authentication, for example `Authorization: Bearer $PROVIDER_API_KEY`.
+
+This is the generic OpenAI Responses path, not Codex OAuth: Cockpit sends the
+Bearer credential only and never sends `chatgpt-account-id`, `originator`, or
+the Codex `OpenAI-Beta` header. Responses requests are stateless: Cockpit sends
+the complete conversation in `input`, always uses `store: false`, and never
+sends `previous_response_id`, `background`, or server-side tools. Providers
+that support it also receive the configured reasoning-effort control.
 
 ## Credentials
 
 Provider config stores non-secret policy and references in layered `.cockpit/` config. Raw pasted secrets and OAuth tokens live in Cockpit's private credential store, not in project files. A project can name a provider or model, but workspace trust controls whether project config is loaded at all.
 
 Environment-variable references are kept as references. For example, `Bearer $OPENAI_API_KEY` means Cockpit reads `OPENAI_API_KEY` from the process environment when it needs to call the provider.
+
+## Custom Grok subscription authentication
+
+The official binary does not ship a SuperGrok browser-login implementation pending xAI authorization. If you independently have a permitted way to obtain a subscription bearer token, configure it as a global user-layer custom OpenAI-compatible provider at your own risk. Do not put `auth_command` in project configuration: Cockpit intentionally ignores it there.
+
+For example, this global provider entry calls a user-owned helper that prints a fresh credential JSON object. The helper is not supplied by FlyCockpit and must not print anything except JSON on stdout:
+
+```json
+{
+  "url": "https://api.x.ai/v1",
+  "auth": "command",
+  "auth_command": ["/Users/you/bin/grok-subscription-token"],
+  "wire_api": "completions",
+  "models": [{ "id": "grok-4" }]
+}
+```
+
+`/Users/you/bin/grok-subscription-token` must return:
+
+```json
+{"token":"your-current-bearer-token","expires_at":1767225600,"headers":null}
+```
+
+`expires_at` is a Unix timestamp and may be `null` when the helper should run for each new Cockpit process. The command can use `$VAR` or `$secret:name` references in its argv. It runs only from your global user provider layer, so review it as carefully as any other executable authentication helper. This path uses the normal OpenAI-compatible transport and has no built-in SuperGrok OAuth code.
 
 ## Test Key
 

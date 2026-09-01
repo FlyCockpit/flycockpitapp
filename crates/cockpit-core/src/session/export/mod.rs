@@ -1823,7 +1823,7 @@ fn config_file_paths_for_export(cwd: &Path, env: &HashMap<String, String>) -> Ve
     for dir in discover_config_dirs(cwd) {
         match dir.kind {
             ConfigDirKind::Project => project.push(dir.path.join(crate::config::dirs::CONFIG_FILE)),
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
+            ConfigDirKind::HomeXdg | ConfigDirKind::MachineLocal => {
                 home_and_local.push(dir.path.join(crate::config::dirs::CONFIG_FILE));
             }
         }
@@ -1844,12 +1844,7 @@ fn export_resume_repair_state_conn(conn: &Connection, target: &SessionRow) -> Op
     let provider = target.provider.clone().unwrap_or_default();
     let model = target.model.clone().unwrap_or_default();
     let providers = crate::secret_ref::load_effective(Path::new(&target.project_root));
-    let configured = providers.resolve_wire_api(&provider, &model);
-    let wire_api = if configured.is_auto() {
-        crate::config::providers::WireApi::detect_for_provider(&provider, &model)
-    } else {
-        configured
-    };
+    let wire_api = providers.resolve_wire_api(&provider, &model);
     if !matches!(wire_api, crate::config::providers::WireApi::Responses) {
         return None;
     }
@@ -2324,7 +2319,6 @@ fn iso8601_from_unix_ms(unix_ms: i64) -> Option<String> {
 fn layer_label(kind: &ConfigDirKind, project_index: usize) -> String {
     match kind {
         ConfigDirKind::HomeXdg => "home-xdg".to_string(),
-        ConfigDirKind::HomeDot => "home-dot".to_string(),
         ConfigDirKind::MachineLocal => "machine-local".to_string(),
         ConfigDirKind::Project => format!("project-{project_index}"),
     }
@@ -2605,7 +2599,7 @@ fn config_entries_from_layers(
 fn merge_order(layers: &[ConfigDir]) -> Vec<&ConfigDir> {
     let home: Vec<&ConfigDir> = layers
         .iter()
-        .filter(|d| matches!(d.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
+        .filter(|d| matches!(d.kind, ConfigDirKind::HomeXdg))
         .collect();
     let machine: Vec<&ConfigDir> = layers
         .iter()

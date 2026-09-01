@@ -41,7 +41,7 @@ use super::{
     generate::{CollectedCandidate, CollectionInput, collect_candidates},
     recipe::{
         RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot,
-        is_clean_room_session_goal_error, select_guidance_for_target,
+        select_guidance_for_target,
     },
 };
 
@@ -97,7 +97,7 @@ fn trusted_minimal_projection_ready(
     collected: &[CollectedCandidate],
     collection_error: Option<&anyhow::Error>,
 ) -> bool {
-    !collection_error.is_some_and(is_clean_room_session_goal_error)
+    collection_error.is_none()
         && super::adjudicate::adjudication_prompt(resolved_name, args, collected).is_ok()
 }
 
@@ -1607,11 +1607,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_room_goal_collection_failure_disables_original_only_projection() {
+    fn collection_failure_disables_original_only_projection() {
         let args = serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" });
-        let error = anyhow::Error::new(
-            crate::engine::verification::recipe::CleanRoomSessionGoalError::Missing,
-        );
+        let error = anyhow::anyhow!("tool-call evidence storage is unavailable");
 
         assert!(
             super::adjudicate::adjudication_prompt("edit", &args, &[]).is_ok(),
@@ -1619,7 +1617,7 @@ mod tests {
         );
         assert!(
             !trusted_minimal_projection_ready("edit", &args, &[], Some(&error)),
-            "a clean-room goal failure during collection must not reach a dispatch-original policy"
+            "any collection failure must not reach a dispatch-original policy"
         );
     }
 

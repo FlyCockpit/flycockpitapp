@@ -22,18 +22,14 @@ const MAX_LINKED_BYTES: usize = 256 * 1024;
 
 /// A clean-room projection cannot safely proceed without its durable goal.
 ///
-/// Keep this typed so the intercept can distinguish a custody failure from
-/// ordinary candidate-collection failures when applying failure policy.
+/// Keep the failure typed so all callers retain the durable-goal context when
+/// propagating recipe-assembly errors.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CleanRoomSessionGoalError {
     #[error("loading persisted session goal for clean-room verification: {0}")]
     Load(anyhow::Error),
     #[error("clean-room verification requires a persisted session goal")]
     Missing,
-}
-
-pub(crate) fn is_clean_room_session_goal_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<CleanRoomSessionGoalError>().is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

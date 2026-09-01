@@ -219,3 +219,198 @@ async fn sealed_vault_crash_recovery_delete_rolls_forward() {
         .unwrap();
     assert_eq!(tombstoned, 1);
 }
+
+#[tokio::test]
+async fn session_end_removes_real_vault_literal_and_action_grant() {
+    let fixture = SealedFixture::new().await;
+    let created = fixture
+        .seed_value(
+            SealedScopeRef::Session(fixture.session_id),
+            "ephemeral_token",
+        )
+        .await;
+    let item_id = crate::secure_key::session_sealed_item_id(
+        &fixture.session_id.to_string(),
+        "ephemeral_token",
+        1,
+    );
+    let vault = fixture.compartment.vault().unwrap();
+    assert!(
+        vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &item_id,
+            )
+            .is_ok(),
+        "the production create path writes an encrypted session literal"
+    );
+    fixture
+        .db
+        .issue_sealed_action_grant(NewSealedActionGrant {
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            record_id: created.record_id.to_string(),
+            value_version: 1,
+            project_key: fixture.project_key.as_str().to_string(),
+            session_id: fixture.session_id.to_string(),
+            session_generation: 0,
+            action_id: "act".into(),
+            action_revision: 1,
+            issued_at_ms: 1_100,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    fixture.db.end_session(fixture.session_id).await.unwrap();
+
+    assert!(
+        fixture
+            .db
+            .sealed_value_record(created.record_id.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &item_id,
+            )
+            .is_err()
+    );
+    let grant_count: i64 = fixture
+        .db
+        .read({
+            let record_id = created.record_id.to_string();
+            move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM sealed_action_grants WHERE record_id = ?1",
+                    [record_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(grant_count, 0, "session end removes grants with the record");
+}
+
+#[tokio::test]
+async fn production_promotion_copies_real_literal_and_retires_source_name() {
+    let fixture = SealedFixture::new().await;
+    let directory = fixture.directory();
+    let owner = SealedFixture::owner();
+    let created = fixture
+        .seed_value(SealedScopeRef::Session(fixture.session_id), "keep_token")
+        .await;
+    fixture
+        .db
+        .issue_sealed_action_grant(NewSealedActionGrant {
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            record_id: created.record_id.to_string(),
+            value_version: 1,
+            project_key: fixture.project_key.as_str().to_string(),
+            session_id: fixture.session_id.to_string(),
+            session_generation: 0,
+            action_id: "act".into(),
+            action_revision: 1,
+            issued_at_ms: 1_100,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    let source_item =
+        crate::secure_key::session_sealed_item_id(&fixture.session_id.to_string(), "keep_token", 1);
+
+    let promoted = directory
+        .promote_session_at_version(
+            owner,
+            created.record_id,
+            SealedScopeRef::Project(fixture.project_key.clone()),
+            2_000,
+            1,
+        )
+        .await
+        .unwrap();
+    let row = fixture
+        .db
+        .sealed_value_record(promoted.record_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let locator =
+        crate::sealed::SealedCompartmentKey::parse(row.compartment_key.as_deref().unwrap())
+            .unwrap();
+    let literal = fixture
+        .compartment
+        .get_exact(&locator)
+        .unwrap()
+        .unwrap()
+        .handle()
+        .expose()
+        .to_string();
+    assert_eq!(
+        literal, TEST_LITERAL,
+        "promotion copies the real vault literal"
+    );
+    assert!(
+        fixture
+            .compartment
+            .vault()
+            .unwrap()
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &source_item,
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .db
+            .sealed_value_name_retired(
+                SealedScopeKind::Session,
+                fixture.session_id.to_string(),
+                "keep_token".into(),
+            )
+            .await
+            .unwrap()
+    );
+    let live_grants: i64 = fixture
+        .db
+        .read({
+            let record_id = promoted.record_id.to_string();
+            move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM sealed_action_grants
+                      WHERE record_id = ?1 AND revoked_at_ms IS NULL",
+                    [record_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(live_grants, 0, "promotion revokes source-session grants");
+
+    fixture.db.end_session(fixture.session_id).await.unwrap();
+    assert!(
+        fixture
+            .db
+            .sealed_value_record(promoted.record_id.to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .compartment
+            .get_exact(&locator)
+            .unwrap()
+            .unwrap()
+            .handle()
+            .expose(),
+        TEST_LITERAL,
+        "the promoted literal survives source-session termination"
+    );
+}

@@ -410,6 +410,27 @@ fn name_tombstoned_conn(
     Ok(hit.is_some())
 }
 
+/// Refuse to attach a session-scoped value to a missing or ended session.
+///
+/// The session-end transition purges session scoped values before marking the
+/// session ended.  This check must be in the same transaction as every session
+/// create entry point so an ended session cannot acquire a new value after that
+/// one-time purge has passed.
+fn ensure_session_is_live_conn(conn: &Connection, session_key: &str) -> Result<()> {
+    let live: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sessions WHERE session_id = ?1 AND ended_at_unix_ms IS NULL",
+            [session_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking session liveness for sealed value")?;
+    if live.is_none() {
+        bail!("session-scoped sealed values require a live session");
+    }
+    Ok(())
+}
+
 /// Connection-scoped body of [`Db::create_session_sealed_value`]. Exposed so a
 /// caller (the sealed-adoption journaling seam in `cockpit-core`) can compose
 /// the session sealed-row write with a protected-history append in one
@@ -424,6 +445,7 @@ pub fn create_session_sealed_value_conn(
     if record.scope != SealedScopeKind::Session {
         bail!("create_session_sealed_value is only for session scope");
     }
+    ensure_session_is_live_conn(conn, &record.scope_key)?;
     if name_tombstoned_conn(conn, record.scope, &record.scope_key, &record.name)? {
         bail!("sealed value name was retired and is never reused");
     }
@@ -477,6 +499,7 @@ pub fn stage_session_sealed_create_conn(
     if record.scope != SealedScopeKind::Session {
         bail!("stage_session_sealed_create is only for session scope");
     }
+    ensure_session_is_live_conn(conn, &record.scope_key)?;
     if name_tombstoned_conn(conn, record.scope, &record.scope_key, &record.name)? {
         bail!("sealed value name was retired and is never reused");
     }
@@ -1561,6 +1584,15 @@ pub fn promote_session_sealed_value_conn(
     if collision.is_some() {
         bail!("a sealed value with that name already exists in the target scope");
     }
+    // A promoted value no longer belongs to its source session, so the source
+    // name must be retired before changing the record's scope. Otherwise its
+    // session can recreate the name after this record survives session end.
+    conn.execute(
+        "INSERT OR IGNORE INTO sealed_value_name_tombstones
+             (scope, scope_key, name, retired_at_ms) VALUES ('session', ?1, ?2, ?3)",
+        params![existing.scope_key, existing.name, now_ms],
+    )
+    .context("tombstoning promoted session sealed value name")?;
     conn.execute(
         "UPDATE sealed_value_records
             SET scope = ?2, scope_key = ?3, compartment_key = ?4, updated_at_ms = ?5
@@ -1590,8 +1622,23 @@ pub fn promote_session_sealed_value_conn(
     record_conn(conn, record_id)?.context("promoted session sealed value record vanished")
 }
 
+/// Exact vault item id for one session-scoped value generation.
+///
+/// Names permit `/`, so delimiter-only ids let one name be a prefix of another
+/// during lifecycle cleanup. Prefixing the value with its UTF-8 byte length
+/// makes the boundary self-delimiting while retaining a session-wide prefix for
+/// permanent session deletion.
+pub fn session_sealed_vault_item_id(session_key: &str, name: &str, version: i64) -> String {
+    format!("{session_key}/{}:{name}/v{version}", name.len())
+}
+
 fn session_sealed_vault_prefix(session_key: &str, name: &str) -> String {
-    format!("{}/{}/%", escape_like(session_key), escape_like(name))
+    format!(
+        "{}/{}:{}/v%",
+        escape_like(session_key),
+        name.len(),
+        escape_like(name)
+    )
 }
 
 fn escape_like(value: &str) -> String {
@@ -1654,6 +1701,22 @@ mod tests {
         .await
         .unwrap();
         (session_key, record.record_id)
+    }
+
+    fn insert_session_vault_marker(conn: &Connection, item_id: &str, nonce_byte: u8) -> Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO secret_vault_keys
+                 (key_version, kek_version, wrap_version, algorithm, wrap_nonce, wrapped_dek, active, created_at)
+             VALUES (1, 1, 1, 'chacha20poly1305', zeroblob(12), zeroblob(48), 1, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO secret_vault_items
+                 (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+             VALUES ('session_sealed_value', ?1, 1, ?2, zeroblob(16), 0, 0, 1)",
+            params![item_id, vec![nonce_byte; 12]],
+        )?;
+        Ok(())
     }
 
     /// Stage the state an older binary could leave behind: a session record
@@ -1998,6 +2061,25 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (session_key, record_id) = seeded_session_value(&db).await;
         let session_id = uuid::Uuid::parse_str(&session_key).unwrap();
+        db.issue_sealed_action_grant(NewSealedActionGrant {
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            record_id: record_id.clone(),
+            value_version: 1,
+            project_key: "p".into(),
+            session_id: session_key.clone(),
+            session_generation: 0,
+            action_id: "act".into(),
+            action_revision: 1,
+            issued_at_ms: 1_500,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+        let vault_item_id = session_sealed_vault_item_id(&session_key, "prod_token", 1);
+        let vault_marker_id = vault_item_id.clone();
+        db.transaction(move |conn| insert_session_vault_marker(conn, &vault_marker_id, 1))
+            .await
+            .unwrap();
 
         db.end_session(session_id).await.unwrap();
 
@@ -2023,6 +2105,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(literal_rows, 0);
+        let vault_rows = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM secret_vault_items
+                      WHERE kind = 'session_sealed_value' AND item_id = ?1",
+                    [vault_item_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(vault_rows, 0, "session end removes the vault ciphertext");
+        let grant_rows = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sealed_action_grants WHERE record_id = ?1",
+                    [record_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(grant_rows, 0, "session end removes action grants");
+    }
+
+    #[tokio::test]
+    async fn session_value_creation_refuses_an_ended_session_at_every_entry_point() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/repo", "Build").await.unwrap();
+        let session_key = session.session_id.to_string();
+        db.end_session(session.session_id).await.unwrap();
+
+        let create = new_record(SealedScopeKind::Session, &session_key, "after_end_create");
+        let error = db
+            .create_session_sealed_value(
+                create.clone(),
+                "SECRET".into(),
+                "deploy".into(),
+                "user".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("live session"), "{error}");
+
+        let stage = new_record(SealedScopeKind::Session, &session_key, "after_end_stage");
+        let error = db
+            .transaction(move |conn| {
+                stage_session_sealed_create_conn(conn, &stage, "deploy", "user")
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("live session"), "{error}");
+        assert!(
+            db.sealed_value_record(create.record_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2077,5 +2219,61 @@ mod tests {
         assert_eq!(promoted.scope, SealedScopeKind::Project);
         assert_eq!(promoted.scope_key, "project-a");
         assert!(promoted.is_resolvable());
+        assert!(
+            db.sealed_value_name_retired(
+                SealedScopeKind::Session,
+                session_key,
+                "prod_token".into(),
+            )
+            .await
+            .unwrap(),
+            "promotion retires the former session name"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_vault_cleanup_does_not_match_a_slash_prefixed_sibling_name() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/repo", "Build").await.unwrap();
+        let session_key = session.session_id.to_string();
+        let first = new_record(SealedScopeKind::Session, &session_key, "token");
+        let sibling = new_record(SealedScopeKind::Session, &session_key, "token/backup");
+        db.create_session_sealed_value(first.clone(), "FIRST".into(), "r".into(), "o".into())
+            .await
+            .unwrap();
+        db.create_session_sealed_value(sibling.clone(), "SIBLING".into(), "r".into(), "o".into())
+            .await
+            .unwrap();
+        let first_item = session_sealed_vault_item_id(&session_key, &first.name, 1);
+        let sibling_item = session_sealed_vault_item_id(&session_key, &sibling.name, 1);
+        db.transaction(move |conn| {
+            insert_session_vault_marker(conn, &first_item, 1)?;
+            insert_session_vault_marker(conn, &sibling_item, 2)
+        })
+        .await
+        .unwrap();
+
+        db.delete_session_sealed_value_at_version(first.record_id, 1, 2_000)
+            .await
+            .unwrap();
+        let retained = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM secret_vault_items
+                      WHERE kind = 'session_sealed_value' AND item_id = ?1",
+                    [sibling_item],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained, 1, "cleanup retains the sibling ciphertext");
+        assert!(
+            db.sealed_value_record(sibling.record_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -88,6 +88,14 @@ pub(crate) struct SealedWritePlan {
     pub label: String,
 }
 
+/// A planned literal-free owner control: `begin`, then immediately apply its
+/// capability on the same attached connection.
+#[derive(Debug, Clone)]
+pub(crate) struct SealedControlPlan {
+    pub begin: Request,
+    pub success: String,
+}
+
 /// The routing decision for a parsed `/sealed` command.
 #[derive(Debug)]
 pub(crate) enum SealedDispatch {
@@ -97,6 +105,8 @@ pub(crate) enum SealedDispatch {
     Write(SealedWritePlan),
     /// A recover: `begin` + `apply(recover)` on one connection, reveal overlay.
     Recover { record_id: String },
+    /// A reset/promotion: `begin` + literal-free control apply on one connection.
+    Control(SealedControlPlan),
     /// A command with no landed owner RPC (fail closed with a message).
     Unsupported(String),
 }
@@ -166,6 +176,27 @@ fn record_begin(disposition: &str, record_id: &str) -> Request {
     }
 }
 
+fn promote_begin(
+    record_id: &str,
+    target_scope: &SealedScopeKind,
+    ctx: &SealedScopeContext,
+) -> Request {
+    let scope_key = match target_scope {
+        SealedScopeKind::Project => ctx.project_key.clone(),
+        SealedScopeKind::Global => String::new(),
+        // The command parser rejects non-persistent targets before dispatch.
+        SealedScopeKind::Session | SealedScopeKind::KnowledgeBase => String::new(),
+    };
+    Request::BeginSealedOwnerOperation {
+        disposition: "promote".to_string(),
+        record_id: Some(record_id.to_string()),
+        name: None,
+        description: None,
+        scope_kind: Some(scope_kind_wire(target_scope).to_string()),
+        scope_key: Some(scope_key),
+    }
+}
+
 /// The apply request for a create/replace/rotate write. The `literal` rides the
 /// apply frame and nowhere else.
 pub(crate) fn apply_write_request(capability_id: &str, literal: SensitiveWireLiteral) -> Request {
@@ -184,7 +215,8 @@ pub(crate) fn cancel_request(capability_id: &str) -> Request {
 
 /// Route a parsed `/sealed` command to its owner RPC(s). Metadata commands map
 /// to a single request; create/replace/rotate open a no-echo overlay; recover
-/// reveals; delete has no remoted owner RPC and fails closed.
+/// reveals; reset/promotion use literal-free controls; delete has no remoted
+/// owner RPC and fails closed.
 pub(crate) fn plan_dispatch(cmd: &SealedCommand, ctx: &SealedScopeContext) -> SealedDispatch {
     match cmd {
         SealedCommand::List { scope, project } => {
@@ -225,6 +257,20 @@ pub(crate) fn plan_dispatch(cmd: &SealedCommand, ctx: &SealedScopeContext) -> Se
         SealedCommand::Delete { .. } => SealedDispatch::Unsupported(
             "/sealed: delete has no owner RPC; rotate or replace the value instead".to_string(),
         ),
+        SealedCommand::Reset { record_id, .. } => SealedDispatch::Control(SealedControlPlan {
+            begin: record_begin("reset", &record_id.to_string()),
+            success: format!("reset {record_id}"),
+        }),
+        SealedCommand::Promote {
+            record_id,
+            target_scope,
+        } => SealedDispatch::Control(SealedControlPlan {
+            begin: promote_begin(&record_id.to_string(), target_scope, ctx),
+            success: format!(
+                "promoted {record_id} to {} scope",
+                scope_kind_wire(target_scope)
+            ),
+        }),
         SealedCommand::Action(action) => SealedDispatch::Metadata(action_request(action)),
     }
 }
@@ -1359,5 +1405,43 @@ mod tests {
             ),
             SealedDispatch::Recover { .. }
         ));
+    }
+
+    #[test]
+    fn session_controls_map_to_literal_free_owner_begin_requests() {
+        let id = SealedRecordId::generate();
+        let reset = parse_sealed_command(&["reset", &id.to_string(), "--confirm", &id.to_string()])
+            .unwrap();
+        match plan_dispatch(&reset, &ctx()) {
+            SealedDispatch::Control(plan) => assert!(matches!(
+                plan.begin,
+                Request::BeginSealedOwnerOperation {
+                    ref disposition,
+                    record_id: Some(_),
+                    name: None,
+                    description: None,
+                    scope_kind: None,
+                    scope_key: None,
+                } if disposition == "reset"
+            )),
+            other => panic!("reset must be a control operation, got {other:?}"),
+        }
+
+        let promote =
+            parse_sealed_command(&["promote", &id.to_string(), "--scope", "project"]).unwrap();
+        match plan_dispatch(&promote, &ctx()) {
+            SealedDispatch::Control(plan) => assert!(matches!(
+                plan.begin,
+                Request::BeginSealedOwnerOperation {
+                    ref disposition,
+                    record_id: Some(_),
+                    name: None,
+                    description: None,
+                    scope_kind: Some(ref scope_kind),
+                    scope_key: Some(ref scope_key),
+                } if disposition == "promote" && scope_kind == "project" && scope_key == "project-a"
+            )),
+            other => panic!("promote must be a control operation, got {other:?}"),
+        }
     }
 }

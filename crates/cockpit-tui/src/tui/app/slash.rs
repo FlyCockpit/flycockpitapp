@@ -2560,7 +2560,8 @@ impl App {
     /// `/sealed` — the owner-remoted frontend over `parse_sealed_command`. Parses
     /// locally, NEVER opens the vault, and routes only sealed-owner RPCs:
     /// metadata commands render safe text; create/rotate/replace open a no-echo
-    /// overlay; recover reveals into an ephemeral overlay; delete has no owner RPC.
+    /// overlay; recover reveals into an ephemeral overlay; reset and promote use
+    /// literal-free owner controls; delete has no owner RPC.
     pub(super) fn handle_sealed_command(&mut self, args: &str) {
         use crate::tui::sealed_overlay::{SealedDispatch, SealedScopeContext, plan_dispatch};
         let tokens: Vec<&str> = args.split_whitespace().collect();
@@ -2593,6 +2594,7 @@ impl App {
             SealedDispatch::Metadata(request) => self.dispatch_sealed_metadata(request),
             SealedDispatch::Write(plan) => self.begin_sealed_write(plan),
             SealedDispatch::Recover { record_id } => self.recover_sealed_into_overlay(record_id),
+            SealedDispatch::Control(plan) => self.apply_sealed_control(plan),
             SealedDispatch::Unsupported(message) => self.push_plain(message),
         }
     }
@@ -2693,6 +2695,70 @@ impl App {
                     };
                 }
                 Ok(response)
+            },
+        );
+    }
+
+    /// Apply a reset or promotion through a single-use control capability. The
+    /// control carries no literal and is settled on the same attached binding
+    /// that minted it, matching the recovery path's attachment-transition
+    /// handling.
+    fn apply_sealed_control(&mut self, plan: crate::tui::sealed_overlay::SealedControlPlan) {
+        use cockpit_proto::{Request, Response};
+        let Some(binding) = self.attached_sealed_binding() else {
+            self.push_plain("/sealed: attach a session first".to_string());
+            return;
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        let request_binding = binding.clone();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_active = std::sync::Arc::clone(&active);
+        self.start_sealed_effect(
+            binding,
+            PendingSealedOperation::Control {
+                operation_id,
+                success: plan.success,
+                active,
+            },
+            async move {
+                let capability_id = match request_binding.request(plan.begin).await? {
+                    Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+                    _ => return Err("unexpected daemon response".to_string()),
+                };
+                if !worker_active.load(std::sync::atomic::Ordering::Acquire) {
+                    return match request_binding
+                        .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                        .await
+                    {
+                        Ok(Response::SealedOwnerOperationCancelled { .. }) => {
+                            Err("sealed control cancelled by attachment transition".to_string())
+                        }
+                        _ => Err("sealed control capability settlement failed".to_string()),
+                    };
+                }
+                let apply = request_binding
+                    .request(Request::ApplySealedOwnerOperation {
+                        capability_id: capability_id.clone(),
+                        literal: None,
+                    })
+                    .await;
+                if !matches!(
+                    &apply,
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: None
+                    })
+                ) {
+                    let settlement = request_binding
+                        .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                        .await;
+                    if !matches!(
+                        settlement,
+                        Ok(Response::SealedOwnerOperationCancelled { .. })
+                    ) {
+                        return Err("sealed control capability settlement failed".to_string());
+                    }
+                }
+                apply
             },
         );
     }
@@ -3054,6 +3120,17 @@ impl App {
                 Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
                 Err(error) => self.push_plain(format!("/sealed: {error}")),
             },
+            PendingSealedOperation::Control { success, .. } => match completion.response {
+                Ok(Response::SealedOwnerOperationApplied {
+                    revealed_literal: None,
+                }) if binding_is_current => self.push_plain(format!("/sealed: {success}")),
+                Ok(Response::SealedOwnerOperationApplied { .. }) => {}
+                Ok(_) if binding_is_current => {
+                    self.push_plain("/sealed: unexpected daemon response".to_string())
+                }
+                Err(error) if binding_is_current => self.push_plain(format!("/sealed: {error}")),
+                Ok(_) | Err(_) => {}
+            },
         }
     }
 }
@@ -3094,6 +3171,11 @@ pub(super) enum PendingSealedOperation {
         record_id: String,
         active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
+    Control {
+        operation_id: uuid::Uuid,
+        success: String,
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 impl PendingSealedOperation {
@@ -3103,13 +3185,16 @@ impl PendingSealedOperation {
             | Self::BeginWrite { operation_id, .. }
             | Self::ApplyWrite { operation_id, .. }
             | Self::Cancel { operation_id, .. }
-            | Self::Recover { operation_id, .. } => *operation_id,
+            | Self::Recover { operation_id, .. }
+            | Self::Control { operation_id, .. } => *operation_id,
         }
     }
 
     pub(super) fn invalidate(&self) {
         match self {
-            Self::BeginWrite { active, .. } | Self::Recover { active, .. } => {
+            Self::BeginWrite { active, .. }
+            | Self::Recover { active, .. }
+            | Self::Control { active, .. } => {
                 active.store(false, std::sync::atomic::Ordering::Release);
             }
             Self::Metadata { .. } | Self::ApplyWrite { .. } | Self::Cancel { .. } => {}

@@ -1120,7 +1120,7 @@ pub fn substitute_item_ciphertext(
 }
 
 pub fn session_sealed_item_id(session_id: &str, value_id: &str, version: i64) -> String {
-    format!("{session_id}/{value_id}/v{version}")
+    cockpit_db::db::sealed_scope::session_sealed_vault_item_id(session_id, value_id, version)
 }
 
 pub fn redaction_table_item_id(session_id: &str) -> String {

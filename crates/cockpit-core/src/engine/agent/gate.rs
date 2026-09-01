@@ -1418,6 +1418,8 @@ mod safety_gate_tests {
                 truncated: false,
                 text_artifact_capture: None,
                 text_artifact_model_ephemeral: false,
+                text_artifact_captures: Vec::new(),
+                notices: Vec::new(),
                 recovery: None,
                 canonical_args: None,
                 sandbox: None,

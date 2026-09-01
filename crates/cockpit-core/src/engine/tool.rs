@@ -1127,6 +1127,13 @@ pub struct ToolOutput {
     /// Such an artifact is retained with the durable event but must never
     /// replace the model result in live or rehydrated history.
     pub text_artifact_model_ephemeral: bool,
+    /// Additional lane-tagged captures. This preserves the legacy singular
+    /// capture API while allowing an envelope-producing tool to retain every
+    /// independently spilled lane in the same owning event.
+    pub text_artifact_captures: Vec<ToolTextArtifactCapture>,
+    /// Host-owned human-only notices. The dispatcher publishes these only
+    /// after the same result-injection recheck that governs the tool result.
+    pub notices: Vec<String>,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -1354,6 +1361,30 @@ pub struct TextArtifactCapture {
     pub stored_source_bytes: usize,
 }
 
+/// The projection lane that owns a retained tool body. Only model-lane
+/// artifacts may replace a tool result in model history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArtifactLane {
+    Model,
+    Display,
+    Attachment,
+}
+
+impl ToolArtifactLane {
+    pub const fn is_model_ephemeral(self) -> bool {
+        !matches!(self, Self::Model)
+    }
+}
+
+/// A retained tool body together with its projection lane. `explicit` means
+/// the tool requested retention even below the context spill threshold.
+#[derive(Debug, Clone)]
+pub struct ToolTextArtifactCapture {
+    pub lane: ToolArtifactLane,
+    pub capture: TextArtifactCapture,
+    pub explicit: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutputSidecar {
     pub payload: serde_json::Value,
@@ -1557,6 +1588,8 @@ impl ToolOutput {
             truncated: false,
             text_artifact_capture: None,
             text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1575,6 +1608,8 @@ impl ToolOutput {
             truncated: true,
             text_artifact_capture: None,
             text_artifact_model_ephemeral: false,
+            text_artifact_captures: Vec::new(),
+            notices: Vec::new(),
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1611,6 +1646,25 @@ impl ToolOutput {
     ) -> Self {
         self.text_artifact_capture = Some(capture);
         self.text_artifact_model_ephemeral = true;
+        self
+    }
+
+    pub fn with_text_artifact_lane(
+        mut self,
+        lane: ToolArtifactLane,
+        capture: TextArtifactCapture,
+        explicit: bool,
+    ) -> Self {
+        self.text_artifact_captures.push(ToolTextArtifactCapture {
+            lane,
+            capture,
+            explicit,
+        });
+        self
+    }
+
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
         self
     }
 

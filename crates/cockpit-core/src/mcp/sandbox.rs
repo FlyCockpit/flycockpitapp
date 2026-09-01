@@ -44,6 +44,11 @@ use super::builtin::{HostContext, McpChildDispatch};
 use super::config::McpConfig;
 
 const STDOUT_FALLBACK_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
+/// `notify` is a durable, broadcast side channel. Keep its independent host
+/// budget small enough that one model-authored script cannot turn a completed
+/// sandbox run into unbounded SQLite writes or client fan-out.
+pub const NOTIFY_COUNT_CAP: usize = 16;
+pub const NOTIFY_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 
 /// Host-side result of one Monty execution. Values are serialized before they
 /// enter a lane, so callers never need a Python JSON helper and raw
@@ -235,6 +240,22 @@ fn dispatch_projection(
             let MontyObject::String(message) = &args[0] else {
                 return Err("notify(s) expects a string".to_owned());
             };
+            if envelope.notifications.len() >= NOTIFY_COUNT_CAP {
+                return Err(format!(
+                    "notify() exceeds the host count limit of {NOTIFY_COUNT_CAP}"
+                ));
+            }
+            let used_bytes = envelope
+                .notifications
+                .iter()
+                .map(String::len)
+                .sum::<usize>();
+            let proposed_bytes = used_bytes.saturating_add(message.len());
+            if proposed_bytes > NOTIFY_BYTE_CAP {
+                return Err(format!(
+                    "notify() exceeds the host byte limit of {NOTIFY_BYTE_CAP}"
+                ));
+            }
             envelope.notifications.push(message.clone());
         }
         "attach" => envelope.artifacts.push(value),
@@ -912,6 +933,26 @@ mod tests {
         assert_eq!(envelope.notifications, ["done"]);
         assert_eq!(envelope.artifacts, [r#"{"large":true}"#]);
         assert_eq!(envelope.model_text(), "first\n{\"answer\":42}");
+    }
+
+    #[tokio::test]
+    async fn notify_has_host_owned_count_and_byte_limits() {
+        let cfg = McpConfig::default();
+        let host = HostContext::empty_for_tests();
+        let count_script = (0..=NOTIFY_COUNT_CAP)
+            .map(|_| "notify('x')")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count_error = run_envelope_with_host(&count_script, &cfg, &host)
+            .await
+            .unwrap_err();
+        assert!(count_error.to_string().contains("host count limit"));
+
+        let oversized = format!("notify('{}')", "x".repeat(NOTIFY_BYTE_CAP + 1));
+        let byte_error = run_envelope_with_host(&oversized, &cfg, &host)
+            .await
+            .unwrap_err();
+        assert!(byte_error.to_string().contains("host byte limit"));
     }
 
     #[tokio::test]

@@ -4034,11 +4034,11 @@ CREATE TABLE session_text_artifacts (
         AND substr(artifact_id, 19, 1) = '-' AND substr(artifact_id, 24, 1) = '-'
     ),
     kind TEXT NOT NULL CHECK(typeof(kind) = 'text' AND kind IN ('tool_result', 'user_input_source', 'user_input_projection')),
-    capture_reason TEXT NOT NULL CHECK(typeof(capture_reason) = 'text' AND capture_reason IN ('display_truncation', 'prune_boundary', 'oversized_user_input')),
+    capture_reason TEXT NOT NULL CHECK(typeof(capture_reason) = 'text' AND capture_reason IN ('display_truncation', 'explicit_attachment', 'prune_boundary', 'oversized_user_input')),
     content_representation TEXT NOT NULL CHECK(typeof(content_representation) = 'text' AND content_representation IN ('raw', 'export_redacted')),
     archive_import_id TEXT,
     owner_event_seq INTEGER NOT NULL CHECK(typeof(owner_event_seq) = 'integer' AND owner_event_seq > 0),
-    owner_relation TEXT NOT NULL CHECK(typeof(owner_relation) = 'text' AND owner_relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result')),
+    owner_relation TEXT NOT NULL CHECK(typeof(owner_relation) = 'text' AND owner_relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result', 'tool_result_display', 'tool_result_attachment')),
     -- A source edge has no public projection slot.  The private -1 sentinel
     -- makes that nullable SQL shape participate in the owning FK below.
     owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
@@ -4056,7 +4056,7 @@ CREATE TABLE session_text_artifacts (
     CHECK(stored_source_bytes <= host_captured_bytes),
     CHECK(json_extract(provenance_json, '$.blob_path') IS NOT NULL OR content_bytes = length(CAST(content AS BLOB))),
     CHECK(content_bytes = stored_source_bytes),
-    CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
+    CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'explicit_attachment', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
     CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),
     CHECK((content_representation = 'raw' AND archive_import_id IS NULL) OR (content_representation = 'export_redacted' AND archive_import_id IS NOT NULL)),
     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
@@ -4122,7 +4122,7 @@ END;
 CREATE TABLE session_text_artifact_event_refs (
     session_id TEXT NOT NULL CHECK(typeof(session_id) = 'text' AND length(session_id) > 0),
     event_seq INTEGER NOT NULL CHECK(typeof(event_seq) = 'integer' AND event_seq > 0),
-    relation TEXT NOT NULL CHECK(typeof(relation) = 'text' AND relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result')),
+    relation TEXT NOT NULL CHECK(typeof(relation) = 'text' AND relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result', 'tool_result_display', 'tool_result_attachment')),
     projection_slot INTEGER CHECK(projection_slot IS NULL OR (typeof(projection_slot) = 'integer' AND projection_slot >= 0)),
     owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
     artifact_id TEXT NOT NULL CHECK(typeof(artifact_id) = 'text' AND length(artifact_id) = 36),
@@ -4493,6 +4493,28 @@ BEGIN
                     AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
                     AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'))
     ) THEN RAISE(ABORT, 'tool artifact binding is invalid') END;
+    -- Display and attachment lanes are durable resources, not model-context
+    -- projections. They still require the same owning tool-call identity, but
+    -- deliberately have no `artifact_projection` event field to replay.
+    SELECT CASE WHEN NEW.relation IN ('tool_result_display', 'tool_result_attachment') AND NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a JOIN session_events e
+          ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND e.type = 'tool_call' AND a.kind = 'tool_result'
+           AND ((NEW.relation = 'tool_result_display' AND a.capture_reason = 'display_truncation')
+             OR (NEW.relation = 'tool_result_attachment' AND a.capture_reason = 'explicit_attachment'))
+           AND NEW.projection_slot >= 0
+           AND json_type(a.provenance_json, '$.tool') = 'text'
+           AND json_type(a.provenance_json, '$.call_id') = 'text'
+           AND json_extract(a.provenance_json, '$.call_id') = e.call_id
+           AND (json_type(a.provenance_json, '$.agent_id') = 'null'
+             OR json_extract(a.provenance_json, '$.agent_id') = e.agent)
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) BETWEEN 3 AND 6
+           AND NOT EXISTS (
+               SELECT 1 FROM json_each(a.provenance_json) provenance
+                WHERE provenance.key NOT IN ('agent_id', 'tool', 'call_id', 'source', 'preview_lines', 'blob_path')
+           )
+    ) THEN RAISE(ABORT, 'non-model tool artifact binding is invalid') END;
     -- The event-owned projection state is the authority for model context.
     -- Do not allow direct SQL to attach a real body to a made-up tool slot,
     -- a stale single projection, or a sparse/misaligned prune array.

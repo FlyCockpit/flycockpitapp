@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, invalid_input};
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
@@ -172,18 +172,7 @@ impl Tool for McpTool {
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         let cfg = catalog.to_mcp_config();
         let result = match crate::mcp::sandbox::run_envelope_with_host(script, &cfg, &host).await {
-            Ok(envelope) => {
-                for notification in &envelope.notifications {
-                    if let Some(events) = &ctx.events {
-                        let _ = events
-                            .send(TurnEvent::Notice {
-                                text: notification.clone(),
-                            })
-                            .await;
-                    }
-                }
-                Ok(rendered_result_output(envelope, ctx))
-            }
+            Ok(envelope) => Ok(rendered_result_output(envelope, ctx)),
             // Unhandled Monty compile/runtime/OS denial/import/host
             // exceptions are failed parent tool calls (`hard_fail`). Authored
             // try/except that returns a value remains Ok above. Do not infer
@@ -241,40 +230,47 @@ fn rendered_result_output(
         }
     });
 
-    let (model_inline, automatic_capture) = if model.len() > OUTPUT_BYTE_CAP {
-        (
-            truncate_head_tail(&model, OUTPUT_BYTE_CAP),
-            Some(capture_text_artifact_body(&model)),
-        )
+    let model_over_cap = model.len() > OUTPUT_BYTE_CAP;
+    let model_inline = if model_over_cap {
+        truncate_head_tail(&model, OUTPUT_BYTE_CAP)
     } else {
-        (model.clone(), None)
+        model.clone()
     };
-
-    let explicit_capture = (!attached.is_empty()).then(|| capture_text_artifact_body(&attached));
-    let display_capture = display
-        .as_ref()
-        .filter(|display| display.len() > OUTPUT_BYTE_CAP)
-        .map(|display| capture_text_artifact_body(display));
-    let model_capture = explicit_capture.or(automatic_capture);
-    let display_capture_is_model_ephemeral = model_capture.is_none() && display_capture.is_some();
-    let capture = model_capture.or(display_capture);
-    let mut output = if capture.is_some() {
+    let mut output = if model_over_cap {
         ToolOutput::truncated_text(model_inline)
     } else {
         ToolOutput::text(model_inline)
     };
-    if let Some(capture) = capture {
-        output = if display_capture_is_model_ephemeral {
-            output.with_model_ephemeral_text_artifact_capture(capture)
-        } else {
-            output.with_text_artifact_capture(capture)
-        };
+    // Keep each envelope lane independent through dispatch. Model and display
+    // candidates are automatic (threshold controlled by the host policy),
+    // while `attach` is an explicit durable request. This prevents either
+    // non-model lane from replacing what `emit` selected for model history.
+    if !model.is_empty() {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Model,
+            capture_text_artifact_body(&model),
+            model_over_cap,
+        );
+    }
+    if !display_lane.is_empty() {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Display,
+            capture_text_artifact_body(&display_lane),
+            display_lane.len() > OUTPUT_BYTE_CAP,
+        );
+    }
+    if !attached.is_empty() {
+        output = output.with_text_artifact_lane(
+            ToolArtifactLane::Attachment,
+            capture_text_artifact_body(&attached),
+            true,
+        );
     }
 
     if let Some(display) = display {
         output = output.with_model_ephemeral_display(truncate_head_tail(&display, OUTPUT_BYTE_CAP));
     }
-    output
+    output.with_notices(envelope.notifications)
 }
 
 #[cfg(test)]
@@ -436,11 +432,12 @@ mod tests {
 
         assert!(output.truncated);
         let capture = output
-            .text_artifact_capture
-            .as_ref()
-            .expect("capture for over-cap mcp result");
-        assert_eq!(capture.host_original_bytes, body.len());
-        assert_eq!(capture.content, body);
+            .text_artifact_captures
+            .iter()
+            .find(|capture| capture.lane == ToolArtifactLane::Model)
+            .expect("model capture for over-cap mcp result");
+        assert_eq!(capture.capture.host_original_bytes, body.len());
+        assert_eq!(capture.capture.content, body);
     }
 
     #[test]
@@ -456,13 +453,17 @@ mod tests {
         );
 
         assert!(!output.truncated);
-        assert!(output.text_artifact_capture.is_none());
+        assert_eq!(output.text_artifact_captures.len(), 1);
+        assert_eq!(
+            output.text_artifact_captures[0].lane,
+            ToolArtifactLane::Model
+        );
     }
 
     #[test]
     fn projection_mapping_redacts_model_display_and_artifact_lanes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.redact = Arc::new(projection_redaction_table(tmp.path()));
         let output = rendered_result_output(
             crate::mcp::sandbox::ProjectionEnvelope {
@@ -479,8 +480,10 @@ mod tests {
         assert!(display.contains("model [redacted]"), "{display}");
         assert!(display.contains("display [redacted]"), "{display}");
         assert!(!display.contains("monty-secret-value"), "{display}");
-        let capture = output.text_artifact_capture.as_ref().unwrap();
-        assert_eq!(capture.content, "artifact [redacted]");
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Attachment
+                && capture.capture.content == "artifact [redacted]"
+        }));
     }
 
     #[test]
@@ -499,20 +502,49 @@ mod tests {
 
         assert_eq!(output.content, "small model result");
         assert!(output.display_content.as_ref().unwrap().len() <= OUTPUT_BYTE_CAP);
-        assert!(output.text_artifact_model_ephemeral);
-        assert_eq!(
-            output.text_artifact_capture.as_ref().unwrap().content,
-            format!("small model result\n{display}")
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Display && capture.capture.content == display
+        }));
+    }
+
+    #[test]
+    fn attachment_and_automatic_lanes_do_not_replace_emit_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["exact model answer".to_owned()],
+                display: vec!["display body".to_owned()],
+                artifacts: vec!["attached body".to_owned()],
+                ..Default::default()
+            },
+            &ctx,
         );
+
+        assert_eq!(output.content, "exact model answer");
+        assert!(
+            output
+                .text_artifact_captures
+                .iter()
+                .any(|capture| { capture.lane == ToolArtifactLane::Model && !capture.explicit })
+        );
+        assert!(
+            output
+                .text_artifact_captures
+                .iter()
+                .any(|capture| { capture.lane == ToolArtifactLane::Display && !capture.explicit })
+        );
+        assert!(output.text_artifact_captures.iter().any(|capture| {
+            capture.lane == ToolArtifactLane::Attachment
+                && capture.explicit
+                && capture.capture.content == "attached body"
+        }));
     }
 
     #[tokio::test]
     async fn show_and_notify_stay_out_of_model_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        ctx.events = Some(tx);
-
+        let ctx = crate::tools::common::test_ctx(tmp.path());
         let output = McpTool
             .call(
                 serde_json::json!({
@@ -532,10 +564,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|display| display.contains("display only"))
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(TurnEvent::Notice { text }) if text == "human only"
-        ));
+        assert_eq!(output.notices, vec!["human only"]);
     }
 
     #[test]

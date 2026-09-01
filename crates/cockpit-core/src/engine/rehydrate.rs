@@ -421,14 +421,6 @@ fn apply_text_artifact_tool_projections(
                                 "tool artifact projection provenance does not match event call id"
                             ));
                         }
-                        if event
-                            .data
-                            .get("artifact_model_ephemeral")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true)
-                        {
-                            continue;
-                        }
                         if projections_by_call
                             .insert(call_id.to_owned(), (frame, false))
                             .is_some()

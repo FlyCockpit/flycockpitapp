@@ -538,6 +538,26 @@ pub(crate) async fn generate_session_metadata_fork(
             return;
         };
         let calls = collect_tool_calls(&content);
+        let fork_registry = crate::mcp::builtin::BuiltinRegistry::metadata_fork();
+        // A mixed response must fail as a unit. Otherwise a successful Monty
+        // metadata update returns before its native sibling receives the
+        // purpose-specific capability denial that normal dispatch supplies.
+        if calls.iter().any(|call| {
+            fork_registry
+                .capability_denial(&call.function.name)
+                .is_some()
+        }) {
+            history.push(prompt);
+            history.push(Message::Assistant { id: None, content });
+            for ignored_call in calls {
+                history.push(tool_result_message(
+                    &ignored_call,
+                    metadata_fork_ignored_tool_result(&fork_registry, &ignored_call.function.name),
+                ));
+            }
+            prompt = Message::user(metadata_fork_retry_instruction());
+            continue;
+        }
         let Some((monty_call_index, call)) = calls
             .iter()
             .enumerate()
@@ -553,7 +573,7 @@ pub(crate) async fn generate_session_metadata_fork(
             for ignored_call in calls {
                 history.push(tool_result_message(
                     &ignored_call,
-                    metadata_fork_ignored_tool_result(),
+                    metadata_fork_ignored_tool_result(&fork_registry, &ignored_call.function.name),
                 ));
             }
             prompt = Message::user(metadata_fork_retry_instruction());
@@ -602,7 +622,10 @@ pub(crate) async fn generate_session_metadata_fork(
             let output = if index == monty_call_index {
                 result.clone()
             } else {
-                metadata_fork_ignored_tool_result()
+                metadata_fork_ignored_tool_result(
+                    &host.builtin_registry,
+                    &ignored_call.function.name,
+                )
             };
             history.push(tool_result_message(&ignored_call, output));
         }
@@ -610,8 +633,17 @@ pub(crate) async fn generate_session_metadata_fork(
     }
 }
 
-fn metadata_fork_ignored_tool_result() -> String {
-    r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#.to_string()
+fn metadata_fork_ignored_tool_result(
+    registry: &crate::mcp::builtin::BuiltinRegistry,
+    tool: &str,
+) -> String {
+    registry.capability_denial(tool).map_or_else(
+        || {
+            r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#
+                .to_string()
+        },
+        |denial| denial.to_string(),
+    )
 }
 
 /// Cancels the revocation watcher once this short-lived, ephemeral fork has

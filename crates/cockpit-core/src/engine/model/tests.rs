@@ -263,6 +263,125 @@ async fn metadata_fork_reuses_foreground_prefix_and_publishes_combined_metadata_
 }
 
 #[tokio::test]
+async fn metadata_fork_rejects_mixed_native_and_monty_calls_atomically() {
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("foreground response".into()))
+        .turn(Turn::ParallelToolCalls(vec![
+            (
+                "metadata-monty".into(),
+                "mcp".into(),
+                serde_json::json!({
+                    "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'must-not-publish', 'description': 'The mixed response must not execute this call.'})"
+                }),
+            ),
+            (
+                "metadata-native-edit".into(),
+                "edit".into(),
+                serde_json::json!({"path": "README.md", "old_string": "old", "new_string": "new"}),
+            ),
+        ]))
+        .turn(Turn::ToolCall {
+            id: "metadata-retry".into(),
+            name: "mcp".into(),
+            arguments: serde_json::json!({
+                "script": "mcp.invoke('cockpit', 'set_session_metadata', {'title': 'mixed-call-recovered', 'description': 'The native sibling was denied before Monty could publish.'})"
+            }),
+        })
+        .start()
+        .await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Completions, true);
+    let session = std::sync::Arc::new(
+        crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/metadata-fork-mixed-call-test"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let work = session
+        .note_user_content_for_metadata("deny the native sibling before metadata writes")
+        .expect("first user boundary schedules metadata");
+    let work = session.activate_metadata_fork(work).unwrap();
+    let history = vec![Message::user("prior user context")];
+    let foreground_prompt = Message::user("foreground user turn");
+    let tools = vec![
+        ToolDefinition {
+            name: "mcp".into(),
+            description: "Execute a Monty script.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "script": { "type": "string" } },
+                "required": ["script"]
+            }),
+        },
+        ToolDefinition {
+            name: "edit".into(),
+            description: "Edit a file.".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    ];
+    let params = ModelParams::default();
+    let cancel = CancellationToken::new();
+
+    model
+        .complete_captured(
+            "shared system prompt",
+            &history,
+            foreground_prompt.clone(),
+            &tools,
+            params.clone(),
+            "Build",
+            None,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("foreground request");
+    crate::auto_title::generate_session_metadata_fork(
+        session.clone(),
+        model,
+        "shared system prompt".into(),
+        "Build".into(),
+        params,
+        history,
+        foreground_prompt,
+        tools,
+        false,
+        work,
+        std::path::PathBuf::from("/metadata-fork-mixed-call-test"),
+        crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        cancel,
+        None,
+    )
+    .await;
+
+    let captured = provider.captured();
+    assert_eq!(
+        captured.len(),
+        3,
+        "foreground plus rejected fork turn and retry"
+    );
+    let retry_wire = serde_json::to_string(&captured[2].body).unwrap();
+    assert!(
+        retry_wire.contains("capability_guard_denied"),
+        "{retry_wire}"
+    );
+    assert!(
+        retry_wire.contains("session-rename micro-fork"),
+        "{retry_wire}"
+    );
+    assert!(retry_wire.contains("metadata-native-edit"), "{retry_wire}");
+
+    let row = session.db.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("mixed-call-recovered"));
+    assert_eq!(
+        row.description.as_deref(),
+        Some("The native sibling was denied before Monty could publish.")
+    );
+}
+
+#[tokio::test]
 async fn metadata_fork_retry_retains_the_initial_call_skeleton() {
     let provider = ScriptedProvider::builder()
         .turn(Turn::Text("I will provide metadata shortly.".into()))

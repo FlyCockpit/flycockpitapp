@@ -4753,7 +4753,7 @@ pub(crate) mod tests {
 
     fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
         let mut ctx = crate::tools::common::test_ctx(cwd);
-        ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry();
+        ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry_for_context(&agent.name);
         ctx.mcp_resolver = agent.mcp_resolver.clone();
         crate::mcp::builtin::HostContext::from_tool_ctx(&ctx)
     }

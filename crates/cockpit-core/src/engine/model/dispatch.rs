@@ -840,7 +840,7 @@ impl Model {
         // method finally returns): a wrong endpoint never switches models.
         let mut successful_wire = match self {
             Model::ChatGpt { .. } => Some(crate::config::providers::WireApi::Responses),
-            Model::Anthropic { .. } => Some(crate::config::providers::WireApi::Completions),
+            Model::Anthropic { .. } => Some(crate::config::providers::WireApi::Anthropic),
             Model::OpenAi { .. } => None,
         };
         let out = match self {

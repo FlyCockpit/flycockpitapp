@@ -345,7 +345,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
-            mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
+            mcp_builtin_registry: agent.tools.mcp_builtin_registry_for_context(&agent.name),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Preparation is deliberately silent.  Applying the prepared

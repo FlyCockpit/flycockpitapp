@@ -198,8 +198,10 @@ impl HostContext {
         &self,
         fallback: &crate::mcp::config::McpConfig,
     ) -> crate::mcp::resolver::EffectiveCatalog {
-        if self.metadata_expected_user_content_tokens.is_some() {
-            // The fork catalog is a distinct source with exactly one builtin.
+        if self.builtin_registry.is_scoped() {
+            // A scoped catalog is a distinct, cache-neutral source. Do not
+            // reconstruct persistent config here: even `mcp.search` must not
+            // open or enumerate an external catalog.
             // Do not reconstruct persistent config here: even `mcp.search`
             // must not open or enumerate an external catalog.
             crate::mcp::resolver::EffectiveCatalog::from_mcp_config(
@@ -217,6 +219,9 @@ impl HostContext {
     /// The `mcp` grant now admits only non-cockpit MCP servers. The Monty
     /// runtime and the reserved `cockpit` server remain available without it.
     pub fn external_mcp_servers_allowed(&self) -> bool {
+        if self.builtin_registry.is_scoped() {
+            return false;
+        }
         self.native_tool_ctx
             .as_ref()
             .is_none_or(|ctx| ctx.mcp_resolver.external_servers_allowed())
@@ -869,6 +874,7 @@ impl BuiltinFunction {
 #[derive(Clone)]
 pub struct BuiltinRegistry {
     funcs: Arc<BTreeMap<String, BuiltinFunction>>,
+    capability_guard: Option<crate::engine::agent::tool_dispatch::CapabilityGuard>,
 }
 
 impl BuiltinRegistry {
@@ -879,6 +885,7 @@ impl BuiltinRegistry {
             .collect();
         Self {
             funcs: Arc::new(funcs),
+            capability_guard: None,
         }
     }
 
@@ -901,23 +908,64 @@ impl BuiltinRegistry {
         Self::new(funcs)
     }
 
+    pub(crate) fn with_capability_guard(
+        mut self,
+        guard: crate::engine::agent::tool_dispatch::CapabilityGuard,
+    ) -> Self {
+        self.capability_guard = Some(guard);
+        self
+    }
+
+    /// Construct a cache-neutral runtime catalog for a fork or fenced
+    /// context. `native_allowed_tools` names tools that may still execute from
+    /// the unchanged provider-visible native schema; `funcs` are the only
+    /// cockpit functions discoverable through Monty in this context.
+    pub(crate) fn scoped_fork(
+        purpose: impl Into<Arc<str>>,
+        native_allowed_tools: impl IntoIterator<Item = impl Into<String>>,
+        funcs: Vec<BuiltinFunction>,
+    ) -> Self {
+        let mut allowed_tools = native_allowed_tools
+            .into_iter()
+            .map(Into::into)
+            .collect::<std::collections::BTreeSet<String>>();
+        allowed_tools.extend(funcs.iter().map(|func| func.name.clone()));
+        Self::new(funcs).with_capability_guard(
+            crate::engine::agent::tool_dispatch::CapabilityGuard::new(purpose, allowed_tools),
+        )
+    }
+
+    pub(crate) fn is_scoped(&self) -> bool {
+        self.capability_guard.is_some()
+    }
+
+    pub(crate) fn capability_denial(&self, tool: &str) -> Option<Value> {
+        self.capability_guard
+            .as_ref()
+            .and_then(|guard| guard.denial(tool))
+    }
+
     /// The source-tagged effective catalog for an ephemeral metadata fork.
     /// This is deliberately separate from both the global default registry and
     /// every agent registry, so `mcp.search` in the foreground can never
     /// discover `set_session_metadata`.
     pub fn metadata_fork() -> Self {
-        Self::new(vec![BuiltinFunction::new(
-            "set_session_metadata",
-            "Set this session's generated title and one-sentence description",
-            BuiltinPresentation {
-                glyph: "🏷️",
-                label: "set_session_metadata".to_string(),
-            },
-            Arc::new(set_session_metadata_schema),
-            Arc::new(set_session_metadata_availability),
-            true,
-            Arc::new(set_session_metadata),
-        )])
+        Self::scoped_fork(
+            "the session-rename micro-fork",
+            ["mcp"],
+            vec![BuiltinFunction::new(
+                "set_session_metadata",
+                "Set this session's generated title and one-sentence description",
+                BuiltinPresentation {
+                    glyph: "🏷️",
+                    label: "set_session_metadata".to_string(),
+                },
+                Arc::new(set_session_metadata_schema),
+                Arc::new(set_session_metadata_availability),
+                true,
+                Arc::new(set_session_metadata),
+            )],
+        )
     }
 
     /// Monty-only capability provisioned after explore finishes. It is absent
@@ -926,29 +974,33 @@ impl BuiltinRegistry {
     pub fn seed_reads_fork(
         slot: Arc<std::sync::Mutex<Option<Vec<crate::engine::seed_reads::SeedRead>>>>,
     ) -> Self {
-        Self::new(vec![BuiltinFunction::new(
-            "seed_reads",
-            "Return read-only tool calls for the implementation child to execute fresh",
-            BuiltinPresentation {
-                glyph: "🌱",
-                label: "seed_reads".to_string(),
-            },
-            Arc::new(seed_reads_schema),
-            Arc::new(|_| Availability::available()),
-            true,
-            Arc::new(move |_ctx, args| {
-                let slot = slot.clone();
-                Box::pin(async move {
-                    let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
-                        .map_err(anyhow::Error::msg)?;
-                    *slot
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
-                        Some(calls.clone());
-                    Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
-                })
-            }),
-        )])
+        Self::scoped_fork(
+            "the explore seed-selection micro-fork",
+            ["mcp"],
+            vec![BuiltinFunction::new(
+                "seed_reads",
+                "Return read-only tool calls for the implementation child to execute fresh",
+                BuiltinPresentation {
+                    glyph: "🌱",
+                    label: "seed_reads".to_string(),
+                },
+                Arc::new(seed_reads_schema),
+                Arc::new(|_| Availability::available()),
+                true,
+                Arc::new(move |_ctx, args| {
+                    let slot = slot.clone();
+                    Box::pin(async move {
+                        let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
+                            .map_err(anyhow::Error::msg)?;
+                        *slot
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
+                            Some(calls.clone());
+                        Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
+                    })
+                }),
+            )],
+        )
     }
 
     fn iter(&self) -> impl Iterator<Item = &BuiltinFunction> {
@@ -1049,6 +1101,9 @@ pub fn describe(ctx: &HostContext, tool: &str) -> Result<ToolDescriptor> {
 }
 
 pub async fn invoke(ctx: &HostContext, tool: &str, args: Value) -> Result<Value> {
+    if let Some(denial) = ctx.builtin_registry.capability_denial(tool) {
+        return Ok(denial);
+    }
     let Some(func) = ctx.builtin_registry.get(tool) else {
         let descriptors = available_descriptors(ctx);
         if let Some(suggestion) = crate::mcp::suggest::closest_tool(
@@ -1793,6 +1848,63 @@ mod tests {
                 .is_some(),
             "the ephemeral fork catalog owns the metadata function"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_fork_catalog_returns_guard_denial_before_unknown_tool_lookup() {
+        let host = HostContext::empty_for_tests()
+            .with_builtin_registry(Arc::new(BuiltinRegistry::metadata_fork()));
+
+        let denial = invoke(&host, "edit", serde_json::json!({"path": "README.md"}))
+            .await
+            .expect("guard denial is a structured Monty result");
+
+        assert_eq!(denial["denied"], true);
+        assert_eq!(denial["kind"], "capability_guard_denied");
+        assert_eq!(denial["tool"], "edit");
+        assert!(
+            denial["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("the session-rename micro-fork")
+                    && message.contains("`set_session_metadata`"))
+        );
+    }
+
+    #[test]
+    fn knowledge_fence_scopes_catalog_without_changing_native_schema_bytes() {
+        let toolbox = crate::engine::tool::ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::knowledge::SemanticSearchTool::new(None)))
+            .with(Arc::new(crate::knowledge::StructuredSearchTool::new(None)))
+            .with(Arc::new(crate::tools::edit::EditTool));
+        let before =
+            serde_json::to_vec(&toolbox.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+
+        let registry = toolbox.mcp_builtin_registry_for_context("knowledge");
+        let host = HostContext::empty_for_tests().with_builtin_registry(registry.clone());
+        let after =
+            serde_json::to_vec(&toolbox.definitions(crate::agents::ToolSteering::Terse)).unwrap();
+        let names = available_descriptors(&host)
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(before, after, "scoping must not filter or rewrite tools[]");
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+            ])
+        );
+        assert!(registry.capability_denial("read").is_none());
+        assert_eq!(
+            registry.capability_denial("edit").unwrap()["kind"],
+            "capability_guard_denied"
+        );
+        assert!(registry.is_scoped());
+        assert!(!host.external_mcp_servers_allowed());
     }
 
     #[test]

@@ -12,6 +12,58 @@ use anyhow::Context as _;
 
 use super::*;
 
+/// Dispatch-time capability boundary for a cache-reusing fork or fenced
+/// context. The provider-visible native schema is intentionally untouched;
+/// only execution is narrowed here, after the model has selected a tool.
+#[derive(Debug, Clone)]
+pub(crate) struct CapabilityGuard {
+    purpose: Arc<str>,
+    allowed_tools: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl CapabilityGuard {
+    pub(crate) fn new(
+        purpose: impl Into<Arc<str>>,
+        allowed_tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            purpose: purpose.into(),
+            allowed_tools: Arc::new(allowed_tools.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    pub(crate) fn denial(&self, tool: &str) -> Option<Value> {
+        (!self.allowed_tools.contains(tool)).then(|| {
+            let allowed = self
+                .allowed_tools
+                .iter()
+                // `mcp` is the transport wrapper, not a purpose-specific
+                // capability worth steering the model toward.
+                .filter(|name| name.as_str() != "mcp")
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            serde_json::json!({
+                "denied": true,
+                "kind": "capability_guard_denied",
+                "tool": tool,
+                "purpose": self.purpose.as_ref(),
+                "message": format!(
+                    "you are {}, not a general worker — you can only call {}",
+                    self.purpose, allowed
+                ),
+            })
+        })
+    }
+}
+
+fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {
+    ToolOutput::canonical(vec![
+        crate::typed_media_result::CanonicalToolResultContent::Json { value: denial },
+    ])
+    .context("capability guard denial must form a canonical tool result")
+}
+
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
     crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
         .or_else(|| {
@@ -523,6 +575,7 @@ async fn authorize_btw_native_call(
 enum RevisedCallAuthorization {
     Ready { args: Value, recheck_result: bool },
     Refused(String),
+    GuardDenied(Value),
 }
 
 /// Re-enter every pre-host boundary whose decision depended on substituted
@@ -538,6 +591,13 @@ async fn authorize_revised_call(
     proposed_args: Value,
     payload: &mut InterruptParkPayload,
 ) -> Result<RevisedCallAuthorization> {
+    if let Some(denial) = env
+        .ctx
+        .mcp_builtin_registry
+        .capability_denial(resolved_name)
+    {
+        return Ok(RevisedCallAuthorization::GuardDenied(denial));
+    }
     let mut canonical =
         crate::engine::model::wire_schema::strip_wire_nulls(schema, proposed_args.clone());
     let repaired = repair(&mut canonical, schema, resolved_name);
@@ -658,6 +718,9 @@ pub(crate) async fn authorize_monty_native_call(
     args: &Value,
     ctx: &crate::engine::tool::ToolCtx,
 ) -> Result<MontyNativeAuthorization> {
+    if let Some(denial) = ctx.mcp_builtin_registry.capability_denial(tool.name()) {
+        return Ok(MontyNativeAuthorization::Denied(denial));
+    }
     let fallback_events;
     let tx = if let Some(events) = ctx.events.as_ref() {
         events
@@ -1066,6 +1129,10 @@ async fn execute_ordinary_call_unscoped(
     // not let a stale repeated-call signature turn an unavailable capability
     // into an approval prompt or loop-guard refusal.
     let unavailable_call = env.active_tools.unavailable_call_message(resolved_name);
+    let capability_denial = env
+        .ctx
+        .mcp_builtin_registry
+        .capability_denial(resolved_name);
 
     // Loop guard (GOALS §1/§12): block a back-to-back identical tool
     // call (same name + canonical post-repair `wire_input`) pending
@@ -1087,7 +1154,10 @@ async fn execute_ordinary_call_unscoped(
         env,
         resolved_name,
         &args,
-        repair_outcome.valid && !placeholder_blocked && unavailable_call.is_none(),
+        repair_outcome.valid
+            && !placeholder_blocked
+            && unavailable_call.is_none()
+            && capability_denial.is_none(),
     )
     .await?;
     let repeated_recoverable_tool_call = match &repeat_authorization {
@@ -1142,6 +1212,7 @@ async fn execute_ordinary_call_unscoped(
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
     let gate_block: Option<String> = if unavailable_call.is_none()
+        && capability_denial.is_none()
         && !placeholder_blocked
         && repair_outcome.valid
         && !loop_guard_reject
@@ -1179,16 +1250,19 @@ async fn execute_ordinary_call_unscoped(
     ) {
         recheck_result = true;
     }
-    let cage_block: Option<String> =
-        if unavailable_call.is_none() && !placeholder_blocked && repair_outcome.valid {
-            env.ctx
-                .review_cage
-                .as_ref()
-                .and_then(|cage| cage.allow_dispatch(resolved_name).err())
-                .map(|err| err.to_string())
-        } else {
-            None
-        };
+    let cage_block: Option<String> = if unavailable_call.is_none()
+        && capability_denial.is_none()
+        && !placeholder_blocked
+        && repair_outcome.valid
+    {
+        env.ctx
+            .review_cage
+            .as_ref()
+            .and_then(|cage| cage.allow_dispatch(resolved_name).err())
+            .map(|err| err.to_string())
+    } else {
+        None
+    };
 
     // Dispatch only when validate-then-repair produced a schema-valid
     // call AND the loop guard didn't reject it AND the safety gate didn't
@@ -1362,6 +1436,7 @@ async fn execute_ordinary_call_unscoped(
         || gate_blocked
         || cage_block.is_some()
         || unavailable_call.is_some()
+        || capability_denial.is_some()
         || !repair_outcome.valid;
     if selected_replay_denied_before_intercept {
         cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
@@ -1404,6 +1479,11 @@ async fn execute_ordinary_call_unscoped(
         (Err(invalid_input(msg)), 0)
     } else if let Some(msg) = cage_block {
         (Err(invalid_input(msg)), 0)
+    } else if let Some(denial) = capability_denial {
+        // A capability refusal is a structured model result, not a dispatcher
+        // error string. Monty's nested-native path returns this exact value,
+        // so direct native calls must retain the same classification fields.
+        (capability_guard_denial_output(denial), 0)
     } else if let Some(message) = unavailable_call {
         // The provider was told this tool exists, so a call is not a
         // hallucination. Return a normal call-time availability result without
@@ -1671,6 +1751,20 @@ async fn execute_ordinary_call_unscoped(
                         }
                         verification_blocked = true;
                         (Err(invalid_input(message)), 0)
+                    }
+                    RevisedCallAuthorization::GuardDenied(denial) => {
+                        if let Err(error) = cancel_verification_dispatch_no_submission(
+                            env.session,
+                            operation_id,
+                            plan.attempt_revision,
+                            b"verification-revised-call-capability-guard-denied",
+                        )
+                        .await
+                        {
+                            return (Err(error), 0);
+                        }
+                        verification_blocked = true;
+                        (capability_guard_denial_output(denial), 0)
                     }
                     RevisedCallAuthorization::Ready {
                         args: authorized_args,
@@ -3245,7 +3339,7 @@ mod tests {
     use crate::{
         approval::{Approver, store::GrantStore},
         config::extended::ApprovalMode,
-        engine::tool::Tool as _,
+        engine::tool::Tool,
     };
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
@@ -5712,6 +5806,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "normalized call must reach real dispatch");
+    }
+
+    #[tokio::test]
+    async fn capability_guard_denial_matches_native_and_monty_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let edit: Arc<dyn Tool> = Arc::new(NeverCalledTool {
+            name: "edit",
+            called: called.clone(),
+        });
+        let tools = ToolBox::new().with(edit.clone());
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.mcp_builtin_registry = Arc::new(
+            crate::mcp::builtin::BuiltinRegistry::from_functions(Vec::new()).with_capability_guard(
+                CapabilityGuard::new("the session-rename micro-fork", ["set_session_metadata"]),
+            ),
+        );
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &agent.model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("edit", serde_json::json!({"text": "blocked"}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "edit", Recovery::Clean, None)
+            .await
+            .unwrap();
+        let native_denial = history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|part| match part {
+                    UserContent::ToolResult(result) if result.call == call.id => {
+                        result.content.iter().find_map(|part| match part {
+                            ToolResultContent::Json { value } => Some(value.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("direct native denial is a structured tool result");
+
+        let MontyNativeAuthorization::Denied(monty_denial) =
+            authorize_monty_native_call(edit.as_ref(), &call.function.arguments, &ctx)
+                .await
+                .unwrap()
+        else {
+            panic!("guarded Monty call must be denied");
+        };
+        assert_eq!(native_denial, monty_denial);
+        assert_eq!(native_denial["kind"], "capability_guard_denied");
+        assert!(
+            native_denial["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("the session-rename micro-fork")
+                    && message.contains("`set_session_metadata"))
+        );
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

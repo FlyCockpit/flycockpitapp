@@ -2605,6 +2605,49 @@ impl ToolBox {
         Arc::new(crate::mcp::builtin::BuiltinRegistry::for_agent(funcs))
     }
 
+    /// Build the runtime-only Monty catalog for an execution context without
+    /// changing this toolbox's provider-visible native definitions. The
+    /// knowledge specialist is a filesystem-fenced context: its Monty catalog
+    /// contains only KB retrieval primitives, while the dispatch guard also
+    /// permits the native wrapper and its existing structural completion path.
+    pub fn mcp_builtin_registry_for_context(
+        &self,
+        agent_id: &str,
+    ) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
+        if agent_id != "knowledge" {
+            return self.mcp_builtin_registry();
+        }
+        let funcs = self
+            .mcp_builtin_tools
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "read" | "semantic_search" | "structured_search"
+                )
+            })
+            .filter(|(name, _)| !self.capability_unavailable.contains_key(*name))
+            .filter_map(|(_name, entry)| {
+                crate::mcp::builtin::ToolOutputBuiltinAdapter::new(entry.tool.clone())
+                    .with_direct_call_marker(entry.directly_callable)
+                    .into_function()
+                    .ok()
+            })
+            .collect();
+        Arc::new(crate::mcp::builtin::BuiltinRegistry::scoped_fork(
+            "the knowledge-base retrieval context",
+            [
+                "mcp",
+                "read",
+                "semantic_search",
+                "structured_search",
+                "history_search",
+                "return",
+            ],
+            funcs,
+        ))
+    }
+
     /// Whether every native operation reachable through this agent's Monty
     /// registry is a registered read-only operation.  This deliberately
     /// describes the registry rather than the provider-visible `mcp` wrapper:

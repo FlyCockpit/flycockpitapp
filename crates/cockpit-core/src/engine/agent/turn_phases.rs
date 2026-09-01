@@ -3457,7 +3457,7 @@ pub(crate) async fn run_turn(
                 .map(str::to_string)
                 .collect(),
         ),
-        mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+        mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
         has_tree: agent.tools.get("code").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`read` waiting indicator routes its

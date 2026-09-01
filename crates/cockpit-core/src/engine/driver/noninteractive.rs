@@ -10396,7 +10396,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
                 .map(str::to_string)
                 .collect(),
         ),
-        mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+        mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
         has_tree: agent.tools.get("code").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         events: Some(tx.clone()),
@@ -10904,7 +10904,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     .map(str::to_string)
                     .collect(),
             ),
-            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
             has_tree: active_tools.get("code").is_some(),
             has_bash: active_tools.get("bash").is_some(),
             events: Some(child_tx.clone()),

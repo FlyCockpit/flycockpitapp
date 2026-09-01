@@ -5711,6 +5711,9 @@ async fn ensure_mcp_host_access_for_session(
 }
 
 pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
+    if ctx.mcp_builtin_registry.is_scoped() {
+        return Ok(());
+    }
     ensure_mcp_host_access_for_session(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
 }
 

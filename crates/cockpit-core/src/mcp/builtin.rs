@@ -1860,6 +1860,47 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_fence_scopes_catalog_without_changing_native_schema_bytes() {
+        let toolbox = crate::engine::tool::ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::knowledge::SemanticSearchTool::new(None)))
+            .with(Arc::new(crate::knowledge::StructuredSearchTool::new(None)))
+            .with(Arc::new(crate::tools::edit::EditTool));
+        let before = serde_json::to_vec(
+            &toolbox.definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+
+        let registry = toolbox.mcp_builtin_registry_for_context("knowledge");
+        let host = HostContext::empty_for_tests().with_builtin_registry(registry.clone());
+        let after = serde_json::to_vec(
+            &toolbox.definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+        let names = available_descriptors(&host)
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(before, after, "scoping must not filter or rewrite tools[]");
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "read".to_string(),
+                "semantic_search".to_string(),
+                "structured_search".to_string(),
+            ])
+        );
+        assert!(registry.capability_denial("read").is_none());
+        assert_eq!(
+            registry.capability_denial("edit").unwrap()["kind"],
+            "capability_guard_denied"
+        );
+        assert!(registry.is_scoped());
+        assert!(!host.external_mcp_servers_allowed());
+    }
+
+    #[test]
     fn seed_reads_function_exists_only_on_ephemeral_fork_catalog() {
         assert!(
             BuiltinRegistry::default_with(Vec::new())

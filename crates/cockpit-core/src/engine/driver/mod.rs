@@ -4562,7 +4562,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
-            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             events: Some(tx.clone()),
@@ -4746,7 +4746,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
-            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
             has_tree: active_tools.get("code").is_some(),
             has_bash: active_tools.get("bash").is_some(),
             events: Some(tx.clone()),

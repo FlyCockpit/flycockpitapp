@@ -371,15 +371,26 @@ fn append_acquisition_audit(out: &mut String, acquisitions: &[SealedAcquisitionA
         return;
     }
     out.push_str(
-        "\n/sealed acquisitions: acquisition_id | name | outcome | consent | child | created",
+        "\n/sealed acquisitions: acquisition_id | name | outcome | owner question | consent | child | created",
     );
     for acquisition in acquisitions {
+        let owner_question = match (
+            acquisition.requires_user_reason.as_deref(),
+            acquisition.requires_user_prompt.as_deref(),
+        ) {
+            (Some(reason), Some(prompt)) => format!("{reason}: {prompt}"),
+            _ if acquisition.outcome == "requires_user" => {
+                "invalid requires-user audit entry".to_owned()
+            }
+            _ => String::new(),
+        };
         out.push('\n');
         out.push_str(&format!(
-            "{} | {} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {} | {}",
             acquisition.acquisition_id,
             acquisition.name,
             acquisition.outcome,
+            owner_question,
             acquisition.consent_mode,
             acquisition.child_agent,
             acquisition.created_at_ms,
@@ -1171,7 +1182,9 @@ mod tests {
                 child_agent: "sealed-acquisition".to_string(),
                 source_tool_call_id: Some("call-1".to_string()),
                 consent_mode: "audit_only".to_string(),
-                outcome: "sealed".to_string(),
+                outcome: "requires_user".to_string(),
+                requires_user_reason: Some("interactive_login".to_string()),
+                requires_user_prompt: Some("Please complete the provider login.".to_string()),
                 created_at_ms: 1_000,
                 completed_at_ms: Some(1_001),
             }],
@@ -1185,6 +1198,7 @@ mod tests {
         assert!(rendered.contains("AgentAcquired"));
         assert!(rendered.contains("/sealed acquisitions"));
         assert!(rendered.contains("audit_only"));
+        assert!(rendered.contains("interactive_login: Please complete the provider login."));
 
         // Precondition: this response really carries the secret.
         const SENTINEL: &str = "SENTINEL_LITERAL_XYZ";

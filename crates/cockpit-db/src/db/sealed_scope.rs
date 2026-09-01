@@ -138,7 +138,8 @@ pub struct ReferenceableSealedValueMetadataRow {
 }
 
 /// Safe owner-visible metadata for a trusted-child acquisition attempt. This
-/// row never contains a command, prompt, tool output, literal, or value length.
+/// row never contains a command, tool output, literal, or value length. A
+/// requires-user outcome may carry the child's already validated safe question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedValueAcquisitionAuditRow {
     pub acquisition_id: String,
@@ -151,6 +152,8 @@ pub struct SealedValueAcquisitionAuditRow {
     pub source_tool_call_id: Option<String>,
     pub consent_mode: String,
     pub outcome: String,
+    pub requires_user_reason: Option<String>,
+    pub requires_user_prompt: Option<String>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }
@@ -717,8 +720,8 @@ impl Db {
                 "INSERT INTO sealed_value_acquisition_audit
                     (acquisition_id, record_id, session_id, project_key, name, description,
                      child_agent, source_tool_call_id, consent_mode, outcome,
-                     created_at_ms, completed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 'pending', ?9, NULL)",
+                     requires_user_reason, requires_user_prompt, created_at_ms, completed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, 'pending', NULL, NULL, ?9, NULL)",
                 params![
                     audit.acquisition_id,
                     audit.record_id,
@@ -743,19 +746,43 @@ impl Db {
         &self,
         acquisition_id: String,
         outcome: String,
+        requires_user_reason: Option<String>,
+        requires_user_prompt: Option<String>,
         completed_at_ms: i64,
     ) -> Result<bool> {
-        if !matches!(outcome.as_str(), "requires_user" | "failed") {
-            bail!("non-sealed acquisition outcome must be requires_user or failed");
-        }
+        let (requires_user_reason, requires_user_prompt) = match (
+            outcome.as_str(),
+            requires_user_reason,
+            requires_user_prompt,
+        ) {
+            ("failed", None, None) => (None, None),
+            ("requires_user", Some(reason), Some(prompt))
+                if matches!(
+                    reason.as_str(),
+                    "missing_credential" | "interactive_login" | "owner_knowledge"
+                ) =>
+            {
+                (Some(reason), Some(prompt))
+            }
+            _ => bail!(
+                "non-sealed acquisition outcome must be failed or a complete validated requires-user question"
+            ),
+        };
         self.write(move |conn| {
             let changed = conn
                 .execute(
                     "UPDATE sealed_value_acquisition_audit
-                        SET outcome = ?2, completed_at_ms = ?3
+                        SET outcome = ?2, requires_user_reason = ?3,
+                            requires_user_prompt = ?4, completed_at_ms = ?5
                       WHERE acquisition_id = ?1 AND outcome = 'pending'
                         AND completed_at_ms IS NULL",
-                    params![acquisition_id, outcome, completed_at_ms],
+                    params![
+                        acquisition_id,
+                        outcome,
+                        requires_user_reason,
+                        requires_user_prompt,
+                        completed_at_ms,
+                    ],
                 )
                 .context("terminalizing sealed acquisition audit")?;
             Ok(changed == 1)
@@ -774,7 +801,8 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT acquisition_id, record_id, session_id, project_key, name,
                         description, child_agent, source_tool_call_id, consent_mode,
-                        outcome, created_at_ms, completed_at_ms
+                        outcome, requires_user_reason, requires_user_prompt,
+                        created_at_ms, completed_at_ms
                    FROM sealed_value_acquisition_audit
                   WHERE (?1 IS NULL OR session_id = ?1)
                   ORDER BY created_at_ms DESC, acquisition_id DESC
@@ -793,8 +821,10 @@ impl Db {
                         source_tool_call_id: row.get(7)?,
                         consent_mode: row.get(8)?,
                         outcome: row.get(9)?,
-                        created_at_ms: row.get(10)?,
-                        completed_at_ms: row.get(11)?,
+                        requires_user_reason: row.get(10)?,
+                        requires_user_prompt: row.get(11)?,
+                        created_at_ms: row.get(12)?,
+                        completed_at_ms: row.get(13)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()

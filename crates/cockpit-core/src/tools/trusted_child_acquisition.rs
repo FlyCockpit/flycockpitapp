@@ -25,6 +25,7 @@ pub(crate) enum AcquisitionTerminalMove {
 struct AcquisitionRuntimeState {
     quarantined: HashMap<String, QuarantinedOutput>,
     terminal: Option<AcquisitionTerminalMove>,
+    command_started: bool,
 }
 
 struct QuarantinedOutput {
@@ -68,6 +69,24 @@ impl AcquisitionRuntime {
 
     pub(crate) fn terminal(&self) -> Option<AcquisitionTerminalMove> {
         self.state.lock().unwrap().terminal.clone()
+    }
+
+    /// Spend the one command-execution permit for this acquisition before
+    /// entering bash. The permit is intentionally not restored when bash
+    /// errors: command execution may have already started or had side effects.
+    fn take_untrusted_command(&self) -> Result<Arc<str>> {
+        let command = self
+            .command
+            .clone()
+            .ok_or_else(|| invalid_input("host acquisition command is unavailable"))?;
+        let mut state = self.state.lock().unwrap();
+        if state.command_started {
+            return Err(invalid_input(
+                "the host acquisition command has already been started",
+            ));
+        }
+        state.command_started = true;
+        Ok(command)
     }
 
     pub(crate) fn take_quarantined(&self, source_tool_call_id: &str) -> Option<Zeroizing<String>> {
@@ -211,9 +230,8 @@ impl Tool for RunAcquisitionCommandTool {
             return Err(invalid_input("run_acquisition_command takes no arguments"));
         }
         let command = CURRENT_ACQUISITION_RUNTIME
-            .try_with(|runtime| runtime.command.clone())
-            .map_err(|_| invalid_input("acquisition capability is not active"))?
-            .ok_or_else(|| invalid_input("host acquisition command is unavailable"))?;
+            .try_with(|runtime| runtime.take_untrusted_command())
+            .map_err(|_| invalid_input("acquisition capability is not active"))??;
         crate::tools::bash::BashTool::new()
             .call(serde_json::json!({ "command": command.as_ref() }), ctx)
             .await
@@ -424,6 +442,21 @@ mod tests {
             assert!(set_terminal(AcquisitionTerminalMove::Failed).is_err());
         })
         .await;
+    }
+
+    #[test]
+    fn host_command_execution_permit_is_single_use() {
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::new(),
+            crate::config::extended::ApprovalMode::Manual,
+        )
+        .with_untrusted_command("printf secret".to_owned());
+
+        assert_eq!(
+            runtime.take_untrusted_command().unwrap().as_ref(),
+            "printf secret"
+        );
+        assert!(runtime.take_untrusted_command().is_err());
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::extended::{ApprovalMode, ExtendedConfig, SealedAcquisitionConsent};
 use crate::config::providers::ProvidersConfig;
@@ -36,8 +36,8 @@ const TERMINAL_NUDGE: &str = "Choose exactly one terminal move now: capture_seal
 
 /// Owns the two lifecycle obligations that otherwise disappear when Tokio
 /// drops a cancelled acquisition future. `Drop` is deliberately synchronous:
-/// it first releases only its own in-memory reservation, then schedules the
-/// idempotent durable terminal transition on the live runtime.
+/// it first releases only its own in-memory reservation, then keeps retrying
+/// the idempotent durable terminal transition on the live runtime.
 struct PendingAcquisitionGuard<'a> {
     registry: &'a TrustedChildCaptureRegistry,
     session_id: String,
@@ -62,13 +62,23 @@ impl Drop for PendingAcquisitionGuard<'_> {
         let acquisition_id = self.acquisition_id.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = db
-                    .finish_sealed_value_acquisition_audit(
-                        acquisition_id,
-                        "failed".to_owned(),
-                        chrono::Utc::now().timestamp_millis(),
-                    )
-                    .await;
+                loop {
+                    match db
+                        .finish_sealed_value_acquisition_audit(
+                            acquisition_id.clone(),
+                            "failed".to_owned(),
+                            None,
+                            None,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                    {
+                        // A false result means another terminal transition
+                        // won; either way no pending row remains to repair.
+                        Ok(_) => return,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    }
+                }
             });
         }
     }
@@ -213,11 +223,16 @@ pub(crate) async fn run_parent_acquisition_tool(
         PRODUCTION_CAPTURE_REGISTRY.get_or_init(TrustedChildCaptureRegistry::new),
     )
     .await;
-    Ok(crate::engine::tool::ToolOutput::text(match outcome {
-        AcquisitionOutcome::Sealed => "sealed acquisition completed",
-        AcquisitionOutcome::RequiresUser(_) => "sealed acquisition requires user input",
-        AcquisitionOutcome::Failed => "sealed acquisition failed",
-    }))
+    let parent_result = match outcome {
+        AcquisitionOutcome::Sealed => "sealed acquisition completed".to_owned(),
+        AcquisitionOutcome::RequiresUser(question) => format!(
+            "sealed acquisition requires user input ({}): {}",
+            question.reason().as_str(),
+            question.prompt(),
+        ),
+        AcquisitionOutcome::Failed => "sealed acquisition failed".to_owned(),
+    };
+    Ok(crate::engine::tool::ToolOutput::text(parent_result))
 }
 
 /// Perform one acquisition. The returned closed outcome is the only parent
@@ -335,8 +350,11 @@ pub async fn run_trusted_child_acquisition(
         )
         .is_err()
     {
-        terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms).await;
-        pending_guard.disarm();
+        if terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
+            .await
+        {
+            pending_guard.disarm();
+        }
         return AcquisitionOutcome::Failed;
     }
 
@@ -364,10 +382,12 @@ pub async fn run_trusted_child_acquisition(
             child
         }
         _ => {
-            terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
-                .await;
-            registry.cancel(&session_id, request.acquisition_id);
-            pending_guard.disarm();
+            if terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
+                .await
+            {
+                registry.cancel(&session_id, request.acquisition_id);
+                pending_guard.disarm();
+            }
             return AcquisitionOutcome::Failed;
         }
     };
@@ -440,9 +460,12 @@ pub async fn run_trusted_child_acquisition(
 
     if run_failed {
         let completed_at_ms = completion_time_ms(request.now_ms, started_at);
-        terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms).await;
-        registry.cancel(&session_id, request.acquisition_id);
-        pending_guard.disarm();
+        if terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
+            .await
+        {
+            registry.cancel(&session_id, request.acquisition_id);
+            pending_guard.disarm();
+        }
         return AcquisitionOutcome::Failed;
     }
 
@@ -457,25 +480,29 @@ pub async fn run_trusted_child_acquisition(
                 &source_tool_call_id,
                 completed_at_ms,
             ) else {
-                terminalize_audit_failed(
+                if terminalize_audit_failed(
                     &execution.session,
                     request.acquisition_id,
                     completed_at_ms,
                 )
-                .await;
-                registry.cancel(&session_id, request.acquisition_id);
-                pending_guard.disarm();
+                .await
+                {
+                    registry.cancel(&session_id, request.acquisition_id);
+                    pending_guard.disarm();
+                }
                 return AcquisitionOutcome::Failed;
             };
             let Some(mut quarantined) = runtime.take_quarantined(&source_tool_call_id) else {
-                terminalize_audit_failed(
+                if terminalize_audit_failed(
                     &execution.session,
                     request.acquisition_id,
                     completed_at_ms,
                 )
-                .await;
-                registry.cancel(&session_id, request.acquisition_id);
-                pending_guard.disarm();
+                .await
+                {
+                    registry.cancel(&session_id, request.acquisition_id);
+                    pending_guard.disarm();
+                }
                 return AcquisitionOutcome::Failed;
             };
             let value = SealedCaptureValue::new(std::mem::take(&mut *quarantined));
@@ -489,46 +516,69 @@ pub async fn run_trusted_child_acquisition(
                 )
                 .await
             {
-                TrustedChildCaptureOutcome::Captured { .. } => AcquisitionOutcome::Sealed,
+                TrustedChildCaptureOutcome::Captured { .. } => {
+                    pending_guard.disarm();
+                    AcquisitionOutcome::Sealed
+                }
                 TrustedChildCaptureOutcome::Denied => {
-                    terminalize_audit_failed(
+                    if terminalize_audit_failed(
                         &execution.session,
                         request.acquisition_id,
                         completed_at_ms,
                     )
-                    .await;
-                    registry.cancel(&session_id, request.acquisition_id);
+                    .await
+                    {
+                        registry.cancel(&session_id, request.acquisition_id);
+                        pending_guard.disarm();
+                    }
                     AcquisitionOutcome::Failed
                 }
             };
-            pending_guard.disarm();
             outcome
         }
         Some(AcquisitionTerminalMove::RequiresUser { reason, prompt }) => {
-            registry.cancel(&session_id, request.acquisition_id);
-            let outcome = RequiresUser::parse(&reason, &prompt);
-            let audit_outcome = if matches!(outcome, AcquisitionOutcome::RequiresUser(_)) {
-                "requires_user"
-            } else {
-                "failed"
-            };
-            let _ = execution
-                .session
-                .db
-                .finish_sealed_value_acquisition_audit(
-                    request.acquisition_id.to_owned(),
-                    audit_outcome.to_owned(),
-                    completed_at_ms,
-                )
-                .await;
-            pending_guard.disarm();
-            outcome
+            match RequiresUser::parse(&reason, &prompt) {
+                AcquisitionOutcome::RequiresUser(question) => {
+                    if terminalize_audit_requires_user(
+                        &execution.session,
+                        request.acquisition_id,
+                        &question,
+                        completed_at_ms,
+                    )
+                    .await
+                    {
+                        registry.cancel(&session_id, request.acquisition_id);
+                        pending_guard.disarm();
+                        AcquisitionOutcome::RequiresUser(question)
+                    } else {
+                        // Keep the guard armed: its retry owns the durable
+                        // failed transition if this terminal write failed.
+                        AcquisitionOutcome::Failed
+                    }
+                }
+                AcquisitionOutcome::Failed => {
+                    if terminalize_audit_failed(
+                        &execution.session,
+                        request.acquisition_id,
+                        completed_at_ms,
+                    )
+                    .await
+                    {
+                        registry.cancel(&session_id, request.acquisition_id);
+                        pending_guard.disarm();
+                    }
+                    AcquisitionOutcome::Failed
+                }
+                AcquisitionOutcome::Sealed => unreachable!("RequiresUser::parse is closed"),
+            }
         }
         Some(AcquisitionTerminalMove::Failed) | None => {
-            terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
-                .await;
-            registry.cancel(&session_id, request.acquisition_id);
-            pending_guard.disarm();
+            if terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
+                .await
+            {
+                registry.cancel(&session_id, request.acquisition_id);
+                pending_guard.disarm();
+            }
             AcquisitionOutcome::Failed
         }
     }
@@ -539,15 +589,41 @@ fn completion_time_ms(started_at_ms: i64, started_at: Instant) -> i64 {
     started_at_ms.saturating_add(elapsed_ms)
 }
 
-async fn terminalize_audit_failed(session: &Session, acquisition_id: &str, now_ms: i64) {
-    let _ = session
-        .db
-        .finish_sealed_value_acquisition_audit(
-            acquisition_id.to_owned(),
-            "failed".to_owned(),
-            now_ms,
-        )
-        .await;
+async fn terminalize_audit_failed(session: &Session, acquisition_id: &str, now_ms: i64) -> bool {
+    matches!(
+        session
+            .db
+            .finish_sealed_value_acquisition_audit(
+                acquisition_id.to_owned(),
+                "failed".to_owned(),
+                None,
+                None,
+                now_ms,
+            )
+            .await,
+        Ok(true)
+    )
+}
+
+async fn terminalize_audit_requires_user(
+    session: &Session,
+    acquisition_id: &str,
+    question: &RequiresUser,
+    now_ms: i64,
+) -> bool {
+    matches!(
+        session
+            .db
+            .finish_sealed_value_acquisition_audit(
+                acquisition_id.to_owned(),
+                "requires_user".to_owned(),
+                Some(question.reason().as_str().to_owned()),
+                Some(question.prompt().to_owned()),
+                now_ms,
+            )
+            .await,
+        Ok(true)
+    )
 }
 
 #[cfg(test)]

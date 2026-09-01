@@ -2084,6 +2084,8 @@ mod tests {
                     source_tool_call_id: Some("call-1".into()),
                     consent_mode: "audit_only".into(),
                     outcome: "sealed".into(),
+                    requires_user_reason: None,
+                    requires_user_prompt: None,
                     created_at_ms: 0,
                     completed_at_ms: Some(1),
                 }],
@@ -2159,6 +2161,8 @@ mod tests {
                 source_tool_call_id: None,
                 consent_mode: "audit_only".into(),
                 outcome: "failed".into(),
+                requires_user_reason: None,
+                requires_user_prompt: None,
                 created_at_ms: 0,
                 completed_at_ms: Some(1),
             })

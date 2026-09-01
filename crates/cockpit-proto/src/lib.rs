@@ -3246,6 +3246,8 @@ pub struct SealedAcquisitionAuditItem {
     pub source_tool_call_id: Option<String>,
     pub consent_mode: String,
     pub outcome: String,
+    pub requires_user_reason: Option<String>,
+    pub requires_user_prompt: Option<String>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }

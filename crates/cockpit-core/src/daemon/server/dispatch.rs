@@ -29855,6 +29855,8 @@ fn sealed_acquisition_audit_to_wire(
         source_tool_call_id: row.source_tool_call_id,
         consent_mode: row.consent_mode,
         outcome: row.outcome,
+        requires_user_reason: row.requires_user_reason,
+        requires_user_prompt: row.requires_user_prompt,
         created_at_ms: row.created_at_ms,
         completed_at_ms: row.completed_at_ms,
     }

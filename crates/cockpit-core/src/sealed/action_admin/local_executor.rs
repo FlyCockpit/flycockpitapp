@@ -294,10 +294,8 @@ impl SealedHostAction for FileSealedAction {
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, _params: &SealedParams) -> Result<()> {
         let path = resolve_destination(&self.destination)?;
         git_leak_guard(&path).await?;
-        let cleanup = EphemeralFile::new(
-            path.clone(),
-            self.persistence == FilePersistence::Ephemeral,
-        );
+        let cleanup =
+            EphemeralFile::new(path.clone(), self.persistence == FilePersistence::Ephemeral);
         // Arm cleanup before opening the destination: a partial write, flush
         // failure, cancellation, or panic must not strand an ephemeral file.
         write_private_file(&path, literal.expose()).await?;
@@ -324,7 +322,11 @@ impl SealedHostAction for FileSealedAction {
 fn rebind_params(descriptor: &SealedActionDescriptor, params: &SealedParams) -> Result<()> {
     let supplied: BTreeMap<String, SealedParamValue> = params
         .names()
-        .filter_map(|name| params.get(name).map(|value| (name.to_string(), value.clone())))
+        .filter_map(|name| {
+            params
+                .get(name)
+                .map(|value| (name.to_string(), value.clone()))
+        })
         .collect();
     descriptor.bind_parameters(&supplied)?;
     Ok(())
@@ -351,10 +353,7 @@ async fn run_command_scrubbed(
 }
 
 fn scrub_output(bytes: &[u8], literal: &str) -> String {
-    crate::redact::RedactionTable::scrub_injected_output(
-        &String::from_utf8_lossy(bytes),
-        literal,
-    )
+    crate::redact::RedactionTable::scrub_injected_output(&String::from_utf8_lossy(bytes), literal)
 }
 
 fn resolve_destination(destination: &FileDestination) -> Result<PathBuf> {
@@ -375,7 +374,9 @@ fn resolve_destination(destination: &FileDestination) -> Result<PathBuf> {
 
 #[cfg(unix)]
 async fn write_private_file(path: &Path, literal: &str) -> Result<()> {
-    let parent = path.parent().context("sealed file destination has no parent")?;
+    let parent = path
+        .parent()
+        .context("sealed file destination has no parent")?;
     if !parent.is_dir() {
         bail!("sealed file destination parent does not exist");
     }
@@ -418,7 +419,9 @@ async fn write_private_file(_path: &Path, _literal: &str) -> Result<()> {
 }
 
 async fn git_leak_guard(path: &Path) -> Result<()> {
-    let parent = path.parent().context("sealed file destination has no parent")?;
+    let parent = path
+        .parent()
+        .context("sealed file destination has no parent")?;
     let mut inside_command = tokio::process::Command::new("git");
     inside_command
         .arg("-C")
@@ -529,9 +532,7 @@ mod tests {
         let destination = FileDestination::PrivateRuntime {
             filename: "credential.pem".into(),
         };
-        assert!(
-            validate_file_kind(&destination, FilePersistence::Ephemeral, &[]).is_err()
-        );
+        assert!(validate_file_kind(&destination, FilePersistence::Ephemeral, &[]).is_err());
         assert!(
             validate_file_kind(
                 &destination,
@@ -548,12 +549,8 @@ mod tests {
             path: PathBuf::from("/owner/pinned/credential.pem"),
         };
         assert!(
-            validate_file_kind(
-                &destination,
-                FilePersistence::PersistentOwnerApproved,
-                &[],
-            )
-            .is_ok()
+            validate_file_kind(&destination, FilePersistence::PersistentOwnerApproved, &[],)
+                .is_ok()
         );
         assert!(PERSISTENT_FILE_APPROVAL_WARNING.contains("transform or exfiltrate"));
     }

@@ -281,10 +281,13 @@ impl SealedRuntime {
                 cockpit_db::db::sealed_actions::SealedActionInvocationAuditEntry {
                     audit_id: uuid::Uuid::new_v4().to_string(),
                     record_id: claimed.record_id.clone(),
-                    action_id: authorized.action.descriptor().action_id.as_str().to_string(),
-                    action_revision: i64::from(
-                        authorized.action.descriptor().revision.get(),
-                    ),
+                    action_id: authorized
+                        .action
+                        .descriptor()
+                        .action_id
+                        .as_str()
+                        .to_string(),
+                    action_revision: i64::from(authorized.action.descriptor().revision.get()),
                     grant_id: authorized.grant().grant_id.clone(),
                     session_id: ctx.session_id.to_string(),
                     sink_kind: authorized.action.sink_kind().to_string(),

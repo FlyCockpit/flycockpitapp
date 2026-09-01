@@ -627,7 +627,9 @@ mod tests {
         );
         assert!(url.contains("channel=primary"), "{url}");
         assert!(
-            headers.iter().any(|(name, value)| name == "Content-Type" && value == "text/plain")
+            headers
+                .iter()
+                .any(|(name, value)| name == "Content-Type" && value == "text/plain")
         );
         assert_eq!(body.as_deref(), Some("cred-xyz"));
     }

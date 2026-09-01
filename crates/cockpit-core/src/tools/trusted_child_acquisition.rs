@@ -23,14 +23,20 @@ pub(crate) enum AcquisitionTerminalMove {
 
 #[derive(Default)]
 struct AcquisitionRuntimeState {
-    quarantined: HashMap<String, Zeroizing<String>>,
+    quarantined: HashMap<String, QuarantinedOutput>,
     terminal: Option<AcquisitionTerminalMove>,
+}
+
+struct QuarantinedOutput {
+    value: Zeroizing<String>,
+    truncated: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct AcquisitionRuntime {
     allowed_sealed_record_ids: Arc<BTreeSet<String>>,
     child_approval_mode: crate::config::extended::ApprovalMode,
+    command: Option<Arc<str>>,
     state: Arc<Mutex<AcquisitionRuntimeState>>,
 }
 
@@ -50,8 +56,14 @@ impl AcquisitionRuntime {
                     crate::config::extended::ApprovalMode::Manual
                 }
             },
+            command: None,
             state: Arc::new(Mutex::new(AcquisitionRuntimeState::default())),
         }
+    }
+
+    pub(crate) fn with_untrusted_command(mut self, command: String) -> Self {
+        self.command = Some(Arc::from(command));
+        self
     }
 
     pub(crate) fn terminal(&self) -> Option<AcquisitionTerminalMove> {
@@ -64,6 +76,8 @@ impl AcquisitionRuntime {
             .unwrap()
             .quarantined
             .remove(source_tool_call_id)
+            .filter(|output| !output.truncated)
+            .map(|output| output.value)
     }
 }
 
@@ -86,6 +100,19 @@ where
     CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await
 }
 
+/// Tokio task-locals are not inherited by `tokio::spawn`. Every scheduler lane
+/// enters through this wrapper, preserving the exact acquisition capability
+/// when one is active while leaving ordinary non-acquisition turns unchanged.
+pub(crate) async fn with_inherited_acquisition_runtime<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    match CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) {
+        Ok(runtime) => CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await,
+        Err(_) => future.await,
+    }
+}
+
 /// Production-time quarantine. This runs immediately after successful bash
 /// dispatch and before hooks, audit rows, artifacts, timeline events, or model
 /// history can observe the result. Only the task-local coordinator can later
@@ -94,7 +121,7 @@ pub(crate) fn quarantine_bash_result(call_id: &str, tool: &str, output: &mut Too
     let Ok(runtime) = CURRENT_ACQUISITION_RUNTIME.try_with(|runtime| runtime.clone()) else {
         return false;
     };
-    if tool != "bash" {
+    if !matches!(tool, "bash" | "run_acquisition_command") {
         return false;
     }
     let assembled = output
@@ -106,16 +133,20 @@ pub(crate) fn quarantine_bash_result(call_id: &str, tool: &str, output: &mut Too
     let raw = raw
         .trim_end_matches(|ch| matches!(ch, '\r' | '\n'))
         .to_owned();
-    runtime
-        .state
-        .lock()
-        .unwrap()
-        .quarantined
-        .insert(call_id.to_owned(), Zeroizing::new(raw));
+    runtime.state.lock().unwrap().quarantined.insert(
+        call_id.to_owned(),
+        QuarantinedOutput {
+            value: Zeroizing::new(raw),
+            // The visible representation is not the command result when bash
+            // capped it. Keep that integrity fact in host-only state; a
+            // terminal capture then fails closed rather than sealing a head /
+            // tail rendering as a credential.
+            truncated: output.truncated,
+        },
+    );
     output.content = CanonicalToolResultContents::text(format!(
         "sensitive command output quarantined by host; capture by source tool-call reference `{call_id}`"
     ));
-    output.truncated = false;
     output.text_artifact_capture = None;
     output.text_artifact_captures.clear();
     output.notices.clear();
@@ -142,7 +173,10 @@ fn set_terminal(move_: AcquisitionTerminalMove) -> Result<()> {
     if let AcquisitionTerminalMove::Capture {
         source_tool_call_id,
     } = &move_
-        && !state.quarantined.contains_key(source_tool_call_id)
+        && !state
+            .quarantined
+            .get(source_tool_call_id)
+            .is_some_and(|output| !output.truncated)
     {
         return Err(invalid_input(
             "source_tool_call_id does not name quarantined output from this acquisition",
@@ -153,6 +187,73 @@ fn set_terminal(move_: AcquisitionTerminalMove) -> Result<()> {
 }
 
 pub struct CaptureSealedValueTool;
+
+/// Run the one host-supplied command for this acquisition. The child never
+/// receives command bytes in its instruction channel or tool arguments.
+pub struct RunAcquisitionCommandTool;
+
+#[async_trait]
+impl Tool for RunAcquisitionCommandTool {
+    fn name(&self) -> &str {
+        "run_acquisition_command"
+    }
+    fn description(&self) -> &str {
+        "Run the single host-supplied acquisition command under normal bash sandbox and approval policy"
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Dynamic
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({ "type": "object", "additionalProperties": false })
+    }
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        if args.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(invalid_input("run_acquisition_command takes no arguments"));
+        }
+        let command = CURRENT_ACQUISITION_RUNTIME
+            .try_with(|runtime| runtime.command.clone())
+            .map_err(|_| invalid_input("acquisition capability is not active"))?
+            .ok_or_else(|| invalid_input("host acquisition command is unavailable"))?;
+        crate::tools::bash::BashTool::new()
+            .call(serde_json::json!({ "command": command.as_ref() }), ctx)
+            .await
+    }
+}
+
+/// Parent-facing request. Dispatch intercepts this tool and supplies the
+/// host-only execution context; its body is deliberately unreachable so an
+/// MCP/catalog context cannot manufacture that authority from a bare ToolCtx.
+pub struct AcquireSealedValueTool;
+
+#[async_trait]
+impl Tool for AcquireSealedValueTool {
+    fn name(&self) -> &str {
+        "acquire_sealed_value"
+    }
+    fn description(&self) -> &str {
+        "Delegate one command to the trusted acquisition child and return only sealed, requires-user, or failed"
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutating
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "command": { "type": "string" }
+            },
+            "required": ["name", "description", "command"],
+            "additionalProperties": false
+        })
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Err(invalid_input(
+            "acquire_sealed_value is available only from a live parent agent dispatch",
+        ))
+    }
+}
 
 #[async_trait]
 impl Tool for CaptureSealedValueTool {
@@ -321,6 +422,49 @@ mod tests {
                 })
             );
             assert!(set_terminal(AcquisitionTerminalMove::Failed).is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn truncated_bash_output_cannot_be_selected_for_capture() {
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::new(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
+        with_acquisition_runtime(runtime, async move {
+            let mut output = ToolOutput::text(format!("stdout:\n{SECRET}\nexit: 0\n"));
+            output.truncated = true;
+            assert!(quarantine_bash_result("truncated", "bash", &mut output));
+            assert!(
+                set_terminal(AcquisitionTerminalMove::Capture {
+                    source_tool_call_id: "truncated".to_owned(),
+                })
+                .is_err()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_spawn_inherits_the_exact_acquisition_custody_boundary() {
+        let mut allowed = BTreeSet::new();
+        allowed.insert("allowed-record".to_owned());
+        let runtime = AcquisitionRuntime::new(allowed, crate::config::extended::ApprovalMode::Auto);
+        with_acquisition_runtime(runtime, async {
+            let inherited = tokio::spawn(with_inherited_acquisition_runtime(async {
+                (
+                    acquisition_allows_sealed_reference("allowed-record"),
+                    acquisition_allows_sealed_reference("owner-record"),
+                    effective_approval_mode(crate::config::extended::ApprovalMode::Auto),
+                )
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                inherited,
+                (true, false, crate::config::extended::ApprovalMode::Manual)
+            );
         })
         .await;
     }

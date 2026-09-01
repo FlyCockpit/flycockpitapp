@@ -3641,7 +3641,7 @@ impl Driver {
                     let completion_tx = ordinary_tx.clone();
                     ordinary_active += 1;
                     tokio::spawn(async move {
-                        let (messages, error, terminal_record, terminal) = call.execute().await;
+                        let (messages, error, terminal_record, terminal) = crate::tools::trusted_child_acquisition::with_inherited_acquisition_runtime(call.execute()).await;
                         let _ = completion_tx
                             .send((
                                 source_index,

@@ -698,6 +698,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "glob",
         "list_sealed_value_descriptions",
         "use_sealed_value",
+        "acquire_sealed_value",
+        "run_acquisition_command",
         "capture_sealed_value",
         "acquisition_requires_user",
         "acquisition_fail",
@@ -1118,6 +1120,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
+        Arc::new(tools::trusted_child_acquisition::AcquireSealedValueTool),
+        Arc::new(tools::trusted_child_acquisition::RunAcquisitionCommandTool),
         Arc::new(tools::audio_video::InspectAudioTool::new()),
         Arc::new(tools::audio_video::InspectVideoTool::new()),
         Arc::new(tools::audio_video::ExtractVideoClipTool::new()),
@@ -1170,6 +1174,12 @@ pub(crate) fn materialize_tool_by_name(
             tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool,
         )),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "acquire_sealed_value" => tb.with(Arc::new(
+            tools::trusted_child_acquisition::AcquireSealedValueTool,
+        )),
+        "run_acquisition_command" => tb.with(Arc::new(
+            tools::trusted_child_acquisition::RunAcquisitionCommandTool,
+        )),
         "capture_sealed_value" => tb.with(Arc::new(
             tools::trusted_child_acquisition::CaptureSealedValueTool,
         )),

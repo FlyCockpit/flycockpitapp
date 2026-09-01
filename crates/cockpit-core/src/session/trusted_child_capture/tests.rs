@@ -224,14 +224,49 @@ fn reserved_capture_binds_the_source_exactly_once() {
     )
     .unwrap();
     let authority = reg
-        .bind_source_tool_call(&session.id.to_string(), TOOL_CALL, NOW_MS)
+        .bind_source_tool_call(&session.id.to_string(), "acq-distinct", TOOL_CALL, NOW_MS)
         .expect("first exact source binding succeeds");
     assert_eq!(authority.source_tool_call_id(), TOOL_CALL);
     assert!(
-        reg.bind_source_tool_call(&session.id.to_string(), "other", NOW_MS)
+        reg.bind_source_tool_call(&session.id.to_string(), "acq-distinct", "other", NOW_MS)
             .is_none(),
         "a reserved authority cannot be redirected to another source"
     );
+}
+
+#[test]
+fn stale_acquisition_cannot_bind_or_cancel_a_recycled_session_slot() {
+    let session = new_session();
+    let reg = TrustedChildCaptureRegistry::new();
+    reg.reserve_capture(
+        &session, "acq-a", RECORD_ID, VALUE_ID, REASON, ORIGIN, GENERATION, VERSION, NOW_MS,
+    )
+    .unwrap();
+    let replacement_time = NOW_MS + TRUSTED_CHILD_CAPTURE_TTL_MS + 1;
+    reg.reserve_capture(
+        &session,
+        "acq-b",
+        "4f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f",
+        "replacement_secret",
+        REASON,
+        ORIGIN,
+        GENERATION,
+        VERSION,
+        replacement_time,
+    )
+    .unwrap();
+
+    assert!(
+        reg.bind_source_tool_call(
+            &session.id.to_string(),
+            "acq-a",
+            TOOL_CALL,
+            replacement_time
+        )
+        .is_none()
+    );
+    assert!(!reg.cancel(&session.id.to_string(), "acq-a"));
+    assert!(reg.has_in_flight(&session.id.to_string(), replacement_time));
 }
 
 #[test]
@@ -304,7 +339,7 @@ async fn agent_capture_cannot_replace_an_owner_authored_slot() {
     )
     .unwrap();
     let authority = reg
-        .bind_source_tool_call(&session.id.to_string(), TOOL_CALL, NOW_MS)
+        .bind_source_tool_call(&session.id.to_string(), "acq-collision", TOOL_CALL, NOW_MS)
         .unwrap();
     let outcome = reg
         .verify_and_capture(
@@ -553,7 +588,7 @@ async fn cancelled_authority_is_denied_before_store() {
     let session = new_session();
     let reg = TrustedChildCaptureRegistry::new();
     let authority = begin(&reg, &session);
-    reg.cancel(&session.id.to_string());
+    reg.cancel(&session.id.to_string(), RECORD_ID);
 
     let outcome = reg
         .verify_and_capture(

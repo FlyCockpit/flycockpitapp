@@ -380,6 +380,7 @@ fn assistant_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             "write",
             "edit",
             "delete",
@@ -416,6 +417,7 @@ fn careful_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             "search",
             "write",
             "edit",
@@ -461,6 +463,7 @@ fn build_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             // full intel (GOALS §21)
             "context_pack",
             "code",
@@ -701,6 +704,7 @@ fn plan_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             // full intel (GOALS §21)
             "context_pack",
             "code",
@@ -869,7 +873,7 @@ fn sealed_acquisition_def() -> AgentDef {
         "Host-constrained trusted-child credential acquisition profile.",
         AgentMode::Subagent,
         &[
-            "bash",
+            "run_acquisition_command",
             "list_sealed_value_descriptions",
             "use_sealed_value",
             "capture_sealed_value",

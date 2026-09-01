@@ -62,7 +62,6 @@ pub(crate) mod trusted_child_acquisition;
 /// Host coordinator for one trusted-child capture-by-reference acquisition.
 /// Its input is host-authored and its only caller-visible result is the closed
 /// `Sealed` / `RequiresUser` / `Failed` outcome.
-#[allow(dead_code)]
 pub(crate) mod trusted_child_acquisition_coordinator;
 pub mod validation_hint;
 pub(crate) mod verification;

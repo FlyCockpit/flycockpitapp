@@ -627,6 +627,7 @@ impl Db {
         repair_db_file_permissions(path);
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
+        reconcile_interrupted_sealed_value_acquisitions(&conn)?;
         timer.phase("migrate");
 
         drop(conn);
@@ -651,6 +652,7 @@ impl Db {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
         migrate(&conn)?;
+        reconcile_interrupted_sealed_value_acquisitions(&conn)?;
 
         let db = Self {
             memory: Some(Arc::new(Mutex::new(conn))),
@@ -1058,6 +1060,20 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
         f(&guard)
     }
+}
+
+/// An acquisition child has no resumable secret output. On process recovery,
+/// every audit row left pending by a dropped runtime is therefore terminally
+/// failed before the database is exposed to readers or a new acquisition.
+fn reconcile_interrupted_sealed_value_acquisitions(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE sealed_value_acquisition_audit
+            SET outcome = 'failed', completed_at_ms = ?1
+          WHERE outcome = 'pending' AND completed_at_ms IS NULL",
+        rusqlite::params![chrono::Utc::now().timestamp_millis()],
+    )
+    .context("reconciling interrupted sealed value acquisitions")?;
+    Ok(())
 }
 
 // Canonical `BEGIN IMMEDIATE` transaction wrapper: rolls back on body error,

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::config::extended::{ApprovalMode, ExtendedConfig, SealedAcquisitionConsent};
@@ -32,6 +33,46 @@ const ACQUISITION_AGENT: &str = "sealed-acquisition";
 const MAX_ACQUISITION_TURNS_PER_ATTEMPT: usize = 8;
 const MAX_TERMINAL_NUDGES: usize = 2;
 const TERMINAL_NUDGE: &str = "Choose exactly one terminal move now: capture_sealed_value(source_tool_call_id), acquisition_requires_user(reason, prompt), or acquisition_fail(). Never ask for or repeat the value.";
+
+/// Owns the two lifecycle obligations that otherwise disappear when Tokio
+/// drops a cancelled acquisition future. `Drop` is deliberately synchronous:
+/// it first releases only its own in-memory reservation, then schedules the
+/// idempotent durable terminal transition on the live runtime.
+struct PendingAcquisitionGuard<'a> {
+    registry: &'a TrustedChildCaptureRegistry,
+    session_id: String,
+    acquisition_id: String,
+    db: crate::db::Db,
+    armed: bool,
+}
+
+impl PendingAcquisitionGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingAcquisitionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.registry.cancel(&self.session_id, &self.acquisition_id);
+        let db = self.db.clone();
+        let acquisition_id = self.acquisition_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = db
+                    .finish_sealed_value_acquisition_audit(
+                        acquisition_id,
+                        "failed".to_owned(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await;
+            });
+        }
+    }
+}
 
 /// Host-authored destination and model-selection request. No field is supplied
 /// by the acquisition child, and the child brief must not name the destination.
@@ -75,6 +116,110 @@ pub struct AcquisitionExecutionContext {
     pub local_installations: crate::agents::LocalInstallationResolver,
 }
 
+static PRODUCTION_CAPTURE_REGISTRY: OnceLock<TrustedChildCaptureRegistry> = OnceLock::new();
+
+/// The sole production parent entry point. The dispatcher has the live parent
+/// frame, so it can mint every child input and execution dependency itself;
+/// the model supplies only the requested name, safe description, and command.
+pub(crate) async fn run_parent_acquisition_tool(
+    env: &crate::engine::agent::tool_dispatch::DispatchEnv<'_>,
+    args: &serde_json::Value,
+) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+    let name = args
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let description = args
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let command = args
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let providers = env.ctx.config.providers();
+    let extended = env.ctx.config.extended();
+    let acquisition_id = uuid::Uuid::now_v7().to_string();
+    let record_id = uuid::Uuid::now_v7().to_string();
+    let spawn_args = SpawnArgs {
+        compiled_guidance: Vec::new(),
+        guidance_compiler: None,
+        model: env.agent.model.clone(),
+        params: env.agent.params.clone(),
+        env_overlay: env.agent.env_overlay.clone(),
+        cwd: env.ctx.cwd.clone(),
+        config: env.ctx.config.clone(),
+        session_short_id: env.ctx.session.short_id(),
+        workspace_scratch_dir: env.ctx.session.workspace_scratch_dir(),
+        assistant_identity_prefix: env.agent.assistant_identity_prefix.clone(),
+        model_system_prompt_snapshot: env.ctx.session.model_system_prompt_snapshot(),
+        knowledge_base_system_prefix: env.ctx.session.knowledge_base_system_prompt(),
+        interactive: false,
+        mcp_parent_reachable: Some(env.agent.mcp_resolver.catalog().admitted_entries()),
+        mcp_root_catalog: env.agent.mcp_resolver.root_catalog(),
+        model_override: None,
+        delegation_model: None,
+        delegated: true,
+        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
+        vnext_host_policy: None,
+        vnext_local_installation_resolver:
+            crate::agents::LocalInstallationResolver::no_installations(),
+        parent_vnext_grant: None,
+        parent_posture: None,
+        swarm_depth: 0,
+        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+        granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: env.agent.write_scope.clone(),
+        dream_read_scope: env.ctx.session.dream_read_scope(),
+        workspace_lease: env.agent.workspace_lease.clone(),
+        credential_store: env.ctx.session.provider_credential_store(&providers).ok(),
+        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+    };
+    let outcome = run_trusted_child_acquisition(
+        AcquisitionRequest {
+            caller_mode: env.ctx.session.approval_mode(),
+            category: "trusted-child-acquisition",
+            delegating_agent_name: &env.agent.name,
+            extended: &extended,
+            providers: &providers,
+            session_model: &env.agent.model,
+            store: env.ctx.session.provider_credential_store(&providers).ok(),
+            acquisition_id: &acquisition_id,
+            record_id: &record_id,
+            value_name: name,
+            description,
+            generation: i64::try_from(env.ctx.config.generation()).unwrap_or(i64::MAX),
+            value_version: 1,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            command,
+            allowed_sealed_record_ids: BTreeSet::new(),
+        },
+        AcquisitionExecutionContext {
+            spawn_args,
+            session: env.ctx.session.clone(),
+            locks: env.ctx.locks.clone(),
+            redaction: env.ctx.redact.clone(),
+            config: env.ctx.config.clone(),
+            guidance_compiler: None,
+            interrupts: env.ctx.interrupts.clone(),
+            cancel: env.ctx.cancel.clone(),
+            approver: env.ctx.approver.clone(),
+            resource_scheduler: env.ctx.resource_scheduler.clone(),
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+        },
+        PRODUCTION_CAPTURE_REGISTRY.get_or_init(TrustedChildCaptureRegistry::new),
+    )
+    .await;
+    Ok(crate::engine::tool::ToolOutput::text(match outcome {
+        AcquisitionOutcome::Sealed => "sealed acquisition completed",
+        AcquisitionOutcome::RequiresUser(_) => "sealed acquisition requires user input",
+        AcquisitionOutcome::Failed => "sealed acquisition failed",
+    }))
+}
+
 /// Perform one acquisition. The returned closed outcome is the only parent
 /// result; no report, record id, source id, or literal is returned.
 pub async fn run_trusted_child_acquisition(
@@ -114,8 +259,13 @@ pub async fn run_trusted_child_acquisition(
         let Some(approver) = execution.approver.as_ref() else {
             return AcquisitionOutcome::Failed;
         };
+        // Consent is meaningful only when the owner can inspect the exact
+        // command that will be run; never reduce this to a generic label.
         match approver
-            .approve_tool_call("trusted child credential acquisition")
+            .approve_tool_call(&format!(
+                "trusted child credential acquisition command: {}",
+                request.command
+            ))
             .await
         {
             Ok(decision) if decision.is_allowed() => {}
@@ -160,6 +310,13 @@ pub async fn run_trusted_child_acquisition(
     {
         return AcquisitionOutcome::Failed;
     }
+    let mut pending_guard = PendingAcquisitionGuard {
+        registry,
+        session_id: session_id.clone(),
+        acquisition_id: request.acquisition_id.to_owned(),
+        db: execution.session.db.clone(),
+        armed: true,
+    };
 
     // Reserve before dispatch so concurrent acquisitions cannot both run a
     // secret-producing command. The source id is bound later because it does
@@ -179,7 +336,7 @@ pub async fn run_trusted_child_acquisition(
         .is_err()
     {
         terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms).await;
-        registry.cancel(&session_id);
+        pending_guard.disarm();
         return AcquisitionOutcome::Failed;
     }
 
@@ -209,18 +366,20 @@ pub async fn run_trusted_child_acquisition(
         _ => {
             terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
                 .await;
-            registry.cancel(&session_id);
+            registry.cancel(&session_id, request.acquisition_id);
+            pending_guard.disarm();
             return AcquisitionOutcome::Failed;
         }
     };
 
-    let runtime = AcquisitionRuntime::new(request.allowed_sealed_record_ids, request.caller_mode);
+    let runtime = AcquisitionRuntime::new(request.allowed_sealed_record_ids, request.caller_mode)
+        .with_untrusted_command(request.command);
     let mut agent = child;
     let mut history = Vec::new();
-    let mut prompt = Message::user(format!(
-        "Run this untrusted acquisition command under the normal sandbox and approval policy, then choose one terminal move. Do not repeat its output:\n{}",
-        request.command
-    ));
+    let mut prompt = Message::user(
+        "Call run_acquisition_command exactly once under the normal sandbox and approval policy, then choose one terminal move. Do not repeat its output."
+            .to_owned(),
+    );
     let mut run_failed = false;
     for nudge in 0..=MAX_TERMINAL_NUDGES {
         let result = with_acquisition_runtime(
@@ -282,7 +441,8 @@ pub async fn run_trusted_child_acquisition(
     if run_failed {
         let completed_at_ms = completion_time_ms(request.now_ms, started_at);
         terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms).await;
-        registry.cancel(&session_id);
+        registry.cancel(&session_id, request.acquisition_id);
+        pending_guard.disarm();
         return AcquisitionOutcome::Failed;
     }
 
@@ -291,16 +451,20 @@ pub async fn run_trusted_child_acquisition(
         Some(AcquisitionTerminalMove::Capture {
             source_tool_call_id,
         }) => {
-            let Some(authority) =
-                registry.bind_source_tool_call(&session_id, &source_tool_call_id, completed_at_ms)
-            else {
+            let Some(authority) = registry.bind_source_tool_call(
+                &session_id,
+                request.acquisition_id,
+                &source_tool_call_id,
+                completed_at_ms,
+            ) else {
                 terminalize_audit_failed(
                     &execution.session,
                     request.acquisition_id,
                     completed_at_ms,
                 )
                 .await;
-                registry.cancel(&session_id);
+                registry.cancel(&session_id, request.acquisition_id);
+                pending_guard.disarm();
                 return AcquisitionOutcome::Failed;
             };
             let Some(mut quarantined) = runtime.take_quarantined(&source_tool_call_id) else {
@@ -310,11 +474,12 @@ pub async fn run_trusted_child_acquisition(
                     completed_at_ms,
                 )
                 .await;
-                registry.cancel(&session_id);
+                registry.cancel(&session_id, request.acquisition_id);
+                pending_guard.disarm();
                 return AcquisitionOutcome::Failed;
             };
             let value = SealedCaptureValue::new(std::mem::take(&mut *quarantined));
-            match registry
+            let outcome = match registry
                 .verify_and_capture(
                     &execution.session,
                     &execution.redaction,
@@ -332,13 +497,15 @@ pub async fn run_trusted_child_acquisition(
                         completed_at_ms,
                     )
                     .await;
-                    registry.cancel(&session_id);
+                    registry.cancel(&session_id, request.acquisition_id);
                     AcquisitionOutcome::Failed
                 }
-            }
+            };
+            pending_guard.disarm();
+            outcome
         }
         Some(AcquisitionTerminalMove::RequiresUser { reason, prompt }) => {
-            registry.cancel(&session_id);
+            registry.cancel(&session_id, request.acquisition_id);
             let outcome = RequiresUser::parse(&reason, &prompt);
             let audit_outcome = if matches!(outcome, AcquisitionOutcome::RequiresUser(_)) {
                 "requires_user"
@@ -354,12 +521,14 @@ pub async fn run_trusted_child_acquisition(
                     completed_at_ms,
                 )
                 .await;
+            pending_guard.disarm();
             outcome
         }
         Some(AcquisitionTerminalMove::Failed) | None => {
             terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
                 .await;
-            registry.cancel(&session_id);
+            registry.cancel(&session_id, request.acquisition_id);
+            pending_guard.disarm();
             AcquisitionOutcome::Failed
         }
     }

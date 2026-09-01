@@ -1855,14 +1855,21 @@ async fn execute_ordinary_call_unscoped(
             DispatchVerificationOutcome::Skip => {
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    dispatch_one_timed(
-                        env.active_tools,
-                        resolved_name,
-                        args.clone(),
-                        env.ctx,
-                        Some(&tc.id),
-                    )
-                    .await
+                    if resolved_name == "acquire_sealed_value" {
+                        crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
+                            env, &args,
+                        )
+                        .await
+                    } else {
+                        dispatch_one_timed(
+                            env.active_tools,
+                            resolved_name,
+                            args.clone(),
+                            env.ctx,
+                            Some(&tc.id),
+                        )
+                        .await
+                    }
                 })
                 .await
             }

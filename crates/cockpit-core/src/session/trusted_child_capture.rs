@@ -349,12 +349,14 @@ impl TrustedChildCaptureRegistry {
     pub fn bind_source_tool_call(
         &self,
         session_id: &str,
+        acquisition_id: &str,
         source_tool_call_id: &str,
         now_ms: i64,
     ) -> Option<TrustedChildCaptureAuthority> {
         let mut pending = self.pending.lock().unwrap();
         let record = pending.get_mut(session_id)?;
-        if now_ms > record.expires_at_ms
+        if record.acquisition_id != acquisition_id
+            || now_ms > record.expires_at_ms
             || record.source_tool_call_id.is_some()
             || source_tool_call_id.is_empty()
         {
@@ -374,8 +376,17 @@ impl TrustedChildCaptureRegistry {
     /// Cancel any in-flight acquisition for a session, freeing the slot. A
     /// subsequent verify for a cancelled record fails closed (indistinguishably
     /// from a missing record).
-    pub fn cancel(&self, session_id: &str) {
-        self.pending.lock().unwrap().remove(session_id);
+    pub fn cancel(&self, session_id: &str, acquisition_id: &str) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending
+            .get(session_id)
+            .is_some_and(|record| record.acquisition_id == acquisition_id)
+        {
+            pending.remove(session_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a live (non-expired) acquisition is in flight for a session.

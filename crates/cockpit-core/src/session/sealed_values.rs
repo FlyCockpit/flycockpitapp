@@ -70,6 +70,66 @@ pub fn validate_sealed_value(value_id: &str, value: &str) -> Result<(), SealedVa
     Ok(())
 }
 
+/// Agent-acquired values originate in a command selected by a model and are
+/// therefore not trusted as redaction-table entries merely because they pass
+/// the owner-authored literal floor. Accept only an opaque, single-token
+/// credential shape: this prevents a command from registering a sentence or
+/// other future transcript fragment as a session-wide forced redaction.
+fn validate_agent_acquired_sealed_value(
+    value_id: &str,
+    value: &str,
+) -> Result<(), SealedValueError> {
+    validate_sealed_value(value_id, value)?;
+    let mut has_alpha = false;
+    let mut has_digit = false;
+    let mut has_separator = false;
+    if value.len() < 20
+        || value.len() > 4096
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(SealedValueError::PoisoningRisk);
+    }
+    for ch in value.chars() {
+        has_alpha |= ch.is_ascii_alphabetic();
+        has_digit |= ch.is_ascii_digit();
+        has_separator |= matches!(ch, '-' | '_' | '.' | '~' | '+' | '/' | '=' | ':');
+        if !ch.is_ascii_alphanumeric()
+            && !matches!(ch, '-' | '_' | '.' | '~' | '+' | '/' | '=' | ':')
+        {
+            return Err(SealedValueError::PoisoningRisk);
+        }
+    }
+    if !(has_alpha && has_digit) || !(has_separator || value.len() >= 32) {
+        return Err(SealedValueError::PoisoningRisk);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod agent_acquisition_tests {
+    use super::*;
+
+    #[test]
+    fn command_output_cannot_register_a_sentence_as_forced_redaction() {
+        assert_eq!(
+            validate_agent_acquired_sealed_value(
+                "acquired_token",
+                "this is a future transcript phrase 123"
+            ),
+            Err(SealedValueError::PoisoningRisk)
+        );
+        assert!(
+            validate_agent_acquired_sealed_value(
+                "acquired_token",
+                "ghp_6qV0t9Pz1Rf4Dx8Lm2Nc7Bw5Kj3Hs6Ya"
+            )
+            .is_ok()
+        );
+    }
+}
+
 impl Session {
     /// Union every live machine-scoped sealed literal into a session redaction
     /// table. Project values are intentionally not narrowed to this session's
@@ -125,7 +185,7 @@ impl Session {
         source_tool_call_id: &str,
         now_ms: i64,
     ) -> Result<()> {
-        validate_sealed_value(name, value).map_err(anyhow::Error::from)?;
+        validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let identity = crate::sealed::identity::SealedRedactionIdentity {
             scope: crate::sealed::identity::SealedScopeKind::Session,
             record_id: Some(crate::sealed::identity::SealedRecordId::parse(record_id)?),

@@ -9390,6 +9390,25 @@ impl Driver {
             self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
+        // `system` contains model-trust-dependent leak-report steering.  Build
+        // it before publishing the replacement agent so a later best-effort
+        // tool-surface rebuild cannot leave an untrusted model with the old
+        // trusted model's prompt.
+        let prompt_args = self.rebuild_frame_args(frame_idx, new_model.clone(), selection, None);
+        let role_prompt = refreshed.definition.as_ref().map_or_else(
+            || refreshed.role_prompt.clone(),
+            |definition| {
+                definition
+                    .resolved_prompt_for_model(new_model.provider_id(), new_model.model_id_ref())
+                    .to_string()
+            },
+        );
+        refreshed.system = crate::engine::builtin::compose_system_prompt_for_model(
+            &role_prompt,
+            new_model.as_ref(),
+            &prompt_args,
+        );
+        refreshed.role_prompt = role_prompt;
         refreshed.model = new_model;
         // Posture (tool_steering/capabilities/context_policy) comes from the
         // agent def and is model-independent, so a model swap preserves it.

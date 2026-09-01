@@ -2482,8 +2482,8 @@ mod tests {
             "https://api.anthropic.com/v1".to_string(),
         ))
         .unwrap();
-        let entry = provider_entry_from_answers(&run, Vec::new())
-            .expect("Anthropic provider entry");
+        let entry =
+            provider_entry_from_answers(&run, Vec::new()).expect("Anthropic provider entry");
         assert_eq!(entry.wire_api, WireApi::Anthropic);
         assert_eq!(
             entry.anthropic,

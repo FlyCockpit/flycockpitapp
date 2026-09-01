@@ -6776,7 +6776,10 @@ async fn custom_anthropic_wire_omits_prompt_caching_and_beta_headers_by_default(
 
     let _ = model.text_completion("hi").await;
     let request = provider.next_request().await;
-    assert_eq!(request_header_value(&request.headers, "anthropic-beta"), None);
+    assert_eq!(
+        request_header_value(&request.headers, "anthropic-beta"),
+        None
+    );
     assert!(!request_body_string(&request).contains("cache_control"));
 }
 

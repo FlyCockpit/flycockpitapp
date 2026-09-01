@@ -5,9 +5,10 @@
 //! are spawned directly (never through a shell), and argument/environment
 //! injection never writes plaintext to disk. File injection is the deliberate
 //! downgrade: the destination is pinned, mode 0600, git guarded, and ephemeral
-//! unless the snapshot records explicit persistent approval. Runtime paths
-//! require `$XDG_RUNTIME_DIR`; the code fails closed rather than placing an
-//! ephemeral plaintext file in a persistent platform temp directory.
+//! unless the snapshot records explicit persistent approval. Linux keeps using
+//! `$XDG_RUNTIME_DIR`; macOS falls back only to the OS-provided private user
+//! temp root when XDG is absent. Other platforms fail closed rather than
+//! placing ephemeral plaintext in a persistent or shared temp location.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,13 +44,12 @@ static FILE_MATERIALIZATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::n
 /// [`FilePersistence::PersistentOwnerApproved`].
 pub const PERSISTENT_FILE_APPROVAL_WARNING: &str = "Persistent materialization writes plaintext to the pinned path until you remove it. The consuming process can transform or exfiltrate the value (for example with base64), and redaction can only scrub known representations. Approve only this declared action and destination.";
 
-/// Stable Unix executable identity. The canonical path is only a locator: the
-/// executor opens it no-follow, proves this identity, then executes through
-/// that held descriptor so a post-approval replacement cannot change the sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Stable executable/materialized-file identity. The canonical path is only a
+/// locator: execution and cleanup reopen through no-follow rules and prove
+/// this platform identity before using the object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutableIdentity {
-    device: u64,
-    inode: u64,
+    stable_id: String,
 }
 
 impl ExecutableIdentity {
@@ -57,46 +57,34 @@ impl ExecutableIdentity {
     /// it before validation/persistence; a persisted zero identity is rejected.
     pub fn unpinned() -> Self {
         Self {
-            device: 0,
-            inode: 0,
+            stable_id: String::new(),
         }
-    }
-    #[cfg(unix)]
-    fn capture(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::symlink_metadata(path)?;
-        Self::from_metadata(&metadata)
     }
 
-    #[cfg(unix)]
-    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt as _;
-        if !metadata.file_type().is_file() {
-            bail!("sealed action executable must name a regular file");
-        }
+    fn capture(path: &Path) -> Result<Self> {
         Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            stable_id:
+                cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_authorization_identity(path)
+                    .with_context(|| {
+                        format!("capturing sealed action executable identity {}", path.display())
+                    })?,
         })
     }
 
-    #[cfg(not(unix))]
-    fn capture(_path: &Path) -> Result<Self> {
-        bail!("sealed executable identity pinning is unsupported on this platform")
+    fn from_file(file: &std::fs::File) -> Result<Self> {
+        Ok(Self {
+            stable_id:
+                cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_identity(file)
+                    .context("capturing opened sealed action file identity")?,
+        })
     }
 
     pub(crate) fn matches(&self, file: &std::fs::File) -> Result<bool> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let metadata = file.metadata()?;
-            Ok(metadata.is_file() && metadata.dev() == self.device && metadata.ino() == self.inode)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            Ok(false)
-        }
+        Ok(Self::from_file(file)?.stable_id == self.stable_id)
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        !self.stable_id.is_empty()
     }
 }
 
@@ -121,8 +109,9 @@ impl CommandInjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDestination {
-    /// Materialize below `$XDG_RUNTIME_DIR`, which the operating system reclaims
-    /// at session end. The fixed filename may not contain separators.
+    /// Materialize below the platform's private runtime root: `$XDG_RUNTIME_DIR`
+    /// on Linux/Android, or macOS's OS-provided per-user temp root when XDG is
+    /// absent. The fixed filename may not contain separators.
     PrivateRuntime { filename: String },
     /// A fixed absolute path for a consumer that cannot accept another path.
     Pinned {
@@ -206,7 +195,7 @@ pub fn validate_command_kind(
     parameters: &BTreeMap<String, SealedParamSpecJson>,
 ) -> Result<()> {
     validate_argv(argv_template, SEALED_VALUE_ARG_PLACEHOLDER)?;
-    if executable_identity.device == 0 || executable_identity.inode == 0 {
+    if !executable_identity.is_pinned() {
         bail!("command action executable has not been identity-pinned");
     }
     if parameters.len() > super::MAX_SEALED_ACTION_PARAMS {
@@ -332,7 +321,7 @@ pub fn validate_file_kind(
         validate_argv(consumer_argv, SEALED_FILE_PATH_PLACEHOLDER)?;
         let identity = consumer_executable_identity
             .context("file consumer executable has not been identity-pinned")?;
-        if identity.device == 0 || identity.inode == 0 {
+        if !identity.is_pinned() {
             bail!("file consumer executable has not been identity-pinned");
         }
         if consumer_argv
@@ -406,7 +395,7 @@ impl CommandSealedAction {
                 &snapshot.description,
             )?,
             argv_template: argv_template.clone(),
-            executable_identity: *executable_identity,
+            executable_identity: executable_identity.clone(),
             injection: injection.clone(),
         })
     }
@@ -444,7 +433,7 @@ impl SealedHostAction for CommandSealedAction {
             &argv,
             environment,
             literal.expose(),
-            Some(self.executable_identity),
+            Some(self.executable_identity.clone()),
         )
         .await
     }
@@ -485,7 +474,7 @@ impl FileSealedAction {
             destination: destination.clone(),
             persistence: persistence.clone(),
             consumer_argv: consumer_argv.clone(),
-            consumer_executable_identity: *consumer_executable_identity,
+            consumer_executable_identity: consumer_executable_identity.clone(),
         })
     }
 }
@@ -514,7 +503,7 @@ impl SealedHostAction for FileSealedAction {
             .await;
         let resolved = resolve_destination(&self.destination)?;
         let path = &resolved.path;
-        git_leak_guard(&path).await?;
+        git_leak_guard(&resolved).await?;
         // An ephemeral pinned target is always a new inode.  It must never
         // truncate or delete a pre-existing owner file merely because the
         // action happened to use the same declared pathname.
@@ -523,9 +512,9 @@ impl SealedHostAction for FileSealedAction {
         let cleanup = EphemeralFile::new(
             path.clone(),
             !self.persistence.is_persistent(),
-            file_identity,
+            file_identity.clone(),
         );
-        let held_materialized = hold_materialized_file(path, file_identity)?;
+        let held_materialized = hold_materialized_file(path, file_identity.clone())?;
         let consumer_path = retained_materialized_path(path, held_materialized.as_ref())?;
         let consume_result = if !self.consumer_argv.is_empty() {
             let rendered = zeroize::Zeroizing::new(
@@ -540,16 +529,18 @@ impl SealedHostAction for FileSealedAction {
                     })
                     .collect::<Vec<_>>(),
             );
+            resolved.revalidate_before_spawn()?;
             run_command_scrubbed(
                 &rendered,
                 None,
                 literal.expose(),
-                self.consumer_executable_identity,
+                self.consumer_executable_identity.clone(),
             )
             .await
         } else {
             Ok(())
         };
+        drop(held_materialized);
         // Completion is not reported until the consuming step's materialized
         // plaintext has been removed. `Drop` remains only cancellation/panic
         // backstop; its failure cannot turn a normal invocation into success.
@@ -601,10 +592,20 @@ fn scrub_output(bytes: &[u8], literal: &str) -> String {
 
 struct ResolvedDestination {
     path: PathBuf,
+    git_guard: GitGuard,
+    git_path: Option<PathBuf>,
     // Kept alive through git inspection, file creation, child spawn, and
     // cleanup. On Linux `path` is rooted at this descriptor via procfs.
     _pinned_parent:
         Option<cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
+    #[cfg(windows)]
+    _pinned_windows_execution_lease:
+        Option<cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease>,
+}
+
+enum GitGuard {
+    Skip,
+    Inspect { repo_parent: PathBuf },
 }
 
 fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestination> {
@@ -616,6 +617,7 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             let parent = path
                 .parent()
                 .context("pinned sealed-file destination has no parent")?;
+            let guard_path = path.clone();
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -625,19 +627,33 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             if held.identity() != parent_identity.stable_id.as_str() {
                 bail!("pinned sealed-file destination parent identity changed since approval");
             }
+            #[cfg(windows)]
+            let windows_execution_lease = Some(
+                held.acquire_windows_execution_lease(parent)
+                    .context("leasing pinned sealed-file parent for Windows consumer path")?,
+            );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let path = held
                 .retained_relative_path(name)
                 .context("creating retained pinned sealed-file destination path")?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let path = path.clone();
             Ok(ResolvedDestination {
                 path,
+                git_guard: GitGuard::Inspect {
+                    repo_parent: parent.to_path_buf(),
+                },
+                git_path: Some(guard_path),
                 _pinned_parent: Some(held),
+                #[cfg(windows)]
+                _pinned_windows_execution_lease: windows_execution_lease,
             })
         }
         FileDestination::PrivateRuntime { filename } => {
-            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .context("sealed file materialization requires an absolute XDG_RUNTIME_DIR")?;
+            let runtime_dir = cockpit_host::private_fs::private_runtime_root().context(
+                "sealed file materialization requires a private runtime root \
+                 (absolute XDG_RUNTIME_DIR, or on macOS the OS-provided per-user temp root)",
+            )?;
             let base = runtime_dir.join(format!(
                 "flycockpit-sealed-{}-{}",
                 std::process::id(),
@@ -647,9 +663,31 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
                 .context("creating private sealed runtime directory")?;
             Ok(ResolvedDestination {
                 path: base.join(filename),
+                git_guard: GitGuard::Skip,
+                git_path: None,
                 _pinned_parent: None,
+                #[cfg(windows)]
+                _pinned_windows_execution_lease: None,
             })
         }
+    }
+}
+
+impl ResolvedDestination {
+    #[cfg(windows)]
+    fn revalidate_before_spawn(&self) -> Result<()> {
+        if let Some(lease) = &self._pinned_windows_execution_lease {
+            lease.revalidate_before_spawn().context(
+                "revalidating pinned sealed-file Windows execution lease before consumer spawn",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn revalidate_before_spawn(&self) -> Result<()> {
+        let _ = self;
+        Ok(())
     }
 }
 
@@ -686,12 +724,8 @@ async fn write_private_file(
         .open(path)
         .await
         .context("opening sealed file destination")?;
-    let created_identity = ExecutableIdentity::from_metadata(
-        &file
-            .metadata()
-            .await
-            .context("reading created sealed-file identity")?,
-    )?;
+    let created_identity = ExecutableIdentity::from_file(file.as_std())
+        .context("reading created sealed-file identity")?;
     use tokio::io::AsyncWriteExt;
     let write_result = async {
         file.write_all(literal.as_bytes())
@@ -719,11 +753,20 @@ async fn write_private_file(
 async fn write_private_file(
     path: &Path,
     literal: &str,
-    _exclusive: bool,
+    exclusive: bool,
 ) -> Result<Option<ExecutableIdentity>> {
-    cockpit_host::private_fs::write_private_file(path, literal.as_bytes())
-        .context("writing ACL-private sealed file")?;
-    Ok(None)
+    if exclusive {
+        cockpit_host::private_fs::write_private_file_exclusive(path, literal.as_bytes())
+            .context("writing ACL-private sealed file exclusively")?;
+    } else {
+        cockpit_host::private_fs::write_private_file(path, literal.as_bytes())
+            .context("writing ACL-private sealed file")?;
+    }
+    let file = open_windows_retained_materialized_file(path)
+        .context("re-opening Windows sealed file after materialization")?;
+    Ok(Some(
+        ExecutableIdentity::from_file(&file).context("reading created sealed-file identity")?,
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -735,10 +778,13 @@ async fn write_private_file(
     bail!("sealed file materialization is unsupported on this platform")
 }
 
-async fn git_leak_guard(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("sealed file destination has no parent")?;
+async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
+    let GitGuard::Inspect {
+        repo_parent: parent,
+    } = &resolved.git_guard
+    else {
+        return Ok(());
+    };
     let mut inside_command = tokio::process::Command::new("git");
     inside_command
         .arg("-C")
@@ -758,7 +804,11 @@ async fn git_leak_guard(path: &Path) -> Result<()> {
         // rename, so a failed Git inspection is always fail-closed.
         bail!("cannot establish sealed file git-guard state for destination");
     }
-    let path_text = path.to_string_lossy();
+    let path_text = resolved
+        .git_path
+        .as_ref()
+        .unwrap_or(&resolved.path)
+        .to_string_lossy();
     let tracked = git_status(parent, &["ls-files", "--error-unmatch", "--", &path_text]).await?;
     let ignored = git_status(parent, &["check-ignore", "-q", "--", &path_text]).await?;
     if tracked || !ignored {
@@ -812,7 +862,7 @@ impl Drop for EphemeralFile {
         if self.remove {
             // Cancellation/panic cannot return an error to the caller. Normal
             // completion uses `remove` above; this is a best-effort backstop.
-            let _ = remove_ephemeral_file_checked(&self.path, self.identity);
+            let _ = remove_ephemeral_file_checked(&self.path, self.identity.clone());
         }
     }
 }
@@ -833,6 +883,10 @@ fn remove_ephemeral_file_checked(path: &Path, identity: Option<ExecutableIdentit
     if let Some(identity) = identity {
         return remove_ephemeral_file_if_identity(path, identity);
     }
+    #[cfg(windows)]
+    if let Some(identity) = identity.as_ref() {
+        return remove_ephemeral_file_if_identity(path, identity);
+    }
     remove_ephemeral_file(path)
 }
 
@@ -844,7 +898,7 @@ fn remove_ephemeral_file_checked(path: &Path, identity: Option<ExecutableIdentit
 fn hold_materialized_file(
     path: &Path,
     identity: Option<ExecutableIdentity>,
-) -> Result<Option<std::fs::File>> {
+) -> Result<Option<RetainedMaterializedFile>> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let Some(identity) = identity else {
         return Ok(None);
@@ -857,26 +911,43 @@ fn hold_materialized_file(
     if !identity.matches(&file)? {
         bail!("materialized sealed-file identity changed before consumer execution");
     }
-    Ok(Some(file))
+    Ok(Some(RetainedMaterializedFile::new(file)?))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn hold_materialized_file(
+    path: &Path,
+    identity: Option<ExecutableIdentity>,
+) -> Result<Option<RetainedMaterializedFile>> {
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    let file = open_windows_retained_materialized_file(path)
+        .context("opening retained Windows materialized file")?;
+    if !identity.matches(&file)? {
+        bail!("materialized sealed-file identity changed before consumer execution");
+    }
+    Ok(Some(RetainedMaterializedFile::new(file)?))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn hold_materialized_file(
     _path: &Path,
     _identity: Option<ExecutableIdentity>,
-) -> Result<Option<std::fs::File>> {
+) -> Result<Option<RetainedMaterializedFile>> {
     Ok(None)
 }
 
-fn retained_materialized_path(path: &Path, held: Option<&std::fs::File>) -> Result<PathBuf> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(held) = held {
-        use std::os::fd::AsRawFd as _;
-        return Ok(PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd())));
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn retained_materialized_path(
+    path: &Path,
+    held: Option<&RetainedMaterializedFile>,
+) -> Result<PathBuf> {
+    #[cfg(windows)]
     if held.is_some() {
-        bail!("descriptor-backed materialized file paths are unsupported on this platform");
+        return Ok(path.to_path_buf());
+    }
+    if let Some(held) = held {
+        return held.path();
     }
     Ok(path.to_path_buf())
 }
@@ -897,6 +968,166 @@ fn remove_ephemeral_file_if_identity(path: &Path, expected: ExecutableIdentity) 
         bail!("ephemeral sealed-file identity changed before cleanup");
     }
     std::fs::remove_file(path).context("removing ephemeral sealed file")
+}
+
+#[cfg(windows)]
+fn remove_ephemeral_file_if_identity(path: &Path, expected: &ExecutableIdentity) -> Result<()> {
+    let file = open_windows_retained_materialized_file(path)
+        .context("reopening Windows ephemeral sealed file for cleanup")?;
+    if !expected.matches(&file)? {
+        bail!("ephemeral sealed-file identity changed before cleanup");
+    }
+    delete_windows_file_by_handle(&file)?;
+    // Best-effort path cleanup after handle-marked deletion keeps the helper
+    // behavior aligned with the Unix unlink contract when the last handle drops.
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+struct RetainedMaterializedFile {
+    file: std::fs::File,
+}
+
+impl RetainedMaterializedFile {
+    fn new(file: std::fs::File) -> Result<Self> {
+        #[cfg(unix)]
+        clear_cloexec(&file)?;
+        Ok(Self { file })
+    }
+
+    fn path(&self) -> Result<PathBuf> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd as _;
+            Ok(PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                self.file.as_raw_fd()
+            )))
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            use std::os::fd::AsRawFd as _;
+            Ok(PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd())))
+        }
+        #[cfg(windows)]
+        {
+            Err(anyhow::anyhow!(
+                "Windows consumers use the retained verified pathname directly"
+            ))
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            windows
+        )))]
+        {
+            Err(anyhow::anyhow!(
+                "descriptor-backed materialized file paths are unsupported on this platform"
+            ))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn clear_cloexec(file: &std::fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        bail!(
+            "reading retained materialized file descriptor flags failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        bail!(
+            "clearing CLOEXEC on retained materialized file failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_retained_materialized_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+
+    // This retained handle is reused for both identity verification and
+    // handle-bound deletion via `delete_windows_file_by_handle`. Write sharing
+    // allows the declared consumer, while omitting delete sharing preserves the
+    // rename/delete fence alongside DELETE and read/write access.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening Windows retained sealed file {}", path.display()))
+}
+
+#[cfg(windows)]
+fn delete_windows_file_by_handle(file: &std::fs::File) -> Result<()> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle as _;
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+    #[repr(C)]
+    struct FileDispositionInformation {
+        delete_file: u8,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            file: *mut c_void,
+            io: *mut IoStatusBlock,
+            information: *const c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+
+    const FILE_DISPOSITION_INFORMATION: u32 = 13;
+    // `open_windows_retained_materialized_file` is the only producer for the
+    // cleanup handles below; that opener requests DELETE explicitly so this
+    // `NtSetInformationFile(FileDispositionInformation)` call cannot receive an
+    // incompatible read/write-only handle.
+    let info = FileDispositionInformation { delete_file: 1 };
+    let mut io = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io,
+            (&info as *const FileDispositionInformation).cast(),
+            size_of::<FileDispositionInformation>() as u32,
+            FILE_DISPOSITION_INFORMATION,
+        )
+    };
+    if status < 0 {
+        bail!(
+            "marking Windows sealed file for deletion by handle failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -217,24 +217,12 @@ pub(crate) async fn run_injected_process(
     executable_identity: Option<crate::sealed::action_admin::local_executor::ExecutableIdentity>,
 ) -> Result<InjectedCommandCapture, CommandSecretError> {
     let (program, args) = argv.split_first().ok_or(CommandSecretError::EmptySpec)?;
-    let held_executable = if let Some(identity) = executable_identity {
+    let pinned_executable = if let Some(identity) = executable_identity {
         open_identity_pinned_executable(program, identity)?
     } else {
         return Err(CommandSecretError::Io("identity_pin_missing".to_string()));
     };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let program = format!(
-        "/proc/self/fd/{}",
-        std::os::fd::AsRawFd::as_raw_fd(&held_executable)
-    );
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let program = {
-        let _ = held_executable;
-        return Err(CommandSecretError::Io(
-            "identity_pin_unsupported".to_string(),
-        ));
-    };
-    let mut command = tokio::process::Command::new(program);
+    let mut command = tokio::process::Command::new(pinned_executable.launch_path());
     command
         .args(args)
         // The action snapshot has already pinned an absolute executable. Do
@@ -273,7 +261,7 @@ pub(crate) async fn run_injected_process(
 fn open_identity_pinned_executable(
     program: &str,
     identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
-) -> Result<std::fs::File, CommandSecretError> {
+) -> Result<PinnedExecutable, CommandSecretError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -288,14 +276,85 @@ fn open_identity_pinned_executable(
         {
             return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
         }
-        Ok(file)
+        Ok(PinnedExecutable::unix(file, program))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(program)
+            .map_err(map_spawn_error)?;
+        if !identity
+            .matches(&file)
+            .map_err(|error| CommandSecretError::Io(error.to_string()))?
+        {
+            return Err(CommandSecretError::Io("identity_pin_changed".to_string()));
+        }
+        Ok(PinnedExecutable::windows(file, program))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (program, identity);
         Err(CommandSecretError::Io(
             "identity_pin_unsupported".to_string(),
         ))
+    }
+}
+
+struct PinnedExecutable {
+    _file: std::fs::File,
+    launch_path: String,
+}
+
+impl PinnedExecutable {
+    #[cfg(unix)]
+    fn unix(file: std::fs::File, _program: &str) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd as _;
+            return Self {
+                launch_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
+                _file: file,
+            };
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            use std::os::fd::AsRawFd as _;
+            return Self {
+                launch_path: format!("/dev/fd/{}", file.as_raw_fd()),
+                _file: file,
+            };
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        {
+            Self {
+                _file: file,
+                launch_path: _program.to_string(),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows(file: std::fs::File, program: &str) -> Self {
+        Self {
+            _file: file,
+            launch_path: program.to_string(),
+        }
+    }
+
+    fn launch_path(&self) -> &str {
+        &self.launch_path
     }
 }
 

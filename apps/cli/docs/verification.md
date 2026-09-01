@@ -108,8 +108,9 @@ instructions/files, curated tool outputs with provenance, and the proposed
 change, but no author transcript or raw tool-call invocations. Configuration
 validation warns when an `inherit` generator targets an untrusted slot.
 
-The trusted adjudicator still receives the full context. Candidates containing
-the redaction placeholder are marked `invalid` and are never selectable.
+The adjudicator's model must be trusted before it receives the full context;
+otherwise adjudication fails closed. Candidates containing the redaction
+placeholder are marked `invalid` and are never selectable.
 
 Generator and adjudicator inferences are journaled through the normal
 inference-journal barrier. Candidate bodies never enter the tool-call

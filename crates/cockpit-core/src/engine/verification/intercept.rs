@@ -40,8 +40,7 @@ use super::{
     },
     generate::{CollectedCandidate, CollectionInput, collect_candidates},
     recipe::{
-        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot,
-        select_guidance_for_target,
+        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot, select_guidance_for_target,
     },
 };
 
@@ -430,10 +429,12 @@ async fn run_verification(
                 &std::slice::from_ref(&super::adjudicate::verdict_tool()),
             );
         let adjudicator_tools = serde_json::to_string(&adjudicator_tools)?;
-        let adjudicator_fixed = format!(
-            "{}\n{}\n{}",
-            adjudicator_system, adjudicator_tools, adjudicator_prompt
-        );
+        let adjudicator_fixed = serde_json::to_string(&serde_json::json!({
+            "system": adjudicator_system,
+            "history": input.history,
+            "prompt": adjudicator_prompt,
+            "tools": adjudicator_tools,
+        }))?;
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
             assembled_texts: std::slice::from_ref(&adjudicator_fixed),
             encoding: encoding_for_model_id(model.model_id_ref()),
@@ -685,6 +686,7 @@ async fn run_verification(
                         input.ctx.interrupts.as_ref(),
                         &input.ctx.cancel,
                         &format!("{}:verification-adjudicator", input.agent.name),
+                        input.history,
                         input.resolved_name,
                         input.args,
                         &collected,

@@ -236,7 +236,7 @@ impl App {
                     cockpit_proto::Request::SetToolSurfaceOverride {
                         override_json,
                         persist_session,
-                        prune_after_switch: cache_break,
+                        cache_break_acknowledged: cache_break,
                         monty_nudge,
                     },
                     applied,

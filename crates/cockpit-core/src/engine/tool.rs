@@ -2474,6 +2474,21 @@ impl ToolBox {
             })
     }
 
+    /// Whether the provider-visible native schema is unchanged for the
+    /// steering used by an active agent. Discoverable MCP tools are absent
+    /// from this projection, so their catalog-only transitions compare equal.
+    ///
+    /// This is intentionally separate from `definition_cache`: an empty
+    /// rendered-definition cache must not make a native-schema transition look
+    /// cache-neutral.
+    pub(crate) fn native_schema_matches(
+        &self,
+        previous: &Self,
+        steering: crate::agents::ToolSteering,
+    ) -> bool {
+        self.advertised_definitions(steering) == previous.advertised_definitions(steering)
+    }
+
     pub fn mcp_builtin_registry(&self) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
         let funcs = self
             .mcp_builtin_tools

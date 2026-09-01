@@ -19607,7 +19607,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
-            prune_after_switch: true,
+            cache_break_acknowledged: true,
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
@@ -22117,7 +22117,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
-            prune_after_switch: true,
+            cache_break_acknowledged: true,
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
@@ -22367,14 +22367,14 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     SessionWork::SetToolSurfaceOverride {
                         override_json,
                         persist_session,
-                        prune_after_switch,
+                        cache_break_acknowledged,
                         monty_nudge,
                         respond_to,
                     },
                 ) => {
                     assert!(override_json.contains("\"read\""));
                     assert!(persist_session);
-                    assert!(prune_after_switch);
+                    assert!(cache_break_acknowledged);
                     assert_eq!(monty_nudge.as_deref(), Some("monty tools enabled: read"));
                     respond_to
                         .send(Ok(()))
@@ -22757,7 +22757,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         "set_tool_surface_override" => Request::SetToolSurfaceOverride {
             override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
             persist_session: true,
-            prune_after_switch: true,
+            cache_break_acknowledged: true,
             monty_nudge: None,
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
@@ -26868,7 +26868,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             request: Request::SetToolSurfaceOverride {
                 override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
                 persist_session: true,
-                prune_after_switch: true,
+                cache_break_acknowledged: true,
                 monty_nudge: None,
             },
             kind: "set_tool_surface_override",

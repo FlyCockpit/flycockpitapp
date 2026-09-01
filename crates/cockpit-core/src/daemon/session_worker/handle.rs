@@ -2371,7 +2371,7 @@ pub enum SessionWork {
     SetToolSurfaceOverride {
         override_json: String,
         persist_session: bool,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },

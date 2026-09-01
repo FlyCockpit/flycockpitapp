@@ -3183,13 +3183,13 @@ async fn relay_agent_tree_events(
 
 pub(super) fn tool_surface_override_control(
     selection: crate::agents::ToolSurfaceSelection,
-    prune_after_switch: bool,
+    cache_break_acknowledged: bool,
     monty_nudge: Option<String>,
     respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> crate::engine::driver::DriverControl {
     crate::engine::driver::DriverControl::SetToolSurfaceOverride {
         selection,
-        prune_after_switch,
+        cache_break_acknowledged,
         monty_nudge,
         respond_to,
     }
@@ -13072,7 +13072,7 @@ pub(super) async fn run_worker(
                 SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge,
                     respond_to,
                 } => {
@@ -13093,21 +13093,12 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
-                    let prior_override = session.tool_surface_override_json();
-                    if persist_session
-                        && let Err(error) =
-                            session.set_tool_surface_override_json(Some(override_json.clone()))
-                    {
-                        let message = format!("could not persist session override: {error:#}");
-                        let _ = respond_to.send(Err(message));
-                        continue;
-                    }
                     let (driver_respond_to, driver_result) = tokio::sync::oneshot::channel();
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         tool_surface_override_control(
                             selection,
-                            prune_after_switch,
+                            cache_break_acknowledged,
                             monty_nudge,
                             driver_respond_to,
                         ),
@@ -13119,9 +13110,6 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
-                        if persist_session {
-                            let _ = session.set_tool_surface_override_json(prior_override);
-                        }
                         let _ = respond_to.send(Err("driver stopped before tool update".into()));
                         break WorkerStop::DriverFailed;
                     }
@@ -13129,17 +13117,20 @@ pub(super) async fn run_worker(
                         .await
                         .unwrap_or_else(|_| Err("driver dropped tool update result".into()));
                     if let Err(error) = applied {
-                        if persist_session
-                            && let Err(rollback_error) =
-                                session.set_tool_surface_override_json(prior_override)
-                        {
-                            tracing::error!(%rollback_error, session_id = %session_id, "rolling back refused tool override failed");
-                            let _ = respond_to.send(Err(format!(
-                                "{error}; durable rollback failed: {rollback_error:#}"
-                            )));
-                            continue;
-                        }
                         let _ = respond_to.send(Err(error));
+                        continue;
+                    }
+                    // Persist only after the driver accepted the transition.
+                    // Persisting first leaves a crash window where an
+                    // unacknowledged native-schema change is replayed during
+                    // startup without ever crossing the driver's cache-break
+                    // gate.
+                    if persist_session
+                        && let Err(error) =
+                            session.set_tool_surface_override_json(Some(override_json))
+                    {
+                        let message = format!("could not persist session override: {error:#}");
+                        let _ = respond_to.send(Err(message));
                         continue;
                     }
                     let _ = respond_to.send(Ok(()));

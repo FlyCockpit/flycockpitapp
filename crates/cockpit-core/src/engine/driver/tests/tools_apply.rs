@@ -49,7 +49,7 @@ async fn tools_apply_rebuilds_root_and_prunes() {
                     tools,
                     tool_tiers: base.tool_tiers,
                 },
-                prune_after_switch: true,
+                cache_break_acknowledged: true,
                 monty_nudge: Some("monty tools disabled: code".to_string()),
                 respond_to,
             },
@@ -82,7 +82,56 @@ async fn tools_apply_rebuilds_root_and_prunes() {
         events
             .iter()
             .any(|event| matches!(event, TurnEvent::Pruned { .. })),
-        "tool-surface apply with prune_after_switch should use prune path"
+        "an acknowledged native tool-surface change must use the prune path"
+    );
+}
+
+#[tokio::test]
+async fn tools_apply_refuses_unacknowledged_native_schema_change_before_mutation() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    install_pinned_build_definition(&mut driver);
+    let before = driver.stack[0].agent.clone();
+    let mut base = crate::agents::embedded_default("Build").unwrap();
+    let mut tools = base.tools.take().unwrap();
+    assert!(
+        tools.iter().any(|tool| tool == "read"),
+        "fixture must start with a native read tool"
+    );
+    tools.retain(|tool| tool != "read");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let (respond_to, result) = tokio::sync::oneshot::channel();
+
+    driver
+        .run_control(
+            DriverControl::SetToolSurfaceOverride {
+                selection: crate::agents::ToolSurfaceSelection {
+                    tools,
+                    tool_tiers: base.tool_tiers,
+                },
+                cache_break_acknowledged: false,
+                monty_nudge: Some("must not be staged".to_string()),
+                respond_to,
+            },
+            &tx,
+        )
+        .await;
+
+    let error = result
+        .await
+        .unwrap()
+        .expect_err("native schema changes require acknowledgement");
+    assert!(error.contains("cache-break acknowledgement"), "{error}");
+    assert!(
+        Arc::ptr_eq(&driver.stack[0].agent, &before),
+        "refusal must leave the active tool surface untouched"
+    );
+    assert!(driver.pending_monty_tool_nudge.is_none());
+    let events = drain_ready(&mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Pruned { .. })),
+        "an unacknowledged change must not mutate cached context"
     );
 }
 
@@ -101,7 +150,7 @@ async fn tools_apply_refused_when_subagent_foreground() {
                     tools: vec!["read".to_string()],
                     tool_tiers: std::collections::BTreeMap::new(),
                 },
-                prune_after_switch: true,
+                cache_break_acknowledged: true,
                 monty_nudge: None,
                 respond_to,
             },

@@ -250,7 +250,9 @@ pub enum DriverControl {
     /// subagent owns the foreground.
     SetToolSurfaceOverride {
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        /// Confirms the caller warned the user about a provider cache break.
+        /// The driver, not the caller, determines whether pruning is required.
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
@@ -6405,12 +6407,12 @@ impl Driver {
             }
             DriverControl::SetToolSurfaceOverride {
                 selection,
-                prune_after_switch,
+                cache_break_acknowledged,
                 monty_nudge,
                 respond_to,
             } => {
                 let result = self
-                    .set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
+                    .set_tool_surface_override(selection, cache_break_acknowledged, monty_nudge, tx)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -9684,7 +9686,7 @@ impl Driver {
     async fn set_tool_surface_override(
         &mut self,
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> std::result::Result<(), String> {
@@ -9705,26 +9707,36 @@ impl Driver {
         args.model_override = Some(current.model.clone());
         args.params = current.params.clone();
         args.vnext_grant = current.vnext_grant.clone();
-        let updated = (|| -> Result<Agent> {
+        let updated = (|| -> Result<(Agent, bool)> {
             let mut def =
                 current.definition.as_deref().cloned().ok_or_else(|| {
                     anyhow::anyhow!("running frame has no pinned agent definition")
                 })?;
             crate::agents::apply_tool_surface_override(&mut def, &selection)?;
             let mut rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
-            rebuilt
+            let native_schema_changed = !rebuilt
                 .tools
-                .preserve_definition_cache_if_native_schema_matches(&current.tools);
+                .native_schema_matches(&current.tools, current.tool_steering);
+            if native_schema_changed && !cache_break_acknowledged {
+                anyhow::bail!(
+                    "native tool-surface changes require cache-break acknowledgement before applying"
+                );
+            }
+            if !native_schema_changed {
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(&current.tools);
+            }
             let mut updated = (*current).clone();
             // This control changes only the requested tool surface. All other
             // running-frame state stays pinned, while the adjusted definition
             // becomes the snapshot used by later model/config rebuilds.
             updated.tools = rebuilt.tools;
             updated.definition = rebuilt.definition;
-            Ok(updated)
+            Ok((updated, native_schema_changed))
         })();
         match updated {
-            Ok(updated) => {
+            Ok((updated, native_schema_changed)) => {
                 self.stack[0].agent = Arc::new(updated);
                 self.schedule.set_agent(self.stack[0].agent.clone());
                 if let Some(note) = monty_nudge {
@@ -9736,7 +9748,7 @@ impl Driver {
                     })
                     .await;
                 self.emit_context_projection(tx).await;
-                if prune_after_switch {
+                if native_schema_changed {
                     self.do_prune(false, tx).await;
                 }
                 Ok(())

@@ -2469,7 +2469,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "override_json:string|persist_session:bool|prune_after_switch:bool|monty_nudge:option<string>",
+      "fcorCanonicalSchema": "override_json:string|persist_session:bool|cache_break_acknowledged:bool|monty_nudge:option<string>",
       "fcorRoles": [
         {
           "field": "override_json",
@@ -2482,7 +2482,7 @@
           "type": "bool"
         },
         {
-          "field": "prune_after_switch",
+          "field": "cache_break_acknowledged",
           "role": "param",
           "type": "bool"
         },
@@ -2492,7 +2492,7 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>",
+      "fcorSchema": "override_json:String|persist_session:bool|cache_break_acknowledged:bool|monty_nudge:Option<String>",
       "strategy": "nonrepeatable_dispatch",
       "tag": "set_tool_surface_override"
     },

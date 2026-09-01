@@ -13389,7 +13389,7 @@ async fn handle_serialized_request_impl(
         Request::SetToolSurfaceOverride {
             override_json,
             persist_session,
-            prune_after_switch,
+            cache_break_acknowledged,
             monty_nudge,
         } => {
             let att = require_attached(state)?;
@@ -13398,7 +13398,7 @@ async fn handle_serialized_request_impl(
                 let request = Request::SetToolSurfaceOverride {
                     override_json: override_json.clone(),
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge: monty_nudge.clone(),
                 };
                 if let Some(response) =
@@ -13415,7 +13415,7 @@ async fn handle_serialized_request_impl(
                 .send_work(SessionWork::SetToolSurfaceOverride {
                     override_json,
                     persist_session,
-                    prune_after_switch,
+                    cache_break_acknowledged,
                     monty_nudge,
                     respond_to,
                 })

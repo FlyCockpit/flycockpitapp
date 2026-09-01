@@ -743,27 +743,10 @@ const ID_INJECTION_EDIT: &str = "inj_edit";
 
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 
-/// Path to the global `config.json` to write override settings
-/// into: the first existing home-scoped config dir, else the first
-/// creatable one (scaffolded). Errors only when no home dir is locatable.
+/// Path to the user-owned global `config.json` for override settings.
+/// Workspace trust never selects or gates this file.
 fn global_extended_config_path() -> Result<std::path::PathBuf> {
-    use crate::config::dirs::{
-        CONFIG_FILE, ConfigDirKind, creatable_config_dirs, discover_config_dirs,
-    };
-    // Prefer an existing home-scoped layer.
-    if let Some(dir) = discover_config_dirs(std::path::Path::new("."))
-        .into_iter()
-        .find(|d| matches!(d.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
-    {
-        return Ok(dir.path.join(CONFIG_FILE));
-    }
-    // Otherwise scaffold the first creatable home location.
-    let dir = creatable_config_dirs()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no home directory to write global config into"))?;
-    std::fs::create_dir_all(&dir.path)?;
-    Ok(dir.path.join(CONFIG_FILE))
+    crate::config::dirs::global_config_file()
 }
 
 /// Handle the session worker keeps to cancel the in-flight user-message

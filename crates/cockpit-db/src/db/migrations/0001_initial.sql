@@ -2788,6 +2788,10 @@ CREATE INDEX packages_source_url ON packages(source_url);
 --     millisecond resolution. The `type` discriminant aligns with the
 --     engine `TurnEvent` vocabulary; per-type fields ride in `data_json`
 --     so the schema stays stable as the event set grows.
+--     Rows are append-only except for the atomic cancel-before-response
+--     retraction of the latest user_message. Retraction appends a durable
+--     tombstone after deleting the message; AUTOINCREMENT remains mandatory
+--     so global replay and org-sync cursors can never observe a reused id.
 
 -- One row per DISPATCHED TARGET ATTEMPT of a logical inference call. The
 -- primary attempt is ordinal 0; each backup/failover attempt shares the logical
@@ -2835,7 +2839,7 @@ CREATE TABLE session_events (
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
         'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree',
-        'thread_anchor'
+        'thread_anchor', 'user_message_retracted'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

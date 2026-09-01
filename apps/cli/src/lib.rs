@@ -194,6 +194,10 @@ pub mod integration {
             session_id: Uuid,
             max_seq: i64,
             entries: Vec<ReplayEntry>,
+            /// Durable user-row identities retracted since the replay cursor.
+            /// These ids let consumers remove stale projected rows before
+            /// applying the retained replay entries.
+            removed_user_message_seqs: Vec<i64>,
         },
         ToolStart {
             session_id: Uuid,
@@ -539,10 +543,12 @@ pub mod integration {
             crate::daemon::proto::Event::HistoryReplay {
                 session_id,
                 entries,
+                removed_user_message_seqs,
                 max_seq,
             } => DaemonEvent::HistoryReplay {
                 session_id,
                 max_seq,
+                removed_user_message_seqs,
                 entries: entries
                     .iter()
                     .map(|entry| ReplayEntry {

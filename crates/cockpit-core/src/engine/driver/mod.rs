@@ -58,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -83,6 +83,16 @@ use crate::{
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::{InferenceSendIdentity, Session};
+
+/// Serializes the detached automatic-title write with retraction of the user
+/// message that triggered it. A retraction either fences the write before it
+/// happens or observes its exact generated title for the rollback CAS; it can
+/// never abort the task between those two ownership steps.
+#[derive(Default)]
+struct RetractableAutoTitleState {
+    retracted: bool,
+    persisted_title: Option<String>,
+}
 
 /// Out-of-band control requests routed to the driver from the daemon
 /// worker — `/prune`, `/compact`, `/pin`. Drained on the same boundary
@@ -755,17 +765,33 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
 /// inference and signals any foreground `bash` subprocess to die. Adopted
 /// subprocesses live in the session registry and are cancelled alongside this
 /// handle by the worker. Idempotent and safe at idle — when no run is in flight
-/// the slot is `None` and [`Self::cancel`] is a no-op.
+/// the slot is `None` and [`Self::cancel_turn`] is a no-op.
 #[derive(Clone)]
 pub struct CancelHandle {
     current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// The shared token is also used by deadlines and terminal invocation
+    /// state.  This bit is set only by an interactive CancelTurn.
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CancelHandle {
-    /// Cancel the in-flight run, if any. Safe to call when idle (no-op),
-    /// when already cancelling (cancelling a cancelled token is a no-op),
-    /// and concurrently from multiple callers.
-    pub fn cancel(&self) {
+    /// Cancel the in-flight run for an interactive `CancelTurn`, if any.
+    /// Safe to call when idle (no-op), when already cancelling (cancelling a
+    /// cancelled token is a no-op), and concurrently from multiple callers.
+    ///
+    /// This is intentionally distinct from a lifecycle, deadline, or
+    /// `CancelAllSessionWork` cancellation: only an explicit user turn cancel
+    /// can retract the just-recorded message.
+    pub fn cancel_turn(&self) {
+        if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
+            self.user_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            token.cancel();
+        }
+    }
+
+    /// Cancel the in-flight run without attributing it to `CancelTurn`.
+    pub fn cancel_noninteractive(&self) {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             token.cancel();
         }
@@ -778,11 +804,14 @@ impl CancelHandle {
 /// fresh first press.
 struct CancelSlotGuard {
     slot: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for CancelSlotGuard {
     fn drop(&mut self) {
         *crate::sync::lock_or_recover(&self.slot) = None;
+        self.user_requested
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1305,6 +1334,7 @@ pub struct Driver {
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_cancel_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Session-owned waiters for backgroundable tools that have yielded their
     /// foreground turn. Unlike `cancel_current`, this registry survives turn
     /// boundaries and is drained by the session worker.
@@ -2300,6 +2330,7 @@ impl Driver {
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
+            user_cancel_requested: self.user_cancel_requested.clone(),
             adopted_processes: self.adopted_processes.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
@@ -2671,6 +2702,7 @@ impl Driver {
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
+            user_cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
             approver: None,
             lsp: None,
@@ -4344,10 +4376,11 @@ impl Driver {
     /// A handle the session worker keeps so a user ctrl+c
     /// (`SessionWork::Cancel`) can abort the in-flight user-message run.
     /// Cheap to clone — it shares the driver's `cancel_current` slot. See
-    /// [`CancelHandle::cancel`].
+    /// [`CancelHandle::cancel_turn`].
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
             current: self.cancel_current.clone(),
+            user_requested: self.user_cancel_requested.clone(),
         }
     }
 
@@ -4779,9 +4812,12 @@ impl Driver {
         self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -10035,9 +10071,12 @@ impl Driver {
         // scheduler owns this token too, so its callback timeout/drop aborts
         // the provider call instead of merely abandoning the response waiter.
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let active_target_id = self.active_queue_target_id();
@@ -11825,15 +11864,18 @@ impl Driver {
             None
         };
         // Install a fresh cancellation token for this run so a user ctrl+c
-        // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
+        // (`SessionWork::Cancel` → `CancelHandle::cancel_turn`) can abort the
         // in-flight inference and kill any running `bash` subprocess. The
         // guard clears the slot on every exit path (normal, cancel, error)
         // so a stale token can never affect a later run.
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         // Run-invocation deadline: child cancel token so expiry aborts provider/
@@ -11978,6 +12020,7 @@ impl Driver {
         } else {
             None
         };
+        let mut recorded_user_seq = None;
         let artifact_frame = if let Some(mut oversized) = oversized_artifact_submission {
             // Long preprocessing can consume most of the original lease. Renew
             // at this final boundary, rotating the token when required, before
@@ -12161,6 +12204,7 @@ impl Driver {
                         source_artifact,
                         projection_artifact,
                     } = *materialized;
+                    recorded_user_seq = Some(event_seq);
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
@@ -12380,6 +12424,7 @@ impl Driver {
             };
             match record_outcome {
                 UserMessageRecordOutcome::Recorded(seq) => {
+                    recorded_user_seq = Some(seq);
                     // Carry the assigned `seq` (the message's stable id) back to
                     // the client so it can stamp the already-pushed user history
                     // row. UI/DB-only — the seq never enters model context.
@@ -12561,6 +12606,7 @@ impl Driver {
         // after the foreground prompt is assembled below, so its prefix is the
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
+        let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
         let (title_action, mut metadata_work) = if use_session_model_metadata {
@@ -12572,6 +12618,7 @@ impl Driver {
         } else {
             (self.session.note_user_content(&canonical_user_text), None)
         };
+        let mut auto_title_task = None;
         if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
@@ -12592,19 +12639,45 @@ impl Driver {
             let redact = self.redact.clone();
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
-            tokio::spawn(async move {
-                crate::auto_title::generate_session_title(
-                    session,
-                    extended,
-                    providers,
-                    redact,
-                    content_prefix,
-                    title_action,
-                    Some(shutdown_gate),
-                    tx,
-                )
-                .await;
-            });
+            let title_session = Arc::clone(&session);
+            let title_state = Arc::new(Mutex::new(RetractableAutoTitleState::default()));
+            let task_title_state = Arc::clone(&title_state);
+            auto_title_task = Some((
+                title_state,
+                tokio::spawn(async move {
+                    let session_for_persist = Arc::clone(&title_session);
+                    crate::auto_title::generate_session_title_with_persist(
+                        session,
+                        extended,
+                        providers,
+                        redact,
+                        content_prefix,
+                        title_action,
+                        Some(shutdown_gate),
+                        tx,
+                        move |title, action| {
+                            // Hold this short synchronous critical section over both
+                            // the durable write and its rollback identity handoff.
+                            // Retraction takes the same mutex before aborting this
+                            // task, so an abort cannot strand a title derived solely
+                            // from the removed user row.
+                            let mut state = task_title_state.lock().unwrap();
+                            if state.retracted {
+                                return Ok(());
+                            }
+                            let stored = session_for_persist.set_auto_title(title)?;
+                            if stored && matches!(action, crate::session::TitleAction::Eager) {
+                                session_for_persist.mark_eager_titled();
+                            }
+                            if stored {
+                                state.persisted_title = Some(title.to_owned());
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await;
+                }),
+            ));
         }
 
         // Skills auto-selection (GOALS §5): consult the cheap utility
@@ -12795,6 +12868,7 @@ impl Driver {
             }
         }
 
+        let response_window_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
@@ -12871,6 +12945,7 @@ impl Driver {
             let attempted_prompt = next_prompt.clone();
             self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
+            turn_metadata.response_window_closed = std::sync::Arc::clone(&response_window_closed);
             let fallback_models = self.resolve_failover_models(&agent.model);
             // The durable snapshot carries the accepted continuation marker
             // for *every* subsequent model/tool phase, not merely its first
@@ -13111,6 +13186,65 @@ impl Driver {
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    let retractable_direct_turn = user_prompt_source == Some("user")
+                        && submission_kind == UserSubmissionKind::User
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
+                        && agent
+                            .model
+                            .resolve_reasoning_params(&self.config.providers())
+                            .is_some()
+                        && self
+                            .user_cancel_requested
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
+                    if retractable_direct_turn
+                        && let Some(seq) = recorded_user_seq
+                        && self
+                            .session
+                            .db
+                            .remove_latest_user_message(self.session.id, seq)
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
+                                false
+                            })
+                    {
+                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
+                            // The state handoff and the durable title write share
+                            // one mutex. Marking retracted before aborting either
+                            // prevents a later write or captures the exact title
+                            // already written for the rollback predicate.
+                            let generated_title = {
+                                let mut state = title_state.lock().unwrap();
+                                state.retracted = true;
+                                state.persisted_title.clone()
+                            };
+                            task.abort();
+                            let _ = task.await;
+                            generated_title
+                        } else {
+                            None
+                        };
+                        if let Err(error) = self.session.restore_title_progress_after_retract(
+                            title_progress_before_turn,
+                            generated_title.as_deref(),
+                        ).await {
+                            tracing::warn!(%error, "auto_title: retract rollback lost");
+                        }
+                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
+                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                        }
+                        let _ = tx
+                            .send(TurnEvent::UserMessageRemoved {
+                                seq,
+                                client_submission_ids: client_submissions
+                                    .iter()
+                                    .map(|receipt| receipt.id)
+                                    .collect(),
+                            })
+                            .await;
+                    }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
                             .session

@@ -2662,7 +2662,12 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
             Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
     }
-    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::Cancel)));
+    assert!(matches!(
+        work_rx.try_recv(),
+        Ok(SessionWork::Cancel {
+            origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn
+        })
+    ));
     assert!(
         work_rx.try_recv().is_err(),
         "replay must not dispatch a second cancel"
@@ -22313,7 +22318,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
                     respond_to.send(Ok(())).unwrap();
                 }
-                ("cancel_turn", SessionWork::Cancel) => {}
+                (
+                    "cancel_turn",
+                    SessionWork::Cancel {
+                        origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                    },
+                ) => {}
                 (
                     "resolve_interrupt",
                     SessionWork::ResolveInterrupt {
@@ -33766,6 +33776,49 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
     event_task.abort();
 }
 
+#[test]
+fn attach_hydration_lag_queues_resync_before_retained_events() {
+    let session_id = Uuid::new_v4();
+    let (event_tx, mut event_rx) = broadcast::channel(1);
+    event_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id,
+            text: "before durable snapshot".to_string(),
+        }))
+        .unwrap();
+    // This retraction falls in the broadcast gap. Its durable tombstone is
+    // recovered by the reattach that the lag marker requires, rather than
+    // leaving the client to infer a deletion from a stale snapshot.
+    event_tx
+        .send(test_event_envelope(proto::Event::UserMessageRemoved {
+            session_id,
+            seq: 41,
+            client_submission_ids: Vec::new(),
+        }))
+        .unwrap();
+    event_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id,
+            text: "retained after gap".to_string(),
+        }))
+        .unwrap();
+
+    let mut pending_replay = Vec::new();
+    replay_attach_hydration_events(&mut event_rx, &mut pending_replay, session_id);
+
+    assert!(matches!(
+        pending_replay.first(),
+        Some(proto::Event::EventStreamLagged {
+            session_id: Some(observed),
+            dropped: 2,
+        }) if *observed == session_id
+    ));
+    assert!(matches!(
+        pending_replay.get(1),
+        Some(proto::Event::Notice { text, .. }) if text == "retained after gap"
+    ));
+}
+
 #[tokio::test]
 async fn in_process_broadcast_lag_emits_typed_event() {
     let base = test_ctx();
@@ -35164,14 +35217,16 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             proto::Event::HistoryReplay {
                 session_id,
                 entries,
+                removed_user_message_seqs,
                 max_seq,
-            } => Some((*session_id, entries, *max_seq)),
+            } => Some((*session_id, entries, removed_user_message_seqs, *max_seq)),
             _ => None,
         })
         .expect("pending history replay");
-    let (session_id, entries, max_seq) = replay;
+    let (session_id, entries, removed_user_message_seqs, max_seq) = replay;
     assert_eq!(session_id, session.session_id);
     assert_eq!(max_seq, seq2);
+    assert!(removed_user_message_seqs.is_empty());
     assert_eq!(entries.len(), 1);
     match &entries[0] {
         proto::HistoryEntry::User { text, seq, .. } => {
@@ -35179,6 +35234,741 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             assert_eq!(*seq, seq2);
         }
         other => panic!("expected replayed user message, got {other:?}"),
+    }
+}
+
+/// A reconnecting client may have rendered the user row before its interactive
+/// reasoning-only cancel, then lost the nonpersistent removal broadcast. The
+/// durable tombstone must replay a targeted removal even though the deleted row
+/// cannot appear in normal history projection.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_since_seq_replays_retracted_user_row_identity() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let session = Session::insert_row_for_test(
+        &ctx.db,
+        tmp.path(),
+        "Build",
+        crate::session::TestSessionRowOptions::default()
+            .with_entry_mode(proto::SessionEntryMode::Assistant),
+    )
+    .await
+    .unwrap();
+    let visible_seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "older visible row"}),
+        )
+        .await
+        .unwrap();
+    let recorded_seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "seen before disconnect"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ctx.db
+            .remove_latest_user_message(session.session_id, recorded_seq)
+            .await
+            .unwrap()
+    );
+
+    let live_session = Arc::new(
+        Session::resume_for_test(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
+    );
+    let (handle, _work_rx) =
+        SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle, join);
+
+    let mut state = MutableClientState::detached_for_test();
+    let response = handle_request(
+        Request::Attach {
+            session_id: Some(session.session_id),
+            since_seq: Some(0),
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("reconnect attach succeeds");
+    assert!(matches!(response, Response::Attached { history, .. } if history.is_empty()));
+
+    let replay = state
+        .pending_replay
+        .iter()
+        .find_map(|event| match event {
+            proto::Event::HistoryReplay {
+                entries,
+                removed_user_message_seqs,
+                max_seq,
+                ..
+            } => Some((entries, removed_user_message_seqs, *max_seq)),
+            _ => None,
+        })
+        .expect("durable retraction replay");
+    assert!(matches!(
+        replay.0.as_slice(),
+        [proto::HistoryEntry::User { seq, text, .. }] if *seq == visible_seq && text == "older visible row"
+    ));
+    assert_eq!(replay.1.as_slice(), &[recorded_seq]);
+    assert!(
+        replay.2 > recorded_seq,
+        "the replay cursor covers the newer tombstone, not only the older displayed row"
+    );
+
+    let response = handle_request(
+        Request::Attach {
+            session_id: Some(session.session_id),
+            since_seq: None,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("full attach succeeds");
+    let Response::Attached {
+        history,
+        removed_user_message_seqs,
+        ..
+    } = response
+    else {
+        panic!("expected Attached response");
+    };
+    assert!(matches!(
+        history.as_slice(),
+        [proto::HistoryEntry::User { seq, text, .. }] if *seq == visible_seq && text == "older visible row"
+    ));
+    assert_eq!(removed_user_message_seqs, vec![recorded_seq]);
+}
+
+/// The local `CancelTurn` RPC must reach the real worker-owned driver rather
+/// than merely proving that dispatch can enqueue a `SessionWork::Cancel`.
+///
+/// This is deliberately a two-client acceptance path.  The originating TUI
+/// recognizes its own submission id in the removal fanout and restores its
+/// private composer draft; the other attached TUI sees the same row removal
+/// but cannot recover text that was never sent in the event.  The controlled
+/// model sends a real reasoning-only SSE delta before stalling, so this also
+/// locks the narrow retraction boundary to actual stream state rather than a
+/// test-only `CancelHandle` call.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
+    use crate::config::providers::{
+        ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig, ThinkingMode,
+    };
+
+    let (model_url, captured_requests, model_server) = retraction_acceptance_model_server().await;
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "lmstudio".to_string(),
+        ProviderEntry {
+            url: model_url,
+            models: vec![ModelEntry {
+                id: "retraction-model".to_string(),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "lmstudio".to_string(),
+        model: "retraction-model".to_string(),
+        reasoning_effort: None,
+        thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: None,
+    });
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .thinking_params
+        .0
+        .insert(
+            ThinkingMode::High,
+            serde_json::json!({"reasoning_effort":"high"}),
+        );
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers, extended,
+    ));
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
+    trust_workspace_root(&ctx, project.path()).await;
+
+    let attach_request = |session_id| Request::Attach {
+        session_id,
+        since_seq: None,
+        project_root: Some(project.path().to_string_lossy().into_owned()),
+        initial_model: None,
+        no_sandbox: false,
+        interactive: true,
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    };
+    let mut origin = owner_state_with_instance(Uuid::new_v4());
+    let Response::Attached { session_id, .. } =
+        handle_request(attach_request(None), &mut origin, &ctx)
+            .await
+            .expect("first TUI attaches to the real worker")
+    else {
+        panic!("expected Attached response");
+    };
+    let handle = origin
+        .attached
+        .as_ref()
+        .expect("origin remains attached")
+        .handle
+        .clone();
+    let mut origin_events = handle.subscribe();
+
+    let mut other = owner_state_with_instance(Uuid::new_v4());
+    assert!(matches!(
+        handle_request(attach_request(Some(session_id)), &mut other, &ctx)
+            .await
+            .expect("second TUI attaches to the same worker"),
+        Response::Attached { session_id: attached, .. } if attached == session_id
+    ));
+    let mut other_events = other
+        .attached
+        .as_ref()
+        .expect("other TUI remains attached")
+        .handle
+        .subscribe();
+
+    let send = |client_submission_id, text: &str| Request::SendUserMessageV2 {
+        ingress: MessageIngressV2::local_direct(
+            Uuid::now_v7(),
+            session_id.to_string(),
+            None,
+            None,
+            None,
+            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id,
+                origin: Default::default(),
+                text: text.to_string(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                delivery_class_override: None,
+                resolved_delivery_class: None,
+                resolved_queue_target: None,
+                attachments: Vec::new(),
+            },
+        ),
+    };
+
+    let retracted_submission = Uuid::now_v7();
+    assert!(matches!(
+        handle_request(send(retracted_submission, "same resend"), &mut origin, &ctx)
+            .await
+            .expect("the real worker accepts the initial message"),
+        Response::UserMessageQueued { .. }
+    ));
+    let recorded = wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "durable initial user row",
+        |event| matches!(event, proto::Event::UserMessageRecorded { client_submission_ids, .. } if client_submission_ids == &[retracted_submission]),
+    )
+    .await;
+    let recorded_seq = match recorded {
+        proto::Event::UserMessageRecorded { seq, .. } => seq,
+        _ => unreachable!("predicate selected a user row"),
+    };
+    wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "real provider reasoning delta",
+        |event| matches!(event, proto::Event::AssistantDisplayReasoningDelta { .. }),
+    )
+    .await;
+
+    // This is the acceptance boundary under test: request dispatch sends
+    // `SessionWork::Cancel { origin: InteractiveTurn }` to the actual worker,
+    // which reaches the driver's live cancellation token.
+    assert!(matches!(
+        handle_request(Request::CancelTurn, &mut origin, &ctx)
+            .await
+            .expect("CancelTurn dispatches to the attached real worker"),
+        Response::Ack
+    ));
+    for events in [&mut origin_events, &mut other_events] {
+        let removal = wait_for_retraction_acceptance_event(
+            events,
+            "retraction fanout to each attached TUI",
+            |event| matches!(event, proto::Event::UserMessageRemoved { seq, client_submission_ids, .. } if *seq == recorded_seq && client_submission_ids == &[retracted_submission]),
+        )
+        .await;
+        assert!(matches!(removal, proto::Event::UserMessageRemoved { .. }));
+    }
+    assert!(
+        !ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_message" && event.seq == recorded_seq),
+        "the recorded user row is physically deleted, not merely hidden"
+    );
+    assert!(
+        ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_message_retracted"),
+        "the durable retraction tombstone remains available for reconnect replay"
+    );
+    // The event contains only the opaque origin identity.  This is what makes
+    // the two existing TUI projections intentionally diverge: origin restores
+    // `same resend` into its composer, while the other client removes the row
+    // without receiving either composer text or a reasoning/title payload.
+    let removal_wire = serde_json::to_string(&proto::Event::UserMessageRemoved {
+        session_id,
+        seq: recorded_seq,
+        client_submission_ids: vec![retracted_submission],
+    })
+    .unwrap();
+    assert!(!removal_wire.contains("same resend"));
+    assert!(!removal_wire.contains("checking"));
+    for events in [&mut origin_events, &mut other_events] {
+        wait_for_retraction_acceptance_event(
+            events,
+            "idle after reasoning-only retraction",
+            |event| {
+                matches!(
+                    event,
+                    proto::Event::AgentIdle {
+                        reason: proto::IdleReason::Interrupted,
+                        ..
+                    }
+                )
+            },
+        )
+        .await;
+    }
+
+    // A resend must rebuild the identical provider request/cache prefix: the
+    // retracted durable row and reasoning display delta are not model history.
+    assert!(matches!(
+        handle_request(send(Uuid::now_v7(), "same resend"), &mut origin, &ctx)
+            .await
+            .expect("resend is accepted after a real CancelTurn"),
+        Response::UserMessageQueued { .. }
+    ));
+    wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "resent visible response",
+        |event| matches!(event, proto::Event::AssistantText { text, .. } if text == "resent answer"),
+    )
+    .await;
+    for events in [&mut origin_events, &mut other_events] {
+        wait_for_retraction_acceptance_event(events, "idle after resend", |event| {
+            matches!(event, proto::Event::AgentIdle { .. })
+        })
+        .await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if captured_requests.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model captured the original and resent provider requests");
+    let requests = captured_requests.lock().unwrap().clone();
+    assert_eq!(
+        requests[0], requests[1],
+        "retract + resend preserves the exact provider request, including its cacheable prefix"
+    );
+
+    // Visible text closes the retraction window.  This cancel still uses the
+    // RPC/server/worker path, but cannot delete the durable user row.
+    let text_submission = Uuid::now_v7();
+    assert!(matches!(
+        handle_request(
+            send(text_submission, "keep after visible text"),
+            &mut origin,
+            &ctx
+        )
+        .await
+        .expect("visible-text case is accepted"),
+        Response::UserMessageQueued { .. }
+    ));
+    wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "visible text before cancel",
+        |event| matches!(event, proto::Event::AssistantDisplayTextDelta { .. }),
+    )
+    .await;
+    handle_request(Request::CancelTurn, &mut origin, &ctx)
+        .await
+        .expect("CancelTurn after text is delivered");
+    let mut text_cancel_events = Vec::new();
+    for events in [&mut origin_events, &mut other_events] {
+        text_cancel_events.extend(
+            collect_retraction_acceptance_events_until(
+                events,
+                "idle after visible-text cancellation",
+                |event| {
+                    matches!(
+                        event,
+                        proto::Event::AgentIdle {
+                            reason: proto::IdleReason::Interrupted,
+                            ..
+                        }
+                    )
+                },
+            )
+            .await,
+        );
+    }
+    assert!(
+        !text_cancel_events
+            .iter()
+            .any(|event| matches!(event, proto::Event::UserMessageRemoved { .. })),
+        "visible output must not fan out a retract event: {text_cancel_events:?}"
+    );
+    assert!(
+        ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_message"
+                && event.data["text"] == "keep after visible text"),
+        "visible output makes cancellation normal: its user row remains durable"
+    );
+
+    // A completed real tool call closes the same window.  The scripted model
+    // only stalls on the tool-result follow-up request, so this cancellation
+    // proves the tool crossed the driver boundary before it was sent.
+    let tool_submission = Uuid::now_v7();
+    assert!(matches!(
+        handle_request(
+            send(tool_submission, "read before cancel"),
+            &mut origin,
+            &ctx
+        )
+        .await
+        .expect("tool case is accepted"),
+        Response::UserMessageQueued { .. }
+    ));
+    wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "completed real read tool before cancel",
+        |event| matches!(event, proto::Event::ToolEnd { call_id, .. } if call_id == "read-before-cancel"),
+    )
+    .await;
+    handle_request(Request::CancelTurn, &mut origin, &ctx)
+        .await
+        .expect("CancelTurn after tool is delivered");
+    let mut tool_cancel_events = Vec::new();
+    for events in [&mut origin_events, &mut other_events] {
+        tool_cancel_events.extend(
+            collect_retraction_acceptance_events_until(
+                events,
+                "idle after tool cancellation",
+                |event| {
+                    matches!(
+                        event,
+                        proto::Event::AgentIdle {
+                            reason: proto::IdleReason::Interrupted,
+                            ..
+                        }
+                    )
+                },
+            )
+            .await,
+        );
+    }
+    assert!(
+        !tool_cancel_events
+            .iter()
+            .any(|event| matches!(event, proto::Event::UserMessageRemoved { .. })),
+        "a completed tool must not fan out a retract event: {tool_cancel_events:?}"
+    );
+    assert!(
+        ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_message" && event.data["text"] == "read before cancel"),
+        "a tool call makes cancellation normal: its user row remains durable"
+    );
+
+    // `CancelAllSessionWork` uses the worker's noninteractive cancellation
+    // provenance even when it aborts this live, reasoning-only foreground
+    // stream. It must therefore leave the accepted user row intact.
+    let cancel_all_submission = Uuid::now_v7();
+    assert!(matches!(
+        handle_request(
+            send(cancel_all_submission, "keep after cancel all"),
+            &mut origin,
+            &ctx
+        )
+        .await
+        .expect("cancel-all boundary case is accepted"),
+        Response::UserMessageQueued { .. }
+    ));
+    wait_for_retraction_acceptance_event(
+        &mut origin_events,
+        "live reasoning before cancel-all",
+        |event| matches!(event, proto::Event::AssistantDisplayReasoningDelta { .. }),
+    )
+    .await;
+    handle_request(Request::CancelAllSessionWork, &mut origin, &ctx)
+        .await
+        .expect("CancelAllSessionWork reaches the real worker");
+    let mut cancel_all_events = Vec::new();
+    for events in [&mut origin_events, &mut other_events] {
+        cancel_all_events.extend(
+            collect_retraction_acceptance_events_until(
+                events,
+                "idle after cancel-all reasoning cancellation",
+                |event| {
+                    matches!(
+                        event,
+                        proto::Event::AgentIdle {
+                            reason: proto::IdleReason::Interrupted,
+                            ..
+                        }
+                    )
+                },
+            )
+            .await,
+        );
+    }
+    assert!(
+        !cancel_all_events
+            .iter()
+            .any(|event| matches!(event, proto::Event::UserMessageRemoved { .. })),
+        "CancelAllSessionWork must not retract a live reasoning turn: {cancel_all_events:?}"
+    );
+    assert!(
+        ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_message"
+                && event.data["text"] == "keep after cancel all"),
+        "noninteractive cancellation provenance keeps the live reasoning user row durable"
+    );
+
+    handle
+        .send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .await
+        .expect("real worker shuts down after acceptance test");
+    model_server.abort();
+}
+
+async fn wait_for_retraction_acceptance_event(
+    events: &mut crate::daemon::EventReceiver,
+    label: &str,
+    matches_event: impl Fn(&proto::Event) -> bool,
+) -> proto::Event {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
+            if matches_event(&event.event) {
+                return event.event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+}
+
+async fn collect_retraction_acceptance_events_until(
+    events: &mut crate::daemon::EventReceiver,
+    label: &str,
+    terminal: impl Fn(&proto::Event) -> bool,
+) -> Vec<proto::Event> {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut collected = Vec::new();
+        loop {
+            let event = events
+                .recv()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
+            let terminal = terminal(&event.event);
+            collected.push(event.event);
+            if terminal {
+                return collected;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+}
+
+/// Six controlled chat-completions streams for the acceptance test above:
+/// reasoning/hang, resend/text, visible-text/hang, tool, then tool-follow-up
+/// hang, then reasoning/hang for the `CancelAllSessionWork` boundary. Hanging
+/// the socket after a real delta forces production cancellation to abort a
+/// live HTTP stream; it cannot be simulated by a completed turn.
+async fn retraction_acceptance_model_server() -> (
+    String,
+    Arc<StdMutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(StdMutex::new(Vec::new()));
+    let captured_server = captured.clone();
+    let reasoning = serde_json::json!({
+        "id": "retraction-1", "model": "retraction-model",
+        "choices": [{ "delta": { "reasoning_content": "checking" }, "finish_reason": null }]
+    });
+    let resent = serde_json::json!({
+        "id": "retraction-2", "model": "retraction-model",
+        "choices": [{ "delta": { "content": "resent answer" }, "finish_reason": null }]
+    });
+    let visible = serde_json::json!({
+        "id": "retraction-3", "model": "retraction-model",
+        "choices": [{ "delta": { "content": "visible answer" }, "finish_reason": null }]
+    });
+    let tool = serde_json::json!({
+        "id": "retraction-4", "model": "retraction-model",
+        "choices": [{ "delta": { "tool_calls": [{
+            "index": 0, "id": "read-before-cancel", "type": "function",
+            "function": { "name": "read", "arguments": "{\\\"path\\\":\\\"fixture.txt\\\"}" }
+        }] }, "finish_reason": null }]
+    });
+    let tool_finish = serde_json::json!({
+        "id": "retraction-4", "model": "retraction-model",
+        "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+    });
+    let streams = vec![
+        (format!("data: {reasoning}\n\n"), true),
+        (format!("data: {resent}\n\ndata: [DONE]\n\n"), false),
+        (format!("data: {visible}\n\n"), true),
+        (
+            format!("data: {tool}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"),
+            false,
+        ),
+        (String::new(), true),
+        (format!("data: {reasoning}\n\n"), true),
+    ];
+    let server = tokio::spawn(async move {
+        for (stream_body, hang) in streams {
+            let (mut socket, _) = listener.accept().await.expect("model accepts request");
+            let request = read_retraction_acceptance_http_request(&mut socket).await;
+            captured_server.lock().unwrap().push(request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("model writes stream headers");
+            socket
+                .write_all(stream_body.as_bytes())
+                .await
+                .expect("model writes stream body");
+            socket.flush().await.expect("model flushes stream body");
+            if hang {
+                let mut eof = [0_u8; 1];
+                let _ = socket.read(&mut eof).await;
+            }
+        }
+    });
+    (format!("http://{address}/v1"), captured, server)
+}
+
+async fn read_retraction_acceptance_http_request(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    let mut scratch = [0_u8; 4096];
+    loop {
+        let read = socket
+            .read(&mut scratch)
+            .await
+            .expect("model reads request");
+        assert!(read > 0, "model request ended before its HTTP headers");
+        bytes.extend_from_slice(&scratch[..read]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).expect("ASCII HTTP headers");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content length")
+                    })
+                })
+            })
+            .expect("model request has a content length");
+        let body_start = header_end + 4;
+        if bytes.len() >= body_start + content_length {
+            return String::from_utf8(bytes[body_start..body_start + content_length].to_vec())
+                .expect("UTF-8 JSON request body");
+        }
     }
 }
 

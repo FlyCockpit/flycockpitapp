@@ -1217,7 +1217,10 @@ pub fn history_page_before_conn(
     })
 }
 
-fn history_snapshot_from_events_conn(
+/// Project one already-read ledger snapshot into transcript entries. Keeping
+/// the input rows caller-owned lets an attach couple history with other
+/// ledger-derived metadata from the exact same SQLite read.
+pub(crate) fn history_snapshot_from_events_conn(
     conn: &Connection,
     session_id: Uuid,
     root_agent: &str,

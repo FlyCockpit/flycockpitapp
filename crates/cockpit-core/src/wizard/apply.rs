@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::dirs::{
-    CONFIG_FILE, config_write_target_for_provider, most_specific_config_write_target,
-};
+use crate::config::dirs::global_config_file;
 use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::ConfigDoc;
 use crate::wizard::{
@@ -85,11 +83,10 @@ pub fn model_descriptor_for_cwd(cwd: &Path, preselect: Option<(&str, &str)>) -> 
     crate::wizard::model_descriptor_with_selection(&current, preselect)
 }
 
-/// Where [`apply_security_answers`] will write: the most specific writable
-/// config layer for `cwd`, falling back to `cwd/.cockpit/config.json` when
-/// no layer exists yet.
-pub fn security_config_path(cwd: &Path) -> PathBuf {
-    most_specific_config_write_target(cwd).unwrap_or_else(|| cwd.join(".cockpit").join(CONFIG_FILE))
+/// Where onboarding security answers are written: the always-writable global
+/// layer. Workspace trust never selects or gates this path.
+pub fn security_config_path() -> Result<PathBuf> {
+    global_config_file().context("resolving global config for security setup")
 }
 
 /// Persist the security wizard's answers: sandbox default mode, default
@@ -168,7 +165,7 @@ pub fn apply_security_answers_with_caps(
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Result<Option<PathBuf>> {
     let effective = crate::config::extended::load_for_cwd(cwd);
-    let target = security_config_path(cwd);
+    let target = security_config_path()?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut cfg = doc.config();
     let mut changed = false;
@@ -232,15 +229,16 @@ impl ModelAnswersOutcome {
 /// Persist the model wizard's answers for the selected `provider:model`:
 /// trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
-/// prompt, and optionally the active model. Model fields go to the most
-/// specific writable layer for that provider; the "make default" choice
-/// delegates to the one authoritative effective-default operation, which
-/// selects and verifies its own target layer.
+/// prompt, and optionally the active model. Onboarding model fields belong to
+/// the global config layer; workspace trust neither selects nor gates that
+/// user-owned target. The "make default" choice delegates to the one
+/// authoritative effective-default operation.
 pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
-    let model_target = config_write_target_for_provider(cwd, &provider_id).ok_or_else(|| {
-        anyhow!("provider `{provider_id}` config is not writable; cannot save model settings")
-    })?;
+    let global_config = global_config_file().context("resolving global config for model setup")?;
+    let model_target =
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)
+            .context("resolving global provider config for model setup")?;
     let effective = ConfigDoc::load_effective(cwd);
     let mut base = effective.clone();
     if let Some(model) = base.providers.get_mut(&provider_id).and_then(|provider| {
@@ -513,7 +511,7 @@ fn numeric_capability_override(
 mod tests {
     use super::*;
 
-    use crate::config::dirs::COCKPIT_CONFIG_ENV;
+    use crate::config::dirs::{COCKPIT_CONFIG_ENV, most_specific_config_write_target};
     use crate::wizard::WizardAnswer;
     use cockpit_test_support::TestEnvGuard;
 

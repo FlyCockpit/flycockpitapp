@@ -2,7 +2,8 @@
 //!
 //! Walk order (matches the [[config_layering]] plan):
 //!
-//!   1. Home-scoped: `~/.config/cockpit/`, then `~/.cockpit/`.
+//!   1. Global platform config (`~/.config/cockpit/` on Linux), then the
+//!      legacy `~/.cockpit/` layer.
 //!   2. Machine-local-but-project-scoped: a hashed-cwd dir under the
 //!      cockpit data dir. Lets a user override per-cwd without
 //!      committing anything to the repo. Hashing the cwd dodges
@@ -72,7 +73,7 @@ fn mark_stray_warned(stray: &Path) -> bool {
 /// Where a cockpit config directory was discovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDirKind {
-    /// `~/.config/cockpit/`
+    /// Platform-default global config dir (`~/.config/cockpit/` on Linux).
     HomeXdg,
     /// `~/.cockpit/`
     HomeDot,
@@ -89,18 +90,41 @@ pub struct ConfigDir {
     pub path: PathBuf,
 }
 
+/// The canonical user-owned global config directory. Unlike project
+/// `.cockpit/` layers, this path is never subject to workspace trust.
+pub fn global_config_dir() -> anyhow::Result<PathBuf> {
+    crate::config::resolve::cockpit_config_dir()
+}
+
+/// The canonical global `config.json` path. Onboarding and other
+/// user-level setup must use this rather than selecting a workspace layer.
+pub fn global_config_file() -> anyhow::Result<PathBuf> {
+    Ok(global_config_dir()?.join(CONFIG_FILE))
+}
+
+/// Ensure the canonical global directory exists and can accept writes.
+///
+/// This has no workspace-trust dependency. Persistent daemon boot calls it
+/// before publishing its socket; read-only commands intentionally do not.
+pub fn ensure_global_config_dir() -> anyhow::Result<PathBuf> {
+    let path = global_config_dir()?;
+    crate::config::files::ensure_private_writable_dir(&path)?;
+    Ok(path)
+}
+
 /// All cockpit config directories that exist on disk and apply to `cwd`.
 pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
     let mut out = Vec::new();
 
+    if let Ok(global) = global_config_dir()
+        && global.is_dir()
+    {
+        out.push(ConfigDir {
+            kind: ConfigDirKind::HomeXdg,
+            path: global,
+        });
+    }
     if let Some(home) = dirs::home_dir() {
-        let xdg = home.join(".config/cockpit");
-        if xdg.is_dir() {
-            out.push(ConfigDir {
-                kind: ConfigDirKind::HomeXdg,
-                path: xdg,
-            });
-        }
         let dot = home.join(".cockpit");
         if dot.is_dir() {
             out.push(ConfigDir {
@@ -253,7 +277,7 @@ pub fn mcp_file_layers_for_load(cwd: &Path) -> Vec<(ConfigDirKind, PathBuf)> {
 /// home XDG layer; `workspace` is the nearest project `.cockpit/mcp.json`.
 pub fn mcp_write_target_for_scope(cwd: &Path, scope: &str) -> Option<PathBuf> {
     match scope {
-        "global" => dirs::home_dir().map(|home| home.join(".config/cockpit").join(MCP_FILE)),
+        "global" => global_config_dir().ok().map(|dir| dir.join(MCP_FILE)),
         "workspace" => discover_config_dirs(cwd)
             .into_iter()
             .rev()
@@ -315,18 +339,15 @@ pub fn config_dirs_most_specific_first(cwd: &Path) -> Vec<ConfigDir> {
 
 /// Default places `/settings` will offer when no config exists yet.
 pub fn creatable_config_dirs() -> Vec<ConfigDir> {
-    let mut out = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        out.push(ConfigDir {
-            kind: ConfigDirKind::HomeXdg,
-            path: home.join(".config/cockpit"),
-        });
-        out.push(ConfigDir {
-            kind: ConfigDirKind::HomeDot,
-            path: home.join(".cockpit"),
-        });
-    }
-    out
+    global_config_dir()
+        .ok()
+        .map(|path| {
+            vec![ConfigDir {
+                kind: ConfigDirKind::HomeXdg,
+                path,
+            }]
+        })
+        .unwrap_or_default()
 }
 
 /// Candidate locations for "add a new config scoped to this directory":
@@ -510,6 +531,33 @@ mod tests {
         // proving the no-op path didn't pre-mark it.
         std::fs::write(&stray, "{}").unwrap();
         assert!(mark_stray_warned(&stray));
+    }
+
+    #[test]
+    fn global_config_dir_is_created_writable_and_ignores_workspace_trust() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = crate::config::trust::resolve_trust_root(&workspace).unwrap();
+        crate::config::trust::set_runtime_policy(
+            root,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+
+        let global = ensure_global_config_dir().unwrap();
+        assert_eq!(global, tmp.path().join("config/cockpit"));
+        assert!(global.is_dir());
+        assert_eq!(
+            discover_config_dirs(&workspace)
+                .into_iter()
+                .find(|dir| dir.kind == ConfigDirKind::HomeXdg)
+                .map(|dir| dir.path),
+            Some(global),
+            "workspace trust must not hide the user-owned global config layer"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[test]

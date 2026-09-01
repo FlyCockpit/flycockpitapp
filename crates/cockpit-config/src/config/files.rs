@@ -314,6 +314,21 @@ pub fn ensure_parent_dir_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a Cockpit-owned directory, keep its final component private, and
+/// prove that it accepts a create/remove cycle. Global configuration uses
+/// this during persistent daemon boot so a later onboarding write cannot be
+/// blocked by a missing or unwritable directory.
+pub(crate) fn ensure_private_writable_dir(path: &Path) -> Result<()> {
+    ensure_private_dir(path)?;
+    #[cfg(any(unix, windows))]
+    {
+        let directory = open_directory_handle_nofollow(path)?;
+        return probe_directory_writable_from_retained_directory(&directory, path);
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    Ok(())
+}
+
 /// Ensure a file's parent exists without taking ownership of an existing
 /// directory.
 ///
@@ -390,8 +405,8 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
         return false;
     }
 
-    if dirs::home_dir()
-        .is_some_and(|home| path == home.join(".config/cockpit") || path == home.join(".cockpit"))
+    if crate::config::dirs::global_config_dir().is_ok_and(|global| path == global)
+        || dirs::home_dir().is_some_and(|home| path == home.join(".cockpit"))
     {
         return true;
     }

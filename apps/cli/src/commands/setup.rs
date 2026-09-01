@@ -869,8 +869,7 @@ impl ProviderSetupActions {
                 #[cfg(not(test))]
                 let result = apply_security_wizard_via_daemon(&self.cwd, run).await?;
                 if result {
-                    self.security_saved =
-                        Some(cockpit_core::wizard::security_config_path(&self.cwd));
+                    self.security_saved = Some(cockpit_core::wizard::security_config_path()?);
                     io.write_line("Saved security settings through the daemon.")?;
                 } else {
                     io.write_line("Security settings unchanged.")?;

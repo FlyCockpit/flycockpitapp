@@ -1109,11 +1109,13 @@ fn discovered_settings_layers(
 ) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
     use cockpit_config::config::dirs::{CONFIG_FILE, ConfigDirKind as K};
     let mut layer_dirs = cockpit_config::config::dirs::discover_config_dirs(root);
-    if let Some(home) = dirs::home_dir() {
+    if let Ok(global) = cockpit_config::config::dirs::global_config_dir() {
         layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
             kind: K::HomeXdg,
-            path: home.join(".config/cockpit"),
+            path: global,
         });
+    }
+    if let Some(home) = dirs::home_dir() {
         layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
             kind: K::HomeDot,
             path: home.join(".cockpit"),

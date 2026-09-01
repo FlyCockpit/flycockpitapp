@@ -2482,7 +2482,8 @@ fn guidance_proposal_field_from_doc(doc: &ExtendedConfigDoc) -> Option<bool> {
 /// Resolve the global and canonical machine-local project doc layers of
 /// `allow_computer_guidance_proposals` for `cwd`.
 ///
-/// Home-scoped directories (`~/.config/cockpit`, `~/.cockpit`) fold into the
+/// Global/home directories (the platform config dir and legacy `~/.cockpit`)
+/// fold into the
 /// global slot; the machine-local per-cwd directory and any project
 /// `.cockpit` directories fold into the project slot. When `COCKPIT_CONFIG`
 /// selects a single file, that file is the effective (most-specific) layer and

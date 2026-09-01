@@ -1,8 +1,10 @@
 //! The Monty Python-sandbox runner backing the `mcp` tool (GOALS §18a).
 //!
 //! Runs a model-authored Python script in a locked-down [`monty`] VM and
-//! returns the script's final value as JSON, with captured `print(...)`
-//! output as a fallback when the final value is `None`. Host functions
+//! returns a host-owned projection envelope. `emit`, `show`, `notify`, and
+//! `attach` append JSON-serialized values to separate envelope lanes. When a
+//! script does not call `emit`, its final value (or captured `print(...)`
+//! output) is retained as the graceful model-lane fallback. MCP host functions
 //! are exposed inside the sandbox, attached as the `mcp` namespace object:
 //!
 //! - `mcp.search(query) -> list[dict]` — fuzzy/keyword search over
@@ -43,6 +45,31 @@ use super::config::McpConfig;
 
 const STDOUT_FALLBACK_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 
+/// Host-side result of one Monty execution. Values are serialized before they
+/// enter a lane, so callers never need a Python JSON helper and raw
+/// `mcp.invoke` results remain isolate-local unless explicitly projected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionEnvelope {
+    pub model: Vec<String>,
+    pub display: Vec<String>,
+    pub notifications: Vec<String>,
+    pub artifacts: Vec<String>,
+}
+
+impl ProjectionEnvelope {
+    pub fn model_text(&self) -> String {
+        join_lane(&self.model)
+    }
+
+    pub fn display_text(&self) -> String {
+        join_lane(&self.display)
+    }
+}
+
+fn join_lane(values: &[String]) -> String {
+    values.join("\n")
+}
+
 /// Resource limits applied to every sandbox run. Conservative: enough for
 /// realistic tool-orchestration scripts, tight enough that a runaway can't
 /// exhaust the host (priority #1 / §22).
@@ -70,8 +97,24 @@ pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
 pub(crate) const MCP_IMPORT_GUIDANCE: &str = "mcp is prebound in this sandbox; call mcp.search, \
 mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe, or mcp.invoke directly — do not import mcp";
 
-pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) -> Result<String> {
-    let runner = MontyRun::new(script.to_owned(), "mcp.py", vec!["mcp".to_owned()])
+pub async fn run_with_host(
+    script: &str,
+    cfg: &McpConfig,
+    host: &HostContext,
+) -> Result<String> {
+    Ok(run_envelope_with_host(script, cfg, host).await?.model_text())
+}
+
+pub async fn run_envelope_with_host(
+    script: &str,
+    cfg: &McpConfig,
+    host: &HostContext,
+) -> Result<ProjectionEnvelope> {
+    let input_names = ["mcp", "emit", "show", "notify", "attach"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let runner = MontyRun::new(script.to_owned(), "mcp.py", input_names)
         .map_err(|e| sandbox_err("Python compile error", &e))?;
 
     // The `mcp` namespace: an empty frozen dataclass. Any `mcp.<attr>(…)`
@@ -85,14 +128,22 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
         frozen: true,
     };
 
+    let projection_function = |name: &str, docstring: &str| MontyObject::Function {
+        name: name.to_owned(),
+        docstring: Some(docstring.to_owned()),
+    };
+    let inputs = vec![
+        mcp_ns,
+        projection_function("emit", "Append a JSON-able value to model context."),
+        projection_function("show", "Append a JSON-able display-only value."),
+        projection_function("notify", "Send a string to the human side channel."),
+        projection_function("attach", "Retain a JSON-able value as a text artifact."),
+    ];
     let tracker = LimitedTracker::new(limits());
     let mut stdout = String::new();
+    let mut envelope = ProjectionEnvelope::default();
     let mut progress = runner
-        .start(
-            vec![mcp_ns],
-            tracker,
-            PrintWriter::CollectString(&mut stdout),
-        )
+        .start(inputs, tracker, PrintWriter::CollectString(&mut stdout))
         .map_err(|e| sandbox_err("sandbox error", &e))?;
 
     loop {
@@ -101,11 +152,22 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
                 if let Some(recorder) = &host.child_events {
                     recorder.finish_suppressed().await;
                 }
-                return render_complete_value(&value, &stdout);
+                if envelope.model.is_empty() {
+                    envelope.model.push(render_complete_value(&value, &stdout)?);
+                }
+                return Ok(envelope);
             }
             RunProgress::FunctionCall(call) => {
-                let result =
-                    dispatch(cfg, host, &call.function_name, call.method_call, &call.args).await;
+                let result = if call.method_call {
+                    dispatch(cfg, host, &call.function_name, true, &call.args).await
+                } else {
+                    dispatch_projection(
+                        &mut envelope,
+                        &call.function_name,
+                        &call.args,
+                        &call.kwargs,
+                    )
+                };
                 let ext = match result {
                     Ok(obj) => ExtFunctionResult::Return(obj),
                     Err(msg) => ExtFunctionResult::Error(MontyException::new(
@@ -151,6 +213,42 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
             }
         }
     }
+}
+
+fn dispatch_projection(
+    envelope: &mut ProjectionEnvelope,
+    name: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+) -> Result<MontyObject, String> {
+    if !kwargs.is_empty() {
+        return Err(format!("{name}(x) does not accept keyword arguments"));
+    }
+    if args.len() != 1 {
+        return Err(format!("{name}(x) expects exactly one argument"));
+    }
+    let value = serialize_projection_value(&args[0])?;
+    match name {
+        "emit" => envelope.model.push(value),
+        "show" => envelope.display.push(value),
+        "notify" => {
+            let MontyObject::String(message) = &args[0] else {
+                return Err("notify(s) expects a string".to_owned());
+            };
+            envelope.notifications.push(message.clone());
+        }
+        "attach" => envelope.artifacts.push(value),
+        other => return Err(format!("unknown MCP sandbox function `{other}`")),
+    }
+    Ok(MontyObject::None)
+}
+
+fn serialize_projection_value(value: &MontyObject) -> Result<String, String> {
+    if let MontyObject::String(value) = value {
+        return Ok(value.clone());
+    }
+    serde_json::to_string(&JsonMontyObject(value))
+        .map_err(|error| format!("projection value is not JSON-serializable: {error}"))
 }
 
 fn render_complete_value(value: &MontyObject, stdout: &str) -> Result<String> {
@@ -795,6 +893,57 @@ mod tests {
         let cfg = McpConfig::default();
         let out = run("'hello ' + 'world'", &cfg).await.unwrap();
         assert_eq!(out, "\"hello world\"");
+    }
+
+    #[tokio::test]
+    async fn projection_functions_serialize_and_preserve_lane_order() {
+        let cfg = McpConfig::default();
+        let host = HostContext::empty_for_tests();
+        let envelope = run_envelope_with_host(
+            "emit('first')\nemit({'answer': 42})\nshow(['display', 1])\nnotify('done')\nattach({'large': True})\n'ignored final'",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.model, ["first", r#"{"answer":42}"#]);
+        assert_eq!(envelope.display, [r#"["display",1]"#]);
+        assert_eq!(envelope.notifications, ["done"]);
+        assert_eq!(envelope.artifacts, [r#"{"large":true}"#]);
+        assert_eq!(envelope.model_text(), "first\n{\"answer\":42}");
+    }
+
+    #[tokio::test]
+    async fn no_emit_keeps_final_expression_and_stdout_fallbacks() {
+        let cfg = McpConfig::default();
+        let host = HostContext::empty_for_tests();
+
+        let expression = run_envelope_with_host("{'ok': True}", &cfg, &host)
+            .await
+            .unwrap();
+        assert_eq!(expression.model, [r#"{"ok":true}"#]);
+
+        let printed = run_envelope_with_host("print({'ok': True})", &cfg, &host)
+            .await
+            .unwrap();
+        assert_eq!(printed.model, [r#"{"ok":true}"#]);
+    }
+
+    #[tokio::test]
+    async fn raw_invoke_result_is_not_projected_after_emit() {
+        let cfg = McpConfig::default();
+        let (host, _gate) = test_builtin_host(true);
+        let envelope = run_envelope_with_host(
+            "raw = mcp.invoke('cockpit', 'test_count', {'count': 7})\nemit({'count': raw['count']})\nraw",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.model, [r#"{"count":7}"#]);
+        assert!(!envelope.model_text().contains("count_type"));
     }
 
     #[tokio::test]

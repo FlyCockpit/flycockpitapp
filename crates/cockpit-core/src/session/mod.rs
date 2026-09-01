@@ -646,7 +646,7 @@ pub struct Session {
     /// deliberately separate from `last_usage`: context chrome may use a
     /// session-wide estimate, but cache work is authorized only by a hit from
     /// the endpoint it is about to refresh.
-    observed_cache_hit_endpoints: Mutex<BTreeSet<(String, String)>>,
+    observed_cache_hit_endpoints: Mutex<BTreeSet<crate::engine::model::CacheEndpointIdentity>>,
     /// Monotonic instant and durable identity of the most recent inference
     /// send. The cache-cold predicate uses the monotonic instant, while the
     /// daemon-scheduled keep-warm callback carries the unique identity across

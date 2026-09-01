@@ -581,10 +581,9 @@ fn slot_supports_observed_cache_hits(
                 candidate.model.model_id_ref(),
             )
             .mode,
-        input.session.has_observed_cache_hit_for_endpoint(
-            candidate.model.provider_id(),
-            candidate.model.model_id_ref(),
-        ),
+        input
+            .session
+            .has_observed_cache_hit_for_endpoint(&candidate.model.cache_endpoint_identity()),
     )
 }
 
@@ -624,27 +623,36 @@ fn dispatched_cache_read_count(
     }
 }
 
-async fn collect_dispatch_group(
-    input: &CollectionInput<'_>,
+async fn collect_dispatch_group<T, F>(
     slot: &str,
-    candidates: &[PreparedGeneratorCandidate<'_>],
+    candidates: &[T],
     plan: &CandidateDispatchPlan,
-) -> Result<CollectedDispatchGroup> {
+    candidate_index: impl Fn(&T) -> usize,
+    collect_one: F,
+) -> Result<CollectedDispatchGroup>
+where
+    F: for<'candidate> Fn(
+        &'candidate T,
+        Option<&'candidate AtomicBool>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CandidateExecution>> + 'candidate>,
+    >,
+{
     let mut collected = Vec::new();
     let candidate_count = candidates.len();
     if let Some(warm_index) = plan.warm_candidate {
         let warm = candidates
             .iter()
-            .find(|candidate| candidate.index == warm_index)
+            .find(|candidate| candidate_index(candidate) == warm_index)
             .expect("warm candidate must belong to its dispatch group");
-        let warm_execution = collect_one_candidate(input, warm, None).await?;
+        let warm_execution = collect_one(warm, None).await?;
         if let Some(candidate) = warm_execution.candidate {
             collected.push((warm_index, candidate));
         }
         let actual_mode = completed_dispatch_mode(plan, warm_execution.completed_provider_request);
         let fanout = candidates
             .iter()
-            .filter(|candidate| candidate.index != warm_index)
+            .filter(|candidate| candidate_index(candidate) != warm_index)
             .collect::<Vec<_>>();
         // Each sibling gets its own execution observation. Planned fan-out is
         // not telemetry: deadline, model, budget, and ledger gates can refuse
@@ -657,8 +665,8 @@ async fn collect_dispatch_group(
             for result in join_all(fanout.iter().zip(fanout_handoffs.iter()).map(
                 |(candidate, handoff)| async move {
                     Ok::<_, anyhow::Error>((
-                        candidate.index,
-                        collect_one_candidate(input, candidate, Some(handoff)).await?,
+                        candidate_index(candidate),
+                        collect_one(candidate, Some(handoff)).await?,
                     ))
                 },
             ))
@@ -691,8 +699,8 @@ async fn collect_dispatch_group(
     }
     for result in join_all(candidates.iter().map(|candidate| async move {
         Ok::<_, anyhow::Error>((
-            candidate.index,
-            collect_one_candidate(input, candidate, None).await?,
+            candidate_index(candidate),
+            collect_one(candidate, None).await?,
         ))
     }))
     .await
@@ -794,11 +802,15 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
 
     let mut indexed = Vec::new();
     let mut telemetry = Vec::with_capacity(scheduled.len());
-    for group in join_all(
-        scheduled
-            .iter()
-            .map(|(slot, candidates, plan)| collect_dispatch_group(input, slot, candidates, plan)),
-    )
+    for group in join_all(scheduled.iter().map(|(slot, candidates, plan)| {
+        collect_dispatch_group(
+            slot,
+            candidates,
+            plan,
+            |candidate| candidate.index,
+            |candidate, handoff| Box::pin(collect_one_candidate(input, candidate, handoff)),
+        )
+    }))
     .await
     {
         let group = group?;
@@ -1363,6 +1375,52 @@ mod tests {
             dispatched_cache_read_count(VerificationCandidateDispatch::Parallel, [true, true]),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn collect_dispatch_group_keeps_siblings_behind_failed_warm_execution_fence() {
+        for warm_outcome in ["failed", "cancelled", "timed_out", "pre_dispatch_refused"] {
+            let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed_attempts = attempted.clone();
+            let plan = candidate_dispatch_plan(
+                VerificationCandidateDispatch::WarmThenFanout,
+                &[0, 1, 2],
+                true,
+            );
+
+            let group = collect_dispatch_group(
+                "primary",
+                &[0, 1, 2],
+                &plan,
+                |candidate| *candidate,
+                move |candidate, provider_handoff| {
+                    observed_attempts
+                        .lock()
+                        .unwrap()
+                        .push((*candidate, provider_handoff.is_some()));
+                    Box::pin(async {
+                        Ok(CandidateExecution {
+                            candidate: None,
+                            completed_provider_request: false,
+                        })
+                    })
+                },
+            )
+            .await
+            .expect(
+                "a refused warm result is a terminal dispatch observation, not a collector error",
+            );
+
+            assert_eq!(
+                *attempted.lock().unwrap(),
+                vec![(0, false)],
+                "{warm_outcome} warm execution must not invoke a sibling collector/provider handoff"
+            );
+            assert_eq!(
+                group.telemetry["actual_mode"], "parallel",
+                "{warm_outcome} warm execution must report that fan-out never ran"
+            );
+        }
     }
 
     #[test]

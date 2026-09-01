@@ -9924,9 +9924,8 @@ impl Driver {
         };
         let context = providers.resolve_context(&provider, &model);
         let profile = providers.resolve_cache_retention_profile(&provider, &model);
-        let observed_cache_hit = self
-            .session
-            .has_observed_cache_hit_for_endpoint(&provider, &model);
+        let endpoint = self.active_agent().model.cache_endpoint_identity();
+        let observed_cache_hit = self.session.has_observed_cache_hit_for_endpoint(&endpoint);
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,
@@ -10109,20 +10108,20 @@ impl Driver {
             return Ok("skipped: idle window elapsed".to_string());
         }
 
+        let Some(root) = self.stack.first() else {
+            return Ok("skipped: root context unavailable".to_string());
+        };
+        let endpoint = root.agent.model.cache_endpoint_identity();
         let decision = crate::keep_warm::decide(
             context.keep_warm,
             context.idle_window_secs,
             providers.resolve_cache_retention_profile(&provider, &model_id),
-            self.session
-                .has_observed_cache_hit_for_endpoint(&provider, &model_id),
+            self.session.has_observed_cache_hit_for_endpoint(&endpoint),
         );
         if let crate::keep_warm::KeepWarmDecision::Skip(reason) = decision {
             return Ok(format!("skipped: {}", reason.as_str()));
         }
 
-        let Some(root) = self.stack.first() else {
-            return Ok("skipped: root context unavailable".to_string());
-        };
         let model = root.agent.model.clone();
         let params = root.agent.params.clone();
         let system = root.agent.system.clone();

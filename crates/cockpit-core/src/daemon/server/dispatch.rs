@@ -2743,8 +2743,8 @@ mod oauth_store_tests {
         assert!(source.contains("mcp-oauth/complete/v1\\0"));
         assert!(source.contains("finish_local_operation_error("));
         let complete_provider = source
-            .split("Request::CompleteProviderOAuth {")
-            .nth(1)
+            .rsplit("Request::CompleteProviderOAuth {")
+            .next()
             .and_then(|rest| rest.split("Request::CancelProviderOAuth {").next())
             .expect("CompleteProviderOAuth branch");
         assert!(
@@ -22887,8 +22887,8 @@ mod provider_atomic_authority_tests {
     fn descriptor_credential_mutations_use_a_private_record_namespace() {
         let source = include_str!("dispatch.rs");
         let completion = source
-            .split("Request::CompleteProviderOAuth {")
-            .nth(1)
+            .rsplit("Request::CompleteProviderOAuth {")
+            .next()
             .and_then(|tail| tail.split("Request::CancelProviderOAuth {").next())
             .expect("complete-provider-oauth dispatch arm");
         let completion_descriptor_lock = completion

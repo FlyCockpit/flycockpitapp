@@ -439,10 +439,9 @@ async fn sealed_owner_rpcs_are_owner_remoted_and_never_leak() {
 
 #[tokio::test]
 async fn action_admin_unknown_ids_reject_before_persist() {
-    // Unknown kind_id / origin_id / projection_id are rejected as a BadRequest
-    // BEFORE any persist. Positive control: a fully resolvable request passes the
-    // closed lookup and now persists a daemon-minted action instance (the backing
-    // is wired), proving the ids really were resolved before the persist boundary.
+    // The retired catalog selector is rejected before touching persistence. The
+    // owner-declared request is now the only create surface, and its declaration
+    // is parsed before a durable action can be minted.
     let ctx = test_ctx();
 
     let unknown_cases = [
@@ -472,16 +471,16 @@ async fn action_admin_unknown_ids_reject_before_persist() {
         );
     }
 
-    // Positive control: all ids resolve, so the request passes the closed lookup
-    // and persists a daemon-minted action instance.
+    // Positive control: an owner-declared fixed sink persists a daemon-minted
+    // action instance.
     let mut state = owner_state();
     let response = handle_request(
-        Request::CreateSealedAction {
-            kind_id: "https.notify".into(),
+        Request::CreateDeclaredSealedAction {
             project_id: "proj".into(),
             description: "notify".into(),
-            origin_id: "0".into(),
-            projection_id: "http_status_and_ok".into(),
+            declaration: proto::SealedActionDeclaration::CommandArgument {
+                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+            },
         },
         &mut state,
         &ctx,
@@ -17621,6 +17620,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "sealed_owner_inventory"
         | "list_sealed_actions"
         | "create_sealed_action"
+        | "create_declared_sealed_action"
         | "retire_sealed_action" => AuthzAllowedOutcome::Response,
         "edit_sealed_owner_description"
         | "revise_sealed_action_description"
@@ -17984,6 +17984,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("edit_sealed_owner_description"),
         authz_owner_only("list_sealed_actions"),
         authz_owner_only("create_sealed_action"),
+        authz_owner_only("create_declared_sealed_action"),
         authz_owner_only("revise_sealed_action_description"),
         authz_owner_only("revise_sealed_action_enabled"),
         authz_owner_only("retire_sealed_action"),
@@ -18143,7 +18144,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         #[cfg(feature = "remote")]
         authz_owner_only("set_provider_layer_metadata"),
         authz_owner_only("setup_copilot_auth"),
-        #[cfg(feature = "remote")]
         authz_owner_only("apply_setup_wizard"),
         authz_owner_only("save_mcp_config"),
         authz_owner_only("save_extended_config"),
@@ -19517,6 +19517,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             description: "notify".into(),
             origin_id: "0".into(),
             projection_id: "http_status_and_ok".into(),
+        },
+        "create_declared_sealed_action" => Request::CreateDeclaredSealedAction {
+            project_id: "proj".into(),
+            description: "notify".into(),
+            declaration: proto::SealedActionDeclaration::CommandArgument {
+                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+            },
         },
         "revise_sealed_action_description" => Request::ReviseSealedActionDescription {
             action_id: "act-authz".into(),
@@ -25718,6 +25725,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
 #[cfg(unix)]
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = persistent_test_ctx();
     let project = tempfile::tempdir().unwrap();
     ctx.db
@@ -27583,6 +27591,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::CreateDeclaredSealedAction {
+                project_id: "p".into(),
+                description: "d".into(),
+                declaration: proto::SealedActionDeclaration::CommandArgument {
+                    argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                },
+            },
+            kind: "create_declared_sealed_action",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::ReviseSealedActionDescription {
                 action_id: "a".into(),
                 description: "d".into(),
@@ -28603,6 +28624,7 @@ async fn assert_durable_attachment_persists(ctx: &Arc<DaemonContext>, attachment
 
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
     ctx.db
@@ -28770,6 +28792,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
 
 #[test]
 fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
@@ -30622,8 +30645,19 @@ async fn list_agents_returns_chat_ownable_primaries() {
     );
     for agent in &agents {
         assert!(agent.builtin);
-        assert_eq!(agent.mode, "assistant");
     }
+    assert_eq!(
+        agents
+            .iter()
+            .map(|agent| (agent.name.as_str(), agent.mode.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Assistant", "assistant"),
+            ("Plan", "coding"),
+            ("Build", "coding"),
+            ("Careful", "coding"),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -31073,7 +31107,7 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
     let project = tempfile::tempdir().unwrap();
-    let global_config = home.path().join("home/.config/cockpit/config.json");
+    let global_config = home.path().join("config/cockpit/config.json");
     std::fs::create_dir_all(global_config.parent().unwrap()).unwrap();
     std::fs::write(&global_config, r#"{"providers":{"global":{}}}"#).unwrap();
     let global_provider =
@@ -35657,6 +35691,7 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 /// test-only `CancelHandle` call.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
         ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig, ThinkingMode,
     };
@@ -36234,6 +36269,7 @@ async fn read_retraction_acceptance_http_request(socket: &mut tokio::net::TcpStr
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_compatible_reflects_client_protocol_version() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     ctx.db
@@ -36303,6 +36339,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
 async fn attach_resolves_model_from_injected_config_source() {
     use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
 
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "lmstudio".to_string(),
@@ -36403,6 +36440,7 @@ async fn attach_resolves_model_from_injected_config_source() {
 async fn reconnect_attach_uses_authoritative_default_correction_before_config_watch() {
     use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
 
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let old_default = ActiveModelRef {
         provider: "lmstudio".into(),
         model: "old-default".into(),
@@ -36819,6 +36857,7 @@ async fn attach_requires_db_workspace_trust_row() {
 /// see that from the code alone, never by matching the message text.
 #[tokio::test]
 async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let parent = tempfile::tempdir().unwrap();
@@ -36907,6 +36946,7 @@ async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable(
 
 #[tokio::test]
 async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let parent = tempfile::tempdir().unwrap();
@@ -36972,6 +37012,7 @@ async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity()
 
 #[tokio::test]
 async fn modes_session_setup_dispatch_rejects_replaced_ancestor_config_authority() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let container = tempfile::tempdir().unwrap();
@@ -37035,6 +37076,7 @@ async fn modes_session_setup_dispatch_rejects_replaced_ancestor_config_authority
 
 #[tokio::test]
 async fn modes_session_setup_shared_dispatch_rejects_replaced_ancestor_config_authority() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let container = tempfile::tempdir().unwrap();
@@ -37099,6 +37141,7 @@ async fn modes_session_setup_shared_dispatch_rejects_replaced_ancestor_config_au
 
 #[tokio::test]
 async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_and_restore() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let parent = tempfile::tempdir().unwrap();
     let workspace = parent.path().join("workspace");
     let moved = parent.path().join("workspace-attached");
@@ -38162,16 +38205,17 @@ async fn sealed_action_channel_create_list_revise_retire_roundtrip() {
     let ctx = test_ctx();
     let mut state = owner_state();
 
-    // Create via the closed catalog id.
+    // Create through the owner-declared fixed sink. Models never receive this
+    // declaration; they later interact only through the minted action id.
     let created = dispatch_sealed_owner(
         &ctx,
         &mut state,
-        Request::CreateSealedAction {
-            kind_id: "https.notify".into(),
+        Request::CreateDeclaredSealedAction {
             project_id: "proj".into(),
             description: "notify deploy".into(),
-            origin_id: "0".into(),
-            projection_id: "http_status_and_ok".into(),
+            declaration: proto::SealedActionDeclaration::CommandArgument {
+                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+            },
         },
     )
     .await

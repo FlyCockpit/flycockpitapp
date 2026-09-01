@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
-use crate::engine::message::{AssistantContent, Message, collect_tool_calls};
+use crate::engine::message::{AssistantContent, Message, collect_tool_calls, tool_result_message};
 
 /// The complete launch allowlist. Keep this closed and name-based: accepting a
 /// newly read-only effect classification here by accident would widen the
@@ -103,7 +103,8 @@ pub fn parse_seed_reads(value: Option<&Value>) -> Result<Vec<SeedRead>, String> 
 /// Ask a same-model ephemeral fork of the completed explore transcript which
 /// discoveries the implementation child should refresh. The fork receives the
 /// exact base native tool block; `seed_reads` exists only in its Monty host
-/// catalog. Prose and non-Monty calls are ignored.
+/// catalog. A native call is rejected with the fork's capability steering and
+/// gets one recovery turn; prose is ignored.
 #[allow(clippy::too_many_arguments)]
 pub async fn select_from_explore_fork(
     session: Arc<crate::session::Session>,
@@ -128,100 +129,166 @@ pub async fn select_from_explore_fork(
         config,
         slot.clone(),
     );
-    let prompt = Message::user(
+    let mut history = history.to_vec();
+    let mut prompt = Message::user(
         "Select only the read-only calls an implementation subagent should rerun before its first inference to avoid rediscovery while keeping results fresh. Call Monty exactly once with a script that invokes mcp.invoke('cockpit', 'seed_reads', {'calls': [...]}); each call is {'tool': one of read/grep/code/graph/search, 'args': {...}}. The script may compute the list programmatically. Do not execute the calls and do not explain.",
     );
-    let call_id = uuid::Uuid::new_v4();
-    let completion = model
-        .complete_captured_with_sealed_egress(
-            system,
-            history,
-            prompt,
-            &tools,
-            params,
-            agent_name,
-            false,
-            &cancel,
-            Some(sealed_egress.as_ref()),
-        )
-        .await;
-    let Ok(((_, content, usage), captured, _)) = completion else {
-        return SeedReadSelection::empty();
-    };
-    // This is a real provider inference even though its output is consumed
-    // only by the host. Keep the captured request, token cost, and timeline
-    // metadata joined by one call id so `/stats`, context usage, and export do
-    // not under-report the explore → implementation handoff.
-    let session_table = model.session_redact_table();
-    if let Err(error) = session
-        .record_inference_request(
-            call_id,
-            &captured,
-            crate::db::session_log::InferenceRequestStatus::Completed,
-            session_table.as_ref(),
-            model.is_trusted(),
-        )
-        .await
-    {
-        tracing::warn!(%error, "recording seed-read selection request failed");
-    }
-    if let Some(usage) = usage
-        && let Err(error) = session.record_usage_utility(call_id, usage).await
-    {
-        tracing::warn!(%error, "recording seed-read selection usage failed");
-    }
-    if let Err(error) = session
-        .record_event(
-            crate::db::session_log::SessionEventKind::InferenceRequest,
-            Some(agent_name),
-            Some(&call_id.to_string()),
-            &serde_json::json!({
-                "purpose": "seed_read_selection",
-                "usage": usage.map(|usage| serde_json::json!({
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cached_input_tokens": usage.cached_input_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                })),
-            }),
-        )
-        .await
-    {
-        tracing::warn!(%error, "recording seed-read selection completion failed");
-    }
-    let Some(script) = collect_tool_calls(&content)
-        .into_iter()
-        .find(|call| call.function.name == "mcp")
-        .and_then(|call| {
-            call.function
-                .arguments
-                .get("script")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-    else {
-        return SeedReadSelection::empty();
-    };
-    if crate::mcp::sandbox::run_with_host(&script, &crate::mcp::config::McpConfig::default(), &host)
-        .await
-        .is_err()
-    {
-        return SeedReadSelection::empty();
-    }
-    let calls = slot
-        .lock()
-        .ok()
-        .and_then(|mut selected| selected.take())
-        .unwrap_or_default();
-    let receipt = if !calls.is_empty() && session.parent_session_id.is_none() {
-        let Some(receipt) = session.issue_seed_read_receipt(&calls) else {
+    for _ in 0..2 {
+        let call_id = uuid::Uuid::new_v4();
+        let completion = model
+            .complete_captured_with_sealed_egress(
+                system,
+                &history,
+                prompt.clone(),
+                &tools,
+                params.clone(),
+                agent_name,
+                false,
+                &cancel,
+                Some(sealed_egress.as_ref()),
+            )
+            .await;
+        let Ok(((_, content, usage), captured, _)) = completion else {
             return SeedReadSelection::empty();
         };
-        Some(receipt)
-    } else {
-        None
-    };
-    SeedReadSelection { calls, receipt }
+        // This is a real provider inference even though its output is consumed
+        // only by the host. Keep the captured request, token cost, and timeline
+        // metadata joined by one call id so `/stats`, context usage, and export do
+        // not under-report the explore → implementation handoff.
+        let session_table = model.session_redact_table();
+        if let Err(error) = session
+            .record_inference_request(
+                call_id,
+                &captured,
+                crate::db::session_log::InferenceRequestStatus::Completed,
+                session_table.as_ref(),
+                model.is_trusted(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording seed-read selection request failed");
+        }
+        if let Some(usage) = usage
+            && let Err(error) = session.record_usage_utility(call_id, usage).await
+        {
+            tracing::warn!(%error, "recording seed-read selection usage failed");
+        }
+        if let Err(error) = session
+            .record_event(
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some(agent_name),
+                Some(&call_id.to_string()),
+                &serde_json::json!({
+                    "purpose": "seed_read_selection",
+                    "usage": usage.map(|usage| serde_json::json!({
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cached_input_tokens": usage.cached_input_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    })),
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, "recording seed-read selection completion failed");
+        }
+
+        let calls = collect_tool_calls(&content);
+        // Treat a mixed response as a failed selection attempt. Executing its
+        // Monty call and returning immediately would still drop the native
+        // sibling on the floor, leaving the model without the capability
+        // steering that ordinary dispatch would have produced.
+        if calls.iter().any(|call| {
+            host.builtin_registry
+                .capability_denial(&call.function.name)
+                .is_some()
+        }) {
+            history.push(prompt);
+            history.push(Message::Assistant { id: None, content });
+            for call in calls {
+                history.push(tool_result_message(
+                    &call,
+                    seed_reads_fork_ignored_tool_result(
+                        &host.builtin_registry,
+                        &call.function.name,
+                    ),
+                ));
+            }
+            prompt = Message::user(seed_reads_fork_retry_instruction());
+            continue;
+        }
+        let Some(script) = calls
+            .iter()
+            .find(|call| call.function.name == "mcp")
+            .and_then(|call| {
+                call.function
+                    .arguments
+                    .get("script")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        else {
+            // This ephemeral fork does not run the ordinary dispatcher, so it
+            // must still materialize the same guard denial a native call would
+            // receive there. Preserve every call/result pairing for the one
+            // recovery turn rather than silently dropping native calls.
+            history.push(prompt);
+            history.push(Message::Assistant { id: None, content });
+            for call in calls {
+                history.push(tool_result_message(
+                    &call,
+                    seed_reads_fork_ignored_tool_result(
+                        &host.builtin_registry,
+                        &call.function.name,
+                    ),
+                ));
+            }
+            prompt = Message::user(seed_reads_fork_retry_instruction());
+            continue;
+        };
+        if crate::mcp::sandbox::run_with_host(
+            &script,
+            &crate::mcp::config::McpConfig::default(),
+            &host,
+        )
+        .await
+        .is_err()
+        {
+            return SeedReadSelection::empty();
+        }
+        let calls = slot
+            .lock()
+            .ok()
+            .and_then(|mut selected| selected.take())
+            .unwrap_or_default();
+        let receipt = if !calls.is_empty() && session.parent_session_id.is_none() {
+            let Some(receipt) = session.issue_seed_read_receipt(&calls) else {
+                return SeedReadSelection::empty();
+            };
+            Some(receipt)
+        } else {
+            None
+        };
+        return SeedReadSelection { calls, receipt };
+    }
+    SeedReadSelection::empty()
+}
+
+fn seed_reads_fork_ignored_tool_result(
+    registry: &crate::mcp::builtin::BuiltinRegistry,
+    tool: &str,
+) -> String {
+    registry.capability_denial(tool).map_or_else(
+        || {
+            r#"{"ignored":true,"reason":"The explore seed-selection micro-fork only executes Monty calls."}"#
+                .to_string()
+        },
+        |denial| denial.to_string(),
+    )
+}
+
+fn seed_reads_fork_retry_instruction() -> &'static str {
+    "Read the tool results above. You are the explore seed-selection micro-fork, not a general worker. Do not use native tools. Call Monty exactly once with a script that invokes mcp.invoke('cockpit', 'seed_reads', {'calls': [...]}); do not execute the selected calls or explain."
 }
 
 pub fn append_to_report(mut report: String, selection: &SeedReadSelection) -> String {
@@ -505,6 +572,25 @@ mod tests {
         ])))
         .unwrap_err();
         assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn seed_selection_native_calls_receive_the_scoped_guard_denial() {
+        let registry =
+            crate::mcp::builtin::BuiltinRegistry::seed_reads_fork(Arc::new(Mutex::new(None)));
+        let result: Value =
+            serde_json::from_str(&seed_reads_fork_ignored_tool_result(&registry, "edit"))
+                .expect("guard denial is valid JSON");
+
+        assert_eq!(result["kind"], "capability_guard_denied");
+        assert_eq!(result["tool"], "edit");
+        assert!(
+            result["message"].as_str().is_some_and(|message| {
+                message.contains("the explore seed-selection micro-fork")
+                    && message.contains("`seed_reads`")
+            }),
+            "{result}"
+        );
     }
 
     #[test]

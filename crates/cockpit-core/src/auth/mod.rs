@@ -16,6 +16,7 @@ pub mod copilot_setup;
 pub mod flycockpit;
 pub(crate) mod refresh_guard;
 pub mod subscription_ack;
+#[cfg(feature = "grok-subscription")]
 pub mod xai_oauth;
 
 /// Reserved provider-credential key for the Flycockpit account credential.

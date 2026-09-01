@@ -1400,8 +1400,10 @@ export function reduceRemoteSessionEvent(
   }
 
   if (event.event === "history_replay") {
-    const entries = data?.entries;
-    if (!sessionId || !Array.isArray(entries)) return { state: existing, warningKind: event.event };
+    if (!sessionId || !data || !Array.isArray(data.entries)) {
+      return { state: existing, warningKind: event.event };
+    }
+    const entries = data.entries;
     const removedUserMessageSeqs = Array.isArray(data.removed_user_message_seqs)
       ? data.removed_user_message_seqs.filter((seq): seq is number => typeof seq === "number")
       : [];

@@ -846,6 +846,7 @@ impl ProviderSetupActions {
                     selected_provider_template(run).context("provider template answer")?;
                 self.headers = crate::providers::default_headers_for(template);
             }
+            #[cfg(feature = "grok-subscription")]
             "grok-oauth" => {
                 require_oauth_acknowledgement("grok-oauth", io).await?;
                 io.write_line("Starting Grok OAuth login.")?;
@@ -860,6 +861,12 @@ impl ProviderSetupActions {
                 let input = io.read_line().context("reading Grok OAuth callback")?;
                 complete_provider_oauth_via_daemon(flow_id, Some(input.trim().to_string())).await?;
                 io.write_line("Grok OAuth login complete.")?;
+            }
+            #[cfg(not(feature = "grok-subscription"))]
+            "grok-oauth" => {
+                anyhow::bail!(
+                    "Grok (SuperGrok) is disabled pending xAI authorization; use a custom OpenAI-compatible provider with auth_command instead"
+                )
             }
             "codex-oauth" => {
                 require_oauth_acknowledgement("codex-oauth", io).await?;
@@ -1219,6 +1226,7 @@ impl TerminalActionHandler for ProviderSetupActions {
 fn subscription_oauth_provider(step_id: &str) -> Option<&'static str> {
     match step_id {
         "codex-oauth" => Some(crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER),
+        #[cfg(feature = "grok-subscription")]
         "grok-oauth" => Some(crate::auth::subscription_ack::GROK_OAUTH_PROVIDER),
         _ => None,
     }
@@ -1612,6 +1620,7 @@ mod tests {
         assert!(io.output.contains("may result in account suspension"));
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[tokio::test]
     async fn grok_oauth_requires_acknowledgement() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1661,16 +1670,19 @@ mod tests {
         assert_eq!(second.reads, 0);
         assert!(second.output.is_empty());
 
-        let mut grok = ScriptIo::default();
-        let error = require_oauth_acknowledgement("grok-oauth", &mut grok)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("reading subscription OAuth acknowledgement")
-        );
-        assert_eq!(grok.reads, 1);
+        #[cfg(feature = "grok-subscription")]
+        {
+            let mut grok = ScriptIo::default();
+            let error = require_oauth_acknowledgement("grok-oauth", &mut grok)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reading subscription OAuth acknowledgement")
+            );
+            assert_eq!(grok.reads, 1);
+        }
     }
 
     #[test]

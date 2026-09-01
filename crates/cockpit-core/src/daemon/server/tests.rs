@@ -11981,6 +11981,25 @@ async fn remote_owner_setup_mutations_reserve_and_close_ledger() {
 /// the public authorize URL (+ optional user code) and `complete_*` returns only
 /// a boolean outcome. This locks the response projection so a future field can't
 /// silently leak the daemon-held secret onto the protocol.
+#[cfg(not(feature = "grok-subscription"))]
+#[tokio::test]
+async fn feature_off_daemon_dispatch_rejects_begin_grok_provider_oauth() {
+    let ctx = persistent_test_ctx();
+    let mut state = owner_state();
+    let error = handle_request(
+        Request::BeginProviderOAuth {
+            client_operation_id: "feature-off-grok-begin".into(),
+            provider_id: "grok-oauth".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("the official daemon must reject the gated Grok OAuth flow");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, "unsupported provider OAuth flow");
+}
+
 #[tokio::test]
 async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     let verifier = "PKCE-VERIFIER-SENTINEL-1a2b3c4d";

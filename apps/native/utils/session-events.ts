@@ -398,8 +398,8 @@ export function mergeNativeHistorySnapshot(
 function removeDurableNativeUserMessages(
   history: readonly NativeHistoryEntry[],
   seqs: readonly number[],
-) {
-  if (!seqs.length) return history;
+): NativeHistoryEntry[] {
+  if (!seqs.length) return [...history];
   const removed = new Set(seqs);
   return history.filter((entry) => entry.kind !== "user_message" || !removed.has(entry.seq));
 }

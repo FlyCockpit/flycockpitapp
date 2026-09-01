@@ -5465,14 +5465,14 @@ use ui_page::{InstructionsPage, RedactPatternsPage};
 
 fn oauth_credential_inventory_name(provider: OAuthProvider) -> &'static str {
     match provider {
-        OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+        OAuthProvider::Grok => "grok-oauth",
         OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
     }
 }
 
 fn oauth_acknowledgement_inventory_name(provider: OAuthProvider) -> String {
     let provider = match provider {
-        OAuthProvider::Grok => cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER,
+        OAuthProvider::Grok => "grok-oauth",
         OAuthProvider::Codex => cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER,
     };
     format!(
@@ -6623,9 +6623,8 @@ impl SettingsDialog {
                             Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
                                 Some(OAuthProvider::Codex)
                             }
-                            Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
-                                Some(OAuthProvider::Grok)
-                            }
+                            #[cfg(feature = "grok-subscription")]
+                            Some("grok-oauth" | "grok") => Some(OAuthProvider::Grok),
                             _ => None,
                         })
                         .flatten();

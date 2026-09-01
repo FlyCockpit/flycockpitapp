@@ -58,6 +58,24 @@ enum GenerationOutcome {
     Failed,
 }
 
+/// The semantic generator result and whether any provider request completed
+/// are deliberately separate. A completed request can warm a cache even when
+/// its returned tool payload is malformed or otherwise unusable as a
+/// verification candidate.
+struct GenerationExecution {
+    outcome: GenerationOutcome,
+    completed_provider_request: bool,
+}
+
+impl GenerationExecution {
+    fn without_provider_request(outcome: GenerationOutcome) -> Self {
+        Self {
+            outcome,
+            completed_provider_request: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GeneratorTurnBudget {
     remaining_tokens: u64,
@@ -392,7 +410,7 @@ async fn collect_one_candidate(
         return Ok(CandidateExecution::not_dispatched());
     }
     let generated = if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
-        GenerationOutcome::TimedOut
+        GenerationExecution::without_provider_request(GenerationOutcome::TimedOut)
     } else {
         generate_with_turns(
             input,
@@ -405,9 +423,8 @@ async fn collect_one_candidate(
         )
         .await
     };
-    let completed_provider_request = matches!(generated, GenerationOutcome::Answer(_))
-        && provider_handoff.is_some_and(|handoff| handoff.load(Ordering::Acquire));
-    let (mut answer, forced_terminal) = materialize_generation(generated);
+    let completed_provider_request = generated.completed_provider_request;
+    let (mut answer, forced_terminal) = materialize_generation(generated.outcome);
     // Candidate arguments cross the same schema-repair/path-normalization
     // boundary as an authored call before they can become adjudicable.
     // Dispatch repeats this check as a TOCTOU defense; canonicalizing here
@@ -579,11 +596,18 @@ fn completed_dispatch_mode(
     plan: &CandidateDispatchPlan,
     warm_completed_provider_request: bool,
 ) -> VerificationCandidateDispatch {
-    if plan.warm_candidate.is_some() && warm_completed_provider_request {
+    if fanout_is_released(plan, warm_completed_provider_request) {
         VerificationCandidateDispatch::WarmThenFanout
     } else {
         VerificationCandidateDispatch::Parallel
     }
+}
+
+/// The warm candidate is an execution fence, not a telemetry hint. Its
+/// provider inference must finish before sibling requests can use the prefix
+/// it established.
+fn fanout_is_released(plan: &CandidateDispatchPlan, warm_completed_provider_request: bool) -> bool {
+    plan.warm_candidate.is_some() && warm_completed_provider_request
 }
 
 fn dispatched_cache_read_count(
@@ -613,11 +637,11 @@ async fn collect_dispatch_group(
             .iter()
             .find(|candidate| candidate.index == warm_index)
             .expect("warm candidate must belong to its dispatch group");
-        let warm_handoff = AtomicBool::new(false);
-        let warm_execution = collect_one_candidate(input, warm, Some(&warm_handoff)).await?;
+        let warm_execution = collect_one_candidate(input, warm, None).await?;
         if let Some(candidate) = warm_execution.candidate {
             collected.push((warm_index, candidate));
         }
+        let actual_mode = completed_dispatch_mode(plan, warm_execution.completed_provider_request);
         let fanout = candidates
             .iter()
             .filter(|candidate| candidate.index != warm_index)
@@ -629,22 +653,23 @@ async fn collect_dispatch_group(
             .iter()
             .map(|_| AtomicBool::new(false))
             .collect::<Vec<_>>();
-        for result in join_all(fanout.iter().zip(fanout_handoffs.iter()).map(
-            |(candidate, handoff)| async move {
-                Ok::<_, anyhow::Error>((
-                    candidate.index,
-                    collect_one_candidate(input, candidate, Some(handoff)).await?,
-                ))
-            },
-        ))
-        .await
-        {
-            let (index, execution) = result?;
-            if let Some(candidate) = execution.candidate {
-                collected.push((index, candidate));
+        if fanout_is_released(plan, warm_execution.completed_provider_request) {
+            for result in join_all(fanout.iter().zip(fanout_handoffs.iter()).map(
+                |(candidate, handoff)| async move {
+                    Ok::<_, anyhow::Error>((
+                        candidate.index,
+                        collect_one_candidate(input, candidate, Some(handoff)).await?,
+                    ))
+                },
+            ))
+            .await
+            {
+                let (index, execution) = result?;
+                if let Some(candidate) = execution.candidate {
+                    collected.push((index, candidate));
+                }
             }
         }
-        let actual_mode = completed_dispatch_mode(plan, warm_execution.completed_provider_request);
         let cache_read_candidate_count = dispatched_cache_read_count(
             actual_mode,
             fanout_handoffs
@@ -938,7 +963,7 @@ async fn generate_with_turns(
     reserved_tokens: u64,
     reserved_cost_microusd: u64,
     provider_handoff: Option<&AtomicBool>,
-) -> GenerationOutcome {
+) -> GenerationExecution {
     let turns = spec
         .max_turns
         .max(1)
@@ -953,14 +978,20 @@ async fn generate_with_turns(
         remaining_tokens: reserved_tokens,
         remaining_cost_microusd: reserved_cost_microusd,
     };
+    let mut completed_provider_request = false;
     for turn in investigation_turn_budget(turns) {
         if let Some(answer) = take_override_answer() {
-            return GenerationOutcome::Answer(answer);
+            return GenerationExecution::without_provider_request(GenerationOutcome::Answer(
+                answer,
+            ));
         }
         let Ok(turn_body) =
             generator_budget_text(model, &candidate.prompt, &private_history, tools)
         else {
-            return GenerationOutcome::Failed;
+            return GenerationExecution {
+                outcome: GenerationOutcome::Failed,
+                completed_provider_request,
+            };
         };
         let turn_estimate =
             super::estimate::estimate_candidate_set(super::estimate::CandidateSetEstimateInput {
@@ -972,9 +1003,12 @@ async fn generate_with_turns(
                 max_collection_millis: 1,
             });
         if !budget.debit(turn_estimate) {
-            return GenerationOutcome::BudgetExhausted;
+            return GenerationExecution {
+                outcome: GenerationOutcome::BudgetExhausted,
+                completed_provider_request,
+            };
         }
-        match generate_one_shot(
+        let generated = generate_one_shot(
             input,
             model,
             &candidate.prompt,
@@ -983,9 +1017,15 @@ async fn generate_with_turns(
             (*params).clone(),
             provider_handoff,
         )
-        .await
-        {
-            Ok(GeneratorTurn::Answer(answer)) => return GenerationOutcome::Answer(answer),
+        .await;
+        completed_provider_request |= generated.completed_provider_request;
+        match generated.turn {
+            Ok(GeneratorTurn::Answer(answer)) => {
+                return GenerationExecution {
+                    outcome: GenerationOutcome::Answer(answer),
+                    completed_provider_request,
+                };
+            }
             Ok(GeneratorTurn::Investigate(choice, calls)) if turn + 1 < turns => {
                 private_history.push(Message::Assistant {
                     id: None,
@@ -1021,27 +1061,37 @@ async fn generate_with_turns(
                 }
             }
             Ok(GeneratorTurn::Investigate(_, _)) => {
-                return GenerationOutcome::Answer(GeneratorAnswer {
-                    kind: CandidateKind::Flag,
-                    args: None,
-                    critique: "generator exhausted its investigation turn cap".to_string(),
-                });
+                return GenerationExecution {
+                    outcome: GenerationOutcome::Answer(GeneratorAnswer {
+                        kind: CandidateKind::Flag,
+                        args: None,
+                        critique: "generator exhausted its investigation turn cap".to_string(),
+                    }),
+                    completed_provider_request,
+                };
             }
             Err(_) => {
-                return if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms
-                {
-                    GenerationOutcome::TimedOut
-                } else {
-                    GenerationOutcome::Failed
+                return GenerationExecution {
+                    outcome: if chrono::Utc::now().timestamp_millis()
+                        >= input.collection_deadline_unix_ms
+                    {
+                        GenerationOutcome::TimedOut
+                    } else {
+                        GenerationOutcome::Failed
+                    },
+                    completed_provider_request,
                 };
             }
         }
     }
-    GenerationOutcome::Answer(GeneratorAnswer {
-        kind: CandidateKind::Flag,
-        args: None,
-        critique: "generator produced no candidate".to_string(),
-    })
+    GenerationExecution {
+        outcome: GenerationOutcome::Answer(GeneratorAnswer {
+            kind: CandidateKind::Flag,
+            args: None,
+            critique: "generator produced no candidate".to_string(),
+        }),
+        completed_provider_request,
+    }
 }
 
 fn investigation_turn_budget(max_turns: u8) -> std::ops::Range<u8> {
@@ -1085,6 +1135,11 @@ enum GeneratorTurn {
     ),
 }
 
+struct GeneratedTurn {
+    turn: Result<GeneratorTurn>,
+    completed_provider_request: bool,
+}
+
 fn candidate_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "verification_candidate".to_string(),
@@ -1111,7 +1166,7 @@ async fn generate_one_shot(
     tools: &[ToolDefinition],
     params: crate::engine::model::ModelParams,
     provider_handoff: Option<&AtomicBool>,
-) -> Result<GeneratorTurn> {
+) -> GeneratedTurn {
     let tool = candidate_tool_definition();
     let choice = journaled_verification_inference(VerificationInferenceInput {
         session: input.ctx.session.clone(),
@@ -1129,18 +1184,38 @@ async fn generate_one_shot(
         provider_handoff,
         deadline_unix_ms: Some(input.collection_deadline_unix_ms),
     })
-    .await?;
-    let calls = crate::engine::message::collect_tool_calls(&choice);
-    let call = calls
-        .iter()
-        .find(|call| call.function.name == tool.name)
-        .map(|call| parse_candidate_payload(&call.function.arguments))
-        .transpose()?;
-    if let Some(answer) = call {
-        Ok(GeneratorTurn::Answer(answer))
-    } else {
-        Ok(GeneratorTurn::Investigate(choice, calls))
+    .await;
+    generated_turn_from_provider_result(choice, &tool.name)
+}
+
+fn generated_turn_from_provider_result(
+    provider_result: Result<Vec<rig::message::AssistantContent>>,
+    candidate_tool_name: &str,
+) -> GeneratedTurn {
+    // Successful inference proves the provider completed the request. Parse
+    // afterward so malformed candidate data cannot erase the cache-warm fact.
+    let completed_provider_request = provider_request_completed(&provider_result);
+    let turn = provider_result.and_then(|choice| {
+        let calls = crate::engine::message::collect_tool_calls(&choice);
+        let call = calls
+            .iter()
+            .find(|call| call.function.name == candidate_tool_name)
+            .map(|call| parse_candidate_payload(&call.function.arguments))
+            .transpose()?;
+        if let Some(answer) = call {
+            Ok(GeneratorTurn::Answer(answer))
+        } else {
+            Ok(GeneratorTurn::Investigate(choice, calls))
+        }
+    });
+    GeneratedTurn {
+        turn,
+        completed_provider_request,
     }
+}
+
+fn provider_request_completed<T>(provider_result: &Result<T>) -> bool {
+    provider_result.is_ok()
 }
 
 fn candidate_descriptor(
@@ -1267,10 +1342,15 @@ mod tests {
             VerificationCandidateDispatch::Parallel,
             "a stream poll or pre-dispatch refusal must not be recorded as a completed cache warm"
         );
+        assert!(
+            !fanout_is_released(&plan, false),
+            "a failed, cancelled, or pre-dispatch warm must not release siblings"
+        );
         assert_eq!(
             completed_dispatch_mode(&plan, true),
             VerificationCandidateDispatch::WarmThenFanout
         );
+        assert!(fanout_is_released(&plan, true));
         assert_eq!(
             dispatched_cache_read_count(
                 VerificationCandidateDispatch::WarmThenFanout,
@@ -1282,6 +1362,35 @@ mod tests {
         assert_eq!(
             dispatched_cache_read_count(VerificationCandidateDispatch::Parallel, [true, true]),
             0
+        );
+    }
+
+    #[test]
+    fn malformed_warm_payload_preserves_completed_provider_request() {
+        let provider_result = Ok(vec![rig::message::AssistantContent::ToolCall(
+            crate::engine::message::ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("malformed-candidate"),
+                provider: None,
+                function: rig::message::ToolFunction {
+                    name: "verification_candidate".to_string(),
+                    arguments: serde_json::json!({"kind": "not-a-candidate"}),
+                },
+                signature: None,
+                additional_params: None,
+            },
+        )]);
+        let warm = generated_turn_from_provider_result(provider_result, "verification_candidate");
+        assert!(
+            warm.turn.is_err(),
+            "the semantic payload can fail after a completed provider request"
+        );
+        assert!(warm.completed_provider_request);
+
+        let plan =
+            candidate_dispatch_plan(VerificationCandidateDispatch::WarmThenFanout, &[0, 1], true);
+        assert!(
+            fanout_is_released(&plan, warm.completed_provider_request),
+            "payload parsing must not erase a completed warm request or suppress its fan-out"
         );
     }
 

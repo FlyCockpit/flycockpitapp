@@ -71,8 +71,55 @@ pub struct WindowsDesktopBackend {
 /// preferred over handing a possibly held key to a replacement daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum HeldKeyboardInput {
-    VirtualKey(u16),
+    VirtualKey { key: u16, extended: bool },
     Unicode(u16),
+}
+
+/// The exact Win32 input required for one logical key. A character resolved by
+/// the active keyboard layout can require modifiers in addition to its virtual
+/// key; those modifiers must be kept distinct from the caller's chord so the
+/// injected effect remains the requested character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtualKeyInput {
+    key: VIRTUAL_KEY,
+    extended: bool,
+    character_modifiers: CharacterModifiers,
+}
+
+impl VirtualKeyInput {
+    const fn plain(key: VIRTUAL_KEY) -> Self {
+        Self {
+            key,
+            extended: is_extended_key(key),
+            character_modifiers: CharacterModifiers::NONE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CharacterModifiers {
+    shift: bool,
+    control: bool,
+    alt: bool,
+}
+
+impl CharacterModifiers {
+    const NONE: Self = Self {
+        shift: false,
+        control: false,
+        alt: false,
+    };
+
+    const fn from_vk_key_scan(shift_state: u8) -> Option<Self> {
+        if shift_state & !0x07 != 0 {
+            return None;
+        }
+        Some(Self {
+            shift: shift_state & 0x01 != 0,
+            control: shift_state & 0x02 != 0,
+            alt: shift_state & 0x04 != 0,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -175,14 +222,20 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    fn key_down(&mut self, key: VIRTUAL_KEY) -> Result<(), ComputerError> {
-        self.remember_held_keyboard_input(HeldKeyboardInput::VirtualKey(key.0))?;
+    fn key_down(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
+        self.remember_held_keyboard_input(HeldKeyboardInput::VirtualKey {
+            key: key.key.0,
+            extended: key.extended,
+        })?;
         send_key(key, false)
     }
 
-    fn key_up(&mut self, key: VIRTUAL_KEY) -> Result<(), ComputerError> {
+    fn key_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
         send_key(key, true)?;
-        self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey(key.0))
+        self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey {
+            key: key.key.0,
+            extended: key.extended,
+        })
     }
 
     fn unicode_down(&mut self, unit: u16) -> Result<(), ComputerError> {
@@ -197,10 +250,10 @@ impl WindowsDesktopBackend {
 
     fn send_modifiers(&mut self, modifiers: Modifiers, up: bool) -> Result<(), ComputerError> {
         let keys = [
-            (modifiers.shift, VK_SHIFT),
-            (modifiers.control, VK_CONTROL),
-            (modifiers.alt, VK_MENU),
-            (modifiers.meta, VK_LWIN),
+            (modifiers.shift, VirtualKeyInput::plain(VK_SHIFT)),
+            (modifiers.control, VirtualKeyInput::plain(VK_CONTROL)),
+            (modifiers.alt, VirtualKeyInput::plain(VK_MENU)),
+            (modifiers.meta, VirtualKeyInput::plain(VK_LWIN)),
         ];
         if up {
             for (enabled, key) in keys.iter().rev() {
@@ -216,6 +269,42 @@ impl WindowsDesktopBackend {
             }
         }
         Ok(())
+    }
+
+    fn send_character_modifiers(
+        &mut self,
+        modifiers: CharacterModifiers,
+        up: bool,
+    ) -> Result<(), ComputerError> {
+        let keys = [
+            (modifiers.shift, VirtualKeyInput::plain(VK_SHIFT)),
+            (modifiers.control, VirtualKeyInput::plain(VK_CONTROL)),
+            (modifiers.alt, VirtualKeyInput::plain(VK_MENU)),
+        ];
+        if up {
+            for (enabled, key) in keys.iter().rev() {
+                if *enabled {
+                    self.key_up(*key)?;
+                }
+            }
+        } else {
+            for (enabled, key) in keys {
+                if enabled {
+                    self.key_down(key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn key_input_down(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
+        self.send_character_modifiers(key.character_modifiers, false)?;
+        self.key_down(key)
+    }
+
+    fn key_input_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
+        self.key_up(key)?;
+        self.send_character_modifiers(key.character_modifiers, true)
     }
 
     fn refresh_geometry(&mut self) -> Result<(), ComputerError> {
@@ -449,19 +538,19 @@ impl ComputerBackend for WindowsDesktopBackend {
                     .map(|key| virtual_key(key))
                     .collect::<Result<Vec<_>, _>>()?;
                 for key in &keys {
-                    self.key_down(*key)?;
+                    self.key_input_down(*key)?;
                 }
                 for key in keys.iter().rev() {
-                    self.key_up(*key)?;
+                    self.key_input_up(*key)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::HoldKey { key, duration } => {
                 checked_action_duration(*duration)?;
                 let key = virtual_key(key)?;
-                self.key_down(key)?;
+                self.key_input_down(key)?;
                 thread::sleep(*duration);
-                self.key_up(key)?;
+                self.key_input_up(key)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Scroll {
@@ -496,7 +585,14 @@ impl ComputerBackend for WindowsDesktopBackend {
         }
         for input in self.held_keyboard_inputs.clone().into_iter().rev() {
             let released = match input {
-                HeldKeyboardInput::VirtualKey(key) => send_key(VIRTUAL_KEY(key), true),
+                HeldKeyboardInput::VirtualKey { key, extended } => send_key(
+                    VirtualKeyInput {
+                        key: VIRTUAL_KEY(key),
+                        extended,
+                        character_modifiers: CharacterModifiers::NONE,
+                    },
+                    true,
+                ),
                 HeldKeyboardInput::Unicode(unit) => send_unicode(unit, true),
             };
             match released {
@@ -670,23 +766,31 @@ fn send_button(button: MouseButton, up: bool) -> Result<(), ComputerError> {
     send_mouse(0, 0, 0, flags)
 }
 
-fn send_key(key: VIRTUAL_KEY, up: bool) -> Result<(), ComputerError> {
+fn send_key(key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
     send(&[INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: key,
+                wVk: key.key,
                 wScan: 0,
-                dwFlags: if up {
-                    KEYEVENTF_KEYUP
-                } else {
-                    KEYBD_EVENT_FLAGS(0)
-                },
+                dwFlags: key_event_flags(key, up),
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     }])
+}
+
+fn key_event_flags(key: VirtualKeyInput, up: bool) -> KEYBD_EVENT_FLAGS {
+    (if key.extended {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    }) | if up {
+        KEYEVENTF_KEYUP
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    }
 }
 
 fn send_unicode(unit: u16, up: bool) -> Result<(), ComputerError> {
@@ -709,27 +813,131 @@ fn send_unicode(unit: u16, up: bool) -> Result<(), ComputerError> {
     }])
 }
 
-fn virtual_key(key: &str) -> Result<VIRTUAL_KEY, ComputerError> {
+fn virtual_key(key: &str) -> Result<VirtualKeyInput, ComputerError> {
     let upper = key.to_ascii_uppercase();
-    let vk = match upper.as_str() {
+    if let Some(input) = named_virtual_key(&upper) {
+        return Ok(input);
+    }
+    let mut characters = key.chars();
+    let Some(character) = characters.next() else {
+        return Err(win_input_error(format!("unsupported Windows key: {key}")));
+    };
+    if characters.next().is_some() {
+        return Err(win_input_error(format!("unsupported Windows key: {key}")));
+    }
+    let utf16 = u16::try_from(character as u32)
+        .map_err(|_| win_input_error(format!("unsupported Windows key: {key}")))?;
+    // SAFETY: GetForegroundWindow/GetWindowThreadProcessId/GetKeyboardLayout
+    // have no caller-owned pointers. The foreground window's layout, rather
+    // than the daemon thread's layout, determines the character the target
+    // application observes.
+    let keyboard_layout = unsafe {
+        let window = GetForegroundWindow();
+        if window.is_invalid() {
+            return Err(win_input_error("no foreground window for keyboard input"));
+        }
+        let thread_id = GetWindowThreadProcessId(window, None);
+        if thread_id == 0 {
+            return Err(win_input_error(
+                "could not determine foreground keyboard layout",
+            ));
+        }
+        GetKeyboardLayout(thread_id)
+    };
+    // SAFETY: VkKeyScanExW has no pointers and translates one UTF-16 code unit
+    // through the captured foreground-window keyboard layout.
+    let scan = unsafe { VkKeyScanExW(utf16, keyboard_layout) };
+    virtual_key_from_layout_scan(scan)
+        .ok_or_else(|| win_input_error(format!("unsupported Windows key: {key}")))
+}
+
+fn named_virtual_key(key: &str) -> Option<VirtualKeyInput> {
+    let key = match key {
         "SHIFT" => VK_SHIFT,
         "CONTROL" | "CTRL" => VK_CONTROL,
+        "LEFTCONTROL" | "LEFTCTRL" => VK_LCONTROL,
+        "RIGHTCONTROL" | "RIGHTCTRL" => VK_RCONTROL,
         "ALT" => VK_MENU,
-        "META" | "WIN" | "SUPER" => VK_LWIN,
+        "LEFTALT" => VK_LMENU,
+        "RIGHTALT" => VK_RMENU,
+        "META" | "WIN" | "SUPER" | "LEFTMETA" | "LEFTWIN" | "LEFTSUPER" => VK_LWIN,
+        "RIGHTMETA" | "RIGHTWIN" | "RIGHTSUPER" => VK_RWIN,
         "ENTER" | "RETURN" => VK_RETURN,
         "TAB" => VK_TAB,
         "ESC" | "ESCAPE" => VK_ESCAPE,
         "BACKSPACE" => VK_BACK,
-        "DELETE" => VK_DELETE,
-        "SPACE" => VK_SPACE,
-        "UP" => VK_UP,
-        "DOWN" => VK_DOWN,
-        "LEFT" => VK_LEFT,
-        "RIGHT" => VK_RIGHT,
-        _ if upper.len() == 1 => VIRTUAL_KEY(upper.as_bytes()[0] as u16),
-        _ => return Err(win_input_error(format!("unsupported Windows key: {key}"))),
+        "DELETE" | "DEL" => VK_DELETE,
+        "INSERT" | "INS" => VK_INSERT,
+        "SPACE" | "SPACEBAR" => VK_SPACE,
+        "UP" | "ARROWUP" => VK_UP,
+        "DOWN" | "ARROWDOWN" => VK_DOWN,
+        "LEFT" | "ARROWLEFT" => VK_LEFT,
+        "RIGHT" | "ARROWRIGHT" => VK_RIGHT,
+        "HOME" => VK_HOME,
+        "END" => VK_END,
+        "PAGEUP" | "PAGE_UP" | "PGUP" => VK_PRIOR,
+        "PAGEDOWN" | "PAGE_DOWN" | "PGDN" => VK_NEXT,
+        "CAPSLOCK" => VK_CAPITAL,
+        "NUMLOCK" => VK_NUMLOCK,
+        "SCROLLLOCK" => VK_SCROLL,
+        "PRINTSCREEN" | "PRINT" | "PRTSC" => VK_SNAPSHOT,
+        "PAUSE" | "BREAK" => VK_PAUSE,
+        "APPS" | "CONTEXTMENU" => VK_APPS,
+        "F1" => VK_F1,
+        "F2" => VK_F2,
+        "F3" => VK_F3,
+        "F4" => VK_F4,
+        "F5" => VK_F5,
+        "F6" => VK_F6,
+        "F7" => VK_F7,
+        "F8" => VK_F8,
+        "F9" => VK_F9,
+        "F10" => VK_F10,
+        "F11" => VK_F11,
+        "F12" => VK_F12,
+        _ => return None,
     };
-    Ok(vk)
+    Some(VirtualKeyInput::plain(key))
+}
+
+fn virtual_key_from_layout_scan(scan: i16) -> Option<VirtualKeyInput> {
+    if scan == -1 {
+        return None;
+    }
+    let scan = scan as u16;
+    let key = VIRTUAL_KEY(scan & 0x00ff);
+    (key.0 != 0)
+        .then_some(CharacterModifiers::from_vk_key_scan((scan >> 8) as u8))
+        .flatten()
+        .map(|character_modifiers| VirtualKeyInput {
+            key,
+            extended: is_extended_key(key),
+            character_modifiers,
+        })
+}
+
+const fn is_extended_key(key: VIRTUAL_KEY) -> bool {
+    matches!(
+        key,
+        VK_RCONTROL
+            | VK_RMENU
+            | VK_INSERT
+            | VK_DELETE
+            | VK_HOME
+            | VK_END
+            | VK_PRIOR
+            | VK_NEXT
+            | VK_UP
+            | VK_DOWN
+            | VK_LEFT
+            | VK_RIGHT
+            | VK_NUMLOCK
+            | VK_SNAPSHOT
+            | VK_DIVIDE
+            | VK_LWIN
+            | VK_RWIN
+            | VK_APPS
+    )
 }
 
 fn click_count(count: ClickCount) -> usize {
@@ -1201,9 +1409,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn virtual_key_mapping_covers_approval_actions() {
-        assert_eq!(virtual_key("ctrl").unwrap(), VK_CONTROL);
-        assert_eq!(virtual_key("A").unwrap(), VIRTUAL_KEY(b'A' as u16));
+    fn named_virtual_key_mapping_covers_approval_actions() {
+        assert_eq!(
+            virtual_key("ctrl").unwrap(),
+            VirtualKeyInput::plain(VK_CONTROL)
+        );
+        assert_eq!(
+            virtual_key_from_layout_scan(0x0041).unwrap().key,
+            VIRTUAL_KEY(b'A' as u16)
+        );
+        assert!(virtual_key("not-a-key").is_err());
+    }
+
+    #[test]
+    fn layout_character_mapping_preserves_required_modifiers() {
+        let exclamation = virtual_key_from_layout_scan(0x0131).unwrap();
+        assert_eq!(exclamation.key, VIRTUAL_KEY(b'1' as u16));
+        assert!(exclamation.character_modifiers.shift);
+        assert!(!exclamation.character_modifiers.control);
+        assert!(!exclamation.character_modifiers.alt);
+
+        let slash = virtual_key_from_layout_scan(0x00bf).unwrap();
+        assert_eq!(slash.key, VK_OEM_2);
+        assert_eq!(slash.character_modifiers, CharacterModifiers::NONE);
+        assert!(virtual_key_from_layout_scan(-1).is_none());
+        assert!(virtual_key_from_layout_scan(0x08bf).is_none());
+    }
+
+    #[test]
+    fn extended_navigation_keys_keep_the_extended_flag() {
+        for key in [
+            "delete", "up", "down", "left", "right", "pageup", "pagedown",
+        ] {
+            let input = virtual_key(key).unwrap();
+            assert!(input.extended, "{key}");
+            assert_eq!(key_event_flags(input, true).0, 3, "{key}");
+        }
+        assert!(!virtual_key("enter").unwrap().extended);
         assert!(virtual_key("not-a-key").is_err());
     }
 

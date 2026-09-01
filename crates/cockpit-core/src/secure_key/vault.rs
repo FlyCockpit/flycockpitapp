@@ -267,7 +267,7 @@ impl SecretVault {
         key_version: i64,
         placement: SecretVaultPlacement,
     ) -> Result<Self, SecureKeyError> {
-        let kek = kek_store.initial_kek();
+        let kek = kek_store.initial_kek()?;
         kek_store.write_kek_exclusive(kek_version, kek.as_ref())?;
         let kek_store_for_cleanup = kek_store.clone();
         let db_for_cleanup = db.clone();

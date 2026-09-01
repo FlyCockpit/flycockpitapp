@@ -214,7 +214,9 @@ pub struct SecretVaultItemRow {
 pub struct SecretVaultSagaRow {
     pub op_id: String,
     pub source_placement: SecretVaultPlacement,
+    pub source_file_kek_mode: Option<SecretVaultFileKekMode>,
     pub dest_placement: SecretVaultPlacement,
+    pub dest_file_kek_mode: Option<SecretVaultFileKekMode>,
     pub kek_fingerprint: String,
     pub phase: SecretVaultSagaPhase,
     pub created_at: i64,
@@ -364,6 +366,12 @@ pub fn insert_passphrase_kdf_conn(
     Ok(())
 }
 
+pub fn delete_passphrase_kdf_conn(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute("DELETE FROM secret_vault_passphrase_kdf WHERE id = 1", [])
+        .context("deleting secret vault passphrase KDF parameters")?;
+    Ok(())
+}
+
 pub fn upsert_authority_conn(
     conn: &rusqlite::Connection,
     intent: SecretVaultPlacement,
@@ -376,7 +384,8 @@ pub fn upsert_authority_conn(
         conn,
         intent,
         active_placement,
-        None,
+        (active_placement == SecretVaultPlacement::Database)
+            .then_some(SecretVaultFileKekMode::MachineBound),
         kek_fingerprint,
         kek_version,
         wrap_version,
@@ -392,8 +401,14 @@ pub fn upsert_authority_with_file_kek_mode_conn(
     kek_version: i64,
     wrap_version: i64,
 ) -> Result<()> {
-    if active_placement == SecretVaultPlacement::Keyring && file_kek_mode.is_some() {
-        bail!("keyring vault placement cannot have a file KEK mode");
+    match (active_placement, file_kek_mode) {
+        (SecretVaultPlacement::Database, None) => {
+            bail!("database vault placement requires a file KEK mode");
+        }
+        (SecretVaultPlacement::Keyring, Some(_)) => {
+            bail!("keyring vault placement cannot have a file KEK mode");
+        }
+        _ => {}
     }
     let now = Utc::now().timestamp();
     conn.execute(
@@ -820,19 +835,24 @@ pub fn insert_saga_conn(
     conn: &rusqlite::Connection,
     op_id: &str,
     source: SecretVaultPlacement,
+    source_file_kek_mode: Option<SecretVaultFileKekMode>,
     dest: SecretVaultPlacement,
+    dest_file_kek_mode: Option<SecretVaultFileKekMode>,
     kek_fingerprint: &str,
     phase: SecretVaultSagaPhase,
 ) -> Result<()> {
     let now = Utc::now().timestamp();
     conn.execute(
         "INSERT INTO secret_vault_sagas
-            (op_id, source_placement, dest_placement, kek_fingerprint, phase, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            (op_id, source_placement, source_file_kek_mode, dest_placement, dest_file_kek_mode,
+             kek_fingerprint, phase, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         params![
             op_id,
             source.as_str(),
+            source_file_kek_mode.map(SecretVaultFileKekMode::as_str),
             dest.as_str(),
+            dest_file_kek_mode.map(SecretVaultFileKekMode::as_str),
             kek_fingerprint,
             phase.as_str(),
             now
@@ -847,7 +867,8 @@ pub fn load_saga_conn(
     op_id: &str,
 ) -> Result<Option<SecretVaultSagaRow>> {
     conn.query_row(
-        "SELECT op_id, source_placement, dest_placement, kek_fingerprint, phase, created_at, updated_at
+        "SELECT op_id, source_placement, source_file_kek_mode, dest_placement, dest_file_kek_mode,
+                kek_fingerprint, phase, created_at, updated_at
          FROM secret_vault_sagas WHERE op_id = ?1",
         [op_id],
         map_saga_row,
@@ -858,7 +879,8 @@ pub fn load_saga_conn(
 
 pub fn list_open_sagas_conn(conn: &rusqlite::Connection) -> Result<Vec<SecretVaultSagaRow>> {
     let mut stmt = conn.prepare(
-        "SELECT op_id, source_placement, dest_placement, kek_fingerprint, phase, created_at, updated_at
+        "SELECT op_id, source_placement, source_file_kek_mode, dest_placement, dest_file_kek_mode,
+                kek_fingerprint, phase, created_at, updated_at
          FROM secret_vault_sagas
          WHERE phase != 'complete'
          ORDER BY created_at ASC, op_id ASC",
@@ -888,8 +910,10 @@ pub fn set_saga_phase_conn(
 
 fn map_saga_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultSagaRow> {
     let source: String = row.get(1)?;
-    let dest: String = row.get(2)?;
-    let phase: String = row.get(4)?;
+    let source_file_kek_mode: Option<String> = row.get(2)?;
+    let dest: String = row.get(3)?;
+    let dest_file_kek_mode: Option<String> = row.get(4)?;
+    let phase: String = row.get(6)?;
     Ok(SecretVaultSagaRow {
         op_id: row.get(0)?,
         source_placement: SecretVaultPlacement::parse(&source).map_err(|e| {
@@ -899,24 +923,42 @@ fn map_saga_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultSagaRow>
                 Box::new(std::io::Error::other(e.to_string())),
             )
         })?,
+        source_file_kek_mode: parse_file_kek_mode_column(source_file_kek_mode, 2)?,
         dest_placement: SecretVaultPlacement::parse(&dest).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                2,
+                3,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::other(e.to_string())),
             )
         })?,
-        kek_fingerprint: row.get(3)?,
+        dest_file_kek_mode: parse_file_kek_mode_column(dest_file_kek_mode, 4)?,
+        kek_fingerprint: row.get(5)?,
         phase: SecretVaultSagaPhase::parse(&phase).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                4,
+                6,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::other(e.to_string())),
             )
         })?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
+}
+
+fn parse_file_kek_mode_column(
+    raw: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<SecretVaultFileKekMode>> {
+    raw.as_deref()
+        .map(SecretVaultFileKekMode::parse)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(e.to_string())),
+            )
+        })
 }
 
 pub fn is_unique_constraint(err: &rusqlite::Error) -> bool {
@@ -1221,6 +1263,7 @@ mod tests {
             if name == "0001_initial.sql" {
                 saw_initial = true;
                 assert!(sql.contains("CREATE TABLE secret_vault_authority"));
+                assert!(sql.contains("CREATE TABLE secret_vault_passphrase_kdf"));
                 assert!(sql.contains("CREATE TABLE secret_vault_keys"));
                 assert!(sql.contains("CREATE TABLE secret_vault_items"));
                 assert!(sql.contains("CREATE TABLE secret_vault_sagas"));

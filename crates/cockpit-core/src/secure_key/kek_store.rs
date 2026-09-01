@@ -23,6 +23,10 @@ pub const PASSPHRASE_KDF_MEMORY_KIB: u32 = 19_456;
 pub const PASSPHRASE_KDF_ITERATIONS: u32 = 2;
 pub const PASSPHRASE_KDF_PARALLELISM: u32 = 1;
 pub const PASSPHRASE_KDF_SALT_LEN: usize = 16;
+pub const PASSPHRASE_KDF_MAX_MEMORY_KIB: u32 = 65_536;
+pub const PASSPHRASE_KDF_MAX_ITERATIONS: u32 = 10;
+pub const PASSPHRASE_KDF_MAX_PARALLELISM: u32 = 4;
+pub const PASSPHRASE_KDF_MAX_SALT_LEN: usize = 64;
 
 /// Non-secret Argon2id metadata persisted beside a passphrase vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,13 +49,17 @@ impl PassphraseKdfParams {
         }
     }
 
-    pub(crate) fn from_db(row: cockpit_db::secret_vault::SecretVaultPassphraseKdfRow) -> Self {
-        Self {
+    pub(crate) fn from_db(
+        row: cockpit_db::secret_vault::SecretVaultPassphraseKdfRow,
+    ) -> Result<Self, SecureKeyError> {
+        let params = Self {
             memory_kib: row.memory_kib,
             iterations: row.iterations,
             parallelism: row.parallelism,
             salt: row.salt,
-        }
+        };
+        params.validate()?;
+        Ok(params)
     }
 
     pub(crate) fn to_db(&self) -> cockpit_db::secret_vault::SecretVaultPassphraseKdfRow {
@@ -61,6 +69,34 @@ impl PassphraseKdfParams {
             parallelism: self.parallelism,
             salt: self.salt.clone(),
         }
+    }
+
+    fn validate(&self) -> Result<(), SecureKeyError> {
+        if !(8..=PASSPHRASE_KDF_MAX_MEMORY_KIB).contains(&self.memory_kib) {
+            return Err(SecureKeyError::Corrupt(format!(
+                "passphrase KDF memory cost {} KiB is outside the supported range 8..={PASSPHRASE_KDF_MAX_MEMORY_KIB}",
+                self.memory_kib
+            )));
+        }
+        if !(1..=PASSPHRASE_KDF_MAX_ITERATIONS).contains(&self.iterations) {
+            return Err(SecureKeyError::Corrupt(format!(
+                "passphrase KDF iteration count {} is outside the supported range 1..={PASSPHRASE_KDF_MAX_ITERATIONS}",
+                self.iterations
+            )));
+        }
+        if !(1..=PASSPHRASE_KDF_MAX_PARALLELISM).contains(&self.parallelism) {
+            return Err(SecureKeyError::Corrupt(format!(
+                "passphrase KDF parallelism {} is outside the supported range 1..={PASSPHRASE_KDF_MAX_PARALLELISM}",
+                self.parallelism
+            )));
+        }
+        if !(PASSPHRASE_KDF_SALT_LEN..=PASSPHRASE_KDF_MAX_SALT_LEN).contains(&self.salt.len()) {
+            return Err(SecureKeyError::Corrupt(format!(
+                "passphrase KDF salt length {} is outside the supported range {PASSPHRASE_KDF_SALT_LEN}..={PASSPHRASE_KDF_MAX_SALT_LEN}",
+                self.salt.len()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -104,8 +140,18 @@ impl fmt::Debug for Passphrase {
 struct Argon2WorkMemory(Vec<Block>);
 
 impl Argon2WorkMemory {
-    fn new(block_count: usize) -> Self {
-        Self(vec![Block::default(); block_count])
+    fn new(block_count: usize) -> Result<Self, SecureKeyError> {
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(block_count)
+            .map_err(|error| SecureKeyError::KekUnavailable {
+                reason: format!("allocating passphrase KDF workspace: {error}"),
+                fix_command: None,
+            })?;
+        for _ in 0..block_count {
+            blocks.push(Block::default());
+        }
+        Ok(Self(blocks))
     }
 }
 
@@ -140,8 +186,8 @@ pub trait KekStore: Send + Sync {
 
     /// Material to wrap the first vault DEK with. The passphrase store returns
     /// its single Argon2id-derived KEK; all other stores generate a random KEK.
-    fn initial_kek(&self) -> SecureKeyBytes {
-        super::key_material::generate_key_bytes()
+    fn initial_kek(&self) -> Result<SecureKeyBytes, SecureKeyError> {
+        Ok(super::key_material::generate_key_bytes())
     }
 
     fn write_kek(&self, version: i64, bytes: &[u8]) -> Result<(), SecureKeyError>;
@@ -318,7 +364,7 @@ impl KekStore for FileKekStore {
 /// bytes are written to disk: the database holds only wrapped vault keys and
 /// the non-secret Argon2id parameters/salt.
 pub struct PassphraseKekStore {
-    kek: SecureKeyBytes,
+    kek: Mutex<Option<SecureKeyBytes>>,
     params: PassphraseKdfParams,
 }
 
@@ -340,16 +386,28 @@ impl PassphraseKekStore {
     ) -> Result<Self, SecureKeyError> {
         file_kek_supported()?;
         let kek = derive_passphrase_kek(passphrase, &params)?;
-        Ok(Self { kek, params })
+        Ok(Self {
+            kek: Mutex::new(Some(kek)),
+            params,
+        })
     }
 
     fn ensure_matches(&self, bytes: &[u8]) -> Result<(), SecureKeyError> {
-        if bytes != self.kek.as_ref() {
+        if bytes != self.kek()?.as_ref() {
             return Err(SecureKeyError::Corrupt(
                 "passphrase-derived KEK does not match vault initialization material".into(),
             ));
         }
         Ok(())
+    }
+
+    fn kek(&self) -> Result<SecureKeyBytes, SecureKeyError> {
+        self.kek
+            .lock()
+            .map_err(|_| SecureKeyError::Internal("passphrase KEK lock poisoned".into()))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| SecureKeyError::NotFound("passphrase KEK has been retired".into()))
     }
 }
 
@@ -357,6 +415,7 @@ fn derive_passphrase_kek(
     passphrase: Passphrase,
     params: &PassphraseKdfParams,
 ) -> Result<SecureKeyBytes, SecureKeyError> {
+    params.validate()?;
     let argon_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -368,7 +427,7 @@ fn derive_passphrase_kek(
     })?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params.clone());
     let mut output = Zeroizing::new([0_u8; KEY_BYTE_LEN]);
-    let mut memory = Argon2WorkMemory::new(argon_params.block_count());
+    let mut memory = Argon2WorkMemory::new(argon_params.block_count())?;
     argon
         .hash_password_into_with_memory(
             passphrase.as_bytes(),
@@ -404,8 +463,8 @@ impl KekStore for PassphraseKekStore {
         Some(self.params.clone())
     }
 
-    fn initial_kek(&self) -> SecureKeyBytes {
-        self.kek.clone()
+    fn initial_kek(&self) -> Result<SecureKeyBytes, SecureKeyError> {
+        self.kek()
     }
 
     fn write_kek(&self, _version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {
@@ -419,10 +478,15 @@ impl KekStore for PassphraseKekStore {
     }
 
     fn read_kek(&self, _version: i64) -> Result<TempSecret, SecureKeyError> {
-        Ok(TempSecret::from_vec(self.kek.as_ref().to_vec()))
+        Ok(TempSecret::from_vec(self.kek()?.as_ref().to_vec()))
     }
 
     fn delete_kek(&self, _version: i64) -> Result<(), SecureKeyError> {
+        let _ = self
+            .kek
+            .lock()
+            .map_err(|_| SecureKeyError::Internal("passphrase KEK lock poisoned".into()))?
+            .take();
         Ok(())
     }
 }

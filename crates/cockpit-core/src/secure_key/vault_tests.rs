@@ -118,6 +118,7 @@ fn assert_no_plaintext_bytes(db: &Db, needle: &[u8]) {
                 "secure_key_sagas",
                 "secure_key_consumer_refs",
                 "secret_vault_authority",
+                "secret_vault_passphrase_kdf",
                 "secret_vault_keys",
                 "secret_vault_items",
                 "secret_vault_sagas",
@@ -1278,6 +1279,163 @@ fn passphrase_file_vault_persists_argon2_parameters_and_reopens() {
     )
     .unwrap();
     assert_eq!(reopened.placement, SecretStorePlacement::Database);
+}
+
+#[test]
+fn first_run_rejects_passphrases_for_non_passphrase_intents() {
+    for intent in [
+        FirstRunSecretStoreIntent::Automatic,
+        FirstRunSecretStoreIntent::Keyring,
+        FirstRunSecretStoreIntent::FileMachineBound,
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let error = match ensure_secret_vault_with_options(
+            &db,
+            &available_probe(),
+            &tmp.path().join("secret-vault"),
+            SecretStoreInjected::default(),
+            SecretVaultOpenOptions {
+                first_run_intent: intent,
+                passphrase: Some(Passphrase::from_bytes(b"not silently ignored".to_vec()).unwrap()),
+            },
+        ) {
+            Ok(_) => panic!("non-passphrase first run must reject a supplied passphrase"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .reason
+                .contains("only with the FilePassphrase first-run intent")
+        );
+    }
+}
+
+#[test]
+fn first_run_passphrase_intent_requires_a_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let error = match ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: None,
+        },
+    ) {
+        Ok(_) => panic!("passphrase first run must require a passphrase"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .reason
+            .contains("first-run passphrase vault initialization requires a passphrase")
+    );
+}
+
+#[test]
+fn persisted_passphrase_kdf_limits_fail_closed_before_derivation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"bounded metadata".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    db.blocking_write_for_sync_maintenance(|conn| {
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+        conn.execute(
+            "UPDATE secret_vault_passphrase_kdf SET memory_kib = 65537 WHERE id = 1",
+            [],
+        )?;
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let error = match ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: Some(Passphrase::from_bytes(b"bounded metadata".to_vec()).unwrap()),
+        },
+    ) {
+        Ok(_) => panic!("out-of-range persisted KDF parameters must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.reason.contains("memory cost 65537 KiB"));
+}
+
+#[test]
+fn prepared_passphrase_to_keyring_migration_recovers_with_the_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let keyring = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring.clone()),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"recovery passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    let error = migrate_kek_placement(
+        first.vault.as_ref(),
+        keyring.clone(),
+        SecretVaultPlacement::Keyring,
+        &available_probe(),
+        &VaultFault::at(VaultFaultPoint::BeforeActivation),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("BeforeActivation"));
+
+    let recovered = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: Some(Passphrase::from_bytes(b"recovery passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered.placement, SecretStorePlacement::Keyring);
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .expect("activated authority");
+    assert_eq!(authority.active_placement, SecretVaultPlacement::Keyring);
+    assert_eq!(authority.file_kek_mode, None);
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

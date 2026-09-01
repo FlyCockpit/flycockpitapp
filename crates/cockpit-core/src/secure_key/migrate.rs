@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use cockpit_db::secret_vault::{
-    SecretVaultPlacement, SecretVaultSagaPhase, insert_saga_conn, list_open_sagas_conn,
-    load_authority_conn, set_saga_phase_conn, upsert_authority_with_file_kek_mode_conn,
+    SecretVaultFileKekMode, SecretVaultPlacement, SecretVaultSagaPhase, delete_passphrase_kdf_conn,
+    insert_saga_conn, list_open_sagas_conn, load_authority_conn, set_saga_phase_conn,
+    upsert_authority_with_file_kek_mode_conn,
 };
 use cockpit_proto::FeatureCapabilityState;
 use uuid::Uuid;
@@ -90,6 +91,12 @@ pub fn migrate_kek_placement(
     }
     if dest_placement == SecretVaultPlacement::Database {
         reject_database_kek_if_keyring_available(probe)?;
+        if dest.file_kek_mode() == Some(SecretVaultFileKekMode::Passphrase) {
+            return Err(SecureKeyError::Invalid(
+                "migrating an existing vault to a passphrase KEK requires an explicit rewrap and is not supported"
+                    .into(),
+            ));
+        }
     }
     let authority = vault
         .db()
@@ -97,7 +104,15 @@ pub fn migrate_kek_placement(
         .map_err(|e| SecureKeyError::Internal(e.to_string()))?
         .ok_or_else(|| SecureKeyError::Corrupt("secret vault authority missing".into()))?;
     let source_placement = authority.active_placement;
+    let source_file_kek_mode = source_file_kek_mode(&authority, vault.kek_store().as_ref())?;
+    let dest_file_kek_mode = validate_store_mode(dest_placement, dest.as_ref())?;
     if source_placement == dest_placement {
+        if source_file_kek_mode != dest_file_kek_mode {
+            return Err(SecureKeyError::Invalid(
+                "changing a database vault's KEK mode requires an explicit rewrap and is not supported"
+                    .into(),
+            ));
+        }
         return SecretVault::open(vault.db().clone(), dest, vault_installation(vault));
     }
     let source = vault.kek_store().clone();
@@ -115,7 +130,9 @@ pub fn migrate_kek_placement(
                     conn,
                     &op_id,
                     source_placement,
+                    source_file_kek_mode,
                     dest_placement,
+                    dest_file_kek_mode,
                     &fingerprint,
                     SecretVaultSagaPhase::Prepared,
                 )
@@ -176,7 +193,7 @@ fn run_migrate_from_prepared(
     }
     let probe_vault = SecretVault::open(db.clone(), dest.clone(), installation.clone())?;
     let _ = probe_vault.unwrap_active_dek_with(&dest_kek)?;
-    let dest_file_kek_mode = dest.file_kek_mode();
+    let dest_file_kek_mode = validate_store_mode(dest_placement, dest.as_ref())?;
 
     fault.check(VaultFaultPoint::BeforeActivation)?;
     db.blocking_write_for_sync_maintenance({
@@ -233,7 +250,26 @@ fn run_migrate_from_prepared(
     fault.check(VaultFaultPoint::BeforeComplete)?;
     db.blocking_write_for_sync_maintenance({
         let op_id = op_id.to_owned();
-        move |conn| set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Complete)
+        let source_file_kek_mode = source.file_kek_mode();
+        move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| {
+                if source_file_kek_mode == Some(SecretVaultFileKekMode::Passphrase) {
+                    delete_passphrase_kdf_conn(conn)?;
+                }
+                set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Complete)
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(error)
+                }
+            }
+        }
     })
     .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
 
@@ -256,6 +292,21 @@ pub fn resume_kek_migrate(
     let Some(saga) = open.into_iter().next() else {
         return Ok(None);
     };
+    if saga.dest_placement != dest_placement {
+        return Err(SecureKeyError::Corrupt(
+            "migration recovery destination does not match the durable saga".into(),
+        ));
+    }
+    if validate_store_mode(saga.source_placement, source.as_ref())? != saga.source_file_kek_mode {
+        return Err(SecureKeyError::Corrupt(
+            "migration recovery source KEK mode does not match the durable saga".into(),
+        ));
+    }
+    if validate_store_mode(saga.dest_placement, dest.as_ref())? != saga.dest_file_kek_mode {
+        return Err(SecureKeyError::Corrupt(
+            "migration recovery destination KEK mode does not match the durable saga".into(),
+        ));
+    }
     if saga.dest_placement == SecretVaultPlacement::Keyring {
         reject_keyring_if_unavailable(probe)?;
     }
@@ -304,23 +355,81 @@ pub fn resume_kek_migrate(
                 move |conn| set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::SourceDeleted)
             })
             .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
-            db.blocking_write_for_sync_maintenance({
-                let op_id = saga.op_id.clone();
-                move |conn| set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Complete)
-            })
-            .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+            complete_saga_and_cleanup_passphrase_kdf(db, &saga)?;
             Ok(Some(SecretVault::open(db.clone(), dest, installation)?))
         }
         SecretVaultSagaPhase::SourceDeleted => {
-            db.blocking_write_for_sync_maintenance({
-                let op_id = saga.op_id.clone();
-                move |conn| set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Complete)
-            })
-            .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+            complete_saga_and_cleanup_passphrase_kdf(db, &saga)?;
             Ok(Some(SecretVault::open(db.clone(), dest, installation)?))
         }
         SecretVaultSagaPhase::Complete => {
             Ok(Some(SecretVault::open(db.clone(), dest, installation)?))
         }
     }
+}
+
+fn complete_saga_and_cleanup_passphrase_kdf(
+    db: &Db,
+    saga: &cockpit_db::secret_vault::SecretVaultSagaRow,
+) -> Result<(), SecureKeyError> {
+    db.blocking_write_for_sync_maintenance({
+        let op_id = saga.op_id.clone();
+        let source_file_kek_mode = saga.source_file_kek_mode;
+        move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| {
+                if source_file_kek_mode == Some(SecretVaultFileKekMode::Passphrase) {
+                    delete_passphrase_kdf_conn(conn)?;
+                }
+                set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Complete)
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(error)
+                }
+            }
+        }
+    })
+    .map_err(|e| SecureKeyError::Internal(e.to_string()))
+}
+
+fn source_file_kek_mode(
+    authority: &cockpit_db::secret_vault::SecretVaultAuthorityRow,
+    source: &dyn KekStore,
+) -> Result<Option<SecretVaultFileKekMode>, SecureKeyError> {
+    let mode = validate_store_mode(authority.active_placement, source)?;
+    if mode != authority.file_kek_mode {
+        return Err(SecureKeyError::Corrupt(
+            "source KEK mode does not match the active vault authority".into(),
+        ));
+    }
+    Ok(mode)
+}
+
+fn validate_store_mode(
+    placement: SecretVaultPlacement,
+    store: &dyn KekStore,
+) -> Result<Option<SecretVaultFileKekMode>, SecureKeyError> {
+    if store.placement() != placement {
+        return Err(SecureKeyError::Corrupt(
+            "KEK store placement does not match the vault placement".into(),
+        ));
+    }
+    let mode = store.file_kek_mode();
+    if placement == SecretVaultPlacement::Keyring && mode.is_some() {
+        return Err(SecureKeyError::Corrupt(
+            "keyring KEK store unexpectedly declares a file KEK mode".into(),
+        ));
+    }
+    if placement == SecretVaultPlacement::Database && mode.is_none() {
+        return Err(SecureKeyError::Corrupt(
+            "database KEK store is missing its durable file KEK mode".into(),
+        ));
+    }
+    Ok(mode)
 }

@@ -6787,6 +6787,10 @@ CREATE TABLE secret_vault_authority (
     intent                TEXT    NOT NULL CHECK (intent IN ('database', 'keyring')),
     active_placement      TEXT    NOT NULL CHECK (active_placement IN ('database', 'keyring')),
     file_kek_mode         TEXT    CHECK (file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (active_placement = 'database' AND file_kek_mode IS NOT NULL)
+        OR (active_placement = 'keyring' AND file_kek_mode IS NULL)
+    ),
     kek_fingerprint       TEXT    NOT NULL,
     kek_version           INTEGER NOT NULL CHECK (kek_version >= 1),
     wrap_version          INTEGER NOT NULL CHECK (wrap_version = 1),
@@ -6798,10 +6802,10 @@ CREATE TABLE secret_vault_authority (
 CREATE TABLE secret_vault_passphrase_kdf (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     algorithm   TEXT    NOT NULL CHECK (algorithm = 'argon2id'),
-    memory_kib  INTEGER NOT NULL CHECK (memory_kib >= 8),
-    iterations  INTEGER NOT NULL CHECK (iterations >= 1),
-    parallelism INTEGER NOT NULL CHECK (parallelism >= 1),
-    salt        BLOB    NOT NULL CHECK (length(salt) >= 8)
+    memory_kib  INTEGER NOT NULL CHECK (memory_kib >= 8 AND memory_kib <= 65536),
+    iterations  INTEGER NOT NULL CHECK (iterations >= 1 AND iterations <= 10),
+    parallelism INTEGER NOT NULL CHECK (parallelism >= 1 AND parallelism <= 4),
+    salt        BLOB    NOT NULL CHECK (length(salt) >= 16 AND length(salt) <= 64)
 );
 
 -- Wrapped DEKs. No KEK bytes. No DEK plaintext.
@@ -6896,7 +6900,17 @@ END;
 CREATE TABLE secret_vault_sagas (
     op_id              TEXT    PRIMARY KEY,
     source_placement   TEXT    NOT NULL CHECK (source_placement IN ('database', 'keyring')),
+    source_file_kek_mode TEXT  CHECK (source_file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (source_placement = 'database' AND source_file_kek_mode IS NOT NULL)
+        OR (source_placement = 'keyring' AND source_file_kek_mode IS NULL)
+    ),
     dest_placement     TEXT    NOT NULL CHECK (dest_placement IN ('database', 'keyring')),
+    dest_file_kek_mode TEXT    CHECK (dest_file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (dest_placement = 'database' AND dest_file_kek_mode IS NOT NULL)
+        OR (dest_placement = 'keyring' AND dest_file_kek_mode IS NULL)
+    ),
     kek_fingerprint    TEXT    NOT NULL,
     phase              TEXT    NOT NULL CHECK (phase IN (
         'prepared',

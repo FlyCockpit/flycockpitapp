@@ -963,18 +963,16 @@ pub enum AgentScopeArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AgentExecutionKindArg {
+pub enum AgentRoleArg {
     Assistant,
-    Coding,
-    Computer,
+    Code,
 }
 
-impl From<AgentExecutionKindArg> for cockpit_proto::AgentInstallationExecutionKindV1 {
-    fn from(value: AgentExecutionKindArg) -> Self {
+impl From<AgentRoleArg> for cockpit_proto::AgentInstallationRoleV1 {
+    fn from(value: AgentRoleArg) -> Self {
         match value {
-            AgentExecutionKindArg::Assistant => Self::Assistant,
-            AgentExecutionKindArg::Coding => Self::Coding,
-            AgentExecutionKindArg::Computer => Self::Computer,
+            AgentRoleArg::Assistant => Self::Assistant,
+            AgentRoleArg::Code => Self::Code,
         }
     }
 }
@@ -1081,8 +1079,10 @@ pub enum AgentCommand {
         name: String,
         #[arg(long, value_enum, required = true)]
         scope: Option<AgentScopeArg>,
-        #[arg(long, value_enum)]
-        execution_kind: AgentExecutionKindArg,
+        #[arg(long = "role", value_enum, required = true)]
+        roles: Vec<AgentRoleArg>,
+        #[arg(long)]
+        computer_use: bool,
         #[arg(long, default_value = "primary")]
         primary_slot: String,
         #[arg(long, value_name = "PATH")]

@@ -4918,7 +4918,7 @@ pub(super) mod tests {
 
     fn vnext_workspace_agent(name: &str, description: &str, body: &str) -> String {
         format!(
-            "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+            "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{name}\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
         )
     }
 

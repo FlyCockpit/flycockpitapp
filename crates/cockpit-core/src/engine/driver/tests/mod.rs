@@ -591,8 +591,8 @@ fn test_driver_with_url_vnext(
 /// called and the broad list cannot cause a resolution bail.
 fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
     use crate::agents::{
-        AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
-        ModelLocality, ModelSlot, VnextAgentDef,
+        AllowedChild, DelegationPolicy, DelegationTarget, ModelCapability, ModelLocality,
+        ModelSlot, VnextAgentDef,
     };
     let host = crate::agents::VnextHostPolicy::for_session_config(
         &crate::config::extended::load_for_cwd(root),
@@ -607,9 +607,8 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
     let definition = VnextAgentDef {
         schema_version: crate::agents::SCHEMA_VERSION,
         agent_id: "cockpit/build".to_string(),
-        // Build is a chat-ownable primary → Assistant execution kind (see
-        // `builtin_vnext` for Primary-mode names).
-        execution_kind: ExecutionKind::Assistant,
+        roles: vec![crate::agents::AgentRole::Code],
+        capabilities: std::collections::BTreeSet::new(),
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {

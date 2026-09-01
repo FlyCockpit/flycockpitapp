@@ -642,7 +642,6 @@ mod agent_tiering {
             scan_tool_results: None,
             goal_supervision: Default::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,

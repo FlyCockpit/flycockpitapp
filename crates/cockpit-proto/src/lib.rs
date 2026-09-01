@@ -51,8 +51,8 @@ pub use acp::{
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
-    AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
-    AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
+    AgentInstallationOperationKind, AgentInstallationReadV1, AgentInstallationReceiptStatusV1,
+    AgentInstallationRecordV1, AgentInstallationResultV1, AgentInstallationRoleV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };

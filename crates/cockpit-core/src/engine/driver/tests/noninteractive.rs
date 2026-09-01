@@ -61,7 +61,7 @@ async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_fail
 /// [`write_host_tool_surface`]) instead of reviving `tools:`.
 fn vnext_coding_agent_document(agent_id: &str, description: &str, body: &str) -> String {
     format!(
-        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{agent_id}\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
     )
 }
 
@@ -4298,7 +4298,7 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         std::fs::create_dir_all(&agents_dir).unwrap();
                         std::fs::write(
                             agents_dir.join("explore.md"),
-                            "---\ndescription: probe\nschemaVersion: 1\nagentId: cockpit/explore\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nInvestigate read-only.\n",
+                            "---\ndescription: probe\nschemaVersion: 1\nagentId: cockpit/explore\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nInvestigate read-only.\n",
                         )
                         .unwrap();
                         driver.refresh_config_from_disk_for_tests();

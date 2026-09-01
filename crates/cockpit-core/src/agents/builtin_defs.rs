@@ -19,8 +19,9 @@
 use std::path::PathBuf;
 
 use super::{
-    AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind,
-    ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier, VnextAgentDef,
+    AgentCapability, AgentDef, AgentMode, AgentRole, AllowedChild, DelegationPolicy,
+    DelegationTarget, ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier,
+    VnextAgentDef,
 };
 
 /// Names of the built-in agents in scope for user editing, in canonical
@@ -208,7 +209,6 @@ fn def_with_normal(
         scan_tool_results: Some(super::default_scan_tool_results(name)),
         goal_supervision: super::GoalSettingsOverride::default(),
         permission: None,
-        capabilities: None,
         tool_steering: None,
         context_policy: None,
         vnext,
@@ -237,7 +237,7 @@ fn def_with_normal(
 ///   terse, defaults, `{followupSeed, sandboxEscalate}`.
 /// - `computer`/docs agents: terse, defaults, no extra capabilities (`{}`).
 fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
-    use super::{AgentCapability, ContextPolicy, InlineCapsProfile, ToolSteering};
+    use super::{ContextPolicy, InlineCapsProfile, ToolSteering};
     let mut caps = std::collections::BTreeSet::new();
     match name {
         "Careful" => {
@@ -267,25 +267,22 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
             def.tool_steering = Some(ToolSteering::Terse);
         }
     }
-    def.capabilities = Some(caps);
+    if let Some(vnext) = &mut def.vnext {
+        vnext.capabilities.extend(caps);
+    }
 }
 
 /// Bundled definitions are authored by the binary, not by an editable
 /// frontmatter file. Their historic tool arrays remain host-owned factory
 /// inputs, while their ejected form is the closed launch-v1 contract below.
-fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
-    let execution_kind = if matches!(name, "Computer" | "computer") {
-        ExecutionKind::Computer
-    } else if name == "Dream" {
-        // Dream is a daemon-owned maintenance root, not a chat-owning
-        // assistant. Keeping it on the coding path prevents the Assistant
-        // default from demoting its required history_search tool to an
-        // unreachable discoverable MCP entry.
-        ExecutionKind::Coding
-    } else if mode.is_chat_ownable() {
-        ExecutionKind::Assistant
+fn builtin_vnext(name: &str, _mode: AgentMode) -> VnextAgentDef {
+    // Chat ownership is an instance concern, not an agent role. The personal
+    // assistant definitions declare `assistant`; coding primaries remain
+    // `code` even though they can own a root conversation.
+    let roles = if matches!(name, "Assistant" | "Computer") {
+        vec![AgentRole::Assistant]
     } else {
-        ExecutionKind::Coding
+        vec![AgentRole::Code]
     };
     // These are binary-owned reachability declarations mirroring the current
     // built-in task surfaces. They are serializable policy requests, never a
@@ -344,7 +341,12 @@ fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     VnextAgentDef {
         schema_version: super::SCHEMA_VERSION,
         agent_id: format!("cockpit/{}", name.to_ascii_lowercase()),
-        execution_kind,
+        roles,
+        capabilities: if matches!(name, "Computer" | "computer") {
+            std::collections::BTreeSet::from([AgentCapability::ComputerUse])
+        } else {
+            std::collections::BTreeSet::new()
+        },
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {
@@ -875,6 +877,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builtin_trust_suggestions_still_require_confirmation() {
+        let mut def = embedded_default("Assistant").expect("Assistant definition");
+        let primary = def
+            .vnext
+            .as_mut()
+            .unwrap()
+            .model_slots
+            .get_mut("primary")
+            .unwrap();
+        primary
+            .suggested_models
+            .push(crate::agents::ModelRecommendation {
+                recommendation_id: "trusted-candidate".into(),
+                upstream_identity: "vendor/model".into(),
+                provider_aliases: Vec::new(),
+                author_label: None,
+                rationale: None,
+                trust_suggestion: Some(crate::agents::ModelTrustSuggestion::Trusted),
+            });
+
+        assert!(primary.suggested_models[0].requires_trust_confirmation());
+    }
+
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
             return ToolTier::Disabled;
@@ -1121,12 +1147,11 @@ mod tests {
             AllowedChild::PortableRef { portable_agent_ref }
                 if portable_agent_ref == "cockpit/builder"
         )));
-        assert_eq!(
+        assert!(
             worker
                 .vnext
                 .expect("computer worker vNext definition")
-                .execution_kind,
-            ExecutionKind::Computer
+                .supports_computer_use()
         );
     }
 

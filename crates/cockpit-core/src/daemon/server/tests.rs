@@ -20498,7 +20498,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 target_installation_id: None,
                 replace_acknowledged: false,
                 requested_slot: None,
-                execution_kind: Some(cockpit_proto::AgentInstallationExecutionKindV1::Coding),
+                roles: vec![cockpit_proto::AgentInstallationRoleV1::Code],
+                computer_use: false,
                 primary_slot_id: Some("primary".into()),
                 auto_select_first_exact: false,
             })
@@ -28119,7 +28120,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::DocsAsk { question: "how do tasks work?".into(), package: Some("tokio".into()), project_root: Some("/tmp/project".into()) }, kind: "docs_ask", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::AgentInstallationBegin(cockpit_proto::AgentInstallationBeginV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, idempotency_key: "metadata-agent-installation".into(), operation: cockpit_proto::AgentInstallationOperationKind::Create, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, source_locator: "authored/helper".into(), target_installation_id: None, replace_acknowledged: false, requested_slot: None, execution_kind: Some(cockpit_proto::AgentInstallationExecutionKindV1::Coding), primary_slot_id: Some("primary".into()), auto_select_first_exact: false }), kind: "agent_installation_begin", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::AgentInstallationBegin(cockpit_proto::AgentInstallationBeginV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, idempotency_key: "metadata-agent-installation".into(), operation: cockpit_proto::AgentInstallationOperationKind::Create, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, source_locator: "authored/helper".into(), target_installation_id: None, replace_acknowledged: false, requested_slot: None, roles: vec![cockpit_proto::AgentInstallationRoleV1::Code], computer_use: false, primary_slot_id: Some("primary".into()), auto_select_first_exact: false }), kind: "agent_installation_begin", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, continuation_token: Uuid::new_v4().to_string(), choice_id: Some("choice-a".into()), defer: false }), kind: "agent_installation_submit_choice", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: None }), kind: "agent_installation_list", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: Some(Uuid::new_v4().to_string()) }), kind: "agent_installation_inspect", session_id: None, audit_path: None, mutating: false },
@@ -30665,7 +30666,7 @@ async fn list_agents_respects_workspace_trust() {
     std::fs::create_dir_all(tmp.path().join(".cockpit").join("agents")).unwrap();
     std::fs::write(
         tmp.path().join(".cockpit").join("agents").join("Custom.md"),
-        "---\ndescription: custom primary\nschemaVersion: 1\nagentId: authored/custom\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nBody\n",
+        "---\ndescription: custom primary\nschemaVersion: 1\nagentId: authored/custom\nroles: [assistant]\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nBody\n",
     )
     .unwrap();
     let ctx = test_ctx();

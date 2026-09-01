@@ -64,18 +64,18 @@ pub(crate) use profile::{
 pub(crate) use vnext::DefinitionScope;
 pub(crate) use vnext::author_slot;
 pub use vnext::{
-    AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
+    AgentRole, AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
     EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
     LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
-    ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
-    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute,
-    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass, VerificationAction,
-    VerificationBudget, VerificationDispatch, VerificationEstimate, VerificationMode,
-    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
-    VerificationSessionReduction, VerificationSubject, VnextAgentDef, VnextHostPolicy,
-    delegation_kind_permitted, resolve_question_policy,
+    ModelLocality, ModelRecommendation, ModelSlot, ModelTrustSuggestion, OnAdjudicationFailure,
+    OnBudgetExceeded, PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK,
+    PreparedPrimarySlotRoute, ProhibitedQuestionClass, ProviderAlias, QuestionOverride,
+    QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef,
+    ToolClass, VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
+    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
+    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
+    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
@@ -89,14 +89,14 @@ pub(crate) const PACKAGE_ROOT_FILE: &str = "agent.md";
 pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 const PACKAGE_MCP_FILE: &str = "mcp.json";
 
-/// Per-agent capability grants (issue #75). These replace the four
-/// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
-/// an explicit member of the agent definition's `capabilities` set rather
-/// than a side effect of a session-global steering posture. Wire names are the
+/// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
+/// the computer-use declaration share one closed set; host policy still
+/// decides whether a declared capability is executable. Wire names are the
 /// camelCase spellings below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentCapability {
+    ComputerUse,
     FollowupSeed,
     SandboxEscalate,
     ForkContext,
@@ -106,6 +106,7 @@ pub enum AgentCapability {
 impl AgentCapability {
     pub fn from_wire(name: &str) -> Option<Self> {
         match name {
+            "computerUse" => Some(Self::ComputerUse),
             "followupSeed" => Some(Self::FollowupSeed),
             "sandboxEscalate" => Some(Self::SandboxEscalate),
             "forkContext" => Some(Self::ForkContext),
@@ -116,6 +117,7 @@ impl AgentCapability {
 
     pub fn wire_name(self) -> &'static str {
         match self {
+            Self::ComputerUse => "computerUse",
             Self::FollowupSeed => "followupSeed",
             Self::SandboxEscalate => "sandboxEscalate",
             Self::ForkContext => "forkContext",
@@ -212,10 +214,7 @@ impl ContextPolicy {
 
 /// The resolved posture of one agent node (issue #75): the single value the
 /// engine consults for capability grants. It carries
-/// the resolved capability-grant set. When the [`AgentDef`] declares
-/// `capabilities`, that set is authoritative; when it does not (`None`), the
-/// `standard` fallback grant set (empty — none of the four capabilities)
-/// applies.
+/// the resolved capability-grant set from the unified launch definition.
 ///
 /// The only constructor is [`PostureResolution::from_def`], which lives in
 /// this module: no engine site can synthesize a grant set (closure ratchet).
@@ -225,12 +224,23 @@ pub struct PostureResolution {
 }
 
 impl PostureResolution {
-    /// Resolve posture from an agent definition. When `def.capabilities` is
-    /// `Some`, the declared set is authoritative; when `None`, the `standard`
-    /// fallback (no capabilities) applies.
+    /// Resolve posture from the unified definition capability set. Computer
+    /// use is a launch capability and is intentionally not a tool-posture
+    /// grant.
     pub fn from_def(def: &AgentDef) -> Self {
         Self {
-            grants: def.capabilities.clone().unwrap_or_default(),
+            grants: def
+                .vnext
+                .as_ref()
+                .map(|definition| {
+                    definition
+                        .capabilities
+                        .iter()
+                        .copied()
+                        .filter(|capability| *capability != AgentCapability::ComputerUse)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -335,12 +345,6 @@ pub struct AgentDef {
     pub goal_supervision: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
-    /// Explicit per-agent capability grants (issue #75). `None` = "not
-    /// declared" (resolves to the `standard` fallback grant set — none of
-    /// the four capabilities); `Some(empty)` = explicitly none. The four
-    /// variants mirror the [`crate::engine::tool::Capability`] set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<BTreeSet<AgentCapability>>,
     /// Per-agent tool-description steering (issue #75). `None` = not declared
     /// (default `Terse`); `Some` selects the rendering directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,7 +482,7 @@ pub fn computed_tool_tier(def: &AgentDef, tool: &str) -> ToolTier {
     let is_assistant = def
         .vnext
         .as_ref()
-        .is_some_and(|definition| definition.execution_kind == ExecutionKind::Assistant);
+        .is_some_and(|definition| definition.has_role(AgentRole::Assistant));
     crate::engine::builtin::effective_tool_tier(def, tool, is_assistant)
 }
 
@@ -530,7 +534,9 @@ pub fn apply_tool_surface_override(
 /// Project the author-declared placement preference onto an already
 /// host-granted vNext surface. Preferences for names outside the host grant
 /// are intentionally ignored: a definition may influence presentation of a
-/// granted tool, never acquire a new one.
+/// granted tool, never acquire a new one. This is the default path; the
+/// advanced tool-surface controls write session-scoped entries first, and
+/// those explicit entries win over the author's tier preference below.
 pub fn apply_author_tool_tier_preferences(def: &mut AgentDef) -> Result<()> {
     let Some(preferences) = def
         .vnext
@@ -1009,9 +1015,11 @@ fn chat_ownable_primaries_with(cwd: &Path) -> Vec<String> {
         .filter(|listing| matches!(listing.kind, AgentKind::Custom))
         .filter_map(|listing| match listing.def {
             Ok(def)
-                if def.vnext.as_ref().is_some_and(|definition| {
-                    definition.execution_kind == ExecutionKind::Assistant
-                }) || def.vnext.is_none() && def.mode.is_chat_ownable() =>
+                if def
+                    .vnext
+                    .as_ref()
+                    .is_some_and(|definition| definition.has_role(AgentRole::Assistant))
+                    || def.vnext.is_none() && def.mode.is_chat_ownable() =>
             {
                 Some(listing.name)
             }
@@ -1190,9 +1198,6 @@ impl AgentDef {
         if let Some(perm) = &self.permission {
             fm.insert("permission".into(), serde_yaml::to_value(perm)?);
         }
-        if let Some(caps) = &self.capabilities {
-            fm.insert("capabilities".into(), serde_yaml::to_value(caps)?);
-        }
         if let Some(steering) = self.tool_steering {
             fm.insert("toolSteering".into(), serde_yaml::to_value(steering)?);
         }
@@ -1306,10 +1311,7 @@ impl AgentDef {
         let mut fm = serde_yaml::Mapping::new();
         fm.insert("schemaVersion".into(), (vnext.schema_version as u64).into());
         fm.insert("agentId".into(), vnext.agent_id.clone().into());
-        fm.insert(
-            "executionKind".into(),
-            serde_yaml::to_value(vnext.execution_kind)?,
-        );
+        fm.insert("roles".into(), serde_yaml::to_value(&vnext.roles)?);
         fm.insert(
             "modelSlots".into(),
             serde_yaml::to_value(&vnext.model_slots)?,
@@ -1338,8 +1340,11 @@ impl AgentDef {
                 serde_yaml::to_value(&vnext.tool_tier_preferences)?,
             );
         }
-        if let Some(capabilities) = &self.capabilities {
-            fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
+        if !vnext.capabilities.is_empty() {
+            fm.insert(
+                "capabilities".into(),
+                serde_yaml::to_value(&vnext.capabilities)?,
+            );
         }
         if let Some(tool_steering) = self.tool_steering {
             fm.insert("toolSteering".into(), serde_yaml::to_value(tool_steering)?);
@@ -1460,8 +1465,7 @@ fn parse_agent_with_scope(
         schema_version: u8,
         #[serde(rename = "agentId")]
         agent_id: String,
-        #[serde(rename = "executionKind")]
-        execution_kind: ExecutionKind,
+        roles: Vec<AgentRole>,
         #[serde(rename = "modelSlots")]
         model_slots: BTreeMap<String, ModelSlot>,
         #[serde(default)]
@@ -1477,7 +1481,7 @@ fn parse_agent_with_scope(
         #[serde(default)]
         description: String,
         #[serde(default)]
-        capabilities: Option<BTreeSet<AgentCapability>>,
+        capabilities: BTreeSet<AgentCapability>,
         #[serde(rename = "toolSteering", default)]
         tool_steering: Option<ToolSteering>,
         #[serde(rename = "contextPolicy", default)]
@@ -1540,7 +1544,8 @@ fn parse_agent_with_scope(
     let definition = VnextAgentDef {
         schema_version: fm.schema_version,
         agent_id: fm.agent_id,
-        execution_kind: fm.execution_kind,
+        roles: fm.roles,
+        capabilities: fm.capabilities,
         model_slots: fm.model_slots,
         delegation: fm.delegation.unwrap_or_default(),
         questions: fm.questions,
@@ -1570,7 +1575,6 @@ fn parse_agent_with_scope(
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
-        capabilities: fm.capabilities,
         tool_steering: fm.tool_steering,
         context_policy: fm.context_policy,
         vnext: Some(definition),

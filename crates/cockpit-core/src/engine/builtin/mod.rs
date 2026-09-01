@@ -2161,7 +2161,7 @@ fn load_resolved_def(
         let is_assistant = def.vnext.as_ref().map_or(
             args.assistant_identity_prefix.is_some()
                 && crate::agents::embedded_default(&def.name).is_none(),
-            |definition| definition.execution_kind == crate::agents::ExecutionKind::Assistant,
+            |definition| definition.has_role(crate::agents::AgentRole::Assistant),
         );
         for grant in &args.granted_tools {
             if effective_tool_tier(def, grant, is_assistant) == crate::agents::ToolTier::Disabled {
@@ -2657,9 +2657,9 @@ fn derive_parallel_read_only_eligible(child: &Agent, args: &SpawnArgs) -> bool {
 /// returning a structured summary envelope, so it holds `return` from session
 /// start (cache-safe; the tools array is never mutated mid-session). The `docs`
 /// pipeline stages are **exempt** (their answer is the payload), so they never
-/// get it; a chat-owning primary (`Build`/`Plan`/`Multireview`) is never
-/// delegated to and finishes via `Done`, so it is excluded too. `name` is the
-/// agent's own name.
+/// get it; bundled primaries finish via `Done`, so their names are excluded.
+/// A dual-role custom definition gets it only for its delegated coding launch.
+/// `name` is the agent's own name.
 fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
     if name == "deepthink" {
         return tb;
@@ -2701,7 +2701,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     let is_assistant = effective_def.vnext.as_ref().map_or(
         args.assistant_identity_prefix.is_some()
             && crate::agents::embedded_default(&effective_def.name).is_none(),
-        |definition| definition.execution_kind == crate::agents::ExecutionKind::Assistant,
+        |definition| vnext_uses_assistant_surface(definition, args.delegated),
     );
     if effective_def.vnext.is_some() {
         if effective_def.tools.is_none() {
@@ -2823,7 +2823,10 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // structural `task` tool, and it is still checked again by the driver
     // immediately before a child is constructed.
     if let (Some(vnext), Some(grant)) = (&def.vnext, &effective_vnext_grant) {
-        if grant.agent_id != vnext.agent_id || grant.execution_kind != vnext.execution_kind {
+        if grant.agent_id != vnext.agent_id
+            || grant.roles != vnext.roles
+            || grant.capabilities != vnext.capabilities
+        {
             bail!("vNext effective grant does not match selected definition");
         }
         let targets = vnext_reachable_subagents(
@@ -2859,11 +2862,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         // -return-summary.md`): a delegated subagent finishes by returning a
         // structured summary. An on-disk override of a bundled agent keeps its name,
         // so `with_return_tool`'s name guards exclude a bundled primary/docs
-        // override; a custom agent is gated on its `mode` here (a `Primary`-only
-        // custom agent is chat-owning, never delegated to, so it gets no `return`).
+        // override; a vNext custom agent is gated on the actual delegated
+        // launch plus its `code` role. A dual-role definition is a chat-owning
+        // primary at the root and a normal coding child when delegated.
         let delegated_return = match def.vnext.as_ref() {
             Some(definition) => {
-                definition.execution_kind != crate::agents::ExecutionKind::Assistant
+                args.delegated && definition.has_role(crate::agents::AgentRole::Code)
             }
             None => def.mode.is_subagent(),
         };
@@ -2929,6 +2933,17 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     })
 }
 
+/// Select assistant defaults only for an assistant-only definition or for a
+/// dual-role definition at the root. A delegated dual-role agent fills its
+/// coding role, so it must receive the coding surface and completion protocol.
+fn vnext_uses_assistant_surface(
+    definition: &crate::agents::VnextAgentDef,
+    delegated: bool,
+) -> bool {
+    definition.has_role(crate::agents::AgentRole::Assistant)
+        && (!delegated || !definition.has_role(crate::agents::AgentRole::Code))
+}
+
 fn emit_model_override_warning(def: &crate::agents::AgentDef, args: &SpawnArgs, model: &Model) {
     if (args.model_override.is_some() || args.delegation_model.is_some() || def.model.is_some())
         && let Some(warning) = def.model_override_warning(model.provider_id(), model.model_id_ref())
@@ -2946,7 +2961,8 @@ fn effective_vnext_grant_for(
     };
     if let Some(grant) = &args.vnext_grant {
         if grant.agent_id != definition.agent_id
-            || grant.execution_kind != definition.execution_kind
+            || grant.roles != definition.roles
+            || grant.capabilities != definition.capabilities
         {
             bail!("vNext effective grant does not match selected definition");
         }
@@ -3140,8 +3156,8 @@ pub(crate) async fn unknown_agent_rejection(
     }
 }
 
-/// The bundled reachable subagent set for `Plan` plus any user-authored
-/// custom subagent (`mode` `subagent`/`all`).
+/// The bundled reachable subagent set for `Plan` plus user-authored coding
+/// agents (legacy `mode` or unified `code` role).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
     let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
     append_custom_subagents(&mut out, cwd);
@@ -3149,10 +3165,9 @@ fn plan_subagents(cwd: &Path) -> Vec<String> {
 }
 
 /// The bundled reachable subagent set (`builder`/`explore`/`docs`) plus any
-/// user-authored custom agent whose `mode` makes it reachable as a
-/// subagent (`subagent`/`all`). Shared by the bundled `Build` factory and
-/// the generic [`reachable_subagents`] so both honor the `mode` field for
-/// reachability (implementation note). Each name appears
+/// user-authored coding agent. Shared by the bundled `Build` factory and the
+/// generic [`reachable_subagents`] so both honor legacy `mode` and unified
+/// roles for reachability. Each name appears
 /// once; the bundled set leads so the cached prefix stays stable when no
 /// custom agents are present.
 fn build_subagents(
@@ -3196,21 +3211,20 @@ fn recursive_targets(
     out
 }
 
-/// Append every user-authored custom agent whose `mode` makes it reachable
-/// as a subagent (`subagent`/`all`) to `out`, skipping names already
-/// present. Shared by [`build_subagents`] and [`plan_subagents`] so both
-/// honor the `mode` field for reachability the same way
-/// (implementation note).
+/// Append every user-authored coding agent to `out`, skipping names already
+/// present. Legacy definitions use `mode`; unified definitions use their
+/// `code` role so a dual-role definition can serve as both a chat primary and
+/// a coding child. Shared by [`build_subagents`] and [`plan_subagents`].
 fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
     for listing in crate::agents::list_all(cwd) {
         if !matches!(listing.kind, crate::agents::AgentKind::Custom) {
             continue;
         }
         if let Ok(custom) = &listing.def
-            && (custom.mode.is_subagent()
-                || custom.vnext.as_ref().is_some_and(|definition| {
-                    definition.execution_kind != crate::agents::ExecutionKind::Assistant
-                }))
+            && custom.vnext.as_ref().map_or_else(
+                || custom.mode.is_subagent(),
+                |definition| definition.has_role(crate::agents::AgentRole::Code),
+            )
             && !out.contains(&listing.name)
         {
             out.push(listing.name);
@@ -3288,7 +3302,7 @@ fn vnext_reachable_subagents(
                         let child = listing.def.as_ref().ok()?;
                         let child_vnext = child.vnext.as_ref()?;
                         (child_vnext.agent_id == *portable_agent_ref)
-                            .then_some((listing.name.clone(), child_vnext.execution_kind))
+                            .then_some((listing.name.clone(), child_vnext.execution_kind()))
                     })
                     .collect();
                 match matches.as_slice() {
@@ -5028,7 +5042,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5073,7 +5086,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5176,7 +5188,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5221,6 +5232,56 @@ pub(crate) mod tests {
             crate::mcp::builtin::search(&host, "search")
                 .iter()
                 .all(|hit| hit.tool != "search")
+        );
+    }
+
+    #[test]
+    fn dual_role_vnext_agent_is_discoverable_and_uses_its_coding_child_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("dual-role.md"),
+            "---\ndescription: dual role\nschemaVersion: 1\nagentId: authored/dual-role\nroles: [code, assistant]\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        )
+        .unwrap();
+        let mut reachable = Vec::new();
+        append_custom_subagents(&mut reachable, tmp.path());
+        assert!(
+            reachable.iter().any(|name| name == "dual-role"),
+            "a definition with the code role must be a normal coding child"
+        );
+
+        let mut definition = crate::agents::embedded_default("Assistant").unwrap();
+        definition.name = "dual-role".into();
+        definition.tools = None;
+        let vnext = definition.vnext.as_mut().unwrap();
+        vnext.agent_id = "authored/dual-role".into();
+        vnext.roles = vec![
+            crate::agents::AgentRole::Code,
+            crate::agents::AgentRole::Assistant,
+        ];
+
+        let root = agent_from_def(&definition, &test_spawn_args(tmp.path())).unwrap();
+        assert!(
+            root.tools.names().contains(&"skill_manage"),
+            "the root launch fills the assistant role"
+        );
+        assert!(
+            !root.tools.names().contains(&"return"),
+            "a root launch does not use the child completion protocol"
+        );
+
+        let mut child_args = test_spawn_args(tmp.path());
+        child_args.delegated = true;
+        let child = agent_from_def(&definition, &child_args).unwrap();
+        assert!(
+            !child.tools.names().contains(&"skill_manage"),
+            "the delegated launch uses coding, not assistant, defaults"
+        );
+        assert!(
+            child.tools.names().contains(&"return"),
+            "a delegated coding launch receives the subagent completion protocol"
         );
     }
 
@@ -5299,7 +5360,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5401,7 +5461,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5463,7 +5522,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5507,7 +5565,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5558,7 +5615,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5601,7 +5657,7 @@ pub(crate) mod tests {
         let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(tmp.path(), r#"{"web":{"provider":"firecrawl"}}"#);
         let def = crate::agents::parse_agent(
-            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
             "reviewer",
             tmp.path().join("reviewer.md"),
         )
@@ -5692,7 +5748,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5855,7 +5910,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -6026,7 +6080,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("my-reviewer.md"),
-            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/my-reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/my-reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         let args = test_spawn_args(tmp.path());
@@ -6047,19 +6101,19 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("custom-sub.md"),
-            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-sub\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-sub\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         std::fs::write(
             agents_dir.join("custom-primary.md"),
-            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-primary\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-primary\nroles: [assistant]\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
         )
         .unwrap();
         let assistant_home = tmp.path().join("assistant-home");
         std::fs::create_dir_all(&assistant_home).unwrap();
         std::fs::write(
             assistant_home.join("assistant.md"),
-            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\nassistant body\n",
+            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nroles: [assistant]\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\nassistant body\n",
         )
         .unwrap();
         let db = test_assistant_db();
@@ -6200,7 +6254,6 @@ pub(crate) mod tests {
                 scan_tool_results: None,
                 goal_supervision: crate::agents::GoalSettingsOverride::default(),
                 permission: None,
-                capabilities: None,
                 tool_steering: None,
                 context_policy: None,
                 vnext: None,
@@ -7537,7 +7590,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&shadow_dir).unwrap();
         std::fs::write(
             shadow_dir.join("nested-child.md"),
-            "---\ndescription: workspace shadow\nschemaVersion: 1\nagentId: authored/nested-child\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
+            "---\ndescription: workspace shadow\nschemaVersion: 1\nagentId: authored/nested-child\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
         )
         .unwrap();
 
@@ -7862,7 +7915,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -7916,7 +7968,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -8134,7 +8185,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,

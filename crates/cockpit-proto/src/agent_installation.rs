@@ -28,10 +28,9 @@ pub enum AgentInstallationScopeWire {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AgentInstallationExecutionKindV1 {
+pub enum AgentInstallationRoleV1 {
     Assistant,
-    Coding,
-    Computer,
+    Code,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,13 +59,16 @@ pub struct AgentInstallationBeginV1 {
     pub requested_slot: Option<String>,
     /// Create-only explicit template choices. They are declarative AgentDef
     /// fields, never provider/profile or credential routes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_kind: Option<AgentInstallationExecutionKindV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<AgentInstallationRoleV1>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub computer_use: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_slot_id: Option<String>,
     /// Non-interactive callers may ask the daemon to select only the first
-    /// exact, author-suggested compatible route. The daemon never falls back
-    /// to a merely compatible or unsuggested offering.
+    /// exact, author-suggested compatible route that does not carry a trust
+    /// suggestion. The daemon never falls back to a merely compatible or
+    /// unsuggested offering and never confirms trust on the user's behalf.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_select_first_exact: bool,
 }
@@ -148,6 +150,11 @@ pub struct AgentInstallationChoiceV1 {
     pub rationale: Option<String>,
     pub author_suggested: bool,
     pub exact_alias_match: bool,
+    /// True when the definition suggests trusting this model. Explicitly
+    /// submitting this displayed choice is the confirmation boundary;
+    /// unattended install flows must not select it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_trust_confirmation: bool,
 }
 
 /// A portable author recommendation for which the local daemon has no exact
@@ -261,6 +268,7 @@ mod tests {
                 rationale: None,
                 author_suggested: true,
                 exact_alias_match: true,
+                requires_trust_confirmation: false,
             }],
             unmatched_recommendations: vec![],
             expires_at_unix_ms: 10,

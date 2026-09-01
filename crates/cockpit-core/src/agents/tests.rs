@@ -46,7 +46,7 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
     let local = tmp.path().join("local.md");
     fs::write(
         &local,
-        "---\ndescription: local\nschemaVersion: 1\nagentId: local/00000000-0000-0000-0000-000000000003\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        "---\ndescription: local\nschemaVersion: 1\nagentId: local/00000000-0000-0000-0000-000000000003\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
     )
     .unwrap();
     let global = installation(
@@ -81,7 +81,7 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
     let authored = tmp.path().join("shared.md");
     fs::write(
         &authored,
-        "---\ndescription: shared\nschemaVersion: 1\nagentId: authored/shared\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        "---\ndescription: shared\nschemaVersion: 1\nagentId: authored/shared\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
     )
     .unwrap();
     assert!(
@@ -198,13 +198,13 @@ fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
 
 fn vnext_document(extra_frontmatter: &str) -> String {
     format!(
-        "---\ndescription: Reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra_frontmatter}---\nbody\n"
+        "---\ndescription: Reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra_frontmatter}---\nbody\n"
     )
 }
 
 fn vnext_agent_document(description: &str, body: &str) -> String {
     format!(
-        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+        "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
     )
 }
 
@@ -222,7 +222,7 @@ fn agent_vnext_parse_round_trip_preserves_advisory_model_metadata() {
 description: Reviewer
 schemaVersion: 1
 agentId: authored/reviewer
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -238,6 +238,7 @@ modelSlots:
             modelId: claude-sonnet-4
         authorLabel: Sonnet
         rationale: Strong code review
+        trustSuggestion: trusted
 questions:
   autoAnswer: recommended_low_risk
   decisionTimeoutSeconds: 30
@@ -256,6 +257,7 @@ Review only the declared scope.
         vnext.model_slots["primary"].suggested_models[0].recommendation_id,
         "claude-sonnet"
     );
+    assert!(vnext.model_slots["primary"].suggested_models[0].requires_trust_confirmation());
     assert_eq!(
         parse_agent(
             &parsed.to_markdown().unwrap(),
@@ -269,11 +271,26 @@ Review only the declared scope.
 }
 
 #[test]
+fn unified_schema_accepts_dual_role_computer_agents_and_rejects_execution_kind() {
+    let unified = vnext_document("")
+        .replace("roles: [code]", "roles: [code, assistant]")
+        .replace("modelSlots:", "capabilities: [computerUse]\nmodelSlots:");
+    let parsed = parse_agent(&unified, "reviewer", "reviewer.md".into()).unwrap();
+    let definition = parsed.vnext.unwrap();
+    assert!(definition.has_role(AgentRole::Assistant));
+    assert!(definition.has_role(AgentRole::Code));
+    assert!(definition.supports_computer_use());
+
+    let legacy = unified.replace("roles: [code, assistant]", "executionKind: computer");
+    assert!(parse_agent(&legacy, "reviewer", "reviewer.md".into()).is_err());
+}
+
+#[test]
 fn agent_vnext_rejects_legacy_authority_fields_and_unsorted_capabilities() {
     let authority = r#"---
 schemaVersion: 1
 agentId: authored/reviewer
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -311,7 +328,7 @@ fn agent_vnext_rejects_legacy_keys_by_raw_presence_even_when_default_or_null() {
     let base = r#"---
 schemaVersion: 1
 agentId: authored/reviewer
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -341,7 +358,7 @@ fn agent_vnext_canonical_digest_bytes_ignore_authored_mapping_order() {
     let first_source = r#"---
 schemaVersion: 1
 agentId: authored/reviewer
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -362,7 +379,7 @@ modelSlots:
     requiredCapabilities: [text_generation]
     minContextTokens: 1
     purpose: Review source changes
-executionKind: coding
+roles: [code]
 agentId: authored/reviewer
 schemaVersion: 1
 ---
@@ -400,7 +417,7 @@ legacy body
     let null_delegation = r#"---
 schemaVersion: 1
 agentId: authored/reviewer
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -421,7 +438,7 @@ fn agent_vnext_workspace_definition_cannot_claim_daemon_local_publisher() {
 description: Private reviewer
 schemaVersion: 1
 agentId: local/00000000-0000-0000-0000-000000000001
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Review source changes
@@ -451,16 +468,10 @@ fn agent_vnext_rejects_duplicate_slots_and_invalid_delegation_combinations() {
     assert!(parse_agent(&duplicate_slots, "reviewer", "reviewer.md".into()).is_err());
 
     for delegation in [
-        // Computer agents are always leaves.
-        "executionKind: computer\ndelegation:\n  allowedChildren: [{ kind: portable_ref, ref: authored/child }]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n",
         // Worktree and same-root are contradictory target authority.
         "delegation:\n  allowedChildren: [{ kind: portable_ref, ref: authored/child }]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root, managed_worktree]\n",
     ] {
-        let text = if delegation.starts_with("executionKind") {
-            vnext_document("").replacen("executionKind: coding\n", delegation, 1)
-        } else {
-            vnext_document(delegation)
-        };
+        let text = vnext_document(delegation);
         assert!(parse_agent(&text, "reviewer", "reviewer.md".into()).is_err());
     }
 }
@@ -863,7 +874,6 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
-        capabilities: None,
         tool_steering: None,
         context_policy: None,
         vnext: None,
@@ -1804,7 +1814,7 @@ fn launch_schema_rejects_tool_descriptions_field() {
 description: A custom builder.
 schemaVersion: 1
 agentId: authored/builder
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Execute a coding task
@@ -1849,7 +1859,7 @@ fn launch_schema_rejects_nested_tool_description_fields() {
 description: A custom builder.
 schemaVersion: 1
 agentId: authored/builder
-executionKind: coding
+roles: [code]
 modelSlots:
   primary:
     purpose: Execute a coding task
@@ -2012,31 +2022,17 @@ fn docs_answerer_keeps_grep_and_glob_verbose_descriptions() {
     );
 }
 
-// ── Issue #75 Stage 1: posture schema (additive, no behavior change) ──────
+// ── Unified capability posture ───────────────────────────────────────────
 
 #[test]
 fn agent_def_capabilities_parse_and_validate() {
     use super::AgentCapability;
-    use std::collections::BTreeSet;
-
-    let def = def_with_tools("custom", &["read", "bash"]);
-    // An empty set = explicitly none.
-    let mut def = def;
-    def.capabilities = Some(BTreeSet::new());
-    validate_invariants(&def).expect("empty capability set is valid");
-
-    let mut caps = BTreeSet::new();
-    caps.insert(AgentCapability::FollowupSeed);
-    caps.insert(AgentCapability::SandboxEscalate);
-    caps.insert(AgentCapability::ForkContext);
-    caps.insert(AgentCapability::ScopedParallelWrite);
-    def.capabilities = Some(caps);
-    validate_invariants(&def).expect("all four capabilities are valid");
 
     // Wire names parse via serde.
-    let yaml = "---\nschemaVersion: 1\nagentId: authored/cap\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n---\n";
+    let yaml = "---\nschemaVersion: 1\nagentId: authored/cap\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: [computerUse, followupSeed, sandboxEscalate, forkContext, scopedParallelWrite]\ndescription: x\n---\n";
     let parsed = parse_agent(yaml, "cap", "cap.md".into()).expect("capabilities parse");
-    let resolved = parsed.capabilities.expect("capabilities present");
+    let resolved = &parsed.vnext.expect("v1 definition").capabilities;
+    assert!(resolved.contains(&AgentCapability::ComputerUse));
     assert!(resolved.contains(&AgentCapability::FollowupSeed));
     assert!(resolved.contains(&AgentCapability::ScopedParallelWrite));
 }
@@ -2052,7 +2048,7 @@ fn absent_capabilities_resolve_to_no_grants() {
 
 #[test]
 fn agent_def_load_and_model_override_warnings_are_advisory() {
-    let text = "---\nschemaVersion: 1\nagentId: authored/local-worker\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
+    let text = "---\nschemaVersion: 1\nagentId: authored/local-worker\nroles: [code]\nmodelSlots:\n  primary:\n    purpose: x\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: local\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: local-small\n        upstreamIdentity: local/small-model\n        providerAliases:\n          - providerId: local\n            modelId: small-model\ncapabilities: [forkContext]\ndescription: local worker\n---\nbody\n";
     let def = parse_agent(text, "local-worker", "local-worker.md".into()).unwrap();
     let before = PostureResolution::from_def(&def).grants().clone();
 
@@ -2070,13 +2066,13 @@ fn agent_def_load_and_model_override_warnings_are_advisory() {
 
 #[test]
 fn child_posture_intersection_never_widens_parent() {
-    let mut parent = def_with_tools("parent", &["read"]);
-    parent.capabilities = Some(BTreeSet::from([AgentCapability::FollowupSeed]));
-    let mut child = def_with_tools("child", &["read"]);
-    child.capabilities = Some(BTreeSet::from([
+    let mut parent = embedded_default("Build").unwrap();
+    parent.vnext.as_mut().unwrap().capabilities = BTreeSet::from([AgentCapability::FollowupSeed]);
+    let mut child = embedded_default("builder").unwrap();
+    child.vnext.as_mut().unwrap().capabilities = BTreeSet::from([
         AgentCapability::FollowupSeed,
         AgentCapability::SandboxEscalate,
-    ]));
+    ]);
 
     let effective =
         PostureResolution::from_def(&child).intersect_parent(&PostureResolution::from_def(&parent));
@@ -2183,7 +2179,7 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
         "custom.md".into(),
     )
     .expect("vNext base def");
-    base.capabilities = None;
+    base.vnext.as_mut().unwrap().capabilities.clear();
     base.tool_steering = None;
     base.context_policy = None;
     let digest_base = base.vnext_digest_bytes().expect("digest base");
@@ -2191,7 +2187,7 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
     let mut with_caps = base.clone();
     let mut caps = std::collections::BTreeSet::new();
     caps.insert(crate::agents::AgentCapability::FollowupSeed);
-    with_caps.capabilities = Some(caps);
+    with_caps.vnext.as_mut().unwrap().capabilities = caps;
     let digest_caps = with_caps.vnext_digest_bytes().expect("digest caps");
     assert_ne!(
         digest_base, digest_caps,
@@ -2221,7 +2217,7 @@ fn agent_def_digest_changes_iff_posture_fields_change() {
 
     // Reverting to None reproduces the base digest (stability).
     let mut reverted = with_caps.clone();
-    reverted.capabilities = None;
+    reverted.vnext.as_mut().unwrap().capabilities.clear();
     let digest_reverted = reverted.vnext_digest_bytes().expect("digest reverted");
     assert_eq!(
         digest_base, digest_reverted,

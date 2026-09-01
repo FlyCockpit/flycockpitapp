@@ -52,6 +52,38 @@ impl Session {
         enabled
     }
 
+    /// Apply an explicit user action to the process-local session allowlist.
+    pub fn mutate_monty_session_network_grants(
+        &self,
+        mutation: crate::mcp::network::SessionNetworkMutation,
+    ) -> anyhow::Result<crate::mcp::network::SessionNetworkGrantSnapshot> {
+        let mut grants = self
+            .monty_network_grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        grants.apply(mutation)
+    }
+
+    pub(crate) fn monty_session_network_grant_snapshot(
+        &self,
+    ) -> crate::mcp::network::SessionNetworkGrantSnapshot {
+        self.monty_network_grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
+    }
+
+    pub(crate) fn monty_session_network_fence_allows(
+        &self,
+        expected_generation: u64,
+        host: &str,
+    ) -> bool {
+        self.monty_network_grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fence_allows(expected_generation, host)
+    }
+
     /// Whether explicit sandbox escalation retries are available in this
     /// session. Approval mode still decides how an allowed escalation is gated.
     pub fn sandbox_escalation_enabled(&self) -> bool {

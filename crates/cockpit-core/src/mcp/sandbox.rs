@@ -18,10 +18,12 @@
 //! - `mcp.invoke(server, tool, args) -> result` — call a tool; the result
 //!   returns *into the sandbox*, not into model context.
 //!
-//! **Lockdown (deny-by-default).** No mount points (filesystem), no
-//! network, no env: any `OsCall` (which is how `open`/`os.getenv`/etc.
-//! surface) is refused with the VM's `on_no_handler` exception. The only
-//! capabilities are the host functions above. Resource limits (memory,
+//! **Lockdown (deny-by-default).** No mount points (filesystem), raw network,
+//! or env: any `OsCall` (which is how `open`/`os.getenv`/etc. surface) is
+//! refused with the VM's `on_no_handler` exception. Safe pure modules are
+//! available by default. The optional `requests` facade is a governed host
+//! function, not a socket package: it appears only after a per-agent user
+//! toggle and still requires a live user host grant. Resource limits (memory,
 //! wall-clock, recursion depth) are set on every run.
 //!
 //! **Async dispatch + single-async-job authority (GOALS §22).** The VM is
@@ -31,6 +33,7 @@
 //! sandbox cannot spawn ambient async work — every MCP call routes through
 //! the host.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
@@ -113,11 +116,33 @@ pub async fn run_envelope_with_host(
     cfg: &McpConfig,
     host: &HostContext,
 ) -> Result<ProjectionEnvelope> {
-    let input_names = ["mcp", "emit", "show", "notify", "attach"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let runner = MontyRun::new(script.to_owned(), "mcp.py", input_names)
+    let requests_enabled = if host.native_tool_ctx.is_some()
+        && host.builtin_registry.monty_network_denial().is_none()
+    {
+        super::network::effective_policy(host)
+            .await
+            .map(|policy| policy.requests_enabled)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let mut input_names = vec![
+        "mcp".to_string(),
+        "csv".to_string(),
+        "statistics".to_string(),
+        "textwrap".to_string(),
+        "base64".to_string(),
+        "hashlib".to_string(),
+        "emit".to_string(),
+        "show".to_string(),
+        "notify".to_string(),
+        "attach".to_string(),
+    ];
+    if requests_enabled {
+        input_names.push("requests".to_string());
+    }
+    let script = rewrite_host_module_imports(script, requests_enabled);
+    let runner = MontyRun::new(script, "mcp.py", input_names)
         .map_err(|e| sandbox_err("Python compile error", &e))?;
 
     // The `mcp` namespace: an empty frozen dataclass. Any `mcp.<attr>(…)`
@@ -135,13 +160,21 @@ pub async fn run_envelope_with_host(
         name: name.to_owned(),
         docstring: Some(docstring.to_owned()),
     };
-    let inputs = vec![
+    let mut inputs = vec![
         mcp_ns,
+        host_module_namespace("csv"),
+        host_module_namespace("statistics"),
+        host_module_namespace("textwrap"),
+        host_module_namespace("base64"),
+        host_module_namespace("hashlib"),
         projection_function("emit", "Append a JSON-able value to model context."),
         projection_function("show", "Append a JSON-able display-only value."),
         projection_function("notify", "Send a string to the human side channel."),
         projection_function("attach", "Retain a JSON-able value as a text artifact."),
     ];
+    if requests_enabled {
+        inputs.push(host_module_namespace("requests"));
+    }
     let tracker = LimitedTracker::new(limits());
     let mut stdout = String::new();
     let mut envelope = ProjectionEnvelope::default();
@@ -161,15 +194,25 @@ pub async fn run_envelope_with_host(
                 return Ok(envelope);
             }
             RunProgress::FunctionCall(call) => {
-                let result = if call.method_call {
-                    dispatch(cfg, host, &call.function_name, true, &call.args).await
-                } else {
+                let result = if !call.method_call
+                    && matches!(call.function_name.as_str(), "emit" | "show" | "notify" | "attach")
+                {
                     dispatch_projection(
                         &mut envelope,
                         &call.function_name,
                         &call.args,
                         &call.kwargs,
                     )
+                } else {
+                    dispatch(
+                        cfg,
+                        host,
+                        &call.function_name,
+                        call.method_call,
+                        &call.args,
+                        &call.kwargs,
+                    )
+                    .await
                 };
                 let ext = match result {
                     Ok(obj) => ExtFunctionResult::Return(obj),
@@ -196,7 +239,7 @@ pub async fn run_envelope_with_host(
                     recorder.finish_suppressed().await;
                 }
                 bail!(
-                    "name `{name}` is not defined in the MCP sandbox (available host names: mcp, emit, show, notify, attach)"
+                    "name `{name}` is not defined in the MCP sandbox (available host names: mcp, emit, show, notify, attach; safe packages: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib; requests is per-agent and default-off)"
                 );
             }
             RunProgress::OsCall(call) => {
@@ -218,6 +261,92 @@ pub async fn run_envelope_with_host(
             }
         }
     }
+}
+
+fn host_module_namespace(name: &str) -> MontyObject {
+    let functions: &[&str] = match name {
+        "csv" => &["reader", "writer"],
+        "statistics" => &["mean", "median"],
+        "textwrap" => &["wrap", "fill", "dedent"],
+        "base64" => &["b64encode", "b64decode"],
+        "hashlib" => &["sha256", "sha512"],
+        "requests" => &["request", "get", "post", "put", "patch", "delete"],
+        _ => &[],
+    };
+    MontyObject::Dataclass {
+        name: name.to_string(),
+        type_id: u64::MAX - 1,
+        field_names: vec![],
+        attrs: functions
+            .iter()
+            .map(|function| {
+                (
+                    MontyObject::String((*function).to_string()),
+                    MontyObject::Function {
+                        name: (*function).to_string(),
+                        docstring: Some(format!("governed {name}.{function}")),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        frozen: true,
+    }
+}
+
+fn rewrite_host_module_imports(script: &str, requests_enabled: bool) -> String {
+    const HOST_MODULES: &[&str] = &["csv", "statistics", "textwrap", "base64", "hashlib"];
+    let mut output = String::with_capacity(script.len());
+    for line in script.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let rewritten = if let Some(imported) = trimmed.strip_prefix("import ") {
+            let (module, alias) = imported
+                .split_once(" as ")
+                .map_or((imported.trim(), None), |(module, alias)| {
+                    (module.trim(), Some(alias.trim()))
+                });
+            let host_module = HOST_MODULES.contains(&module)
+                || (module == "requests" && requests_enabled);
+            if host_module {
+                alias.map_or_else(String::new, |alias| format!("{alias} = {module}"))
+            } else {
+                line.to_string()
+            }
+        } else if let Some(imported) = trimmed.strip_prefix("from ") {
+            if let Some((module, names)) = imported.split_once(" import ") {
+                let module = module.trim();
+                let host_module = HOST_MODULES.contains(&module)
+                    || (module == "requests" && requests_enabled);
+                if host_module {
+                    names
+                        .split(',')
+                        .map(|name| {
+                            let (source, binding) = name
+                                .trim()
+                                .split_once(" as ")
+                                .map_or_else(
+                                    || (name.trim(), name.trim()),
+                                    |(source, binding)| (source.trim(), binding.trim()),
+                                );
+                            format!("{binding} = {module}.{source}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        } else {
+            line.to_string()
+        };
+        output.push_str(indent);
+        output.push_str(rewritten.strip_prefix(indent).unwrap_or(&rewritten));
+        output.push('\n');
+    }
+    output
 }
 
 fn dispatch_projection(
@@ -349,7 +478,16 @@ async fn dispatch(
     name: &str,
     method_call: bool,
     args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
 ) -> Result<MontyObject, String> {
+    if name == "hexdigest" {
+        return dataclass_attr(args.first(), "_hex")
+            .ok_or_else(|| "hashlib digest has no hexadecimal value".to_string());
+    }
+    if name == "json" && dataclass_name(args.first()) == Some("Response") {
+        return dataclass_attr(args.first(), "_json")
+            .ok_or_else(|| "response body is not valid JSON".to_string());
+    }
     // Drop the receiver for method calls (`mcp.search` → args[0] == mcp).
     let args = if method_call && !args.is_empty() {
         &args[1..]
@@ -358,6 +496,17 @@ async fn dispatch(
     };
     let catalog = host.effective_catalog(cfg);
     match name {
+        "request" | "get" | "post" | "put" | "patch" | "delete" => {
+            let request = governed_request_from_monty(name, args, kwargs)?;
+            super::network::dispatch(host, request)
+                .await
+                .map(response_to_monty)
+                .map_err(|error| format!("requests.{name} failed: {error:#}"))
+        }
+        "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent"
+        | "b64encode" | "b64decode" | "sha256" | "sha512" => {
+            dispatch_pure_host_module(name, args, kwargs)
+        }
         "search" => {
             let query = match args.first() {
                 Some(MontyObject::String(s)) => s.clone(),
@@ -543,6 +692,342 @@ async fn dispatch(
         }
         other => Err(format!("unknown MCP sandbox function `mcp.{other}`")),
     }
+}
+
+fn governed_request_from_monty(
+    function: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+) -> Result<super::network::GovernedRequest, String> {
+    let kwargs = monty_kwargs(kwargs)?;
+    let (method, url_index) = if function == "request" {
+        (str_arg(args, 0, "method", "requests.request")?, 1)
+    } else {
+        (function.to_ascii_uppercase(), 0)
+    };
+    let mut url = str_arg(args, url_index, "url", &format!("requests.{function}"))?;
+    if let Some(params) = kwargs.get("params") {
+        let Value::Object(params) = monty_to_json(params) else {
+            return Err("requests params must be a dict".to_string());
+        };
+        let mut parsed = reqwest::Url::parse(&url)
+            .map_err(|error| format!("requests URL is invalid: {error}"))?;
+        {
+            let mut query = parsed.query_pairs_mut();
+            for (name, value) in params {
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                query.append_pair(&name, &value);
+            }
+        }
+        url = parsed.to_string();
+    }
+    let headers_value = kwargs
+        .get("headers")
+        .or_else(|| args.get(url_index + 1));
+    let mut headers = BTreeMap::new();
+    if let Some(headers_value) = headers_value {
+        let Value::Object(values) = monty_to_json(headers_value) else {
+            return Err("requests headers must be a dict".to_string());
+        };
+        for (name, value) in values {
+            let Some(value) = value.as_str() else {
+                return Err("requests header values must be strings".to_string());
+            };
+            headers.insert(name, value.to_string());
+        }
+    }
+    let body = if let Some(json) = kwargs.get("json") {
+        headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
+        Some(
+            serde_json::to_string(&monty_to_json(json))
+                .map_err(|error| format!("requests json body is invalid: {error}"))?,
+        )
+    } else {
+        kwargs
+            .get("data")
+            .or_else(|| kwargs.get("body"))
+            .or_else(|| args.get(url_index + 2))
+            .map(|value| match value {
+                MontyObject::String(value) => Ok(value.clone()),
+                other => serde_json::to_string(&monty_to_json(other))
+                    .map_err(|error| format!("requests body is invalid: {error}")),
+            })
+            .transpose()?
+    };
+    Ok(super::network::GovernedRequest {
+        method,
+        url,
+        headers,
+        body,
+    })
+}
+
+fn monty_kwargs(
+    kwargs: &[(MontyObject, MontyObject)],
+) -> Result<BTreeMap<String, MontyObject>, String> {
+    kwargs
+        .iter()
+        .map(|(name, value)| match name {
+            MontyObject::String(name) => Ok((name.clone(), value.clone())),
+            _ => Err("keyword argument names must be strings".to_string()),
+        })
+        .collect()
+}
+
+fn dispatch_pure_host_module(
+    name: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+) -> Result<MontyObject, String> {
+    if !kwargs.is_empty() {
+        return Err(format!("{name} does not accept keyword arguments in this sandbox"));
+    }
+    match name {
+        "reader" => {
+            let input = str_arg(args, 0, "text", "csv.reader")?;
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(input.as_bytes());
+            let rows = reader
+                .records()
+                .map(|row| {
+                    row.map(|row| {
+                        MontyObject::List(
+                            row.iter()
+                                .map(|cell| MontyObject::String(cell.to_string()))
+                                .collect(),
+                        )
+                    })
+                    .map_err(|error| format!("csv.reader failed: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MontyObject::List(rows))
+        }
+        "writer" => {
+            let Value::Array(rows) = args.first().map(monty_to_json).unwrap_or(Value::Null) else {
+                return Err("csv.writer(rows) expects a list of rows".to_string());
+            };
+            let mut writer = csv::Writer::from_writer(Vec::new());
+            for row in rows {
+                let Value::Array(cells) = row else {
+                    return Err("csv.writer rows must be lists".to_string());
+                };
+                writer
+                    .write_record(cells.iter().map(|cell| {
+                        cell.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| cell.to_string())
+                    }))
+                    .map_err(|error| format!("csv.writer failed: {error}"))?;
+            }
+            let bytes = writer
+                .into_inner()
+                .map_err(|error| format!("csv.writer failed: {error}"))?;
+            String::from_utf8(bytes)
+                .map(MontyObject::String)
+                .map_err(|error| format!("csv.writer produced invalid UTF-8: {error}"))
+        }
+        "mean" | "median" => {
+            let values = numeric_list_arg(args, name)?;
+            if values.is_empty() {
+                return Err(format!("statistics.{name} requires at least one value"));
+            }
+            let value = if name == "mean" {
+                values.iter().sum::<f64>() / values.len() as f64
+            } else {
+                let mut values = values;
+                values.sort_by(f64::total_cmp);
+                let middle = values.len() / 2;
+                if values.len() % 2 == 0 {
+                    (values[middle - 1] + values[middle]) / 2.0
+                } else {
+                    values[middle]
+                }
+            };
+            Ok(MontyObject::Float(value))
+        }
+        "wrap" | "fill" => {
+            let text = str_arg(args, 0, "text", &format!("textwrap.{name}"))?;
+            let width = args
+                .get(1)
+                .and_then(|value| match value {
+                    MontyObject::Int(value) => usize::try_from(*value).ok(),
+                    _ => None,
+                })
+                .unwrap_or(70)
+                .max(1);
+            let lines = wrap_words(&text, width);
+            if name == "fill" {
+                Ok(MontyObject::String(lines.join("\n")))
+            } else {
+                Ok(MontyObject::List(
+                    lines.into_iter().map(MontyObject::String).collect(),
+                ))
+            }
+        }
+        "dedent" => {
+            let text = str_arg(args, 0, "text", "textwrap.dedent")?;
+            let indent = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.len() - line.trim_start().len())
+                .min()
+                .unwrap_or(0);
+            Ok(MontyObject::String(
+                text.lines()
+                    .map(|line| line.get(indent..).unwrap_or(line))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ))
+        }
+        "b64encode" | "b64decode" => {
+            use base64::Engine as _;
+            let input = str_arg(args, 0, "data", &format!("base64.{name}"))?;
+            if name == "b64encode" {
+                Ok(MontyObject::String(
+                    base64::engine::general_purpose::STANDARD.encode(input.as_bytes()),
+                ))
+            } else {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(input)
+                    .map_err(|error| format!("base64.b64decode failed: {error}"))?;
+                String::from_utf8(decoded)
+                    .map(MontyObject::String)
+                    .map_err(|error| format!("base64.b64decode is not UTF-8: {error}"))
+            }
+        }
+        "sha256" | "sha512" => {
+            use sha2::Digest as _;
+            let input = str_arg(args, 0, "data", &format!("hashlib.{name}"))?;
+            let digest = if name == "sha256" {
+                format!("{:x}", sha2::Sha256::digest(input.as_bytes()))
+            } else {
+                format!("{:x}", sha2::Sha512::digest(input.as_bytes()))
+            };
+            Ok(MontyObject::Dataclass {
+                name: "Hash".to_string(),
+                type_id: u64::MAX - 2,
+                field_names: vec![],
+                attrs: vec![
+                    (
+                        MontyObject::String("_hex".to_string()),
+                        MontyObject::String(digest),
+                    ),
+                ]
+                .into(),
+                frozen: true,
+            })
+        }
+        _ => Err(format!("unknown safe host module function `{name}`")),
+    }
+}
+
+fn dataclass_attr(receiver: Option<&MontyObject>, name: &str) -> Option<MontyObject> {
+    let MontyObject::Dataclass { attrs, .. } = receiver? else {
+        return None;
+    };
+    attrs
+        .iter()
+        .find_map(|(key, value)| match key {
+            MontyObject::String(key) if key == name => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn dataclass_name(receiver: Option<&MontyObject>) -> Option<&str> {
+    match receiver? {
+        MontyObject::Dataclass { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+fn response_to_monty(value: Value) -> MontyObject {
+    let status = value
+        .get("status_code")
+        .and_then(Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or_default();
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let headers = value.get("headers").cloned().unwrap_or(Value::Null);
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let parsed = serde_json::from_str::<Value>(&text).ok();
+    let mut attrs = vec![
+        (
+            MontyObject::String("status_code".to_string()),
+            MontyObject::Int(status),
+        ),
+        (
+            MontyObject::String("ok".to_string()),
+            MontyObject::Bool(ok),
+        ),
+        (
+            MontyObject::String("headers".to_string()),
+            json_to_monty(&headers),
+        ),
+        (
+            MontyObject::String("text".to_string()),
+            MontyObject::String(text),
+        ),
+    ];
+    if let Some(parsed) = parsed {
+        attrs.push((
+            MontyObject::String("_json".to_string()),
+            json_to_monty(&parsed),
+        ));
+    }
+    MontyObject::Dataclass {
+        name: "Response".to_string(),
+        type_id: u64::MAX - 3,
+        field_names: vec![
+            "status_code".to_string(),
+            "ok".to_string(),
+            "headers".to_string(),
+            "text".to_string(),
+        ],
+        attrs: attrs.into(),
+        frozen: true,
+    }
+}
+
+fn numeric_list_arg(args: &[MontyObject], name: &str) -> Result<Vec<f64>, String> {
+    let Some(MontyObject::List(values)) = args.first() else {
+        return Err(format!("statistics.{name} expects a list"));
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            MontyObject::Int(value) => Ok(*value as f64),
+            MontyObject::Float(value) => Ok(*value),
+            _ => Err(format!("statistics.{name} accepts only numbers")),
+        })
+        .collect()
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn invoke_child_dispatch(server: &str, tool: &str, call_args: &Value) -> McpChildDispatch {
@@ -1778,6 +2263,29 @@ mod tests {
         let obj = json_to_monty(&v);
         let back = monty_to_json(&obj);
         assert_eq!(back, v);
+    }
+
+    #[tokio::test]
+    async fn safe_host_modules_are_available_without_os_authority() {
+        let cfg = McpConfig::default();
+        let out = run(
+            "import csv\nimport statistics\nimport base64\n[\n  csv.reader('a,b\\n1,2'),\n  statistics.mean([2, 4, 6]),\n  base64.b64encode('safe')\n]",
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("a"), "{out}");
+        assert!(out.contains("4.0"), "{out}");
+        assert!(out.contains("c2FmZQ=="), "{out}");
+    }
+
+    #[tokio::test]
+    async fn requests_package_is_absent_by_default() {
+        let cfg = McpConfig::default();
+        let error = run("requests.get('https://example.test')", &cfg)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requests"), "{error:#}");
     }
 
     #[tokio::test]

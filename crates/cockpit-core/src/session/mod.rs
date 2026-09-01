@@ -498,6 +498,9 @@ pub struct Session {
     /// Per-session container-network toggle. Only honored by container modes;
     /// default off so container sandboxes start with `--network none`.
     container_network_enabled: AtomicBool,
+    /// Process-local session-scope Monty egress grants. They deliberately do
+    /// not survive daemon restart; agent-scope grants are the durable layer.
+    pub(crate) monty_network_grants: Mutex<crate::mcp::network::SessionNetworkGrants>,
     /// Whether the session may offer explicit sandbox escalation retries.
     /// Seeded from config at spawn/resume and flipped live by
     /// `/sandbox-escalate` or the settings dialog. Approval mode still gates

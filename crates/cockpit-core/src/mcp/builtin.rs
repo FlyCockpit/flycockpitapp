@@ -945,6 +945,15 @@ impl BuiltinRegistry {
             .and_then(|guard| guard.denial(tool))
     }
 
+    /// Network uses the same per-fork capability guard as native Monty calls.
+    /// Any scoped catalog must opt into no egress; foreground registries have
+    /// no guard and defer to the live user-grant policy.
+    pub(crate) fn monty_network_denial(&self) -> Option<Value> {
+        self.capability_guard
+            .as_ref()
+            .map(|guard| guard.monty_network_denial())
+    }
+
     /// The source-tagged effective catalog for an ephemeral metadata fork.
     /// This is deliberately separate from both the global default registry and
     /// every agent registry, so `mcp.search` in the foreground can never

@@ -55,6 +55,19 @@ impl CapabilityGuard {
             })
         })
     }
+
+    pub(crate) fn monty_network_denial(&self) -> Value {
+        serde_json::json!({
+            "denied": true,
+            "kind": "capability_guard_denied",
+            "tool": "requests",
+            "purpose": self.purpose.as_ref(),
+            "message": format!(
+                "you are {}, and this fork has no governed network capability",
+                self.purpose
+            ),
+        })
+    }
 }
 
 fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {

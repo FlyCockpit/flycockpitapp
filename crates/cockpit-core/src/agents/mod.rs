@@ -1048,6 +1048,18 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// Author-requested host names for owner-prompt prefill. This is not the
+    /// effective network policy and never widens it.
+    pub fn requested_network_hosts(&self) -> &BTreeSet<String> {
+        self.vnext
+            .as_ref()
+            .map(VnextAgentDef::requested_network_hosts)
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(BTreeSet::new)
+            })
+    }
+
     /// The knowledge-base restriction authored in this exact definition.
     /// Running agents retain an `AgentDef` snapshot, so knowledge access is
     /// governed by that snapshot rather than a same-named reloaded definition.

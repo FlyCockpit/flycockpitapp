@@ -136,19 +136,17 @@ impl Db {
     }
 
     /// Final generation fence immediately before transport dispatch.
-    pub async fn monty_network_agent_fence_allows(
+    pub async fn monty_network_agent_fence_is_current(
         &self,
         agent_id: &str,
         expected_generation: u64,
-        host: &str,
     ) -> Result<bool> {
         let agent_id = agent_id.to_string();
-        let host = host.to_string();
         self.read(move |conn| {
             let generation = i64::try_from(expected_generation)?;
             Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM monty_network_agent_policies p JOIN monty_network_agent_grants g ON g.agent_id=p.agent_id WHERE p.agent_id=?1 AND p.requests_enabled=1 AND p.generation=?2 AND g.host=?3)",
-                params![agent_id, generation, host],
+                "SELECT EXISTS(SELECT 1 FROM monty_network_agent_policies WHERE agent_id=?1 AND requests_enabled=1 AND generation=?2)",
+                params![agent_id, generation],
                 |row| row.get::<_, bool>(0),
             )?)
         })
@@ -165,4 +163,57 @@ fn validate_canonical_host(host: &str) -> Result<()> {
         bail!("network grant host is not canonical");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_policy_is_deny_by_default_and_revocation_advances_fence() {
+        let db = Db::open_in_memory().unwrap();
+        let absent = db.monty_network_agent_policy("authored/demo").await.unwrap();
+        assert!(!absent.requests_enabled);
+        assert!(absent.hosts.is_empty());
+
+        let enabled = db
+            .mutate_monty_network_agent_policy(
+                "authored/demo",
+                MontyNetworkAgentMutation::SetRequestsEnabled(true),
+                10,
+            )
+            .await
+            .unwrap();
+        let granted = db
+            .mutate_monty_network_agent_policy(
+                "authored/demo",
+                MontyNetworkAgentMutation::GrantHost("api.example.test".to_string()),
+                11,
+            )
+            .await
+            .unwrap();
+        assert!(granted.generation > enabled.generation);
+        assert!(granted.permits("api.example.test"));
+        assert!(
+            db.monty_network_agent_fence_is_current("authored/demo", granted.generation)
+                .await
+                .unwrap()
+        );
+
+        let revoked = db
+            .mutate_monty_network_agent_policy(
+                "authored/demo",
+                MontyNetworkAgentMutation::RevokeHost("api.example.test".to_string()),
+                12,
+            )
+            .await
+            .unwrap();
+        assert!(revoked.generation > granted.generation);
+        assert!(!revoked.permits("api.example.test"));
+        assert!(
+            !db.monty_network_agent_fence_is_current("authored/demo", granted.generation)
+                .await
+                .unwrap()
+        );
+    }
 }

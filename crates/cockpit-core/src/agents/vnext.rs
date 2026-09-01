@@ -1145,6 +1145,13 @@ impl VnextAgentDef {
             .contains(&crate::agents::AgentCapability::ComputerUse)
     }
 
+    /// Safe prompt-prefill data only. Callers must route any accepted host
+    /// through the explicit user-action grant APIs; this accessor is not an
+    /// authority projection.
+    pub fn requested_network_hosts(&self) -> &BTreeSet<String> {
+        &self.requested_network_hosts
+    }
+
     /// Existing runtime snapshots still require a single launch lane. This is
     /// a projection of the unified definition, not an authored schema axis.
     pub fn execution_kind(&self) -> ExecutionKind {

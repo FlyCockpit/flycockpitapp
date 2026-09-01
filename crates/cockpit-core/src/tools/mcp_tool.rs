@@ -7,9 +7,10 @@
 //! `mcp.describe(server, tool)`, and `mcp.invoke(server, tool, args)`.
 //! `emit`, `show`, `notify`, and `attach` project values into host-owned lanes.
 //! If `emit` is unused, the final value or captured `print(...)` output remains
-//! the model fallback. The VM has no direct
-//! filesystem, network, or environment access; host functions remain subject to the same
-//! authorization as native tool calls.
+//! the model fallback. The VM has no direct filesystem, socket, or environment
+//! access. Optional network calls use the separately governed `requests`
+//! facade and host functions remain subject to the same authorization as
+//! native tool calls.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ fn identity_accounting_key(ctx: &ToolCtx) -> usize {
     ctx as *const ToolCtx as usize
 }
 
-const NORMAL_DESCRIPTION: &str = "Run Python over native tools. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
+const NORMAL_DESCRIPTION: &str = "Run Python over native tools. Enabled packages: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib. Governed requests is a per-agent package and is off by default; when user-enabled, every request still requires an explicit host grant and whole-request redaction. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
@@ -56,13 +57,31 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
      `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
      printed output is captured and returned as a fallback. The VM has no direct filesystem, \
-     network, or environment access; every host function remains subject to the same authorization as a native tool call.";
+     network, or environment access. Enabled safe packages are json, csv, re, datetime, math, \
+     statistics, textwrap, base64, and hashlib. The requests-like package is disabled by default; \
+     when the user enables it for this agent, calls use the host's explicit agent/session host \
+     allowlist, whole-request redaction, generation fence, and optional approval. Every host \
+     function remains subject to the same authorization as a native tool call.";
 
 pub(crate) async fn turn_start_advert_message(
     _toolbox: &ToolBox,
     session: &crate::session::Session,
 ) -> Option<String> {
     let mut adverts = Vec::new();
+    let active_agent = session.active_agent();
+    let mut packages = crate::mcp::network::SAFE_STDLIB_PACKAGES.to_vec();
+    if session
+        .db
+        .monty_network_agent_policy(&active_agent)
+        .await
+        .is_ok_and(|policy| policy.requests_enabled)
+    {
+        packages.push("requests (governed)");
+    }
+    adverts.push(format!(
+        "Monty packages enabled for `{active_agent}`: {}.",
+        packages.join(", ")
+    ));
     if session
         .db
         .current_session_goal(session.id, false)
@@ -111,7 +130,7 @@ impl Tool for McpTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "script": { "type": "string", "description": "Python script; use emit(x) to project model context" }
+                "script": { "type": "string", "description": "Python script; enabled packages: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib; governed requests is per-agent and default-off; use emit(x) to project model context" }
             },
             "required": ["script"]
         })
@@ -123,7 +142,7 @@ impl Tool for McpTool {
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "Python source using mcp.search, mcp.describe, and mcp.invoke; use emit(x) for model context, show(x) for display only, notify(s) for a human-only notice, and attach(x) for an artifact; with no emit, the final expression is returned and print(...) is the fallback when it is None"
+                    "description": "Python source using mcp.search, mcp.describe, and mcp.invoke. Enabled safe packages: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib. Governed requests is available only when explicitly enabled for this agent and a user host grant is live. Use emit(x) for model context, show(x) for display only, notify(s) for a human-only notice, and attach(x) for an artifact; with no emit, the final expression is returned and print(...) is the fallback when it is None"
                 }
             },
             "required": ["script"]
@@ -303,6 +322,16 @@ mod tests {
             .find(|definition| definition.name == "mcp")
             .unwrap()
             .description
+    }
+
+    #[test]
+    fn tool_description_advertises_enabled_safe_packages_and_default_off_requests() {
+        for package in crate::mcp::network::SAFE_STDLIB_PACKAGES {
+            assert!(NORMAL_DESCRIPTION.contains(package), "missing {package}");
+            assert!(DEFENSIVE_DESCRIPTION.contains(package), "missing {package}");
+        }
+        assert!(NORMAL_DESCRIPTION.contains("off by default"));
+        assert!(DEFENSIVE_DESCRIPTION.contains("disabled by default"));
     }
 
     #[tokio::test]

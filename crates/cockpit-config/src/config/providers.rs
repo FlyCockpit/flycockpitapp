@@ -1304,6 +1304,7 @@ pub enum AuthKind {
     /// API key carried by an explicit header (Authorization / x-api-key / etc.).
     ApiKey,
     /// OAuth bearer resolved from the credential store at request time.
+    #[serde(rename = "oauth")]
     OAuth,
     /// Bearer token and optional headers returned by `auth_command`.
     Command,

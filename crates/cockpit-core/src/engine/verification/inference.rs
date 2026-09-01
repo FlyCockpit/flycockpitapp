@@ -4,7 +4,7 @@
 //! Verification rows store a digest-only audit projection because raw
 //! candidate bodies are intentionally non-durable.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -55,6 +55,10 @@ pub(crate) struct VerificationInferenceInput<'a> {
     pub agent_name: &'a str,
     pub site: UtilityCallSite,
     pub cancel: &'a tokio_util::sync::CancellationToken,
+    /// Set at the model's irreversible provider-stream handoff. Callers which
+    /// need to distinguish a pre-dispatch refusal from a provider inference
+    /// attempt use this only as an execution fact, never as an outcome signal.
+    pub provider_handoff: Option<&'a AtomicBool>,
     /// Optional caller-owned absolute deadline. The inference barrier owns
     /// the timeout so a deadline cannot drop a provider future while leaving
     /// either audit journal pending.
@@ -166,20 +170,43 @@ pub(crate) async fn journaled_verification_inference(
             ))
         });
     let started = std::time::Instant::now();
-    let completion = match tokio::time::timeout(
-        timeout,
-        input.model.complete_captured(
-            &system,
-            input.history,
-            prompt,
-            &tools,
-            params,
-            input.agent_name,
-            None,
-            input.cancel,
-            None,
-        ),
-    )
+    let completion = match tokio::time::timeout(timeout, async {
+        match input.provider_handoff {
+            Some(provider_handoff) => {
+                input
+                    .model
+                    .complete_captured_with_provider_handoff(
+                        &system,
+                        input.history,
+                        prompt,
+                        &tools,
+                        params,
+                        input.agent_name,
+                        None,
+                        input.cancel,
+                        None,
+                        provider_handoff,
+                    )
+                    .await
+            }
+            None => {
+                input
+                    .model
+                    .complete_captured(
+                        &system,
+                        input.history,
+                        prompt,
+                        &tools,
+                        params,
+                        input.agent_name,
+                        None,
+                        input.cancel,
+                        None,
+                    )
+                    .await
+            }
+        }
+    })
     .await
     {
         Ok(result) => result,

@@ -201,6 +201,7 @@ pub async fn adjudicate(
         agent_name,
         site: UtilityCallSite::VerificationAdjudication,
         cancel,
+        provider_handoff: None,
         deadline_unix_ms: Some(deadline_unix_ms),
     })
     .await?;

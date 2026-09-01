@@ -3892,6 +3892,10 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
     let execution_plan_valid = region.execution_plan.as_ref().is_some_and(|plan| {
         matches!(plan.mode.as_str(), "gate" | "revise")
             && matches!(
+                plan.candidate_dispatch.as_str(),
+                "parallel" | "warm_then_fanout"
+            )
+            && matches!(
                 plan.on_budget_exceeded.as_str(),
                 "refuse" | "dispatch_original"
             )
@@ -6070,6 +6074,18 @@ mod tests {
         let forged_selector_mask = serde_json::to_vec(&profile).unwrap();
         assert!(decode_canonical_snapshot(&forged_selector_mask, "forged selector mask").is_err());
         profile.verification_regions[0].enabled_intersection_mask = vec!["all:tool_id:read".into()];
+
+        let mut invalid_candidate_dispatch = profile.clone();
+        invalid_candidate_dispatch.verification_regions[0]
+            .execution_plan
+            .as_mut()
+            .unwrap()
+            .candidate_dispatch = "forged".into();
+        let invalid_candidate_dispatch = serde_json::to_vec(&invalid_candidate_dispatch).unwrap();
+        assert!(
+            decode_canonical_snapshot(&invalid_candidate_dispatch, "invalid candidate dispatch")
+                .is_err()
+        );
 
         profile.verification_regions[0].effective_action = VerificationEffectiveAction::Off;
         profile.verification_regions[0].enabled = false;

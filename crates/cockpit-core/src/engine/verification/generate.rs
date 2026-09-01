@@ -2,7 +2,7 @@
 //! verification. Candidate bodies are persisted only as
 //! [`RedactedVerificationJson`]; they never enter the tool-call audit path.
 
-use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use futures::future::join_all;
@@ -184,6 +184,7 @@ fn candidate_is_adjudicable(
 async fn collect_one_candidate(
     input: &CollectionInput<'_>,
     spec: &GeneratorSpec,
+    provider_handoff: Option<&AtomicBool>,
 ) -> Result<Option<CollectedCandidate>> {
     let guidance_names = input.ctx.config.extended().agent_guidance_files.clone();
     let target = input
@@ -330,6 +331,7 @@ async fn collect_one_candidate(
             same_as_author,
             reservation_tokens,
             reserved_cost,
+            provider_handoff,
         )
         .await
     };
@@ -429,11 +431,21 @@ async fn collect_one_candidate(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CandidateDispatchPlan {
-    actual_mode: VerificationCandidateDispatch,
+    scheduled_mode: VerificationCandidateDispatch,
     warm_candidate: Option<usize>,
-    /// Requests which follow a completed warm request and therefore carry the
-    /// slot's shared prefix as provider cache reads.
+    /// Requests which follow a completed warm request and therefore carry this
+    /// group's proven shared prefix as provider cache reads.
     cache_read_candidates: Vec<usize>,
+}
+
+/// Every first-turn cache-prefix input is derived from the collection input
+/// shared by all candidates plus the complete generator spec: the slot selects
+/// the endpoint, the recipe selects prompt/history material, and `max_turns`
+/// constrains the advertised tool surface and turn contract. This deliberately
+/// conservative equivalence may split otherwise cacheable requests, but never
+/// warms one request for a sibling with unequal prefix inputs.
+fn shares_cacheable_request_prefix(first: &GeneratorSpec, second: &GeneratorSpec) -> bool {
+    first == second
 }
 
 fn candidate_dispatch_plan(
@@ -446,13 +458,13 @@ fn candidate_dispatch_plan(
         && slot_supports_observed_cache_hits
     {
         CandidateDispatchPlan {
-            actual_mode: VerificationCandidateDispatch::WarmThenFanout,
+            scheduled_mode: VerificationCandidateDispatch::WarmThenFanout,
             warm_candidate: candidates.first().copied(),
             cache_read_candidates: candidates[1..].to_vec(),
         }
     } else {
         CandidateDispatchPlan {
-            actual_mode: VerificationCandidateDispatch::Parallel,
+            scheduled_mode: VerificationCandidateDispatch::Parallel,
             warm_candidate: None,
             cache_read_candidates: Vec::new(),
         }
@@ -495,27 +507,43 @@ fn cache_warm_is_eligible(cache_mode: CacheMode, observed_cache_hit: bool) -> bo
     cache_mode != CacheMode::None && observed_cache_hit
 }
 
+fn completed_dispatch_mode(
+    plan: &CandidateDispatchPlan,
+    warm_reached_provider: bool,
+) -> VerificationCandidateDispatch {
+    if plan.warm_candidate.is_some() && warm_reached_provider {
+        VerificationCandidateDispatch::WarmThenFanout
+    } else {
+        VerificationCandidateDispatch::Parallel
+    }
+}
+
 async fn collect_dispatch_group(
     input: &CollectionInput<'_>,
+    slot: &str,
     candidates: Vec<(usize, &GeneratorSpec)>,
     plan: &CandidateDispatchPlan,
-) -> Result<Vec<(usize, CollectedCandidate)>> {
+) -> Result<CollectedDispatchGroup> {
     let mut collected = Vec::new();
+    let candidate_count = candidates.len();
+    let provider_handoff = AtomicBool::new(false);
     if let Some(warm_index) = plan.warm_candidate {
         let (index, spec) = candidates
             .iter()
             .find(|(index, _)| *index == warm_index)
             .expect("warm candidate must belong to its dispatch group");
-        if let Some(candidate) = collect_one_candidate(input, spec).await? {
+        if let Some(candidate) = collect_one_candidate(input, spec, Some(&provider_handoff)).await?
+        {
             collected.push((*index, candidate));
         }
     }
+    let warmed_provider_cache = provider_handoff.load(Ordering::Acquire);
     let fanout = candidates
         .into_iter()
         .filter(|(index, _)| plan.warm_candidate != Some(*index));
     for result in join_all(fanout.map(|(index, spec)| async move {
         Ok::<_, anyhow::Error>(
-            collect_one_candidate(input, spec)
+            collect_one_candidate(input, spec, None)
                 .await?
                 .map(|candidate| (index, candidate)),
         )
@@ -526,12 +554,34 @@ async fn collect_dispatch_group(
             collected.push(candidate);
         }
     }
-    Ok(collected)
+    let actual_mode = completed_dispatch_mode(plan, warmed_provider_cache);
+    Ok(CollectedDispatchGroup {
+        collected,
+        telemetry: serde_json::json!({
+            "slot": slot,
+            "actual_mode": match actual_mode {
+                VerificationCandidateDispatch::Parallel => "parallel",
+                VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
+            },
+            "candidate_count": candidate_count,
+            "cache_read_candidate_count": if actual_mode == VerificationCandidateDispatch::WarmThenFanout {
+                plan.cache_read_candidates.len()
+            } else {
+                0
+            },
+        }),
+    })
 }
 
-/// Collect candidates concurrently by slot. A warm group completes its first
-/// request before the remaining same-slot requests begin; distinct slots make
-/// their own warm/fan-out decision and proceed independently.
+struct CollectedDispatchGroup {
+    collected: Vec<(usize, CollectedCandidate)>,
+    telemetry: serde_json::Value,
+}
+
+/// Collect candidates concurrently by cacheable request prefix. A warm group
+/// completes its first request before the remaining matching-prefix requests
+/// begin; distinct prefixes make their own warm/fan-out decision and proceed
+/// independently.
 pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<CollectedCandidate>> {
     let now = chrono::Utc::now().timestamp_millis();
     let started = input
@@ -553,19 +603,26 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         .len()
         .min(usize::from(input.max_candidates))
         .min(usize::from(crate::agents::MAX_VERIFICATION_CANDIDATES));
-    let mut groups = BTreeMap::<&str, Vec<(usize, &GeneratorSpec)>>::new();
+    let mut groups = Vec::<Vec<(usize, &GeneratorSpec)>>::new();
     for (index, spec) in input
         .generators
         .iter()
         .take(effective_candidate_count)
         .enumerate()
     {
-        groups.entry(&spec.slot).or_default().push((index, spec));
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group
+                .first()
+                .is_some_and(|(_, first)| shares_cacheable_request_prefix(first, spec))
+        }) {
+            group.push((index, spec));
+        } else {
+            groups.push(vec![(index, spec)]);
+        }
     }
 
     let mut scheduled = Vec::with_capacity(groups.len());
-    let mut telemetry = Vec::with_capacity(groups.len());
-    for (slot, candidates) in groups {
+    for candidates in groups {
         let supports_cache = match candidates.first() {
             Some((_, spec)) => slot_supports_observed_cache_hits(input, spec).await,
             None => false,
@@ -575,16 +632,25 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             .map(|(index, _)| *index)
             .collect::<Vec<_>>();
         let plan = candidate_dispatch_plan(input.candidate_dispatch, &indices, supports_cache);
-        telemetry.push(serde_json::json!({
-            "slot": slot,
-            "actual_mode": match plan.actual_mode {
-                VerificationCandidateDispatch::Parallel => "parallel",
-                VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
-            },
-            "candidate_count": candidates.len(),
-            "cache_read_candidate_count": plan.cache_read_candidates.len(),
-        }));
-        scheduled.push((candidates, plan));
+        let slot = candidates
+            .first()
+            .expect("dispatch group must contain at least one candidate")
+            .1
+            .slot
+            .clone();
+        scheduled.push((slot, candidates, plan));
+    }
+
+    let mut indexed = Vec::new();
+    let mut telemetry = Vec::with_capacity(scheduled.len());
+    for group in join_all(scheduled.iter().map(|(slot, candidates, plan)| {
+        collect_dispatch_group(input, slot, candidates.clone(), plan)
+    }))
+    .await
+    {
+        let group = group?;
+        indexed.extend(group.collected);
+        telemetry.push(group.telemetry);
     }
     if let Err(error) = input
         .session
@@ -598,23 +664,12 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
                     VerificationCandidateDispatch::Parallel => "parallel",
                     VerificationCandidateDispatch::WarmThenFanout => "warm_then_fanout",
                 },
-                "slot_groups": telemetry,
+                "cache_prefix_groups": telemetry,
             }),
         )
         .await
     {
         tracing::warn!(%error, "record verification candidate dispatch telemetry failed");
-    }
-
-    let mut indexed = Vec::new();
-    for group in join_all(
-        scheduled
-            .iter()
-            .map(|(candidates, plan)| collect_dispatch_group(input, candidates.clone(), plan)),
-    )
-    .await
-    {
-        indexed.extend(group?);
     }
     indexed.sort_by_key(|(index, _)| *index);
 
@@ -755,6 +810,7 @@ async fn generate_with_turns(
     same_as_author: bool,
     reserved_tokens: u64,
     reserved_cost_microusd: u64,
+    provider_handoff: Option<&AtomicBool>,
 ) -> GenerationOutcome {
     let turns = spec
         .max_turns
@@ -804,6 +860,7 @@ async fn generate_with_turns(
             &private_history,
             &tools,
             params.clone(),
+            provider_handoff,
         )
         .await
         {
@@ -932,6 +989,7 @@ async fn generate_one_shot(
     history: &[Message],
     tools: &[ToolDefinition],
     params: crate::engine::model::ModelParams,
+    provider_handoff: Option<&AtomicBool>,
 ) -> Result<GeneratorTurn> {
     let tool = candidate_tool_definition();
     let choice = journaled_verification_inference(VerificationInferenceInput {
@@ -947,6 +1005,7 @@ async fn generate_one_shot(
         agent_name: &format!("{}:verification-generator", input.agent.name),
         site: UtilityCallSite::VerificationVariant,
         cancel: &input.ctx.cancel,
+        provider_handoff,
         deadline_unix_ms: Some(input.collection_deadline_unix_ms),
     })
     .await?;
@@ -1041,7 +1100,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warm_then_fanout_marks_each_same_slot_sibling_as_a_cache_read() {
+    fn warm_then_fanout_marks_each_matching_prefix_sibling_as_a_cache_read() {
         let plan = candidate_dispatch_plan(
             VerificationCandidateDispatch::WarmThenFanout,
             &[0, 1, 2],
@@ -1049,7 +1108,7 @@ mod tests {
         );
 
         assert_eq!(
-            plan.actual_mode,
+            plan.scheduled_mode,
             VerificationCandidateDispatch::WarmThenFanout
         );
         assert_eq!(plan.warm_candidate, Some(0));
@@ -1068,7 +1127,7 @@ mod tests {
                 candidates,
                 observed_cache_hit,
             );
-            assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+            assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
             assert_eq!(plan.warm_candidate, None);
             assert!(plan.cache_read_candidates.is_empty());
         }
@@ -1081,15 +1140,63 @@ mod tests {
             &[0, 1],
             cache_warm_is_eligible(CacheMode::None, true),
         );
-        assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+        assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
         assert!(plan.cache_read_candidates.is_empty());
+    }
+
+    #[test]
+    fn dispatch_telemetry_counts_cache_reads_only_after_a_provider_handoff() {
+        let plan =
+            candidate_dispatch_plan(VerificationCandidateDispatch::WarmThenFanout, &[0, 1], true);
+        assert_eq!(
+            completed_dispatch_mode(&plan, false),
+            VerificationCandidateDispatch::Parallel,
+            "a deadline, resolution, reservation, or running-transition refusal must not be recorded as a cache warm"
+        );
+        assert_eq!(
+            completed_dispatch_mode(&plan, true),
+            VerificationCandidateDispatch::WarmThenFanout
+        );
     }
 
     #[test]
     fn parallel_never_serializes_a_cache_warm() {
         let plan = candidate_dispatch_plan(VerificationCandidateDispatch::Parallel, &[0, 1], true);
-        assert_eq!(plan.actual_mode, VerificationCandidateDispatch::Parallel);
+        assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
         assert_eq!(plan.warm_candidate, None);
+    }
+
+    #[test]
+    fn cache_warm_groups_require_the_complete_generator_spec() {
+        let inherit = GeneratorSpec {
+            slot: "primary".into(),
+            recipe: VerificationRecipe::Inherit,
+            max_turns: 1,
+        };
+        let same_prefix = inherit.clone();
+        let different_recipe = GeneratorSpec {
+            recipe: VerificationRecipe::CleanRoom {
+                include_linked_files: false,
+                last_n_reads: 1,
+                tool_categories: Default::default(),
+                tool_allowlist: Vec::new(),
+            },
+            ..inherit.clone()
+        };
+        let different_turn_surface = GeneratorSpec {
+            max_turns: 2,
+            ..inherit.clone()
+        };
+
+        assert!(shares_cacheable_request_prefix(&inherit, &same_prefix));
+        assert!(
+            !shares_cacheable_request_prefix(&inherit, &different_recipe),
+            "same-slot recipes may assemble different prompts and histories"
+        );
+        assert!(
+            !shares_cacheable_request_prefix(&inherit, &different_turn_surface),
+            "max-turns changes the advertised tool surface"
+        );
     }
 
     #[test]

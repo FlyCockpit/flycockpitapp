@@ -752,10 +752,7 @@ impl ConfigDoc {
             reject_legacy_redact_fields(id, &provider)?;
             if !matches!(
                 snapshot.origin,
-                Some(
-                    crate::config::dirs::ConfigDirKind::HomeXdg
-                        | crate::config::dirs::ConfigDirKind::HomeDot
-                )
+                Some(crate::config::dirs::ConfigDirKind::HomeXdg)
             ) {
                 strip_project_auth_command(
                     id,
@@ -1734,17 +1731,11 @@ fn merge_provider_files_for_layer(
     }
 }
 
-/// Only the two conventional home-scoped directories are global authority.
+/// Only the canonical platform global config file has global authority.
 /// Machine-local per-cwd, project `.cockpit`, attached workspace snapshots,
 /// and `COCKPIT_CONFIG` are project scoped for executable configuration.
 fn config_path_is_global_user_layer(config_path: &Path) -> bool {
-    let Some(parent) = config_path.parent() else {
-        return false;
-    };
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    parent == home.join(".cockpit") || parent == home.join(".config/cockpit")
+    crate::config::dirs::global_config_file().is_ok_and(|global| config_path == global)
 }
 
 fn strip_project_auth_command(

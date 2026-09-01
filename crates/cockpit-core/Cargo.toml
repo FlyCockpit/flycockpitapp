@@ -230,8 +230,8 @@ mach2 = { version = "=0.6.0", default-features = false }
 block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace"] }
 objc2-application-services = { version = "=0.3.2", default-features = false, features = ["std", "AXError", "AXUIElement", "AXValue", "HIServices", "libc"] }
-objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString"] }
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGGeometry", "CGSession", "CGWindow", "libc"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGSession", "CGWindow", "libc"] }
 objc2-color-sync = { version = "=0.3.2", default-features = false, features = ["std", "ColorSyncDevice"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSURL"] }
 

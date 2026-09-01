@@ -19,10 +19,15 @@ pub mod frame;
 pub mod guidance;
 pub mod host_identity;
 pub mod live_loop;
+#[cfg(target_os = "macos")]
+mod macos_backend;
 pub mod observation;
 pub mod outcome_store;
 pub mod platform;
 pub mod target;
+
+#[cfg(target_os = "macos")]
+pub use macos_backend::MacOsComputerBackend;
 
 #[cfg(test)]
 mod target_tests;

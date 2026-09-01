@@ -544,6 +544,13 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Native Anthropic Messages API features accepted by this provider.
+    /// These vendor-specific request extensions are opt-in so an
+    /// Anthropic-compatible gateway receives only the portable Messages wire
+    /// unless its configuration explicitly enables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<AnthropicFeatures>,
+
     /// Delegation-shrink behavior for this provider (GOALS §10 /
     /// implementation note). Drives the parent-context
     /// shrink that hides cache-cold cost across a sub-agent delegation. A
@@ -872,6 +879,36 @@ pub struct BackupConfig {
     pub provider: String,
     /// The backup model id that `provider` serves.
     pub model: String,
+}
+
+/// Native Anthropic Messages-wire features accepted by a provider.
+///
+/// Custom Anthropic-compatible endpoints default to both fields disabled.
+/// The first-party Anthropic template materializes both as enabled when it
+/// creates a provider entry.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicFeatures {
+    /// Enable Anthropic `cache_control` request blocks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_caching: bool,
+
+    /// Enable Anthropic beta headers, including extended cache TTL and
+    /// computer-use contracts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub betas: bool,
+}
+
+impl AnthropicFeatures {
+    pub const fn first_party() -> Self {
+        Self {
+            prompt_caching: true,
+            betas: true,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.prompt_caching && !self.betas
+    }
 }
 
 /// Prompt-cache configuration. Set per-provider on [`ProviderEntry`] and
@@ -2148,6 +2185,24 @@ impl ProviderEntry {
     /// and cannot prove registry provenance.
     pub fn effective_template(&self, _key: &str) -> Option<&str> {
         self.template.as_deref()
+    }
+
+    /// Resolve native Anthropic extensions without relying on the endpoint
+    /// host. A missing gate retains the first-party template default for
+    /// existing Anthropic entries while custom providers stay portable by
+    /// default. A present empty object explicitly disables both extensions.
+    pub fn effective_anthropic_features(&self) -> AnthropicFeatures {
+        self.anthropic.unwrap_or_else(|| {
+            if self
+                .template
+                .as_deref()
+                .is_some_and(|template| template.eq_ignore_ascii_case("anthropic"))
+            {
+                AnthropicFeatures::first_party()
+            } else {
+                AnthropicFeatures::default()
+            }
+        })
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.

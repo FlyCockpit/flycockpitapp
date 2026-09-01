@@ -956,6 +956,7 @@ fn round_trips_a_provider_entry() {
             embeddings: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
+            anthropic: Default::default(),
             shrink: ShrinkConfig::default(),
             context: ContextConfig::default(),
             auto_prune: None,

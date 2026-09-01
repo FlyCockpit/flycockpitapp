@@ -1399,6 +1399,10 @@ pub struct EffectiveVnextGrant {
 }
 
 impl EffectiveVnextGrant {
+    pub fn execution_kind(&self) -> ExecutionKind {
+        self.execution_kind
+    }
+
     pub fn computer_delegation_enabled(&self) -> bool {
         self.computer_delegation_enabled
     }

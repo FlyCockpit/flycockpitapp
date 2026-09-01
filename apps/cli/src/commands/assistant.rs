@@ -192,7 +192,6 @@ fn write_assistant_home_with_installation_id(
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
-        capabilities: None,
         tool_steering: None,
         context_policy: None,
         vnext: Some(crate::assistants::vnext_for_private_assistant(

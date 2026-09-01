@@ -246,7 +246,7 @@ mod tests {
         SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch, VerificationPolicy,
         VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn estimate_is_at_least_tokenizer_count_on_fixtures() {

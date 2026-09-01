@@ -1184,7 +1184,7 @@ mod tests {
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction};
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},

@@ -1823,6 +1823,7 @@ impl WireApi {
     /// everything else → [`WireApi::Completions`] (today's default for every
     /// existing model). Deliberately minimal — the error-driven fallback
     /// corrects any miss, so this list never tries to enumerate every model.
+    #[inline]
     pub fn detect(model_id: &str) -> WireApi {
         // Byte-compare (panic-free across UTF-8 boundaries; the prefix is pure
         // ASCII so byte equality is exactly the case-insensitive `str` match).
@@ -1837,6 +1838,7 @@ impl WireApi {
     /// `gpt-5*` → Responses fallback; a fetched catalog remains authoritative
     /// whenever it advertises concrete endpoints. Arbitrary OpenAI-compatible
     /// endpoints default to Chat Completions.
+    #[inline]
     pub fn detect_for_provider(provider_id: &str, model_id: &str) -> WireApi {
         match provider_id {
             "openai" | "copilot" => Self::detect(model_id),
@@ -1849,6 +1851,7 @@ impl WireApi {
     /// identity as well as its legacy config key.  A connection created from
     /// the Copilot template may be renamed, so the key alone is not enough to
     /// select Copilot's GPT-5 Responses fallback.
+    #[inline]
     pub fn detect_for_provider_entry(
         provider_id: &str,
         entry: &ProviderEntry,

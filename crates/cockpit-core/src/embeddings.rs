@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::providers::{ProviderEntry, ProvidersConfig, ResolvedEmbeddingModel};
 use crate::engine::model::{Model, OutboundGuard};
@@ -25,13 +25,18 @@ pub struct OpenAiCompatEmbedder {
     headers: Vec<models_fetch::ResolvedHeader>,
     model: String,
     expected_dimensions: Option<u32>,
-    guard: OutboundGuard,
-    command_refresh: Option<(
-        String,
-        ProviderEntry,
-        crate::credentials::CredentialStore,
-        Option<u64>,
-    )>,
+    guard: Arc<Mutex<OutboundGuard>>,
+    command_refresh: Option<Arc<CommandRefresh>>,
+}
+
+/// Runtime state for a long-lived command-authenticated embedding client.
+/// The request that sends a credential owns its generation, so both must move
+/// together after every refresh rather than retaining construction-time data.
+struct CommandRefresh {
+    provider_id: String,
+    entry: ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    request: Mutex<models_fetch::ResolvedRequest>,
 }
 
 impl OpenAiCompatEmbedder {
@@ -139,17 +144,17 @@ impl OpenAiCompatEmbedder {
             session_redact,
         );
         let guard = OutboundGuard::new(effective_redact);
-        let command_credential_generation = request.command_credential_generation();
+        let command_request = request.clone();
         Ok(
             Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
                 .with_command_refresh(store.filter(|_| entry.auth_command.is_some()).map(
                     |store| {
-                        (
-                            provider_id.to_string(),
-                            entry.clone(),
+                        Arc::new(CommandRefresh {
+                            provider_id: provider_id.to_string(),
+                            entry: entry.clone(),
                             store,
-                            command_credential_generation,
-                        )
+                            request: Mutex::new(command_request),
+                        })
                     },
                 )),
         )
@@ -168,20 +173,12 @@ impl OpenAiCompatEmbedder {
             headers: request.headers,
             model,
             expected_dimensions,
-            guard,
+            guard: Arc::new(Mutex::new(guard)),
             command_refresh: None,
         }
     }
 
-    fn with_command_refresh(
-        mut self,
-        command_refresh: Option<(
-            String,
-            ProviderEntry,
-            crate::credentials::CredentialStore,
-            Option<u64>,
-        )>,
-    ) -> Self {
+    fn with_command_refresh(mut self, command_refresh: Option<Arc<CommandRefresh>>) -> Self {
         self.command_refresh = command_refresh;
         self
     }
@@ -209,19 +206,44 @@ impl OpenAiCompatEmbedder {
         }
         req
     }
+
+    fn current_request(&self) -> (String, Vec<models_fetch::ResolvedHeader>, Option<u64>) {
+        self.command_refresh
+            .as_ref()
+            .map(|refresh| {
+                let request = refresh
+                    .request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (
+                    request.base_url.clone(),
+                    request.headers.clone(),
+                    request.command_credential_generation(),
+                )
+            })
+            .unwrap_or_else(|| (self.base_url.clone(), self.headers.clone(), None))
+    }
+
+    fn guard(&self) -> OutboundGuard {
+        self.guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 #[async_trait]
 impl Embedder for OpenAiCompatEmbedder {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let redacted = self.guard.scrub_many(texts);
+        let redacted = self.guard().scrub_many(texts);
         let redacted_refs: Vec<&str> = redacted.iter().map(String::as_str).collect();
         let body = EmbeddingsRequest {
             model: &self.model,
             input: &redacted_refs,
         };
+        let (base_url, headers, request_generation) = self.current_request();
         let response = self
-            .request(&body, &self.base_url, &self.headers)
+            .request(&body, &base_url, &headers)
             .send()
             .await
             .context("sending embeddings request")?;
@@ -229,24 +251,34 @@ impl Embedder for OpenAiCompatEmbedder {
             response.status(),
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
-            self.command_refresh
-                .as_ref()
-                .map(|(provider_id, entry, store, generation)| {
-                    (provider_id, entry, store, generation)
-                })
+            self.command_refresh.as_ref()
         } else {
             None
         };
-        let response = if let Some((provider_id, entry, store, generation)) = refreshed {
+        let response = if let Some(refresh) = refreshed {
             let request = models_fetch::refresh_provider_request_async_with_store(
-                provider_id,
-                entry,
-                store.clone(),
+                &refresh.provider_id,
+                &refresh.entry,
+                refresh.store.clone(),
                 |name| std::env::var(name).ok(),
-                *generation,
+                request_generation,
             )
             .await?;
             if let Some(request) = request {
+                // The store now contains the refreshed command result. Update
+                // both request provenance and diagnostic redaction before the
+                // retry can send or surface a provider body.
+                let guard = self
+                    .guard()
+                    .with_current_provider_auth_command_values(&refresh.store)?;
+                *self
+                    .guard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
+                *refresh
+                    .request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = request.clone();
                 self.request(&body, &request.base_url, &request.headers)
                     .send()
                     .await
@@ -262,11 +294,15 @@ impl Embedder for OpenAiCompatEmbedder {
             .text()
             .await
             .context("reading embeddings response")?;
+        let diagnostic = self.guard().scrub(&text);
         if !status.is_success() {
-            anyhow::bail!("embeddings request returned {status}: {}", snippet(&text));
+            anyhow::bail!(
+                "embeddings request returned {status}: {}",
+                snippet(&diagnostic)
+            );
         }
         let parsed: EmbeddingsResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parsing embeddings response: {}", snippet(&text)))?;
+            .with_context(|| format!("parsing embeddings response: {}", snippet(&diagnostic)))?;
         if parsed.data.len() != texts.len() {
             anyhow::bail!(
                 "embeddings response count mismatch: requested {}, got {}",

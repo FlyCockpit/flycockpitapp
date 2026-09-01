@@ -1206,7 +1206,9 @@ impl Session {
         provider_id: &str,
         model_id: &str,
         env: &std::collections::HashMap<String, String>,
-    ) -> Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>> {
+    ) -> anyhow::Result<
+        Option<Arc<crate::audio_transcription::journal::TranscriptionDispatchService>>,
+    > {
         let resolved = crate::audio_transcription::transport::resolve_vetted_egress(
             self,
             config,
@@ -1214,7 +1216,7 @@ impl Session {
             model_id,
             env,
         )
-        .await
+        .await?
         .and_then(|egress| {
             self.external_journal().map(|journal| {
                 Arc::new(
@@ -1239,7 +1241,7 @@ impl Session {
                 dispatches.remove(&key);
             }
         }
-        resolved
+        Ok(resolved)
     }
 
     pub(crate) fn set_message_media_authority(

@@ -44,6 +44,9 @@ pub enum TranscriptionEgressError {
     /// Request bytes may have reached the provider; retrying could duplicate a
     /// paid operation. The journal must retain this as submission-unknown.
     AmbiguousAcceptance,
+    /// Provider authentication could not be resolved or refreshed. Deliberately
+    /// carries no command stderr, JSON, or credential material.
+    Authentication,
 }
 
 impl TranscriptionEgressError {
@@ -61,6 +64,9 @@ impl TranscriptionEgressError {
             TranscriptionEgressError::Malformed => "invalid_output: response was malformed",
             TranscriptionEgressError::AmbiguousAcceptance => {
                 "transcription_unavailable: provider acceptance is unknown"
+            }
+            TranscriptionEgressError::Authentication => {
+                "transcription_authentication_failed: provider authentication failed"
             }
         }
     }

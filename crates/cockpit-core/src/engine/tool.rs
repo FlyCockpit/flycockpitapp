@@ -2204,6 +2204,7 @@ enum DirectNativeMediaUnavailable {
     AuthorityUnavailable,
     Availability(crate::tool_media_authority::MediaToolAvailabilityReason),
     TranscriptionDispatchUnavailable,
+    TranscriptionAuthenticationFailed,
 }
 
 impl DirectNativeMediaUnavailable {
@@ -2232,6 +2233,9 @@ impl DirectNativeMediaUnavailable {
             ) => "it is not callable in this turn",
             Self::TranscriptionDispatchUnavailable => {
                 "no authorized transcription dispatch is available for this session and current model"
+            }
+            Self::TranscriptionAuthenticationFailed => {
+                "provider authentication failed while preparing transcription"
             }
         }
     }
@@ -2362,6 +2366,15 @@ impl ToolBox {
         self.deactivate_direct_native_media(
             "transcribe_audio",
             DirectNativeMediaUnavailable::TranscriptionDispatchUnavailable,
+        )
+    }
+
+    /// Keep transcription's stable schema while surfacing a failed provider
+    /// auth command as authentication failure at the model-visible call site.
+    pub(crate) fn deactivate_direct_native_media_for_transcription_authentication(self) -> Self {
+        self.deactivate_direct_native_media(
+            "transcribe_audio",
+            DirectNativeMediaUnavailable::TranscriptionAuthenticationFailed,
         )
     }
 

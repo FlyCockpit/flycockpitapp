@@ -13,6 +13,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
@@ -28,26 +29,32 @@ use crate::image_generation::transport::ProviderTransportError;
 use crate::image_generation_runtime::{AddressClass, DnsResolver};
 
 /// Resolve and bind the complete live transcription route. Absence is the
-/// fail-closed result for missing capability, journal-independent provider
-/// configuration, credentials, or a route that is not the supported public
-/// OpenAI-compatible HTTPS endpoint shape.
+/// fail-closed result for missing capability or a route that is not the
+/// supported public OpenAI-compatible HTTPS endpoint shape. Authentication
+/// resolution errors deliberately remain errors so a failed auth command is
+/// surfaced as authentication failure instead of disappearing as capability
+/// absence.
 pub(crate) async fn resolve_vetted_egress(
     session: &crate::session::Session,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     provider_id: &str,
     model_id: &str,
     env: &std::collections::HashMap<String, String>,
-) -> Option<VettedTranscriptionEgress> {
+) -> anyhow::Result<Option<VettedTranscriptionEgress>> {
     use crate::config::providers::CapabilityStatus;
 
     let providers = config.providers();
     let capabilities =
         providers.resolve_effective_model_capabilities(provider_id, model_id, config.generation());
     if capabilities.transcription != CapabilityStatus::Supported {
-        return None;
+        return Ok(None);
     }
-    let entry = providers.providers.get(provider_id)?;
-    let store = session.provider_credential_store(&providers).ok()?;
+    let Some(entry) = providers.providers.get(provider_id) else {
+        return Ok(None);
+    };
+    let store = session
+        .provider_credential_store(&providers)
+        .context("resolving transcription provider credentials")?;
     let request = crate::providers::models_fetch::resolve_provider_request_async_with_store(
         provider_id,
         entry,
@@ -55,22 +62,26 @@ pub(crate) async fn resolve_vetted_egress(
         |name| env.get(name).cloned().or_else(|| std::env::var(name).ok()),
     )
     .await
-    .ok()?;
-    let authorization = request
+    .context("resolving transcription provider authentication")?;
+    let Some(header) = request
         .headers
         .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("authorization"))?
-        .value
-        .as_str();
+        .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+    else {
+        return Ok(None);
+    };
+    let authorization = header.value.as_str();
     if authorization.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut origin = reqwest::Url::parse(&request.base_url).ok()?;
+    let Ok(mut origin) = reqwest::Url::parse(&request.base_url) else {
+        return Ok(None);
+    };
     if origin.path().trim_end_matches('/') == "/v1" {
         origin.set_path("/");
     }
     if origin.path() != "/" {
-        return None;
+        return Ok(None);
     }
     let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
     let command_refresh = entry.auth_command.as_ref().map(|_| CommandRefresh {
@@ -78,7 +89,10 @@ pub(crate) async fn resolve_vetted_egress(
         entry: entry.clone(),
         store,
         env: env.clone(),
-        rejected_refresh_generation: request.command_credential_generation(),
+        state: Arc::new(Mutex::new(CommandRequestState {
+            headers: HeaderMap::new(),
+            rejected_refresh_generation: request.command_credential_generation(),
+        })),
     });
     VettedTranscriptionEgress::new_with_headers_and_refresh(
         provider_id.to_string(),
@@ -90,7 +104,8 @@ pub(crate) async fn resolve_vetted_egress(
         Arc::new(crate::image_generation_runtime::TokioDnsResolver),
         command_refresh,
     )
-    .ok()
+    .map(Some)
+    .context("binding transcription provider authentication")
 }
 
 /// Production HTTPS transport for OpenAI-compatible `/v1/audio/transcriptions`.
@@ -110,6 +125,15 @@ struct CommandRefresh {
     entry: crate::config::providers::ProviderEntry,
     store: crate::credentials::CredentialStore,
     env: std::collections::HashMap<String, String>,
+    state: Arc<Mutex<CommandRequestState>>,
+}
+
+/// The exact command-authenticated headers and generation attached to a
+/// request. They must be read and replaced under one lock: a delayed 401 from
+/// generation N must never be attributed to concurrently published N+1.
+#[derive(Clone)]
+struct CommandRequestState {
+    headers: HeaderMap,
     rejected_refresh_generation: Option<u64>,
 }
 
@@ -291,6 +315,13 @@ impl TranscriptionHttpTransport {
         if origin.path() != "/" {
             return Err(ProviderTransportConfigError::ForbiddenOriginComponent);
         }
+        if let Some(refresh) = &command_refresh {
+            refresh
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .headers = headers.clone();
+        }
         Ok(Self {
             origin,
             headers: Mutex::new(headers),
@@ -342,11 +373,25 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let content_type_value =
             HeaderValue::from_str(&content_type).map_err(|_| TranscriptionEgressError::Connect)?;
-        let mut headers = self
-            .headers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let (mut headers, rejected_refresh_generation) = self
+            .command_refresh
+            .as_ref()
+            .map(|refresh| {
+                let state = refresh
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (state.headers.clone(), state.rejected_refresh_generation)
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.headers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                    None,
+                )
+            });
         headers.insert(CONTENT_TYPE, content_type_value.clone());
 
         let outcome = VettedHttpClient::new(self.dns.clone(), self.required_location)
@@ -376,22 +421,36 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
                             .cloned()
                             .or_else(|| std::env::var(name).ok())
                     },
-                    refresh.rejected_refresh_generation,
+                    rejected_refresh_generation,
                 )
                 .await
-                .map_err(|_| TranscriptionEgressError::Connect)?;
+                .map_err(|_| TranscriptionEgressError::Authentication)?;
             if let Some(refreshed) = refreshed {
                 let mut refreshed_headers = HeaderMap::new();
                 for header in &refreshed.headers {
                     let name = HeaderName::from_bytes(header.name.as_bytes())
-                        .map_err(|_| TranscriptionEgressError::Connect)?;
+                        .map_err(|_| TranscriptionEgressError::Authentication)?;
                     let mut value = HeaderValue::from_str(&header.value)
-                        .map_err(|_| TranscriptionEgressError::Connect)?;
+                        .map_err(|_| TranscriptionEgressError::Authentication)?;
                     value.set_sensitive(true);
                     refreshed_headers.insert(name, value);
                 }
                 let mut request_headers = refreshed_headers.clone();
                 request_headers.insert(CONTENT_TYPE, content_type_value);
+                // Publish the refreshed request state before retrying. The
+                // next long-lived dispatch must reject generation N+1 (not
+                // the construction-time N) if this retry is rejected too.
+                *self
+                    .headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed_headers.clone();
+                *refresh
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = CommandRequestState {
+                    headers: refreshed_headers.clone(),
+                    rejected_refresh_generation: refreshed.command_credential_generation(),
+                };
                 let retry = VettedHttpClient::new(self.dns.clone(), self.required_location)
                     .execute(
                         Method::POST,
@@ -402,10 +461,6 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
                     )
                     .await
                     .map_err(Self::map_error)?;
-                *self
-                    .headers
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed_headers;
                 return Ok(TranscriptionHttpResponse {
                     status: retry.status,
                     body: retry.body,

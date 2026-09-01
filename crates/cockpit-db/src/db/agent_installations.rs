@@ -558,7 +558,25 @@ pub enum RedactedVerificationRecipe {
     CleanRoom {
         include_linked_files: bool,
         last_n_reads: u8,
+        #[serde(default = "default_redacted_verification_tool_categories")]
+        tool_categories: Vec<RedactedVerificationToolCategory>,
+        #[serde(default)]
+        tool_allowlist: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactedVerificationToolCategory {
+    Reads,
+    Exploration,
+}
+
+fn default_redacted_verification_tool_categories() -> Vec<RedactedVerificationToolCategory> {
+    vec![
+        RedactedVerificationToolCategory::Reads,
+        RedactedVerificationToolCategory::Exploration,
+    ]
 }
 
 /// Complete non-secret execution policy for one enabled verification region.

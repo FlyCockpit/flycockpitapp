@@ -144,9 +144,23 @@ fn rule_from_snapshot(
                 crate::db::agent_installations::RedactedVerificationRecipe::CleanRoom {
                     include_linked_files,
                     last_n_reads,
+                    tool_categories,
+                    tool_allowlist,
                 } => VerificationRecipe::CleanRoom {
                     include_linked_files: *include_linked_files,
                     last_n_reads: *last_n_reads,
+                    tool_categories: tool_categories
+                        .iter()
+                        .map(|category| match category {
+                            crate::db::agent_installations::RedactedVerificationToolCategory::Reads => {
+                                crate::agents::VerificationToolCategory::Reads
+                            }
+                            crate::db::agent_installations::RedactedVerificationToolCategory::Exploration => {
+                                crate::agents::VerificationToolCategory::Exploration
+                            }
+                        })
+                        .collect(),
+                    tool_allowlist: tool_allowlist.clone(),
                 },
             },
             max_turns: generator.max_turns,
@@ -310,10 +324,13 @@ async fn run_verification(
             continue;
         };
         let (include_linked_files, last_n_reads) = match generator.recipe {
-            crate::agents::VerificationRecipe::Inherit => (false, 3),
+            crate::agents::VerificationRecipe::Inherit => {
+                (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS)
+            }
             crate::agents::VerificationRecipe::CleanRoom {
                 include_linked_files,
                 last_n_reads,
+                ..
             } => (include_linked_files, last_n_reads),
         };
         let recipe = assemble_recipe(RecipeAssemblyInput {

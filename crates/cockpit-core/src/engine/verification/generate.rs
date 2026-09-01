@@ -234,10 +234,11 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         generator_model
             .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
         let (include_linked, last_n) = match &spec.recipe {
-            VerificationRecipe::Inherit => (false, 3),
+            VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
             VerificationRecipe::CleanRoom {
                 include_linked_files,
                 last_n_reads,
+                ..
             } => (*include_linked_files, *last_n_reads),
         };
         let Ok(assembled) = assemble_recipe(RecipeAssemblyInput {

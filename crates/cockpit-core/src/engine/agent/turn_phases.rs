@@ -1372,7 +1372,13 @@ async fn phase_10_dispatch_one_call_with_registry(
             return Ok(ControlFlow::Break($outcome));
         };
     }
-    if let Some(denial) = mcp_builtin_registry.capability_denial(resolved_name) {
+    // Ordinary calls must continue into `execute_ordinary_call_unscoped`,
+    // which produces the canonical structured capability denial shared with
+    // Monty's nested-native path. Only calls consumed by this phase need a
+    // guard here, before they leave the ordinary dispatcher.
+    if is_structural_dispatch_call(agent, resolved_name)
+        && let Some(denial) = mcp_builtin_registry.capability_denial(resolved_name)
+    {
         return_structural!(TurnOutcome::ToolResult {
             task_call_id: tc.id.to_string(),
             task_provider_item_id: tc
@@ -2215,6 +2221,15 @@ async fn phase_10_dispatch_one_call_with_registry(
     }
 
     Ok(ControlFlow::Continue(()))
+}
+
+/// Whether this phase consumes the call instead of passing it to ordinary tool
+/// dispatch. `schedule` is ordinary inside a fork loop, where the fork-only
+/// `note` tool is present; see the dispatch branch above for the ownership
+/// distinction.
+fn is_structural_dispatch_call(agent: &Agent, resolved_name: &str) -> bool {
+    matches!(resolved_name, "task" | "spawn" | "return")
+        || (resolved_name == "schedule" && agent.tools.get("note").is_none())
 }
 
 fn structural_tool_result_is_refusal(body: &str) -> bool {
@@ -4420,6 +4435,37 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
+    }
+
+    #[tokio::test]
+    async fn phase_10_guarded_ordinary_tool_reaches_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent();
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(1);
+        let registry = crate::mcp::builtin::BuiltinRegistry::scoped_fork(
+            "the session-rename micro-fork",
+            ["set_session_metadata"],
+            Vec::new(),
+        );
+        let call = tool_call("edit", serde_json::json!({ "text": "blocked" }));
+
+        let flow = phase_10_dispatch_one_call_with_registry(
+            &agent,
+            &session,
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            &tx,
+            &call,
+            "edit",
+            &registry,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(flow, ControlFlow::Continue(())),
+            "ordinary calls must reach the canonical guard denial in ordinary dispatch"
+        );
     }
 
     fn identified_task_call(call_id: &str, provider_call_id: &str, args: Value) -> ToolCall {

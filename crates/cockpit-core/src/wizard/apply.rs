@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::dirs::{
-    CONFIG_FILE, config_write_target_for_provider, most_specific_config_write_target,
-};
+use crate::config::dirs::global_config_file;
 use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::ConfigDoc;
 use crate::wizard::{
@@ -48,10 +46,10 @@ pub async fn compose_wizard_host_capabilities(cwd: &Path) -> cockpit_proto::Host
     )
 }
 
-/// Build the descriptor for wizard `id`, seeded from the config effective
-/// at `cwd`. The security and model wizards are config-dependent (their
-/// steps show current values and provider/model lists); every other wizard
-/// is static and comes straight from the registry.
+/// Build the descriptor for wizard `id`. Security and model onboarding are
+/// seeded exclusively from the canonical global layer: workspace trust and
+/// workspace overlays must not influence a user-global choice. Every other
+/// wizard is static and comes straight from the registry.
 pub fn descriptor_for_cwd(id: &str, cwd: &Path) -> Option<WizardDescriptor> {
     descriptor_for_cwd_with_caps(id, cwd, None)
 }
@@ -61,11 +59,15 @@ pub fn descriptor_for_cwd(id: &str, cwd: &Path) -> Option<WizardDescriptor> {
 /// (no host On, no container rows).
 pub fn descriptor_for_cwd_with_caps(
     id: &str,
-    cwd: &Path,
+    _cwd: &Path,
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Option<WizardDescriptor> {
+    let global_config = global_config_file().ok()?;
     if id == crate::wizard::SECURITY_WIZARD_ID {
-        let current = crate::config::extended::load_for_cwd(cwd);
+        let current = ExtendedConfigDoc::load(&global_config)
+            .ok()
+            .map(|doc| doc.config())
+            .unwrap_or_default();
         let unpublished = crate::daemon::session_worker::unpublished_host_capability_snapshot();
         let caps = caps.unwrap_or(&unpublished);
         return Some(crate::wizard::security_descriptor_for_config_with_caps(
@@ -73,23 +75,32 @@ pub fn descriptor_for_cwd_with_caps(
         ));
     }
     if id == crate::wizard::MODEL_WIZARD_ID {
-        return Some(model_descriptor_for_cwd(cwd, None));
+        let current = ConfigDoc::load(&global_config)
+            .ok()
+            .map(|doc| doc.providers())
+            .unwrap_or_default();
+        return Some(crate::wizard::model_descriptor_with_selection(
+            &current, None,
+        ));
     }
     crate::wizard::descriptor(id)
 }
 
 /// Model-wizard descriptor for `cwd`, optionally opening on a specific
 /// `(provider_id, model_id)` rather than the first entry.
-pub fn model_descriptor_for_cwd(cwd: &Path, preselect: Option<(&str, &str)>) -> WizardDescriptor {
-    let current = ConfigDoc::load_effective(cwd);
+pub fn model_descriptor_for_cwd(_cwd: &Path, preselect: Option<(&str, &str)>) -> WizardDescriptor {
+    let current = global_config_file()
+        .ok()
+        .and_then(|path| ConfigDoc::load(&path).ok())
+        .map(|doc| doc.providers())
+        .unwrap_or_default();
     crate::wizard::model_descriptor_with_selection(&current, preselect)
 }
 
-/// Where [`apply_security_answers`] will write: the most specific writable
-/// config layer for `cwd`, falling back to `cwd/.cockpit/config.json` when
-/// no layer exists yet.
-pub fn security_config_path(cwd: &Path) -> PathBuf {
-    most_specific_config_write_target(cwd).unwrap_or_else(|| cwd.join(".cockpit").join(CONFIG_FILE))
+/// Where onboarding security answers are written: the always-writable global
+/// layer. Workspace trust never selects or gates this path.
+pub fn security_config_path() -> Result<PathBuf> {
+    global_config_file().context("resolving global config for security setup")
 }
 
 /// Persist the security wizard's answers: sandbox default mode, default
@@ -163,13 +174,15 @@ pub async fn apply_setup_wizard_answers_authoritative(
 /// Persist security-wizard answers. When `caps` is present, unavailable
 /// sandbox modes are refused and not written.
 pub fn apply_security_answers_with_caps(
-    cwd: &Path,
+    _cwd: &Path,
     run: &WizardRun,
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Result<Option<PathBuf>> {
-    let effective = crate::config::extended::load_for_cwd(cwd);
-    let target = security_config_path(cwd);
+    let target = security_config_path()?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
+    // Onboarding owns only the canonical global layer. A workspace overlay
+    // must neither suppress nor redirect a user-global choice.
+    let effective = doc.config();
     let mut cfg = doc.config();
     let mut changed = false;
 
@@ -232,16 +245,20 @@ impl ModelAnswersOutcome {
 /// Persist the model wizard's answers for the selected `provider:model`:
 /// trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
-/// prompt, and optionally the active model. Model fields go to the most
-/// specific writable layer for that provider; the "make default" choice
-/// delegates to the one authoritative effective-default operation, which
-/// selects and verifies its own target layer.
-pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
+/// prompt, and optionally the active model. Onboarding model fields belong to
+/// the global config layer; workspace trust neither selects nor gates that
+/// user-owned target. The "make default" choice delegates to the one
+/// authoritative effective-default operation.
+pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
-    let model_target = config_write_target_for_provider(cwd, &provider_id).ok_or_else(|| {
-        anyhow!("provider `{provider_id}` config is not writable; cannot save model settings")
-    })?;
-    let effective = ConfigDoc::load_effective(cwd);
+    let global_config = global_config_file().context("resolving global config for model setup")?;
+    let model_target =
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)
+            .context("resolving global provider config for model setup")?;
+    // Model onboarding is authored against the global layer alone; resolving
+    // workspace overlays here would make an untrusted project influence the
+    // user's durable provider/model defaults.
+    let effective = ConfigDoc::load(&global_config)?.providers();
     let mut base = effective.clone();
     if let Some(model) = base.providers.get_mut(&provider_id).and_then(|provider| {
         provider
@@ -460,7 +477,9 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOu
         // authoritative operation as Ctrl+Enter and `/settings`; there is no
         // parallel default-persistence API.
         let result = crate::config::providers::mutate_effective_default(
-            cwd,
+            global_config
+                .parent()
+                .context("global config file has no parent directory")?,
             Some(&next),
             crate::config::providers::ActiveModelWriteMode::Replace,
             None,
@@ -513,7 +532,7 @@ fn numeric_capability_override(
 mod tests {
     use super::*;
 
-    use crate::config::dirs::COCKPIT_CONFIG_ENV;
+    use crate::config::dirs::{COCKPIT_CONFIG_ENV, global_config_file};
     use crate::wizard::WizardAnswer;
     use cockpit_test_support::TestEnvGuard;
 
@@ -522,33 +541,20 @@ mod tests {
     }
 
     impl CockpitConfigEnvGuard {
-        fn set(path: &std::path::Path) -> Self {
-            Self::set_with_state(
-                path,
-                path.parent()
-                    .unwrap_or_else(|| std::path::Path::new("/tmp")),
-            )
-        }
-
-        fn set_with_state(path: &std::path::Path, state_home: &std::path::Path) -> Self {
-            let guard = crate::test_env::lock();
-            guard.set_var(COCKPIT_CONFIG_ENV, path);
-            guard.set_var("XDG_STATE_HOME", state_home);
-            guard.set_var("XDG_DATA_HOME", state_home);
-            guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
-            Self { _guard: guard }
-        }
-
-        fn clear_config() -> Self {
+        fn set(root: &std::path::Path) -> Self {
             let guard = crate::test_env::lock();
             guard.remove_var(COCKPIT_CONFIG_ENV);
+            guard.set_var("XDG_CONFIG_HOME", root.join("config"));
+            guard.set_var("HOME", root.join("home"));
+            guard.set_var("XDG_STATE_HOME", root.join("state"));
+            guard.set_var("XDG_DATA_HOME", root.join("data"));
+            guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
             Self { _guard: guard }
         }
     }
 
-    fn write_model_wizard_provider(cwd: &std::path::Path) -> PathBuf {
-        let path = most_specific_config_write_target(cwd)
-            .unwrap_or_else(|| cwd.join(".cockpit").join(crate::config::dirs::CONFIG_FILE));
+    fn write_model_wizard_provider(_cwd: &std::path::Path) -> PathBuf {
+        let path = global_config_file().unwrap();
         let Some(parent) = path.parent() else {
             panic!("config target has no parent");
         };
@@ -696,8 +702,8 @@ mod tests {
     #[test]
     fn security_wizard_all_defaults_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let mut run = security_run_for_cwd(tmp.path());
         submit_security_wizard_prefills_until_save(&mut run);
 
@@ -710,8 +716,8 @@ mod tests {
     #[test]
     fn security_wizard_writes_only_changed_fields() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let mut run = security_run_for_cwd(tmp.path());
         submit_security_wizard_until_save(
             &mut run,
@@ -733,8 +739,8 @@ mod tests {
     #[test]
     fn security_wizard_cannot_persist_unavailable_container() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
             cockpit_proto::FeatureCapabilityState::Available,
             cockpit_proto::FeatureCapabilityState::Missing,
@@ -757,8 +763,8 @@ mod tests {
     #[test]
     fn security_wizard_off_sandbox_mode_persists() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let mut run = security_run_for_cwd(tmp.path());
         submit_security_wizard_until_save(
             &mut run,
@@ -776,15 +782,16 @@ mod tests {
     }
 
     #[test]
-    fn security_wizard_matching_parent_layer_value_writes_nothing() {
+    fn security_wizard_ignores_matching_workspace_layer_value() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = CockpitConfigEnvGuard::clear_config();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let global_config = global_config_file().unwrap();
         let parent = tmp.path().join("repo");
         let child = parent.join("child");
         let parent_config = parent.join(".cockpit/config.json");
         std::fs::create_dir_all(parent_config.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(&parent_config, r#"{}"#).unwrap();
+        std::fs::write(&parent_config, r#"{"sandbox":{"defaultMode":"container"}}"#).unwrap();
         let before = std::fs::read_to_string(&parent_config).unwrap();
         let policy = trust_policy_for(
             &parent,
@@ -792,19 +799,23 @@ mod tests {
         );
         let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
             let mut run = security_run_for_cwd(&child);
-            submit_security_wizard_prefills_until_save(&mut run);
+            submit_security_wizard_until_save(
+                &mut run,
+                &[("sandbox", WizardAnswer::Select("container".to_string()))],
+            );
 
             apply_security_answers(&child, &run).unwrap()
         });
 
-        assert_eq!(saved, None);
+        assert_eq!(saved.as_deref(), Some(global_config.as_path()));
         assert_eq!(std::fs::read_to_string(&parent_config).unwrap(), before);
     }
 
     #[test]
-    fn security_wizard_write_target_prefers_existing_layer() {
+    fn security_wizard_write_target_is_global_despite_workspace_layer() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = CockpitConfigEnvGuard::clear_config();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let global_config = global_config_file().unwrap();
         let project = tmp.path().join("repo");
         let project_config = project.join(".cockpit/config.json");
         std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
@@ -823,11 +834,12 @@ mod tests {
             apply_security_answers(&project, &run).unwrap()
         });
 
-        assert_eq!(saved.as_deref(), Some(project_config.as_path()));
+        assert_eq!(saved.as_deref(), Some(global_config.as_path()));
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), "{}");
     }
 
     #[test]
-    fn security_wizard_write_target_falls_back_to_cwd_config() {
+    fn security_wizard_write_target_is_global_in_fresh_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("repo");
         let home = tmp.path().join("home");
@@ -840,7 +852,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "wizard::apply::tests::security_wizard_write_target_falls_back_to_cwd_config_child",
+                "wizard::apply::tests::security_wizard_write_target_is_global_in_fresh_workspace_child",
                 "--ignored",
                 "--nocapture",
             ])
@@ -862,13 +874,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "spawned by security_wizard_write_target_falls_back_to_cwd_config"]
-    async fn security_wizard_write_target_falls_back_to_cwd_config_child() {
+    #[ignore = "spawned by security_wizard_write_target_is_global_in_fresh_workspace"]
+    async fn security_wizard_write_target_is_global_in_fresh_workspace_child() {
         let cwd = std::path::PathBuf::from(
             std::env::var_os("COCKPIT_SECURITY_FALLBACK_CWD").expect("fallback cwd env var"),
         );
-        let fallback = cwd.join(".cockpit/config.json");
-        assert!(!fallback.exists());
+        let global =
+            std::path::PathBuf::from(std::env::var_os("HOME").expect("isolated home env var"))
+                .join(".config/cockpit/config.json");
+        assert!(!global.exists());
         let mut run = security_run_for_cwd(&cwd);
         submit_security_wizard_until_save(
             &mut run,
@@ -877,15 +891,16 @@ mod tests {
 
         let saved = apply_security_answers(&cwd, &run).unwrap();
 
-        assert_eq!(saved.as_deref(), Some(fallback.as_path()));
-        assert!(fallback.exists());
+        assert_eq!(saved.as_deref(), Some(global.as_path()));
+        assert!(global.exists());
+        assert!(!cwd.join(".cockpit/config.json").exists());
     }
 
     #[test]
     fn security_wizard_unparseable_min_secret_length_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let mut run = security_run_for_cwd(tmp.path());
         submit_security_wizard_prefills_until_save(&mut run);
         run.answers
@@ -904,8 +919,8 @@ mod tests {
     #[test]
     fn security_wizard_min_secret_length_trims_whitespace() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
         let mut run = security_run_for_cwd(tmp.path());
         submit_security_wizard_until_save(
             &mut run,
@@ -1200,14 +1215,21 @@ mod tests {
                 .unwrap()
                 .exists()
         );
-        let project_cfg = ConfigDoc::load(&project_config).unwrap().providers();
-        assert_eq!(project_cfg.active_model.as_ref().unwrap().provider, "p");
-        assert_eq!(project_cfg.active_model.as_ref().unwrap().model, "m");
+        let global_cfg = ConfigDoc::load(&home_config).unwrap().providers();
+        assert_eq!(global_cfg.active_model.as_ref().unwrap().provider, "p");
+        assert_eq!(global_cfg.active_model.as_ref().unwrap().model, "m");
+        assert!(
+            ConfigDoc::load(&project_config)
+                .unwrap()
+                .providers()
+                .active_model
+                .is_none()
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[test]
-    fn model_wizard_partial_overlay_layer_write() {
+    fn model_wizard_ignores_workspace_overlay_layer_for_global_write() {
         let tmp = tempfile::tempdir().unwrap();
         let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
@@ -1216,8 +1238,8 @@ mod tests {
         std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
         let home_config = tmp.path().join("home/.config/cockpit/config.json");
         let home_provider = write_model_wizard_provider_at(&home_config);
-        let before_home = std::fs::read_to_string(&home_provider).unwrap();
         std::fs::write(&project_config, "{}").unwrap();
+        let before_project = std::fs::read_to_string(&project_config).unwrap();
         let project_provider =
             crate::config::providers::provider_file_path_for_config(&project_config, "p").unwrap();
         std::fs::create_dir_all(project_provider.parent().unwrap()).unwrap();
@@ -1232,33 +1254,40 @@ mod tests {
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         );
         let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
-            let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
+            let descriptor = descriptor_for_cwd(
+                crate::wizard::MODEL_WIZARD_ID,
+                home_config.parent().unwrap(),
+            )
+            .unwrap();
             let mut run = WizardRun::new(descriptor).unwrap();
             submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
             apply_model_answers(&project, &run).unwrap()
         });
 
+        assert_eq!(saved.model_file.as_deref(), Some(home_provider.as_path()));
         assert_eq!(
-            saved.model_file.as_deref(),
-            Some(project_provider.as_path())
-        );
-        assert_eq!(
-            std::fs::read_to_string(&home_provider).unwrap(),
-            before_home
+            std::fs::read_to_string(&project_config).unwrap(),
+            before_project
         );
         let raw: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&project_provider).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&home_provider).unwrap()).unwrap();
         let models = raw["models"].as_array().unwrap();
-        assert!(models.iter().any(|model| model["id"] == "other"));
         let overlay = models.iter().find(|model| model["id"] == "m").unwrap();
         assert_eq!(overlay["trust"], "trusted");
         assert_eq!(overlay["capability_overrides"]["image_input"], "supported");
-        assert!(raw.get("url").is_none());
+        assert_eq!(raw["url"], "http://localhost:1/v1");
+        assert!(
+            std::fs::read_to_string(&project_provider)
+                .unwrap()
+                .contains("other")
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[test]
     fn model_wizard_unwritable_layer_errors_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
         let mut cfg = crate::config::providers::ProvidersConfig::default();
         let mut provider = crate::config::providers::ProviderEntry {
             url: "http://localhost:1/v1".to_string(),

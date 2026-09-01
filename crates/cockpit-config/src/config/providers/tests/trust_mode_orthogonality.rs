@@ -27,9 +27,9 @@ fn combo_provider(trust: ModelTrust, quality: i64, cost: i64) -> ProviderEntry {
 /// provider/model identity, for every optimization.
 ///
 /// The removed tie-break preferred the trusted candidate, which made a custody
-/// choice leak into ordinary routing: identical models would silently route
-/// raw values to a trusted provider nobody asked for. Identity is the only
-/// remaining tie-break, so flipping *which* side is trusted must not move the
+/// choice leak into ordinary routing: identical models would silently route to
+/// a capture-capable provider nobody asked for. Identity is the only remaining
+/// tie-break, so flipping *which* side is trusted must not move the
 /// winner.
 #[test]
 fn model_policy_default_ranking_is_trust_neutral() {
@@ -161,7 +161,7 @@ fn model_policy_explicit_trust_filter_is_preserved() {
             .policy
             .routing_diagnostics()
             .custody_filter_reason
-            .contains("raw-custody")
+            .contains("capture-capable")
     );
 
     // Cost optimization still applies inside the filtered set.
@@ -305,10 +305,7 @@ fn trust_mode_cartesian_configuration() {
             ModelTrust::Trusted => ModelCustody::Trusted,
             ModelTrust::Untrusted => ModelCustody::Untrusted,
         };
-        let payload = match custody {
-            ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-            ModelCustody::Untrusted => untrusted_payload(),
-        };
+        let payload = redacted_payload(custody);
         let selector = format!("{provider_id}:m");
         let resolved = cfg
             .resolve_sensitive_model_policy(
@@ -421,7 +418,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
     let mismatch = SensitiveModelPolicyRequest::new(
         policy_criteria(ModelPolicySelector::Any),
         ModelCustody::Trusted,
-        untrusted_payload(),
+        redacted_payload(ModelCustody::Untrusted),
     )
     .unwrap_err();
     assert!(matches!(
@@ -440,7 +437,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
         .unwrap();
     assert_eq!(non_sensitive.custody_filter, None);
 
-    // A trusted selection mints the grant that unlocks raw provider bytes.
+    // A trusted selection mints a capture grant, never a raw egress grant.
     let trusted = cfg
         .resolve_sensitive_model_policy(
             &SensitiveModelPolicyRequest::new(
@@ -449,7 +446,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
                     ..policy_criteria(ModelPolicySelector::Exact("t:m"))
                 },
                 ModelCustody::Trusted,
-                SensitivePayload::raw_for_trusted_custody(),
+                redacted_payload(ModelCustody::Trusted),
             )
             .unwrap(),
         )
@@ -459,28 +456,10 @@ fn model_policy_custody_requirements_are_type_enforced() {
         .expect("a trusted selection mints a grant");
     assert_eq!(grant.provider(), "t");
     assert_eq!(grant.model(), "m");
-    assert_eq!(
-        SensitivePayload::raw_for_trusted_custody().raw_provider_bytes(
-            grant,
-            &trusted.policy,
-            CUSTODY_TEST_SECRET
-        ),
-        Some(CUSTODY_TEST_SECRET),
-        "raw bytes are reachable only after a trusted selection"
-    );
-    assert_eq!(
-        SensitivePayload::raw_for_trusted_custody()
-            .render_for_untrusted(&trusted.policy, CUSTODY_TEST_SECRET),
-        None,
-        "a raw payload has no untrusted rendering"
-    );
-
-    // An untrusted payload has no raw-byte conversion, even holding a grant.
-    assert_eq!(
-        untrusted_payload().raw_provider_bytes(grant, &trusted.policy, CUSTODY_TEST_SECRET),
-        None,
-        "a redacted rendering has no raw-byte conversion"
-    );
+    let rendered =
+        redacted_payload(ModelCustody::Trusted).render(&trusted.policy, CUSTODY_TEST_SECRET);
+    assert!(rendered.contains("t:m"), "{rendered}");
+    assert!(!rendered.contains(CUSTODY_TEST_SECRET), "{rendered}");
     let untrusted = cfg
         .resolve_sensitive_model_policy(
             &SensitiveModelPolicyRequest::new(
@@ -489,15 +468,14 @@ fn model_policy_custody_requirements_are_type_enforced() {
                     ..policy_criteria(ModelPolicySelector::Exact("u:m"))
                 },
                 ModelCustody::Untrusted,
-                untrusted_payload(),
+                redacted_payload(ModelCustody::Untrusted),
             )
             .unwrap(),
         )
         .unwrap();
     assert!(untrusted.trusted_custody_grant().is_none());
-    let rendered = untrusted_payload()
-        .render_for_untrusted(&untrusted.policy, CUSTODY_TEST_SECRET)
-        .expect("untrusted construction requires a target-specific rendering");
+    let rendered =
+        redacted_payload(ModelCustody::Untrusted).render(&untrusted.policy, CUSTODY_TEST_SECRET);
     assert!(rendered.contains("u:m"), "{rendered}");
     assert!(!rendered.contains(CUSTODY_TEST_SECRET));
 
@@ -507,10 +485,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
         ("t:m", ModelCustody::Untrusted, ModelTrust::Trusted),
         ("u:m", ModelCustody::Trusted, ModelTrust::Untrusted),
     ] {
-        let payload = match custody {
-            ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
-            ModelCustody::Untrusted => untrusted_payload(),
-        };
+        let payload = redacted_payload(custody);
         let err = cfg
             .resolve_sensitive_model_policy(
                 &SensitiveModelPolicyRequest::new(
@@ -538,9 +513,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
         assert_eq!(reported, actual);
     }
 
-    // The grant is bound to the destination it was minted for. A grant for one
-    // trusted route cannot be replayed to release raw bytes toward a different
-    // route, so a mismatched destination yields no raw bytes.
+    // The capture grant is bound to the destination it was minted for.
     let mut two_trusted = ProvidersConfig::default();
     two_trusted
         .providers
@@ -566,17 +539,7 @@ fn model_policy_custody_requirements_are_type_enforced() {
         !first_grant.authorizes(&second.policy),
         "a grant must not authorize a different destination"
     );
-    assert_eq!(
-        SensitivePayload::raw_for_trusted_custody().raw_provider_bytes(
-            first_grant,
-            &second.policy,
-            CUSTODY_TEST_SECRET
-        ),
-        None,
-        "a grant minted for `t:m` must not release raw bytes toward `t2:m`"
-    );
-
-    // An untrusted destination can never be authorized by any grant.
+    // An untrusted destination can never be authorized by any capture grant.
     let untrusted_route = cfg
         .resolve_non_sensitive_model_policy(&NonSensitiveModelPolicyRequest::proven_non_sensitive(
             policy_criteria(ModelPolicySelector::Exact("u:m")),

@@ -955,6 +955,7 @@ fn copy_oauth_url_with(
 pub(super) struct AddState {
     pub(super) run: WizardRun,
     pub(super) template_cursor: usize,
+    pub(super) wire_api_cursor: usize,
     pub(super) template: Option<&'static ProviderTemplate>,
     pub(super) id_field: TextField,
     pub(super) url_field: TextField,
@@ -993,6 +994,7 @@ impl AddState {
             run: WizardRun::new(cockpit_core::wizard::provider_descriptor())
                 .expect("built-in provider wizard descriptor is valid"),
             template_cursor: 0,
+            wire_api_cursor: 0,
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
@@ -1035,10 +1037,12 @@ fn provider_entry_from_add(
     template: &'static ProviderTemplate,
     headers: Vec<HeaderSpec>,
 ) -> ProviderEntry {
-    cockpit_core::wizard::provider_entry_for_template(
+    let wire_api = cockpit_core::wizard::provider_wire_api_for_template(&s.run, template);
+    cockpit_core::wizard::provider_entry_for_template_with_wire_api(
         template,
         s.url_field.text().trim_end_matches('/').to_string(),
         headers,
+        wire_api,
     )
 }
 
@@ -1549,6 +1553,7 @@ impl SettingsCx {
                             .or_else(|| t.env_var_candidates.first().copied())
                             .unwrap_or("API_KEY"),
                     );
+                    s.wire_api_cursor = 0;
                     s.error = None;
                     s.run
                         .submit(WizardAnswer::Select(t.id.to_string()))
@@ -1556,6 +1561,29 @@ impl SettingsCx {
                 }
                 _ => {}
             },
+            Some("wire-api") => {
+                const WIRE_APIS: [&str; 4] = ["auto", "completions", "responses", "anthropic"];
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        s.wire_api_cursor =
+                            crate::tui::nav::wrap_prev(s.wire_api_cursor, WIRE_APIS.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        s.wire_api_cursor =
+                            crate::tui::nav::wrap_next(s.wire_api_cursor, WIRE_APIS.len());
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if let Err(error) = s.run.submit(WizardAnswer::Select(
+                            WIRE_APIS[s.wire_api_cursor].to_string(),
+                        )) {
+                            s.error = Some(error);
+                        } else {
+                            s.error = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Some("id") => match key.code {
                 KeyCode::Enter => {
                     let id = s.id_field.text().trim().to_string();
@@ -3310,6 +3338,43 @@ impl SettingsCx {
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
+                }
+            }
+            Some("wire-api") => {
+                lines.push(Line::from(Span::styled(
+                    "Which request wire does this endpoint accept?".to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::default());
+                for (index, (label, description)) in [
+                    ("Auto", "let Cockpit select the request wire"),
+                    (
+                        "Chat Completions",
+                        "use the OpenAI-compatible /chat/completions API",
+                    ),
+                    ("Responses", "use the OpenAI Responses API"),
+                    ("Anthropic", "use Anthropic's native Messages API"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let marker = if index == s.wire_api_cursor {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    let style = if index == s.wire_api_cursor {
+                        yellow.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    controls.push((lines.len(), index));
+                    lines.push(Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled((*label).to_string(), style),
+                        Span::raw(" — "),
+                        Span::styled((*description).to_string(), muted),
+                    ]));
                 }
             }
             Some("id" | "url" | "auth-method" | "api-key" | "env-var" | "headers") => {
@@ -5105,6 +5170,9 @@ fn provider_add_pointer_action(
         WizardStepId::Template => {
             WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
         }
+        WizardStepId::WireApi => WizardControlId::WireApi(
+            (*["auto", "completions", "responses", "anthropic"].get(index)?).to_string(),
+        ),
         WizardStepId::AuthMethod => WizardControlId::AuthMethod(
             *[
                 WizardAuthMethod::PasteKey,
@@ -5728,6 +5796,7 @@ impl SettingsPage for ProvidersPage {
                 Some("template") if index < templates::TEMPLATES.len() => {
                     state.template_cursor = index;
                 }
+                Some("wire-api") if index < 4 => state.wire_api_cursor = index,
                 Some("auth-method") if index < 3 => state.auth_method_cursor = index,
                 Some("headers") if !state.headers.is_editing() => {
                     let last = state

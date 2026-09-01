@@ -2864,7 +2864,9 @@ impl SessionRegistry {
         let Some(mut join) = join else {
             let _ = tokio::time::timeout_at(
                 deadline,
-                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await;
             let _ = tokio::time::timeout_at(
@@ -2887,7 +2889,9 @@ impl SessionRegistry {
 
         let _ = tokio::time::timeout_at(
             deadline,
-            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+            }),
         )
         .await;
         let _ = tokio::time::timeout_at(
@@ -3682,7 +3686,7 @@ mod tests {
         assert_invalid_tokenizer_blocks_snapshot(resume_error, "configuration value is invalid");
         let assistant_home = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&assistant_home).unwrap();
-        let assistant_md = "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nHelp with tests.\n";
+        let assistant_md = "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\n\nHelp with tests.\n";
         std::fs::write(assistant_home.join("assistant.md"), assistant_md).unwrap();
         let content_hash =
             crate::assistants::markdown_content_identity(&reg.inner.db, assistant_md).unwrap();
@@ -4952,7 +4956,9 @@ mod tests {
         loop {
             if tokio::time::timeout(
                 Duration::from_millis(50),
-                handle.send_work(session_worker::SessionWork::Cancel),
+                handle.send_work(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await
             .is_err()

@@ -1794,6 +1794,14 @@ async fn run_foreground_inner_with_boot_db(
     boot_db: Option<crate::db::Db>,
 ) -> Result<()> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::run_foreground");
+    // The global config layer belongs to the user, not the workspace. Make it
+    // durable and writable before a persistent daemon can accept onboarding
+    // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
+    // strictly read-only with respect to this creation path.
+    if !paths.ephemeral {
+        crate::config::config::dirs::ensure_global_config_dir()
+            .context("creating writable global Cockpit config directory")?;
+    }
     if matches!(
         probe(&paths).await,
         DaemonStatus::Running | DaemonStatus::IncompatibleProtocol

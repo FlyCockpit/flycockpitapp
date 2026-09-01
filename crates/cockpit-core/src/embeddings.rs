@@ -168,12 +168,8 @@ impl OpenAiCompatEmbedder {
             }
             None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
         };
-        // AC4: the embedding send boundary is a potentially sensitive caller.
-        // Its custody class is host-owned (the *configured* embedding model
-        // fixes it, no caller may ask for `Trusted`), but it still may not
-        // decide raw-vs-redacted by reading a trust flag: it routes custody
-        // through the typed request API and takes the raw table only from the
-        // grant that route mints. An unroutable target falls closed.
+        // The embedding send boundary uses the same enforced table as every
+        // other model egress. Trust never releases sealed literals.
         let effective_redact = Model::effective_redact_table_for_configured(
             providers,
             provider_id,
@@ -297,37 +293,32 @@ impl Embedder for OpenAiCompatEmbedder {
             None
         };
         let response = if let Some(refresh) = refreshed {
-            let entry = refresh.current_entry()?;
-            let request = models_fetch::refresh_provider_request_async_with_store(
+            let request = models_fetch::refresh_provider_request_async_with_store_authorized(
                 &refresh.provider_id,
-                &entry,
                 refresh.store.clone(),
                 |name| std::env::var(name).ok(),
                 request_generation,
+                || refresh.current_entry(),
             )
             .await?;
-            if let Some(request) = request {
-                // The store now contains the refreshed command result. Update
-                // both request provenance and diagnostic redaction before the
-                // retry can send or surface a provider body.
-                let guard = self
-                    .guard()
-                    .with_current_provider_auth_command_values(&refresh.store)?;
-                *self
-                    .guard
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
-                *refresh
-                    .request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = request.clone();
-                self.request(&body, &request.base_url, &request.headers)
-                    .send()
-                    .await
-                    .context("retrying embeddings request after credential refresh")?
-            } else {
-                response
-            }
+            // The store now contains the refreshed command result. Update
+            // both request provenance and diagnostic redaction before the
+            // retry can send or surface a provider body.
+            let guard = self
+                .guard()
+                .with_current_provider_auth_command_values(&refresh.store)?;
+            *self
+                .guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
+            *refresh
+                .request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = request.clone();
+            self.request(&body, &request.base_url, &request.headers)
+                .send()
+                .await
+                .context("retrying embeddings request after credential refresh")?
         } else {
             response
         };
@@ -416,6 +407,8 @@ fn snippet(body: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::RwLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -428,8 +421,9 @@ mod tests {
         body: String,
     }
 
-    async fn capture_embedding_server_with_response(
+    async fn capture_embedding_server_with_response_status(
         response_body: &'static str,
+        status: &'static str,
     ) -> (
         String,
         tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
@@ -473,13 +467,22 @@ mod tests {
                 }
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (format!("http://{addr}/v1"), rx)
+    }
+
+    async fn capture_embedding_server_with_response(
+        response_body: &'static str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
+    ) {
+        capture_embedding_server_with_response_status(response_body, "200 OK").await
     }
 
     async fn capture_embedding_server() -> (
@@ -531,13 +534,8 @@ mod tests {
         )
     }
 
-    fn guard(trusted: bool) -> OutboundGuard {
-        let redact = if trusted {
-            Arc::new(RedactionTable::empty())
-        } else {
-            secret_table()
-        };
-        OutboundGuard::new(redact)
+    fn guard(_trusted: bool) -> OutboundGuard {
+        OutboundGuard::new(secret_table())
     }
 
     fn embedder(base_url: String, guard: OutboundGuard) -> OpenAiCompatEmbedder {
@@ -558,21 +556,13 @@ mod tests {
 
     /// AC4, embeddings send boundary. The embedding path is a potentially
     /// sensitive caller — it ships user text to a provider — so it may not
-    /// pick raw-vs-redacted by reading a trust flag. It routes custody through
-    /// the typed request API and takes the raw table only from the grant that
-    /// route mints.
-    ///
-    /// Custody here is host-owned: the *configured* embedding model fixes the
-    /// class and no caller may ask for `Trusted`. What this pins is the
-    /// outcome on the wire, built through the production constructor
-    /// [`OpenAiCompatEmbedder::for_provider_entry`]: an untrusted (cloud)
-    /// endpoint receives the placeholder, a trusted (self-hosted / no-log)
-    /// endpoint receives the value — and neither changes with harness posture.
+    /// uses the enforced table regardless of configured trust. This pins the
+    /// production constructor [`OpenAiCompatEmbedder::for_provider_entry`].
     #[tokio::test]
     async fn embedding_send_boundary_routes_custody_before_the_wire() {
         use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
 
-        for (trust, raw_expected) in [(ModelTrust::Trusted, true), (ModelTrust::Untrusted, false)] {
+        for trust in [ModelTrust::Trusted, ModelTrust::Untrusted] {
             let (base_url, capture_rx) = capture_embedding_server_with_response(
                 r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
             )
@@ -605,24 +595,16 @@ mod tests {
                 .unwrap();
 
             let captured = capture_rx.await.unwrap();
-            if raw_expected {
-                assert!(
-                    captured.body.contains(SECRET),
-                    "{trust:?}: a trusted embedding endpoint keeps raw custody: {}",
-                    captured.body
-                );
-            } else {
-                assert!(
-                    !captured.body.contains(SECRET),
-                    "{trust:?}: an untrusted embedding endpoint must never receive the secret: {}",
-                    captured.body
-                );
-                assert!(
-                    captured.body.contains(PLACEHOLDER),
-                    "{trust:?}: the redacted rendering must have reached the wire: {}",
-                    captured.body
-                );
-            }
+            assert!(
+                !captured.body.contains(SECRET),
+                "{trust:?}: an embedding endpoint must never receive the secret: {}",
+                captured.body
+            );
+            assert!(
+                captured.body.contains(PLACEHOLDER),
+                "{trust:?}: the redacted rendering must have reached the wire: {}",
+                captured.body
+            );
         }
     }
 
@@ -644,6 +626,101 @@ mod tests {
             vec![crate::user_agent::user_agent().to_string()],
             "exactly one canonical User-Agent expected; head=\n{}",
             captured.head
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedding_refresh_does_not_run_a_command_revoked_while_waiting() {
+        use crate::config::providers::{AuthKind, ModelEntry, ProviderEntry, ProvidersConfig};
+        use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+
+        const PROVIDER_ID: &str = "embedding-refresh-revoked-while-waiting";
+        let temp = tempfile::tempdir().unwrap();
+        let executions = temp.path().join("auth-command-executions");
+        let (base_url, request_rx) = capture_embedding_server_with_response_status(
+            r#"{"error":"expired"}"#,
+            "401 Unauthorized",
+        )
+        .await;
+        let entry = ProviderEntry {
+            url: base_url,
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'executed\\n' >> \"$1\"; printf '%s' '{\"token\":\"test-token\",\"expires_at\":null}'"
+                    .into(),
+                "auth-command".into(),
+                executions.to_string_lossy().into_owned(),
+            ]),
+            models: vec![ModelEntry {
+                id: "text-embedding-3-small".into(),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        };
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert(PROVIDER_ID.into(), entry.clone());
+        let config = SessionConfigHandle::new(Arc::new(RwLock::new(SessionConfigSnapshot::new(
+            1,
+            providers.clone(),
+            crate::config::extended::ExtendedConfig::default(),
+        ))));
+        let store = crate::credentials::CredentialStore::open(temp.path().join("credentials.json"))
+            .unwrap();
+        let embedder = OpenAiCompatEmbedder::for_provider_entry_with_store(
+            &providers,
+            PROVIDER_ID,
+            &entry,
+            "text-embedding-3-small",
+            Some(3),
+            secret_table(),
+            Some(store),
+            Some(&config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&executions).unwrap(), "executed\n");
+
+        // Occupy the same production refresh guard so the rejected embedding
+        // request is queued when its provider config is reloaded.
+        let (guard_entered_tx, guard_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_guard_tx, release_guard_rx) = tokio::sync::oneshot::channel();
+        let guard = tokio::spawn(async move {
+            crate::auth::refresh_guard::serialized_refresh(PROVIDER_ID, || async move {
+                let _ = guard_entered_tx.send(());
+                let _ = release_guard_rx.await;
+            })
+            .await;
+        });
+        guard_entered_rx.await.unwrap();
+
+        let embedding = tokio::spawn(async move { embedder.embed(&["queued refresh"]).await });
+        let _request = request_rx.await.unwrap();
+
+        let mut revoked_providers = providers;
+        revoked_providers.providers.remove(PROVIDER_ID);
+        config.set_full_config_snapshot_for_tests(SessionConfigSnapshot::new(
+            2,
+            revoked_providers,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let _ = release_guard_tx.send(());
+        guard.await.unwrap();
+
+        let error = embedding.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer has a global auth_command")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&executions).unwrap(),
+            "executed\n",
+            "the production embedding retry must not spawn the revoked command"
         );
     }
 
@@ -773,7 +850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embed_trusted_provider_skips_redaction() {
+    async fn embed_trusted_provider_redacts() {
         let (base_url, capture_rx) = capture_embedding_server_with_response(
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
@@ -785,12 +862,12 @@ mod tests {
 
         let raw = capture_rx.await.unwrap().body;
         assert!(
-            raw.contains(SECRET),
-            "trusted provider should see original text: {raw}"
+            !raw.contains(SECRET),
+            "trusted provider must not see sealed text: {raw}"
         );
         assert!(
-            !raw.contains(PLACEHOLDER),
-            "trusted provider should skip redaction: {raw}"
+            raw.contains(PLACEHOLDER),
+            "trusted provider must receive the redacted rendering: {raw}"
         );
     }
 

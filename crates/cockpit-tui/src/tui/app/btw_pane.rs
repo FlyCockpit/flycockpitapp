@@ -18,7 +18,7 @@ use super::{
     App, FreshQueueAck, RunnerAttachContinuation,
     events::{
         reconcile_folded_user_history, reconcile_history_replay,
-        remove_correlated_optimistic_user_history,
+        remove_correlated_optimistic_user_history, remove_durable_user_history,
     },
     new_pending, wire_history_to_entries,
 };
@@ -78,6 +78,10 @@ pub(super) struct BtwPane {
     /// Live typed-display attempt owning BTW provisional UI (mirrors main TUI).
     active_display_attempt_id: Option<cockpit_client::presentation::AssistantAttemptId>,
     pub queue: Vec<QueuedUserMessage>,
+    /// Durable rows that this pane submitted itself. The shared removal event
+    /// carries opaque submission ids so only this owner restores a draft.
+    local_user_submission_ids_by_seq:
+        std::collections::HashMap<i64, std::collections::HashSet<Uuid>>,
     fresh_queue_ack: FreshQueueAck,
     folded_queue_item_ids: std::collections::HashSet<Uuid>,
     folded_queue_item_order: std::collections::VecDeque<Uuid>,
@@ -102,6 +106,7 @@ impl BtwPane {
             pending: None,
             active_display_attempt_id: None,
             queue: Vec::new(),
+            local_user_submission_ids_by_seq: std::collections::HashMap::new(),
             fresh_queue_ack: FreshQueueAck::None,
             folded_queue_item_ids: std::collections::HashSet::new(),
             folded_queue_item_order: std::collections::VecDeque::new(),
@@ -178,8 +183,22 @@ impl BtwPane {
 
     pub(super) fn apply_event(&mut self, event: TurnEvent, strip_inline_think: bool) {
         match event {
-            TurnEvent::HistoryReplay { entries } => {
-                reconcile_history_replay(&mut self.history, entries);
+            TurnEvent::HistoryReplay {
+                entries,
+                removed_user_message_seqs,
+            } => {
+                for (seq, text) in
+                    reconcile_history_replay(&mut self.history, entries, removed_user_message_seqs)
+                {
+                    if self.local_user_submission_ids_by_seq.remove(&seq).is_some() {
+                        let draft = self.composer.text().to_owned();
+                        if draft.is_empty() {
+                            self.composer.replace_buffer(text);
+                        } else {
+                            self.composer.replace_buffer(format!("{text}\n\n{draft}"));
+                        }
+                    }
+                }
             }
             TurnEvent::QueueUpdated { queue } => {
                 self.reconcile_queue_update(queue);
@@ -240,6 +259,7 @@ impl BtwPane {
                 ) {
                     return;
                 }
+                let mut local_submission_id = None;
                 for entry in self.history.iter_mut() {
                     if let HistoryEntry::User {
                         seq: row_seq @ None,
@@ -252,6 +272,7 @@ impl BtwPane {
                         && optimistic_submission_id
                             .is_some_and(|id| client_submission_ids.contains(&id))
                     {
+                        local_submission_id = *optimistic_submission_id;
                         *row_seq = Some(seq);
                         *cleaned = preflight_cleaned;
                         *preflight_pending = false;
@@ -259,6 +280,12 @@ impl BtwPane {
                         *optimistic_submission_id = None;
                         break;
                     }
+                }
+                if let Some(client_submission_id) = local_submission_id {
+                    self.local_user_submission_ids_by_seq
+                        .entry(seq)
+                        .or_default()
+                        .insert(client_submission_id);
                 }
             }
             TurnEvent::PreflightStarted {
@@ -308,6 +335,30 @@ impl BtwPane {
                     .copied()
                     .collect::<std::collections::HashSet<_>>();
                 remove_correlated_optimistic_user_history(&mut self.history, &ids);
+            }
+            TurnEvent::UserMessageRemoved {
+                seq,
+                client_submission_ids,
+            } => {
+                let restore_composer = self
+                    .local_user_submission_ids_by_seq
+                    .remove(&seq)
+                    .is_some_and(|local_ids| {
+                        client_submission_ids
+                            .iter()
+                            .any(|id| local_ids.contains(id))
+                    });
+                let restored_text = remove_durable_user_history(&mut self.history, seq);
+                self.pending = None;
+                self.active_display_attempt_id = None;
+                if restore_composer && let Some(text) = restored_text {
+                    let draft = self.composer.text().to_owned();
+                    if draft.is_empty() {
+                        self.composer.replace_buffer(text);
+                    } else {
+                        self.composer.replace_buffer(format!("{text}\n\n{draft}"));
+                    }
+                }
             }
             TurnEvent::ThinkingStarted { agent, .. } => {
                 self.finalize_pending();
@@ -548,6 +599,8 @@ impl BtwPane {
                 }
             }
             TurnEvent::AgentIdle { .. } => {
+                // The retract window closes when this pane's turn settles.
+                self.local_user_submission_ids_by_seq.clear();
                 self.finalize_pending();
             }
             TurnEvent::Notice { text } => self.history.push(HistoryEntry::Plain { line: text }),
@@ -1214,6 +1267,7 @@ mod tests {
                     client_submission_ids: vec![id],
                     origin_principal: None,
                 }],
+                removed_user_message_seqs: Vec::new(),
             },
             false,
         );
@@ -1686,6 +1740,42 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows, vec![("A", Some(21)), ("B", Some(20))]);
         assert!(pane.queue.is_empty());
+    }
+
+    #[test]
+    fn btw_retract_restores_only_the_originating_panes_draft() {
+        let mut pane = BtwPane::new(info(false), false);
+        let client_submission_id = Uuid::new_v4();
+        pane.history.push(HistoryEntry::User {
+            text: "cancel me".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            optimistic_submission_id: Some(client_submission_id),
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        pane.apply_event(
+            TurnEvent::UserMessageRecorded {
+                seq: 22,
+                client_submission_ids: vec![client_submission_id],
+                preflight_cleaned: None,
+            },
+            true,
+        );
+        pane.composer.replace_buffer("my draft");
+
+        pane.apply_event(
+            TurnEvent::UserMessageRemoved {
+                seq: 22,
+                client_submission_ids: vec![client_submission_id],
+            },
+            true,
+        );
+
+        assert!(pane.history.is_empty());
+        assert_eq!(pane.composer.text(), "cancel me\n\nmy draft");
     }
 
     #[test]

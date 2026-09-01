@@ -122,6 +122,9 @@ pub enum TurnEvent {
     /// Warm daemon reattach replay of persisted history entries.
     HistoryReplay {
         entries: Vec<cockpit_proto::HistoryEntry>,
+        /// Durable user rows deleted by retractions since the client's replay
+        /// cursor. These targeted ids never carry user text.
+        removed_user_message_seqs: Vec<i64>,
     },
     /// A configured stream wait threshold elapsed. The TUI shows a yellow
     /// warning; without a backup the stream keeps waiting, while with a backup
@@ -228,6 +231,14 @@ pub enum TurnEvent {
         seq: i64,
         client_submission_ids: Vec<uuid::Uuid>,
         preflight_cleaned: Option<String>,
+    },
+    /// The latest durable user row was retracted by an initial-thinking
+    /// cancellation. Every client removes `seq`; only a client that owns one
+    /// of `client_submission_ids` restores its local draft, so user text is
+    /// never broadcast.
+    UserMessageRemoved {
+        seq: i64,
+        client_submission_ids: Vec<uuid::Uuid>,
     },
     /// One or more daemon-queued user messages were drained and folded into
     /// the next model request. This is the authoritative transcript signal for

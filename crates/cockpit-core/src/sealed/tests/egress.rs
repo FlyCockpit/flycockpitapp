@@ -6,9 +6,9 @@
 //! [`crate::engine::model::Model::prepare_completion_request`] (the interactive
 //! completion chokepoint's egress), with the derived active set applied to the
 //! model's effective table via `with_sealed_replacements`. It proves the
-//! actionable marker reaches an untrusted wire iff an exact grant is live,
-//! generic otherwise, raw for a trusted target, and that derivation is fresh per
-//! attempt (a grant revoked between two attempts renders marker then generic).
+//! actionable marker reaches every model wire iff an exact grant is live, is
+//! generic otherwise, and that derivation is fresh per attempt (a grant revoked
+//! between two attempts renders marker then generic).
 
 use std::sync::Arc;
 
@@ -77,9 +77,9 @@ fn sealed_table(record_id: crate::sealed::identity::SealedRecordId) -> Arc<Redac
     )
 }
 
-/// Prepare the untrusted request body with the derived active set applied and
+/// Prepare a request body with the derived active set applied and
 /// return the serialized captured wire body.
-fn prepared_untrusted_body(model: &Model, active: &std::collections::HashSet<String>) -> String {
+fn prepared_body(model: &Model, active: &std::collections::HashSet<String>) -> String {
     let egress = model.redact_table().with_sealed_replacements(active);
     let history = [Message::user(format!("the deploy token is {TEST_LITERAL}"))];
     let prepared = model
@@ -142,18 +142,17 @@ async fn sealed_marker_reaches_untrusted_wire_only_with_active_grant() {
 
     let table = sealed_table(seeded.record_id);
     let untrusted = untrusted_model(table.clone());
-    let body = prepared_untrusted_body(&untrusted, &active);
+    let body = prepared_body(&untrusted, &active);
     assert!(
         body.contains(&marker),
-        "the exact actionable marker reaches the untrusted wire: {body}"
+        "the exact actionable marker reaches the wire: {body}"
     );
     assert!(
         !body.contains(TEST_LITERAL),
-        "zero literal bytes on the untrusted wire: {body}"
+        "zero literal bytes on the wire: {body}"
     );
 
-    // (d) The identical message on a TRUSTED target keeps raw custody: the
-    // literal rides the wire (allowed, not a leak) and no marker appears.
+    // (d) The identical message on a TRUSTED target is reference-only too.
     let trusted = trusted_model(table.clone());
     let trusted_history = [Message::user(format!("the deploy token is {TEST_LITERAL}"))];
     let trusted_prepared = trusted
@@ -163,17 +162,17 @@ async fn sealed_marker_reaches_untrusted_wire_only_with_active_grant() {
             &[],
             &ModelParams::default(),
             false,
-            None,
+            Some(&trusted.redact_table().with_sealed_replacements(&active)),
         )
         .expect("prepared trusted request");
     let trusted_body = serde_json::to_string(&trusted_prepared.captured).expect("serialize");
     assert!(
-        trusted_body.contains(TEST_LITERAL),
-        "trusted raw custody carries the literal: {trusted_body}"
+        !trusted_body.contains(TEST_LITERAL),
+        "trusted completion receives no literal: {trusted_body}"
     );
     assert!(
-        !trusted_body.contains("reference sealed value"),
-        "no marker on a trusted target"
+        trusted_body.contains(&marker),
+        "a trusted completion gets the actionable reference marker"
     );
 
     // Per attempt: revoke the grant, then re-derive. The set no longer contains
@@ -194,7 +193,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_with_active_grant() {
         !after_revoke.contains(&sealed_scoped_active_key(&seeded.record_id.to_string(), 1)),
         "a revoked grant is not active on the later attempt"
     );
-    let generic_body = prepared_untrusted_body(&untrusted, &after_revoke);
+    let generic_body = prepared_body(&untrusted, &after_revoke);
     assert!(
         !generic_body.contains(&marker) && !generic_body.contains("reference sealed value"),
         "no stale marker after revocation: {generic_body}"
@@ -226,15 +225,15 @@ fn unrelated_tool() -> ToolDefinition {
 }
 
 /// AC8: drive the ACTUAL production chokepoint derivation
-/// (`derive_untrusted_interactive_sealed_egress`, the single seam
+/// (`derive_interactive_sealed_egress`, the single seam
 /// `turn_phases` calls) end-to-end over real grant rows, so deleting the marker
 /// derivation from production fails this test. Proves every gate: (a) live grant
 /// → exact marker + zero literal; (b) revoked → generic; (c) no
-/// `use_sealed_value` in the roster → generic; (d) trusted target → raw; (e)
+/// `use_sealed_value` in the roster → generic; (d) trusted target → marker; (e)
 /// per-attempt refresh (revoke between attempts → marker then generic).
 #[tokio::test]
-async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint() {
-    use crate::sealed::egress::derive_untrusted_interactive_sealed_egress;
+async fn sealed_marker_reaches_every_model_wire_only_through_production_chokepoint() {
+    use crate::sealed::egress::derive_interactive_sealed_egress;
 
     let fixture = SealedFixture::new().await;
     let seeded = fixture
@@ -272,7 +271,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
     let untrusted = untrusted_model(table.clone());
 
     // (a) Every gate holds → the production seam returns the marker table.
-    let egress = derive_untrusted_interactive_sealed_egress(
+    let egress = derive_interactive_sealed_egress(
         &untrusted,
         true,
         &roster,
@@ -298,7 +297,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
     // returns None (generic), so removing the tool-roster gate would leak a
     // marker to a request that cannot act on it.
     assert!(
-        derive_untrusted_interactive_sealed_egress(
+        derive_interactive_sealed_egress(
             &untrusted,
             true,
             &[unrelated_tool()],
@@ -315,7 +314,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
 
     // Non-interactive with a live grant and the tool present → None.
     assert!(
-        derive_untrusted_interactive_sealed_egress(
+        derive_interactive_sealed_egress(
             &untrusted,
             false,
             &roster,
@@ -330,11 +329,10 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
         "a non-interactive request renders generic"
     );
 
-    // (d) A trusted target keeps raw custody → None, even with a live grant and
-    // the tool present.
+    // (d) A trusted target gets the same reference-only marker table.
     let trusted = trusted_model(table.clone());
     assert!(
-        derive_untrusted_interactive_sealed_egress(
+        derive_interactive_sealed_egress(
             &trusted,
             true,
             &roster,
@@ -345,8 +343,8 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
             NOW,
         )
         .await
-        .is_none(),
-        "a trusted target derives no marker table (raw custody)"
+        .is_some(),
+        "a trusted target derives the same marker table"
     );
 
     // (b)/(e) Per-attempt refresh: revoke the grant, then re-derive — the seam
@@ -359,7 +357,7 @@ async fn sealed_marker_reaches_untrusted_wire_only_through_production_chokepoint
             .expect("revoke")
     );
     assert!(
-        derive_untrusted_interactive_sealed_egress(
+        derive_interactive_sealed_egress(
             &untrusted,
             true,
             &roster,
@@ -558,7 +556,7 @@ async fn sealed_marker_ignores_entry_whose_version_differs_from_the_live_grant()
 
     // A STALE version-1 entry of the same record → GENERIC, never the marker.
     let stale = untrusted_model(sealed_table_at_version(seeded.record_id, 1));
-    let stale_body = prepared_untrusted_body(&stale, &active);
+    let stale_body = prepared_body(&stale, &active);
     assert!(
         !stale_body.contains(&marker) && !stale_body.contains("reference sealed value"),
         "a stale prior-version entry never activates a later-version grant: {stale_body}"
@@ -575,7 +573,7 @@ async fn sealed_marker_ignores_entry_whose_version_differs_from_the_live_grant()
     // Positive control: an entry at the CURRENT version 2 DOES render the marker,
     // proving the grant itself is live and the negative above is not vacuous.
     let current = untrusted_model(sealed_table_at_version(seeded.record_id, 2));
-    let current_body = prepared_untrusted_body(&current, &active);
+    let current_body = prepared_body(&current, &active);
     assert!(
         current_body.contains(&marker),
         "the current-version entry renders the actionable marker: {current_body}"
@@ -654,7 +652,7 @@ async fn sealed_marker_ignores_legacy_same_name_entry_of_a_different_record() {
             .expect("legacy sealed table"),
     );
     let model = untrusted_model(table);
-    let body = prepared_untrusted_body(&model, &active);
+    let body = prepared_body(&model, &active);
     assert!(
         !body.contains("reference sealed value"),
         "a legacy same-name entry of a different record never activates a scoped grant: {body}"

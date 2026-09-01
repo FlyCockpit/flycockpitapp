@@ -2083,7 +2083,12 @@ mod tests {
 
         db.end_session(session_id).await.unwrap();
 
-        assert!(db.sealed_value_record(record_id).await.unwrap().is_none());
+        assert!(
+            db.sealed_value_record(record_id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             db.sealed_value_name_retired(
                 SealedScopeKind::Session,
@@ -2246,9 +2251,10 @@ mod tests {
             .unwrap();
         let first_item = session_sealed_vault_item_id(&session_key, &first.name, 1);
         let sibling_item = session_sealed_vault_item_id(&session_key, &sibling.name, 1);
+        let sibling_item_for_insert = sibling_item.clone();
         db.transaction(move |conn| {
             insert_session_vault_marker(conn, &first_item, 1)?;
-            insert_session_vault_marker(conn, &sibling_item, 2)
+            insert_session_vault_marker(conn, &sibling_item_for_insert, 2)
         })
         .await
         .unwrap();

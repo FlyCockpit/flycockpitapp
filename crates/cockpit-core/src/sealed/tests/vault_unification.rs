@@ -1,5 +1,7 @@
 use super::*;
-use cockpit_db::db::sealed_scope::{NewSealedValueRecord, stage_session_sealed_create_conn};
+use cockpit_db::db::sealed_scope::{
+    NewSealedActionGrant, NewSealedValueRecord, SealedScopeKind, stage_session_sealed_create_conn,
+};
 
 #[tokio::test]
 async fn sealed_vault_create_rotate_delete_preserves_invariants() {

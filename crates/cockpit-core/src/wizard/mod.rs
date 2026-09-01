@@ -1767,7 +1767,9 @@ pub fn provider_entry_for_template_with_wire_api(
     wire_api: crate::config::providers::WireApi,
 ) -> crate::config::providers::ProviderEntry {
     use crate::auth::{codex_oauth, xai_oauth};
-    use crate::config::providers::{AuthKind, ProviderEntry, ProviderModelCatalog};
+    use crate::config::providers::{
+        AnthropicFeatures, AuthKind, ProviderEntry, ProviderModelCatalog,
+    };
 
     let auth =
         if template.id == xai_oauth::CREDENTIAL_KEY || template.id == codex_oauth::CREDENTIAL_KEY {
@@ -1805,6 +1807,7 @@ pub fn provider_entry_for_template_with_wire_api(
         embeddings: None,
         availability: Default::default(),
         cache: Default::default(),
+        anthropic: (template.id == "anthropic").then(AnthropicFeatures::first_party),
         shrink: Default::default(),
         context: Default::default(),
         auto_prune: None,
@@ -2430,10 +2433,11 @@ mod tests {
             ("responses", WireApi::Responses),
             ("anthropic", WireApi::Anthropic),
         ] {
-            assert_eq!(
-                custom_provider_entry_for_wire(selection).wire_api,
-                expected,
-                "selection {selection}"
+            let entry = custom_provider_entry_for_wire(selection);
+            assert_eq!(entry.wire_api, expected, "selection {selection}");
+            assert!(
+                entry.effective_anthropic_features().is_empty(),
+                "custom provider `{selection}` must not enable Anthropic extensions"
             );
         }
     }
@@ -2477,11 +2481,12 @@ mod tests {
             "https://api.anthropic.com/v1".to_string(),
         ))
         .unwrap();
+        let entry =
+            provider_entry_from_answers(&run, Vec::new()).expect("Anthropic provider entry");
+        assert_eq!(entry.wire_api, WireApi::Anthropic);
         assert_eq!(
-            provider_entry_from_answers(&run, Vec::new())
-                .expect("Anthropic provider entry")
-                .wire_api,
-            WireApi::Anthropic
+            entry.anthropic,
+            Some(crate::config::providers::AnthropicFeatures::first_party())
         );
     }
 

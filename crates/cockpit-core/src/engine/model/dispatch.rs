@@ -2076,7 +2076,7 @@ pub(super) fn assembled_request(
         // recorded is what's sent:
         // - OpenAI-compat: vendor + native computer tools + prompt cache keys
         // - codex-oauth (native ChatGPT): vendor + native computer tools only
-        // - anthropic: vendor + anthropic computer tools (per-block cache)
+        // - anthropic: vendor + Anthropic computer tools
         // Omitted when there's nothing to add.
         "additional_params": match provider {
             "anthropic" => anthropic_additional_params(params),

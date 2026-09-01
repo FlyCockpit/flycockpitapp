@@ -16,13 +16,11 @@
 //! `examples/manual_tool_calls`. Variants: `OpenAi` (every OpenAI-
 //! compatible endpoint in the user's [`crate::providers`] templates —
 //! including Claude reached via OpenRouter/Copilot/etc.), `ChatGpt`
-//! (native ChatGPT/Codex Responses), and `Anthropic` (native
-//! `api.anthropic.com`, which gets rig's provider-concrete per-block
-//! prompt caching, prompt `prompt-caching-strategy.md`).
+//! (native ChatGPT/Codex Responses), and `Anthropic` (the native Anthropic
+//! Messages wire, including explicitly configured compatible endpoints).
 //!
-//! Routing: a build site picks the wire solely from the resolved
-//! `ProviderEntry.wire_api`. Provider ids, model names, and base URLs never
-//! select a request wire.
+//! Routing: a build site picks the wire solely from the resolved `WireApi`.
+//! Provider ids, model names, and base URLs never select a request wire.
 //!
 //! Authentication: we delegate to
 //! [`crate::providers::models_fetch::resolve_provider_request`], the
@@ -31,9 +29,10 @@
 //! GitHub Copilot it also honors the documented env-var sources
 //! (`COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`)
 //! and the `COPILOT_API_URL` base-URL override. The OpenAI-compat path
-//! hands rig the bearer token; the native Anthropic path reads the
-//! resolved `x-api-key` header and lets rig set `anthropic-version`
-//! itself (plus the extended-cache beta header on the 1h opt-in).
+//! hands rig the bearer token; the native Anthropic path accepts either a
+//! resolved `x-api-key` or `Authorization: Bearer` credential. Anthropic
+//! caching and beta extensions are emitted only when the provider's explicit
+//! Anthropic feature gate enables them.
 
 use std::{
     collections::HashMap,
@@ -585,13 +584,14 @@ pub enum Model {
         /// Same effective outbound-provider redaction table as [`Model::OpenAi`].
         redact: Arc<RedactionTable>,
     },
-    /// Native Anthropic Messages endpoint. Routed here only by
-    /// `wire_api = anthropic`. The stored `model` already has rig's
-    /// per-block prompt caching enabled (5-min `with_prompt_caching()` or,
-    /// on the 1h opt-in, top-level `with_automatic_caching_1h()`) — see
-    /// [`build_anthropic_model`]. It's `Clone`, so the per-attempt closure
-    /// builds a fresh caching-enabled agent each turn, which re-applies the
-    /// last-message cache marker over the grown history.
+    /// Anthropic Messages-wire endpoint. Routed here only by
+    /// `wire_api = anthropic`, regardless of host. The provider's explicit
+    /// Anthropic feature gate determines whether the stored `model` uses
+    /// rig's per-block prompt caching (5-min `with_prompt_caching()` or, on
+    /// the 1h opt-in, top-level `with_automatic_caching_1h()`) — see
+    /// [`build_anthropic_model`]. It is `Clone`, so each attempt gets a fresh
+    /// model and, when caching is enabled, re-applies the last-message cache
+    /// marker over the grown history.
     Anthropic {
         model: AnthropicCompletionModel,
         model_id: String,

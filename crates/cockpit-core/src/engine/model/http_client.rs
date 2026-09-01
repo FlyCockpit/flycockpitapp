@@ -36,6 +36,7 @@ pub struct UsageAliasHttpClient {
     client: reqwest::Client,
     extra_headers: reqwest::header::HeaderMap,
     strip_codex_headers: bool,
+    strip_x_api_key: bool,
 }
 
 impl Default for UsageAliasHttpClient {
@@ -49,13 +50,23 @@ impl fmt::Debug for UsageAliasHttpClient {
         f.debug_struct("UsageAliasHttpClient")
             .field("extra_headers", &self.extra_headers.len())
             .field("strip_codex_headers", &self.strip_codex_headers)
+            .field("strip_x_api_key", &self.strip_x_api_key)
             .finish()
     }
 }
 
 impl UsageAliasHttpClient {
     pub(super) fn new(extra_headers: Vec<(String, String)>) -> anyhow::Result<Self> {
-        Self::with_header_policy(extra_headers, false)
+        Self::with_header_policy(extra_headers, false, false)
+    }
+
+    /// Rig's native Anthropic client requires an API key and therefore adds an
+    /// `x-api-key` header itself. Bearer-authenticated Anthropic-compatible
+    /// providers must never receive that synthetic header.
+    pub(super) fn for_anthropic_bearer(
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::with_header_policy(extra_headers, false, true)
     }
 
     /// The rig ChatGPT Responses client supplies ChatGPT subscription headers
@@ -64,12 +75,13 @@ impl UsageAliasHttpClient {
     pub(super) fn without_codex_headers(
         extra_headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
-        Self::with_header_policy(extra_headers, true)
+        Self::with_header_policy(extra_headers, true, false)
     }
 
     fn with_header_policy(
         extra_headers: Vec<(String, String)>,
         strip_codex_headers: bool,
+        strip_x_api_key: bool,
     ) -> anyhow::Result<Self> {
         let extra_headers = with_canonical_user_agent(extra_headers);
         let mut validated = reqwest::header::HeaderMap::new();
@@ -87,6 +99,7 @@ impl UsageAliasHttpClient {
             client,
             extra_headers: validated,
             strip_codex_headers,
+            strip_x_api_key,
         })
     }
 }
@@ -108,6 +121,7 @@ fn apply_extra_headers<T>(
     req: rig::http_client::Request<T>,
     headers: &reqwest::header::HeaderMap,
     strip_codex_headers: bool,
+    strip_x_api_key: bool,
 ) -> rig::http_client::Request<T> {
     let (mut parts, body) = req.into_parts();
     for (name, value) in headers {
@@ -122,6 +136,9 @@ fn apply_extra_headers<T>(
         ] {
             parts.headers.remove(name);
         }
+    }
+    if strip_x_api_key {
+        parts.headers.remove("x-api-key");
     }
     rig::http_client::Request::from_parts(parts, body)
 }
@@ -333,7 +350,12 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: Send + 'static,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers, self.strip_codex_headers);
+        let req = apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+            self.strip_x_api_key,
+        );
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,
@@ -368,6 +390,7 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
             req,
             &self.extra_headers,
             self.strip_codex_headers,
+            self.strip_x_api_key,
         ))
     }
 
@@ -381,7 +404,12 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         T: Into<bytes::Bytes> + Send,
     {
         let client = self.client.clone();
-        let req = apply_extra_headers(req, &self.extra_headers, self.strip_codex_headers);
+        let req = apply_extra_headers(
+            req,
+            &self.extra_headers,
+            self.strip_codex_headers,
+            self.strip_x_api_key,
+        );
         let (parts, body) = req.into_parts();
         let req = rig::http_client::Request::from_parts(
             parts,

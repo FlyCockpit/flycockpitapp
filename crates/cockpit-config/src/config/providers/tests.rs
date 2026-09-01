@@ -1,6 +1,43 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn anthropic_features_require_an_explicit_provider_gate() {
+    let template_without_gate = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        url: "https://anthropic.nahcrof.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert!(
+        template_without_gate
+            .effective_anthropic_features()
+            .is_empty()
+    );
+
+    let explicitly_enabled = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::first_party()),
+        ..ProviderEntry::default()
+    };
+    assert_eq!(
+        explicitly_enabled.effective_anthropic_features(),
+        AnthropicFeatures::first_party()
+    );
+
+    let host_without_gate = ProviderEntry {
+        url: "https://api.anthropic.com/v1".to_string(),
+        ..ProviderEntry::default()
+    };
+    assert!(host_without_gate.effective_anthropic_features().is_empty());
+
+    let explicit_disable = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::default()),
+        ..ProviderEntry::default()
+    };
+    assert!(explicit_disable.effective_anthropic_features().is_empty());
+}
+
 #[cfg(unix)]
 const PRIVATE_ATOMIC_WRITE_UMASK_CHILD: &str = "COCKPIT_TEST_PRIVATE_ATOMIC_WRITE_UMASK_CHILD";
 
@@ -958,6 +995,7 @@ fn round_trips_a_provider_entry() {
             embeddings: None,
             availability: Default::default(),
             cache: CacheConfig::default(),
+            anthropic: Default::default(),
             shrink: ShrinkConfig::default(),
             context: ContextConfig::default(),
             auto_prune: None,

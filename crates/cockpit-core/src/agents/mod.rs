@@ -1340,6 +1340,15 @@ impl AgentDef {
                 serde_yaml::to_value(&vnext.tool_tier_preferences)?,
             );
         }
+        if !vnext.requested_network_hosts.is_empty() {
+            fm.insert(
+                "requestedNetworkHosts".into(),
+                serde_yaml::to_value(&vnext.requested_network_hosts)?,
+            );
+        }
+        if vnext.requests_requested {
+            fm.insert("requestsRequested".into(), true.into());
+        }
         if !vnext.capabilities.is_empty() {
             fm.insert(
                 "capabilities".into(),
@@ -1478,6 +1487,10 @@ fn parse_agent_with_scope(
         allowed_knowledge_bases: Option<BTreeSet<String>>,
         #[serde(rename = "toolTierPreferences", default)]
         tool_tier_preferences: BTreeMap<String, ToolTier>,
+        #[serde(rename = "requestedNetworkHosts", default)]
+        requested_network_hosts: BTreeSet<String>,
+        #[serde(rename = "requestsRequested", default)]
+        requests_requested: bool,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1552,6 +1565,8 @@ fn parse_agent_with_scope(
         verification: fm.verification,
         allowed_knowledge_bases: fm.allowed_knowledge_bases,
         tool_tier_preferences: fm.tool_tier_preferences,
+        requested_network_hosts: fm.requested_network_hosts,
+        requests_requested: fm.requests_requested,
     };
     definition.validate_for_scope(scope).map_err(|error| {
         anyhow::anyhow!(

@@ -1044,6 +1044,35 @@ pub struct VnextAgentDef {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub tool_tier_preferences: BTreeMap<String, ToolTier>,
+    /// Author request used only to pre-fill an owner approval prompt. This is
+    /// never projected into the effective egress allowlist.
+    #[serde(
+        rename = "requestedNetworkHosts",
+        default,
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub requested_network_hosts: BTreeSet<String>,
+    /// Author preference for the governed `requests` facade. Like tool-tier
+    /// preferences, this can request placement but cannot grant the package.
+    #[serde(rename = "requestsRequested", default, skip_serializing_if = "is_false")]
+    pub requests_requested: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn validate_requested_network_host(host: &str) -> Result<()> {
+    if host.is_empty()
+        || host.len() > 253
+        || host != host.to_ascii_lowercase()
+        || host
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
+    {
+        bail!("requestedNetworkHosts contains non-canonical host `{host}`");
+    }
+    Ok(())
 }
 
 impl VnextAgentDef {
@@ -1097,6 +1126,12 @@ impl VnextAgentDef {
             if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
                 bail!("toolTierPreferences may not name host-placement tool `{tool}`");
             }
+        }
+        if self.requested_network_hosts.len() > 64 {
+            bail!("requestedNetworkHosts may contain at most 64 hosts");
+        }
+        for host in &self.requested_network_hosts {
+            validate_requested_network_host(host)?;
         }
         Ok(())
     }
@@ -2857,6 +2892,8 @@ mod tests {
             verification: None,
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         }
     }
 

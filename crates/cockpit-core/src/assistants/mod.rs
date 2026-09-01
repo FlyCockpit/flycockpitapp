@@ -560,6 +560,8 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
         verification: None,
         allowed_knowledge_bases: None,
         tool_tier_preferences: std::collections::BTreeMap::new(),
+        requested_network_hosts: std::collections::BTreeSet::new(),
+        requests_requested: false,
     }
 }
 

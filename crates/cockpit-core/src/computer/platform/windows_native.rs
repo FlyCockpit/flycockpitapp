@@ -12,7 +12,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DISPLAY_DEVICEW, DeleteDC, DeleteObject,
-    EDD_GET_DEVICE_INTERFACE_NAME, EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW,
+    EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW,
     HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY,
     SelectObject,
 };
@@ -23,16 +23,17 @@ use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetProcessWindowStation,
     GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
 };
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    ProcessIdToSessionId, QueryFullProcessImageNameW,
+    QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    EDD_GET_DEVICE_INTERFACE_NAME, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 use windows::core::{PCWSTR, PWSTR};
@@ -48,7 +49,8 @@ use crate::computer::target::{
 use crate::computer::{
     CaptureFrame, ClickCount, ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
     CoordinateSpace, DisplayGeometry, DisplayTarget, Easing, LogicalSize, Modifiers, MouseButton,
-    PixelRect, PixelSize, Point, RealDesktopGrantStore, ScaleFactor, checked_rect,
+    PixelRect, PixelSize, Point, RealDesktopGrantStore, ScaleFactor, checked_action_duration,
+    checked_rect, checked_scroll_delta,
 };
 
 #[derive(Debug)]
@@ -240,6 +242,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 }))
             }
             ComputerAction::MoveCursor { to, duration, easing } => {
+                checked_action_duration(*duration)?;
                 move_with_timing(self, *to, *duration, *easing)?;
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -268,6 +271,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 if path.is_empty() {
                     return Err(win_input_error("drag path must not be empty"));
                 }
+                for step in path { checked_action_duration(step.duration)?; }
                 send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
                 send_button(*button, false)?;
@@ -294,6 +298,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::HoldKey { key, duration } => {
+                checked_action_duration(*duration)?;
                 let key = virtual_key(key)?;
                 send_key(key, false)?;
                 self.held_keys.push(key);
@@ -303,6 +308,8 @@ impl ComputerBackend for WindowsDesktopBackend {
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Scroll { delta_x, delta_y, modifiers } => {
+                checked_scroll_delta(*delta_x)?;
+                checked_scroll_delta(*delta_y)?;
                 send_modifiers(*modifiers, false)?;
                 if *delta_y != 0 { send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?; }
                 if *delta_x != 0 { send_mouse(0, 0, (*delta_x * 120) as u32, MOUSEEVENTF_HWHEEL)?; }
@@ -310,6 +317,7 @@ impl ComputerBackend for WindowsDesktopBackend {
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Wait { duration } => {
+                checked_action_duration(*duration)?;
                 thread::sleep(*duration);
                 Ok(ComputerActionOutcome::Waited(*duration))
             }
@@ -521,14 +529,16 @@ unsafe fn session_desktop_names() -> Result<(String, String), TargetUnavailableR
     let thread_desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.map_err(|_| TargetUnavailableReason::SessionInactive)?;
     let input_desktop = unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }
         .map_err(|_| TargetUnavailableReason::LockOrSecureDesktop)?;
-    if input_desktop != thread_desktop {
-        let _ = unsafe { CloseDesktop(input_desktop) };
+    let station_name = unsafe { user_object_name(HANDLE(station.0)) };
+    let thread_desktop_name = unsafe { user_object_name(HANDLE(thread_desktop.0)) };
+    let input_desktop_name = unsafe { user_object_name(HANDLE(input_desktop.0)) };
+    let _ = unsafe { CloseDesktop(input_desktop) };
+    let thread_desktop_name = thread_desktop_name?;
+    let input_desktop_name = input_desktop_name?;
+    if thread_desktop_name != input_desktop_name {
         return Err(TargetUnavailableReason::LockOrSecureDesktop);
     }
-    let station_name = unsafe { user_object_name(HANDLE(station.0)) };
-    let desktop_name = unsafe { user_object_name(HANDLE(input_desktop.0)) };
-    let _ = unsafe { CloseDesktop(input_desktop) };
-    Ok((station_name?, desktop_name?))
+    Ok((station_name?, input_desktop_name))
 }
 
 unsafe fn monitor_identity(hwnd: HWND) -> Result<[u8; 32], TargetUnavailableReason> {

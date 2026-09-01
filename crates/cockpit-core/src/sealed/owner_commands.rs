@@ -86,6 +86,14 @@ pub enum SealedActionCommand {
         origin_id: String,
         projection_id: String,
     },
+    /// `/sealed action create-declared --project <id> --description <safe-text>
+    /// --declaration-json <owner-authored-json>`. The declaration is parsed by
+    /// the local owner RPC into a typed sink; models never receive this payload.
+    CreateDeclared {
+        project_id: String,
+        description: SealedDescription,
+        declaration_json: String,
+    },
     /// `/sealed action revise <action-id> --description <safe-text>`
     ReviseDescription {
         action_id: String,
@@ -284,6 +292,7 @@ fn parse_action(tokens: &[&str]) -> Result<SealedActionCommand> {
             Ok(SealedActionCommand::List)
         }
         "create" => parse_action_create(&tokens[1..]),
+        "create-declared" => parse_action_create_declared(&tokens[1..]),
         "revise" => parse_action_revise(&tokens[1..]),
         "retire" => parse_action_retire(&tokens[1..]),
         _ => bail!("unknown `/sealed action` subcommand: `{}`", tokens[0]),
@@ -349,6 +358,53 @@ fn parse_action_create(tokens: &[&str]) -> Result<SealedActionCommand> {
         description,
         origin_id,
         projection_id,
+    })
+}
+
+fn parse_action_create_declared(tokens: &[&str]) -> Result<SealedActionCommand> {
+    let mut project_id = None;
+    let mut description = None;
+    let mut declaration_json = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--project" => {
+                i += 1;
+                project_id = Some(
+                    tokens
+                        .get(i)
+                        .context("--project requires a value")?
+                        .to_string(),
+                );
+            }
+            "--description" => {
+                i += 1;
+                description = Some(SealedDescription::parse(
+                    tokens.get(i).context("--description requires a value")?,
+                )?);
+            }
+            "--declaration-json" => {
+                i += 1;
+                declaration_json = Some(
+                    tokens
+                        .get(i)
+                        .context("--declaration-json requires a value")?
+                        .to_string(),
+                );
+            }
+            _ => bail!(
+                "unknown `/sealed action create-declared` flag: `{}`",
+                tokens[i]
+            ),
+        }
+        i += 1;
+    }
+    Ok(SealedActionCommand::CreateDeclared {
+        project_id: project_id.context("`/sealed action create-declared` requires --project")?,
+        description: description
+            .context("`/sealed action create-declared` requires --description")?,
+        declaration_json: declaration_json
+            .context("`/sealed action create-declared` requires --declaration-json")?,
     })
 }
 

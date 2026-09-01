@@ -6585,6 +6585,34 @@ CREATE TABLE sealed_action_instances (
 CREATE INDEX idx_sealed_action_instances_live
     ON sealed_action_instances (retired_at_ms, action_id);
 
+-- ---- sealed action invocation audit ---------------------------------------
+-- Publish-before-effect audit for reference injection. The row is committed
+-- before a resolved literal is handed to a command, HTTP, or file sink. It
+-- intentionally records no destination, argv, environment key, path, request
+-- data, literal, length, or output: those remain in the Owner-only immutable
+-- action snapshot and daemon memory.
+CREATE TABLE sealed_action_invocation_audit (
+    audit_id        TEXT    PRIMARY KEY,
+    record_id       TEXT    NOT NULL,
+    action_id       TEXT    NOT NULL,
+    action_revision INTEGER NOT NULL CHECK (action_revision >= 1),
+    grant_id        TEXT    NOT NULL,
+    session_id      TEXT    NOT NULL,
+    sink_kind       TEXT    NOT NULL CHECK (sink_kind IN ('command_arg', 'process_env', 'http_header', 'http_body', 'file')),
+    file_persistent INTEGER NOT NULL DEFAULT 0 CHECK (file_persistent IN (0, 1)),
+    created_at_ms   INTEGER NOT NULL,
+    -- Audit identities deliberately have no foreign keys: retiring an action,
+    -- deleting a session/value, or expiring a grant must not erase evidence or
+    -- become impossible because an audit row exists.
+    CHECK (sink_kind = 'file' OR file_persistent = 0)
+);
+
+CREATE INDEX idx_sealed_action_invocation_audit_record
+    ON sealed_action_invocation_audit (record_id, created_at_ms);
+
+CREATE INDEX idx_sealed_action_invocation_audit_action
+    ON sealed_action_invocation_audit (action_id, created_at_ms);
+
 -- ---- sealed recovery audit -------------------------------------------------
 -- A durable audit row committed BEFORE an Owner recover reveals the plaintext
 -- to the owner (publish-before-destroy). The reveal fails closed on an audit

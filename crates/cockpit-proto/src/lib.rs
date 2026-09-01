@@ -1824,7 +1824,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, UsageKind, UserMessageOrigin,
+    RunInvocationOptions, SealedActionDeclaration, UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{

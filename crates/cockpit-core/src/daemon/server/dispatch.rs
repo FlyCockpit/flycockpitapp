@@ -8547,18 +8547,16 @@ async fn handle_serialized_request_impl(
                 .collect();
             Ok(Response::sealed_actions(actions))
         }
-        Request::CreateSealedAction {
-            kind_id,
+        Request::CreateSealedAction { .. } => Err(bad_request(
+            "catalog sealed-action creation is retired; submit an owner-declared sink".to_string(),
+        )),
+        Request::CreateDeclaredSealedAction {
             project_id,
             description,
-            origin_id,
-            projection_id,
+            declaration,
         } => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            // Resolve the three closed-lookup ids to a compiled action kind and
-            // parse the safe fields FIRST. An unknown id / unsafe field is
-            // rejected here, before any persist.
-            let kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+            let kind = compile_owner_declared_sealed_action(declaration)
                 .map_err(|error| bad_request(error.to_string()))?;
             let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
@@ -8566,7 +8564,6 @@ async fn handle_serialized_request_impl(
                 return Err(bad_request("project id must not be empty".to_string()));
             }
             let project_key = crate::sealed::identity::SealedProjectKey::from_canonical(project_id);
-            let now_ms = chrono::Utc::now().timestamp_millis();
             let summary = sealed_action_directory(ctx)
                 .create(
                     owner,
@@ -8575,7 +8572,7 @@ async fn handle_serialized_request_impl(
                         description,
                         project_key,
                     },
-                    now_ms,
+                    chrono::Utc::now().timestamp_millis(),
                 )
                 .await
                 .map_err(internal)?;
@@ -29788,63 +29785,101 @@ fn sealed_record_row_to_inventory_item(
     }
 }
 
-/// The closed server-side catalog that resolves the three `CreateSealedAction`
-/// ids to a compiled [`SealedActionKind`].
-///
-/// The ids are closed lookups, never free-form payloads: `kind_id` selects a
-/// builtin kind template (a fixed origin allowlist, credential placement, path
-/// template, and parameter specs — all host-owned, never on the wire),
-/// `origin_id` indexes into that template's allowlist, and `projection_id`
-/// selects the fixed projection. Any unknown id is rejected here, before any
-/// persist. The builtin catalog is intentionally small; the persistence sibling
-/// installs the durable action directory that these snapshots are written to.
-fn resolve_sealed_action_kind(
-    kind_id: &str,
-    origin_id: &str,
-    projection_id: &str,
+/// Compile the owner-authored local declaration into the same closed runtime
+/// enum persisted by the action directory. The owner may select a real fixed
+/// sink, but the model later sees only action ids and cannot modify any field.
+fn compile_owner_declared_sealed_action(
+    declaration: proto::SealedActionDeclaration,
 ) -> anyhow::Result<crate::sealed::action_admin::SealedActionKind> {
     use crate::sealed::action_admin::{
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
+        local_executor::{
+            CommandInjection, ExecutableIdentity, FileDestination, FilePersistence,
+            FileSystemIdentity, PersistentFileApproval, SEALED_FILE_PATH_PLACEHOLDER,
+            SEALED_VALUE_ARG_PLACEHOLDER,
+        },
     };
 
-    // Closed builtin kind templates. Each entry is a fixed, host-owned template;
-    // the wire never supplies an origin URL, header, or path.
-    struct KindTemplate {
-        origins: &'static [&'static str],
-        header_name: &'static str,
-        path_template: &'static str,
+    let unpinned_executable = ExecutableIdentity::unpinned;
+    match declaration {
+        proto::SealedActionDeclaration::CommandArgument { mut argv } => {
+            if !argv.iter().any(|arg| arg == SEALED_VALUE_ARG_PLACEHOLDER) {
+                anyhow::bail!("command argument declaration must contain {{sealed_value}}");
+            }
+            Ok(SealedActionKind::Command {
+                argv_template: std::mem::take(&mut argv),
+                executable_identity: unpinned_executable(),
+                injection: CommandInjection::Argument,
+                parameters: std::collections::BTreeMap::new(),
+            })
+        }
+        proto::SealedActionDeclaration::CommandEnvironment { argv, variable } => {
+            Ok(SealedActionKind::Command {
+                argv_template: argv,
+                executable_identity: unpinned_executable(),
+                injection: CommandInjection::Environment { variable },
+                parameters: std::collections::BTreeMap::new(),
+            })
+        }
+        proto::SealedActionDeclaration::HttpsHeader {
+            origin,
+            path,
+            header_name,
+            projection_id,
+        } => Ok(SealedActionKind::Https {
+            origins: HttpsOriginAllowlist::from_raw(&[&origin])?,
+            credential_placement: HttpsCredentialPlacement::Header { header_name },
+            path_template: path,
+            projection: SealedProjectionId::parse(&projection_id)?,
+            parameters: std::collections::BTreeMap::new(),
+        }),
+        proto::SealedActionDeclaration::HttpsBody {
+            origin,
+            path,
+            content_type,
+            projection_id,
+        } => Ok(SealedActionKind::Https {
+            origins: HttpsOriginAllowlist::from_raw(&[&origin])?,
+            credential_placement: HttpsCredentialPlacement::Body { content_type },
+            path_template: path,
+            projection: SealedProjectionId::parse(&projection_id)?,
+            parameters: std::collections::BTreeMap::new(),
+        }),
+        proto::SealedActionDeclaration::FileRuntime {
+            filename,
+            consumer_argv,
+        } => Ok(SealedActionKind::File {
+            destination: FileDestination::PrivateRuntime { filename },
+            persistence: FilePersistence::Ephemeral,
+            consumer_argv,
+            consumer_executable_identity: None,
+        }),
+        proto::SealedActionDeclaration::FilePinned {
+            path,
+            consumer_argv,
+            persistent_acknowledged_at_ms,
+            persistent_warning,
+        } => {
+            let persistence = match (persistent_acknowledged_at_ms, persistent_warning) {
+                (None, None) => FilePersistence::Ephemeral,
+                (Some(at_ms), Some(warning)) => FilePersistence::PersistentOwnerApproved(
+                    PersistentFileApproval::acknowledge(at_ms, &warning)?,
+                ),
+                _ => anyhow::bail!(
+                    "persistent sealed-file approval requires timestamp and exact warning"
+                ),
+            };
+            Ok(SealedActionKind::File {
+                destination: FileDestination::Pinned {
+                    path: path.into(),
+                    parent_identity: FileSystemIdentity::unpinned(),
+                },
+                persistence,
+                consumer_argv,
+                consumer_executable_identity: None,
+            })
+        }
     }
-    // `origin_id` selects one origin from the template's allowlist by index.
-    let template = match kind_id {
-        "https.notify" => KindTemplate {
-            origins: &[
-                "https://api.deploy.example.com",
-                "https://api.deploy-staging.example.com",
-            ],
-            header_name: "X-Deploy-Key",
-            path_template: "/v1/notify",
-        },
-        other => anyhow::bail!("unknown sealed action kind id: `{other}`"),
-    };
-
-    let index: usize = origin_id
-        .parse()
-        .map_err(|_| anyhow::anyhow!("origin id must be a non-negative index"))?;
-    if index >= template.origins.len() {
-        anyhow::bail!("origin id `{origin_id}` is out of range for kind `{kind_id}`");
-    }
-    // The compiled kind carries the SELECTED origin only.
-    let origins = HttpsOriginAllowlist::from_raw(&[template.origins[index]])?;
-    let projection = SealedProjectionId::parse(projection_id)?;
-    Ok(SealedActionKind::Https {
-        origins,
-        credential_placement: HttpsCredentialPlacement::Header {
-            header_name: template.header_name.to_string(),
-        },
-        path_template: template.path_template.to_string(),
-        projection,
-        parameters: std::collections::BTreeMap::new(),
-    })
 }
 
 async fn ensure_project_note_member(

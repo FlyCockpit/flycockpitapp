@@ -1005,6 +1005,24 @@ impl std::fmt::Debug for RedactionTable {
 }
 
 impl RedactionTable {
+    /// Scrub captured output from a host process that received one sealed
+    /// literal by injection. This intentionally bypasses configured redaction
+    /// disablement and candidate pruning: output from a consuming process is a
+    /// defense-in-depth boundary, and even short values must be removed.
+    pub(crate) fn scrub_injected_output(body: &str, literal: &str) -> String {
+        let mut scrubbed = body.to_string();
+        let mut variants = encoded_secret_variants(literal);
+        variants.push(literal.to_string());
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+        variants.dedup();
+        for variant in variants {
+            if !variant.is_empty() {
+                scrubbed = scrubbed.replace(&variant, "***REDACT***");
+            }
+        }
+        scrubbed
+    }
+
     /// Build a table from the OS env + the env files matched under `cwd`.
     /// Honors `enabled`, `scan_environment`, `scan_dotenv`,
     /// `dotenv_patterns`, `extra_dotenv_paths`, and `min_secret_length`.

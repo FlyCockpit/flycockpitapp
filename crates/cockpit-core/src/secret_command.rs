@@ -27,6 +27,10 @@
 //!
 //! This module contains ZERO provider-specific preset strings: a preset that
 //! maps a product toggle to a concrete argv lives in the UI layer, never here.
+//!
+//! The same daemon seam also spawns sealed-action consumers with one literal
+//! injected into argv or the child environment. Those calls share the no-shell,
+//! null-stdin, timeout, capture-bound, and redacted-debug contract.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -182,6 +186,66 @@ impl CommandSecretExecutor for SubprocessCommandExecutor {
     async fn run(&self, argv: &[String]) -> Result<String, CommandSecretError> {
         run_subprocess(argv).await
     }
+}
+
+/// Captured output from a process that consumed an injected sealed value.
+/// Debug rendering is permanently redacted; callers must pass both byte
+/// buffers through the redaction scrub before doing anything else with them.
+pub(crate) struct InjectedCommandCapture {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl std::fmt::Debug for InjectedCommandCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedCommandCapture")
+            .field("success", &self.success)
+            .field("stdout", &"<redacted>")
+            .field("stderr", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Spawn a fixed argv directly with an optional sealed environment binding.
+/// This is the common daemon seam used by command-argument, process-env, and
+/// file-consumer actions. It never invokes a shell, never writes the injected
+/// value to disk, nulls stdin, and applies the command-secret timeout.
+pub(crate) async fn run_injected_process(
+    argv: &[String],
+    environment: Option<(&str, &str)>,
+) -> Result<InjectedCommandCapture, CommandSecretError> {
+    let (program, args) = argv.split_first().ok_or(CommandSecretError::EmptySpec)?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
+    let output = tokio::time::timeout(COMMAND_SECRET_TIMEOUT, command.output())
+        .await
+        .map_err(|_| CommandSecretError::Timeout)?
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                CommandSecretError::NotFound
+            }
+            kind => CommandSecretError::Io(io_kind_label(kind)),
+        })?;
+    if output.stdout.len() > COMMAND_SECRET_STDOUT_CAP {
+        return Err(CommandSecretError::OutputTooLarge);
+    }
+    if output.stderr.len() > COMMAND_SECRET_STDERR_CAP {
+        return Err(CommandSecretError::StderrTooLarge);
+    }
+    Ok(InjectedCommandCapture {
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 async fn run_subprocess(argv: &[String]) -> Result<String, CommandSecretError> {

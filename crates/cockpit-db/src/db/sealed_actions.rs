@@ -1,5 +1,5 @@
-//! Durable persistence for immutable sealed action instances and the
-//! recovery-audit ledger.
+//! Durable persistence for immutable sealed action instances, publish-before-
+//! effect invocation audit, and the recovery-audit ledger.
 //!
 //! Two durable surfaces live here:
 //!
@@ -15,6 +15,8 @@
 //!   commits to **before** the plaintext is returned (publish-before-destroy).
 //!   The row carries only safe metadata and a closed outcome; never the
 //!   literal.
+//! * `sealed_action_invocation_audit` — safe metadata committed before a host
+//!   injection effect receives plaintext. It carries no target or output.
 //!
 //! The connection-level helpers are `pub` precisely so the cockpit-core store
 //! layer can compose the revoke + snapshot-mutate pair inside one

@@ -6575,10 +6575,9 @@ CREATE TABLE sealed_action_invocation_audit (
     sink_kind       TEXT    NOT NULL CHECK (sink_kind IN ('command_arg', 'process_env', 'http_header', 'http_body', 'file')),
     file_persistent INTEGER NOT NULL DEFAULT 0 CHECK (file_persistent IN (0, 1)),
     created_at_ms   INTEGER NOT NULL,
-    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    FOREIGN KEY (action_id) REFERENCES sealed_action_instances(action_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    FOREIGN KEY (grant_id) REFERENCES sealed_action_grants(grant_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    -- Audit identities deliberately have no foreign keys: retiring an action,
+    -- deleting a session/value, or expiring a grant must not erase evidence or
+    -- become impossible because an audit row exists.
     CHECK (sink_kind = 'file' OR file_persistent = 0)
 );
 

@@ -27817,6 +27817,41 @@ async fn code_root_read_snapshot(
     })
 }
 
+/// Drain events emitted after an attach's durable snapshot was read.
+///
+/// A broadcast gap makes that snapshot stale: the queued lag marker must be
+/// delivered before any retained post-gap events, so clients enter their normal
+/// durable reattach/reconcile path before applying them.
+pub(super) fn replay_attach_hydration_events(
+    event_rx: &mut crate::daemon::EventReceiver,
+    pending_replay: &mut Vec<proto::Event>,
+    session_id: Uuid,
+) {
+    loop {
+        match event_rx.try_recv() {
+            Ok(envelope) => pending_replay.push(envelope.event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                // The history snapshot predates this loss, so it cannot be
+                // treated as an authoritative attach projection. In
+                // particular, a dropped `UserMessageRemoved` would otherwise
+                // leave a retracted durable row rendered indefinitely. Match
+                // the live-forwarder contract: deliver a typed lag marker
+                // after the attach response so the client reattaches and
+                // reconciles from its durable cursor. Keep draining the
+                // receiver too, since events retained after the gap are still
+                // useful while that resync is in flight.
+                tracing::warn!(missed = n, %session_id, "attach hydration event replay lagged; reattach to resync");
+                pending_replay.push(proto::Event::EventStreamLagged {
+                    session_id: Some(session_id),
+                    dropped: n,
+                });
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attach(
     state: &mut MutableClientState,
@@ -28279,17 +28314,7 @@ pub(super) async fn attach(
         );
     }
 
-    loop {
-        match event_rx.try_recv() {
-            Ok(envelope) => state.pending_replay.push(envelope.event),
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!(missed = n, "attach hydration event replay lagged");
-                break;
-            }
-            Err(broadcast::error::TryRecvError::Closed) => break,
-        }
-    }
+    replay_attach_hydration_events(&mut event_rx, &mut state.pending_replay, session_id);
     effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {

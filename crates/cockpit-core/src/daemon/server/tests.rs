@@ -33779,6 +33779,49 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
     event_task.abort();
 }
 
+#[test]
+fn attach_hydration_lag_queues_resync_before_retained_events() {
+    let session_id = Uuid::new_v4();
+    let (event_tx, mut event_rx) = broadcast::channel(1);
+    event_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id,
+            text: "before durable snapshot".to_string(),
+        }))
+        .unwrap();
+    // This retraction falls in the broadcast gap. Its durable tombstone is
+    // recovered by the reattach that the lag marker requires, rather than
+    // leaving the client to infer a deletion from a stale snapshot.
+    event_tx
+        .send(test_event_envelope(proto::Event::UserMessageRemoved {
+            session_id,
+            seq: 41,
+            client_submission_ids: Vec::new(),
+        }))
+        .unwrap();
+    event_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id,
+            text: "retained after gap".to_string(),
+        }))
+        .unwrap();
+
+    let mut pending_replay = Vec::new();
+    replay_attach_hydration_events(&mut event_rx, &mut pending_replay, session_id);
+
+    assert!(matches!(
+        pending_replay.first(),
+        Some(proto::Event::EventStreamLagged {
+            session_id: Some(observed),
+            dropped: 2,
+        }) if *observed == session_id
+    ));
+    assert!(matches!(
+        pending_replay.get(1),
+        Some(proto::Event::Notice { text, .. }) if text == "retained after gap"
+    ));
+}
+
 #[tokio::test]
 async fn in_process_broadcast_lag_emits_typed_event() {
     let base = test_ctx();

@@ -72,6 +72,7 @@ pub mod local_operation_receipts;
 pub mod locks;
 pub mod media_attachments;
 pub mod message_attachments;
+pub mod monty_network;
 pub mod needs_attention;
 #[cfg(feature = "remote")]
 pub mod org_sync;

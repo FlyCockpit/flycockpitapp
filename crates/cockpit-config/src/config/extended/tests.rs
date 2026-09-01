@@ -1523,6 +1523,27 @@ fn approval_mode_defaults_to_manual_and_parses_all_values() {
 }
 
 #[test]
+fn sealed_acquisition_consent_defaults_to_audit_only_and_parses_approval() {
+    assert_eq!(
+        ExtendedConfig::default().sealed_acquisition_consent,
+        SealedAcquisitionConsent::AuditOnly
+    );
+    let omitted: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        omitted.sealed_acquisition_consent,
+        SealedAcquisitionConsent::AuditOnly
+    );
+    let approval: ExtendedConfig =
+        serde_json::from_str(r#"{"sealedAcquisitionConsent":"approval"}"#).unwrap();
+    assert_eq!(
+        approval.sealed_acquisition_consent,
+        SealedAcquisitionConsent::Approval
+    );
+    let serialized = serde_json::to_value(approval).unwrap();
+    assert_eq!(serialized["sealedAcquisitionConsent"], "approval");
+}
+
+#[test]
 fn approval_mode_cycles_manual_auto_yolo() {
     assert_eq!(ApprovalMode::Manual.cycled(), ApprovalMode::Auto);
     assert_eq!(ApprovalMode::Auto.cycled(), ApprovalMode::Yolo);

@@ -95,16 +95,21 @@ pub(crate) fn quarantine_bash_result(
     tool: &str,
     output: &mut ToolOutput,
 ) -> bool {
-    let Ok(runtime) = CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) else {
+    let Ok(runtime) = CURRENT_ACQUISITION_RUNTIME.try_with(|runtime| runtime.clone()) else {
         return false;
     };
-    if tool != "bash" || output.exit_code.is_some_and(|code| code != 0) {
+    if tool != "bash" {
         return false;
     }
-    let raw = output
+    let assembled = output
         .display_content
         .take()
         .unwrap_or_else(|| output.content.model_text().to_owned());
+    let (stdout, stderr) = crate::engine::bash_hints::split_bash_body(&assembled);
+    let raw = if stdout.is_empty() { stderr } else { stdout };
+    let raw = raw
+        .trim_end_matches(|ch| matches!(ch, '\r' | '\n'))
+        .to_owned();
     runtime
         .state
         .lock()
@@ -130,7 +135,7 @@ pub(crate) fn acquisition_allows_sealed_reference(record_id: &str) -> bool {
 
 fn set_terminal(move_: AcquisitionTerminalMove) -> Result<()> {
     let runtime = CURRENT_ACQUISITION_RUNTIME
-        .try_with(Clone::clone)
+        .try_with(|runtime| runtime.clone())
         .map_err(|_| invalid_input("acquisition capability is not active"))?;
     let mut state = runtime.state.lock().unwrap();
     if state.terminal.is_some() {
@@ -218,5 +223,108 @@ impl Tool for AcquisitionFailTool {
         }
         set_terminal(AcquisitionTerminalMove::Failed)?;
         Ok(ToolOutput::text("acquisition failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "sk-quarantined-acquisition-value-123456";
+
+    #[tokio::test]
+    async fn successful_bash_stdout_is_replaced_before_any_consumer_sees_it() {
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::new(),
+            crate::config::extended::ApprovalMode::Auto,
+        );
+        let inspect = runtime.clone();
+        with_acquisition_runtime(runtime, async move {
+            let mut output = ToolOutput::text(format!(
+                "stdout:\n{SECRET}\nstderr:\ndiagnostic without secret\nexit: 0\n"
+            ))
+            .with_exit_code(0);
+            assert!(quarantine_bash_result("call-secret", "bash", &mut output));
+
+            let durable_projection = output.content.model_text();
+            assert!(!durable_projection.contains(SECRET));
+            assert!(durable_projection.contains("call-secret"));
+            assert!(output.display_content.is_none());
+            assert!(output.text_artifact_capture.is_none());
+            assert!(output.text_artifact_captures.is_empty());
+            assert!(output.output_sidecar.is_none());
+
+            let captured = inspect
+                .take_quarantined("call-secret")
+                .expect("host retains the exact referenced stdout");
+            assert_eq!(captured.as_str(), SECRET);
+            assert!(inspect.take_quarantined("call-secret").is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn capture_accepts_only_a_quarantined_call_and_is_single_terminal() {
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::new(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
+        let inspect = runtime.clone();
+        with_acquisition_runtime(runtime, async move {
+            assert!(set_terminal(AcquisitionTerminalMove::Capture {
+                source_tool_call_id: "missing".to_owned(),
+            })
+            .is_err());
+
+            let mut output = ToolOutput::text(format!("stdout:\n{SECRET}\nexit: 0\n"))
+                .with_exit_code(0);
+            assert!(quarantine_bash_result("exact", "bash", &mut output));
+            set_terminal(AcquisitionTerminalMove::Capture {
+                source_tool_call_id: "exact".to_owned(),
+            })
+            .unwrap();
+            assert_eq!(
+                inspect.terminal(),
+                Some(AcquisitionTerminalMove::Capture {
+                    source_tool_call_id: "exact".to_owned(),
+                })
+            );
+            assert!(set_terminal(AcquisitionTerminalMove::Failed).is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nonzero_bash_output_is_quarantined_too() {
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::new(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
+        let inspect = runtime.clone();
+        with_acquisition_runtime(runtime, async move {
+            let mut output =
+                ToolOutput::text(format!("stderr:\n{SECRET}\nexit: 7\n")).with_exit_code(7);
+            assert!(quarantine_bash_result("failed-call", "bash", &mut output));
+            assert!(!output.content.model_text().contains(SECRET));
+            assert_eq!(
+                inspect.take_quarantined("failed-call").unwrap().as_str(),
+                SECRET
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn acquisition_description_scope_is_exact_and_empty_by_default() {
+        assert!(acquisition_allows_sealed_reference("outside-acquisition"));
+        let runtime = AcquisitionRuntime::new(
+            BTreeSet::from(["allowed-record".to_owned()]),
+            crate::config::extended::ApprovalMode::Yolo,
+        );
+        with_acquisition_runtime(runtime, async {
+            assert!(acquisition_allows_sealed_reference("allowed-record"));
+            assert!(!acquisition_allows_sealed_reference("owner-record"));
+        })
+        .await;
     }
 }

@@ -679,6 +679,33 @@ pub fn rotate_session_sealed_value_conn(
 }
 
 impl Db {
+    /// Preflight the create-only agent namespace before dispatching a command.
+    /// The transaction-time INSERT and legacy check remain authoritative; this
+    /// read prevents knowingly running acquisition work for an occupied slot.
+    pub async fn agent_acquired_destination_available(
+        &self,
+        session_id: String,
+        record_id: String,
+        name: String,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            let occupied: i64 = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sealed_value_records
+                     WHERE record_id = ?2
+                        OR (scope = 'session' AND scope_key = ?1 AND name = ?3)
+                    UNION ALL
+                    SELECT 1 FROM sealed_values
+                     WHERE session_id = ?1 AND value_id = ?3
+                 )",
+                params![session_id, record_id, name],
+                |row| row.get(0),
+            )?;
+            Ok(occupied == 0)
+        })
+        .await
+    }
+
     /// Publish an owner-visible acquisition attempt before child dispatch.
     pub async fn begin_sealed_value_acquisition_audit(
         &self,

@@ -871,6 +871,7 @@ fn sealed_acquisition_def() -> AgentDef {
         &[
             "bash",
             "list_sealed_value_descriptions",
+            "use_sealed_value",
             "capture_sealed_value",
             "acquisition_requires_user",
             "acquisition_fail",

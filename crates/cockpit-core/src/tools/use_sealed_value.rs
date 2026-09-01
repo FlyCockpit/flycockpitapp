@@ -122,6 +122,11 @@ impl Tool for UseSealedValueTool {
         // call never reaches the grant table let alone a literal.
         let request =
             parse_use_sealed_value_args(&args).map_err(|error| invalid_input(error.to_string()))?;
+        if !crate::tools::trusted_child_acquisition::acquisition_allows_sealed_reference(
+            &request.sealed_value_id.to_string(),
+        ) {
+            return Ok(ToolOutput::text(SealedUseDenied.to_string()));
+        }
 
         let trust = LiveWorkspaceTrust {
             session: ctx.session.clone(),

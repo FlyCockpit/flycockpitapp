@@ -1,311 +1,383 @@
-//! Trusted-child sealed-value acquisition coordinator (leak-report AC6,
-//! sub-increment 2c-3b).
+//! Trusted-child sealed-value acquisition coordinator.
 //!
-//! ## What this module owns
-//!
-//! The single host function that performs ONE trusted-child credential
-//! acquisition end to end and returns ONLY a closed
-//! [`AcquisitionOutcome`](crate::engine::trusted_child_acquisition::AcquisitionOutcome).
-//! It ties together the three already-landed pieces without reimplementing any
-//! of them:
-//!
-//! - **2c-1** [`resolve_trusted_child_model`] — selects a trusted child and
-//!   mints a `TrustedCustodyGrant` ONLY when the resolved model is host-`Local`
-//!   (Remote / PrivateRemote / missing location fail closed, no grant).
-//! - **2c-2** [`TrustedChildCaptureRegistry`] — mints ONE exact single-use
-//!   capture authority ([`TrustedChildCaptureRegistry::begin_capture`]) and
-//!   performs the verify-before-parse in-process transfer
-//!   ([`TrustedChildCaptureRegistry::verify_and_capture`]).
-//! - **2c-3a** [`RequiresUser::parse`] — the fail-closed validator that is the
-//!   ONLY way to build a human-surfacing `RequiresUser` prompt.
-//!
-//! ## The discard seam (why the child's raw output cannot leak)
-//!
-//! The child runs as a **non-persisting utility completion**
-//! ([`Model::text_completion_with_system_for`]), NOT through the turn runner.
-//! A utility completion issues exactly one provider request and returns the
-//! assistant text as an owned `String`: it never records a session event, never
-//! appends to any durable transcript / inference log, never streams a
-//! `TurnEvent`, and runs no tool loop. So the child's raw output exists ONLY in
-//! the [`Zeroizing`] buffer this function owns and drops. The ONLY thing
-//! extracted from it is the structured acquisition claim (a small JSON object),
-//! from which ONLY whitelisted fields are read: `requires_user.{reason,prompt}`
-//! (each re-validated by 2c-3a) or the `captured_secret` literal (moved — not
-//! copied — straight into a zeroizing [`SealedCaptureValue`] and handed to
-//! 2c-2). Any other content — a rambling preamble, a smuggled token in an
-//! unrecognized field, reasoning, non-JSON text — is ignored and dropped with
-//! the zeroizing buffer. This function emits no `tracing` record carrying
-//! child-derived content.
-//!
-//! Using the turn runner here would be unsound: it durably records the child's
-//! assistant text + reasoning to the session event log BEFORE this function
-//! could classify, redacted only by a table that does not yet contain the
-//! just-captured secret. The utility-completion path has no such sink.
-//!
-//! ## Fail-closed ordering
-//!
-//! 1. **Eligibility.** Only [`ApprovalMode::Auto`] / [`ApprovalMode::Yolo`]
-//!    callers dispatch. Manual (and any ineligible posture) returns `Failed`
-//!    WITHOUT minting a capture record, selecting a model, or dispatching.
-//!    Eligibility is identical across every harness posture.
-//! 2. **Mint the pending record** (2c-2) before any model identity is selected.
-//!    A refusal (one already in flight for the session) fails closed.
-//! 3. **Select** the trusted child (2c-1). An `Err` (non-Local / ineligible)
-//!    cancels the pending record and returns `Failed` WITHOUT dispatching.
-//! 4. **Dispatch** exactly one non-persisting utility completion.
-//! 5. **Classify** the structured claim into the closed outcome.
-//! 6. **Lifecycle.** Retain the pending record on `RequiresUser` (the human is
-//!    prompted by RETURNING the outcome); `cancel` it on `Failed`;
-//!    `verify_and_capture` consumes it single-use on `Sealed`.
-//!
-//! ## Live wiring is deferred (callable-and-dormant, like 2c-1/2c-2/2c-3a)
-//!
-//! The task-delegation loop ([`crate::engine::schedule::swarm::run_swarm_loop`])
-//! injects a child's text into the PARENT via `budget_result` — it has no
-//! existing "this parent turn needs a sealed value, delegate to a trusted child"
-//! trigger, and the live computer-use caller (`computer/coordinator.rs`) is not
-//! a model-turn dispatch host and is coupled to unlanded work. So this module is
-//! built as a callable host unit, exercised end to end through a
-//! `ScriptedProvider`, and the thin live trigger is a follow-up. The module is
-//! `#[allow(dead_code)]`-gated at its `mod` declaration until that live caller
-//! lands, mirroring how 2c-1/2c-2/2c-3a stayed dormant until consumed.
+//! The host owns the destination and the only raw-output resolver. The child
+//! receives a constrained binary-owned agent definition plus a task-local,
+//! user-conferred capture capability. Successful command output is quarantined
+//! at production time and can leave that quarantine only through an exact
+//! single-use `source_tool_call_id` capture.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
-use serde_json::Value;
-use zeroize::Zeroizing;
-
-use crate::config::extended::ApprovalMode;
-use crate::config::extended::ExtendedConfig;
+use crate::config::extended::{ApprovalMode, ExtendedConfig, SealedAcquisitionConsent};
 use crate::config::providers::ProvidersConfig;
 use crate::credentials::CredentialStore;
-use crate::engine::model::{Model, UtilityCallSite};
+use crate::engine::builtin::SpawnArgs;
+use crate::engine::driver::run_noninteractive_resumable;
+use crate::engine::message::Message;
+use crate::engine::model::Model;
 use crate::engine::model_roles::resolve_trusted_child_model;
 use crate::engine::trusted_child_acquisition::{AcquisitionOutcome, RequiresUser};
 use crate::redact::RedactionTable;
 use crate::session::Session;
 use crate::session::trusted_child_capture::{
-    SealedCaptureValue, TrustedChildCaptureAuthority, TrustedChildCaptureOutcome,
-    TrustedChildCaptureRegistry,
+    SealedCaptureValue, TrustedChildCaptureOutcome, TrustedChildCaptureRegistry,
+};
+use crate::tools::trusted_child_acquisition::{
+    AcquisitionRuntime, AcquisitionTerminalMove, with_acquisition_runtime,
 };
 
-/// The host-authored system contract for the acquisition child. It constrains
-/// the reply to exactly one of the two whitelisted claim shapes; anything else
-/// the child emits is ignored and dropped by the classifier.
-const ACQUISITION_SYSTEM: &str = "You are a host-local trusted acquisition child. Acquire the \
-     requested credential and reply with exactly one JSON object: either \
-     {\"captured_secret\":\"<literal>\"} or \
-     {\"requires_user\":{\"reason\":\"<reason>\",\"prompt\":\"<one-line question>\"}}. \
-     Output only that JSON object, with no preamble, explanation, or code fences.";
+const ACQUISITION_AGENT: &str = "sealed-acquisition";
+const MAX_ACQUISITION_TURNS_PER_ATTEMPT: usize = 8;
+const MAX_TERMINAL_NUDGES: usize = 2;
+const TERMINAL_NUDGE: &str = "Choose exactly one terminal move now: capture_sealed_value(source_tool_call_id), acquisition_requires_user(reason, prompt), or acquisition_fail(). Never ask for or repeat the value.";
 
-/// One trusted-child acquisition request. Bundles the selection inputs (2c-1)
-/// and the capture-binding inputs (2c-2) so the coordinator's entry point stays
-/// a single call. Carries no secret.
+/// Host-authored destination and model-selection request. No field is supplied
+/// by the acquisition child, and the child brief must not name the destination.
 pub struct AcquisitionRequest<'a> {
-    /// The caller's approval posture. Only [`ApprovalMode::Auto`] /
-    /// [`ApprovalMode::Yolo`] dispatch; everything else fails closed with no
-    /// side effects.
     pub caller_mode: ApprovalMode,
-
-    // ---- 2c-1 selection inputs ----
-    /// The role/category scanned for a trusted child (empty ⇒ `Any`).
     pub category: &'a str,
-    /// The delegating agent name (drives required capabilities).
-    pub agent_name: &'a str,
+    pub delegating_agent_name: &'a str,
     pub extended: &'a ExtendedConfig,
     pub providers: &'a ProvidersConfig,
     pub session_model: &'a Arc<Model>,
     pub store: Option<CredentialStore>,
-
-    // ---- 2c-2 capture-binding inputs (host-derived, never child-supplied) ----
+    pub acquisition_id: &'a str,
     pub record_id: &'a str,
-    pub value_id: &'a str,
-    pub reason: &'a str,
-    pub origin: &'a str,
+    pub value_name: &'a str,
+    pub description: &'a str,
     pub generation: i64,
-    pub version: i64,
-    pub source_tool_call_id: &'a str,
-    /// The single pinned clock for the whole acquisition (mint AND verify use
-    /// it, so the operation is atomic w.r.t. the clock — guidance L17).
+    /// Create-only sealed-value version. This is not a daemon protocol version.
+    pub value_version: i64,
     pub now_ms: i64,
-
-    /// The host-authored brief handed to the trusted child as its user turn.
+    /// Command/task brief only. It must not include destination metadata.
     pub child_brief: String,
+    /// Exact sealed references required to perform acquisition, usually empty.
+    pub allowed_sealed_record_ids: BTreeSet<String>,
 }
 
-/// Perform ONE trusted-child sealed-value acquisition and return ONLY the closed
-/// [`AcquisitionOutcome`]. See the module docs for the full fail-closed ordering
-/// and the discard seam.
-///
-/// `redaction` is the session's live redaction table: 2c-2 unions the captured
-/// literal into it on `Sealed`.
+/// Runtime dependencies inherited from the parent session. Reusing the live
+/// session and cwd makes sandbox posture identical; the task-local approval
+/// projection independently maps auto to manual without mutating the parent.
+pub struct AcquisitionExecutionContext {
+    pub spawn_args: SpawnArgs,
+    pub session: Arc<Session>,
+    pub locks: Arc<crate::locks::LockManager>,
+    pub redaction: Arc<RedactionTable>,
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
+    pub guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
+    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub approver: Option<Arc<crate::approval::Approver>>,
+    pub resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    pub local_installations: crate::agents::LocalInstallationResolver,
+}
+
+/// Perform one acquisition. The returned closed outcome is the only parent
+/// result; no report, record id, source id, or literal is returned.
 pub async fn run_trusted_child_acquisition(
     request: AcquisitionRequest<'_>,
+    execution: AcquisitionExecutionContext,
     registry: &TrustedChildCaptureRegistry,
-    session: Arc<Session>,
-    redaction: Arc<RedactionTable>,
 ) -> AcquisitionOutcome {
-    // 1. Eligibility gate. Manual / ineligible postures perform ZERO side
-    //    effects: no capture record is minted, no model is selected, no request
-    //    is dispatched (guidance L18 — resolve/validate before any lifecycle
-    //    effect; here we refuse before the very first one).
-    if !matches!(request.caller_mode, ApprovalMode::Auto | ApprovalMode::Yolo) {
+    let started_at = Instant::now();
+    let session_id = execution.session.id.to_string();
+
+    if crate::sealed::identity::SealedRecordId::parse(request.record_id).is_err()
+        || crate::sealed::identity::SealedName::canonical(request.value_name).is_err()
+        || crate::sealed::identity::SealedDescription::parse(request.description).is_err()
+        || request.acquisition_id.trim().is_empty()
+        || request.value_version != 1
+    {
         return AcquisitionOutcome::Failed;
     }
-
-    // 2. Mint the single pending record (2c-2) BEFORE any model identity is
-    //    selected — the child is chosen without a model-selected provider
-    //    identity in hand. A refusal (one already in flight for the session)
-    //    fails closed. The pending record carries no capability by itself: the
-    //    authority it mints is inert until an exact verify, so this benign
-    //    lifecycle registration may precede selection (L18).
-    let session_id = session.id.to_string();
-    let authority = match registry.begin_capture(
-        &session,
-        request.record_id,
-        request.value_id,
-        request.reason,
-        request.origin,
-        request.generation,
-        request.version,
-        request.source_tool_call_id,
-        request.now_ms,
-    ) {
-        Ok(authority) => authority,
-        Err(_already_in_flight) => return AcquisitionOutcome::Failed,
+    let Ok(true) = execution
+        .session
+        .db
+        .agent_acquired_destination_available(
+            session_id.clone(),
+            request.record_id.to_owned(),
+            request.value_name.to_owned(),
+        )
+        .await
+    else {
+        return AcquisitionOutcome::Failed;
     };
 
-    // 3. Select the trusted child (2c-1). A non-Local / ineligible resolution
-    //    fails closed HERE, before any dispatch: cancel the pending record we
-    //    just minted (so no authority orphans) and return `Failed`.
-    let (child_model, _grant) = match resolve_trusted_child_model(
+    // Audit-only is the default. The opt-in approval setting must have a live
+    // owner approver and an affirmative one-shot decision before any child or
+    // capture lifecycle exists.
+    if request.extended.sealed_acquisition_consent == SealedAcquisitionConsent::Approval {
+        let Some(approver) = execution.approver.as_ref() else {
+            return AcquisitionOutcome::Failed;
+        };
+        match approver
+            .approve_tool_call("trusted child credential acquisition")
+            .await
+        {
+            Ok(decision) if decision.is_allowed() => {}
+            _ => return AcquisitionOutcome::Failed,
+        }
+    }
+
+    let (child_model, _trusted_custody) = match resolve_trusted_child_model(
         request.category,
-        request.agent_name,
+        request.delegating_agent_name,
         request.extended,
         request.providers,
         request.session_model,
         request.store,
     ) {
         Ok(selected) => selected,
-        Err(_non_local_or_ineligible) => {
-            registry.cancel(&session_id);
-            return AcquisitionOutcome::Failed;
-        }
+        Err(_) => return AcquisitionOutcome::Failed,
     };
 
-    // 4. Dispatch exactly ONE non-persisting utility completion. Unlike the turn
-    //    runner, `text_completion_with_system_for` records no session event,
-    //    streams no `TurnEvent`, keeps no durable transcript, and runs no tool
-    //    loop — the child's raw output lives ONLY in the `Zeroizing` buffer
-    //    below. The system contract + brief are host-authored (no secret); the
-    //    utility path scrubs both through the outbound redaction chokepoint
-    //    before any provider work. A dispatch error fails closed: cancel the
-    //    pending record and return `Failed`, dropping the error without logging
-    //    any child-derived content.
-    let raw_claim: Zeroizing<String> = match child_model
-        .text_completion_with_system_for(
-            UtilityCallSite::TrustedChildAcquisition,
-            ACQUISITION_SYSTEM,
-            &request.child_brief,
+    let consent_mode = match request.extended.sealed_acquisition_consent {
+        SealedAcquisitionConsent::AuditOnly => "audit_only",
+        SealedAcquisitionConsent::Approval => "approval",
+    };
+    if execution
+        .session
+        .db
+        .begin_sealed_value_acquisition_audit(
+            crate::db::sealed_scope::NewSealedValueAcquisitionAudit {
+                acquisition_id: request.acquisition_id.to_owned(),
+                record_id: request.record_id.to_owned(),
+                session_id: session_id.clone(),
+                project_key: execution.session.project_id.clone(),
+                name: request.value_name.to_owned(),
+                description: request.description.to_owned(),
+                child_agent: ACQUISITION_AGENT.to_owned(),
+                consent_mode: consent_mode.to_owned(),
+                created_at_ms: request.now_ms,
+            },
         )
         .await
+        .is_err()
     {
-        Ok(text) => Zeroizing::new(text),
-        Err(_dispatch_failed) => {
+        return AcquisitionOutcome::Failed;
+    }
+
+    // Reserve before dispatch so concurrent acquisitions cannot both run a
+    // secret-producing command. The source id is bound later because it does
+    // not exist until the child emits the bash call.
+    if registry
+        .reserve_capture(
+            &execution.session,
+            request.acquisition_id,
+            request.record_id,
+            request.value_name,
+            request.description,
+            "trusted_child_acquisition",
+            request.generation,
+            request.value_version,
+            request.now_ms,
+        )
+        .is_err()
+    {
+        terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms).await;
+        registry.cancel(&session_id);
+        return AcquisitionOutcome::Failed;
+    }
+
+    let mut spawn_args = execution.spawn_args.clone();
+    spawn_args.model = child_model;
+    spawn_args.interactive = false;
+    spawn_args.delegated = true;
+    spawn_args.granted_tools.clear();
+    // This owner action is not model-directed delegation. The ordinary
+    // per-fork no-widening guard still applies through `parent_posture`; the
+    // separate capture capability exists only in `AcquisitionRuntime` below.
+    spawn_args.vnext_grant = None;
+    spawn_args.parent_vnext_grant = None;
+    spawn_args.vnext_host_policy = None;
+    let child = match crate::engine::builtin::load(ACQUISITION_AGENT, &spawn_args) {
+        Ok(child)
+            if child.definition.as_ref().is_some_and(|definition| {
+                definition.vnext.as_ref().is_some_and(|vnext| {
+                    vnext.capabilities.contains(
+                        &crate::agents::AgentCapability::SealedAcquisitionCapture,
+                    )
+                })
+            }) => child,
+        _ => {
+            terminalize_audit_failed(&execution.session, request.acquisition_id, request.now_ms)
+                .await;
             registry.cancel(&session_id);
             return AcquisitionOutcome::Failed;
         }
     };
 
-    // 5 + 6. Classify the claim into the closed outcome and run the matching
-    //    lifecycle transition.
-    classify_and_capture(
-        &raw_claim,
-        &authority,
-        registry,
-        &session,
-        &redaction,
-        &session_id,
-        request.now_ms,
-    )
-    .await
+    let runtime = AcquisitionRuntime::new(request.allowed_sealed_record_ids, request.caller_mode);
+    let mut agent = child;
+    let mut history = Vec::new();
+    let mut prompt = Message::user(request.child_brief);
+    let mut run_failed = false;
+    for nudge in 0..=MAX_TERMINAL_NUDGES {
+        let result = with_acquisition_runtime(
+            runtime.clone(),
+            run_noninteractive_resumable(
+                agent,
+                prompt,
+                history,
+                execution.session.clone(),
+                execution.locks.clone(),
+                execution.redaction.clone(),
+                spawn_args.cwd.clone(),
+                execution.config.clone(),
+                execution.guidance_compiler.clone(),
+                execution.interrupts.clone(),
+                execution.cancel.clone(),
+                execution.approver.clone(),
+                execution.resource_scheduler.clone(),
+                crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                MAX_ACQUISITION_TURNS_PER_ATTEMPT,
+                execution.local_installations.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+            ),
+        )
+        .await;
+        match result {
+            Ok(outcome) => {
+                history = outcome.history;
+                agent = match crate::engine::builtin::load(ACQUISITION_AGENT, &spawn_args) {
+                    Ok(agent) => agent,
+                    Err(_) => {
+                        run_failed = true;
+                        break;
+                    }
+                };
+            }
+            Err(_) => {
+                run_failed = true;
+                break;
+            }
+        }
+        if runtime.terminal().is_some() {
+            break;
+        }
+        if nudge == MAX_TERMINAL_NUDGES {
+            break;
+        }
+        prompt = Message::user(TERMINAL_NUDGE);
+    }
+
+    if run_failed {
+        let completed_at_ms = completion_time_ms(request.now_ms, started_at);
+        terminalize_audit_failed(
+            &execution.session,
+            request.acquisition_id,
+            completed_at_ms,
+        )
+        .await;
+        registry.cancel(&session_id);
+        return AcquisitionOutcome::Failed;
+    }
+
+    let completed_at_ms = completion_time_ms(request.now_ms, started_at);
+    match runtime.terminal() {
+        Some(AcquisitionTerminalMove::Capture {
+            source_tool_call_id,
+        }) => {
+            let Some(authority) = registry.bind_source_tool_call(
+                &session_id,
+                &source_tool_call_id,
+                completed_at_ms,
+            ) else {
+                terminalize_audit_failed(
+                    &execution.session,
+                    request.acquisition_id,
+                    completed_at_ms,
+                )
+                .await;
+                registry.cancel(&session_id);
+                return AcquisitionOutcome::Failed;
+            };
+            let Some(mut quarantined) = runtime.take_quarantined(&source_tool_call_id) else {
+                terminalize_audit_failed(
+                    &execution.session,
+                    request.acquisition_id,
+                    completed_at_ms,
+                )
+                .await;
+                registry.cancel(&session_id);
+                return AcquisitionOutcome::Failed;
+            };
+            let value = SealedCaptureValue::new(std::mem::take(&mut *quarantined));
+            match registry
+                .verify_and_capture(
+                    &execution.session,
+                    &execution.redaction,
+                    &authority.to_ingress(),
+                    value,
+                    completed_at_ms,
+                )
+                .await
+            {
+                TrustedChildCaptureOutcome::Captured { .. } => AcquisitionOutcome::Sealed,
+                TrustedChildCaptureOutcome::Denied => {
+                    terminalize_audit_failed(
+                        &execution.session,
+                        request.acquisition_id,
+                        completed_at_ms,
+                    )
+                    .await;
+                    registry.cancel(&session_id);
+                    AcquisitionOutcome::Failed
+                }
+            }
+        }
+        Some(AcquisitionTerminalMove::RequiresUser { reason, prompt }) => {
+            registry.cancel(&session_id);
+            let outcome = RequiresUser::parse(&reason, &prompt);
+            let audit_outcome = if matches!(outcome, AcquisitionOutcome::RequiresUser(_)) {
+                "requires_user"
+            } else {
+                "failed"
+            };
+            let _ = execution
+                .session
+                .db
+                .finish_sealed_value_acquisition_audit(
+                    request.acquisition_id.to_owned(),
+                    audit_outcome.to_owned(),
+                    completed_at_ms,
+                )
+                .await;
+            outcome
+        }
+        Some(AcquisitionTerminalMove::Failed) | None => {
+            terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
+                .await;
+            registry.cancel(&session_id);
+            AcquisitionOutcome::Failed
+        }
+    }
 }
 
-/// Classify the child's structured claim and perform the matching capture /
-/// lifecycle transition. Reads ONLY whitelisted fields; everything else in the
-/// claim is ignored (the discard guarantee for the structured channel).
-#[allow(clippy::too_many_arguments)]
-async fn classify_and_capture(
-    raw_claim: &str,
-    authority: &TrustedChildCaptureAuthority,
-    registry: &TrustedChildCaptureRegistry,
-    session: &Session,
-    redaction: &RedactionTable,
-    session_id: &str,
-    now_ms: i64,
-) -> AcquisitionOutcome {
-    // A non-JSON / non-object claim is unclassifiable ⇒ fail closed. The parsed
-    // `Value` is confined to this scope and dropped before return; the
-    // authoritative copy of the raw text stays in the caller's `Zeroizing`
-    // buffer.
-    let Ok(Value::Object(mut claim)) = serde_json::from_str::<Value>(raw_claim) else {
-        registry.cancel(session_id);
-        return AcquisitionOutcome::Failed;
-    };
+fn completion_time_ms(started_at_ms: i64, started_at: Instant) -> i64 {
+    let elapsed_ms = i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+    started_at_ms.saturating_add(elapsed_ms)
+}
 
-    // MOVE (not clone) any captured-secret literal out of the parsed map into a
-    // zeroizing frame UP FRONT, so it is zeroized on drop on EVERY branch —
-    // including when a `requires_user` claim is also present and wins
-    // classification below (the secret is then dropped, zeroized, unused). After
-    // this, the parsed `Value` retains no owned copy of the secret.
-    let captured_secret: Option<Zeroizing<String>> = match claim.remove("captured_secret") {
-        Some(Value::String(secret)) => Some(Zeroizing::new(secret)),
-        _ => None,
-    };
-
-    // A RequiresUser claim wins classification when present. Read ONLY the two
-    // whitelisted fields and route them through the 2c-3a fail-closed validator;
-    // an invalid reason/prompt collapses to `Failed` and the pending record is
-    // deleted. On a valid `RequiresUser`, the pending record is RETAINED (the
-    // human answers next) — the human is surfaced by RETURNING the outcome. Any
-    // `captured_secret` taken above drops here, zeroized and unused.
-    if let Some(Value::Object(requires)) = claim.get("requires_user") {
-        let reason = requires.get("reason").and_then(Value::as_str).unwrap_or("");
-        let prompt = requires.get("prompt").and_then(Value::as_str).unwrap_or("");
-        return match RequiresUser::parse(reason, prompt) {
-            outcome @ AcquisitionOutcome::RequiresUser(_) => outcome,
-            _invalid => {
-                registry.cancel(session_id);
-                AcquisitionOutcome::Failed
-            }
-        };
-    }
-
-    // A captured-secret claim: move the literal out of the zeroizing frame into
-    // a zeroizing `SealedCaptureValue`, so the only remaining plaintext copies
-    // are the caller's `Zeroizing` raw buffer and the sealed value. Present the
-    // EXACT host-minted authority (the child never supplies or influences it). On
-    // `Captured` the record is consumed single-use and the value is sealed
-    // in-process; on `Denied` (any fail-closed reason in 2c-2, including a value
-    // the sealed-value validator rejects) nothing is stored — fail closed and
-    // free the slot.
-    if let Some(mut secret) = captured_secret {
-        let value = SealedCaptureValue::new(std::mem::take(&mut *secret));
-        return match registry
-            .verify_and_capture(session, redaction, &authority.to_ingress(), value, now_ms)
-            .await
-        {
-            TrustedChildCaptureOutcome::Captured { .. } => AcquisitionOutcome::Sealed,
-            TrustedChildCaptureOutcome::Denied => {
-                registry.cancel(session_id);
-                AcquisitionOutcome::Failed
-            }
-        };
-    }
-
-    // Anything else (an unrecognized claim shape, an empty object) ⇒ fail closed.
-    registry.cancel(session_id);
-    AcquisitionOutcome::Failed
+async fn terminalize_audit_failed(session: &Session, acquisition_id: &str, now_ms: i64) {
+    let _ = session
+        .db
+        .finish_sealed_value_acquisition_audit(
+            acquisition_id.to_owned(),
+            "failed".to_owned(),
+            now_ms,
+        )
+        .await;
 }
 
 #[cfg(test)]

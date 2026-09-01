@@ -20,12 +20,12 @@ use crate::leak_report::{LeakReportSource, OwnerWriteDisposition};
 use crate::redact::RedactionTable;
 use crate::sealed::OwnerAuthority;
 
-const RECORD_ID: &str = "rec-1";
+const RECORD_ID: &str = "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f";
 const VALUE_ID: &str = "captured_secret";
 const REASON: &str = "trusted-child acquisition";
 const ORIGIN: &str = "trusted_child";
 const GENERATION: i64 = 7;
-const VERSION: i64 = 3;
+const VERSION: i64 = 1;
 const TOOL_CALL: &str = "toolcall-abc";
 const NOW_MS: i64 = 1_000_000;
 /// A distinctive marker withheld from every other path. Passes
@@ -175,6 +175,22 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
     assert_eq!(got.as_slice(), SECRET.as_bytes());
     let installed = session.persisted_redaction_table().unwrap().unwrap();
     assert!(!installed.scrub(SECRET).contains(SECRET));
+    let record = session
+        .db
+        .sealed_value_record(RECORD_ID.to_owned())
+        .await
+        .unwrap()
+        .expect("agent-acquired scoped record exists");
+    assert_eq!(record.owner_principal, "agent-acquired");
+    assert_eq!(record.active_version, 1);
+    let audit = session
+        .db
+        .list_sealed_value_acquisition_audit(Some(session.id.to_string()), 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].outcome, "sealed");
+    assert_eq!(audit[0].source_tool_call_id.as_deref(), Some(TOOL_CALL));
 
     // Single-use: a replay of the exact same authority is now denied and stores
     // nothing new (the record was consumed).
@@ -189,6 +205,134 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
         )
         .await;
     assert_eq!(replay, TrustedChildCaptureOutcome::Denied);
+}
+
+#[test]
+fn reserved_capture_binds_the_source_exactly_once() {
+    let session = new_session();
+    let reg = TrustedChildCaptureRegistry::new();
+    reg.reserve_capture(
+        &session,
+        "acq-distinct",
+        RECORD_ID,
+        VALUE_ID,
+        REASON,
+        ORIGIN,
+        GENERATION,
+        VERSION,
+        NOW_MS,
+    )
+    .unwrap();
+    let authority = reg
+        .bind_source_tool_call(&session.id.to_string(), TOOL_CALL, NOW_MS)
+        .expect("first exact source binding succeeds");
+    assert_eq!(authority.source_tool_call_id(), TOOL_CALL);
+    assert!(
+        reg.bind_source_tool_call(&session.id.to_string(), "other", NOW_MS)
+            .is_none(),
+        "a reserved authority cannot be redirected to another source"
+    );
+}
+
+#[test]
+fn create_only_capture_rejects_noninitial_value_version() {
+    let session = new_session();
+    let reg = TrustedChildCaptureRegistry::new();
+    let error = reg
+        .reserve_capture(
+            &session,
+            "acq-version",
+            RECORD_ID,
+            VALUE_ID,
+            REASON,
+            ORIGIN,
+            GENERATION,
+            2,
+            NOW_MS,
+        )
+        .unwrap_err();
+    assert_eq!(error, BeginCaptureError::InvalidCreateVersion);
+    assert!(!reg.has_in_flight(&session.id.to_string(), NOW_MS));
+}
+
+#[tokio::test]
+async fn agent_capture_cannot_replace_an_owner_authored_slot() {
+    const AGENT_RECORD: &str = "4f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f";
+    const OWNER_SECRET: &str = "owner-authored-secret-value-123";
+    let session = new_session();
+    let table = RedactionTable::empty();
+    session
+        .set_sealed_value(
+            OwnerAuthority::for_test("owner"),
+            &table,
+            VALUE_ID,
+            OWNER_SECRET,
+            "owner supplied",
+            "owner",
+        )
+        .await
+        .unwrap();
+    session
+        .db
+        .begin_sealed_value_acquisition_audit(
+            crate::db::sealed_scope::NewSealedValueAcquisitionAudit {
+                acquisition_id: "acq-collision".to_owned(),
+                record_id: AGENT_RECORD.to_owned(),
+                session_id: session.id.to_string(),
+                project_key: session.project_id.clone(),
+                name: VALUE_ID.to_owned(),
+                description: REASON.to_owned(),
+                child_agent: "sealed-acquisition".to_owned(),
+                consent_mode: "audit_only".to_owned(),
+                created_at_ms: NOW_MS,
+            },
+        )
+        .await
+        .unwrap();
+
+    let reg = TrustedChildCaptureRegistry::new();
+    reg.reserve_capture(
+        &session,
+        "acq-collision",
+        AGENT_RECORD,
+        VALUE_ID,
+        REASON,
+        ORIGIN,
+        GENERATION,
+        VERSION,
+        NOW_MS,
+    )
+    .unwrap();
+    let authority = reg
+        .bind_source_tool_call(&session.id.to_string(), TOOL_CALL, NOW_MS)
+        .unwrap();
+    let outcome = reg
+        .verify_and_capture(
+            &session,
+            &table,
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(outcome, TrustedChildCaptureOutcome::Denied);
+    assert!(
+        session
+            .db
+            .sealed_value_record(AGENT_RECORD.to_owned())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let vault = crate::secure_key::vault_for_db(&session.db).unwrap();
+    let item_id = crate::secure_key::session_sealed_item_id(&session.id.to_string(), VALUE_ID, 1);
+    let stored = vault
+        .get_item(
+            cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+            &item_id,
+        )
+        .unwrap();
+    assert_eq!(stored.as_slice(), OWNER_SECRET.as_bytes());
 }
 
 /// Each wrong-field / lifecycle / non-trusted case must fail closed BEFORE the

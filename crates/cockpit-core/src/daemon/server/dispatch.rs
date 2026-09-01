@@ -8519,8 +8519,16 @@ async fn handle_serialized_request_impl(
                 .into_iter()
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
+            let acquisitions = ctx
+                .db
+                .list_sealed_value_acquisition_audit(None, proto::MAX_SEALED_OWNER_INVENTORY_ROWS)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_acquisition_audit_to_wire)
+                .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, acquisitions))
         }
         Request::EditSealedOwnerDescription {
             record_id,
@@ -18997,8 +19005,16 @@ async fn handle_concurrent_request_impl(
                 .into_iter()
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
+            let acquisitions = ctx
+                .db
+                .list_sealed_value_acquisition_audit(None, proto::MAX_SEALED_OWNER_INVENTORY_ROWS)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_acquisition_audit_to_wire)
+                .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, acquisitions))
         }
         Request::ListSealedActions => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
@@ -29817,6 +29833,30 @@ fn sealed_record_row_to_inventory_item(
         scope_key: row.scope_key,
         active_version: u32::try_from(row.active_version).unwrap_or(0),
         created_at_ms: row.created_at_ms,
+        namespace: if row.owner_principal == "agent-acquired" {
+            proto::SealedOwnerNamespace::AgentAcquired
+        } else {
+            proto::SealedOwnerNamespace::OwnerAuthored
+        },
+    }
+}
+
+fn sealed_acquisition_audit_to_wire(
+    row: crate::db::sealed_scope::SealedValueAcquisitionAuditRow,
+) -> proto::SealedAcquisitionAuditItem {
+    proto::SealedAcquisitionAuditItem {
+        acquisition_id: row.acquisition_id,
+        record_id: row.record_id,
+        session_id: row.session_id,
+        project_key: row.project_key,
+        name: row.name,
+        description: row.description,
+        child_agent: row.child_agent,
+        source_tool_call_id: row.source_tool_call_id,
+        consent_mode: row.consent_mode,
+        outcome: row.outcome,
+        created_at_ms: row.created_at_ms,
+        completed_at_ms: row.completed_at_ms,
     }
 }
 

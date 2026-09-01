@@ -356,6 +356,9 @@ pub enum TurnEvent {
         client_submission_ids: Vec<uuid::Uuid>,
         preflight_cleaned: Option<String>,
     },
+    /// The latest durable user row was retracted by an initial-thinking
+    /// cancellation. Clients remove `seq` and restore the authored `text`.
+    UserMessageRemoved { seq: i64, text: String },
     /// One or more daemon-queued user messages were drained and folded into
     /// the next model request. This is the authoritative transcript signal for
     /// queued folds; clients must not infer it from `ThinkingStarted`.

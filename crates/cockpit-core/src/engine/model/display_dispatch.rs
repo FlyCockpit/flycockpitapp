@@ -35,6 +35,7 @@ struct DisplayAttemptSlotInner {
     previous_failed_visible: Option<(AssistantAttemptId, String)>,
     clock_factory: DisplayClockFactory,
     tokenizer: Arc<dyn DisplayTokenizer>,
+    response_window_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DisplayAttemptSlot {
@@ -43,10 +44,11 @@ impl DisplayAttemptSlot {
             encoding: config.encoding,
             force_failure: config.force_tokenization_failure,
         });
-        Self::new_with_clock_and_tokenizer(
+        Self::new_with_clock_tokenizer_and_window(
             config,
             Arc::new(|| Box::new(RealDisplayClock)),
             tokenizer,
+            Arc::default(),
         )
     }
 
@@ -59,12 +61,43 @@ impl DisplayAttemptSlot {
         clock_factory: DisplayClockFactory,
         tokenizer: Arc<dyn DisplayTokenizer>,
     ) -> Self {
+        Self::new_with_clock_tokenizer_and_window(
+            config,
+            clock_factory,
+            tokenizer,
+            Arc::default(),
+        )
+    }
+
+    pub(crate) fn new_with_response_window(
+        config: DisplayClassifierConfig,
+        response_window_closed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let tokenizer: Arc<dyn DisplayTokenizer> = Arc::new(EncodingDisplayTokenizer {
+            encoding: config.encoding,
+            force_failure: config.force_tokenization_failure,
+        });
+        Self::new_with_clock_tokenizer_and_window(
+            config,
+            Arc::new(|| Box::new(RealDisplayClock)),
+            tokenizer,
+            response_window_closed,
+        )
+    }
+
+    fn new_with_clock_tokenizer_and_window(
+        config: DisplayClassifierConfig,
+        clock_factory: DisplayClockFactory,
+        tokenizer: Arc<dyn DisplayTokenizer>,
+        response_window_closed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self(Arc::new(Mutex::new(DisplayAttemptSlotInner {
             config,
             classifier: None,
             previous_failed_visible: None,
             clock_factory,
             tokenizer,
+            response_window_closed,
         })))
     }
 
@@ -141,9 +174,24 @@ impl DisplayAttemptSlot {
             let Some(classifier) = inner.classifier.as_mut() else {
                 return;
             };
-            classifier.feed_text(chunk)
+            let events = classifier.feed_text(chunk);
+            let has_response_text = classifier.has_response_text();
+            if has_response_text {
+                inner
+                    .response_window_closed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            events
         };
         emit_display_events(agent_name, events, event_tx).await;
+    }
+
+    pub(crate) fn close_response_window(&self) {
+        self.0
+            .lock()
+            .expect("display attempt slot")
+            .response_window_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) async fn feed_reasoning(
@@ -290,6 +338,30 @@ async fn emit_display_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_window_ignores_reasoning_and_closes_on_body_or_tool() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slot = DisplayAttemptSlot::new_with_response_window(
+            DisplayClassifierConfig {
+                inline_think: true,
+                translation_enabled: false,
+                encoding: TiktokenEncoding::Cl100k,
+                force_tokenization_failure: false,
+            },
+            Arc::clone(&closed),
+        );
+        slot.begin_successful_attempt("main", None, std::time::Instant::now())
+            .await;
+        slot.feed_reasoning("main", "thinking", None).await;
+        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst));
+        slot.feed_text("main", "answer", None).await;
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+
+        closed.store(false, std::sync::atomic::Ordering::SeqCst);
+        slot.close_response_window();
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
     use cockpit_tokenizer::TiktokenEncoding;
 
     #[tokio::test]

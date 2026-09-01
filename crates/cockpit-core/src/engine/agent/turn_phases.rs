@@ -1249,6 +1249,22 @@ pub(crate) fn new_display_attempt_slot(
     })
 }
 
+pub(crate) fn new_display_attempt_slot_with_window(
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    response_window_closed: Arc<std::sync::atomic::AtomicBool>,
+) -> crate::engine::model::DisplayAttemptSlot {
+    crate::engine::model::DisplayAttemptSlot::new_with_response_window(
+        crate::engine::DisplayClassifierConfig {
+            inline_think: inline_think_enabled(session, config),
+            translation_enabled: config.extended().translation.is_active(),
+            encoding: config.extended().response_metrics_tokenizer,
+            force_tokenization_failure: false,
+        },
+        response_window_closed,
+    )
+}
+
 async fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
     if let Err(e) = session
         .record_tool_rejected(&agent.name, &tc.id, "task", "task_unknown_agent")
@@ -2906,6 +2922,11 @@ pub(crate) async fn run_turn(
                 && crate::computer::is_reserved_native_computer_tool_name(&call.function.name))
         })
         .collect();
+    if !buffered_calls.is_empty()
+        && let Some(display_slot) = display_slot.as_ref()
+    {
+        display_slot.close_response_window();
+    }
     // Decode/contain ONLY on a route that advertised `report_leak`
     // (`report_leak_eligible`) — the SAME funnel that gates the schema append and
     // the withhold sink. A trusted / tool-disabled / unsupported route never

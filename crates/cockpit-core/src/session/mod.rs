@@ -229,6 +229,18 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Exact auto-title accounting captured before one retractable user turn.
+/// Restoring it makes a cancelled/re-sent message consume the same title slot
+/// as a single send.
+pub(crate) struct TitleProgressSnapshot {
+    title: Option<String>,
+    user_renamed: bool,
+    user_content_tokens: usize,
+    user_content_turns: usize,
+    title_stage: u8,
+    title_nudge_slot_pending: u8,
+}
+
 /// Work due for the cache-reusing, same-model metadata fork. The title slots
 /// refine both fields; later slots refresh the richer description while still
 /// requiring the atomic combined metadata call.

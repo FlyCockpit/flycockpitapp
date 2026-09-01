@@ -3,6 +3,64 @@
 use super::*;
 
 impl Session {
+    pub(crate) fn title_progress_snapshot(&self) -> TitleProgressSnapshot {
+        TitleProgressSnapshot {
+            title: self.title(),
+            user_renamed: self.user_renamed(),
+            user_content_tokens: self.user_content_tokens.load(Ordering::Relaxed),
+            user_content_turns: self.user_content_turns.load(Ordering::Relaxed),
+            title_stage: self.title_stage.load(Ordering::Relaxed),
+            title_nudge_slot_pending: self.title_nudge_slot_pending.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Best-effort rollback for the sole latest-message ledger retraction.
+    /// A concurrent manual rename wins the SQL predicate and is never clobbered.
+    pub(crate) fn restore_title_progress_after_retract(
+        &self,
+        snapshot: TitleProgressSnapshot,
+    ) {
+        let session_id = self.id;
+        let title = snapshot.title.clone();
+        let tokens = snapshot.user_content_tokens as i64;
+        let stage = i64::from(snapshot.title_stage);
+        let expected_user_renamed = snapshot.user_renamed;
+        let restored = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions
+                        SET title = ?1, user_content_tokens = ?2, title_stage = ?3
+                      WHERE session_id = ?4 AND user_renamed = ?5",
+                    params![
+                        title,
+                        tokens,
+                        stage,
+                        session_id.to_string(),
+                        expected_user_renamed
+                    ],
+                )?;
+                Ok(changed == 1)
+            });
+        match restored {
+            Ok(true) => {
+                *self.title.lock().unwrap() = snapshot.title;
+                self.user_content_tokens
+                    .store(snapshot.user_content_tokens, Ordering::Relaxed);
+                self.user_content_turns
+                    .store(snapshot.user_content_turns, Ordering::Relaxed);
+                self.title_stage
+                    .store(snapshot.title_stage, Ordering::Relaxed);
+                self.title_nudge_slot_pending
+                    .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "auto_title: retract rollback lost");
+            }
+        }
+    }
+
     /// Apply the combined output of the cache-reusing self-metadata fork.
     /// The durable update is atomic: a manual title or ephemeral session wins
     /// the race and leaves both generated fields untouched.
@@ -488,6 +546,27 @@ impl Session {
 mod metadata_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn retract_restores_auto_title_and_progress_snapshot() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot();
+        assert_eq!(session.note_user_content("cancelled prompt"), TitleAction::Eager);
+        assert!(session.set_auto_title("cancelled-title").unwrap());
+
+        session.restore_title_progress_after_retract(snapshot);
+
+        assert_eq!(session.title(), None);
+        assert_eq!(session.user_content_tokens(), 0);
+        assert_eq!(session.user_content_turns(), 0);
+        assert_eq!(session.title_stage(), 0);
+    }
 
     #[test]
     fn metadata_cadence_uses_user_boundaries_and_describes_at_higher_slots() {

@@ -11925,6 +11925,9 @@ impl Driver {
             .map(|stored| stored.source_text.clone())
             .unwrap_or_else(|| user_text.clone());
         let raw_user_text = canonical_user_text.clone();
+        let composer_restore_text = display_text
+            .clone()
+            .unwrap_or_else(|| raw_user_text.clone());
         let event_data = user_message_event_data(UserMessageEventData {
             text: &canonical_user_text,
             display_text: display_text.as_deref(),
@@ -11976,6 +11979,7 @@ impl Driver {
         } else {
             None
         };
+        let mut recorded_user_seq = None;
         let artifact_frame = if let Some(mut oversized) = oversized_artifact_submission {
             // Long preprocessing can consume most of the original lease. Renew
             // at this final boundary, rotating the token when required, before
@@ -12159,6 +12163,7 @@ impl Driver {
                         source_artifact,
                         projection_artifact,
                     } = *materialized;
+                    recorded_user_seq = Some(event_seq);
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
@@ -12378,6 +12383,7 @@ impl Driver {
             };
             match record_outcome {
                 UserMessageRecordOutcome::Recorded(seq) => {
+                    recorded_user_seq = Some(seq);
                     // Carry the assigned `seq` (the message's stable id) back to
                     // the client so it can stamp the already-pushed user history
                     // row. UI/DB-only — the seq never enters model context.
@@ -12559,6 +12565,7 @@ impl Driver {
         // after the foreground prompt is assembled below, so its prefix is the
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
+        let title_progress_before_turn = self.session.title_progress_snapshot();
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
         let (title_action, mut metadata_work) = if use_session_model_metadata {
@@ -12570,6 +12577,7 @@ impl Driver {
         } else {
             (self.session.note_user_content(&canonical_user_text), None)
         };
+        let mut auto_title_task = None;
         if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
@@ -12590,7 +12598,7 @@ impl Driver {
             let redact = self.redact.clone();
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
-            tokio::spawn(async move {
+            auto_title_task = Some(tokio::spawn(async move {
                 crate::auto_title::generate_session_title(
                     session,
                     extended,
@@ -12602,7 +12610,7 @@ impl Driver {
                     tx,
                 )
                 .await;
-            });
+            }));
         }
 
         // Skills auto-selection (GOALS §5): consult the cheap utility
@@ -12793,6 +12801,8 @@ impl Driver {
             }
         }
 
+        let response_window_closed =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
@@ -12869,6 +12879,7 @@ impl Driver {
             let attempted_prompt = next_prompt.clone();
             self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
+            turn_metadata.response_window_closed = std::sync::Arc::clone(&response_window_closed);
             let fallback_models = self.resolve_failover_models(&agent.model);
             // The durable snapshot carries the accepted continuation marker
             // for *every* subsequent model/tool phase, not merely its first
@@ -13109,6 +13120,41 @@ impl Driver {
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    let retractable_direct_turn = user_prompt_source == Some("user")
+                        && submission_kind == UserSubmissionKind::User
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
+                        && agent
+                            .model
+                            .resolve_reasoning_params(&self.config.providers())
+                            .is_some()
+                        && !response_window_closed
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                    if retractable_direct_turn
+                        && let Some(seq) = recorded_user_seq
+                        && self
+                            .session
+                            .db
+                            .remove_latest_user_message(self.session.id, seq)
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
+                                false
+                            })
+                    {
+                        if let Some(task) = auto_title_task.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        self.session
+                            .restore_title_progress_after_retract(title_progress_before_turn);
+                        let _ = tx
+                            .send(TurnEvent::UserMessageRemoved {
+                                seq,
+                                text: composer_restore_text.clone(),
+                            })
+                            .await;
+                    }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
                             .session

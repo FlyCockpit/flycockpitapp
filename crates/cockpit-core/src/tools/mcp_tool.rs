@@ -223,14 +223,6 @@ fn rendered_result_output(
         .iter()
         .map(|attached| ctx.redact.scrub(attached))
         .collect::<Vec<_>>();
-    let display = (!display_lane.is_empty()).then(|| {
-        if model.is_empty() {
-            display_lane
-        } else {
-            format!("{model}\n{display_lane}")
-        }
-    });
-
     let model_over_cap = model.len() > OUTPUT_BYTE_CAP;
     let model_inline = if model_over_cap {
         truncate_head_tail(&model, OUTPUT_BYTE_CAP)
@@ -268,7 +260,12 @@ fn rendered_result_output(
         );
     }
 
-    if let Some(display) = display {
+    if !display_lane.is_empty() {
+        let display = if model.is_empty() {
+            display_lane
+        } else {
+            format!("{model}\n{display_lane}")
+        };
         output = output.with_model_ephemeral_display(truncate_head_tail(&display, OUTPUT_BYTE_CAP));
     }
     output.with_notices(envelope.notifications)

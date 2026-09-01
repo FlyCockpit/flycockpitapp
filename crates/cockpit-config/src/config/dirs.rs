@@ -534,7 +534,7 @@ mod tests {
         );
 
         let global = ensure_global_config_dir().unwrap();
-        assert_eq!(global, tmp.path().join("config/cockpit"));
+        assert_eq!(global, tmp.path().join("home/.config/cockpit"));
         assert!(global.is_dir());
         assert_eq!(
             discover_config_dirs(&workspace)

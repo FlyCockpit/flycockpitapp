@@ -5,13 +5,14 @@ use reqwest::Url;
 
 use crate::config::providers::{AuthKind, ModelEntry, ProviderEntry, ProviderModelCatalog};
 use crate::providers::models_fetch::{self, ResolvedRequest};
-use crate::providers::usage::probes::{
-    CodexOAuthUsageProbe, GrokOAuthUsageProbe, ProviderUsageProbe,
-};
+#[cfg(feature = "grok-subscription")]
+use crate::providers::usage::probes::GrokOAuthUsageProbe;
+use crate::providers::usage::probes::{CodexOAuthUsageProbe, ProviderUsageProbe};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderCredentialKind {
     CodexOAuth,
+    #[cfg(feature = "grok-subscription")]
     XaiOAuth,
 }
 
@@ -210,10 +211,12 @@ impl Provider for CodexProvider {
     }
 }
 
+#[cfg(feature = "grok-subscription")]
 pub(crate) struct GrokProvider {
     usage: GrokOAuthUsageProbe,
 }
 
+#[cfg(feature = "grok-subscription")]
 impl Default for GrokProvider {
     fn default() -> Self {
         Self {
@@ -222,6 +225,7 @@ impl Default for GrokProvider {
     }
 }
 
+#[cfg(feature = "grok-subscription")]
 impl Provider for GrokProvider {
     fn id(&self) -> &'static str {
         crate::auth::xai_oauth::CREDENTIAL_KEY
@@ -281,11 +285,11 @@ impl ProviderRegistry {
     }
 
     pub fn standard() -> Self {
-        Self::new(vec![
-            Arc::new(CodexProvider::default()),
-            Arc::new(GrokProvider::default()),
-            Arc::new(CopilotProvider),
-        ])
+        let mut special: Vec<Arc<dyn Provider>> = vec![Arc::new(CodexProvider::default())];
+        #[cfg(feature = "grok-subscription")]
+        special.push(Arc::new(GrokProvider::default()));
+        special.push(Arc::new(CopilotProvider));
+        Self::new(special)
     }
 
     pub(crate) fn provider_for(&self, provider_id: &str, entry: &ProviderEntry) -> &dyn Provider {

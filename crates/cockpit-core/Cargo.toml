@@ -12,6 +12,10 @@ publish = false
 [features]
 default = []
 test-support = ["dep:cockpit-test-support"]
+# Enables the xAI-authorized SuperGrok browser OAuth implementation. This is
+# intentionally off in the official release; user-authored `auth_command`
+# providers remain available without it.
+grok-subscription = []
 extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-db/extended", "cockpit-proto/extended"]
 # Starts FlyCockpit-owned account/sync/relay background work. The public v0.1
 # CLI leaves this off; provider network access remains available independently.

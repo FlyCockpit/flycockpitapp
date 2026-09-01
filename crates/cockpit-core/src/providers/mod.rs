@@ -21,6 +21,7 @@ pub mod usage;
 
 pub use registry::ProviderRegistry;
 
+use std::borrow::Cow;
 use std::env;
 
 use crate::config::providers::{AuthKind, HeaderSpec, ThinkingMode, WireApi};
@@ -63,6 +64,35 @@ pub struct ProviderTemplate {
     pub api_key: Option<ApiKeyTemplate>,
     /// User-visible setup/doctor credential check for this template.
     pub auth_check: AuthCheckKind,
+}
+
+impl ProviderTemplate {
+    /// Display label after applying feature-dependent availability state.
+    pub fn display_label(&self) -> Cow<'static, str> {
+        if self.is_disabled() {
+            Cow::Owned(format!(
+                "{} — disabled pending xAI authorization",
+                self.display
+            ))
+        } else {
+            Cow::Borrowed(self.display)
+        }
+    }
+
+    /// Whether this template is visible for discoverability but unavailable in
+    /// the current binary. Disabled templates cannot be materialized by the
+    /// wizard; callers should render [`Self::disabled_reason`] as muted help.
+    pub fn is_disabled(&self) -> bool {
+        self.id == "grok-oauth" && !cfg!(feature = "grok-subscription")
+    }
+
+    /// User-facing reason and custom-provider escape hatch for a disabled
+    /// built-in template.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        self.is_disabled().then_some(
+            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +220,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_headers: &[],
         supports_models_endpoint: true,
         hint: Some(
-            "Standalone SuperGrok browser login at accounts.x.ai; no XAI_API_KEY required. X Premium+ does not include xAI API access; HTTP 403/tier denial means use Grok (xAI API).",
+            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
         ),
         use_id_as_default: true,
         default_wire_api: WireApi::Responses,
@@ -858,6 +888,73 @@ mod tests {
         assert!(oauth.default_headers.is_empty());
         assert!(oauth.env_var_candidates.is_empty());
         assert_eq!(oauth.default_wire_api, WireApi::Responses);
+        #[cfg(not(feature = "grok-subscription"))]
+        assert_eq!(
+            oauth.disabled_reason(),
+            Some(
+                "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead."
+            )
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn official_build_keeps_grok_oauth_visible_but_disabled() {
+        let template = template_by_id("grok-oauth").expect("grok-oauth template");
+        assert!(template.is_disabled());
+        assert!(template.disabled_reason().is_some());
+        assert_eq!(
+            template.display_label(),
+            "Grok (SuperGrok) — disabled pending xAI authorization"
+        );
+
+        let entry = crate::config::providers::ProviderEntry {
+            url: template.url.to_string(),
+            auth: Some(AuthKind::OAuth),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-oauth", &entry),
+            "template"
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn custom_grok_auth_command_stays_on_the_generic_provider_path() {
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://api.x.ai/v1".to_string(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["/Users/you/bin/grok-subscription-token".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-subscription", &entry),
+            "template"
+        );
+    }
+
+    #[cfg(feature = "grok-subscription")]
+    #[test]
+    fn grok_subscription_feature_restores_the_builtin_provider() {
+        let template = template_by_id("grok-oauth").expect("grok-oauth template");
+        assert!(!template.is_disabled());
+
+        let entry = crate::config::providers::ProviderEntry {
+            url: template.url.to_string(),
+            auth: Some(AuthKind::OAuth),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("grok-oauth", &entry),
+            "grok-oauth"
+        );
+        let materialized = crate::wizard::provider_entry_for_template(
+            template,
+            template.url.to_string(),
+            Vec::new(),
+        );
+        assert_eq!(materialized.credential_ref.as_deref(), Some("grok-oauth"));
     }
 
     #[test]

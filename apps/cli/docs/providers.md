@@ -39,7 +39,7 @@ cockpit models
 - OpenAI Platform API: API key from `https://platform.openai.com/api-keys`; defaults to `$OPENAI_API_KEY`.
 - Codex OAuth: browser/device-code login for ChatGPT Plus/Pro quota; no API key.
 - Grok xAI API: API key from the xAI console; defaults to `$XAI_API_KEY`.
-- Grok SuperGrok: browser login for SuperGrok; no API key.
+- Grok SuperGrok: shown as disabled pending xAI authorization. Follow the petition/learn-more link in the picker; the official binary does not include its browser OAuth flow.
 - z.ai, MiniMax, OpenCode Zen, OpenRouter, DeepSeek, Anthropic, Xiaomi MiMo, and Nous Research: API-key templates with provider-specific default environment variable names and headers.
 - Nous Research (`nous-research`): Chat Completions at `https://inference-api.nousresearch.com/v1` with `NOUS_API_KEY` / `Authorization: Bearer $NOUS_API_KEY`. There is no published `/models` endpoint — add models with `cockpit provider add nous-research` or `/setup model`. Failed credential checks report a sanitized status and the portal docs link (`https://portal.nousresearch.com/api-docs`), never a raw provider response body or key material. Automatic x402 payment and non-chat Nous services are not supported.
 - Baseten Model APIs (`baseten`): Chat Completions at `https://inference.baseten.co/v1` with `BASETEN_API_KEY` / `Authorization: Bearer $BASETEN_API_KEY`. Live catalog via `cockpit fetch-models baseten` (`GET /v1/models`). Input capabilities (vision/audio) stay model-dependent and conservatively Unknown until mapped; custom Baseten deployments use a separate custom/OpenAI-compatible provider entry, not this template.
@@ -50,6 +50,30 @@ cockpit models
 Provider config stores non-secret policy and references in layered `.cockpit/` config. Raw pasted secrets and OAuth tokens live in Cockpit's private credential store, not in project files. A project can name a provider or model, but workspace trust controls whether project config is loaded at all.
 
 Environment-variable references are kept as references. For example, `Bearer $OPENAI_API_KEY` means Cockpit reads `OPENAI_API_KEY` from the process environment when it needs to call the provider.
+
+## Custom Grok subscription authentication
+
+The official binary does not ship a SuperGrok browser-login implementation pending xAI authorization. If you independently have a permitted way to obtain a subscription bearer token, configure it as a global user-layer custom OpenAI-compatible provider at your own risk. Do not put `auth_command` in project configuration: Cockpit intentionally ignores it there.
+
+For example, this global provider entry calls a user-owned helper that prints a fresh credential JSON object. The helper is not supplied by FlyCockpit and must not print anything except JSON on stdout:
+
+```json
+{
+  "url": "https://api.x.ai/v1",
+  "auth": "command",
+  "auth_command": ["/Users/you/bin/grok-subscription-token"],
+  "wire_api": "responses",
+  "models": [{ "id": "grok-4" }]
+}
+```
+
+`/Users/you/bin/grok-subscription-token` must return:
+
+```json
+{"token":"your-current-bearer-token","expires_at":1767225600,"headers":null}
+```
+
+`expires_at` is a Unix timestamp and may be `null` when the helper should run for each new Cockpit process. The command can use `$VAR` or `$secret:name` references in its argv. It runs only from your global user provider layer, so review it as carefully as any other executable authentication helper. This path uses the normal OpenAI-compatible transport and has no built-in SuperGrok OAuth code.
 
 ## Test Key
 

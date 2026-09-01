@@ -112,9 +112,7 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
     let registry = templates::ProviderRegistry::standard();
     match registry.provider_id_for(provider_id, entry) {
         "copilot" => actions.push(EditAction::CopilotAuth),
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY => {
-            actions.push(EditAction::OAuthAuth(OAuthProvider::Grok))
-        }
+        "grok-oauth" => actions.push(EditAction::OAuthAuth(OAuthProvider::Grok)),
         cockpit_core::auth::codex_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Codex))
         }
@@ -1526,6 +1524,10 @@ impl SettingsCx {
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     let t = &templates::TEMPLATES[s.template_cursor];
+                    if let Some(reason) = t.disabled_reason() {
+                        s.error = Some(reason.to_string());
+                        return Nav::Stay;
+                    }
                     s.template = Some(t);
                     // Pre-fill id only for templates that map 1:1 to a
                     // single vendor; for `openai-compatible` the user
@@ -1879,7 +1881,7 @@ impl SettingsCx {
 
     fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> Option<bool> {
         let provider_id = match provider {
-            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Grok => "grok-oauth",
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         };
         // The inventory is deliberately metadata-only. Rendering consumes a
@@ -1901,7 +1903,7 @@ impl SettingsCx {
 
     fn logout_provider_oauth(&mut self, provider: OAuthProvider) -> Result<(), String> {
         let provider_id = match provider {
-            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Grok => "grok-oauth",
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         }
         .to_string();
@@ -3286,7 +3288,9 @@ impl SettingsCx {
                 lines.push(Line::default());
                 for (i, t) in templates::TEMPLATES.iter().enumerate() {
                     let marker = if i == s.template_cursor { "▸ " } else { "  " };
-                    let style = if i == s.template_cursor {
+                    let style = if t.is_disabled() {
+                        muted.add_modifier(Modifier::DIM)
+                    } else if i == s.template_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
@@ -3294,7 +3298,7 @@ impl SettingsCx {
                     controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
-                        Span::styled(t.display.to_string(), style),
+                        Span::styled(t.display_label().into_owned(), style),
                         Span::raw("  "),
                         Span::styled(format!("({})", t.id), muted),
                     ]));

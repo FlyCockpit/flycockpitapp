@@ -309,6 +309,7 @@ async fn resolve_provider_request_async_with_store_refresh(
             Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
                 crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
             )),
+            #[cfg(feature = "grok-subscription")]
             Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
                 crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
             )),
@@ -383,12 +384,14 @@ async fn resolve_model_list_request_async_with_store(
                     crate::auth::codex_oauth::credential_from_store(store).await?,
                 ))
             }
+            #[cfg(feature = "grok-subscription")]
             (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
                 crate::auth::xai_oauth::bearer_token_from_store(store).await?,
             )),
             (Some(ProviderCredentialKind::CodexOAuth), None) => {
                 anyhow::bail!("Codex OAuth requires an injected credential store")
             }
+            #[cfg(feature = "grok-subscription")]
             (Some(ProviderCredentialKind::XaiOAuth), None) => {
                 anyhow::bail!("Grok OAuth requires an injected credential store")
             }
@@ -3099,6 +3102,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[test]
     fn grok_oauth_sync_resolver_requires_login() {
         let entry = ProviderEntry {
@@ -3116,6 +3120,7 @@ mod tests {
         assert!(err.to_string().contains("Grok subscription auth required"));
     }
 
+    #[cfg(feature = "grok-subscription")]
     #[tokio::test]
     async fn grok_oauth_async_resolver_injects_stored_bearer() {
         let env = crate::test_env::lock_async().await;
@@ -3855,6 +3860,7 @@ mod tests {
                 },
                 crate::auth::codex_oauth::CREDENTIAL_KEY,
             ),
+            #[cfg(feature = "grok-subscription")]
             (
                 "grok-oauth",
                 ProviderEntry {

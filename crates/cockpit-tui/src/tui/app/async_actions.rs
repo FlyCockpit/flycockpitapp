@@ -2798,7 +2798,7 @@ impl App {
                             let outcome = async {
                                 let provider_id = match provider {
                                     OAuthProvider::Grok => {
-                                        cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
+                                        "grok-oauth"
                                     }
                                     OAuthProvider::Codex => {
                                         cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER

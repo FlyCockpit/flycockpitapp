@@ -17,6 +17,7 @@ default = []
 extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-core/extended", "cockpit-proto/extended"]
 remote = ["cockpit-client/remote", "cockpit-core/remote", "cockpit-proto/remote"]
 test-support = ["cockpit-core/test-support"]
+grok-subscription = ["cockpit-core/grok-subscription"]
 
 [[test]]
 name = "response_performance_e2e"
@@ -103,7 +104,7 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 [dev-dependencies]
 cockpit-client = { path = "../cockpit-client", features = ["test-support"] }
 cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
-cockpit-core = { path = "../cockpit-core", features = ["test-support"] }
+cockpit-core = { path = "../cockpit-core", features = ["test-support", "grok-subscription"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer", features = ["test-support"] }
 predicates = { workspace = true }

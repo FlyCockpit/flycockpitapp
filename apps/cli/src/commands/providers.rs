@@ -15,7 +15,7 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
         ProvidersCommand::List => {
             println!("Built-in provider templates (configure with `cockpit provider add`):");
             for t in crate::providers::TEMPLATES {
-                println!("  {} — {}", t.id, t.display);
+                println!("  {} — {}", t.id, t.display_label());
             }
             Ok(())
         }

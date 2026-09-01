@@ -884,6 +884,7 @@ enum ProviderOAuthFlow {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum ProviderOAuthReady {
+    #[cfg(feature = "grok-subscription")]
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
 }
@@ -14657,9 +14658,17 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            if provider_id != crate::auth::xai_oauth::CREDENTIAL_KEY
-                && provider_id != crate::auth::codex_oauth::CREDENTIAL_KEY
-            {
+            let supported_provider = provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY || {
+                #[cfg(feature = "grok-subscription")]
+                {
+                    provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
+                }
+                #[cfg(not(feature = "grok-subscription"))]
+                {
+                    false
+                }
+            };
+            if !supported_provider {
                 return Err(bad_request("unsupported provider OAuth flow"));
             }
             let owner = oauth_owner(state);
@@ -14832,6 +14841,7 @@ async fn handle_serialized_request_impl(
                 }
                 let flow_id = uuid::Uuid::new_v4().to_string();
                 let (flow, authorize_url, user_code) = match provider_id.as_str() {
+                    #[cfg(feature = "grok-subscription")]
                     crate::auth::xai_oauth::CREDENTIAL_KEY => {
                         let login = match crate::auth::xai_oauth::begin_manual_login().await {
                             Ok(login) => login,
@@ -15063,6 +15073,7 @@ async fn handle_serialized_request_impl(
                         })?,
                 };
                 let provider_id = match &ready {
+                    #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
                     ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
                 };
@@ -15086,6 +15097,7 @@ async fn handle_serialized_request_impl(
                 )
                 .await?;
                 let exchange = match ready {
+                    #[cfg(feature = "grok-subscription")]
                     ProviderOAuthReady::Grok(login) => {
                         let Some(callback) = input.as_deref() else {
                             return Err(bad_request(

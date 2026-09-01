@@ -43,6 +43,7 @@ remote = [
     "dep:tokio-tungstenite",
     "dep:flycockpit-relay-protocol",
 ]
+grok-subscription = ["cockpit-core/grok-subscription", "cockpit-tui/grok-subscription"]
 
 [[bin]]
 name = "cockpit"
@@ -305,7 +306,7 @@ assert_cmd = { workspace = true }
 cockpit-config = { path = "../../crates/cockpit-config" }
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 quote = "1"
-cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support"] }
+cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support", "grok-subscription"] }
 cockpit-test-support = { path = "../../crates/cockpit-test-support" }
 predicates = { workspace = true }
 tempfile = { workspace = true }

@@ -881,8 +881,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         .iter()
         .map(|template| SelectOption {
             id: template.id.into(),
-            label: template.display.into(),
-            description: template.hint.unwrap_or("Provider template").into(),
+            label: template.display_label(),
+            description: template
+                .disabled_reason()
+                .or(template.hint)
+                .unwrap_or("Provider template")
+                .into(),
         })
         .collect();
     WizardDescriptor {
@@ -902,7 +906,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 },
                 default_answer: default_template.map(|id| WizardAnswer::Select(id.to_string())),
                 prefill: None,
-                validate: Some(validate_select),
+                validate: Some(validate_provider_template),
                 write: None,
                 branch: None,
             },
@@ -1465,6 +1469,25 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
     }
 }
 
+fn validate_provider_template(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Select(id) = answer else {
+        return Err("choose an option".to_string());
+    };
+    if id.is_empty() {
+        return Err("choose an option".to_string());
+    }
+    let Some(template) = crate::providers::template_by_id(id) else {
+        return Err("choose a listed provider template".to_string());
+    };
+    match template.disabled_reason() {
+        Some(reason) => Err(reason.to_string()),
+        None => Ok(()),
+    }
+}
+
 fn validate_model_trust_answer(
     _: &WizardRun,
     answer: &WizardAnswer,
@@ -1676,17 +1699,20 @@ pub fn provider_entry_for_template(
     url: String,
     headers: Vec<crate::config::providers::HeaderSpec>,
 ) -> crate::config::providers::ProviderEntry {
-    use crate::auth::{codex_oauth, xai_oauth};
+    use crate::auth::codex_oauth;
     use crate::config::providers::{AuthKind, ProviderEntry, ProviderModelCatalog};
 
-    let auth =
-        if template.id == xai_oauth::CREDENTIAL_KEY || template.id == codex_oauth::CREDENTIAL_KEY {
-            Some(AuthKind::OAuth)
-        } else {
-            Some(template.auth)
-        };
-    let credential_ref = if template.id == xai_oauth::CREDENTIAL_KEY {
-        Some(xai_oauth::CREDENTIAL_KEY.to_string())
+    #[cfg(feature = "grok-subscription")]
+    let is_grok_oauth = template.id == crate::auth::xai_oauth::CREDENTIAL_KEY;
+    #[cfg(not(feature = "grok-subscription"))]
+    let is_grok_oauth = false;
+    let auth = if is_grok_oauth || template.id == codex_oauth::CREDENTIAL_KEY {
+        Some(AuthKind::OAuth)
+    } else {
+        Some(template.auth)
+    };
+    let credential_ref = if is_grok_oauth {
+        Some("grok-oauth".to_string())
     } else if template.id == codex_oauth::CREDENTIAL_KEY {
         Some(codex_oauth::CREDENTIAL_KEY.to_string())
     } else {
@@ -2291,6 +2317,32 @@ mod tests {
             run.prefill(),
             Some(WizardAnswer::Text("openai".to_string()))
         );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn provider_wizard_shows_and_rejects_the_disabled_grok_template() {
+        let descriptor = provider_descriptor();
+        let template_step = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "template")
+            .expect("template step");
+        let StepKind::Select { options } = &template_step.kind else {
+            panic!("template step must be a select")
+        };
+        let grok = options
+            .iter()
+            .find(|option| option.id == "grok-oauth")
+            .expect("disabled Grok entry remains visible");
+        assert!(grok.label.contains("disabled pending xAI authorization"));
+        assert!(grok.description.contains("auth_command"));
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        let error = run
+            .submit(WizardAnswer::Select("grok-oauth".to_string()))
+            .unwrap_err();
+        assert!(error.contains("disabled pending xAI authorization"));
     }
 
     #[test]

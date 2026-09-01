@@ -167,6 +167,45 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  grok-subscription:
+    name: SuperGrok subscription feature
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-subscription
+          workspaces: . -> target
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # Keep the retained implementation compiling and lint-clean even though
+      # official release artifacts leave this feature disabled.
+      - name: Build with SuperGrok subscription support
+        run: cargo build --locked -p cockpit-cli --features grok-subscription
+
+      - name: Test with SuperGrok subscription support
+        run: >
+          cargo nextest run --locked
+          -p cockpit-core -p cockpit-tui -p cockpit-cli
+          --features grok-subscription
+
+      - name: Clippy with SuperGrok subscription support
+        run: >
+          cargo clippy --locked
+          -p cockpit-core -p cockpit-tui -p cockpit-cli
+          --features grok-subscription --tests -- -D warnings
+
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)
     if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance

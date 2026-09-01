@@ -11,11 +11,12 @@
 //! Two properties are load-bearing and are enforced here rather than left to
 //! callers:
 //!
-//! * **No enumeration oracle.** There is no count, prefix, existence, or
-//!   "does this name exist" query in this module's agent-reachable surface.
-//!   Inventory is a single owner-only list of safe metadata; every other
-//!   lookup is by exact `record_id` or by the exact `(scope, scope_key, name)`
-//!   triple that only the Owner can form.
+//! * **Bounded scoped metadata listing.** The agent-reachable listing returns
+//!   only `{record_id, name, description}` for the caller's Session, Project,
+//!   and explicitly granted Global records. There is no count, prefix,
+//!   existence, or "does this name exist" query, and machine-wide inventory
+//!   remains Owner-only. Every other lookup is by exact `record_id` or by the
+//!   exact `(scope, scope_key, name)` triple that only the Owner can form.
 //! * **No resolvable partial state.** A record is resolvable only when
 //!   `active_version >= 1` and `deleted_at_ms IS NULL`. Every cross-store
 //!   lifecycle change stages its new compartment locator in a saga row first,
@@ -121,6 +122,19 @@ impl fmt::Debug for SealedValueRecordRow {
             .field("deleted_at_ms", &self.deleted_at_ms)
             .finish()
     }
+}
+
+/// Safe sealed-value metadata that an agent may receive after the database has
+/// restricted the result set to the caller's referenceable scope.
+///
+/// This deliberately carries neither scope keys nor lifecycle or compartment
+/// state: the agent needs only the immutable reference and the human-authored
+/// metadata required to select it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceableSealedValueMetadataRow {
+    pub record_id: String,
+    pub name: String,
+    pub description: String,
 }
 
 /// Which lifecycle change a saga row is resuming.
@@ -1106,6 +1120,61 @@ impl Db {
         .await
     }
 
+    /// Safe agent-facing metadata for every sealed value referenceable from
+    /// one session in one canonical project.
+    ///
+    /// This bounded relaxation of owner-only inventory returns only live,
+    /// resolvable records in the caller's Session scope, Project scope, or
+    /// explicitly granted Global scope. It never projects a literal, a
+    /// locator, a scope key, or any record outside those three reachable sets.
+    pub async fn list_referenceable_sealed_value_metadata(
+        &self,
+        session_id: String,
+        project_key: String,
+    ) -> Result<Vec<ReferenceableSealedValueMetadataRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT record_id, name, description
+                   FROM sealed_value_records
+                  WHERE deleted_at_ms IS NULL
+                    AND active_version >= 1
+                    AND EXISTS (
+                        SELECT 1
+                          FROM sessions
+                         WHERE session_id = ?1
+                           AND project_id = ?2
+                    )
+                    AND (
+                        (scope = 'session' AND scope_key = ?1)
+                        OR (scope = 'project' AND scope_key = ?2 AND compartment_key IS NOT NULL)
+                        OR (
+                            scope = 'global'
+                            AND compartment_key IS NOT NULL
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM sealed_global_project_grants AS global_grants
+                                 WHERE global_grants.record_id = sealed_value_records.record_id
+                                   AND global_grants.project_key = ?2
+                            )
+                        )
+                    )
+                  ORDER BY name ASC, record_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id, project_key], |row| {
+                    Ok(ReferenceableSealedValueMetadataRow {
+                        record_id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing referenceable sealed value metadata")?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Internal redaction input: every resolvable Project/Global record.
     ///
     /// This is not an inventory surface: callers consume the opaque locators
@@ -1741,6 +1810,148 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn referenceable_metadata_is_limited_to_the_callers_scopes() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project-a", "/repo/a", "Build")
+            .await
+            .unwrap();
+        let session_key = session.session_id.to_string();
+        let other_session = db
+            .create_session("project-b", "/repo/b", "Build")
+            .await
+            .unwrap();
+
+        let session_record = new_record(SealedScopeKind::Session, &session_key, "session_token");
+        db.create_session_sealed_value(
+            session_record.clone(),
+            "SECRET".into(),
+            "deploy".into(),
+            "user".into(),
+        )
+        .await
+        .unwrap();
+
+        let project_record = new_record(SealedScopeKind::Project, "project-a", "project_token");
+        db.prepare_sealed_value_create(
+            project_record.clone(),
+            "project-create".into(),
+            Some("project-locator".into()),
+        )
+        .await
+        .unwrap();
+        db.commit_sealed_value_create(
+            project_record.record_id.clone(),
+            Some("project-locator".into()),
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let other_project =
+            new_record(SealedScopeKind::Project, "project-b", "other_project_token");
+        db.prepare_sealed_value_create(
+            other_project.clone(),
+            "other-project-create".into(),
+            Some("other-project-locator".into()),
+        )
+        .await
+        .unwrap();
+        db.commit_sealed_value_create(
+            other_project.record_id.clone(),
+            Some("other-project-locator".into()),
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let granted_global = new_record(SealedScopeKind::Global, "", "granted_global_token");
+        db.prepare_sealed_value_create(
+            granted_global.clone(),
+            "granted-global-create".into(),
+            Some("granted-global-locator".into()),
+        )
+        .await
+        .unwrap();
+        db.commit_sealed_value_create(
+            granted_global.record_id.clone(),
+            Some("granted-global-locator".into()),
+            2_000,
+        )
+        .await
+        .unwrap();
+        db.grant_sealed_global_to_project(
+            granted_global.record_id.clone(),
+            "project-a".into(),
+            2_100,
+        )
+        .await
+        .unwrap();
+
+        let ungranted_global = new_record(SealedScopeKind::Global, "", "ungranted_global_token");
+        db.prepare_sealed_value_create(
+            ungranted_global.clone(),
+            "ungranted-global-create".into(),
+            Some("ungranted-global-locator".into()),
+        )
+        .await
+        .unwrap();
+        db.commit_sealed_value_create(
+            ungranted_global.clone().record_id,
+            Some("ungranted-global-locator".into()),
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let visible = db
+            .list_referenceable_sealed_value_metadata(session_key, "project-a".into())
+            .await
+            .unwrap();
+        let ids: Vec<_> = visible.iter().map(|row| row.record_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                granted_global.record_id.as_str(),
+                project_record.record_id.as_str(),
+                session_record.record_id.as_str(),
+            ]
+        );
+        assert!(
+            visible
+                .iter()
+                .all(|row| row.description == "deployment credential")
+        );
+        assert!(
+            !ids.contains(&other_project.record_id.as_str())
+                && !ids.contains(&ungranted_global.record_id.as_str()),
+            "other-project and ungranted-global records must not disclose their existence"
+        );
+
+        let other_visible = db
+            .list_referenceable_sealed_value_metadata(
+                other_session.session_id.to_string(),
+                "project-b".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_visible.len(), 1);
+        assert_eq!(other_visible[0].record_id, other_project.record_id);
+
+        let mismatched_scope = db
+            .list_referenceable_sealed_value_metadata(
+                other_session.session_id.to_string(),
+                "project-a".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            mismatched_scope.is_empty(),
+            "a session cannot be paired with another project's scope or grants"
+        );
     }
 
     /// The saga carries only compartment locators, and a session record has

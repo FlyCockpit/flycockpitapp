@@ -61,6 +61,9 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::honors_cancel("inspect_audio"),
     ToolTimeoutSafety::honors_cancel("inspect_video"),
     ToolTimeoutSafety::abandon_safe("list-packages"),
+    // This performs one scoped SQLite read. Dropping the future cannot leave
+    // a durable effect or an owned external operation behind.
+    ToolTimeoutSafety::abandon_safe("list_sealed_value_descriptions"),
     ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),

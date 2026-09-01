@@ -695,6 +695,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "unlock",
         "grep",
         "glob",
+        "list_sealed_value_descriptions",
         "use_sealed_value",
         "inspect_audio",
         "inspect_video",
@@ -941,6 +942,14 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Utility",
+            name: "list_sealed_value_descriptions",
+            summary: "List safe metadata for sealed values referenceable in this session.",
+            condition: Some(
+                "Lists only current-session, current-project, and explicitly granted global values.",
+            ),
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
             name: "use_sealed_value",
             summary: "Use a granted sealed value by reference through a granted action.",
             condition: Some("Requires an Owner-issued sealed-value action grant."),
@@ -1103,6 +1112,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::worktree_orchestrate::WorktreeOrchestrateTool),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
+        Arc::new(tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
         Arc::new(tools::audio_video::InspectAudioTool::new()),
         Arc::new(tools::audio_video::InspectVideoTool::new()),
@@ -1152,6 +1162,9 @@ pub(crate) fn materialize_tool_by_name(
         && !args.interactive;
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
+        "list_sealed_value_descriptions" => tb.with(Arc::new(
+            tools::list_sealed_value_descriptions::ListSealedValueDescriptionsTool,
+        )),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
         "read_image" | "inspect_audio" | "inspect_video" | "extract_video_clip"
         | "extract_audio" | "transcribe_audio"

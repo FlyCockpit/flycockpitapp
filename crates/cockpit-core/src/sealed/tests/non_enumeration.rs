@@ -1,4 +1,4 @@
-//! AC1 `persistent_sealed_values_non_enumerable_to_agents`
+//! AC1 `persistent_sealed_values_are_not_enumerable_outside_agent_scope`
 //! AC7 `sealed_storage_compartment_is_non_enumerable`
 
 use super::*;
@@ -38,7 +38,7 @@ fn public_fn_names(source: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn persistent_sealed_values_non_enumerable_to_agents() {
+async fn persistent_sealed_values_are_not_enumerable_outside_agent_scope() {
     let fixture = SealedFixture::new().await;
     let directory = fixture.directory();
     let owner = SealedFixture::owner();
@@ -109,7 +109,7 @@ async fn persistent_sealed_values_non_enumerable_to_agents() {
         "a global value is not implicitly a member of any project scope"
     );
 
-    // ---- no agent-reachable lifecycle or inventory -------------------------
+    // ---- no agent-reachable lifecycle or machine-wide inventory ------------
     // Structural: every public entry point on the Owner store demands an
     // `OwnerAuthority`, which an agent cannot construct.
     let store_source = include_str!("../store.rs");
@@ -159,6 +159,8 @@ async fn persistent_sealed_values_non_enumerable_to_agents() {
     );
 
     // Structural: the *use* runtime an agent reaches has no listing surface.
+    // Scoped safe metadata belongs to the separate listing tool, which is
+    // covered by its own end-to-end test and does not expose this runtime.
     let runtime_public = public_fn_names(include_str!("../runtime.rs"));
     for name in &runtime_public {
         // `literal_reads` is a test-observability counter over reads that

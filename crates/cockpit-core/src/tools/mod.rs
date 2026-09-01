@@ -33,6 +33,7 @@ pub mod history_scope;
 pub mod intel;
 pub mod jq_shim;
 pub mod knowledge_sealed;
+pub mod list_sealed_value_descriptions;
 mod lock_wait;
 pub mod lsp;
 pub mod mcp_tool;

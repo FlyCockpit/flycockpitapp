@@ -1520,15 +1520,20 @@ impl SettingsCx {
         match s.run.current_step_id() {
             Some("template") => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    s.template_cursor =
-                        crate::tui::nav::wrap_prev(s.template_cursor, templates::TEMPLATES.len());
+                    s.template_cursor = crate::tui::nav::wrap_prev(
+                        s.template_cursor,
+                        onboarding_ordered_templates().len(),
+                    );
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    s.template_cursor =
-                        crate::tui::nav::wrap_next(s.template_cursor, templates::TEMPLATES.len());
+                    s.template_cursor = crate::tui::nav::wrap_next(
+                        s.template_cursor,
+                        onboarding_ordered_templates().len(),
+                    );
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    let t = &templates::TEMPLATES[s.template_cursor];
+                    let ordered = onboarding_ordered_templates();
+                    let t = ordered[s.template_cursor];
                     if let Some(reason) = t.disabled_reason() {
                         s.error = Some(reason.to_string());
                         return Nav::Stay;
@@ -3316,7 +3321,8 @@ impl SettingsCx {
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::default());
-                for (i, t) in templates::TEMPLATES.iter().enumerate() {
+                let ordered = onboarding_ordered_templates();
+                for (i, t) in ordered.iter().enumerate() {
                     let marker = if i == s.template_cursor { "▸ " } else { "  " };
                     let style = if t.is_disabled() {
                         muted.add_modifier(Modifier::DIM)
@@ -3333,7 +3339,7 @@ impl SettingsCx {
                         Span::styled(format!("({})", t.id), muted),
                     ]));
                 }
-                if let Some(t) = templates::TEMPLATES.get(s.template_cursor)
+                if let Some(t) = ordered.get(s.template_cursor)
                     && let Some(hint) = t.display_hint()
                 {
                     lines.push(Line::default());
@@ -5168,7 +5174,7 @@ fn provider_add_pointer_action(
     let step = state.run.current_provider_step()?;
     let control = match step {
         WizardStepId::Template => {
-            WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
+            WizardControlId::Template(onboarding_ordered_templates().get(index)?.id.to_string())
         }
         WizardStepId::WireApi => WizardControlId::WireApi(
             (*["auto", "completions", "responses", "anthropic"].get(index)?).to_string(),
@@ -5793,7 +5799,7 @@ impl SettingsPage for ProvidersPage {
                 state.cursor = index;
             }
             ProvidersPage::Add(state) => match state.run.current_step_id() {
-                Some("template") if index < templates::TEMPLATES.len() => {
+                Some("template") if index < onboarding_ordered_templates().len() => {
                     state.template_cursor = index;
                 }
                 Some("wire-api") if index < 4 => state.wire_api_cursor = index,
@@ -5998,7 +6004,7 @@ impl SettingsPage for ProvidersPage {
                             state.template_cursor = state
                                 .template_cursor
                                 .saturating_add_signed(delta)
-                                .min(templates::TEMPLATES.len().saturating_sub(1));
+                                .min(onboarding_ordered_templates().len().saturating_sub(1));
                         }
                         Some("auth-method") => {
                             state.auth_method_cursor =
@@ -6223,4 +6229,12 @@ impl SettingsPage for ProvidersPage {
     fn test_name(&self) -> &'static str {
         "Providers"
     }
+}
+fn onboarding_ordered_templates() -> Vec<&'static ProviderTemplate> {
+    let mut ordered = templates::TEMPLATES.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|template| match template.id {
+        "codex-oauth" | "copilot" | "grok-oauth" => 0,
+        _ => 1,
+    });
+    ordered
 }

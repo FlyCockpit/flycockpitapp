@@ -2532,6 +2532,11 @@ pub const DIALOG_HEIGHT: u16 = 20;
 
 pub enum Dialog {
     None,
+    OnboardingWelcome {
+        cwd: PathBuf,
+        frame: usize,
+        reduced_motion: bool,
+    },
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2581,11 +2586,19 @@ pub enum Dialog {
     SetupWizard(Box<SetupWizardDialog>),
     FirstRunComplete {
         summary: String,
+        cursor: usize,
+        choice: Option<FirstRunChoice>,
     },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstRunChoice {
+    AddAnotherProvider,
+    StartCoding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5795,6 +5808,19 @@ impl Dialog {
         Self::open_providers_add_with_status(cwd, None)
     }
 
+    pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
+        let reduced_motion = std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+            || ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"]
+                .into_iter()
+                .any(|name| std::env::var(name).is_ok_and(|value| value != "0"));
+        Self::OnboardingWelcome {
+            cwd: cwd.to_path_buf(),
+            frame: 0,
+            reduced_motion,
+        }
+    }
+
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
         // The provider wizard is the first-run destination for the
         // always-writable global layer, not the generic config-location
@@ -5834,7 +5860,9 @@ impl Dialog {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         match wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
+            cockpit_core::wizard::SECURITY_WIZARD_ID
+            | cockpit_core::wizard::MODEL_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 setup_wizard_dialog(&global_root, descriptor, None)
@@ -5871,7 +5899,18 @@ impl Dialog {
     }
 
     pub fn open_first_run_complete(summary: String) -> Self {
-        Dialog::FirstRunComplete { summary }
+        Dialog::FirstRunComplete {
+            summary,
+            cursor: 1,
+            choice: None,
+        }
+    }
+
+    pub fn take_first_run_choice(&mut self) -> Option<FirstRunChoice> {
+        let Dialog::FirstRunComplete { choice, .. } = self else {
+            return None;
+        };
+        choice.take()
     }
 
     pub fn take_completed_provider_id(&mut self) -> Option<String> {
@@ -5894,6 +5933,10 @@ impl Dialog {
             Dialog::SetupWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
+    }
+
+    pub fn setup_wizard_is_active(&self, wizard_id: &str) -> bool {
+        matches!(self, Dialog::SetupWizard(wizard) if wizard.run.descriptor().id == wizard_id)
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -6048,16 +6091,37 @@ impl Dialog {
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
     pub fn tick(&mut self) {
-        if let Dialog::Settings(s) = self {
-            s.tick();
+        match self {
+            Dialog::Settings(s) => s.tick(),
+            Dialog::OnboardingWelcome {
+                frame,
+                reduced_motion,
+                ..
+            } if !*reduced_motion => *frame = frame.wrapping_add(1),
+            _ => {}
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::FirstRunComplete { .. } => {
-                matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
+            Dialog::OnboardingWelcome { cwd, .. } => {
+                if let Ok(next) = Self::open_setup_wizard(
+                    cwd,
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                ) {
+                    *self = next;
+                }
+                false
+            }
+            Dialog::FirstRunComplete { cursor, choice, .. } => {
+                match list_key_action(key, cursor, 2) {
+                    ListAction::Stay => {}
+                    ListAction::Close => *choice = Some(FirstRunChoice::StartCoding),
+                    ListAction::Select(0) => *choice = Some(FirstRunChoice::AddAnotherProvider),
+                    ListAction::Select(_) => *choice = Some(FirstRunChoice::StartCoding),
+                }
+                false
             }
             Dialog::WorkspaceTrust { cursor, chosen, .. } => {
                 match workspace_trust_key_action(key, cursor) {
@@ -6444,6 +6508,11 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
+            Dialog::OnboardingWelcome {
+                frame: animation_frame,
+                reduced_motion,
+                ..
+            } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -6502,7 +6571,9 @@ impl Dialog {
                 *cursor,
             ),
             Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
-            Dialog::FirstRunComplete { summary } => render_first_run_complete(frame, area, summary),
+            Dialog::FirstRunComplete {
+                summary, cursor, ..
+            } => render_first_run_complete(frame, area, summary, *cursor),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -9297,7 +9368,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             _ => {}
         },
         cockpit_core::wizard::StepKind::Action { .. } => {
-            if matches!(step.id, "security-save" | "model-save") {
+            if matches!(step.id, "security-save" | "model-save" | "profile-save") {
                 let answers_json = match run.answers_json() {
                     Ok(answers_json) => answers_json,
                     Err(error) => {
@@ -10076,23 +10147,78 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     );
 }
 
-fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str) {
+fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Setup complete ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let lines = vec![
+    let mut lines = vec![
         Line::from("Cockpit is ready."),
         Line::from(summary.to_string()),
         Line::default(),
         Line::from("Next: run /setup security to choose project trust and approval defaults."),
         Line::from("Use /help any time to see available commands."),
         Line::default(),
-        Line::from(Span::styled("Press Enter to start.", muted)),
     ];
+    for (index, label) in ["Add another provider", "Start coding"].iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!("{} {label}", if index == cursor { "›" } else { " " }),
+            if index == cursor {
+                Style::default().fg(Color::Yellow)
+            } else {
+                muted
+            },
+        )));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_onboarding_welcome(
+    frame: &mut Frame,
+    area: Rect,
+    animation_frame: usize,
+    reduced_motion: bool,
+) {
+    let block = Block::default().borders(Borders::ALL).title(" Welcome ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let stages = ["·", "✦", "✈", "✦"];
+    let mark = if reduced_motion {
+        "✈"
+    } else {
+        stages[(animation_frame / 3) % stages.len()]
+    };
+    let description = if inner.width < 54 {
+        "Your coding cockpit."
+    } else {
+        "A focused cockpit for coding with the models you choose."
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{mark}  FlyCockpit"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::default(),
+        Line::from(description),
+        Line::default(),
+        Line::from("No Cockpit telemetry is collected."),
+        Line::from("Inference providers may have their own telemetry policies."),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press any key to begin setup.",
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        )),
+    ];
+    lines.truncate(lines.len().min(inner.height as usize));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {

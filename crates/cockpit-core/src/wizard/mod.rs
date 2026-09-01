@@ -938,8 +938,13 @@ pub fn provider_descriptor() -> WizardDescriptor {
 pub fn provider_descriptor_with_template(default_template: Option<&str>) -> WizardDescriptor {
     use crate::providers::TEMPLATES;
 
-    let template_options = TEMPLATES
-        .iter()
+    let mut ordered_templates = TEMPLATES.iter().collect::<Vec<_>>();
+    ordered_templates.sort_by_key(|template| match template.id {
+        "codex-oauth" | "copilot" | "grok-oauth" => 0,
+        _ => 1,
+    });
+    let template_options = ordered_templates
+        .into_iter()
         .map(|template| SelectOption {
             id: template.id.into(),
             label: template.display_label(),

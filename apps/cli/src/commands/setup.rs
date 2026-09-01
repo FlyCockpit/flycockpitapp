@@ -686,10 +686,12 @@ async fn apply_model_wizard_via_daemon(
             CapabilityStatus::Unsupported
         })
     };
-    model.capability_overrides.image_input = status("images");
-    model.capability_overrides.tool_calling = status("tools");
-    model.capability_overrides.reasoning = status("reasoning");
-    model.capability_overrides.structured_outputs = status("structured_outputs");
+    if run.answer("capabilities").is_some() {
+        model.capability_overrides.image_input = status("images");
+        model.capability_overrides.tool_calling = status("tools");
+        model.capability_overrides.reasoning = status("reasoning");
+        model.capability_overrides.structured_outputs = status("structured_outputs");
+    }
     model.capability_overrides.context_tokens =
         cockpit_core::wizard::model_context_tokens_answer(run);
     model.capability_overrides.max_output_tokens =
@@ -698,8 +700,10 @@ async fn apply_model_wizard_via_daemon(
         model.default_thinking_mode = value;
     }
     let subagent = cockpit_core::wizard::model_subagent_answers(run);
-    model.subagent_invokable = Some(subagent.contains("subagent_invokable"));
-    model.can_delegate = Some(subagent.contains("can_delegate"));
+    if run.answer("subagent-flags").is_some() {
+        model.subagent_invokable = Some(subagent.contains("subagent_invokable"));
+        model.can_delegate = Some(subagent.contains("can_delegate"));
+    }
     if let Some(value) = cockpit_core::wizard::model_system_prompt_answer(run) {
         model.system_prompt = value;
     }

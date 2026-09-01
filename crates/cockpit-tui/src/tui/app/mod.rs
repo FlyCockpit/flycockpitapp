@@ -473,8 +473,11 @@ pub enum StartupWorkspaceTrust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstRunFlow {
     None,
+    AwaitWelcome,
+    AwaitProfile,
     AwaitProvider,
     AwaitModel,
+    AwaitFinish,
 }
 
 /// Required launch modals share one precedence order for drawing and input.
@@ -3963,7 +3966,7 @@ impl App {
             connector_disclosure,
             has_no_providers_at_startup,
             first_run_flow: if has_no_providers_at_startup {
-                FirstRunFlow::AwaitProvider
+                FirstRunFlow::AwaitWelcome
             } else {
                 FirstRunFlow::None
             },

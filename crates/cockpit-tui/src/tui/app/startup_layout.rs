@@ -2,7 +2,7 @@ use super::*;
 
 impl App {
     /// If the user has no providers configured in the active config
-    /// layer, open `/settings → Providers → Add` directly. No-op when
+    /// layer, open onboarding directly. No-op when
     /// providers already exist or when the settings dialog is already
     /// open. Evaluated each launch so emptying the providers list
     /// re-triggers the wizard on the next start.
@@ -13,13 +13,36 @@ impl App {
         if !self.has_no_providers_at_startup {
             return;
         }
-        self.first_run_flow = FirstRunFlow::AwaitProvider;
-        self.dialog = crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
+        self.first_run_flow = FirstRunFlow::AwaitWelcome;
+        self.dialog = crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd);
     }
 
     pub(super) fn service_first_run_flow(&mut self) -> bool {
         match self.first_run_flow {
             FirstRunFlow::None => false,
+            FirstRunFlow::AwaitWelcome => {
+                if !self.dialog.setup_wizard_is_active(
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                ) {
+                    return false;
+                }
+                self.first_run_flow = FirstRunFlow::AwaitProfile;
+                true
+            }
+            FirstRunFlow::AwaitProfile => {
+                if !self.dialog.setup_wizard_is_complete(
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                ) {
+                    return false;
+                }
+                self.refresh_bootstrap_config_snapshot();
+                self.dialog = crate::tui::settings::Dialog::open_providers_add_with_status(
+                    &self.launch.cwd,
+                    Some("Choose a subscription or API provider. Press Esc for ‘I’ll do this later’; setup will return next launch.".to_string()),
+                );
+                self.first_run_flow = FirstRunFlow::AwaitProvider;
+                true
+            }
             FirstRunFlow::AwaitProvider => {
                 let Some(provider_id) = self.dialog.take_completed_provider_id() else {
                     return false;
@@ -71,8 +94,10 @@ impl App {
                     .unwrap_or_else(|| {
                         "Model configuration finished; no default model was selected.".to_string()
                     });
-                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(summary);
-                self.first_run_flow = FirstRunFlow::None;
+                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(format!(
+                    "{summary} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
+                ));
+                self.first_run_flow = FirstRunFlow::AwaitFinish;
                 if self.submit_after_model_selection {
                     match configured_model {
                         Some(active) => {
@@ -92,6 +117,23 @@ impl App {
                                     .to_string(),
                             );
                         }
+                    }
+                }
+                true
+            }
+            FirstRunFlow::AwaitFinish => {
+                let Some(choice) = self.dialog.take_first_run_choice() else {
+                    return false;
+                };
+                match choice {
+                    crate::tui::settings::FirstRunChoice::AddAnotherProvider => {
+                        self.dialog =
+                            crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
+                        self.first_run_flow = FirstRunFlow::AwaitProvider;
+                    }
+                    crate::tui::settings::FirstRunChoice::StartCoding => {
+                        self.dialog = crate::tui::settings::Dialog::None;
+                        self.first_run_flow = FirstRunFlow::None;
                     }
                 }
                 true

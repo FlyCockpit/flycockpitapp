@@ -113,7 +113,7 @@ impl ProviderTemplate {
     /// built-in template.
     pub fn disabled_reason(&self) -> Option<&'static str> {
         self.is_disabled().then_some(
-            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
+            "Grok subscriptions are not yet officially supported - we are trying to get approval from xAI to enable this feature.",
         )
     }
 

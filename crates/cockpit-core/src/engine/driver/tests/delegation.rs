@@ -59,7 +59,7 @@ fn write_test_agent(root: &std::path::Path, name: &str, fork_eligible: bool) {
     std::fs::write(
         dir.join(format!("{name}.md")),
         format!(
-            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: {}\n---\n\nTest prompt.\n",
+            "---\ndescription: Test agent.\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ncapabilities: {}\n---\n\nTest prompt.\n",
             if fork_eligible { "[forkContext]" } else { "[]" }
         ),
     )

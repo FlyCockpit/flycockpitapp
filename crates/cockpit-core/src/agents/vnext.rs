@@ -1,4 +1,4 @@
-//! Closed, declarative v2 agent-definition schema.
+//! Closed, declarative launch-v1 agent-definition schema.
 //!
 //! This module deliberately contains no provider, credential, tool-grant, or
 //! sandbox binding.  Those are host-owned inputs to a later effective-grant
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u8 = 2;
+use super::ToolTier;
+
+pub const SCHEMA_VERSION: u8 = 1;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
 /// Explicit self-invocation token in `delegation.allowedChildren`. Counted
@@ -871,7 +873,7 @@ impl VnextHostPolicy {
     /// Construct the daemon's session-owned policy snapshot. This is the
     /// single core seam that turns ordinary session configuration into vNext
     /// ceilings; markdown never supplies these values. It intentionally does
-    /// not reuse the legacy per-agent recursion map: v2 tree admission is
+    /// not reuse the legacy per-agent recursion map: launch-v1 tree admission is
     /// governed exclusively by [`EffectiveVnextGrant`].
     pub fn for_session_config(config: &crate::config::extended::ExtendedConfig) -> Self {
         let max_concurrent_children = u16::try_from(config.delegation.max_parallel)
@@ -1028,6 +1030,15 @@ pub struct VnextAgentDef {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_knowledge_bases: Option<BTreeSet<String>>,
+    /// The author's preferred placement for host-granted tools. This chooses
+    /// only between direct native schemas and Monty discovery; it is never a
+    /// tool grant and host/session policy remains authoritative.
+    #[serde(
+        rename = "toolTierPreferences",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub tool_tier_preferences: BTreeMap<String, ToolTier>,
 }
 
 impl VnextAgentDef {
@@ -1054,6 +1065,26 @@ impl VnextAgentDef {
         if let Some(knowledge_bases) = &self.allowed_knowledge_bases {
             for id in knowledge_bases {
                 validate_knowledge_base_id(id)?;
+            }
+        }
+        for (tool, tier) in &self.tool_tier_preferences {
+            if !crate::agents::known_tool_names().contains(&tool.as_str()) {
+                bail!("toolTierPreferences names unknown tool `{tool}`");
+            }
+            if !matches!(tier, ToolTier::Enabled | ToolTier::Discoverable) {
+                bail!(
+                    "toolTierPreferences for `{tool}` must be `enabled` or `discoverable`, not `{}`",
+                    tier.label()
+                );
+            }
+            if !crate::agents::legal_tool_tiers(tool).contains(tier) {
+                bail!(
+                    "toolTierPreferences may not place `{tool}` at `{}`",
+                    tier.label()
+                );
+            }
+            if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
+                bail!("toolTierPreferences may not name host-placement tool `{tool}`");
             }
         }
         Ok(())
@@ -2728,7 +2759,7 @@ mod tests {
 
     fn valid() -> VnextAgentDef {
         VnextAgentDef {
-            schema_version: 2,
+            schema_version: SCHEMA_VERSION,
             agent_id: "acme/reviewer".to_string(),
             execution_kind: ExecutionKind::Coding,
             model_slots: BTreeMap::from([(
@@ -2747,6 +2778,7 @@ mod tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         }
     }
 

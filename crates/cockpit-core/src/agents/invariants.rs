@@ -218,7 +218,7 @@ pub fn validate_grant(
 
 /// Validate the issue-#75 posture fields (`capabilities`, `toolSteering`,
 /// `contextPolicy`) declared on an [`AgentDef`]. These are additive in Stage 1
-/// and apply to both legacy and v2 definitions. Unknown capability names are
+/// and apply to both legacy and launch-v1 definitions. Unknown capability names are
 /// already rejected by serde (the enum is closed), so this checks the
 /// `autoCompactPct` range and emits a lint-level warning (returned via the
 /// load-warning channel by the caller) when `forkContext` or
@@ -305,7 +305,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     validate_posture_fields(def)?;
     validate_read_image_tier_override(def)?;
     if let Some(vnext) = &def.vnext {
-        // v2 declarations are deliberately authority-free. Their own closed
+        // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
         // tool/role checks below must not accidentally reinterpret them.
         return vnext.validate();
@@ -387,6 +387,19 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
             bail!(
                 "agent `{}` may not tier write/lock tool `{tool}` as `disabled`",
                 def.name
+            );
+        }
+        let legal_tiers = crate::agents::legal_tool_tiers(tool);
+        if !legal_tiers.contains(tier) {
+            let legal = legal_tiers
+                .iter()
+                .map(|tier| tier.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "agent `{}` may not tier tool `{tool}` as `{}`; legal tiers are {legal}",
+                def.name,
+                tier.label()
             );
         }
     }
@@ -664,6 +677,26 @@ mod grant_tests {
     }
 
     #[test]
+    fn direct_native_tools_reject_discoverable_tiers() {
+        let def = tiered_def(
+            "custom-media",
+            &["read", "transcribe_audio"],
+            "transcribe_audio",
+            ToolTier::Discoverable,
+        );
+
+        let err = validate_invariants(&def)
+            .expect_err("direct-native tools cannot be Monty-discoverable")
+            .to_string();
+        assert!(err.contains("transcribe_audio"), "{err}");
+        assert!(err.contains("discoverable"), "{err}");
+        assert_eq!(
+            crate::agents::legal_tool_tiers("transcribe_audio"),
+            &[ToolTier::Enabled, ToolTier::Disabled]
+        );
+    }
+
+    #[test]
     fn agent_vnext_invariants_apply_closed_schema_not_legacy_leaf_rules() {
         let mut def = tiered_def(
             "vnext-reviewer",
@@ -691,8 +724,9 @@ mod grant_tests {
             questions: None,
             verification: None,
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         });
-        // A v2 definition has no user-authored tool authority, so legacy tool
+        // A launch-v1 definition has no user-authored tool authority, so legacy tool
         // validation must not reinterpret its ignored internal fields.
         validate_invariants(&def).unwrap();
 

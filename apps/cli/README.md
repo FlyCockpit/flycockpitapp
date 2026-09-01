@@ -229,7 +229,7 @@ cockpit packages prune --dry-run
 | `cockpit agent install OWNER/REPO[@REV]:PATH --scope global\|workspace-private\|workspace` | Ask the daemon to install a versioned agent definition. |
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
-| `cockpit assistant list` | List persistent assistants. |
+| `cockpit assistants list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |

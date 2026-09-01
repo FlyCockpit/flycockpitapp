@@ -472,13 +472,8 @@ fn layer_kind(root: &Path, target: &Path) -> CockpitConfigLayer {
     let Some(directory) = target.parent() else {
         return CockpitConfigLayer::Project;
     };
-    if let Some(home) = dirs::home_dir() {
-        if directory == home.join(".config/cockpit") {
-            return CockpitConfigLayer::HomeXdg;
-        }
-        if directory == home.join(".cockpit") {
-            return CockpitConfigLayer::HomeDot;
-        }
+    if cockpit_config::dirs::global_config_dir().is_ok_and(|global| global.as_path() == directory) {
+        return CockpitConfigLayer::HomeXdg;
     }
     if cockpit_config::dirs::local_config_dir_for(root)
         .is_ok_and(|local| local.as_path() == directory)
@@ -499,9 +494,8 @@ fn discovered_layer_targets(root: &Path) -> Vec<(CockpitConfigLayer, PathBuf)> {
     for directory in cockpit_config::dirs::discover_config_dirs(root) {
         candidates.push(directory.path.join(CONFIG_FILE));
     }
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".config/cockpit").join(CONFIG_FILE));
-        candidates.push(home.join(".cockpit").join(CONFIG_FILE));
+    if let Ok(global) = cockpit_config::dirs::global_config_file() {
+        candidates.push(global);
     }
     if let Ok(local) = cockpit_config::dirs::local_config_dir_for(root) {
         candidates.push(local.join(CONFIG_FILE));

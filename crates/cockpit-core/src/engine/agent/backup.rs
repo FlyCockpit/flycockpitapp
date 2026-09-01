@@ -82,11 +82,12 @@ pub fn suggested_action_for_failure_class(
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct BackupTurnMetadata {
     pub fallback_decision: Option<BackupFallbackDecision>,
     pub fallback_tried: Vec<FailoverAttempt>,
     pub native_computer_items: Vec<serde_json::Value>,
+    pub response_window_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run one turn with per-turn primary-first backup-model fallback
@@ -206,8 +207,15 @@ pub async fn turn_with_backup(
     // One display lifetime spans every physical primary/failover dispatch in
     // this logical call. A failed visible stream stays open until either the
     // next attempt emits Reset or this wrapper proves failure is terminal.
-    let display_slot =
-        crate::engine::agent::turn_phases::new_display_attempt_slot(&session, &config);
+    let response_window_closed = turn_metadata
+        .as_deref()
+        .map(|metadata| Arc::clone(&metadata.response_window_closed))
+        .unwrap_or_default();
+    let display_slot = crate::engine::agent::turn_phases::new_display_attempt_slot_with_window(
+        &session,
+        &config,
+        response_window_closed,
+    );
     // Credentials-rejected rebuild-and-retry latch (AC5), scoped to the WHOLE
     // logical dispatch — declared OUTSIDE the failover loop so at most ONE
     // automatic command-secret rebuild-and-retry happens across every physical

@@ -364,6 +364,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         }
     }
 

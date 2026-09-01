@@ -52,6 +52,22 @@ pub struct NewSealedActionInstance {
     pub created_at_ms: i64,
 }
 
+/// Safe publish-before-effect metadata for one reference injection. This row
+/// deliberately carries no literal, destination, command, environment key,
+/// path, request data, output, or secret-derived outcome.
+#[derive(Debug, Clone)]
+pub struct SealedActionInvocationAuditEntry {
+    pub audit_id: String,
+    pub record_id: String,
+    pub action_id: String,
+    pub action_revision: i64,
+    pub grant_id: String,
+    pub session_id: String,
+    pub sink_kind: String,
+    pub file_persistent: bool,
+    pub created_at_ms: i64,
+}
+
 /// The closed outcome recorded in one recovery-audit row. Neither variant
 /// carries the literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +278,36 @@ pub fn insert_recovery_audit_conn(
     Ok(())
 }
 
+/// Commit an invocation audit row before the host effect receives plaintext.
+pub fn insert_action_invocation_audit_conn(
+    conn: &Connection,
+    entry: &SealedActionInvocationAuditEntry,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "INSERT INTO sealed_action_invocation_audit
+                 (audit_id, record_id, action_id, action_revision, grant_id,
+                  session_id, sink_kind, file_persistent, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                entry.audit_id,
+                entry.record_id,
+                entry.action_id,
+                entry.action_revision,
+                entry.grant_id,
+                entry.session_id,
+                entry.sink_kind,
+                i64::from(entry.file_persistent),
+                entry.created_at_ms,
+            ],
+        )
+        .context("inserting sealed action invocation audit row")?;
+    if changed != 1 {
+        bail!("sealed action invocation audit insert affected {changed} rows");
+    }
+    Ok(())
+}
+
 impl Db {
     /// Persist a freshly compiled action-instance snapshot.
     pub async fn insert_sealed_action_instance(&self, new: NewSealedActionInstance) -> Result<()> {
@@ -281,6 +327,15 @@ impl Db {
     /// List every action instance.
     pub async fn list_sealed_action_instances(&self) -> Result<Vec<SealedActionInstanceRow>> {
         self.read(list_action_instances_conn).await
+    }
+
+    /// Publish safe invocation metadata before a host sink receives plaintext.
+    pub async fn insert_sealed_action_invocation_audit(
+        &self,
+        entry: SealedActionInvocationAuditEntry,
+    ) -> Result<()> {
+        self.write(move |conn| insert_action_invocation_audit_conn(conn, &entry))
+            .await
     }
 
     /// Persist one recovery-audit row and commit it durably.

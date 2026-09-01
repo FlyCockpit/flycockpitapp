@@ -131,7 +131,7 @@ jobs:
           cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
-        run: cargo nextest run --locked --workspace --exclude tenant-authority
+        run: cargo nextest run --locked --workspace --exclude tenant-authority --no-default-features
 
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
@@ -150,11 +150,11 @@ jobs:
 
       - name: Clippy
         if: contains(matrix.os, 'windows') == false
-        run: cargo clippy --locked --workspace --exclude tenant-authority --tests -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --no-default-features -- -D warnings
 
       - name: Clippy Windows target
         if: contains(matrix.os, 'windows')
-        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --target x86_64-pc-windows-msvc -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --no-default-features --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Clippy examples
         if: contains(matrix.os, 'windows') == false

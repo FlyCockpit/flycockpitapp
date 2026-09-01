@@ -32,7 +32,7 @@ pub(super) use fetch::{
 pub(crate) use oauth_flow::CodexOAuthOption;
 #[cfg(test)]
 use oauth_flow::handle_oauth_flow_key_with;
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
     OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
@@ -112,6 +112,7 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
     let registry = templates::ProviderRegistry::standard();
     match registry.provider_id_for(provider_id, entry) {
         "copilot" => actions.push(EditAction::CopilotAuth),
+        #[cfg(feature = "grok-subscription")]
         "grok-oauth" => actions.push(EditAction::OAuthAuth(OAuthProvider::Grok)),
         cockpit_core::auth::codex_oauth::CREDENTIAL_KEY => {
             actions.push(EditAction::OAuthAuth(OAuthProvider::Codex))
@@ -1590,6 +1591,7 @@ impl SettingsCx {
                                 Some("copilot-auth") => {
                                     s.copilot_auth = Some(CopilotSetupState::new());
                                 }
+                                #[cfg(feature = "grok-subscription")]
                                 Some("grok-oauth") => {
                                     s.oauth_auth =
                                         Some(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
@@ -3304,7 +3306,7 @@ impl SettingsCx {
                     ]));
                 }
                 if let Some(t) = templates::TEMPLATES.get(s.template_cursor)
-                    && let Some(hint) = t.hint
+                    && let Some(hint) = t.display_hint()
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
@@ -3387,7 +3389,7 @@ impl SettingsCx {
                     }
                 }
                 if s.is_step("url")
-                    && let Some(hint) = t.hint
+                    && let Some(hint) = t.display_hint()
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));

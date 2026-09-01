@@ -62,7 +62,7 @@ For example, this global provider entry calls a user-owned helper that prints a 
   "url": "https://api.x.ai/v1",
   "auth": "command",
   "auth_command": ["/Users/you/bin/grok-subscription-token"],
-  "wire_api": "responses",
+  "wire_api": "completions",
   "models": [{ "id": "grok-4" }]
 }
 ```

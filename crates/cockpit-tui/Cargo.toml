@@ -104,7 +104,7 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 [dev-dependencies]
 cockpit-client = { path = "../cockpit-client", features = ["test-support"] }
 cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
-cockpit-core = { path = "../cockpit-core", features = ["test-support", "grok-subscription"] }
+cockpit-core = { path = "../cockpit-core", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer", features = ["test-support"] }
 predicates = { workspace = true }

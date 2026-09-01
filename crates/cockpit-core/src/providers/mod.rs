@@ -93,6 +93,18 @@ impl ProviderTemplate {
             "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
         )
     }
+
+    /// Feature-aware picker help. An enabled login must not retain the
+    /// disabled/pending-authorization warning.
+    pub fn display_hint(&self) -> Option<&'static str> {
+        if self.id == "grok-oauth" && !self.is_disabled() {
+            Some(
+                "Standalone SuperGrok browser login at accounts.x.ai; no XAI_API_KEY required. X Premium+ does not include xAI API access; HTTP 403/tier denial means use Grok (xAI API).",
+            )
+        } else {
+            self.hint
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,8 +927,50 @@ mod tests {
         };
         assert_eq!(
             ProviderRegistry::standard().provider_id_for("grok-oauth", &entry),
-            "template"
+            "grok-oauth-unavailable"
         );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn hand_written_grok_oauth_shapes_fail_closed_before_request_resolution() {
+        for (provider_id, entry) in [
+            (
+                "grok-oauth",
+                crate::config::providers::ProviderEntry {
+                    url: "https://example.test/v1".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom",
+                crate::config::providers::ProviderEntry {
+                    url: "https://api.x.ai/v1".into(),
+                    auth: Some(AuthKind::OAuth),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom",
+                crate::config::providers::ProviderEntry {
+                    url: "https://example.test/v1".into(),
+                    credential_ref: Some("grok-oauth".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = crate::providers::models_fetch::resolve_provider_request_with_env(
+                provider_id,
+                &entry,
+                |_| None,
+            )
+            .expect_err("disabled Grok OAuth identity must not reach generic inference");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unavailable in this official build")
+            );
+        }
     }
 
     #[cfg(not(feature = "grok-subscription"))]
@@ -955,6 +1009,12 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(materialized.credential_ref.as_deref(), Some("grok-oauth"));
+        assert!(
+            !template
+                .display_hint()
+                .expect("enabled Grok hint")
+                .contains("pending xAI authorization")
+        );
     }
 
     #[test]

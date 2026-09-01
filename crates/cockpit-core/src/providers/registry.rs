@@ -232,9 +232,7 @@ impl Provider for GrokProvider {
     }
 
     fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
-        provider_id.eq_ignore_ascii_case(crate::auth::xai_oauth::CREDENTIAL_KEY)
-            || entry.credential_ref.as_deref() == Some(crate::auth::xai_oauth::CREDENTIAL_KEY)
-            || (matches!(entry.auth, Some(AuthKind::OAuth)) && entry.url.contains("api.x.ai"))
+        is_grok_oauth_identity(provider_id, entry)
     }
 
     fn credential_kind(&self) -> Option<ProviderCredentialKind> {
@@ -248,6 +246,41 @@ impl Provider for GrokProvider {
     fn usage_probe(&self) -> Option<&dyn ProviderUsageProbe> {
         Some(&self.usage)
     }
+}
+
+/// The official build recognizes Grok OAuth-shaped entries so they fail before
+/// request construction. Omitting this provider would let an existing
+/// `auth = "oauth"` entry fall through to the unauthenticated template path.
+#[cfg(not(feature = "grok-subscription"))]
+pub(crate) struct UnavailableGrokOAuthProvider;
+
+#[cfg(not(feature = "grok-subscription"))]
+impl Provider for UnavailableGrokOAuthProvider {
+    fn id(&self) -> &'static str {
+        "grok-oauth-unavailable"
+    }
+
+    fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
+        is_grok_oauth_identity(provider_id, entry)
+    }
+
+    fn sync_auth_error(&self) -> Option<&'static str> {
+        Some(
+            "Grok subscription OAuth is unavailable in this official build pending xAI authorization; use a custom OpenAI-compatible provider with auth_command instead.",
+        )
+    }
+}
+
+fn is_grok_oauth_identity(provider_id: &str, entry: &ProviderEntry) -> bool {
+    const GROK_OAUTH_CREDENTIAL_KEY: &str = "grok-oauth";
+
+    provider_id.eq_ignore_ascii_case(GROK_OAUTH_CREDENTIAL_KEY)
+        || entry.credential_ref.as_deref() == Some(GROK_OAUTH_CREDENTIAL_KEY)
+        || (matches!(entry.auth, Some(AuthKind::OAuth))
+            && Url::parse(&entry.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host.eq_ignore_ascii_case("api.x.ai")))
 }
 
 pub(crate) struct CopilotProvider;
@@ -288,6 +321,8 @@ impl ProviderRegistry {
         let mut special: Vec<Arc<dyn Provider>> = vec![Arc::new(CodexProvider::default())];
         #[cfg(feature = "grok-subscription")]
         special.push(Arc::new(GrokProvider::default()));
+        #[cfg(not(feature = "grok-subscription"))]
+        special.push(Arc::new(UnavailableGrokOAuthProvider));
         special.push(Arc::new(CopilotProvider));
         Self::new(special)
     }
@@ -319,6 +354,12 @@ impl ProviderRegistry {
         provider_id: &str,
         entry: &ProviderEntry,
     ) -> Result<ResolvedProviderOrigin> {
+        #[cfg(not(feature = "grok-subscription"))]
+        if self.provider_for(provider_id, entry).id() == "grok-oauth-unavailable" {
+            return Err(anyhow!(
+                "provider `{provider_id}` uses disabled Grok subscription OAuth; use a custom OpenAI-compatible provider with auth_command"
+            ));
+        }
         let Some(template_id) = entry.template.as_deref() else {
             return Ok(ResolvedProviderOrigin::default());
         };

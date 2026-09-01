@@ -2939,6 +2939,7 @@ impl App {
                         },
                     );
                 }
+                #[cfg(feature = "grok-subscription")]
                 (OAuthProvider::Grok, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.begin"),
@@ -2957,6 +2958,7 @@ impl App {
                         },
                     );
                 }
+                #[cfg(feature = "grok-subscription")]
                 (OAuthProvider::Grok, OAuthFlowOp::Complete { flow_id, input }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.complete"),
@@ -3037,8 +3039,15 @@ impl App {
                         },
                     );
                 }
-                (OAuthProvider::Codex, OAuthFlowOp::Complete { .. })
-                | (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {}
+                (OAuthProvider::Codex, OAuthFlowOp::Complete { .. }) => {}
+                #[cfg(feature = "grok-subscription")]
+                (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {}
+                #[cfg(not(feature = "grok-subscription"))]
+                (OAuthProvider::Grok, OAuthFlowOp::Begin)
+                | (OAuthProvider::Grok, OAuthFlowOp::Complete { .. })
+                | (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {
+                    debug_assert!(false, "disabled Grok OAuth flow cannot enqueue daemon work");
+                }
             }
         }
     }

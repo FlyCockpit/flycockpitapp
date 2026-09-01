@@ -6614,6 +6614,7 @@ impl SettingsDialog {
                             Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
                                 Some(OAuthProvider::Codex)
                             }
+                            #[cfg(feature = "grok-subscription")]
                             Some("grok-oauth" | "grok") => Some(OAuthProvider::Grok),
                             _ => None,
                         })

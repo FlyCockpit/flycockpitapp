@@ -2078,6 +2078,44 @@ mod tests {
         assert_no_internal_jargon("providers doc", include_str!("../docs/providers.md"));
     }
 
+    #[test]
+    fn documented_custom_grok_subscription_example_is_valid_chat_completions_config() {
+        const DOC: &str = include_str!("../docs/providers.md");
+        let section = DOC
+            .split("## Custom Grok subscription authentication")
+            .nth(1)
+            .expect("custom Grok documentation section");
+        let json = section
+            .split("```json\n")
+            .nth(1)
+            .and_then(|tail| tail.split("\n```").next())
+            .expect("documented provider JSON block");
+        let entry: cockpit_config::providers::ProviderEntry =
+            serde_json::from_str(json).expect("documented Grok provider must parse");
+
+        assert_eq!(entry.url, "https://api.x.ai/v1");
+        assert_eq!(
+            entry.auth,
+            Some(cockpit_config::providers::AuthKind::Command)
+        );
+        assert!(
+            entry
+                .auth_command
+                .as_ref()
+                .is_some_and(|argv| !argv.is_empty())
+        );
+        assert_eq!(
+            entry.wire_api,
+            cockpit_config::providers::WireApi::Completions
+        );
+        assert_eq!(
+            cockpit_core::providers::ProviderRegistry::standard()
+                .provider_id_for("grok-subscription", &entry),
+            "template",
+            "the documented auth_command must exercise the generic OpenAI-compatible path"
+        );
+    }
+
     /// AC6. Checked docs search: every cited surface must say that trusted
     /// inference may be raw, untrusted inference is redacted, exports and
     /// client display stay redacted regardless of trust, and neither harness

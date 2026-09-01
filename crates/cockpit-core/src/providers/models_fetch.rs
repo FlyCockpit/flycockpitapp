@@ -162,8 +162,7 @@ pub fn resolve_provider_request(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = registry.provider_for(provider_id, entry).sync_auth_error() {
         anyhow::bail!(message);
     }
     provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
@@ -215,16 +214,14 @@ pub async fn resolve_provider_request_async(
         );
     }
     let registry = ProviderRegistry::standard();
-    if registry
-        .provider_for(provider_id, entry)
-        .credential_kind()
-        .is_some()
-    {
+    let provider = registry.provider_for(provider_id, entry);
+    if let Some(message) = provider.sync_auth_error() {
+        anyhow::bail!(message);
+    }
+    if provider.credential_kind().is_some() {
         anyhow::bail!("Codex/Grok OAuth requires an injected credential store");
     }
-    registry
-        .provider_for(provider_id, entry)
-        .request(provider_id, entry, None, &|name| std::env::var(name).ok())
+    provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
 }
 
 pub async fn resolve_provider_request_async_with_store(
@@ -283,6 +280,10 @@ async fn resolve_provider_request_async_with_store_refresh(
     rejected_refresh_generation: Option<u64>,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
+    let provider = registry.provider_for(provider_id, entry);
+    if let Some(message) = provider.sync_auth_error() {
+        anyhow::bail!(message);
+    }
     let command_credential = match entry.auth_command.as_deref() {
         Some(_) => Some(
             crate::auth::command::resolve(
@@ -351,6 +352,9 @@ async fn resolve_model_list_request_async_with_store(
     env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
+    if let Some(message) = registry.provider_for(provider_id, entry).sync_auth_error() {
+        anyhow::bail!(message);
+    }
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
         (Some(_), Some(store)) => Some(
             crate::auth::command::resolve(
@@ -3099,6 +3103,28 @@ mod tests {
                 .headers
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+
+    #[cfg(not(feature = "grok-subscription"))]
+    #[test]
+    fn official_build_rejects_grok_oauth_shaped_entries_before_request_construction() {
+        let entry = ProviderEntry {
+            url: "https://api.x.ai/v1".into(),
+            auth: Some(AuthKind::OAuth),
+            ..ProviderEntry::default()
+        };
+        let registry = ProviderRegistry::standard();
+        assert_eq!(
+            registry.provider_for("custom-grok", &entry).id(),
+            "grok-oauth-unavailable"
+        );
+        let error = resolve_provider_request_with_env("custom-grok", &entry, |_| None)
+            .expect_err("official build must not send a Grok OAuth-shaped request unauthenticated");
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable in this official build")
         );
     }
 

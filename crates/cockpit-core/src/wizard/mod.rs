@@ -884,7 +884,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
             label: template.display_label(),
             description: template
                 .disabled_reason()
-                .or(template.hint)
+                .or(template.display_hint())
                 .unwrap_or("Provider template")
                 .into(),
         })

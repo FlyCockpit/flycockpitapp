@@ -317,6 +317,39 @@ fn oauth_provider_config(provider_id: &str, credential_ref: &str) -> ProvidersCo
     }
 }
 
+#[cfg(not(feature = "grok-subscription"))]
+#[test]
+fn feature_off_existing_grok_oauth_config_has_no_edit_login_action() {
+    let config = oauth_provider_config("grok-oauth", "grok-oauth");
+    let entry = &config.providers["grok-oauth"];
+    assert!(
+        !edit_menu_actions("grok-oauth", entry)
+            .iter()
+            .any(|action| matches!(action, EditAction::OAuthAuth(OAuthProvider::Grok)))
+    );
+}
+
+#[cfg(not(feature = "grok-subscription"))]
+#[test]
+fn feature_off_expired_grok_credential_reentry_stays_on_edit_page() {
+    let config = oauth_provider_config("grok-oauth", "grok-oauth");
+    let (_tmp, mut dialog) = dialog_with_config(config.clone());
+    dialog.cx.completed_provider_navigation = Some((
+        super::super::ProviderNavigation::Edit {
+            provider_id: "grok-oauth".into(),
+            oauth_expired: true,
+        },
+        config,
+    ));
+
+    dialog.apply_completed_provider_navigation();
+
+    assert!(matches!(
+        dialog.page.downcast_ref::<ProvidersPage>(),
+        Some(ProvidersPage::Edit(_))
+    ));
+}
+
 fn line_text(line: &Line<'static>) -> String {
     line.spans
         .iter()
@@ -429,6 +462,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_active_model_retention_renders_dispatches_and_persists();
     pointer_xai_entitlement_renders_dispatches_and_persists();
     pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state();
+    #[cfg(feature = "grok-subscription")]
     pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state();
     pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state();
     pointer_add_oauth_skip_continue_sources_save_from_fresh_state();
@@ -1791,6 +1825,7 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
     let _daemon_fixture = ProviderDaemonFixture::new();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -4387,6 +4422,7 @@ fn single_fetch_error_is_redacted_in_status_and_saved_state() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn grok_oauth_template_materializes_oauth_credential_ref() {
     let template = templates::template_by_id("grok-oauth").unwrap();
     let mut state = AddState::new();
@@ -5551,6 +5587,7 @@ fn provider_delete_removes_codex_oauth_provider_via_daemon() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn provider_delete_preserves_shared_oauth_credential_record() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
@@ -5590,6 +5627,7 @@ fn provider_delete_preserves_shared_oauth_credential_record() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn provider_delete_removes_oauth_provider_when_named_secrets_are_kept() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
@@ -5647,6 +5685,7 @@ fn provider_delete_preserves_a_shared_stored_secret() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn provider_edit_oauth_status_uses_daemon_inventory() {
     let (_tmp, mut dialog) = dialog_with_config(oauth_provider_config(
         cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
@@ -6157,6 +6196,7 @@ fn fake_is_ssh() -> bool {
     OAUTH_EFFECTS_SSH.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(feature = "grok-subscription")]
 fn fake_bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     OAUTH_EFFECTS_LOG.lock().unwrap().push("bind".to_string());
     let listener = cockpit_core::auth::xai_oauth::bind_callback_listener(port)?;
@@ -6164,11 +6204,13 @@ fn fake_bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     Ok(listener)
 }
 
+#[cfg(feature = "grok-subscription")]
 fn failing_bind(_port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     OAUTH_EFFECTS_LOG.lock().unwrap().push("bind".to_string());
     anyhow::bail!("callback port busy")
 }
 
+#[cfg(feature = "grok-subscription")]
 fn connecting_open(value: &str) -> anyhow::Result<()> {
     OAUTH_EFFECTS_LOG
         .lock()
@@ -6182,6 +6224,7 @@ fn connecting_open(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "grok-subscription")]
 fn failing_open(value: &str) -> anyhow::Result<()> {
     OAUTH_EFFECTS_LOG
         .lock()
@@ -6195,11 +6238,13 @@ fn fake_oauth_effects() -> OAuthEffects {
         copy: fake_copy,
         is_ssh: fake_is_ssh,
         open: fake_open,
+        #[cfg(feature = "grok-subscription")]
         bind: fake_bind,
     }
 }
 
 #[tokio::test]
+#[cfg(feature = "grok-subscription")]
 async fn oauth_grok_binds_before_opening_browser() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
@@ -6224,6 +6269,7 @@ async fn oauth_grok_binds_before_opening_browser() {
 }
 
 #[tokio::test]
+#[cfg(feature = "grok-subscription")]
 async fn oauth_grok_browser_open_failure_still_listens() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
@@ -6250,6 +6296,7 @@ async fn oauth_grok_browser_open_failure_still_listens() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn oauth_grok_bind_failure_offers_manual_paste() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
@@ -6277,6 +6324,7 @@ fn oauth_grok_bind_failure_offers_manual_paste() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn oauth_grok_ssh_begin_binds_no_listener() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
@@ -7097,6 +7145,7 @@ fn codex_skip_row_saves_with_device_code_present() {
 }
 
 #[test]
+#[cfg(feature = "grok-subscription")]
 fn grok_pending_skip_row_saves_at_rendered_index() {
     let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);

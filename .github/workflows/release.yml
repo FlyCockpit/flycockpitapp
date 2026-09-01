@@ -99,7 +99,10 @@ jobs:
         run: |
           set -euo pipefail
           default_features="$(sed -n '/^\[features\]/,/^\[/p' apps/cli/Cargo.toml | sed -n 's/^default = \(.*\)$/\1/p')"
-          test "$default_features" = "[]"
+          case "$default_features" in
+            '[]'|'["grok-subscription"]') ;;
+            *) echo "::error::official defaults may only select grok-subscription"; exit 1 ;;
+          esac
           grep -q '^remote = \[' apps/cli/Cargo.toml
           ! grep -Eq 'features[[:space:]]*=[[:space:]]*\[[^]]*remote' dist-workspace.toml
           jq -e '.profile == "local-v0.1" and (.targets | length == 5)' apps/cli/release/local-runtime-capabilities-v1.json
@@ -129,8 +132,12 @@ jobs:
           mkdir -p target/distrib
           dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
-          if jq -e '.. | strings | select(test("(^|[ =,])(--features|--all-features)([ =,]|$)|cockpit-cli/remote"))' target/distrib/plan-dist-manifest.json >/dev/null; then
-            echo "::error::cargo-dist planned a non-local Cargo feature selection"
+          if jq -e '.. | strings | select(test("(^|[ =,])--all-features([ =,]|$)|cockpit-cli/remote|(^|[ =,])--features[ =][^ ]*remote"))' target/distrib/plan-dist-manifest.json >/dev/null; then
+            echo "::error::cargo-dist planned a remote Cargo feature"
+            exit 1
+          fi
+          if jq -e '.. | strings | select(test("(^|[ =,])--features[ =]") and (test("(^|[ =,])--features[ =]grok-subscription([ ,]|$)") | not))' target/distrib/plan-dist-manifest.json >/dev/null; then
+            echo "::error::cargo-dist planned a Cargo feature other than grok-subscription"
             exit 1
           fi
 

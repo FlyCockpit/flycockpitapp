@@ -228,12 +228,6 @@ pub(crate) fn validate_posture_fields(def: &AgentDef) -> Result<()> {
     if let Some(policy) = &def.context_policy {
         validate_context_policy(policy)?;
     }
-    if let Some(caps) = &def.capabilities {
-        // The enum is closed (serde rejects unknown names), so the only
-        // set-level check is the small-model lint below. Capability names
-        // are already constrained to the four variants.
-        let _ = caps;
-    }
     Ok(())
 }
 
@@ -266,7 +260,7 @@ fn validate_context_policy(policy: &ContextPolicy) -> Result<()> {
 /// load.
 pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
     use super::AgentCapability;
-    let caps = def.capabilities.as_ref()?;
+    let caps = &def.vnext.as_ref()?.capabilities;
     if !caps.contains(&AgentCapability::ForkContext)
         && !caps.contains(&AgentCapability::ScopedParallelWrite)
     {
@@ -480,7 +474,7 @@ fn validate_discoverable_tools_have_mcp(_def: &AgentDef, _tools: &[String]) -> R
 mod grant_tests {
     use super::*;
     use crate::agents::{
-        AgentMode, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
+        AgentCapability, AgentMode, AgentRole, DelegationPolicy, DelegationTarget, ModelCapability,
         ModelLocality, ModelSlot, VnextAgentDef,
     };
 
@@ -508,7 +502,6 @@ mod grant_tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -674,7 +667,8 @@ mod grant_tests {
         def.vnext = Some(VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "acme/reviewer".to_string(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![AgentRole::Code],
+            capabilities: std::collections::BTreeSet::new(),
             model_slots: std::collections::BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -698,7 +692,7 @@ mod grant_tests {
         validate_invariants(&def).unwrap();
 
         let vnext = def.vnext.as_mut().unwrap();
-        vnext.execution_kind = ExecutionKind::Computer;
+        vnext.capabilities.insert(AgentCapability::ComputerUse);
         vnext.delegation = DelegationPolicy {
             allowed_children: vec![],
             max_descendant_depth: Some(1),

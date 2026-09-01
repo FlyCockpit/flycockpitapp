@@ -1042,6 +1042,9 @@ fn choice_row(choice: &AgentInstallationChoiceV1) -> DisplayRow {
     if choice.exact_alias_match {
         markers.push("exact");
     }
+    if choice.requires_trust_confirmation {
+        markers.push("confirm trust");
+    }
     let mut text = format!("      {}/{}", choice.provider_id, choice.model_id);
     if let Some(rec) = &choice.recommendation_id {
         text.push_str(&format!(" (rec {rec})"));
@@ -1463,6 +1466,7 @@ mod tests {
             rationale: None,
             author_suggested: suggested,
             exact_alias_match: exact,
+            requires_trust_confirmation: false,
         }
     }
 

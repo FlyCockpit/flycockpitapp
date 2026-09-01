@@ -656,7 +656,7 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                 ));
             }
             if let Some(reference) = portable_references.first() {
-                if !parent.permits_child(reference, child.execution_kind) {
+                if !parent.permits_child_definition(reference, child) {
                     return Some(format!(
                         "Error: vNext caller `{}` cannot delegate to child `{}` under its effective host grant",
                         parent.agent_id, child.agent_id
@@ -677,7 +677,7 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     *installation_id,
                     child_agent,
                     child_definition,
-                ) || !parent.permits_child(reference, child.execution_kind)
+                ) || !parent.permits_child_definition(reference, child)
                 {
                     return Some(format!(
                         "Error: vNext caller `{}` has no exact daemon-local installation grant for child `{child_agent}`",
@@ -709,7 +709,11 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
                     parent_cwd,
                     parent_write_scope,
                     parent_workspace_lease,
-                    child.execution_kind,
+                    if child.supports_computer_use() {
+                        crate::agents::ExecutionKind::Computer
+                    } else {
+                        child.execution_kind()
+                    },
                     cwd,
                     child_write_scope,
                     lease,

@@ -295,13 +295,27 @@ async fn show(name: &str) -> Result<()> {
         "agent_id: {}",
         def.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)
     );
-    let execution_kind = match def.vnext.as_ref().map(|v| v.execution_kind) {
-        Some(cockpit_core::agents::ExecutionKind::Assistant) => "assistant",
-        Some(cockpit_core::agents::ExecutionKind::Coding) => "coding",
-        Some(cockpit_core::agents::ExecutionKind::Computer) => "computer",
-        None => "<legacy>",
-    };
-    println!("execution_kind: {execution_kind}");
+    let roles = def.vnext.as_ref().map_or_else(
+        || "<legacy>".to_string(),
+        |definition| {
+            definition
+                .roles
+                .iter()
+                .map(|role| match role {
+                    cockpit_core::agents::AgentRole::Assistant => "assistant",
+                    cockpit_core::agents::AgentRole::Code => "code",
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    println!("roles: {roles}");
+    println!(
+        "computer_use: {}",
+        def.vnext
+            .as_ref()
+            .is_some_and(|definition| definition.supports_computer_use())
+    );
     Ok(())
 }
 
@@ -725,9 +739,10 @@ mod tests {
             &row.name,
         )
         .unwrap();
-        assert_eq!(
-            def.vnext.as_ref().map(|v| v.execution_kind),
-            Some(cockpit_core::agents::ExecutionKind::Assistant)
+        assert!(
+            def.vnext
+                .as_ref()
+                .is_some_and(|v| v.has_role(cockpit_core::agents::AgentRole::Assistant))
         );
         assert!(def.model.is_none());
         assert!(def.tools.is_none());

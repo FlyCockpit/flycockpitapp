@@ -2780,34 +2780,13 @@ mod capability_tests {
     /// (undeclared) set enables none of the four capabilities.
     #[test]
     fn declared_grants_control_capabilities() {
-        use crate::agents::{AgentCapability, AgentDef};
+        use crate::agents::AgentCapability;
         let mut grants = BTreeSet::new();
         grants.insert(AgentCapability::ForkContext);
         // A def that declares forkContext: the grant is on; undeclared
         // capabilities stay off.
-        let mut def = AgentDef {
-            name: "test".into(),
-            description: "d".into(),
-            mode: crate::agents::AgentMode::Primary,
-            model: None,
-            temperature: None,
-            tools: None,
-            tool_tiers: std::collections::BTreeMap::new(),
-            tool_descriptions: std::collections::BTreeMap::new(),
-            scan_tool_results: None,
-            goal_supervision: crate::agents::GoalSettingsOverride::default(),
-            permission: None,
-            capabilities: Some(grants.clone()),
-            tool_steering: None,
-            context_policy: None,
-            vnext: None,
-            prompt: String::new(),
-            prompt_overrides: std::collections::BTreeMap::new(),
-            package_files: None,
-            mcp_bindings: Vec::new(),
-            private_subagents: std::collections::BTreeMap::new(),
-            source: std::path::PathBuf::new(),
-        };
+        let mut def = crate::agents::embedded_default("Build").unwrap();
+        def.vnext.as_mut().unwrap().capabilities = grants.clone();
         let posture = PostureResolution::from_def(&def);
         assert!(
             Capability::ForkContext.enabled(&posture),
@@ -2819,7 +2798,7 @@ mod capability_tests {
         );
 
         // Empty grant set disables everything.
-        def.capabilities = Some(BTreeSet::new());
+        def.vnext.as_mut().unwrap().capabilities.clear();
         let posture_empty = PostureResolution::from_def(&def);
         assert!(!Capability::ForkContext.enabled(&posture_empty));
         assert!(!Capability::FollowupSeed.enabled(&posture_empty));
@@ -2828,7 +2807,7 @@ mod capability_tests {
         // seam consults the same posture).
         let mut escalate_grants = BTreeSet::new();
         escalate_grants.insert(AgentCapability::SandboxEscalate);
-        def.capabilities = Some(escalate_grants);
+        def.vnext.as_mut().unwrap().capabilities = escalate_grants;
         let posture_escalate = PostureResolution::from_def(&def);
         assert!(Capability::SandboxEscalate.enabled(&posture_escalate));
         assert!(!Capability::FollowupSeed.enabled(&posture_escalate));

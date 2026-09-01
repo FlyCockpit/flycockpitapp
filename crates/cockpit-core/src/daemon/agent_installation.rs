@@ -37,8 +37,8 @@ use cockpit_db::db::installation_operations::{
 use cockpit_proto::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
-    AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
-    AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
+    AgentInstallationOperationKind, AgentInstallationReadV1, AgentInstallationReceiptStatusV1,
+    AgentInstallationRecordV1, AgentInstallationResultV1, AgentInstallationRoleV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
     SESSION_SETUP_DTO_VERSION, SessionSetupAgentCandidateV1, SessionSetupLockedReasonV1,
@@ -4422,9 +4422,10 @@ impl AgentInstallationService {
             .installation_operation(request.idempotency_key.clone())
             .await?
             .context("installation operation was not recorded")?;
-        let execution_kind = request
-            .execution_kind
-            .context("create requires an explicit execution kind")?;
+        ensure!(
+            !request.roles.is_empty(),
+            "create requires at least one role"
+        );
         let primary_slot = request
             .primary_slot_id
             .as_deref()
@@ -4439,7 +4440,8 @@ impl AgentInstallationService {
                 }),
             "create primary slot id is invalid"
         );
-        let markdown = minimal_template(agent_id, execution_kind, primary_slot);
+        let markdown =
+            minimal_template(agent_id, &request.roles, request.computer_use, primary_slot);
         let digest = sha256_hex(markdown.as_bytes());
         let definition = crate::agents::parse_agent(
             &markdown,
@@ -4783,8 +4785,9 @@ fn request_fingerprint(request: &AgentInstallationBeginV1, workspace: Option<&st
         request.requested_slot.as_deref().unwrap_or("")
     ));
     hasher.update(format!(
-        ":{:?}:{}:{}",
-        request.execution_kind,
+        ":{:?}:{}:{}:{}",
+        request.roles,
+        request.computer_use,
         request.primary_slot_id.as_deref().unwrap_or(""),
         request.auto_select_first_exact,
     ));
@@ -5923,6 +5926,7 @@ fn binding_choices(
                     rationale: recommendation.rationale.clone(),
                     author_suggested: true,
                     exact_alias_match: true,
+                    requires_trust_confirmation: recommendation.requires_trust_confirmation(),
                 });
             }
         }
@@ -5959,6 +5963,7 @@ fn binding_choices(
             rationale: None,
             author_suggested: false,
             exact_alias_match: false,
+            requires_trust_confirmation: false,
         });
     }
     (choices, unmatched)
@@ -6524,7 +6529,11 @@ pub(crate) fn resolvable_provider_handle_for_choice(
 fn first_exact_author_choice(choices: &[AgentInstallationChoiceV1]) -> Option<String> {
     choices
         .iter()
-        .find(|choice| choice.author_suggested && choice.exact_alias_match)
+        .find(|choice| {
+            choice.author_suggested
+                && choice.exact_alias_match
+                && !choice.requires_trust_confirmation
+        })
         .map(|choice| choice.choice_id.clone())
 }
 
@@ -6540,9 +6549,10 @@ fn automatic_binding_choice(
         return choices
             .iter()
             .find(|choice| {
-                routes
-                    .iter()
-                    .any(|route| route.choice_id == choice.choice_id && route.authored_default)
+                !choice.requires_trust_confirmation
+                    && routes
+                        .iter()
+                        .any(|route| route.choice_id == choice.choice_id && route.authored_default)
             })
             .map(|choice| choice.choice_id.clone());
     }
@@ -6692,6 +6702,7 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
         ensure!(
             choice_set.choices.iter().any(|choice| {
                 choice.choice_id == auto_choice_id
+                    && !choice.requires_trust_confirmation
                     && ((choice.author_suggested && choice.exact_alias_match)
                         || (choice_set.authored_default_required
                             && choice_set.routes.iter().any(|route| {
@@ -6726,16 +6737,23 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
 
 fn minimal_template(
     name: &str,
-    execution_kind: AgentInstallationExecutionKindV1,
+    roles: &[AgentInstallationRoleV1],
+    computer_use: bool,
     primary_slot: &str,
 ) -> String {
-    let execution_kind = match execution_kind {
-        AgentInstallationExecutionKindV1::Assistant => "assistant",
-        AgentInstallationExecutionKindV1::Coding => "coding",
-        AgentInstallationExecutionKindV1::Computer => "computer",
-    };
+    let roles = roles
+        .iter()
+        .map(|role| match role {
+            AgentInstallationRoleV1::Assistant => "assistant",
+            AgentInstallationRoleV1::Code => "code",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let capabilities = computer_use
+        .then_some("\ncapabilities: [computerUse]")
+        .unwrap_or("");
     format!(
-        "---\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: {execution_kind}\ndescription: Custom {name} agent\nmodelSlots:\n  {primary_slot}:\n    purpose: Primary model\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\n\nYou are the `{name}` Cockpit agent.\n"
+        "---\nschemaVersion: 1\nagentId: authored/{name}\nroles: [{roles}]{capabilities}\ndescription: Custom {name} agent\nmodelSlots:\n  {primary_slot}:\n    purpose: Primary model\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\n\nYou are the `{name}` Cockpit agent.\n"
     )
 }
 fn receipt(
@@ -7556,7 +7574,8 @@ mod tests {
                 target_installation_id: None,
                 replace_acknowledged: false,
                 requested_slot: None,
-                execution_kind: None,
+                roles: Vec::new(),
+                computer_use: false,
                 primary_slot_id: None,
                 auto_select_first_exact: false,
             }
@@ -7779,7 +7798,7 @@ mod tests {
         let mut request = ServiceHarness::request("create-authored");
         request.operation = AgentInstallationOperationKind::Create;
         request.source_locator = "authored/new-helper".into();
-        request.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+        request.roles = vec![AgentInstallationRoleV1::Code];
         request.primary_slot_id = Some("primary".into());
         let AgentInstallationResultV1::Receipt {
             status: AgentInstallationReceiptStatusV1::Created,
@@ -7795,7 +7814,7 @@ mod tests {
         let mut collision = ServiceHarness::request("create-authored-collision");
         collision.operation = AgentInstallationOperationKind::Create;
         collision.source_locator = "authored/new-helper".into();
-        collision.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+        collision.roles = vec![AgentInstallationRoleV1::Code];
         collision.primary_slot_id = Some("primary".into());
         let AgentInstallationResultV1::Error { error } = harness.service.begin(collision, 2).await
         else {
@@ -8022,6 +8041,7 @@ mod tests {
                 .collect(),
             author_label: Some(format!("label-{id}")),
             rationale: Some(format!("why-{id}")),
+            trust_suggestion: None,
         }
     }
 
@@ -8204,6 +8224,7 @@ mod tests {
                 rationale: None,
                 author_suggested: true,
                 exact_alias_match: true,
+                requires_trust_confirmation: false,
             }],
             unmatched_recommendations: vec![],
             routes: vec![DurableBindingRoute {
@@ -8285,11 +8306,8 @@ mod tests {
     }
     #[test]
     fn agent_installation_daemon_template_is_minimal_and_provider_free() {
-        let template = minimal_template(
-            "helper",
-            AgentInstallationExecutionKindV1::Coding,
-            "primary",
-        );
+        let template =
+            minimal_template("helper", &[AgentInstallationRoleV1::Code], false, "primary");
         assert!(template.contains("agentId: authored/helper"));
         assert!(!template.contains("provider"));
         assert!(!template.contains("credential"));
@@ -10590,6 +10608,14 @@ mod tests {
             Some("choice-0-offering-0"),
             "--yes selects only the first ordered exact author route"
         );
+        let mut confirmation_required = choices.clone();
+        for choice in &mut confirmation_required[..4] {
+            choice.requires_trust_confirmation = true;
+        }
+        assert!(
+            first_exact_author_choice(&confirmation_required).is_none(),
+            "trusted-model suggestions always require an interactive choice"
+        );
         assert!(first_exact_author_choice(&choices[4..]).is_none());
     }
 
@@ -11477,13 +11503,19 @@ mod tests {
                 default: false,
             },
         ];
-        let (choices, _) = binding_choices("primary", &authored_slot, &offerings);
+        let (mut choices, _) = binding_choices("primary", &authored_slot, &offerings);
         let routes = durable_binding_routes(&authored_slot, &offerings, &choices).unwrap();
         assert_eq!(
             automatic_binding_choice(&authored_slot, &choices, &routes).as_deref(),
             Some(choices[0].choice_id.as_str()),
             "--yes must select the first authored model without suggestedModels"
         );
+        choices[0].requires_trust_confirmation = true;
+        assert!(
+            automatic_binding_choice(&authored_slot, &choices, &routes).is_none(),
+            "an authored default cannot bypass trusted-model confirmation"
+        );
+        choices[0].requires_trust_confirmation = false;
         let mut choice_set = BindChoiceSet {
             installation_id: Uuid::new_v4().to_string(),
             definition_digest: "digest".into(),
@@ -11588,6 +11620,7 @@ mod tests {
             rationale: None,
             author_suggested: false,
             exact_alias_match: false,
+            requires_trust_confirmation: false,
         };
         assert_eq!(
             resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),

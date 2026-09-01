@@ -259,7 +259,18 @@ fn inventory_too_large(message: String) -> ErrorPayload {
 }
 
 fn agent_mode_summary(definition: &crate::agents::AgentDef) -> &'static str {
-    match definition.vnext.as_ref().map(|vnext| vnext.execution_kind) {
+    if definition
+        .vnext
+        .as_ref()
+        .is_some_and(crate::agents::VnextAgentDef::supports_computer_use)
+    {
+        return "computer";
+    }
+    match definition
+        .vnext
+        .as_ref()
+        .map(|vnext| vnext.execution_kind())
+    {
         Some(crate::agents::ExecutionKind::Assistant) => "assistant",
         Some(crate::agents::ExecutionKind::Coding) => "coding",
         Some(crate::agents::ExecutionKind::Computer) => "computer",

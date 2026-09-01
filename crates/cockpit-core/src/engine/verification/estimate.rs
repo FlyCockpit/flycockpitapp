@@ -330,7 +330,8 @@ mod tests {
         VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "authored/reviewer".to_string(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![crate::agents::AgentRole::Code],
+            capabilities: BTreeSet::new(),
             model_slots: BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {

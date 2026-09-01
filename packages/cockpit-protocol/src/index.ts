@@ -2528,6 +2528,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
                                   rationale: z.string().min(1).optional(),
                                   author_suggested: z.boolean(),
                                   exact_alias_match: z.boolean(),
+                                  requires_trust_confirmation: z.boolean().optional(),
                                 })
                                 .strict(),
                             )

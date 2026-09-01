@@ -322,7 +322,6 @@ fn private_assistant_agent(
         scan_tool_results: None,
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
-        capabilities: None,
         tool_steering: None,
         context_policy: None,
         // Assistant homes are daemon-owned definition locations, so they are
@@ -507,7 +506,7 @@ async fn validate_primary_assistant(db: &Db, row: AssistantRow) -> Result<Assist
         .context("built-in Assistant identity definition has no vNext provenance")?;
     anyhow::ensure!(
         vnext.agent_id == format!("local/{PRIMARY_ASSISTANT_INSTALLATION_ID}")
-            && vnext.execution_kind == ExecutionKind::Assistant,
+            && vnext.has_role(crate::agents::AgentRole::Assistant),
         "built-in Assistant identity definition provenance does not match its daemon installation"
     );
     Ok(row)
@@ -542,7 +541,8 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
     VnextAgentDef {
         schema_version: crate::agents::SCHEMA_VERSION,
         agent_id: format!("local/{installation_id}"),
-        execution_kind: ExecutionKind::Assistant,
+        roles: vec![crate::agents::AgentRole::Assistant],
+        capabilities: std::collections::BTreeSet::new(),
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {
@@ -1566,7 +1566,7 @@ mod tests {
         assert_eq!(def.description, "Helps with tests");
         assert_eq!(def.prompt, "Stay focused.");
         assert_eq!(
-            def.vnext.as_ref().map(|v| v.execution_kind),
+            def.vnext.as_ref().map(|v| v.execution_kind()),
             Some(ExecutionKind::Assistant)
         );
         assert!(def.tools.is_none());

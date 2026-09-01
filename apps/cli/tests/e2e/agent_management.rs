@@ -16,8 +16,8 @@ use cockpit_cli::integration_test_api::agent_installation::{
 use cockpit_config::config::providers::ProvidersConfig;
 use cockpit_proto::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationErrorCodeV1,
-    AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
-    AgentInstallationReceiptStatusV1, AgentInstallationResultV1, AgentInstallationScopeWire,
+    AgentInstallationOperationKind, AgentInstallationReadV1, AgentInstallationReceiptStatusV1,
+    AgentInstallationResultV1, AgentInstallationRoleV1, AgentInstallationScopeWire,
     AgentInstallationSlotBindingStateV1,
 };
 use rusqlite::Connection;
@@ -81,7 +81,8 @@ fn begin(key: &str, operation: AgentInstallationOperationKind) -> AgentInstallat
         target_installation_id: None,
         replace_acknowledged: false,
         requested_slot: None,
-        execution_kind: None,
+        roles: Vec::new(),
+        computer_use: false,
         primary_slot_id: None,
         auto_select_first_exact: false,
     }
@@ -248,7 +249,7 @@ async fn agent_cli_management_daemon_install_malformed_source_and_create_collisi
 
     let mut create = begin("create", AgentInstallationOperationKind::Create);
     create.source_locator = "authored/local-helper".into();
-    create.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+    create.roles = vec![AgentInstallationRoleV1::Code];
     create.primary_slot_id = Some("primary".into());
     assert!(matches!(
         service.begin(create, 2).await,
@@ -261,7 +262,7 @@ async fn agent_cli_management_daemon_install_malformed_source_and_create_collisi
     workspace_create.scope = AgentInstallationScopeWire::WorkspaceShared;
     workspace_create.workspace_path = Some("fixture-workspace".into());
     workspace_create.source_locator = "authored/local-helper".into();
-    workspace_create.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+    workspace_create.roles = vec![AgentInstallationRoleV1::Code];
     workspace_create.primary_slot_id = Some("primary".into());
     assert!(matches!(
         service.begin(workspace_create, 3).await,
@@ -324,7 +325,7 @@ async fn agent_cli_management_daemon_install_malformed_source_and_create_collisi
     assert!(!workspace_json.contains("bindings"));
     let mut collision = begin("create-collision", AgentInstallationOperationKind::Create);
     collision.source_locator = "authored/local-helper".into();
-    collision.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+    collision.roles = vec![AgentInstallationRoleV1::Code];
     collision.primary_slot_id = Some("primary".into());
     let collision = service.begin(collision, 3).await;
     assert!(

@@ -836,12 +836,17 @@ fn build_model_rows_with_control(
                 .unwrap_or_default();
             let marker = controlled_model
                 .map_or("", |model| if model.is_default { " (default)" } else { "" });
+            let trust = if choice.requires_trust_confirmation {
+                " (confirm trust)"
+            } else {
+                ""
+            };
             let current = control
                 .and_then(|control| control.effective.as_ref())
                 .is_some_and(|model| Some(model.choice_id.as_str()) == route_choice_id);
             let arrow = if current { "✓" } else { "→" };
             let text = format!(
-                "    {arrow} {}/{}{label}{suggested}{marker}",
+                "    {arrow} {}/{}{label}{suggested}{marker}{trust}",
                 choice.provider_id, choice.model_id
             );
             if terminal {
@@ -1206,6 +1211,7 @@ mod tests {
             rationale: None,
             author_suggested: suggested,
             exact_alias_match: false,
+            requires_trust_confirmation: false,
         }
     }
 

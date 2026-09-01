@@ -54,9 +54,10 @@ pub fn enrich_session_setup_snapshot(
         .or_else(|| agents::embedded_default("Build"))
         .ok_or_else(|| anyhow::anyhow!("embedded Build agent is unavailable"))?;
     if def.vnext.is_some() && def.tools.is_none() {
-        let is_assistant = def.vnext.as_ref().is_some_and(|definition| {
-            definition.execution_kind == agents::ExecutionKind::Assistant
-        });
+        let is_assistant = def
+            .vnext
+            .as_ref()
+            .is_some_and(|definition| definition.has_role(agents::AgentRole::Assistant));
         let tools = crate::engine::builtin::resolved_tool_grant(&def, project_root, is_assistant);
         let tool_tiers = def.tool_tiers.clone();
         agents::apply_tool_surface_override(&mut def, &ToolSurfaceSelection { tools, tool_tiers })?;
@@ -389,6 +390,7 @@ mod tests {
             rationale: None,
             author_suggested: suggested,
             exact_alias_match: suggested,
+            requires_trust_confirmation: false,
         }
     }
 

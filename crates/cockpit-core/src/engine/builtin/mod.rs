@@ -2115,7 +2115,7 @@ fn load_resolved_def(
         let is_assistant = def.vnext.as_ref().map_or(
             args.assistant_identity_prefix.is_some()
                 && crate::agents::embedded_default(&def.name).is_none(),
-            |definition| definition.execution_kind == crate::agents::ExecutionKind::Assistant,
+            |definition| definition.has_role(crate::agents::AgentRole::Assistant),
         );
         for grant in &args.granted_tools {
             if effective_tool_tier(def, grant, is_assistant) == crate::agents::ToolTier::Disabled {
@@ -2653,7 +2653,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     let is_assistant = effective_def.vnext.as_ref().map_or(
         args.assistant_identity_prefix.is_some()
             && crate::agents::embedded_default(&effective_def.name).is_none(),
-        |definition| definition.execution_kind == crate::agents::ExecutionKind::Assistant,
+        |definition| definition.has_role(crate::agents::AgentRole::Assistant),
     );
     if effective_def.vnext.is_some() {
         if effective_def.tools.is_none() {
@@ -2775,7 +2775,10 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // structural `task` tool, and it is still checked again by the driver
     // immediately before a child is constructed.
     if let (Some(vnext), Some(grant)) = (&def.vnext, &effective_vnext_grant) {
-        if grant.agent_id != vnext.agent_id || grant.execution_kind != vnext.execution_kind {
+        if grant.agent_id != vnext.agent_id
+            || grant.roles != vnext.roles
+            || grant.capabilities != vnext.capabilities
+        {
             bail!("vNext effective grant does not match selected definition");
         }
         let targets = vnext_reachable_subagents(
@@ -2814,9 +2817,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         // override; a custom agent is gated on its `mode` here (a `Primary`-only
         // custom agent is chat-owning, never delegated to, so it gets no `return`).
         let delegated_return = match def.vnext.as_ref() {
-            Some(definition) => {
-                definition.execution_kind != crate::agents::ExecutionKind::Assistant
-            }
+            Some(definition) => !definition.has_role(crate::agents::AgentRole::Assistant),
             None => def.mode.is_subagent(),
         };
         if crate::agents::embedded_default(&def.name).is_some() || delegated_return {
@@ -2898,7 +2899,8 @@ fn effective_vnext_grant_for(
     };
     if let Some(grant) = &args.vnext_grant {
         if grant.agent_id != definition.agent_id
-            || grant.execution_kind != definition.execution_kind
+            || grant.roles != definition.roles
+            || grant.capabilities != definition.capabilities
         {
             bail!("vNext effective grant does not match selected definition");
         }
@@ -3161,7 +3163,7 @@ fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
         if let Ok(custom) = &listing.def
             && (custom.mode.is_subagent()
                 || custom.vnext.as_ref().is_some_and(|definition| {
-                    definition.execution_kind != crate::agents::ExecutionKind::Assistant
+                    !definition.has_role(crate::agents::AgentRole::Assistant)
                 }))
             && !out.contains(&listing.name)
         {
@@ -3240,7 +3242,7 @@ fn vnext_reachable_subagents(
                         let child = listing.def.as_ref().ok()?;
                         let child_vnext = child.vnext.as_ref()?;
                         (child_vnext.agent_id == *portable_agent_ref)
-                            .then_some((listing.name.clone(), child_vnext.execution_kind))
+                            .then_some((listing.name.clone(), child_vnext.execution_kind()))
                     })
                     .collect();
                 match matches.as_slice() {
@@ -4947,7 +4949,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -4992,7 +4993,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5095,7 +5095,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5218,7 +5217,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5320,7 +5318,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5382,7 +5379,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5426,7 +5422,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5477,7 +5472,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5611,7 +5605,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -5743,7 +5736,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -6088,7 +6080,6 @@ pub(crate) mod tests {
                 scan_tool_results: None,
                 goal_supervision: crate::agents::GoalSettingsOverride::default(),
                 permission: None,
-                capabilities: None,
                 tool_steering: None,
                 context_policy: None,
                 vnext: None,
@@ -7750,7 +7741,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -7804,7 +7794,6 @@ pub(crate) mod tests {
             scan_tool_results: Some(true),
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,
@@ -8022,7 +8011,6 @@ pub(crate) mod tests {
             scan_tool_results: None,
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
-            capabilities: None,
             tool_steering: None,
             context_policy: None,
             vnext: None,

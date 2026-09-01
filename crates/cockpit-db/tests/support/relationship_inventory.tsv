@@ -2155,7 +2155,7 @@ local	task_todos	updated_at	non_relationship
 local	task_todos	version	non_relationship
 local	text_artifact_blob_cleanup_intents	blob_path	primary
 local	text_artifact_blob_cleanup_intents	created_at_unix_ms	non_relationship
-local	text_artifact_blob_cleanup_intents	session_id	foreign
+local	text_artifact_blob_cleanup_intents	session_id	external
 local	tokenizer_calibration	computed_at	non_relationship
 local	tokenizer_calibration	expires_at	non_relationship
 local	tokenizer_calibration	model	primary

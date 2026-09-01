@@ -3510,8 +3510,6 @@ CREATE UNIQUE INDEX session_fts_docs_one_non_artifact_event_kind
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
-CREATE INDEX session_fts_docs_session_seq_idx
-    ON session_fts_docs(session_id, seq);
 CREATE INDEX session_fts_docs_session_artifact_idx
     ON session_fts_docs(session_id, artifact_id);
 
@@ -4414,7 +4412,10 @@ BEGIN
                 AND json_type(a.provenance_json, '$.event_seq') = 'integer'
                 AND json_extract(a.provenance_json, '$.source') = 'user_paste'
                 AND json_type(a.provenance_json, '$.blob_path') = 'text'
+                AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+                AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'
                 AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+                AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000
                 AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
                 AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq)
                OR
@@ -4432,7 +4433,10 @@ BEGIN
            AND json_type(a.provenance_json, '$.preprocessing_version') = 'integer'
            AND json_extract(a.provenance_json, '$.preprocessing_version') = 1
            AND json_type(a.provenance_json, '$.blob_path') = 'text'
+           AND json_extract(a.provenance_json, '$.blob_path') LIKE 'text-artifacts/%'
+           AND json_extract(a.provenance_json, '$.blob_path') NOT LIKE '%..%'
            AND json_type(a.provenance_json, '$.preview_lines') = 'integer'
+           AND json_extract(a.provenance_json, '$.preview_lines') BETWEEN 1 AND 10000
            AND (SELECT count(*) FROM json_each(a.provenance_json)) = 4
            AND EXISTS (
                SELECT 1 FROM session_text_artifact_event_refs source_ref
@@ -4955,7 +4959,12 @@ CREATE TABLE text_artifact_blob_cleanup_intents (
         AND blob_path NOT LIKE '%\n%'
         AND blob_path NOT LIKE '%\r%'
     ),
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    -- Deliberately NOT a foreign key: the whole point of this table is to
+    -- outlive the session cascade that orphans the blob.  A REFERENCES ...
+    -- ON DELETE CASCADE here would delete each intent in the same transaction
+    -- that enqueued it, stranding the file forever.  Same reasoning as
+    -- task_delegation_sidecar_cleanup_intents.session_id above.
+    session_id TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
 );
 

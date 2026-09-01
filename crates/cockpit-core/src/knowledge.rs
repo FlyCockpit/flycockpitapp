@@ -961,15 +961,10 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     if sidecar_paths.is_empty() {
         return Ok(());
     }
-    let prefix = match crate::git::run_git(root, &["rev-parse", "--show-prefix"]) {
-        Ok(output) if output.success => output.stdout,
-        // Git is the authority on whether this path belongs to a worktree.
-        // Looking for a `.git` marker in arbitrary ancestors is both racy and
-        // wrong: a host-level marker (for example `/tmp/.git`) does not make
-        // every child path a usable worktree.  A successful `rev-parse` is
-        // still required before any mutable sidecar exclusion is touched.
-        Ok(_) => return Ok(()),
-        Err(error) => return Err(error).context("running Git to protect knowledge sidecars"),
+    let prefix_probe = crate::git::run_git(root, &["rev-parse", "--show-prefix"])
+        .context("running Git to protect knowledge sidecars")?;
+    let Some(prefix) = git_worktree_prefix(root, prefix_probe)? else {
+        return Ok(());
     };
     let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])
         .context("locating local knowledge repository exclusion file")?;
@@ -1064,6 +1059,29 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn git_worktree_prefix(root: &Path, output: crate::git::GitOutcome) -> Result<Option<String>> {
+    if output.success {
+        return Ok(Some(output.stdout));
+    }
+
+    // A nonzero rev-parse is safe to interpret as "outside Git" only when Git
+    // says exactly that. Ownership/safe.directory failures and other
+    // inspection refusals must not permit unprotected sidecar creation.
+    if output
+        .stderr
+        .to_ascii_lowercase()
+        .contains("not a git repository")
+    {
+        return Ok(None);
+    }
+
+    bail!(
+        "checking whether local knowledge base {} belongs to a Git worktree failed: {}",
+        root.display(),
+        output.stderr.trim()
+    )
 }
 
 /// Metadata for one durable dream projection. The dream executor supplies
@@ -9155,6 +9173,40 @@ Inventory facts for warehouse operations.
                 .to_string()
                 .contains("checking whether knowledge sidecar"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn sidecar_git_inspection_refusal_fails_closed() {
+        let root = Path::new("/knowledge");
+        let error = git_worktree_prefix(
+            root,
+            crate::git::GitOutcome {
+                success: false,
+                stdout: String::new(),
+                stderr: "fatal: detected dubious ownership in repository at '/knowledge'".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to a Git worktree failed"),
+            "{error:#}"
+        );
+
+        assert!(
+            git_worktree_prefix(
+                root,
+                crate::git::GitOutcome {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "fatal: not a git repository (or any parent directory): .git".into(),
+                },
+            )
+            .unwrap()
+            .is_none(),
+            "only Git's not-a-repository signal may bypass exclusion setup"
         );
     }
 

@@ -12560,7 +12560,7 @@ impl Driver {
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
         let (extended, providers) = self.config.configs();
-        let use_session_model_metadata = extended.auto_title_with_session_model;
+        let use_session_model_metadata = use_session_model_for_auto_title(&extended);
         let (title_action, mut metadata_work) = if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
@@ -15594,6 +15594,10 @@ const AUTO_PRUNE_TRIGGER_UPSTREAM_CACHE_BUST: &str = "upstream_cache_bust";
 const AUTO_PRUNE_TRIGGER_WARM_THRESHOLD: &str = "warm_threshold";
 fn is_continue_command(text: &str) -> bool {
     matches!(text.trim().to_ascii_lowercase().as_str(), "continue")
+}
+
+fn use_session_model_for_auto_title(extended: &crate::config::extended::ExtendedConfig) -> bool {
+    extended.auto_title_with_session_model || extended.auto_title_model_ref().is_none()
 }
 
 /// Turn cap for the explore subagent's noninteractive loop. Real

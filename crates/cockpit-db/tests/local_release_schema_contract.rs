@@ -2215,9 +2215,7 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
         .collect::<BTreeSet<_>>();
     let deferred_tables = ownership
         .iter()
-        .filter_map(|(name, owner)| {
-            (owner.launch_profile != "local").then_some(name.clone())
-        })
+        .filter_map(|(name, owner)| (owner.launch_profile != "local").then_some(name.clone()))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         full_tables

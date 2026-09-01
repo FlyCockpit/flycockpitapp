@@ -9268,18 +9268,37 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     assert!(rendered.contains(secret_display::MASKED_VALUE));
     assert!(!rendered.contains("fc-secret-value"));
 
-    d.handle_key(press(KeyCode::Enter)); // queue owner-remoted persist
-    // The dialog's normal unit harness uses its wire-valid disk daemon fake.
-    // Cross the actual owner boundary here to verify the persisted inventory,
-    // using the exact credential payload that the UI just queued.
+    // Invoke the page reducer directly for the final Enter so the settings
+    // test wrapper cannot auto-settle and consume the newly queued effect.
+    // Production reaches the same reducer before its async effect loop drains
+    // the queue.
+    let nav = d.page.handle_key(&mut d.cx, press(KeyCode::Enter));
+    d.apply_nav(nav); // queue owner-remoted persist
+    // Cross the actual owner boundary with the dialog-produced effect. This
+    // keeps the persistence assertion coupled to the provider, payload, and
+    // operation identity emitted by the UI reducer.
+    let effect =
+        d.cx.take_daemon_effect()
+            .expect("web-key dialog must queue an owner credential effect");
+    let SettingsDaemonEffectWork::ProviderCredentialPut {
+        client_operation_id,
+        provider_id,
+        record,
+    } = effect.work
+    else {
+        panic!("web-key dialog queued the wrong daemon effect")
+    };
+    assert_eq!(provider_id, "firecrawl");
+    let record = record.take();
+    assert_eq!(record, r#"{"api_key":"fc-secret-value"}"#);
     let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .expect("settings daemon client for web credential");
     let response = client
         .request(Request::PutProviderCredential {
-            client_operation_id: uuid::Uuid::new_v4().to_string(),
-            provider_id: "firecrawl".into(),
-            record: r#"{"api_key":"fc-secret-value"}"#.to_string().into(),
+            client_operation_id,
+            provider_id,
+            record: record.into(),
         })
         .await
         .expect("owner credential transport")
@@ -9612,7 +9631,7 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(source.contains("settings commit settlement is unknown"));
     assert!(source.contains("typed settings commit remains unsettled"));
     assert!(mcp.contains("expected_consumed_revision"));
-    assert!(mcp.contains("expected_consumed_revision"));
+    assert!(source.contains("is_opaque_authority_token(result_revision)"));
     assert!(source.contains("sanitized_intent_hash"));
     assert!(source.contains("returned_intent_hash == mutation_intent_hash"));
     assert!(source.contains("mutation_intent_hash == expected_request_hash"));

@@ -422,8 +422,10 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
 
-    /// Use the active session model for the cache-reusing, ephemeral
-    /// title-and-description fork instead of a configured utility model.
+    /// Prefer the active session model for the cache-reusing, ephemeral
+    /// title-and-description fork even when a title or utility model is
+    /// configured. When false, a configured title/utility model is used;
+    /// without one, session titling still falls back to the active model.
     #[serde(default)]
     pub auto_title_with_session_model: bool,
 

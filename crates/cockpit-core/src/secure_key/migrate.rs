@@ -441,7 +441,14 @@ fn validate_store_mode(
     placement: SecretVaultPlacement,
     store: &dyn KekStore,
 ) -> Result<Option<SecretVaultFileKekMode>, SecureKeyError> {
-    if store.placement() != placement {
+    // `KekStore` reports the protocol-facing placement used by callers and
+    // snapshots, while the authority row uses the durable database enum.
+    // Translate at that boundary before validating the persisted invariant.
+    let store_placement =
+        super::resolve::secret_store_dest_placement(store.placement()).map_err(|_| {
+            SecureKeyError::Corrupt("KEK store declares an unavailable placement".into())
+        })?;
+    if store_placement != placement {
         return Err(SecureKeyError::Corrupt(
             "KEK store placement does not match the vault placement".into(),
         ));

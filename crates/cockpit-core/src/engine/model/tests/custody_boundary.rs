@@ -87,7 +87,7 @@ fn model_policy_custody_requirements_are_type_enforced_on_the_active_model_path(
     cfg.active_model = Some(active("selfhosted"));
     let trusted = Model::from_config_with_env(&cfg, secret_table(), |_| Some("k".into()))
         .expect("keyless openai-compat build");
-    assert_eq!(
+    assert!(
         !trusted.redact_table().scrub(SECRET).contains(SECRET),
         "a trusted active model must be redacted too"
     );
@@ -111,7 +111,7 @@ fn model_policy_custody_requirements_are_type_enforced_on_the_utility_model_path
         Some("k".into())
     })
     .expect("keyless openai-compat build");
-    assert_eq!(
+    assert!(
         !trusted.redact_table().scrub(SECRET).contains(SECRET),
         "a trusted utility target must be redacted too"
     );
@@ -140,7 +140,7 @@ fn trusted_custody_grants_never_release_provider_literals() {
     assert_eq!(route.custody, ModelCustody::Trusted);
     assert!(route.trusted_custody_grant().is_some());
 
-    assert_eq!(
+    assert!(
         !Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone())
             .scrub(SECRET)
             .contains(SECRET),
@@ -300,7 +300,7 @@ fn a_trusted_route_redacts_when_redaction_is_disabled_in_config() {
 
     let route = Model::configured_custody_route(&cfg, "selfhosted", "m", &table)
         .expect("a configured trusted target routes");
-    assert_eq!(
+    assert!(
         !Model::effective_redact_table_for(&route, "selfhosted", "m", table.clone())
             .scrub(SECRET)
             .contains(SECRET),
@@ -310,7 +310,7 @@ fn a_trusted_route_redacts_when_redaction_is_disabled_in_config() {
     cfg.active_model = Some(active("selfhosted"));
     let trusted = Model::from_config_with_env(&cfg, table.clone(), |_| Some("k".into()))
         .expect("keyless openai-compat build");
-    assert_eq!(
+    assert!(
         !trusted.redact_table().scrub(SECRET).contains(SECRET),
         "trusted active model must be redacted"
     );
@@ -318,7 +318,7 @@ fn a_trusted_route_redacts_when_redaction_is_disabled_in_config() {
     let utility =
         Model::for_provider_with_env(&cfg, "selfhosted", "m", table, |_| Some("k".into()))
             .expect("keyless openai-compat build");
-    assert_eq!(
+    assert!(
         !utility.redact_table().scrub(SECRET).contains(SECRET),
         "trusted utility target must be redacted"
     );

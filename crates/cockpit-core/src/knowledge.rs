@@ -5410,7 +5410,11 @@ pub(crate) async fn attached_local_knowledge_roots_for_model(
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for knowledge_base in effective_local_knowledge_bases(session, cwd, extended).await {
-        if !native_knowledge_base_permitted_for_model(&knowledge_base, allowed_knowledge_bases) {
+        if !native_knowledge_base_permitted_for_model(
+            &knowledge_base,
+            allowed_knowledge_bases,
+            executing_model_trusted,
+        ) {
             continue;
         }
         if !roots.iter().any(|root| root == &knowledge_base.root) {
@@ -6831,6 +6835,7 @@ impl Tool for KnowledgeDreamSourcesTool {
             &ctx.cwd,
             self.allowed_knowledge_bases.as_ref(),
             &extended,
+            ctx.knowledge_access_trusted,
         )
         .await?;
         let knowledge_base = bundles
@@ -6998,6 +7003,7 @@ impl Tool for KnowledgeDreamApplyTool {
             &ctx.cwd,
             self.allowed_knowledge_bases.as_ref(),
             &extended,
+            ctx.knowledge_access_trusted,
         )
         .await?;
         let knowledge_base = bundles
@@ -8401,6 +8407,7 @@ mod tests {
             KnowledgeBaseEmbeddingOwnership::Local,
             None,
             None,
+            false,
             KnowledgeBaseMergePolicy::Auto,
         );
         let extended = ExtendedConfig {
@@ -8473,6 +8480,7 @@ mod tests {
             KnowledgeBaseEmbeddingOwnership::Local,
             None,
             None,
+            false,
             KnowledgeBaseMergePolicy::Auto,
         );
 

@@ -556,7 +556,7 @@ async fn sealed_marker_ignores_entry_whose_version_differs_from_the_live_grant()
 
     // A STALE version-1 entry of the same record → GENERIC, never the marker.
     let stale = untrusted_model(sealed_table_at_version(seeded.record_id, 1));
-    let stale_body = prepared_untrusted_body(&stale, &active);
+    let stale_body = prepared_body(&stale, &active);
     assert!(
         !stale_body.contains(&marker) && !stale_body.contains("reference sealed value"),
         "a stale prior-version entry never activates a later-version grant: {stale_body}"
@@ -573,7 +573,7 @@ async fn sealed_marker_ignores_entry_whose_version_differs_from_the_live_grant()
     // Positive control: an entry at the CURRENT version 2 DOES render the marker,
     // proving the grant itself is live and the negative above is not vacuous.
     let current = untrusted_model(sealed_table_at_version(seeded.record_id, 2));
-    let current_body = prepared_untrusted_body(&current, &active);
+    let current_body = prepared_body(&current, &active);
     assert!(
         current_body.contains(&marker),
         "the current-version entry renders the actionable marker: {current_body}"
@@ -652,7 +652,7 @@ async fn sealed_marker_ignores_legacy_same_name_entry_of_a_different_record() {
             .expect("legacy sealed table"),
     );
     let model = untrusted_model(table);
-    let body = prepared_untrusted_body(&model, &active);
+    let body = prepared_body(&model, &active);
     assert!(
         !body.contains("reference sealed value"),
         "a legacy same-name entry of a different record never activates a scoped grant: {body}"

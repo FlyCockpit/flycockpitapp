@@ -97,7 +97,7 @@ pub struct Rect {
     pub space: CoordinateSpace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
@@ -412,7 +412,7 @@ impl RealDesktopGrantStore {
         let Ok(stored) = fs::read_to_string(&self.path) else {
             return false;
         };
-        stored.trim() == current_machine_fingerprint().trim()
+        current_machine_fingerprint().is_some_and(|fingerprint| stored.trim() == fingerprint)
     }
 
     /// Resolve the existing machine-local real-desktop grant under Cockpit's
@@ -1684,11 +1684,34 @@ fn unsupported_platform() -> ComputerError {
     }
 }
 
-fn current_machine_fingerprint() -> String {
-    fs::read_to_string("/etc/machine-id")
-        .map(|value| value.trim().to_string())
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-machine".to_string())
+fn current_machine_fingerprint() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // IOPlatformUUID is a hardware-backed IORegistry property. Do not
+        // fall back to an environment variable or a shared sentinel: copied
+        // consent files must not authorize a different Mac.
+        let output = std::process::Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(output.stdout).ok()?;
+        let uuid = value.lines().find_map(|line| {
+            let (_, value) = line.split_once("\"IOPlatformUUID\" = ")?;
+            value.trim().strip_prefix('\"')?.strip_suffix('\"')
+        })?;
+        (!uuid.is_empty()).then(|| format!("macos-ioplatformuuid:{uuid}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::read_to_string("/etc/machine-id")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
 }
 
 pub const COMPUTER_TOOL_GROUP: &str = "computer:*";

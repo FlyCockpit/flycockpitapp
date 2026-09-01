@@ -904,11 +904,10 @@ impl MacOsTargetEvidenceAdapter {
 
     fn capture_macos_snapshot(&self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         use objc2_app_kit::NSWorkspace;
-        use objc2_application_services::{AXUIElement, AXValue, AXValueType};
-        use objc2_core_foundation::{CGPoint, CGSize};
+        use objc2_application_services::AXUIElement;
         use objc2_core_graphics::{
             CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError,
-            CGGetActiveDisplayList,
+            CGGetActiveDisplayList, CGMainDisplayID,
         };
 
         let session = current_audit_session_id()?;
@@ -936,45 +935,8 @@ impl MacOsTargetEvidenceAdapter {
             .downcast::<AXUIElement>()
             .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
 
-        let position_value = ax_attribute(&window, MacAxAttribute::Position)?
-            .downcast::<AXValue>()
-            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
-        let size_value = ax_attribute(&window, MacAxAttribute::Size)?
-            .downcast::<AXValue>()
-            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
-        let mut position = CGPoint::default();
-        let mut size = CGSize::default();
-        // SAFETY: Both destinations are initialized, correctly aligned native
-        // geometry values and remain live for the duration of each call.
-        let position_ok = unsafe {
-            position_value.r#type() == AXValueType::CGPoint
-                && position_value.value(
-                    AXValueType::CGPoint,
-                    std::ptr::NonNull::new_unchecked(
-                        (&mut position as *mut CGPoint).cast::<std::ffi::c_void>(),
-                    ),
-                )
-        };
-        let size_ok = unsafe {
-            size_value.r#type() == AXValueType::CGSize
-                && size_value.value(
-                    AXValueType::CGSize,
-                    std::ptr::NonNull::new_unchecked(
-                        (&mut size as *mut CGSize).cast::<std::ffi::c_void>(),
-                    ),
-                )
-        };
-        if !position_ok
-            || !size_ok
-            || !position.x.is_finite()
-            || !position.y.is_finite()
-            || !size.width.is_finite()
-            || !size.height.is_finite()
-            || size.width <= 0.0
-            || size.height <= 0.0
-        {
-            return Err(TargetUnavailableReason::QueryMismatch);
-        }
+        let (position, size) = ax_window_rect(&window)?;
+        let window_number = cg_window_number_for_ax_window(frontmost_pid, position, size)?;
 
         let mut displays = [0_u32; 32];
         let mut display_count = 0_u32;
@@ -1019,6 +981,13 @@ impl MacOsTargetEvidenceAdapter {
         }
         let (display_id, display_bounds, _) =
             selected.ok_or(TargetUnavailableReason::AmbiguousOutput)?;
+        // The backend currently captures and maps coordinates against the main
+        // display only. Never attach secondary-display evidence to that
+        // surface: fail the physical open closed until a display-bound backend
+        // is composed with the adapter.
+        if display_id != CGMainDisplayID() {
+            return Err(TargetUnavailableReason::AmbiguousOutput);
+        }
         let mode = CGDisplayCopyDisplayMode(display_id)
             .ok_or(TargetUnavailableReason::MissingCapability)?;
         let logical_width = CGDisplayMode::width(Some(&mode));
@@ -1059,16 +1028,22 @@ impl MacOsTargetEvidenceAdapter {
         {
             return Err(TargetUnavailableReason::StaleTarget);
         }
+        let recheck_window = ax_attribute(&recheck_application, MacAxAttribute::FocusedWindow)?
+            .downcast::<AXUIElement>()
+            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+        let (recheck_position, recheck_size) = ax_window_rect(&recheck_window)?;
+        let recheck_window_number =
+            cg_window_number_for_ax_window(frontmost_pid, recheck_position, recheck_size)?;
+        if recheck_position != position
+            || recheck_size != size
+            || recheck_window_number != window_number
+        {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
 
         let window_hash = domain_hash(
-            b"cockpit.macos.ax-window.v1",
-            &[
-                &frontmost_pid.to_le_bytes(),
-                &position.x.to_bits().to_le_bytes(),
-                &position.y.to_bits().to_le_bytes(),
-                &size.width.to_bits().to_le_bytes(),
-                &size.height.to_bits().to_le_bytes(),
-            ],
+            b"cockpit.macos.cg-window.v1",
+            &[&frontmost_pid.to_le_bytes(), &window_number.to_le_bytes()],
         );
         let mut window_id = [0_u8; 16];
         window_id.copy_from_slice(&window_hash[..16]);
@@ -1086,7 +1061,7 @@ impl MacOsTargetEvidenceAdapter {
         );
         snapshot.focused_window_id = FieldEvidence::available(
             OpaqueWindowId::from_bytes(window_id),
-            EvidenceSource::Accessibility,
+            EvidenceSource::CgWindowList,
         );
         snapshot.process_id =
             FieldEvidence::available(frontmost_pid, EvidenceSource::AppKitWorkspace);
@@ -1185,6 +1160,160 @@ impl TargetEvidenceAdapter for MacOsTargetEvidenceAdapter {
     fn observed_focus_epoch(&self) -> u64 {
         self.observed_epoch
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ax_window_rect(
+    window: &objc2_application_services::AXUIElement,
+) -> Result<
+    (
+        objc2_core_foundation::CGPoint,
+        objc2_core_foundation::CGSize,
+    ),
+    TargetUnavailableReason,
+> {
+    use objc2_application_services::{AXValue, AXValueType};
+    use objc2_core_foundation::{CGPoint, CGSize};
+
+    let position_value = ax_attribute(window, MacAxAttribute::Position)?
+        .downcast::<AXValue>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let size_value = ax_attribute(window, MacAxAttribute::Size)?
+        .downcast::<AXValue>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let mut position = CGPoint::default();
+    let mut size = CGSize::default();
+    // SAFETY: Both destinations are initialized, correctly aligned native
+    // geometry values and remain live for the duration of each AX call.
+    let position_ok = unsafe {
+        position_value.r#type() == AXValueType::CGPoint
+            && position_value.value(
+                AXValueType::CGPoint,
+                std::ptr::NonNull::new_unchecked(
+                    (&mut position as *mut CGPoint).cast::<std::ffi::c_void>(),
+                ),
+            )
+    };
+    let size_ok = unsafe {
+        size_value.r#type() == AXValueType::CGSize
+            && size_value.value(
+                AXValueType::CGSize,
+                std::ptr::NonNull::new_unchecked(
+                    (&mut size as *mut CGSize).cast::<std::ffi::c_void>(),
+                ),
+            )
+    };
+    if !position_ok
+        || !size_ok
+        || !position.x.is_finite()
+        || !position.y.is_finite()
+        || !size.width.is_finite()
+        || !size.height.is_finite()
+        || size.width <= 0.0
+        || size.height <= 0.0
+    {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    Ok((position, size))
+}
+
+/// Resolve AX's focused window to the public CoreGraphics window number.
+/// The window number is a live compositor object identity; unlike AX bounds,
+/// it does not change when the window moves or resizes.
+#[cfg(target_os = "macos")]
+fn cg_window_number_for_ax_window(
+    expected_pid: u32,
+    position: objc2_core_foundation::CGPoint,
+    size: objc2_core_foundation::CGSize,
+) -> Result<u32, TargetUnavailableReason> {
+    use objc2_core_foundation::{CFArray, CFDictionary, CFRetained, CGRect};
+    use objc2_core_graphics::{
+        CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption,
+        kCGNullWindowID, kCGWindowBounds, kCGWindowNumber, kCGWindowOwnerPID,
+    };
+
+    let info = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )
+    .ok_or(TargetUnavailableReason::MissingCapability)?;
+    // CoreGraphics documents this return as an array of CFDictionary entries.
+    // The cast only supplies that documented element type to objc2.
+    let info: CFRetained<CFArray<CFDictionary>> = unsafe { CFRetained::cast_unchecked(info) };
+    let owner_pid_key = unsafe { kCGWindowOwnerPID };
+    let window_number_key = unsafe { kCGWindowNumber };
+    let bounds_key = unsafe { kCGWindowBounds };
+    let mut matches = Vec::new();
+    for dictionary in info.iter() {
+        let owner_pid = cg_number_value(dictionary, owner_pid_key)?;
+        if owner_pid != i64::from(expected_pid) {
+            continue;
+        }
+        let bounds_value = cg_dictionary_value(dictionary, bounds_key)
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        let bounds_dictionary = bounds_value
+            .downcast_ref::<CFDictionary>()
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        let mut bounds = CGRect::default();
+        // SAFETY: `bounds_dictionary` is checked as a CFDictionary and
+        // `bounds` is an initialized writable CGRect. CoreGraphics validates
+        // the dictionary's typed geometry fields before returning true.
+        let bounds_ok =
+            unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds_dictionary), &mut bounds) };
+        if !bounds_ok {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+        if (
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ) != (position.x, position.y, size.width, size.height)
+        {
+            continue;
+        }
+        let window_number = cg_number_value(dictionary, window_number_key)?;
+        let window_number = u32::try_from(window_number)
+            .ok()
+            .filter(|number| *number != 0)
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        matches.push(window_number);
+    }
+    match matches.as_slice() {
+        [window_number] => Ok(*window_number),
+        [] => Err(TargetUnavailableReason::FocusIdentityUnavailable),
+        _ => Err(TargetUnavailableReason::AmbiguousOutput),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_dictionary_value<'a>(
+    dictionary: &'a objc2_core_foundation::CFDictionary,
+    key: &objc2_core_foundation::CFString,
+) -> Option<&'a objc2_core_foundation::CFType> {
+    use objc2_core_foundation::{CFDictionary, CFString, CFType};
+
+    // CGWindowList dictionaries are dynamically typed. Reinterpret only the
+    // generic parameters (the CF object layout is identical), then downcast
+    // each value before use.
+    let typed =
+        unsafe { &*(dictionary as *const CFDictionary).cast::<CFDictionary<CFString, CFType>>() };
+    // SAFETY: `typed` supplies the actual key/value CF types documented for a
+    // CGWindowList entry; the returned reference lives no longer than `dictionary`.
+    unsafe { typed.get_unchecked(key) }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_number_value(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: &objc2_core_foundation::CFString,
+) -> Result<i64, TargetUnavailableReason> {
+    use objc2_core_foundation::CFNumber;
+
+    cg_dictionary_value(dictionary, key)
+        .and_then(|value| value.downcast_ref::<CFNumber>())
+        .and_then(CFNumber::as_i64)
+        .ok_or(TargetUnavailableReason::QueryMismatch)
 }
 
 #[cfg(target_os = "macos")]

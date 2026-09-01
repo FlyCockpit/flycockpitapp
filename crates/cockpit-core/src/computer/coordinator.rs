@@ -54,7 +54,7 @@ use super::observation::{
     GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
 };
 use super::target::{
-    BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
+    BackendKind, FieldEvidence, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
     TargetUnavailableReason,
 };
 use super::{
@@ -941,9 +941,9 @@ impl HostInputArbiter {
         self.try_acquire_with_key(target_key, &arbitration_key, delegation)
     }
 
-    /// Acquire a macOS physical-input lease. CGEvent injection is scoped to
-    /// the login session rather than one monitor, so every display in that
-    /// session must share the same arbitration key.
+    /// Acquire a macOS physical-input lease. CGEvent posts reach the host-wide
+    /// HID event tap, not a process audit session or one display. Every
+    /// Cockpit injector on this host must therefore contend on one key.
     fn try_acquire_macos(
         &mut self,
         target_key: &PhysicalTargetKey,
@@ -951,10 +951,13 @@ impl HostInputArbiter {
     ) -> AcquireResult {
         let arbitration_key = PhysicalTargetKey::new(
             target_key.host_installation_id,
-            target_key.platform_session_or_seat_id,
             crate::computer::host_identity::domain_hash(
-                b"cockpit.macos.input-arbiter.v1",
-                &[&target_key.platform_session_or_seat_id],
+                b"cockpit.macos.global-hid.session.v1",
+                &[target_key.host_installation_id.as_bytes()],
+            ),
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.macos.global-hid.display.v1",
+                &[target_key.host_installation_id.as_bytes()],
             ),
         );
         self.try_acquire_with_key(target_key, &arbitration_key, delegation)
@@ -1316,6 +1319,24 @@ async fn acquire_host_lease(
             }
         }
     }
+}
+
+/// macOS currently composes its backend against the main display. Compare the
+/// independently sampled backend geometry with AX/CoreGraphics target evidence
+/// before taking a lease, so a display reconfiguration cannot bind one surface
+/// for capture/coordinates and another for authorization.
+fn macos_evidence_matches_backend_geometry(
+    evidence: &TargetIdentityEvidence,
+    geometry: &DisplayGeometry,
+) -> bool {
+    let FieldEvidence::Available { value, .. } = &evidence.desktop_geometry else {
+        return false;
+    };
+    value.x == 0
+        && value.y == 0
+        && value.width == geometry.physical.width
+        && value.height == geometry.physical.height
+        && value.scale.to_bits() == geometry.scale_factor.0.to_bits()
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,6 +2891,13 @@ impl ComputerActionCoordinator {
             }
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
+                    if backend_kind == BackendKind::RealDesktopMacOs
+                        && !macos_evidence_matches_backend_geometry(&evidence, &geometry)
+                    {
+                        return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                            "matching macOS backend and target display geometry",
+                        ));
+                    }
                     focus_generation = TargetGeneration(evidence.focus_generation);
                     // Pin the virtual display identity for lease scoping. For
                     // physical targets this stays `None` (they scope by host
@@ -5750,6 +5778,8 @@ mod tests {
         let display_a = physical_key();
         let mut display_b = display_a;
         display_b.physical_display_id = [99; 32];
+        // Audit sessions do not partition the global HID event tap.
+        display_b.platform_session_or_seat_id = [98; 32];
 
         let token_a = match arbiter_a
             .try_acquire_macos(&display_a, DelegationId("macos-display-a".to_string()))

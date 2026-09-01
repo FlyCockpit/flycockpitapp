@@ -35221,6 +35221,17 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
     )
     .await
     .unwrap();
+    let visible_seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "older visible row"}),
+        )
+        .await
+        .unwrap();
     let recorded_seq = ctx
         .db
         .insert_session_event(
@@ -35259,7 +35270,7 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
     let response = handle_request(
         Request::Attach {
             session_id: Some(session.session_id),
-            since_seq: Some(recorded_seq),
+            since_seq: Some(0),
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
             initial_model: None,
             no_sandbox: false,
@@ -35290,11 +35301,14 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
             _ => None,
         })
         .expect("durable retraction replay");
-    assert!(replay.0.is_empty());
+    assert!(matches!(
+        replay.0.as_slice(),
+        [proto::HistoryEntry::User { seq, text, .. }] if *seq == visible_seq && text == "older visible row"
+    ));
     assert_eq!(replay.1.as_slice(), &[recorded_seq]);
     assert!(
         replay.2 > recorded_seq,
-        "tombstone advances the replay cursor"
+        "the replay cursor covers the newer tombstone, not only the older displayed row"
     );
 }
 

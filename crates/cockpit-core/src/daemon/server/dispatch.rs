@@ -28284,11 +28284,6 @@ pub(super) async fn attach(
     };
     if let Some(max_seq) = replay_max_seq {
         if !history.is_empty() || !removed_user_message_seqs.is_empty() {
-            let max_seq = history
-                .iter()
-                .map(history_entry_seq)
-                .max()
-                .unwrap_or(max_seq);
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,

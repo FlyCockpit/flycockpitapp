@@ -4224,12 +4224,10 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
         if entries.is_empty() && removed_user_message_seqs.is_empty() {
             return;
         }
-        let applied_max_seq = entries
-            .iter()
-            .filter_map(history_entry_seq)
-            .max()
-            .unwrap_or(max_seq);
-        update_last_applied_seq(ctx.last_applied_seq, applied_max_seq);
+        // `max_seq` covers every durable replay row, including retraction
+        // tombstones that deliberately have no display entry. Advancing only
+        // to the displayed entry would replay the tombstone on each reconnect.
+        update_last_applied_seq(ctx.last_applied_seq, max_seq);
         push_incoming_turn_event(
             ctx,
             TurnEvent::HistoryReplay {
@@ -7439,8 +7437,11 @@ mod tests {
         apply_incoming_event(
             proto::Event::HistoryReplay {
                 session_id: sid,
-                max_seq: 7,
-                removed_user_message_seqs: Vec::new(),
+                // The displayed rows end at 7, but the durable retraction
+                // tombstone is sequence 8. The cursor must advance through
+                // the tombstone so reconnect does not replay it forever.
+                max_seq: 8,
+                removed_user_message_seqs: vec![5],
                 entries: vec![
                     proto::HistoryEntry::ToolCall {
                         seq: 6,
@@ -7474,7 +7475,7 @@ mod tests {
             },
             &incoming,
         );
-        assert_eq!(current_last_applied_seq(&last), Some(7));
+        assert_eq!(current_last_applied_seq(&last), Some(8));
 
         apply_incoming_event(
             proto::Event::ToolEnd {
@@ -7484,7 +7485,7 @@ mod tests {
                 tool: "read".to_string(),
                 output: "overlap".to_string(),
                 truncated: false,
-                seq: Some(7),
+                seq: Some(8),
                 hint: None,
             },
             &incoming,
@@ -7499,7 +7500,7 @@ mod tests {
                 tool: "bash".to_string(),
                 output: "live".to_string(),
                 truncated: false,
-                seq: Some(8),
+                seq: Some(9),
                 hint: None,
             },
             &incoming,
@@ -7512,11 +7513,11 @@ mod tests {
             &drained[1],
             TurnEvent::ToolEnd {
                 output,
-                seq: Some(8),
+                seq: Some(9),
                 ..
             } if output == "live"
         ));
-        assert_eq!(current_last_applied_seq(&last), Some(8));
+        assert_eq!(current_last_applied_seq(&last), Some(9));
     }
 
     struct FixedJitter {

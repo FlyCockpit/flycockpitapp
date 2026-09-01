@@ -58,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -83,6 +83,16 @@ use crate::{
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::{InferenceSendIdentity, Session};
+
+/// Serializes the detached automatic-title write with retraction of the user
+/// message that triggered it. A retraction either fences the write before it
+/// happens or observes its exact generated title for the rollback CAS; it can
+/// never abort the task between those two ownership steps.
+#[derive(Default)]
+struct RetractableAutoTitleState {
+    retracted: bool,
+    persisted_title: Option<String>,
+}
 
 /// Out-of-band control requests routed to the driver from the daemon
 /// worker — `/prune`, `/compact`, `/pin`. Drained on the same boundary
@@ -12628,24 +12638,44 @@ impl Driver {
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
             let title_session = Arc::clone(&session);
-            auto_title_task = Some(tokio::spawn(async move {
-                let title_before = title_session.title();
-                crate::auto_title::generate_session_title(
-                    session,
-                    extended,
-                    providers,
-                    redact,
-                    content_prefix,
-                    title_action,
-                    Some(shutdown_gate),
-                    tx,
-                )
-                .await;
-                let title_after = title_session.title();
-                (title_after != title_before)
-                    .then_some(title_after)
-                    .flatten()
-            }));
+            let title_state = Arc::new(Mutex::new(RetractableAutoTitleState::default()));
+            let task_title_state = Arc::clone(&title_state);
+            auto_title_task = Some((
+                title_state,
+                tokio::spawn(async move {
+                    let session_for_persist = Arc::clone(&title_session);
+                    crate::auto_title::generate_session_title_with_persist(
+                        session,
+                        extended,
+                        providers,
+                        redact,
+                        content_prefix,
+                        title_action,
+                        Some(shutdown_gate),
+                        tx,
+                        move |title, action| {
+                            // Hold this short synchronous critical section over both
+                            // the durable write and its rollback identity handoff.
+                            // Retraction takes the same mutex before aborting this
+                            // task, so an abort cannot strand a title derived solely
+                            // from the removed user row.
+                            let mut state = task_title_state.lock().unwrap();
+                            if state.retracted {
+                                return Ok(());
+                            }
+                            let stored = session_for_persist.set_auto_title(title)?;
+                            if stored && matches!(action, crate::session::TitleAction::Eager) {
+                                session_for_persist.mark_eager_titled();
+                            }
+                            if stored {
+                                state.persisted_title = Some(title.to_owned());
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await;
+                }),
+            ));
         }
 
         // Skills auto-selection (GOALS §5): consult the cheap utility
@@ -13178,9 +13208,19 @@ impl Driver {
                                 false
                             })
                     {
-                        let generated_title = if let Some(task) = auto_title_task.take() {
+                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
+                            // The state handoff and the durable title write share
+                            // one mutex. Marking retracted before aborting either
+                            // prevents a later write or captures the exact title
+                            // already written for the rollback predicate.
+                            let generated_title = {
+                                let mut state = title_state.lock().unwrap();
+                                state.retracted = true;
+                                state.persisted_title.clone()
+                            };
                             task.abort();
-                            task.await.ok().flatten()
+                            let _ = task.await;
+                            generated_title
                         } else {
                             None
                         };

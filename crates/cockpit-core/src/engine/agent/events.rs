@@ -415,7 +415,9 @@ pub enum TurnEvent {
     /// UI-only progress tick for a running tool row. Generic by design:
     /// producers send numeric progress and the client owns formatting.
     ToolProgress(ToolProgress),
-    /// Tool finished. `output` is what the model will see next turn.
+    /// Tool finished. `output` is the durable/display projection. It normally
+    /// matches model history; tools with schema-marked model-ephemeral output
+    /// may provide a richer UI-only value.
     ToolEnd {
         agent: String,
         call_id: String,

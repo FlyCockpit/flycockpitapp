@@ -233,6 +233,13 @@ fn rendered_result_output(
         .redact
         .scrub(&envelope.artifacts.join("\n"))
         .into_owned();
+    let display = (!display_lane.is_empty()).then(|| {
+        if model.is_empty() {
+            display_lane
+        } else {
+            format!("{model}\n{display_lane}")
+        }
+    });
 
     let (model_inline, automatic_capture) = if model.len() > OUTPUT_BYTE_CAP {
         (
@@ -244,22 +251,27 @@ fn rendered_result_output(
     };
 
     let explicit_capture = (!attached.is_empty()).then(|| capture_text_artifact_body(&attached));
-    let capture = explicit_capture.or(automatic_capture);
+    let display_capture = display
+        .as_ref()
+        .filter(|display| display.len() > OUTPUT_BYTE_CAP)
+        .map(|display| capture_text_artifact_body(display));
+    let model_capture = explicit_capture.or(automatic_capture);
+    let display_capture_is_model_ephemeral = model_capture.is_none() && display_capture.is_some();
+    let capture = model_capture.or(display_capture);
     let mut output = if capture.is_some() {
         ToolOutput::truncated_text(model_inline)
     } else {
         ToolOutput::text(model_inline)
     };
     if let Some(capture) = capture {
-        output = output.with_text_artifact_capture(capture);
+        output = if display_capture_is_model_ephemeral {
+            output.with_model_ephemeral_text_artifact_capture(capture)
+        } else {
+            output.with_text_artifact_capture(capture)
+        };
     }
 
-    if !display_lane.is_empty() {
-        let display = if model.is_empty() {
-            display_lane
-        } else {
-            format!("{model}\n{display_lane}")
-        };
+    if let Some(display) = display {
         output = output.with_model_ephemeral_display(truncate_head_tail(
             &display,
             OUTPUT_BYTE_CAP,
@@ -475,6 +487,29 @@ mod tests {
         assert!(!display.contains("monty-secret-value"), "{display}");
         let capture = output.text_artifact_capture.as_ref().unwrap();
         assert_eq!(capture.content, "artifact [redacted]");
+    }
+
+    #[test]
+    fn oversized_display_lane_spills_without_changing_model_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let display = "d".repeat(OUTPUT_BYTE_CAP + 64);
+        let output = rendered_result_output(
+            crate::mcp::sandbox::ProjectionEnvelope {
+                model: vec!["small model result".to_string()],
+                display: vec![display.clone()],
+                ..Default::default()
+            },
+            &ctx,
+        );
+
+        assert_eq!(output.content, "small model result");
+        assert!(output.display_content.as_ref().unwrap().len() <= OUTPUT_BYTE_CAP);
+        assert!(output.text_artifact_model_ephemeral);
+        assert_eq!(
+            output.text_artifact_capture.as_ref().unwrap().content,
+            format!("small model result\n{display}")
+        );
     }
 
     #[tokio::test]

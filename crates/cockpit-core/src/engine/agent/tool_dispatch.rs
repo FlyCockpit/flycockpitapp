@@ -2228,6 +2228,10 @@ async fn execute_ordinary_call_unscoped(
     // automatic capture of ordinary inline results, not the tool's explicit
     // durable artifact contract.
     let explicit_artifact_capture = artifact_capture.is_some();
+    let artifact_model_ephemeral = result
+        .as_ref()
+        .ok()
+        .is_some_and(|output| output.text_artifact_model_ephemeral);
     if artifact_capture.is_none()
         && canonical_result_is_text_only
         && result.as_ref().is_ok_and(|output| !output.truncated)
@@ -2414,6 +2418,9 @@ async fn execute_ordinary_call_unscoped(
                 .is_some_and(|projected| projected.parts() != output.content.parts())
     }) {
         event_data["model_projection_required"] = Value::Bool(true);
+    }
+    if artifact_model_ephemeral {
+        event_data["artifact_model_ephemeral"] = Value::Bool(true);
     }
     // Name-repair surfacing (§14): when the emitted tool NAME was repaired
     // (rebound or charset-sanitized), `tool` above is the wire/model form;
@@ -2621,6 +2628,9 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     };
+    if artifact_model_ephemeral {
+        model_artifact_frame = None;
+    }
     // The verification projection is an audit relation to this exact durable
     // ordinary ToolCall event. It must never create a second synthetic
     // `verification:*` tool-call pair. If the canonical event could not be
@@ -3328,6 +3338,11 @@ mod tests {
                     })
                     .with_model_ephemeral_display(
                         "kept result\nmodel ephemeral display sentinel",
+                    )
+                    .with_model_ephemeral_text_artifact_capture(
+                        crate::intel::budget::capture_text_artifact_body(
+                            "model ephemeral artifact sentinel",
+                        ),
                     )
             })
         }
@@ -6299,6 +6314,7 @@ mod tests {
         const RESOURCE_SECRET: &str = "resource metadata sentinel";
         const SIDECAR_SECRET: &str = "sidecar metadata sentinel";
         const DISPLAY_ONLY: &str = "model ephemeral display sentinel";
+        const ARTIFACT_ONLY: &str = "model ephemeral artifact sentinel";
         const NATIVE_SANDBOX: &str = "native sandbox result";
         const NATIVE_RESOURCE: &str = "native resource result";
         const NATIVE_SIDECAR: &str = "native sidecar result";
@@ -6346,6 +6362,7 @@ mod tests {
         assert!(!live_wire.contains(RESOURCE_SECRET), "{live_wire}");
         assert!(!live_wire.contains(SIDECAR_SECRET), "{live_wire}");
         assert!(!live_wire.contains(DISPLAY_ONLY), "{live_wire}");
+        assert!(!live_wire.contains(ARTIFACT_ONLY), "{live_wire}");
         assert!(!live_wire.contains("987654321"), "{live_wire}");
         assert!(live_wire.contains(NATIVE_SANDBOX), "{live_wire}");
         assert!(live_wire.contains(NATIVE_RESOURCE), "{live_wire}");
@@ -6381,6 +6398,7 @@ mod tests {
         assert!(event.data.to_string().contains(DISPLAY_ONLY));
         assert_eq!(event.data["exit_code"], 987_654_321);
         assert_eq!(event.data["model_projection_required"], true);
+        assert_eq!(event.data["artifact_model_ephemeral"], true);
         assert!(
             !event.data["canonical_output_text"]
                 .to_string()
@@ -6404,12 +6422,23 @@ mod tests {
         assert!(!restart_wire.contains(RESOURCE_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(SIDECAR_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(DISPLAY_ONLY), "{restart_wire}");
+        assert!(!restart_wire.contains(ARTIFACT_ONLY), "{restart_wire}");
         assert!(!restart_wire.contains("987654321"), "{restart_wire}");
         assert!(restart_wire.contains("kept argument"), "{restart_wire}");
         assert!(restart_wire.contains("kept result"), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_SANDBOX), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_RESOURCE), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_SIDECAR), "{restart_wire}");
+        let artifacts = session
+            .db
+            .list_text_artifacts(session.id)
+            .await
+            .unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.content == ARTIFACT_ONLY)
+        );
         assert_eq!(last_tool_result_json(&restarted.history)["exit_code"], 73);
     }
 

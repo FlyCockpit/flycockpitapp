@@ -40,8 +40,8 @@ pub const MODEL_EPHEMERAL_SCHEMA_KEY: &str = "x-cockpit-model-ephemeral";
 ///   their own model-history insertion boundaries in `agent::turn_phases`;
 /// - structured built-in and native/custom results are projected at the same
 ///   boundary and the projected canonical result is the restart authority;
-/// - MCP dispatch is deliberately unchanged because MCP schemas/results do not
-///   participate in this host-owned marker contract;
+/// - external MCP schemas/results remain unchanged, while Monty's host-owned
+///   `show` lane is carried by `ToolOutput` display metadata marked below;
 /// - the existing `ToolOutput` sandbox, exit-code, resource, and output-sidecar
 ///   exclusions are expressed by `ToolOutput::result_metadata_schema` below.
 ///
@@ -1123,6 +1123,10 @@ pub struct ToolOutput {
     /// the dispatcher turns it into an immutable text artifact together with
     /// the owning event.
     pub text_artifact_capture: Option<TextArtifactCapture>,
+    /// Whether `text_artifact_capture` belongs only to the display projection.
+    /// Such an artifact is retained with the durable event but must never
+    /// replace the model result in live or rehydrated history.
+    pub text_artifact_model_ephemeral: bool,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -1552,6 +1556,7 @@ impl ToolOutput {
             repeat_guard: None,
             truncated: false,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1569,6 +1574,7 @@ impl ToolOutput {
             repeat_guard: None,
             truncated: true,
             text_artifact_capture: None,
+            text_artifact_model_ephemeral: false,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -1596,6 +1602,15 @@ impl ToolOutput {
 
     pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
         self.text_artifact_capture = Some(capture);
+        self
+    }
+
+    pub fn with_model_ephemeral_text_artifact_capture(
+        mut self,
+        capture: TextArtifactCapture,
+    ) -> Self {
+        self.text_artifact_capture = Some(capture);
+        self.text_artifact_model_ephemeral = true;
         self
     }
 

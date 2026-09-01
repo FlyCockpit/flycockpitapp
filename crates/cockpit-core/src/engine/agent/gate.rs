@@ -1417,6 +1417,7 @@ mod safety_gate_tests {
                 repeat_guard: None,
                 truncated: false,
                 text_artifact_capture: None,
+                text_artifact_model_ephemeral: false,
                 recovery: None,
                 canonical_args: None,
                 sandbox: None,

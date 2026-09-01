@@ -186,13 +186,15 @@ pub async fn run_envelope_with_host(
                 };
             }
             RunProgress::NameLookup(lookup) => {
-                // Only `mcp` is provided (as an input). Any other free name
-                // is undefined — the script must use `mcp.*` exclusively.
+                // The namespace and projection functions are prebound inputs.
+                // Any other free name is undefined.
                 let name = lookup.name.clone();
                 if let Some(recorder) = &host.child_events {
                     recorder.finish_suppressed().await;
                 }
-                bail!("name `{name}` is not defined in the MCP sandbox (only `mcp` is available)");
+                bail!(
+                    "name `{name}` is not defined in the MCP sandbox (available host names: mcp, emit, show, notify, attach)"
+                );
             }
             RunProgress::OsCall(call) => {
                 // Deny-by-default: no filesystem, no env, no OS access. The

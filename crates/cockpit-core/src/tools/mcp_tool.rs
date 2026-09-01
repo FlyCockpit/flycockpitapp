@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{Tool, ToolArtifactLane, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, invalid_input};
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
@@ -97,6 +97,27 @@ const DEFENSIVE_DESCRIPTION_PREFIX: &str = "Execute a Python script in an isolat
      printed output is captured and returned as a fallback. The VM has no direct filesystem, \
      socket, or environment access. Enabled packages: ";
 const DEFENSIVE_DESCRIPTION_SUFFIX: &str = ". `requests`, when listed, uses the host's explicit user-granted host allowlist, whole-request redaction, revocation generation fence, and optional approval. Every host function remains subject to the same authorization as a native tool call.";
+
+pub(crate) async fn turn_start_advert_message(
+    _toolbox: &ToolBox,
+    session: &crate::session::Session,
+) -> Option<String> {
+    let mut adverts = Vec::new();
+    if session
+        .db
+        .current_session_goal(session.id, false)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        adverts.push(
+            "A goal is active; if context pressure builds (check mcp.invoke(\"cockpit\", \"context_usage\", {})), you may schedule compaction via mcp.invoke(\"cockpit\", \"request_compact\", {})."
+                .to_string(),
+        );
+    }
+    advert_message_from_lines(&adverts)
+}
 
 pub(crate) fn advert_message_from_lines(adverts: &[String]) -> Option<String> {
     if adverts.is_empty() {
@@ -729,6 +750,41 @@ mod tests {
         );
         assert_eq!(plain.content, with_children.content);
         assert_eq!(plain.truncated, with_children.truncated);
+    }
+
+    #[tokio::test]
+    async fn advert_compact_follows_goal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let toolbox = ToolBox::new().with(Arc::new(McpTool::default()));
+
+        ctx.session
+            .db
+            .create_session_goal(
+                ctx.session.id,
+                &ctx.session.project_id,
+                "ship feature",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let message = turn_start_advert_message(&toolbox, &ctx.session)
+            .await
+            .unwrap();
+        assert!(message.contains("request_compact"), "{message}");
+        assert!(message.contains("context_usage"), "{message}");
+
+        ctx.session
+            .db
+            .clear_session_goal(ctx.session.id)
+            .await
+            .unwrap();
+        assert!(
+            turn_start_advert_message(&toolbox, &ctx.session)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

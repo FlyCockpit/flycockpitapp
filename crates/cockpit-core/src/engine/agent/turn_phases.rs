@@ -3787,6 +3787,15 @@ async fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    if active_tool_names.contains(&"mcp")
+        && let Some(nudge) =
+            crate::tools::mcp_tool::turn_start_advert_message(active_tools, session).await
+        && !history
+            .iter()
+            .any(|message| matches!(message, Message::System { content } if content == &nudge))
+    {
+        history.push(Message::System { content: nudge });
+    }
     Ok(())
 }
 

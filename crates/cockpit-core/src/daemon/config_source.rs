@@ -82,6 +82,8 @@ impl ConfigWatchPaths {
 /// [`with_workspace_trust_policy`](crate::config::trust::with_workspace_trust_policy)
 /// (via [`Self::load_with_trust`]) so workspace-trust gating of project
 /// layers applies identically to the production source and any injected one.
+/// The canonical global config directory is user-owned and remains available
+/// under every workspace policy; only project `.cockpit/` layers are filtered.
 #[derive(Clone)]
 pub struct ConfigSource {
     load: Arc<LoadFn>,

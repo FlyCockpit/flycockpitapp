@@ -1572,11 +1572,10 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     path_covers(a, b) || path_covers(b, a)
 }
 
-/// `<global config dir>` for approvals. We prefer `~/.config/cockpit`
-/// (XDG-canonical), the same home-scoped layer config discovery treats
-/// as the user-level config root.
+/// `<global config dir>` for approvals. This is the same platform-default
+/// user-level config root used by layered discovery.
 pub fn global_approvals_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config/cockpit"))
+    crate::config::dirs::global_config_dir().ok()
 }
 
 /// Machine-local approvals dir for a project root. This is keyed through

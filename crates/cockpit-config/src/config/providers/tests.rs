@@ -32,7 +32,9 @@ fn provider_atomic_writes_are_private_under_a_permissive_umask() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        child_root.join("home/.cockpit/config.json").is_file(),
+        child_root
+            .join("home/.config/cockpit/config.json")
+            .is_file(),
         "the isolated child test must have executed"
     );
 }
@@ -59,7 +61,7 @@ fn run_private_atomic_write_umask_case(root: &Path) {
     // so no sibling test can observe this deliberately permissive umask.
     let _umask = UmaskRestore(unsafe { libc::umask(0o000) });
 
-    let config_path = root.join("home/.cockpit/config.json");
+    let config_path = root.join("home/.config/cockpit/config.json");
     let provider_path = provider_file_path_for_config(&config_path, "private-provider").unwrap();
     let mut doc = ConfigDoc::load(&config_path).unwrap();
     let mut cfg = ProvidersConfig {

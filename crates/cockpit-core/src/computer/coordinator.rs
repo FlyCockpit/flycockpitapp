@@ -941,6 +941,25 @@ impl HostInputArbiter {
         self.try_acquire_with_key(target_key, &arbitration_key, delegation)
     }
 
+    /// Acquire a macOS physical-input lease. CGEvent injection is scoped to
+    /// the login session rather than one monitor, so every display in that
+    /// session must share the same arbitration key.
+    fn try_acquire_macos(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let arbitration_key = PhysicalTargetKey::new(
+            target_key.host_installation_id,
+            target_key.platform_session_or_seat_id,
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.macos.input-arbiter.v1",
+                &[&target_key.platform_session_or_seat_id],
+            ),
+        );
+        self.try_acquire_with_key(target_key, &arbitration_key, delegation)
+    }
+
     fn try_acquire_with_key(
         &mut self,
         target_key: &PhysicalTargetKey,
@@ -1269,10 +1288,14 @@ async fn acquire_host_lease(
     loop {
         let acquired = {
             let mut arbiter = lock_poison_safe(arbiter);
-            if backend_kind == BackendKind::RealDesktopX11 {
-                arbiter.try_acquire_x11(physical_key, delegation.clone())
-            } else {
-                arbiter.try_acquire(physical_key, delegation.clone())
+            match backend_kind {
+                BackendKind::RealDesktopX11 => {
+                    arbiter.try_acquire_x11(physical_key, delegation.clone())
+                }
+                BackendKind::RealDesktopMacOs => {
+                    arbiter.try_acquire_macos(physical_key, delegation.clone())
+                }
+                _ => arbiter.try_acquire(physical_key, delegation.clone()),
             }
         };
         match acquired {
@@ -5716,6 +5739,34 @@ mod tests {
         let other_backend =
             arbiter_b.try_acquire(&monitor_b, DelegationId("non-x11-monitor-b".to_string()));
         assert!(matches!(other_backend, AcquireResult::Acquired(_)));
+    }
+
+    #[test]
+    fn macos_arbiter_serializes_all_displays_in_one_login_session() {
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let mut arbiter_a =
+            HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
+        let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(2));
+        let display_a = physical_key();
+        let mut display_b = display_a;
+        display_b.physical_display_id = [99; 32];
+
+        let token_a = match arbiter_a.try_acquire_macos(
+            &display_a,
+            DelegationId("macos-display-a".to_string()),
+        ) {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("first macOS display should acquire, got {other:?}"),
+        };
+        assert_eq!(token_a.target_key, display_a);
+        assert_ne!(token_a.arbitration_key, display_a);
+        assert!(matches!(
+            arbiter_b.try_acquire_macos(
+                &display_b,
+                DelegationId("macos-display-b".to_string()),
+            ),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
     }
 
     #[test]

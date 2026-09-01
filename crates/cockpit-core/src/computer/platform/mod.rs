@@ -14,6 +14,8 @@ pub use macos::{
     MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,
     TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
 };
+#[cfg(target_os = "macos")]
+pub use macos::MacOsTargetEvidenceAdapter;
 pub use wayland::{
     WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,
     WaylandTargetEvidenceProvider, evaluate_wayland_provider,

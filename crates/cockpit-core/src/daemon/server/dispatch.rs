@@ -19761,9 +19761,24 @@ async fn daemon_provider_config(
     ),
     ErrorPayload,
 > {
-    let cwd = std::path::PathBuf::from(project_root);
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
+    }
+    let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    if global_config_root(&cwd)? {
+        let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        let config = crate::config::providers::ConfigDoc::load(&global_config)
+            .map_err(daemon_config_error)?
+            .providers();
+        let root = crate::config::trust::resolve_trust_root(&cwd).map_err(internal)?;
+        return Ok((
+            cwd,
+            crate::config::trust::WorkspaceTrustPolicy {
+                root,
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            config,
+        ));
     }
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
@@ -19773,6 +19788,15 @@ async fn daemon_provider_config(
         .load_effective_for_daemon(&cwd, &trust_policy)
         .map_err(daemon_config_error)?;
     Ok((cwd, trust_policy, config))
+}
+
+/// A catalog rooted at the canonical global config directory is onboarding
+/// authority, not a workspace setting. It is intentionally the only
+/// trust-free root accepted by the provider mutation capability path.
+fn global_config_root(root: &std::path::Path) -> std::result::Result<bool, ErrorPayload> {
+    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
+    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
+    Ok(root == canonical_global)
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -19826,11 +19850,18 @@ async fn provider_catalog_snapshot(
     // it just cannot mint an edit capability. Clients treat the absent
     // capability fields as read-only and an empty `layer_id` as "no editable
     // layer"; a later mutation attempt fails the capability lookup instead.
-    let target_path =
+    let target_path = if global_config_root(&cwd)? {
+        cockpit_config::config::dirs::global_config_file()
+            .ok()
+            .and_then(|config| {
+                crate::config::providers::provider_file_path_for_config(&config, "default").ok()
+            })
+    } else {
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
-        });
+        })
+    };
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -19864,22 +19895,27 @@ async fn provider_catalog_snapshot(
     } else {
         String::new()
     };
-    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-    let mcp_scope_targets = ["global", "workspace"]
-        .into_iter()
-        .filter_map(|scope| {
-            let target =
-                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                    cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope)
-                })?;
-            let path = target
-                .parent()?
-                .join(cockpit_config::config::dirs::MCP_FILE);
-            let path = canonical_mcp_target_path(&path).ok()?;
-            let revision = mcp_target_layer_revision(&path).ok()?;
-            Some((scope.to_string(), (path, revision)))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let (mcp, mcp_scope_targets) = if global_config_root(&cwd)? {
+        (None, std::collections::BTreeMap::new())
+    } else {
+        let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+        let targets = ["global", "workspace"]
+            .into_iter()
+            .filter_map(|scope| {
+                let target = crate::config::trust::with_workspace_trust_policy(
+                    trust_policy.clone(),
+                    || cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope),
+                )?;
+                let path = target
+                    .parent()?
+                    .join(cockpit_config::config::dirs::MCP_FILE);
+                let path = canonical_mcp_target_path(&path).ok()?;
+                let revision = mcp_target_layer_revision(&path).ok()?;
+                Some((scope.to_string(), (path, revision)))
+            })
+            .collect();
+        (mcp, targets)
+    };
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -21201,11 +21237,17 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
-    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        ctx.config_source()
-            .config_write_target_for_provider(&cwd, "default")
-    })
-    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = if global_config_root(&cwd)? {
+        let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+        crate::config::providers::provider_file_path_for_config(&global, "default")
+            .map_err(internal)?
+    } else {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, "default")
+        })
+        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+    };
     let target = canonical_mcp_target_path(&target)?;
     if target != capability_target {
         return Err(ErrorPayload {
@@ -21224,12 +21266,17 @@ async fn stage_and_recover_provider_batch(
                 .map(|delete| delete.provider_id.as_str()),
         )
     {
-        let provider_target =
+        let provider_target = if global_config_root(&cwd)? {
+            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+            crate::config::providers::provider_file_path_for_config(&global, provider_id)
+                .map_err(internal)?
+        } else {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 ctx.config_source()
                     .config_write_target_for_provider(&cwd, provider_id)
             })
-            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
+        };
         let provider_target = canonical_mcp_target_path(&provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(

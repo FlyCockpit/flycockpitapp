@@ -296,16 +296,17 @@ pub async fn save_extended_config(
     .await
 }
 
-/// Return every daemon-discovered settings layer. Each snapshot carries an
-/// ephemeral capability bound to this canonical trusted root, exact target,
-/// raw revision, and individual denylist occurrences.
+/// Return every daemon-discovered settings layer. A request rooted at the
+/// canonical global config directory is deliberately a global-only snapshot;
+/// it never consults workspace trust or workspace-selected layers. Every
+/// other request remains bound to a trusted workspace root.
 pub async fn get_extended_config_snapshot(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
     owner: String,
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
-    let root = trusted_settings_root(ctx, &project_root).await?;
+    let root = settings_snapshot_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction();
     join_fs_handler(
         "get_extended_config_snapshot",
@@ -679,7 +680,7 @@ pub async fn apply_extended_config_patch(
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let mutation_intent_hash = patch.sanitized_intent_hash().map_err(internal)?;
-    let root = trusted_settings_root(ctx, &project_root).await?;
+    let root = settings_snapshot_root(ctx, &project_root).await?;
     let db = ctx.db.clone();
     let runtime = tokio::runtime::Handle::current();
     let settlement_owner = owner.clone();
@@ -983,11 +984,14 @@ pub async fn apply_extended_config_patch(
     Ok(response)
 }
 
-async fn trusted_settings_root(
+async fn settings_snapshot_root(
     ctx: &DaemonContext,
     project_root: &str,
 ) -> Result<PathBuf, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
+    if is_global_config_root(&root)? {
+        return Ok(root);
+    }
     let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
         .await
         .map_err(|error| ErrorPayload {
@@ -1108,6 +1112,12 @@ fn discovered_settings_layers(
     root: &Path,
 ) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
     use cockpit_config::config::dirs::{CONFIG_FILE, ConfigDirKind as K};
+    if is_global_config_root(root)? {
+        return Ok(vec![(
+            cockpit_proto::CockpitConfigLayer::HomeXdg,
+            cockpit_config::config::dirs::global_config_file().map_err(internal)?,
+        )]);
+    }
     let mut layer_dirs = cockpit_config::config::dirs::discover_config_dirs(root);
     if let Ok(global) = cockpit_config::config::dirs::global_config_dir() {
         layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
@@ -1146,6 +1156,16 @@ fn discovered_settings_layers(
             Some((kind, target))
         })
         .collect())
+}
+
+/// `project_root` is also the capability root for settings mutations. The
+/// canonical global config directory is the one non-workspace root accepted
+/// here: its config is user-owned and must remain writable without a trust
+/// decision for whichever workspace happened to launch onboarding.
+fn is_global_config_root(root: &Path) -> Result<bool, ErrorPayload> {
+    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
+    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
+    Ok(root == canonical_global)
 }
 
 fn read_optional_config(
@@ -2875,7 +2895,7 @@ mod tests {
         let apply = source
             .split("pub async fn apply_extended_config_patch")
             .nth(1)
-            .and_then(|tail| tail.split("async fn trusted_settings_root").next())
+            .and_then(|tail| tail.split("async fn settings_snapshot_root").next())
             .expect("typed patch implementation");
         let release = apply.find("drop(_guard)").expect("config lock release");
         let prepare = apply

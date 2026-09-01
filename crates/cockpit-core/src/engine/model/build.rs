@@ -564,8 +564,11 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("authorization"))
         .map(|h| h.value.trim())
-        .filter(|value| value.starts_with("Bearer "))
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
         .map(str::trim)
         .filter(|token| !token.is_empty());
     let (api_key, uses_bearer_auth) = match (x_api_key, bearer_auth) {

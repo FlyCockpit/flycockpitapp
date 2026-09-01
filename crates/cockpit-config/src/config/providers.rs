@@ -2187,22 +2187,11 @@ impl ProviderEntry {
         self.template.as_deref()
     }
 
-    /// Resolve native Anthropic extensions without relying on the endpoint
-    /// host. A missing gate retains the first-party template default for
-    /// existing Anthropic entries while custom providers stay portable by
-    /// default. A present empty object explicitly disables both extensions.
+    /// Resolve native Anthropic extensions from the provider's explicit gate.
+    /// A missing or empty gate disables both extensions. First-party defaults
+    /// are materialized when the Anthropic template creates the entry.
     pub fn effective_anthropic_features(&self) -> AnthropicFeatures {
-        self.anthropic.unwrap_or_else(|| {
-            if self
-                .template
-                .as_deref()
-                .is_some_and(|template| template.eq_ignore_ascii_case("anthropic"))
-            {
-                AnthropicFeatures::first_party()
-            } else {
-                AnthropicFeatures::default()
-            }
-        })
+        self.anthropic.unwrap_or_default()
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.

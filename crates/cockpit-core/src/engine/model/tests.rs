@@ -6650,7 +6650,7 @@ async fn streaming_usage_accepts_input_output_aliases() {
 }
 
 #[tokio::test]
-async fn native_anthropic_dispatch_sends_canonical_user_agent() {
+async fn native_anthropic_lowercase_bearer_auth_reaches_the_wire_without_x_api_key() {
     use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
     let mut provider = anthropic_capture_provider().await;
@@ -6658,7 +6658,7 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
         base_url: provider.base_url(),
         headers: vec![ResolvedHeader {
             name: "Authorization".to_string(),
-            value: "Bearer gateway-token".to_string(),
+            value: "bearer gateway-token".to_string(),
         }],
         is_codex_credential: false,
     };
@@ -6688,7 +6688,7 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     );
     assert_eq!(
         request_header_value(&request.headers, "authorization"),
-        Some("Bearer gateway-token")
+        Some("bearer gateway-token")
     );
     assert_eq!(
         request_header_value(&request.headers, "x-api-key"),

@@ -2,22 +2,33 @@ use super::*;
 use tempfile::TempDir;
 
 #[test]
-fn anthropic_features_default_by_template_without_endpoint_host_detection() {
-    let first_party = ProviderEntry {
+fn anthropic_features_require_an_explicit_provider_gate() {
+    let template_without_gate = ProviderEntry {
         template: Some("anthropic".to_string()),
         url: "https://anthropic.nahcrof.com/v1".to_string(),
         ..ProviderEntry::default()
     };
+    assert!(
+        template_without_gate
+            .effective_anthropic_features()
+            .is_empty()
+    );
+
+    let explicitly_enabled = ProviderEntry {
+        template: Some("anthropic".to_string()),
+        anthropic: Some(AnthropicFeatures::first_party()),
+        ..ProviderEntry::default()
+    };
     assert_eq!(
-        first_party.effective_anthropic_features(),
+        explicitly_enabled.effective_anthropic_features(),
         AnthropicFeatures::first_party()
     );
 
-    let custom = ProviderEntry {
+    let host_without_gate = ProviderEntry {
         url: "https://api.anthropic.com/v1".to_string(),
         ..ProviderEntry::default()
     };
-    assert!(custom.effective_anthropic_features().is_empty());
+    assert!(host_without_gate.effective_anthropic_features().is_empty());
 
     let explicit_disable = ProviderEntry {
         template: Some("anthropic".to_string()),

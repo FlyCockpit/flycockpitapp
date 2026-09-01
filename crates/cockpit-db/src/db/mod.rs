@@ -1908,7 +1908,9 @@ fn validate_unix_backup_lock_ancestry(path: &Path) -> Result<()> {
         let owner_trusted =
             ancestor_metadata.uid() == effective_uid || ancestor_metadata.uid() == 0;
         let child_trusted = child_metadata.uid() == effective_uid || child_metadata.uid() == 0;
-        if mode & libc::S_ISVTX != 0 {
+        // `S_ISVTX` is `mode_t`, which is u32 on Linux but u16 on Darwin, while
+        // `PermissionsExt::mode()` is always u32 — widen so this compiles on both.
+        if mode & u32::from(libc::S_ISVTX) != 0 {
             // Sticky ancestor: only `C`'s owner, `A`'s owner, and root may
             // replace the entry `C`, so all three must be trusted. This is the
             // sole justified sticky exception (e.g. a root-owned `1777 /tmp`
@@ -2912,7 +2914,11 @@ fn filesystem_available_bytes(path: &Path) -> Result<Option<u64>> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    Ok(Some(stats.f_bavail.saturating_mul(stats.f_frsize)))
+    // `f_bavail` and `f_frsize` do not share a width across platforms (both u64 on
+    // Linux; `c_uint` and `c_ulong` on Darwin), so widen both before multiplying
+    // and clamp back down rather than relying on same-type arithmetic.
+    let available_bytes = u128::from(stats.f_bavail).saturating_mul(u128::from(stats.f_frsize));
+    Ok(Some(u64::try_from(available_bytes).unwrap_or(u64::MAX)))
 }
 
 #[cfg(windows)]

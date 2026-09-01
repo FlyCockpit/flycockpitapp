@@ -2971,7 +2971,16 @@ impl Driver {
             &selection,
             model_pin.clone(),
         ) {
-            Ok(rebuilt) => {
+            Ok(mut rebuilt) => {
+                // Rebuilding refreshes the Monty catalog too. When only that
+                // runtime-discovered catalog changed, retain the already
+                // rendered native schema cache; Discoverable tools never
+                // appear in the provider function schema.
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(
+                        &self.stack[active_idx].agent.tools,
+                    );
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -9702,7 +9711,10 @@ impl Driver {
                     anyhow::anyhow!("running frame has no pinned agent definition")
                 })?;
             crate::agents::apply_tool_surface_override(&mut def, &selection)?;
-            let rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            let mut rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            rebuilt
+                .tools
+                .preserve_definition_cache_if_native_schema_matches(&current.tools);
             let mut updated = (*current).clone();
             // This control changes only the requested tool surface. All other
             // running-frame state stays pinned, while the adjusted definition

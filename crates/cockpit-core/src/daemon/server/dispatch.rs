@@ -16988,7 +16988,6 @@ async fn handle_serialized_request_impl(
             .await
         }
 
-        #[cfg(feature = "remote")]
         Request::ApplySetupWizard {
             project_root,
             wizard_id,

@@ -7083,6 +7083,9 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
         tool_surface_touched,
         cwd: tmp.path().to_path_buf(),
         status: None,
+        dialog_id: uuid::Uuid::new_v4(),
+        queued_daemon_effect: None,
+        pending_operation_id: None,
     }));
     for expected in [
         "provider",

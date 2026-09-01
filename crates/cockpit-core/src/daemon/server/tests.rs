@@ -20125,7 +20125,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
         },
-        #[cfg(feature = "remote")]
         "apply_setup_wizard" => Request::ApplySetupWizard {
             project_root: root.clone(),
             // A recognized wizard id ("security"/"model") so the request passes
@@ -27809,7 +27808,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -28090,7 +28088,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         RefreshHostCapabilities,
         MigrateKekPlacement,
         SetupCopilotAuth,
-        #[cfg(feature = "remote")]
         ApplySetupWizard,
         SaveExtendedConfig,
         ExportPolicy,

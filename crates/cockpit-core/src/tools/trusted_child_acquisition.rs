@@ -222,6 +222,13 @@ impl Tool for RunAcquisitionCommandTool {
     fn effect(&self) -> ToolEffect {
         ToolEffect::Dynamic
     }
+    fn honors_dispatch_cancel(&self) -> bool {
+        // This wrapper awaits `BashTool::call` with the exact dispatch context.
+        // Bash observes that child cancellation token and cleans up its process
+        // tree before returning, so this outer tool must receive the same
+        // bounded dispatcher grace rather than being dropped immediately.
+        true
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object", "additionalProperties": false })
     }

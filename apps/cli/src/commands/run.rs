@@ -1294,9 +1294,6 @@ impl RunOutcome {
                 // terminal event after this submitted message can finish it.
                 self.terminal_seen = false;
             }
-            proto::Event::UserMessageRemoved { .. } => {
-                self.message_recorded = false;
-            }
             proto::Event::ThinkingStarted { .. } => {
                 self.inference_dispatched = true;
                 self.terminal_failure = false;

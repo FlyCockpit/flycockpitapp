@@ -87,10 +87,7 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
 
 /// Remove the exact durable user row named by a retract event, together with
 /// its adjacent tag-expansion presentation rows.
-pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(
-    history: &mut H,
-    seq: i64,
-) -> bool {
+pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(history: &mut H, seq: i64) -> bool {
     let Some(index) = history.entries().iter().position(
         |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
     ) else {
@@ -104,6 +101,19 @@ pub(super) fn remove_durable_user_history<H: FoldedUserHistory>(
         history.remove_entry(index + 1);
     }
     history.remove_entry(index);
+    // Auto-selected skill chips are inserted immediately before the user row
+    // they decorate. They are presentation for this prompt, so retaining them
+    // would make cancel + resend differ from a single send.
+    let mut preceding = index;
+    while preceding > 0
+        && matches!(
+            history.entries().get(preceding - 1),
+            Some(HistoryEntry::SkillAutoInjected { .. })
+        )
+    {
+        preceding -= 1;
+        history.remove_entry(preceding);
+    }
     true
 }
 
@@ -4397,9 +4407,11 @@ mod tests {
             reason: cockpit_proto::IdleReason::Interrupted,
         });
 
-        assert!(!app.history.iter().any(
-            |entry| matches!(entry, HistoryEntry::User { seq: Some(41), .. })
-        ));
+        assert!(
+            !app.history
+                .iter()
+                .any(|entry| matches!(entry, HistoryEntry::User { seq: Some(41), .. }))
+        );
         assert_eq!(app.composer.text(), "cancel me\n\nnew draft");
         assert!(app.pending.is_none());
         assert!(!app.history.iter().any(

@@ -1379,11 +1379,7 @@ impl Db {
     /// the caller has proved that the directly answering turn emitted neither
     /// response text nor a tool call. The predicate and delete are one SQL
     /// statement so a concurrent newer human message makes it lose safely.
-    pub async fn remove_latest_user_message(
-        &self,
-        session_id: Uuid,
-        seq: i64,
-    ) -> Result<bool> {
+    pub async fn remove_latest_user_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         self.write(move |conn| {
             let removed = conn
                 .execute(
@@ -2094,7 +2090,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(resent > notice, "AUTOINCREMENT replay cursors must stay monotonic");
+        assert!(
+            resent > notice,
+            "AUTOINCREMENT replay cursors must stay monotonic"
+        );
 
         let newer = db
             .insert_session_event(

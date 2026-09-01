@@ -12598,7 +12598,9 @@ impl Driver {
             let redact = self.redact.clone();
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
+            let title_session = Arc::clone(&session);
             auto_title_task = Some(tokio::spawn(async move {
+                let title_before = title_session.title();
                 crate::auto_title::generate_session_title(
                     session,
                     extended,
@@ -12610,6 +12612,10 @@ impl Driver {
                     tx,
                 )
                 .await;
+                let title_after = title_session.title();
+                (title_after != title_before)
+                    .then_some(title_after)
+                    .flatten()
             }));
         }
 
@@ -12801,8 +12807,7 @@ impl Driver {
             }
         }
 
-        let response_window_closed =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let response_window_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
@@ -13128,8 +13133,7 @@ impl Driver {
                             .model
                             .resolve_reasoning_params(&self.config.providers())
                             .is_some()
-                        && !response_window_closed
-                            .load(std::sync::atomic::Ordering::SeqCst);
+                        && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
                     if retractable_direct_turn
                         && let Some(seq) = recorded_user_seq
                         && self
@@ -13142,12 +13146,16 @@ impl Driver {
                                 false
                             })
                     {
-                        if let Some(task) = auto_title_task.take() {
+                        let generated_title = if let Some(task) = auto_title_task.take() {
                             task.abort();
-                            let _ = task.await;
-                        }
-                        self.session
-                            .restore_title_progress_after_retract(title_progress_before_turn);
+                            task.await.ok().flatten()
+                        } else {
+                            None
+                        };
+                        self.session.restore_title_progress_after_retract(
+                            title_progress_before_turn,
+                            generated_title.as_deref(),
+                        );
                         let _ = tx
                             .send(TurnEvent::UserMessageRemoved {
                                 seq,

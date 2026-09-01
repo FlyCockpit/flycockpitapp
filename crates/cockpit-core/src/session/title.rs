@@ -19,32 +19,45 @@ impl Session {
     pub(crate) fn restore_title_progress_after_retract(
         &self,
         snapshot: TitleProgressSnapshot,
+        generated_title: Option<&str>,
     ) {
         let session_id = self.id;
-        let title = snapshot.title.clone();
+        let prior_title = snapshot.title.clone();
+        let generated_title = generated_title.map(str::to_owned);
         let tokens = snapshot.user_content_tokens as i64;
         let stage = i64::from(snapshot.title_stage);
         let expected_user_renamed = snapshot.user_renamed;
-        let restored = self
-            .db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                let changed = conn.execute(
+        let restored = self.db.blocking_write_for_sync_maintenance(move |conn| {
+            let progress_changed = conn.execute(
+                "UPDATE sessions
+                        SET user_content_tokens = ?1, title_stage = ?2
+                      WHERE session_id = ?3 AND user_renamed = ?4",
+                params![tokens, stage, session_id.to_string(), expected_user_renamed],
+            )?;
+            let title_changed = if let Some(generated_title) = generated_title {
+                conn.execute(
                     "UPDATE sessions
-                        SET title = ?1, user_content_tokens = ?2, title_stage = ?3
-                      WHERE session_id = ?4 AND user_renamed = ?5",
+                            SET title = ?1
+                          WHERE session_id = ?2
+                            AND user_renamed = ?3
+                            AND title = ?4",
                     params![
-                        title,
-                        tokens,
-                        stage,
+                        prior_title,
                         session_id.to_string(),
-                        expected_user_renamed
+                        expected_user_renamed,
+                        generated_title
                     ],
-                )?;
-                Ok(changed == 1)
-            });
+                )? == 1
+            } else {
+                false
+            };
+            Ok((progress_changed == 1, title_changed))
+        });
         match restored {
-            Ok(true) => {
-                *self.title.lock().unwrap() = snapshot.title;
+            Ok((true, title_changed)) => {
+                if title_changed {
+                    *self.title.lock().unwrap() = snapshot.title;
+                }
                 self.user_content_tokens
                     .store(snapshot.user_content_tokens, Ordering::Relaxed);
                 self.user_content_turns
@@ -54,7 +67,7 @@ impl Session {
                 self.title_nudge_slot_pending
                     .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
             }
-            Ok(false) => {}
+            Ok((false, _)) => {}
             Err(error) => {
                 tracing::warn!(%error, "auto_title: retract rollback lost");
             }
@@ -557,10 +570,13 @@ mod metadata_tests {
         )
         .unwrap();
         let snapshot = session.title_progress_snapshot();
-        assert_eq!(session.note_user_content("cancelled prompt"), TitleAction::Eager);
+        assert_eq!(
+            session.note_user_content("cancelled prompt"),
+            TitleAction::Eager
+        );
         assert!(session.set_auto_title("cancelled-title").unwrap());
 
-        session.restore_title_progress_after_retract(snapshot);
+        session.restore_title_progress_after_retract(snapshot, Some("cancelled-title"));
 
         assert_eq!(session.title(), None);
         assert_eq!(session.user_content_tokens(), 0);

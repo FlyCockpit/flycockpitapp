@@ -61,12 +61,7 @@ impl DisplayAttemptSlot {
         clock_factory: DisplayClockFactory,
         tokenizer: Arc<dyn DisplayTokenizer>,
     ) -> Self {
-        Self::new_with_clock_tokenizer_and_window(
-            config,
-            clock_factory,
-            tokenizer,
-            Arc::default(),
-        )
+        Self::new_with_clock_tokenizer_and_window(config, clock_factory, tokenizer, Arc::default())
     }
 
     pub(crate) fn new_with_response_window(

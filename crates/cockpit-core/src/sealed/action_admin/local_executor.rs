@@ -593,9 +593,9 @@ fn scrub_output(bytes: &[u8], literal: &str) -> String {
 struct ResolvedDestination {
     path: PathBuf,
     git_guard: GitGuard,
-    git_path: Option<PathBuf>,
     // Kept alive through git inspection, file creation, child spawn, and
-    // cleanup. On Linux `path` is rooted at this descriptor via procfs.
+    // cleanup. On Linux/Android `path` and the Git working directory are
+    // rooted at this descriptor via procfs.
     _pinned_parent:
         Option<cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority>,
     #[cfg(windows)]
@@ -605,7 +605,13 @@ struct ResolvedDestination {
 
 enum GitGuard {
     Skip,
-    Inspect { repo_parent: PathBuf },
+    /// Both the Git working directory and the destination pathspec are
+    /// derived from the retained parent.  A diagnostic spelling captured at
+    /// approval must never become an operational Git authority.
+    Inspect {
+        repo_parent: PathBuf,
+        destination_name: String,
+    },
 }
 
 fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestination> {
@@ -617,11 +623,11 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             let parent = path
                 .parent()
                 .context("pinned sealed-file destination has no parent")?;
-            let guard_path = path.clone();
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .context("pinned sealed-file destination filename is not valid UTF-8")?;
+                .context("pinned sealed-file destination filename is not valid UTF-8")?
+                .to_owned();
             let held = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(parent)
                 .context("opening pinned sealed-file parent through no-follow authority")?;
             if held.identity() != parent_identity.stable_id.as_str() {
@@ -634,16 +640,36 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             );
             #[cfg(any(target_os = "linux", target_os = "android"))]
             let path = held
-                .retained_relative_path(name)
+                .retained_relative_path(&name)
                 .context("creating retained pinned sealed-file destination path")?;
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let path = path.clone();
+            // macOS has no procfs descriptor path, and the host layer does
+            // not yet offer an equivalent retained-directory execution
+            // capability. Re-opening the approved spelling would let a
+            // parent replacement redirect the plaintext write, Git guard,
+            // consumer path, or cleanup, so reject pinned destinations.
+            #[cfg(target_os = "macos")]
+            bail!(
+                "pinned sealed-file destinations are unsupported on macOS until retained-directory execution is available"
+            );
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                windows
+            )))]
+            bail!("pinned sealed-file destinations are unsupported on this platform");
+            let repo_parent = path
+                .parent()
+                .context("retained pinned sealed-file destination has no parent")?
+                .to_path_buf();
             Ok(ResolvedDestination {
                 path,
                 git_guard: GitGuard::Inspect {
-                    repo_parent: parent.to_path_buf(),
+                    repo_parent,
+                    destination_name: name,
                 },
-                git_path: Some(guard_path),
                 _pinned_parent: Some(held),
                 #[cfg(windows)]
                 _pinned_windows_execution_lease: windows_execution_lease,
@@ -664,7 +690,6 @@ fn resolve_destination(destination: &FileDestination) -> Result<ResolvedDestinat
             Ok(ResolvedDestination {
                 path: base.join(filename),
                 git_guard: GitGuard::Skip,
-                git_path: None,
                 _pinned_parent: None,
                 #[cfg(windows)]
                 _pinned_windows_execution_lease: None,
@@ -713,7 +738,11 @@ async fn write_private_file(
     if exclusive {
         options.create_new(true);
     } else {
-        options.create(true).truncate(true);
+        // Do not truncate an existing persistent file as part of open: it
+        // may still carry broad permissions. We must first set 0600 through
+        // the opened descriptor, then truncate and write through that same
+        // descriptor.
+        options.create(true);
     }
     #[cfg(unix)]
     {
@@ -728,14 +757,22 @@ async fn write_private_file(
         .context("reading created sealed-file identity")?;
     use tokio::io::AsyncWriteExt;
     let write_result = async {
+        // `OpenOptionsExt::mode` applies only at creation. Always chmod the
+        // held descriptor before changing content so an existing file cannot
+        // expose a partial or complete sealed value under its prior mode.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await
+            .context("setting sealed file permissions before materialization")?;
+        if !exclusive {
+            file.set_len(0)
+                .await
+                .context("truncating persistent sealed file after setting private permissions")?;
+        }
         file.write_all(literal.as_bytes())
             .await
             .context("writing sealed file")?;
         file.flush().await.context("flushing sealed file")?;
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await
-            .context("setting sealed file permissions")?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -781,6 +818,7 @@ async fn write_private_file(
 async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
     let GitGuard::Inspect {
         repo_parent: parent,
+        destination_name,
     } = &resolved.git_guard
     else {
         return Ok(());
@@ -804,13 +842,25 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
         // rename, so a failed Git inspection is always fail-closed.
         bail!("cannot establish sealed file git-guard state for destination");
     }
-    let path_text = resolved
-        .git_path
-        .as_ref()
-        .unwrap_or(&resolved.path)
-        .to_string_lossy();
-    let tracked = git_status(parent, &["ls-files", "--error-unmatch", "--", &path_text]).await?;
-    let ignored = git_status(parent, &["check-ignore", "-q", "--", &path_text]).await?;
+    // `parent` is descriptor-backed for pinned Unix destinations, and this
+    // relative pathspec is therefore evaluated inside that same retained
+    // directory. Never pass the approval-time pathname to Git: it may have
+    // been rebound after the parent was opened.
+    let tracked = git_status(
+        parent,
+        &[
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            destination_name.as_str(),
+        ],
+    )
+    .await?;
+    let ignored = git_status(
+        parent,
+        &["check-ignore", "-q", "--", destination_name.as_str()],
+    )
+    .await?;
     if tracked || !ignored {
         bail!(
             "sealed file destination is tracked or not ignored; add the pinned path to .gitignore before approving materialization"
@@ -1217,6 +1267,53 @@ mod tests {
             .is_ok()
         );
         assert!(PERSISTENT_FILE_APPROVAL_WARNING.contains("transform or exfiltrate"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_materialization_repairs_mode_before_replacing_contents() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("credential.pem");
+        std::fs::write(&path, b"old value").expect("seed destination");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make seed destination broadly readable");
+
+        write_private_file(&path, "sealed value", false)
+            .await
+            .expect("materialize persistent sealed file");
+
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat materialized file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read materialized file"),
+            "sealed value"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pinned_destination_fails_closed_without_retained_execution() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut destination = FileDestination::Pinned {
+            path: directory.path().join("credential.pem"),
+            parent_identity: FileSystemIdentity::unpinned(),
+        };
+        pin_file_destination(&mut destination).expect("pin destination");
+
+        let error = resolve_destination(&destination).expect_err("must fail closed on macOS");
+        assert!(
+            error
+                .to_string()
+                .contains("pinned sealed-file destinations are unsupported on macOS")
+        );
     }
 
     #[test]

@@ -1938,7 +1938,7 @@ async fn execute_ordinary_call_unscoped(
     // The schema marker produces the model projection at this one storage
     // boundary; today's built-in metadata fields are all marked, so this is
     // empty without a dispatcher-maintained exclusion list.
-    let result_metadata = match &result {
+    let mut result_metadata = match &result {
         Ok(out) => out.result_metadata(),
         Err(_) => serde_json::Map::new(),
     };
@@ -2055,7 +2055,14 @@ async fn execute_ordinary_call_unscoped(
             true,
             Some(crate::engine::tool::ToolFailKind::Execution),
         ),
-        (Ok(ToolOutput { content, .. }), _) => (content.model_text().to_owned(), false, None),
+        (Ok(output), _) => (
+            output
+                .display_content
+                .clone()
+                .unwrap_or_else(|| output.content.model_text().to_owned()),
+            false,
+            None,
+        ),
         (Err(e), _) => {
             let msg = format!("Error: {e}");
             (msg, true, Some(crate::engine::tool::classify_failure(e)))
@@ -2134,6 +2141,22 @@ async fn execute_ordinary_call_unscoped(
             }
         };
     }
+    // `notify` is a human-only lane, but it can still carry copied untrusted
+    // nested-tool output. Hold it until the enclosing result safety boundary
+    // has run, and apply that same decision to each side-channel value before
+    // it can reach durable notice persistence or a connected client.
+    let mut notices = result
+        .as_ref()
+        .ok()
+        .filter(|_| !hard_fail)
+        .map(|output| output.notices.clone())
+        .unwrap_or_default();
+    if recheck_result {
+        let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
+        for notice in &mut notices {
+            *notice = result_recheck(notice, &recheck_ctx, env.tx).await?;
+        }
+    }
     let recheck_modified_output = output_str != output_before_recheck;
 
     let canonical_result_is_text_only = result.as_ref().is_ok_and(|output| {
@@ -2144,64 +2167,78 @@ async fn execute_ordinary_call_unscoped(
             )
         })
     });
-    let mut artifact_capture = (!hard_fail && canonical_result_is_text_only)
+    let mut artifact_captures = (!hard_fail && canonical_result_is_text_only)
         .then(|| {
-            result
+            let mut captures = result
+                .as_ref()
+                .ok()
+                .map(|output| output.text_artifact_captures.clone())
+                .unwrap_or_default();
+            if let Some(capture) = result
                 .as_ref()
                 .ok()
                 .and_then(|output| output.text_artifact_capture.clone())
-        })
-        .flatten()
-        .map(|mut capture| {
-            // Artifacts are durable and retrievable, so their source crosses
-            // the same outbound redaction boundary before admission. Host
-            // accounting remains pre-safety; only `stored_source_bytes` and
-            // the immutable body describe the post-safety value. A configured
-            // placeholder can be longer than a short secret, which would
-            // violate the store's non-expanding source accounting. In that
-            // case fail closed by withholding the capture rather than storing
-            // the pre-safety bytes or inventing a lossy counter.
-            let scrubbed = env.ctx.redact.scrub(&capture.content);
-            if scrubbed.len() <= capture.host_captured_bytes {
-                capture.content = scrubbed;
-                capture.stored_source_bytes = capture.content.len();
-            } else {
-                capture.content.clear();
-                capture.stored_source_bytes = 0;
+            {
+                captures.push(crate::engine::tool::ToolTextArtifactCapture {
+                    lane: if result
+                        .as_ref()
+                        .ok()
+                        .is_some_and(|output| output.text_artifact_model_ephemeral)
+                    {
+                        crate::engine::tool::ToolArtifactLane::Display
+                    } else {
+                        crate::engine::tool::ToolArtifactLane::Model
+                    },
+                    capture,
+                    explicit: true,
+                });
             }
-            capture
-        });
+            captures
+        })
+        .unwrap_or_default();
+    // Artifacts are durable and retrievable, so every lane crosses the
+    // outbound redaction boundary before admission. A replacement that grows
+    // the body fails closed rather than corrupting host capture accounting.
+    for retained in &mut artifact_captures {
+        let scrubbed = env.ctx.redact.scrub(&retained.capture.content);
+        if scrubbed.len() <= retained.capture.host_captured_bytes {
+            retained.capture.content = scrubbed;
+            retained.capture.stored_source_bytes = retained.capture.content.len();
+        } else {
+            retained.capture.content.clear();
+            retained.capture.stored_source_bytes = 0;
+        }
+    }
     // The display body above can be capped well before an adversarial tail.
     // A durable artifact is a separate outbound surface, so a flagged result
     // must pass the same injection decision over the complete retained body
     // before it can be persisted or rendered into a frame.  Preserve host
     // capture counters; only the accepted post-safety body/accounting changes.
     let mut artifact_capture_recheck_unavailable = false;
-    if recheck_result && let Some(capture) = artifact_capture.as_mut() {
+    if recheck_result {
         let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
-        match crate::engine::agent::recheck::result_recheck_for_artifact_capture(
-            &capture.content,
-            &recheck_ctx,
-            env.tx,
-        )
-        .await?
-        {
-            Some(accepted) => {
-                capture.content = env.ctx.redact.scrub(&accepted);
-                capture.stored_source_bytes = capture.content.len();
-            }
-            None => {
-                // This is not a quota or persistence outcome. The closed
-                // durable projection vocabulary has no safety-unavailable
-                // state, so retain no capture/projection at all; the ordinary
-                // capped tool output remains the sole canonical event body.
-                artifact_capture_recheck_unavailable = true;
+        for retained in &mut artifact_captures {
+            match crate::engine::agent::recheck::result_recheck_for_artifact_capture(
+                &retained.capture.content,
+                &recheck_ctx,
+                env.tx,
+            )
+            .await?
+            {
+                Some(accepted) => {
+                    retained.capture.content = env.ctx.redact.scrub(&accepted);
+                    retained.capture.stored_source_bytes = retained.capture.content.len();
+                }
+                None => {
+                    artifact_capture_recheck_unavailable = true;
+                    break;
+                }
             }
         }
     }
     if artifact_capture_recheck_unavailable {
         tracing::warn!(tool = %resolved_name, "discarding retained tool capture because result safety recheck was unavailable");
-        artifact_capture = None;
+        artifact_captures.clear();
     }
     let artifact_spill_bytes = env
         .agent
@@ -2220,24 +2257,29 @@ async fn execute_ordinary_call_unscoped(
     // small but otherwise inaccessible tail.  The threshold controls only
     // automatic capture of ordinary inline results, not the tool's explicit
     // durable artifact contract.
-    let explicit_artifact_capture = artifact_capture.is_some();
-    if artifact_capture.is_none()
+    if artifact_captures.is_empty()
+        && resolved_name != "mcp"
         && canonical_result_is_text_only
         && result.as_ref().is_ok_and(|output| !output.truncated)
         && output_str.len() > artifact_spill_bytes
     {
-        artifact_capture = Some(crate::intel::budget::capture_text_artifact_body(
-            &output_str,
-        ));
+        artifact_captures.push(crate::engine::tool::ToolTextArtifactCapture {
+            lane: crate::engine::tool::ToolArtifactLane::Model,
+            capture: crate::intel::budget::capture_text_artifact_body(&output_str),
+            explicit: false,
+        });
     }
-    let artifact_capture = artifact_capture.filter(|capture| {
-        crate::engine::agent::text_artifact_capture_is_persistable(
-            resolved_name,
-            Some(capture),
-            &output_str,
-            recheck_modified_output,
-        ) && (explicit_artifact_capture || capture.content.len() > artifact_spill_bytes)
-    });
+    let artifact_captures = artifact_captures
+        .into_iter()
+        .filter(|retained| {
+            crate::engine::agent::text_artifact_capture_is_persistable(
+                resolved_name,
+                Some(&retained.capture),
+                &output_str,
+                recheck_modified_output,
+            ) && (retained.explicit || retained.capture.content.len() > artifact_spill_bytes)
+        })
+        .collect::<Vec<_>>();
 
     let truncated = matches!(
         &result,
@@ -2400,11 +2442,11 @@ async fn execute_ordinary_call_unscoped(
     if let Some(canonical_output_text) = &canonical_history_text {
         event_data["canonical_output_text"] = canonical_output_text.clone().into();
     }
-    if model_result_contents.as_ref().is_some_and(|projected| {
-        result
-            .as_ref()
-            .ok()
-            .is_some_and(|output| projected.parts() != output.content.parts())
+    if result.as_ref().ok().is_some_and(|output| {
+        output.display_content.is_some()
+            || model_result_contents
+                .as_ref()
+                .is_some_and(|projected| projected.parts() != output.content.parts())
     }) {
         event_data["model_projection_required"] = Value::Bool(true);
     }
@@ -2451,45 +2493,82 @@ async fn execute_ordinary_call_unscoped(
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
     let mut model_artifact_frame = None;
-    let tool_call_seq = if let Some(capture) = artifact_capture.as_ref() {
-        let mut provenance = serde_json::json!({
-            "agent_id": &env.agent.name,
-            "tool": resolved_name,
-            "call_id": &tc.id,
-            "source": "tool_result",
-            "preview_lines": artifact_preview_lines,
-        });
-        // `artifact_capture` was filtered at the common boundary above.  A
-        // configured spill is fail-closed: retaining it inline would put the
-        // large secret-bearing body in SQLite after the disk invariant failed.
-        let staged_at = chrono::Utc::now().timestamp_millis();
-        let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
-        env.session
-            .db
-            .stage_text_artifact_blob_cleanup_intent(
-                staged_blob_path.clone(),
-                env.session.id,
-                staged_at,
-            )
-            .await
-            .context("staging tool artifact blob cleanup")?;
-        let blob_path = crate::text_artifact_blob::write_at(&staged_blob_path, &capture.content)
-            .with_context(|| format!("spilling tool result for {resolved_name}"))?;
-        provenance["blob_path"] = serde_json::Value::String(blob_path.clone());
-        let provenance_json = provenance.to_string();
-        let candidate = crate::db::text_artifacts::TextArtifactCandidate {
-            relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
-            projection_slot: Some(0),
-            kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
-            capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
-            content: capture.content.clone(),
-            host_captured_bytes: capture.host_captured_bytes,
-            host_original_bytes: capture.host_original_bytes,
-            host_dropped_bytes: capture.host_dropped_bytes,
-            stored_source_bytes: capture.stored_source_bytes,
-            provenance_json: provenance_json.clone(),
-            created_at: chrono::Utc::now().timestamp_millis(),
-        };
+    let mut human_artifact_notes = Vec::new();
+    let tool_call_seq = if !artifact_captures.is_empty() {
+        let mut display_slot = 0_i64;
+        let mut attachment_slot = 0_i64;
+        let mut staged = Vec::new();
+        for retained in artifact_captures {
+            let (relation, projection_slot, capture_reason) = match retained.lane {
+                crate::engine::tool::ToolArtifactLane::Model => (
+                    crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                    Some(0),
+                    crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                ),
+                crate::engine::tool::ToolArtifactLane::Display => {
+                    let slot = display_slot;
+                    display_slot += 1;
+                    (
+                        crate::db::text_artifacts::TextArtifactRelation::ToolResultDisplay,
+                        Some(slot),
+                        crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                    )
+                }
+                crate::engine::tool::ToolArtifactLane::Attachment => {
+                    let slot = attachment_slot;
+                    attachment_slot += 1;
+                    (
+                        crate::db::text_artifacts::TextArtifactRelation::ToolResultAttachment,
+                        Some(slot),
+                        crate::db::text_artifacts::CaptureReason::ExplicitAttachment,
+                    )
+                }
+            };
+            let staged_at = chrono::Utc::now().timestamp_millis();
+            let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
+            env.session
+                .db
+                .stage_text_artifact_blob_cleanup_intent(
+                    staged_blob_path.clone(),
+                    env.session.id,
+                    staged_at,
+                )
+                .await
+                .context("staging tool artifact blob cleanup")?;
+            let blob_path =
+                crate::text_artifact_blob::write_at(&staged_blob_path, &retained.capture.content)
+                    .with_context(|| format!("spilling tool result for {resolved_name}"))?;
+            let provenance_json = serde_json::json!({
+                "agent_id": &env.agent.name,
+                "tool": resolved_name,
+                "call_id": &tc.id,
+                "source": "tool_result",
+                "preview_lines": artifact_preview_lines,
+                "blob_path": blob_path,
+            })
+            .to_string();
+            staged.push((
+                crate::db::text_artifacts::TextArtifactCandidate {
+                    relation,
+                    projection_slot,
+                    kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                    capture_reason,
+                    content: retained.capture.content,
+                    host_captured_bytes: retained.capture.host_captured_bytes,
+                    host_original_bytes: retained.capture.host_original_bytes,
+                    host_dropped_bytes: retained.capture.host_dropped_bytes,
+                    stored_source_bytes: retained.capture.stored_source_bytes,
+                    provenance_json,
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                },
+                staged_blob_path,
+            ));
+        }
+        let candidates = staged
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        let staged_blob_paths = staged.iter().map(|(_, path)| path.clone()).collect();
         let event = crate::db::text_artifacts::TextArtifactEventInput {
             session_id: env.session.id,
             kind: crate::db::session_log::SessionEventKind::ToolCall,
@@ -2498,26 +2577,49 @@ async fn execute_ordinary_call_unscoped(
             context: Default::default(),
             ts_ms: chrono::Utc::now().timestamp_millis(),
             data_json: event_data.to_string(),
-            artifacts: vec![candidate.clone()],
-            staged_blob_paths: vec![blob_path.clone()],
+            artifacts: candidates,
+            staged_blob_paths,
             unavailable_projection: None,
         };
         match env.session.db.record_event_with_text_artifacts(event).await {
             Ok(result) => {
-                let mut slots = result.slots.into_iter().filter(|slot| {
-                    slot.relation == candidate.relation
-                        && slot.projection_slot == candidate.projection_slot
-                });
-                match (slots.next(), slots.next().is_none()) {
-                    (Some(slot), true) => {
-                        match slot.admission {
-                            crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => {
-                                let preview_head =
-                                    crate::engine::text_artifact_frame::utf8_preview_lines(
-                                        &candidate.content,
-                                        artifact_preview_lines,
-                                    );
-                                model_artifact_frame = Some(
+                for ((candidate, blob_path), slot) in staged.into_iter().zip(result.slots) {
+                    match slot.admission {
+                        crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => {
+                            if candidate.relation
+                                == crate::db::text_artifacts::TextArtifactRelation::ToolResultDisplay
+                            {
+                                human_artifact_notes.push(format!(
+                                    "({} bytes spilled -> handle cockpit://session/{}/artifacts/{})",
+                                    artifact.content_bytes,
+                                    env.session.short_id(),
+                                    artifact.artifact_id
+                                ));
+                            } else if candidate.relation
+                                == crate::db::text_artifacts::TextArtifactRelation::ToolResultAttachment
+                            {
+                                human_artifact_notes.push(format!(
+                                    "({} bytes attached -> handle cockpit://session/{}/artifacts/{})",
+                                    artifact.content_bytes,
+                                    env.session.short_id(),
+                                    artifact.artifact_id
+                                ));
+                            }
+                            if candidate.relation
+                                == crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+                            {
+                                let preview_head = crate::engine::text_artifact_frame::utf8_preview_lines(
+                                    &candidate.content,
+                                    artifact_preview_lines,
+                                );
+                                model_artifact_frame = Some(if resolved_name == "mcp" {
+                                    format!(
+                                        "({} bytes spilled -> handle cockpit://session/{}/artifacts/{})",
+                                        artifact.content_bytes,
+                                        env.session.short_id(),
+                                        artifact.artifact_id
+                                    )
+                                } else {
                                     crate::engine::text_artifact_frame::render_artifact_frame(
                                         &crate::engine::text_artifact_frame::ArtifactFrame {
                                             status: "available",
@@ -2535,56 +2637,78 @@ async fn execute_ordinary_call_unscoped(
                                             preview_head: &preview_head,
                                             preview_tail: "",
                                         },
-                                    ),
-                                );
+                                    )
+                                });
                             }
-                            admission => {
-                                if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
-                                    tracing::error!(%error, %blob_path, "rejected tool artifact blob cleanup failed");
+                        }
+                        admission => {
+                            if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                                tracing::error!(%error, %blob_path, "rejected tool artifact blob cleanup failed");
+                            }
+                            let reason = match admission {
+                                crate::db::text_artifacts::TextArtifactAdmission::ArtifactLimit => {
+                                    "artifact_limit"
                                 }
-                                let reason = match admission {
-                                crate::db::text_artifacts::TextArtifactAdmission::ArtifactLimit => "artifact_limit",
-                                crate::db::text_artifacts::TextArtifactAdmission::SessionQuota => "session_quota",
-                                crate::db::text_artifacts::TextArtifactAdmission::Stored(_) => unreachable!(),
+                                crate::db::text_artifacts::TextArtifactAdmission::SessionQuota => {
+                                    "session_quota"
+                                }
+                                crate::db::text_artifacts::TextArtifactAdmission::Stored(_) => {
+                                    unreachable!()
+                                }
                             };
-                                model_artifact_frame = Some(
-                                    render_unavailable_tool_artifact_frame(&candidate, reason),
-                                );
+                            match candidate.relation {
+                                crate::db::text_artifacts::TextArtifactRelation::ToolResultDisplay => {
+                                    human_artifact_notes.push(format!(
+                                        "({} bytes spilled but artifact is unavailable: {reason})",
+                                        candidate.stored_source_bytes,
+                                    ));
+                                }
+                                crate::db::text_artifacts::TextArtifactRelation::ToolResultAttachment => {
+                                    human_artifact_notes.push(format!(
+                                        "({} bytes attached but artifact is unavailable: {reason})",
+                                        candidate.stored_source_bytes,
+                                    ));
+                                }
+                                crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult => {
+                                    model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                                        &candidate, reason,
+                                    ));
+                                }
+                                _ => unreachable!("tool calls only admit tool-result artifact lanes"),
                             }
                         }
-                    }
-                    (None, _) => {
-                        if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
-                            tracing::error!(%error, %blob_path, "unowned tool artifact blob cleanup failed");
-                        }
-                        tracing::error!(tool = %resolved_name, "tool artifact event returned no matching owner slot");
-                        model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
-                            &candidate,
-                            "persistence_unavailable",
-                        ));
-                    }
-                    (Some(_), false) => {
-                        if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
-                            tracing::error!(%error, %blob_path, "duplicate tool artifact blob cleanup failed");
-                        }
-                        tracing::error!(tool = %resolved_name, "tool artifact event returned duplicate owner slots");
-                        model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
-                            &candidate,
-                            "persistence_unavailable",
-                        ));
                     }
                 }
                 Some(result.event_seq)
             }
             Err(error) => {
-                if let Err(cleanup_error) = crate::text_artifact_blob::remove(&blob_path) {
-                    tracing::error!(%cleanup_error, %blob_path, "failed tool artifact blob cleanup after database error");
+                for (candidate, blob_path) in staged {
+                    if let Err(cleanup_error) = crate::text_artifact_blob::remove(&blob_path) {
+                        tracing::error!(%cleanup_error, %blob_path, "failed tool artifact blob cleanup after database error");
+                    }
+                    match candidate.relation {
+                        crate::db::text_artifacts::TextArtifactRelation::ToolResultDisplay => {
+                            human_artifact_notes.push(format!(
+                                "({} bytes spilled but artifact persistence is unavailable)",
+                                candidate.stored_source_bytes,
+                            ));
+                        }
+                        crate::db::text_artifacts::TextArtifactRelation::ToolResultAttachment => {
+                            human_artifact_notes.push(format!(
+                                "({} bytes attached but artifact persistence is unavailable)",
+                                candidate.stored_source_bytes,
+                            ));
+                        }
+                        crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult => {
+                            model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                                &candidate,
+                                "persistence_unavailable",
+                            ));
+                        }
+                        _ => unreachable!("tool calls only admit tool-result artifact lanes"),
+                    }
                 }
                 tracing::warn!(%error, tool = %resolved_name, "tool artifact event composition failed");
-                model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
-                    &candidate,
-                    "persistence_unavailable",
-                ));
                 None
             }
         }
@@ -2607,6 +2731,25 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     };
+    if !human_artifact_notes.is_empty() {
+        let notes = human_artifact_notes.join("\n");
+        let append_notes = |body: &mut String| {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&notes);
+        };
+        append_notes(&mut output_str);
+        event_data["output"] = Value::String(output_str.clone());
+
+        let display = result_metadata
+            .entry("display".to_owned())
+            .or_insert_with(|| Value::String(String::new()));
+        if let Value::String(display) = display {
+            append_notes(display);
+            event_data["display"] = Value::String(display.clone());
+        }
+    }
     // The verification projection is an audit relation to this exact durable
     // ordinary ToolCall event. It must never create a second synthetic
     // `verification:*` tool-call pair. If the canonical event could not be
@@ -2682,6 +2825,9 @@ async fn execute_ordinary_call_unscoped(
                 hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
             })
             .await;
+    }
+    for text in notices {
+        let _ = env.tx.send(TurnEvent::Notice { text }).await;
     }
     if lifecycle_started {
         let lifecycle_status = if repeated_recoverable_tool_call_reject {
@@ -3312,6 +3458,12 @@ mod tests {
                     .with_output_sidecar(crate::engine::tool::ToolOutputSidecar {
                         payload: serde_json::json!({"detail": "sidecar metadata sentinel"}),
                     })
+                    .with_model_ephemeral_display("kept result\nmodel ephemeral display sentinel")
+                    .with_model_ephemeral_text_artifact_capture(
+                        crate::intel::budget::capture_text_artifact_body(
+                            "model ephemeral artifact sentinel",
+                        ),
+                    )
             })
         }
     }
@@ -3456,6 +3608,49 @@ mod tests {
                     host_dropped_bytes: 0,
                     stored_source_bytes: "visible line\nhidden line\n".len(),
                 }))
+        }
+    }
+
+    struct DisplayAndAttachmentsTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for DisplayAndAttachmentsTool {
+        fn name(&self) -> &str {
+            "mcp"
+        }
+
+        fn description(&self) -> &str {
+            "Return a model projection plus display and explicit artifact lanes."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            let display_body = "display spill\n".repeat(
+                crate::db::text_artifacts::DEFAULT_ARTIFACT_SPILL_BYTES / "display spill\n".len()
+                    + 1,
+            );
+            let first_attachment = "first explicit attachment";
+            let second_attachment = "second explicit attachment";
+            Ok(ToolOutput::text("model projection")
+                .with_model_ephemeral_display("model projection\n[display truncated]")
+                .with_text_artifact_lane(
+                    crate::engine::tool::ToolArtifactLane::Display,
+                    crate::intel::budget::capture_text_artifact_body(&display_body),
+                    false,
+                )
+                .with_text_artifact_lane(
+                    crate::engine::tool::ToolArtifactLane::Attachment,
+                    crate::intel::budget::capture_text_artifact_body(first_attachment),
+                    true,
+                )
+                .with_text_artifact_lane(
+                    crate::engine::tool::ToolArtifactLane::Attachment,
+                    crate::intel::budget::capture_text_artifact_body(second_attachment),
+                    true,
+                ))
         }
     }
 
@@ -4689,6 +4884,64 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[tokio::test]
+    async fn under_cap_mcp_emit_stays_inline_when_artifact_policy_is_lower() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let mut agent = test_agent(tools.clone());
+        agent.context_policy = Some(crate::agents::ContextPolicy {
+            artifact_spill_bytes: Some(1),
+            ..Default::default()
+        });
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call(
+            "mcp",
+            serde_json::json!({ "script": "emit('small result')" }),
+        );
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "mcp", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "mcp")
+        );
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolEnd { tool, output, .. }) if tool == "mcp" && output == "small result")
+        );
+        assert_eq!(last_tool_result_text(&history), "small result");
+        assert!(
+            !last_tool_result_text(&history).contains("cockpit://"),
+            "an under-cap Monty result must not be replaced by an artifact handle"
+        );
+        assert!(
+            session
+                .db
+                .list_text_artifacts(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -6281,6 +6534,8 @@ mod tests {
         const SANDBOX_SECRET: &str = "sandbox metadata sentinel";
         const RESOURCE_SECRET: &str = "resource metadata sentinel";
         const SIDECAR_SECRET: &str = "sidecar metadata sentinel";
+        const DISPLAY_ONLY: &str = "model ephemeral display sentinel";
+        const ARTIFACT_ONLY: &str = "model ephemeral artifact sentinel";
         const NATIVE_SANDBOX: &str = "native sandbox result";
         const NATIVE_RESOURCE: &str = "native resource result";
         const NATIVE_SIDECAR: &str = "native sidecar result";
@@ -6327,6 +6582,8 @@ mod tests {
         assert!(!live_wire.contains(SANDBOX_SECRET), "{live_wire}");
         assert!(!live_wire.contains(RESOURCE_SECRET), "{live_wire}");
         assert!(!live_wire.contains(SIDECAR_SECRET), "{live_wire}");
+        assert!(!live_wire.contains(DISPLAY_ONLY), "{live_wire}");
+        assert!(!live_wire.contains(ARTIFACT_ONLY), "{live_wire}");
         assert!(!live_wire.contains("987654321"), "{live_wire}");
         assert!(live_wire.contains(NATIVE_SANDBOX), "{live_wire}");
         assert!(live_wire.contains(NATIVE_RESOURCE), "{live_wire}");
@@ -6346,6 +6603,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.original_input_json["secret"], ARG_SECRET);
         assert!(row.wire_input_json.get("secret").is_none());
+        assert!(row.output.contains(DISPLAY_ONLY), "{}", row.output);
         let event = session
             .db
             .list_session_events(session.id)
@@ -6358,6 +6616,7 @@ mod tests {
         assert!(event.data.to_string().contains(SANDBOX_SECRET));
         assert!(event.data.to_string().contains(RESOURCE_SECRET));
         assert!(event.data.to_string().contains(SIDECAR_SECRET));
+        assert!(event.data.to_string().contains(DISPLAY_ONLY));
         assert_eq!(event.data["exit_code"], 987_654_321);
         assert_eq!(event.data["model_projection_required"], true);
         assert!(
@@ -6382,12 +6641,20 @@ mod tests {
         assert!(!restart_wire.contains(SANDBOX_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(RESOURCE_SECRET), "{restart_wire}");
         assert!(!restart_wire.contains(SIDECAR_SECRET), "{restart_wire}");
+        assert!(!restart_wire.contains(DISPLAY_ONLY), "{restart_wire}");
+        assert!(!restart_wire.contains(ARTIFACT_ONLY), "{restart_wire}");
         assert!(!restart_wire.contains("987654321"), "{restart_wire}");
         assert!(restart_wire.contains("kept argument"), "{restart_wire}");
         assert!(restart_wire.contains("kept result"), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_SANDBOX), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_RESOURCE), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_SIDECAR), "{restart_wire}");
+        let artifacts = session.db.list_text_artifacts(session.id).await.unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.content == ARTIFACT_ONLY)
+        );
         assert_eq!(last_tool_result_json(&restarted.history)["exit_code"], 73);
     }
 
@@ -6483,6 +6750,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_composition_failure_replaces_capped_model_body_with_unavailable_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        // The audit-row write precedes artifact composition and targets a
+        // different table. Reject only the composed ToolCall event so this
+        // exercises the persistence-error branch, rather than artifact
+        // admission or the ordinary tool-call journal.
+        session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_tool_call_artifact_composition
+                     BEFORE INSERT ON session_events
+                     WHEN NEW.type = 'tool_call'
+                     BEGIN
+                         SELECT RAISE(FAIL, 'forced artifact composition failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let call = tool_call("big", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "big", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        assert!(
+            wire.starts_with("<cockpit_artifact_v1 payload_utf8_bytes="),
+            "persistence failure must replace the capped model body with an artifact frame: {wire}"
+        );
+        assert!(wire.contains("\"status\":\"unavailable\""), "{wire}");
+        assert!(
+            wire.contains("\"reason\":\"persistence_unavailable\""),
+            "{wire}"
+        );
+        assert!(wire.contains("\"kind\":\"tool_result\""), "{wire}");
+        assert_ne!(
+            wire, "visible line\n[truncated]\n",
+            "the former behavior leaked the capped projection after persistence failed"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_result_artifact_live_projection_is_byte_identical_to_rehydrate() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
@@ -6530,6 +6863,92 @@ mod tests {
         assert_eq!(
             live, replay,
             "live and restart/replay tool-result bytes must use one frame composition"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_spills_and_explicit_attachments_surface_distinct_human_handles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(DisplayAndAttachmentsTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("mcp", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "mcp", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "mcp")
+        );
+        let Some(TurnEvent::ToolEnd { output, .. }) = rx.recv().await else {
+            panic!("mcp ToolEnd event");
+        };
+        assert!(
+            output.contains("bytes spilled -> handle cockpit://session/"),
+            "{output}"
+        );
+        assert_eq!(
+            output
+                .matches("bytes attached -> handle cockpit://session/")
+                .count(),
+            2,
+            "{output}"
+        );
+
+        let wire = last_tool_result_text(&history);
+        assert_eq!(wire, "model projection");
+        assert!(!wire.contains("cockpit://"), "{wire}");
+
+        let artifacts = session.db.list_text_artifacts(session.id).await.unwrap();
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.relation
+                        == crate::db::text_artifacts::TextArtifactRelation::ToolResultDisplay
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.relation
+                        == crate::db::text_artifacts::TextArtifactRelation::ToolResultAttachment
+                })
+                .count(),
+            2
+        );
+        let completed = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("completed tool event");
+        assert_eq!(
+            completed.data["output"].as_str().expect("completed output"),
+            output
         );
     }
 

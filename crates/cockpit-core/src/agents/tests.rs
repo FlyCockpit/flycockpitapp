@@ -833,6 +833,21 @@ fn legal_tool_tiers_excludes_disabled_for_safety_set() {
     }
 }
 
+#[test]
+fn direct_native_media_tools_cannot_be_made_discoverable() {
+    for tool in crate::tool_media_authority::availability::MEDIA_TOOL_NAMES {
+        assert_eq!(
+            legal_tool_tiers(tool),
+            &[ToolTier::Enabled, ToolTier::Disabled],
+            "{tool} must remain on the native schema surface or be absent"
+        );
+        assert!(
+            !is_monty_builtin_adaptable(tool),
+            "{tool} must not be treated as a cache-neutral Monty tool"
+        );
+    }
+}
+
 // ── Invariant validation ─────────────────────────────────────────────────
 
 fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {

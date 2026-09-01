@@ -442,7 +442,31 @@ const ALL_TOOL_TIERS: &[ToolTier] = &[
     ToolTier::Disabled,
 ];
 const SAFETY_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled];
-const DIRECT_NATIVE_MEDIA_TIERS: &[ToolTier] = &[ToolTier::Enabled, ToolTier::Disabled];
+const DIRECT_NATIVE_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled, ToolTier::Disabled];
+
+/// Whether a built-in can move off the provider-visible native surface and
+/// remain available through Monty's runtime catalog instead.
+///
+/// This is shared with the tool builder and the TUI because it defines the
+/// cache boundary: only an adaptable tool's `Discoverable`/`Disabled`
+/// transition leaves the provider function schema unchanged.
+pub fn is_monty_builtin_adaptable(name: &str) -> bool {
+    if crate::tool_media_authority::is_media_tool_name(name) {
+        return false;
+    }
+    !matches!(
+        name,
+        "question"
+            | "return"
+            | "schedule"
+            | "task"
+            | "spawn"
+            | "defer_to_orchestrator"
+            | "raise"
+            | "start_build"
+            | "mcp"
+    )
+}
 
 pub fn known_tool_names() -> &'static [&'static str] {
     invariants::known_tool_names()
@@ -459,10 +483,10 @@ pub fn computed_tool_tier(def: &AgentDef, tool: &str) -> ToolTier {
 }
 
 pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
-    if tool == "read_image" {
-        DIRECT_NATIVE_MEDIA_TIERS
-    } else if is_safety_tool(tool) {
+    if is_safety_tool(tool) {
         SAFETY_TOOL_TIERS
+    } else if !is_monty_builtin_adaptable(tool) {
+        DIRECT_NATIVE_TOOL_TIERS
     } else {
         ALL_TOOL_TIERS
     }

@@ -1633,6 +1633,7 @@ struct ReconnectAttach {
     client: DaemonClient,
     session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
+    removed_user_message_seqs: Vec<i64>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
     active_model_state: Option<proto::ActiveModelState>,
@@ -1641,6 +1642,7 @@ struct ReconnectAttach {
 struct AttachedPayload {
     session_entry_mode: proto::SessionEntryMode,
     history: Vec<proto::HistoryEntry>,
+    removed_user_message_seqs: Vec<i64>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
     active_model_state: Option<proto::ActiveModelState>,
@@ -3934,6 +3936,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AssistantDisplayError { session_id, .. }
         | AssistantText { session_id, .. }
         | UserMessageRecorded { session_id, .. }
+        | UserMessageRemoved { session_id, .. }
         | QueuedUserMessagesFolded { session_id, .. }
         | SessionPersistFailed { session_id, .. }
         | SessionDriverFailed { session_id, .. }
@@ -4035,6 +4038,7 @@ async fn reconnect_and_attach(
         client,
         session_entry_mode: payload.session_entry_mode,
         history: payload.history,
+        removed_user_message_seqs: payload.removed_user_message_seqs,
         paused_work: payload.paused_work,
         repair_required: payload.repair_required,
         active_model_state: payload.active_model_state,
@@ -4102,6 +4106,7 @@ fn attach_payload_from_response(
         Ok(Response::Attached {
             session_entry_mode,
             history,
+            removed_user_message_seqs,
             paused_work,
             repair_required,
             active_model_state,
@@ -4109,6 +4114,7 @@ fn attach_payload_from_response(
         }) => Ok(AttachedPayload {
             session_entry_mode,
             history,
+            removed_user_message_seqs,
             paused_work,
             repair_required: repair_required.map(|repair| *repair),
             active_model_state,
@@ -4132,6 +4138,7 @@ fn split_reconnect_attached(attached: ReconnectAttach) -> (DaemonClient, Attache
     let payload = AttachedPayload {
         session_entry_mode: attached.session_entry_mode,
         history: attached.history,
+        removed_user_message_seqs: attached.removed_user_message_seqs,
         paused_work: attached.paused_work,
         repair_required: attached.repair_required,
         active_model_state: attached.active_model_state,
@@ -4146,6 +4153,7 @@ fn apply_attached_payload(
     let AttachedPayload {
         session_entry_mode: _,
         history,
+        removed_user_message_seqs,
         paused_work,
         repair_required,
         active_model_state,
@@ -4163,19 +4171,26 @@ fn apply_attached_payload(
             },
         );
     }
-    if !history.is_empty() {
+    if !history.is_empty() || !removed_user_message_seqs.is_empty() {
         let max_seq = history.iter().filter_map(history_entry_seq).max();
         if let Some(max_seq) = max_seq {
             apply_incoming_event(
                 proto::Event::HistoryReplay {
                     session_id: ctx.session_id,
                     entries: history,
+                    removed_user_message_seqs,
                     max_seq,
                 },
                 ctx,
             );
         } else {
-            push_incoming_turn_event(ctx, TurnEvent::HistoryReplay { entries: history });
+            push_incoming_turn_event(
+                ctx,
+                TurnEvent::HistoryReplay {
+                    entries: history,
+                    removed_user_message_seqs,
+                },
+            );
         }
     }
     active_model_state
@@ -4192,7 +4207,10 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
     let event_session_id = event_session(&event);
 
     if let proto::Event::HistoryReplay {
-        entries, max_seq, ..
+        entries,
+        removed_user_message_seqs,
+        max_seq,
+        ..
     } = event
     {
         let last = current_last_applied_seq(ctx.last_applied_seq);
@@ -4210,16 +4228,20 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
                 None => last.is_none(),
             })
             .collect();
-        if entries.is_empty() {
+        if entries.is_empty() && removed_user_message_seqs.is_empty() {
             return;
         }
-        let applied_max_seq = entries
-            .iter()
-            .filter_map(history_entry_seq)
-            .max()
-            .unwrap_or(max_seq);
-        update_last_applied_seq(ctx.last_applied_seq, applied_max_seq);
-        push_incoming_turn_event(ctx, TurnEvent::HistoryReplay { entries });
+        // `max_seq` covers every durable replay row, including retraction
+        // tombstones that deliberately have no display entry. Advancing only
+        // to the displayed entry would replay the tombstone on each reconnect.
+        update_last_applied_seq(ctx.last_applied_seq, max_seq);
+        push_incoming_turn_event(
+            ctx,
+            TurnEvent::HistoryReplay {
+                entries,
+                removed_user_message_seqs,
+            },
+        );
         return;
     }
 
@@ -4314,7 +4336,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model,
             url,
         },
-        HistoryReplay { entries, .. } => TurnEvent::HistoryReplay { entries },
+        HistoryReplay {
+            entries,
+            removed_user_message_seqs,
+            ..
+        } => TurnEvent::HistoryReplay {
+            entries,
+            removed_user_message_seqs,
+        },
         InferenceWarning {
             agent,
             provider,
@@ -4431,6 +4460,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             seq,
             client_submission_ids,
             preflight_cleaned,
+        },
+        UserMessageRemoved {
+            seq,
+            client_submission_ids,
+            ..
+        } => TurnEvent::UserMessageRemoved {
+            seq,
+            client_submission_ids,
         },
         QueuedUserMessagesFolded {
             text,
@@ -5309,6 +5346,7 @@ mod tests {
             active_model_state: None,
             session_entry_mode: proto::SessionEntryMode::Code,
             history,
+            removed_user_message_seqs: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
             resume_compaction_offer: None,
@@ -6645,7 +6683,7 @@ mod tests {
         let drained = drained_event_payloads(&events);
         assert!(matches!(
             drained.as_slice(),
-            [TurnEvent::HistoryReplay { entries }, TurnEvent::DaemonLinkResynced { active_model_state: None }]
+            [TurnEvent::HistoryReplay { entries, .. }, TurnEvent::DaemonLinkResynced { active_model_state: None }]
                 if matches!(entries.as_slice(), [proto::HistoryEntry::Assistant { text, seq: 5, .. }] if text == "replayed")
         ));
     }
@@ -6955,6 +6993,7 @@ mod tests {
                         active_model_state: None,
                         session_entry_mode: proto::SessionEntryMode::Code,
                         history: Vec::new(),
+                        removed_user_message_seqs: Vec::new(),
                         paused_work: Vec::new(),
                         repair_required: None,
                         resume_compaction_offer: None,
@@ -7059,6 +7098,25 @@ mod tests {
                 turn_id: Some(turn_id),
                 reason: cockpit_proto::IdleReason::Completed,
             } if turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn user_message_removal_maps_without_being_deduplicated_by_replay_cursor() {
+        let session_id = uuid::Uuid::new_v4();
+        let event = proto::Event::UserMessageRemoved {
+            session_id,
+            seq: 17,
+            client_submission_ids: Vec::new(),
+        };
+        assert_eq!(event_session(&event), Some(session_id));
+        assert_eq!(event_persisted_seq(&event), None);
+        assert!(matches!(
+            proto_event_to_turn_event(event),
+            Some(TurnEvent::UserMessageRemoved {
+                seq: 17,
+                client_submission_ids,
+            }) if client_submission_ids.is_empty()
         ));
     }
 
@@ -7388,7 +7446,11 @@ mod tests {
         apply_incoming_event(
             proto::Event::HistoryReplay {
                 session_id: sid,
-                max_seq: 7,
+                // The displayed rows end at 7, but the durable retraction
+                // tombstone is sequence 8. The cursor must advance through
+                // the tombstone so reconnect does not replay it forever.
+                max_seq: 8,
+                removed_user_message_seqs: vec![5],
                 entries: vec![
                     proto::HistoryEntry::ToolCall {
                         seq: 6,
@@ -7422,7 +7484,7 @@ mod tests {
             },
             &incoming,
         );
-        assert_eq!(current_last_applied_seq(&last), Some(7));
+        assert_eq!(current_last_applied_seq(&last), Some(8));
 
         apply_incoming_event(
             proto::Event::ToolEnd {
@@ -7432,7 +7494,7 @@ mod tests {
                 tool: "read".to_string(),
                 output: "overlap".to_string(),
                 truncated: false,
-                seq: Some(7),
+                seq: Some(8),
                 hint: None,
             },
             &incoming,
@@ -7447,7 +7509,7 @@ mod tests {
                 tool: "bash".to_string(),
                 output: "live".to_string(),
                 truncated: false,
-                seq: Some(8),
+                seq: Some(9),
                 hint: None,
             },
             &incoming,
@@ -7460,11 +7522,54 @@ mod tests {
             &drained[1],
             TurnEvent::ToolEnd {
                 output,
-                seq: Some(8),
+                seq: Some(9),
                 ..
             } if output == "live"
         ));
-        assert_eq!(current_last_applied_seq(&last), Some(8));
+        assert_eq!(current_last_applied_seq(&last), Some(9));
+    }
+
+    #[test]
+    fn full_attach_payload_replays_retracted_user_rows() {
+        let session_id = uuid::Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let primary_agent = Arc::new(Mutex::new("Build".to_string()));
+        let last_applied_seq = Arc::new(Mutex::new(None));
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+        let attachment_epoch = Arc::new(AtomicU64::new(0));
+        let incoming = IncomingEventContext {
+            session_id,
+            client_epoch: 0,
+            attachment_epoch: &attachment_epoch,
+            events: &events,
+            event_notify: &notify,
+            active_agent: &active_agent,
+            active_agent_path: &active_agent_path,
+            primary_agent: &primary_agent,
+            last_applied_seq: &last_applied_seq,
+            awaiting_durable: &awaiting_durable,
+        };
+
+        apply_attached_payload(
+            AttachedPayload {
+                session_entry_mode: proto::SessionEntryMode::Assistant,
+                history: Vec::new(),
+                removed_user_message_seqs: vec![5],
+                paused_work: Vec::new(),
+                repair_required: None,
+                active_model_state: None,
+            },
+            &incoming,
+        );
+
+        assert!(matches!(
+            drained_event_payloads(&events).as_slice(),
+            [TurnEvent::HistoryReplay { entries, removed_user_message_seqs }]
+                if entries.is_empty() && removed_user_message_seqs.as_slice() == [5]
+        ));
     }
 
     struct FixedJitter {

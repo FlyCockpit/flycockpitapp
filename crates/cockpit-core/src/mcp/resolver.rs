@@ -38,9 +38,7 @@ pub enum PersistentMcpScope {
 impl PersistentMcpScope {
     fn from_config_dir_kind(kind: ConfigDirKind) -> Self {
         match kind {
-            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot | ConfigDirKind::MachineLocal => {
-                Self::Global
-            }
+            ConfigDirKind::HomeXdg | ConfigDirKind::MachineLocal => Self::Global,
             ConfigDirKind::Project => Self::Workspace,
         }
     }

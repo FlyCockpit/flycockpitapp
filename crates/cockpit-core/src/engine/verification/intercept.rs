@@ -389,12 +389,16 @@ async fn run_verification(
             input.args,
             &candidate_envelopes,
         )?;
-        let adjudicator_tool = serde_json::to_string(&super::adjudicate::verdict_tool())?;
+        let (adjudicator_system, adjudicator_tools, _) =
+            super::inference::effective_verification_route(
+                super::adjudicate::ADJUDICATOR_SYSTEM,
+                model,
+                &std::slice::from_ref(&super::adjudicate::verdict_tool()),
+            );
+        let adjudicator_tools = serde_json::to_string(&adjudicator_tools)?;
         let adjudicator_fixed = format!(
             "{}\n{}\n{}",
-            super::adjudicate::ADJUDICATOR_SYSTEM,
-            adjudicator_tool,
-            adjudicator_prompt
+            adjudicator_system, adjudicator_tools, adjudicator_prompt
         );
         let estimate = estimate_candidate_set(CandidateSetEstimateInput {
             assembled_texts: std::slice::from_ref(&adjudicator_fixed),
@@ -644,6 +648,7 @@ async fn run_verification(
                         input.ctx.session.clone(),
                         &adjudicator,
                         &input.ctx.config,
+                        input.ctx.interrupts.as_ref(),
                         &input.ctx.cancel,
                         &format!("{}:verification-adjudicator", input.agent.name),
                         input.resolved_name,

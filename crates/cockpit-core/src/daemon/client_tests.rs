@@ -76,6 +76,7 @@ fn attached_response(session_id: Uuid) -> Response {
         active_subagent: None,
         active_model_state: None,
         history: Vec::new(),
+        removed_user_message_seqs: Vec::new(),
         paused_work: Vec::new(),
         repair_required: None,
         resume_compaction_offer: None,

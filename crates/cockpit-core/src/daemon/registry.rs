@@ -2834,7 +2834,9 @@ impl SessionRegistry {
         let Some(mut join) = join else {
             let _ = tokio::time::timeout_at(
                 deadline,
-                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+                handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await;
             let _ = tokio::time::timeout_at(
@@ -2857,7 +2859,9 @@ impl SessionRegistry {
 
         let _ = tokio::time::timeout_at(
             deadline,
-            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel),
+            handle.send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+            }),
         )
         .await;
         let _ = tokio::time::timeout_at(
@@ -4922,7 +4926,9 @@ mod tests {
         loop {
             if tokio::time::timeout(
                 Duration::from_millis(50),
-                handle.send_work(session_worker::SessionWork::Cancel),
+                handle.send_work(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Noninteractive,
+                }),
             )
             .await
             .is_err()

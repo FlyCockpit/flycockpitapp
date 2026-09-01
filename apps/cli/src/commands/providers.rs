@@ -12,6 +12,11 @@ use crate::daemon::proto::{ProviderUsageAvailabilityView, Request, Response};
 #[cfg(test)]
 use std::path::Path;
 
+// Descriptor device-code grants can remain pending for fifteen minutes. Leave
+// a small bounded margin for the last token response and durable commit.
+pub(crate) const OAUTH_COMPLETION_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(16 * 60);
+
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
         ProvidersCommand::List => {
@@ -90,11 +95,14 @@ async fn login(args: ProviderLoginArgs) -> Result<()> {
     };
     let completed = daemon
         .client
-        .request(Request::CompleteProviderOAuth {
-            client_operation_id: uuid::Uuid::new_v4().to_string(),
-            flow_id,
-            input,
-        })
+        .request_with_timeout(
+            Request::CompleteProviderOAuth {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                flow_id,
+                input,
+            },
+            OAUTH_COMPLETION_REQUEST_TIMEOUT,
+        )
         .await
         .map_err(|error| anyhow!("provider OAuth completion RPC failed: {error}"))?
         .map_err(|error| anyhow!("daemon rejected provider OAuth completion: {error}"))?;

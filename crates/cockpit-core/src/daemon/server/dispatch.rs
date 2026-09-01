@@ -1271,7 +1271,7 @@ async fn purge_durable_oauth_flows(
     }
     flows.sort_by_key(|(_, _, created, _, _, _, _)| *created);
 
-    // A Ready flow has a hard ten-minute lifetime. Its begin receipt is
+    // A Ready flow has a hard device-code-compatible lifetime. Its begin receipt is
     // rewritten to the exact terminal expiry outcome in the same transaction
     // that removes the sealed verifier, so an abandoned receipt cannot protect
     // capacity forever or replay a dead authorize instruction.
@@ -2036,7 +2036,10 @@ fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<
     Ok(())
 }
 
-const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+// Provider device-code descriptors may poll for up to fifteen minutes. Keep
+// their daemon-owned state alive through that advertised lifetime plus a
+// bounded final token/commit margin.
+const OAUTH_FLOW_TTL: Duration = Duration::from_secs(16 * 60);
 const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
 const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 

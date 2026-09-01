@@ -3263,9 +3263,6 @@ impl Request {
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
-                if !matches!(provider_id.as_str(), "grok-oauth" | "codex-oauth") {
-                    return Err("provider OAuth is only available for Grok or Codex".to_string());
-                }
             }
             Self::CompleteProviderOAuth {
                 client_operation_id,
@@ -5375,6 +5372,16 @@ pub fn remote_operation_uuid_v7_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_oauth_begin_accepts_a_configured_provider_id() {
+        Request::BeginProviderOAuth {
+            client_operation_id: "provider-oauth-begin".into(),
+            provider_id: "custom-device-oauth".into(),
+        }
+        .validate_semantics()
+        .expect("configured provider OAuth ids must reach daemon descriptor validation");
+    }
 
     #[test]
     fn agent_interrupt_response_rejects_the_same_empty_shapes_as_typescript() {

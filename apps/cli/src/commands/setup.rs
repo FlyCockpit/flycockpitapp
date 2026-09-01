@@ -1122,11 +1122,14 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         .context("starting persistent daemon for OAuth login")?;
     match daemon
         .client
-        .request(Request::CompleteProviderOAuth {
-            client_operation_id: uuid::Uuid::new_v4().to_string(),
-            flow_id,
-            input: input.map(cockpit_proto::SensitiveWirePayload::new),
-        })
+        .request_with_timeout(
+            Request::CompleteProviderOAuth {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                flow_id,
+                input: input.map(cockpit_proto::SensitiveWirePayload::new),
+            },
+            crate::commands::providers::OAUTH_COMPLETION_REQUEST_TIMEOUT,
+        )
         .await?
     {
         Ok(Response::ProviderOAuthCompleted {

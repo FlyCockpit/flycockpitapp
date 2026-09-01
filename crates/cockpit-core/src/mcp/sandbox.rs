@@ -97,12 +97,10 @@ pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
 pub(crate) const MCP_IMPORT_GUIDANCE: &str = "mcp is prebound in this sandbox; call mcp.search, \
 mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe, or mcp.invoke directly — do not import mcp";
 
-pub async fn run_with_host(
-    script: &str,
-    cfg: &McpConfig,
-    host: &HostContext,
-) -> Result<String> {
-    Ok(run_envelope_with_host(script, cfg, host).await?.model_text())
+pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) -> Result<String> {
+    Ok(run_envelope_with_host(script, cfg, host)
+        .await?
+        .model_text())
 }
 
 pub async fn run_envelope_with_host(

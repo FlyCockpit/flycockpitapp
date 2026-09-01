@@ -272,10 +272,7 @@ fn rendered_result_output(
     }
 
     if let Some(display) = display {
-        output = output.with_model_ephemeral_display(truncate_head_tail(
-            &display,
-            OUTPUT_BYTE_CAP,
-        ));
+        output = output.with_model_ephemeral_display(truncate_head_tail(&display, OUTPUT_BYTE_CAP));
     }
     output
 }
@@ -299,10 +296,7 @@ mod tests {
         crate::redact::RedactionTable::build_with_env_and_secrets(
             &cfg,
             root,
-            &HashMap::from([(
-                "API_TOKEN".to_string(),
-                "monty-secret-value".to_string(),
-            )]),
+            &HashMap::from([("API_TOKEN".to_string(), "monty-secret-value".to_string())]),
             Vec::<(String, String)>::new(),
         )
         .unwrap()

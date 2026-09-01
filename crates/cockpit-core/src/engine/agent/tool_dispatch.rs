@@ -3336,9 +3336,7 @@ mod tests {
                     .with_output_sidecar(crate::engine::tool::ToolOutputSidecar {
                         payload: serde_json::json!({"detail": "sidecar metadata sentinel"}),
                     })
-                    .with_model_ephemeral_display(
-                        "kept result\nmodel ephemeral display sentinel",
-                    )
+                    .with_model_ephemeral_display("kept result\nmodel ephemeral display sentinel")
                     .with_model_ephemeral_text_artifact_capture(
                         crate::intel::budget::capture_text_artifact_body(
                             "model ephemeral artifact sentinel",
@@ -6429,11 +6427,7 @@ mod tests {
         assert!(restart_wire.contains(NATIVE_SANDBOX), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_RESOURCE), "{restart_wire}");
         assert!(restart_wire.contains(NATIVE_SIDECAR), "{restart_wire}");
-        let artifacts = session
-            .db
-            .list_text_artifacts(session.id)
-            .await
-            .unwrap();
+        let artifacts = session.db.list_text_artifacts(session.id).await.unwrap();
         assert!(
             artifacts
                 .iter()

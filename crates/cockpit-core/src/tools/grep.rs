@@ -37,7 +37,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Literal or regex content search in the current root, an attached local knowledge base, or one `cockpit://` pseudofile; `cockpit://history/` uses bounded FTS discovery"
+        "Literal or regex content search; use `search` for broader discovery and `code` for symbols. Searches the root, attached local knowledge, or one `cockpit://` pseudofile"
     }
 
     fn effect(&self) -> ToolEffect {

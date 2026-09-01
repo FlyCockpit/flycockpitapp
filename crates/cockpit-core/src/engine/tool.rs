@@ -4147,6 +4147,7 @@ mod steering_tests {
             ("context_pack", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
+            ("delete", ToolEffect::Dynamic),
             ("edit", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
             // Media tools: audio/video inspection (read-only) and derivation

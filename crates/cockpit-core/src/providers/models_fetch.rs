@@ -222,7 +222,9 @@ pub async fn resolve_provider_request_async(
     }
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if entry.oauth.is_none() && let Some(message) = provider.auth_resolution_error(false) {
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(false)
+    {
         anyhow::bail!(message);
     }
     if provider.credential_kind().is_some() {
@@ -248,11 +250,9 @@ pub async fn resolve_provider_request_async_with_store(
     .await
 }
 
-/// Re-resolve a command-authenticated request after an explicit provider
-/// rejection.  The environment lookup is deliberately supplied by the caller:
-/// it is part of the resolved command argv and therefore part of the command
-/// credential's configuration identity.  Do not replace it with the daemon's
-/// ambient environment on refresh.
+/// Re-resolve a dynamically authenticated request after an explicit provider
+/// rejection. The environment lookup remains caller-supplied because it is
+/// part of an auth-command argv identity; descriptors ignore it.
 pub async fn refresh_provider_request_async_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
@@ -301,7 +301,9 @@ async fn resolve_provider_request_async_with_store_refresh(
     );
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if entry.oauth.is_none() && let Some(message) = provider.auth_resolution_error(true) {
+    if entry.oauth.is_none()
+        && let Some(message) = provider.auth_resolution_error(true)
+    {
         anyhow::bail!(message);
     }
     let command_credential = match entry.auth_command.as_deref() {
@@ -335,7 +337,11 @@ async fn resolve_provider_request_async_with_store_refresh(
     let command_credential_generation = command_credential
         .as_ref()
         .map(|credential| credential.refresh_generation)
-        .or_else(|| descriptor_credential.as_ref().map(|credential| credential.refresh_generation));
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))
@@ -388,9 +394,10 @@ async fn resolve_model_list_request_async_with_store(
     env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if entry.oauth.is_none() && let Some(message) = registry
-        .provider_for(provider_id, entry)
-        .auth_resolution_error(store.is_some())
+    if entry.oauth.is_none()
+        && let Some(message) = registry
+            .provider_for(provider_id, entry)
+            .auth_resolution_error(store.is_some())
     {
         anyhow::bail!(message);
     }
@@ -433,7 +440,11 @@ async fn resolve_model_list_request_async_with_store(
     let command_credential_generation = command_credential
         .as_ref()
         .map(|credential| credential.refresh_generation)
-        .or_else(|| descriptor_credential.as_ref().map(|credential| credential.refresh_generation));
+        .or_else(|| {
+            descriptor_credential
+                .as_ref()
+                .map(|credential| credential.refresh_generation)
+        });
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = if let Some(credential) = command_credential {
         Some(OAuthCredential::Command(credential))

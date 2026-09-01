@@ -48,7 +48,9 @@ impl OAuthCredential {
             OAuthCredential::Bearer(token) => token,
             OAuthCredential::Codex(tokens) => &tokens.access_token,
             OAuthCredential::Command(credential) => &credential.token,
-            OAuthCredential::Descriptor(_) => unreachable!("descriptor credentials map headers directly"),
+            OAuthCredential::Descriptor(_) => {
+                unreachable!("descriptor credentials map headers directly")
+            }
         }
     }
 }

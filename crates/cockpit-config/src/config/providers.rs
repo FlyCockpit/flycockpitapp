@@ -1071,7 +1071,9 @@ impl OAuthDescriptor {
             return Err("OAuth client_id and token_endpoint must not be empty");
         }
         match self.flow {
-            OAuthFlowKind::DeviceCode if self.device_endpoint.as_deref().unwrap_or("").is_empty() => {
+            OAuthFlowKind::DeviceCode
+                if self.device_endpoint.as_deref().unwrap_or("").is_empty() =>
+            {
                 return Err("device-code OAuth requires device_endpoint");
             }
             OAuthFlowKind::PkceBrowser

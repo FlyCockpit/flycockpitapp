@@ -85,17 +85,18 @@ pub(crate) async fn resolve_vetted_egress(
         return Ok(None);
     }
     let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
-    let command_refresh = (entry.auth_command.is_some() || entry.oauth.is_some()).then(|| CommandRefresh {
-        provider_id: provider_id.to_string(),
-        config: config.live(),
-        configured_generation: config_generation,
-        store,
-        env: env.clone(),
-        state: Arc::new(Mutex::new(CommandRequestState {
-            headers: HeaderMap::new(),
-            rejected_refresh_generation: request.command_credential_generation(),
-        })),
-    });
+    let command_refresh =
+        (entry.auth_command.is_some() || entry.oauth.is_some()).then(|| CommandRefresh {
+            provider_id: provider_id.to_string(),
+            config: config.live(),
+            configured_generation: config_generation,
+            store,
+            env: env.clone(),
+            state: Arc::new(Mutex::new(CommandRequestState {
+                headers: HeaderMap::new(),
+                rejected_refresh_generation: request.command_credential_generation(),
+            })),
+        });
     VettedTranscriptionEgress::new_with_headers_and_refresh(
         provider_id.to_string(),
         origin.as_str(),

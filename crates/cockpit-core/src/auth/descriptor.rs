@@ -168,6 +168,7 @@ pub async fn complete_device_code_login_in(
     login: DeviceCodeLogin,
     store: CredentialStore,
 ) -> Result<()> {
+    validate_descriptor(descriptor, OAuthFlowKind::DeviceCode)?;
     validate_login_identity(descriptor, &login.configuration_identity)?;
     let deadline = std::time::Instant::now()
         + Duration::from_secs(login.expires_in_secs.min(MAX_DEVICE_POLL_SECS));
@@ -236,6 +237,7 @@ pub async fn complete_pkce_browser_login_in(
     callback_or_code: &str,
     store: CredentialStore,
 ) -> Result<()> {
+    validate_descriptor(descriptor, OAuthFlowKind::PkceBrowser)?;
     validate_login_identity(descriptor, &login.configuration_identity)?;
     let code = parse_callback(callback_or_code, &login.state)?;
     let response = token_post(
@@ -254,12 +256,7 @@ pub async fn complete_pkce_browser_login_in(
     if !status.is_success() {
         return Err(token_endpoint_error(status, &body));
     }
-    persist_initial(
-        provider_id,
-        descriptor,
-        store,
-        parse_token_response(&body)?,
-    )
+    persist_initial(provider_id, descriptor, store, parse_token_response(&body)?)
 }
 
 pub(crate) async fn resolve(
@@ -307,6 +304,11 @@ pub(crate) async fn resolve(
             return Err(token_endpoint_error(status, &body));
         }
         let mut merged = cached.token;
+        // Expiry metadata describes the access token returned alongside it.
+        // Never carry an already-expired absolute timestamp onto a rotated
+        // token when the refresh response omits fresh lifetime metadata.
+        merged.remove("expires_at");
+        merged.remove("expires_in");
         merged.extend(parse_token_response(&body)?);
         validate_token_mapping(descriptor, &merged)?;
         let refreshed = StoredCredential {
@@ -328,9 +330,12 @@ fn persist_initial(
     token: Map<String, Value>,
 ) -> Result<()> {
     validate_token_mapping(descriptor, &token)?;
+    let configuration_identity = configuration_identity(descriptor)?;
+    let refresh_generation = load_cached(&store, provider_id, &configuration_identity)?
+        .map_or(1, |cached| cached.refresh_generation.saturating_add(1));
     let cached = StoredCredential {
-        configuration_identity: configuration_identity(descriptor)?,
-        refresh_generation: 1,
+        configuration_identity,
+        refresh_generation,
         expires_at: token_expiry(&token),
         token,
     };
@@ -416,7 +421,10 @@ fn render_template(template: &str, token: &Map<String, Value>) -> Result<String>
 
 fn validate_descriptor(descriptor: &OAuthDescriptor, expected: OAuthFlowKind) -> Result<()> {
     descriptor.validate().map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(descriptor.flow == expected, "OAuth flow kind does not match operation");
+    anyhow::ensure!(
+        descriptor.flow == expected,
+        "OAuth flow kind does not match operation"
+    );
     validate_endpoint(&descriptor.token_endpoint, false)?;
     if let Some(endpoint) = descriptor.refresh_endpoint.as_deref() {
         validate_endpoint(endpoint, false)?;
@@ -436,7 +444,10 @@ fn validate_descriptor(descriptor: &OAuthDescriptor, expected: OAuthFlowKind) ->
 fn validate_endpoint(endpoint: &str, browser_facing: bool) -> Result<()> {
     let url = Url::parse(endpoint).context("OAuth endpoint is not a URL")?;
     let loopback = url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     });
     anyhow::ensure!(
         url.scheme() == "https" || (url.scheme() == "http" && loopback),
@@ -447,7 +458,10 @@ fn validate_endpoint(endpoint: &str, browser_facing: bool) -> Result<()> {
         "OAuth endpoint contains forbidden URL components"
     );
     if !browser_facing {
-        anyhow::ensure!(url.query().is_none(), "OAuth POST endpoint must not contain a query");
+        anyhow::ensure!(
+            url.query().is_none(),
+            "OAuth POST endpoint must not contain a query"
+        );
     }
     Ok(())
 }
@@ -471,17 +485,21 @@ fn oauth_client() -> Result<reqwest::Client> {
 }
 
 fn parse_token_response(body: &str) -> Result<Map<String, Value>> {
-    let Value::Object(token) = serde_json::from_str(body).context("OAuth token response is malformed")? else {
+    let Value::Object(token) =
+        serde_json::from_str(body).context("OAuth token response is malformed")?
+    else {
         anyhow::bail!("OAuth token response must be a JSON object");
     };
     Ok(token)
 }
 
 fn token_expiry(token: &Map<String, Value>) -> Option<i64> {
-    token
-        .get("expires_at")
-        .and_then(Value::as_i64)
-        .or_else(|| token.get("expires_in").and_then(Value::as_i64).map(|ttl| unix_now().saturating_add(ttl)))
+    token.get("expires_at").and_then(Value::as_i64).or_else(|| {
+        token
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .map(|ttl| unix_now().saturating_add(ttl))
+    })
 }
 
 fn needs_refresh(cached: &StoredCredential) -> bool {
@@ -502,11 +520,17 @@ fn parse_callback(input: &str, expected_state: &str) -> Result<String> {
         .split('#')
         .next()
         .unwrap_or_default();
-    let values: BTreeMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+    let values: BTreeMap<_, _> = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
     anyhow::ensure!(!values.contains_key("error"), "OAuth authorization failed");
-    if let Some(state) = values.get("state") {
-        anyhow::ensure!(state == expected_state, "OAuth state mismatch (possible CSRF)");
-    }
+    let state = values
+        .get("state")
+        .context("OAuth callback is missing `state` (possible CSRF)")?;
+    anyhow::ensure!(
+        state == expected_state,
+        "OAuth state mismatch (possible CSRF)"
+    );
     values
         .get("code")
         .filter(|code| !code.is_empty())
@@ -531,14 +555,16 @@ fn validate_login_identity(descriptor: &OAuthDescriptor, identity: &str) -> Resu
 }
 
 fn oauth_error_code(body: &str) -> Option<String> {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_string))
+    serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
-fn token_endpoint_error(status: StatusCode, body: &str) -> anyhow::Error {
-    let code = oauth_error_code(body).unwrap_or_else(|| "unknown_error".to_string());
-    anyhow!("OAuth token endpoint rejected the request ({status}, {code})")
+fn token_endpoint_error(status: StatusCode, _body: &str) -> anyhow::Error {
+    anyhow!("OAuth token endpoint rejected the request ({status})")
 }
 
 fn ensure_nonempty(value: &str, field: &str) -> Result<()> {
@@ -570,8 +596,7 @@ mod tests {
             flow,
             authorize_endpoint: (flow == OAuthFlowKind::PkceBrowser)
                 .then(|| format!("{base}/authorize")),
-            device_endpoint: (flow == OAuthFlowKind::DeviceCode)
-                .then(|| format!("{base}/device")),
+            device_endpoint: (flow == OAuthFlowKind::DeviceCode).then(|| format!("{base}/device")),
             token_endpoint: format!("{base}/token"),
             refresh_endpoint: Some(format!("{base}/refresh")),
             client_id: "test-client".to_string(),
@@ -597,7 +622,9 @@ mod tests {
         (temp, store)
     }
 
-    async fn response_server(responses: Vec<&'static str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    async fn response_server(
+        responses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -612,11 +639,16 @@ mod tests {
                         break;
                     }
                     bytes.extend_from_slice(&buffer[..read]);
-                    if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
                         let headers = String::from_utf8_lossy(&bytes[..header_end]);
                         let content_length = headers
                             .lines()
-                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|value| value.parse::<usize>().ok()))
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
                             .unwrap_or(0);
                         if bytes.len() >= header_end + 4 + content_length {
                             break;
@@ -664,8 +696,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(resolved.headers.iter().any(|header| header.name == "Authorization" && header.value == "Bearer device-access"));
-        assert!(resolved.headers.iter().any(|header| header.name == "X-Account" && header.value == "acct-1"));
+        assert!(
+            resolved
+                .headers
+                .iter()
+                .any(|header| header.name == "Authorization"
+                    && header.value == "Bearer device-access")
+        );
+        assert!(
+            resolved
+                .headers
+                .iter()
+                .any(|header| header.name == "X-Account" && header.value == "acct-1")
+        );
         let requests = server.await.unwrap();
         assert!(requests[0].contains("client_id=test-client"));
         assert!(requests[1].contains("device_code=device"));
@@ -680,12 +723,17 @@ mod tests {
         let descriptor = descriptor(&base, OAuthFlowKind::PkceBrowser);
         let login = begin_pkce_browser_login(&descriptor).unwrap();
         assert!(login.authorize_url.contains("code_challenge_method=S256"));
-        let callback = format!("http://127.0.0.1:8765/callback?code=approved&state={}", login.state);
+        let callback = format!(
+            "http://127.0.0.1:8765/callback?code=approved&state={}",
+            login.state
+        );
         let (_temp, store) = store();
         complete_pkce_browser_login_in("custom", &descriptor, login, &callback, store.clone())
             .await
             .unwrap();
-        let credential = resolve("custom", &descriptor, store, false, None).await.unwrap();
+        let credential = resolve("custom", &descriptor, store, false, None)
+            .await
+            .unwrap();
         assert_eq!(credential.headers["Authorization"], "Bearer pkce-access");
         let requests = server.await.unwrap();
         assert!(requests[0].contains("code=approved"));
@@ -694,10 +742,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_credential_refreshes_and_preserves_omitted_fields() {
-        let (base, server) = response_server(vec![
-            r#"{"access_token":"fresh-access","expires_in":3600}"#,
-        ])
-        .await;
+        let (base, server) =
+            response_server(vec![r#"{"access_token":"fresh-access","expires_in":3600}"#]).await;
         let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
         let (_temp, store) = store();
         persist_initial(
@@ -714,7 +760,9 @@ mod tests {
         )
         .unwrap();
 
-        let credential = resolve("custom", &descriptor, store, false, None).await.unwrap();
+        let credential = resolve("custom", &descriptor, store, false, None)
+            .await
+            .unwrap();
         assert_eq!(credential.headers["Authorization"], "Bearer fresh-access");
         assert_eq!(credential.headers["X-Account"], "preserved-account");
         assert_eq!(credential.refresh_generation, 2);
@@ -733,7 +781,11 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "refresh_token": "only-refresh" })).unwrap(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("missing string field `access_token`"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing string field `access_token`")
+        );
         assert!(store.reopen().unwrap().get("custom").is_none());
     }
 }

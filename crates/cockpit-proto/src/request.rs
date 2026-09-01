@@ -3553,8 +3553,14 @@ impl Request {
                 answers_json,
             } => {
                 validate_owner_project_root(project_root)?;
-                if !matches!(wizard_id.as_str(), "security" | "model") {
-                    return Err("setup wizard must be security or model".to_string());
+                if !matches!(
+                    wizard_id.as_str(),
+                    "security" | "model" | "onboarding-model" | "onboarding-profile"
+                ) {
+                    return Err(
+                        "setup wizard must be security, model, onboarding-model, or onboarding-profile"
+                            .to_string(),
+                    );
                 }
                 if answers_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("setup wizard answers exceed maximum length".to_string());

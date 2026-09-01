@@ -68,7 +68,9 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     let save = ProviderSavePlan {
         provider_id: "example".into(),
         entry: ProviderEntry::default(),
-        header_secrets: vec![Some(zeroize::Zeroizing::new(sentinel.to_string()))],
+        header_secrets: vec![Some(cockpit_proto::ProviderSecretValue::new(
+            sentinel.to_string(),
+        ))],
     };
     let plan = ProviderMutationPlan {
         snapshot_session_id: "snapshot".into(),

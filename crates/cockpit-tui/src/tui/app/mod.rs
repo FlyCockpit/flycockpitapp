@@ -3578,6 +3578,7 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
+        let onboarding_stage = cockpit_core::welcome::onboarding_stage();
         let startup_dependency_notice =
             cockpit_core::external_runtime::current_startup_dependency_policy()
                 .and_then(|policy| policy.summary)
@@ -3965,10 +3966,12 @@ impl App {
             #[cfg(feature = "remote")]
             connector_disclosure,
             has_no_providers_at_startup,
-            first_run_flow: if has_no_providers_at_startup {
-                FirstRunFlow::AwaitWelcome
-            } else {
-                FirstRunFlow::None
+            first_run_flow: match onboarding_stage {
+                cockpit_core::welcome::OnboardingStage::Welcome => FirstRunFlow::AwaitWelcome,
+                cockpit_core::welcome::OnboardingStage::Profile => FirstRunFlow::AwaitProfile,
+                cockpit_core::welcome::OnboardingStage::Provider => FirstRunFlow::AwaitProvider,
+                cockpit_core::welcome::OnboardingStage::Model => FirstRunFlow::AwaitModel,
+                cockpit_core::welcome::OnboardingStage::Complete => FirstRunFlow::None,
             },
             side_conversation: None,
             daemon_draining: false,

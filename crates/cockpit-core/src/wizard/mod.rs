@@ -239,6 +239,12 @@ impl WizardRun {
             let answer = answers
                 .get(step.id)
                 .cloned()
+                .or_else(|| {
+                    // The client acknowledges the terminal save action only after
+                    // the daemon response. It is the sole answer replay may infer.
+                    matches!(&step.kind, StepKind::Action { .. })
+                        .then_some(WizardAnswer::Acknowledged)
+                })
                 .ok_or_else(|| anyhow!("missing answer for wizard step `{}`", step.id))?;
             run.submit(answer)
                 .map_err(|error| anyhow!("invalid wizard answer: {error}"))?;
@@ -606,17 +612,17 @@ fn model_descriptor_with_selection_mode(
             },
             StepDescriptor {
                 id: "model",
-                prompt: "Choose a model",
-                help: "Only models configured for the selected provider are shown.",
+                prompt: if onboarding { "Model ID" } else { "Choose a model" },
+                help: if onboarding { "Enter the exact provider model ID. This also works when the provider has no catalog endpoint or the catalog is unavailable." } else { "Only models configured for the selected provider are shown." },
                 help_hook: None,
-                kind: StepKind::Select {
+                kind: if onboarding { StepKind::Text } else { StepKind::Select {
                     // Resolved from the provider answer by `select_options`.
                     // Do not restore an all-provider static list here.
                     options: Vec::new(),
-                },
+                } },
                 default_answer: None,
-                prefill: Some(model_ref_prefill),
-                validate: Some(validate_model_ref_matches_provider),
+                prefill: Some(if onboarding { onboarding_model_id_prefill } else { model_ref_prefill }),
+                validate: Some(if onboarding { validate_onboarding_model_id } else { validate_model_ref_matches_provider }),
                 write: None,
                 branch: None,
             },
@@ -1452,11 +1458,35 @@ pub fn model_provider_answer(run: &WizardRun) -> Option<String> {
 }
 
 pub fn model_ref_answer(run: &WizardRun) -> Option<(String, String)> {
-    let WizardAnswer::Select(value) = run.answer("model")? else {
+    match run.answer("model")? {
+        WizardAnswer::Select(value) => {
+            let (provider, model) = value.split_once(':')?;
+            Some((provider.to_string(), model.to_string()))
+        }
+        WizardAnswer::Text(model) => Some((model_provider_answer(run)?, model.trim().to_string())),
+        _ => None,
+    }
+}
+
+fn onboarding_model_id_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let WizardAnswer::Select(value) = model_ref_prefill(run)? else {
         return None;
     };
-    let (provider, model) = value.split_once(':')?;
-    Some((provider.to_string(), model.to_string()))
+    let (_, model) = value.split_once(':')?;
+    Some(WizardAnswer::Text(model.to_string()))
+}
+
+fn validate_onboarding_model_id(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Text(value) if !value.trim().is_empty() && !value.contains(':') => Ok(()),
+        WizardAnswer::Text(_) => {
+            Err("enter a non-empty model ID without a provider prefix".to_string())
+        }
+        _ => Err("model ID must be text".to_string()),
+    }
 }
 
 pub fn model_trust_answer(run: &WizardRun) -> Option<crate::config::providers::ModelTrust> {
@@ -2222,6 +2252,37 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn onboarding_model_wizard_accepts_manual_model_id_and_context() {
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "openai".into(),
+            crate::config::providers::ProviderEntry::default(),
+        );
+        let descriptor = onboarding_model_descriptor_with_selection(&providers, None);
+        let model = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "model")
+            .unwrap();
+        assert!(matches!(model.kind, StepKind::Text));
+        assert!(
+            descriptor
+                .steps
+                .iter()
+                .any(|step| step.id == "context-tokens")
+        );
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("manual-model-id".into()))
+            .unwrap();
+        assert_eq!(
+            model_ref_answer(&run),
+            Some(("openai".into(), "manual-model-id".into()))
+        );
+    }
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 

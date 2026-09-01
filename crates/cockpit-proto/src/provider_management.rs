@@ -95,23 +95,45 @@ pub struct ProviderLayerMetadataPatch {
 }
 
 #[derive(Clone)]
-pub struct ProviderSecretValue(Zeroizing<String>);
+pub enum ProviderSecretValue {
+    Literal(Zeroizing<String>),
+    DetectedEnvironment {
+        template_id: String,
+        variable: String,
+    },
+}
 
 impl ProviderSecretValue {
     pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
+        Self::Literal(Zeroizing::new(value))
     }
 
-    pub fn into_zeroizing(mut self) -> Zeroizing<String> {
-        Zeroizing::new(std::mem::take(&mut *self.0))
+    pub fn detected_environment(template_id: String, variable: String) -> Self {
+        Self::DetectedEnvironment {
+            template_id,
+            variable,
+        }
+    }
+
+    pub fn into_literal(self) -> Option<Zeroizing<String>> {
+        match self {
+            Self::Literal(mut value) => Some(Zeroizing::new(std::mem::take(&mut *value))),
+            Self::DetectedEnvironment { .. } => None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        matches!(self, Self::Literal(value) if value.is_empty())
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        match self {
+            Self::Literal(value) => value.len(),
+            Self::DetectedEnvironment {
+                template_id,
+                variable,
+            } => template_id.len() + variable.len(),
+        }
     }
 }
 
@@ -126,7 +148,18 @@ impl Serialize for ProviderSecretValue {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.0.as_str())
+        match self {
+            Self::Literal(value) => serializer.serialize_str(value.as_str()),
+            Self::DetectedEnvironment {
+                template_id,
+                variable,
+            } => serde_json::json!({
+                "source": "detected_environment",
+                "template_id": template_id,
+                "variable": variable,
+            })
+            .serialize(serializer),
+        }
     }
 }
 
@@ -135,7 +168,29 @@ impl<'de> Deserialize<'de> for ProviderSecretValue {
     where
         D: serde::Deserializer<'de>,
     {
-        String::deserialize(deserializer).map(Self::new)
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Literal(String),
+            Detected {
+                source: String,
+                template_id: String,
+                variable: String,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Literal(value) => Ok(Self::new(value)),
+            Wire::Detected {
+                source,
+                template_id,
+                variable,
+            } if source == "detected_environment" => {
+                Ok(Self::detected_environment(template_id, variable))
+            }
+            Wire::Detected { .. } => {
+                Err(serde::de::Error::custom("unknown provider secret source"))
+            }
+        }
     }
 }
 
@@ -151,7 +206,7 @@ mod tests {
         let wire = serde_json::to_string(&value).unwrap();
         assert_eq!(wire, format!("\"{sentinel}\""));
         let decoded: ProviderSecretValue = serde_json::from_str(&wire).unwrap();
-        let decoded = decoded.into_zeroizing();
+        let decoded = decoded.into_literal().unwrap();
         assert_eq!(decoded.as_str(), sentinel);
     }
 

@@ -454,11 +454,7 @@ fn provider_mutation_request(
                 header_secrets: save
                     .header_secrets
                     .into_iter()
-                    .map(|secret| {
-                        secret.map(|mut value| {
-                            cockpit_proto::ProviderSecretValue::new(std::mem::take(&mut *value))
-                        })
-                    })
+                    .map(|secret| secret)
                     .collect(),
             })
             .collect(),
@@ -638,7 +634,13 @@ pub(crate) struct ProviderMutationPlan {
 pub(crate) struct ProviderSavePlan {
     provider_id: String,
     entry: ProviderEntry,
-    header_secrets: Vec<Option<zeroize::Zeroizing<String>>>,
+    header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>>,
+}
+
+#[derive(Clone)]
+pub(super) struct DetectedEnvironmentCopy {
+    pub(super) template_id: String,
+    pub(super) variable: String,
 }
 
 impl std::fmt::Debug for ProviderMutationPlan {
@@ -859,13 +861,7 @@ pub(crate) async fn execute_settings_daemon_work(
                         header_secrets: save
                             .header_secrets
                             .into_iter()
-                            .map(|secret| {
-                                secret.map(|mut value| {
-                                    cockpit_proto::ProviderSecretValue::new(std::mem::take(
-                                        &mut *value,
-                                    ))
-                                })
-                            })
+                            .map(|secret| secret)
                             .collect(),
                     })
                     .collect(),
@@ -3058,7 +3054,7 @@ pub struct SettingsCx {
     completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
     completed_web_credential: Option<(String, Result<(), String>)>,
     completed_provider_auth: Option<CompletedProviderAuthMutation>,
-    pending_provider_add: Option<(String, ProviderEntry, bool)>,
+    pending_provider_add: Option<(String, ProviderEntry, bool, Option<DetectedEnvironmentCopy>)>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -4123,8 +4119,11 @@ impl SettingsCx {
                         self.completed_provider_mutation = Some(Ok(()));
                         self.completed_provider_mutation_navigation =
                             self.pending_provider_mutation_navigation.take();
-                        if let Some(pending) = self.pending_provider_add.take() {
-                            self.completed_provider_add = Some(Ok(pending));
+                        if let Some((id, entry, supports_models_endpoint, _)) =
+                            self.pending_provider_add.take()
+                        {
+                            self.completed_provider_add =
+                                Some(Ok((id, entry, supports_models_endpoint)));
                         }
                     }
                     Ok(other) => {
@@ -5808,6 +5807,10 @@ impl Dialog {
         Self::open_providers_add_with_status(cwd, None)
     }
 
+    pub fn open_onboarding_provider_add(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, true)
+    }
+
     pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
         let reduced_motion = std::env::var_os("NO_COLOR").is_some()
             || std::env::var("TERM").is_ok_and(|term| term == "dumb")
@@ -5822,6 +5825,14 @@ impl Dialog {
     }
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, false)
+    }
+
+    fn open_providers_add_mode(
+        cwd: &std::path::Path,
+        status: Option<String>,
+        onboarding: bool,
+    ) -> Self {
         // The provider wizard is the first-run destination for the
         // always-writable global layer, not the generic config-location
         // picker. Opening (or cancelling) it must not create a config layer.
@@ -5832,7 +5843,7 @@ impl Dialog {
         match path {
             Ok((path, global_root)) => {
                 let mut s = SettingsDialog::open_from_picker(path, global_root);
-                let mut add = AddState::new();
+                let mut add = AddState::new_with_onboarding(onboarding);
                 add.error = status;
                 s.page = providers_page(ProvidersPage::Add(add));
                 Dialog::Settings(Box::new(s))
@@ -5862,6 +5873,7 @@ impl Dialog {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
             cockpit_core::wizard::SECURITY_WIZARD_ID
             | cockpit_core::wizard::MODEL_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
             | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
@@ -5895,6 +5907,13 @@ impl Dialog {
             &global_root,
             Some((provider_id, model_id)),
         );
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
+    pub fn open_onboarding_model_setup(status: Option<String>) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor =
+            cockpit_core::wizard::onboarding_model_descriptor_for_cwd(&global_root, None);
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
@@ -5945,6 +5964,14 @@ impl Dialog {
             self,
             Dialog::SetupWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
+        )
+    }
+
+    pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {
+        matches!(
+            self,
+            Dialog::SetupWizard(wizard)
+                if wizard_ids.contains(&wizard.run.descriptor().id) && wizard.run.is_complete()
         )
     }
 
@@ -6125,10 +6152,19 @@ impl Dialog {
         match self {
             Dialog::None => false,
             Dialog::OnboardingWelcome { cwd, .. } => {
-                if let Ok(next) =
-                    Self::open_setup_wizard(cwd, cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
-                {
-                    *self = next;
+                match Self::open_setup_wizard(
+                    cwd,
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                ) {
+                    Ok(next) => *self = next,
+                    Err(error) => {
+                        *self = Dialog::CreateConfig {
+                            choices: Vec::new(),
+                            cursor: 0,
+                            cwd: cwd.clone(),
+                            status: Some(format!("Could not open profile setup: {error}")),
+                        };
+                    }
                 }
                 false
             }
@@ -8903,10 +8939,29 @@ impl SettingsCx {
                 if !changed {
                     return None;
                 }
+                let detected_copy = self.pending_provider_add.as_ref().and_then(
+                    |(pending_id, _, _, detected_copy)| {
+                        (pending_id == provider_id)
+                            .then(|| detected_copy.clone())
+                            .flatten()
+                    },
+                );
+                let detected_header_index = detected_copy.as_ref().and_then(|copy| {
+                    let template = cockpit_core::providers::template_by_id(&copy.template_id)?;
+                    let placeholder_headers =
+                        cockpit_core::providers::templates::headers_for_pasted_key(template, "");
+                    entry.headers.iter().position(|header| {
+                        placeholder_headers.iter().any(|placeholder| {
+                            placeholder.name.eq_ignore_ascii_case(&header.name)
+                                && placeholder.value == header.value
+                        })
+                    })
+                });
                 let header_secrets = entry
                     .headers
                     .iter_mut()
-                    .map(|header| {
+                    .enumerate()
+                    .map(|(index, header)| {
                         let value = header.value.trim();
                         let is_secret = !value.is_empty()
                             && !value.starts_with('$')
@@ -8915,9 +8970,19 @@ impl SettingsCx {
                                 value,
                             )
                             && !secret_display::is_mask_value(value);
-                        is_secret.then(|| {
-                            zeroize::Zeroizing::new(std::mem::take(&mut header.value))
-                        })
+                        if detected_header_index == Some(index) {
+                            let copy = detected_copy.as_ref().expect("copy index has copy details");
+                            Some(cockpit_proto::ProviderSecretValue::detected_environment(
+                                copy.template_id.clone(),
+                                copy.variable.clone(),
+                            ))
+                        } else {
+                            is_secret.then(|| {
+                                cockpit_proto::ProviderSecretValue::new(std::mem::take(
+                                    &mut header.value,
+                                ))
+                            })
+                        }
                     })
                     .collect::<Vec<_>>();
                 Some(ProviderSavePlan {

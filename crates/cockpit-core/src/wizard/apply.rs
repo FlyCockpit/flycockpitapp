@@ -333,11 +333,14 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         .providers
         .get(&provider_id)
         .with_context(|| format!("provider `{provider_id}` not found"))?;
-    provider_read
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
+    let onboarding = run.descriptor().id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID;
+    if !onboarding {
+        provider_read
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
+    }
     let inherited_trust = effective.provider_trust_default(&provider_id);
     let current_trust = effective.resolve_trust(&provider_id, &model_id);
     let inherited_thinking = effective.provider_default_thinking_mode_default(&provider_id);
@@ -350,24 +353,24 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     let mut model_doc = ConfigDoc::load(&model_target)?;
     let mut layer_cfg = model_doc.providers();
     let provider = layer_cfg.providers.entry(provider_id.clone()).or_default();
-    let model_index = if let Some(index) = provider
+    let (model_index, model_inserted) = if let Some(index) = provider
         .models
         .iter()
         .position(|model| model.id == model_id)
     {
-        index
+        (index, false)
     } else {
         provider.models.push(crate::config::providers::ModelEntry {
             id: model_id.clone(),
             ..Default::default()
         });
-        provider.models.len() - 1
+        (provider.models.len() - 1, true)
     };
     let model = provider
         .models
         .get_mut(model_index)
         .expect("model index was just resolved");
-    let mut model_changed = false;
+    let mut model_changed = model_inserted;
 
     if let Some(selected) = model_trust_answer(run) {
         let next = if selected == current_trust {

@@ -591,6 +591,16 @@ pub fn headers_for_env_var(template: &ProviderTemplate, env_var: &str) -> Vec<He
     headers_with_key_value(template, api_key.value_for_env_var(env_var))
 }
 
+/// First non-empty credential candidate visible to this process. Callers use
+/// the name only; credential bytes never leave the environment owner.
+pub fn detected_env_var(template: &ProviderTemplate) -> Option<&'static str> {
+    template
+        .env_var_candidates
+        .iter()
+        .copied()
+        .find(|name| env_var_is_nonempty(name))
+}
+
 fn headers_with_key_value(template: &ProviderTemplate, key_value: String) -> Vec<HeaderSpec> {
     let Some(api_key) = template.api_key else {
         return default_headers_for(template);

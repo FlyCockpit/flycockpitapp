@@ -828,6 +828,21 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         }
     }
 
+    // A persistent daemon creates the global config directory. Record a truly
+    // fresh interactive launch before trust setup can start that daemon, while
+    // leaving every non-TUI and non-interactive trust path unchanged.
+    if (tui_mode_for_command(cli.command.as_ref()).is_some()
+        || matches!(
+            cli.command.as_ref(),
+            Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+        ))
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        cockpit_core::welcome::initialize_onboarding_if_first_run()
+            .context("initializing first-run onboarding state")?;
+    }
+
     if command_requires_workspace_trust(cli.command.as_ref()) {
         install_cli_trust_policy(cli.project.as_deref()).await?;
     }
@@ -838,6 +853,23 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             cli.no_sandbox,
             mode,
             Some(launch_start),
+            cli.skip_setup,
+            false,
+        )
+        .await;
+    }
+
+    if matches!(
+        cli.command.as_ref(),
+        Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+    ) {
+        return commands::tui::run_mode(
+            cli.project.as_deref(),
+            cli.no_sandbox,
+            commands::tui::SessionMode::Code,
+            Some(launch_start),
+            false,
+            true,
         )
         .await;
     }

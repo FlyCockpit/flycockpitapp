@@ -953,6 +953,7 @@ fn copy_oauth_url_with(
 }
 
 pub(super) struct AddState {
+    pub(super) onboarding: bool,
     pub(super) run: WizardRun,
     pub(super) template_cursor: usize,
     pub(super) wire_api_cursor: usize,
@@ -969,6 +970,7 @@ pub(super) struct AddState {
     pub(super) saved_provider_id: Option<String>,
     pub(super) copilot_auth: Option<CopilotSetupState>,
     pub(super) oauth_auth: Option<Box<OAuthFlowState>>,
+    pub(super) detected_env_offer: Option<String>,
 }
 
 pub(super) struct EditState {
@@ -990,7 +992,12 @@ pub(super) enum EditField {
 
 impl AddState {
     pub(super) fn new() -> Self {
+        Self::new_with_onboarding(false)
+    }
+
+    pub(super) fn new_with_onboarding(onboarding: bool) -> Self {
         Self {
+            onboarding,
             run: WizardRun::new(cockpit_core::wizard::provider_descriptor())
                 .expect("built-in provider wizard descriptor is valid"),
             template_cursor: 0,
@@ -1008,6 +1015,7 @@ impl AddState {
             saved_provider_id: None,
             copilot_auth: None,
             oauth_auth: None,
+            detected_env_offer: None,
         }
     }
 
@@ -1069,6 +1077,14 @@ impl SettingsDialog {
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let onboarding_validation = self
+            .page
+            .downcast_ref::<ProvidersPage>()
+            .is_some_and(|page| matches!(page, ProvidersPage::Add(state) if state.onboarding && state.is_step("test-key")));
+        let live_validation_succeeded = matches!(
+            &result,
+            Ok(FetchOutcome::Models { .. } | FetchOutcome::Unsupported)
+        );
         let mut message = String::new();
         if let Ok(FetchOutcome::Models { models, catalog }) = result {
             let Some(pre_fetch_models) = self
@@ -1081,7 +1097,10 @@ impl SettingsDialog {
             };
             let unlisted = compute_unlisted_for_models(&pre_fetch_models, &models);
             let stored = self.config.on_unlisted_models_fetch;
-            if matches!(stored, None | Some(OnUnlistedModelsFetch::Ask)) && !unlisted.is_empty() {
+            if matches!(stored, None | Some(OnUnlistedModelsFetch::Ask))
+                && !unlisted.is_empty()
+                && !onboarding_validation
+            {
                 self.clear_fetch_handle(provider_id);
                 self.page =
                     super::providers_page(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
@@ -1184,6 +1203,8 @@ impl SettingsDialog {
                     s.error = Some(message);
                     s.fetch = None;
                     if s.is_step("fetching") {
+                        let _ = s.run.submit(WizardAnswer::Acknowledged);
+                    } else if s.is_step("test-key") && live_validation_succeeded {
                         let _ = s.run.submit(WizardAnswer::Acknowledged);
                     }
                 }
@@ -1436,8 +1457,27 @@ impl SettingsCx {
         entry: ProviderEntry,
         template: &'static ProviderTemplate,
     ) {
+        self.save_and_fetch_provider_with_detected_env(s, id, entry, template, None);
+    }
+
+    fn save_and_fetch_provider_with_detected_env(
+        &mut self,
+        s: &mut AddState,
+        id: String,
+        entry: ProviderEntry,
+        template: &'static ProviderTemplate,
+        detected_env: Option<String>,
+    ) {
         self.config.providers.insert(id.clone(), entry.clone());
-        self.pending_provider_add = Some((id, entry, template.supports_models_endpoint));
+        self.pending_provider_add = Some((
+            id,
+            entry,
+            template.supports_models_endpoint,
+            detected_env.map(|variable| super::DetectedEnvironmentCopy {
+                template_id: template.id.to_string(),
+                variable,
+            }),
+        ));
         match self.save_config() {
             Ok(()) => {
                 // The mutation now owns the wizard. Advance to the explicit
@@ -1554,10 +1594,15 @@ impl SettingsCx {
                         /* show_continue */ true,
                     );
                     s.env_var_field.set(
-                        t.default_env_var
+                        cockpit_core::providers::detected_env_var(t)
+                            .or(t.default_env_var)
                             .or_else(|| t.env_var_candidates.first().copied())
                             .unwrap_or("API_KEY"),
                     );
+                    if let Some(detected) = cockpit_core::providers::detected_env_var(t) {
+                        s.auth_method_cursor = 1;
+                        s.detected_env_offer = Some(detected.to_string());
+                    }
                     s.wire_api_cursor = 0;
                     s.error = None;
                     s.run
@@ -1643,18 +1688,42 @@ impl SettingsCx {
                 }
             },
             Some("auth-method") => {
-                const AUTH_METHODS: [&str; 3] = ["paste-key", "env-var", "advanced-headers"];
+                const AUTH_METHODS: [&str; 4] = [
+                    "paste-key",
+                    "env-var",
+                    "advanced-headers",
+                    "copy-detected-env",
+                ];
+                let choice_count = if s.detected_env_offer.is_some() { 4 } else { 3 };
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         s.auth_method_cursor =
-                            crate::tui::nav::wrap_prev(s.auth_method_cursor, AUTH_METHODS.len());
+                            crate::tui::nav::wrap_prev(s.auth_method_cursor, choice_count);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         s.auth_method_cursor =
-                            crate::tui::nav::wrap_next(s.auth_method_cursor, AUTH_METHODS.len());
+                            crate::tui::nav::wrap_next(s.auth_method_cursor, choice_count);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         let choice = AUTH_METHODS[s.auth_method_cursor];
+                        if choice == "copy-detected-env" {
+                            let env_var = s
+                                .detected_env_offer
+                                .as_deref()
+                                .expect("copy choice requires detected env");
+                            let template = s.template.expect("template chosen");
+                            let id = s.id_field.text().trim().to_string();
+                            let headers = templates::headers_for_pasted_key(template, "");
+                            let entry = provider_entry_from_add(s, template, headers);
+                            self.save_and_fetch_provider_with_detected_env(
+                                s,
+                                id,
+                                entry,
+                                template,
+                                Some(env_var.to_string()),
+                            );
+                            return Nav::Stay;
+                        }
                         if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
                             s.error = Some(error);
                         } else {
@@ -1805,18 +1874,26 @@ impl SettingsCx {
             }
             Some("test-key-choice") => {
                 const TEST_CHOICES: [&str; 2] = ["test", "skip-test"];
+                let choice_count = if s.onboarding { 1 } else { TEST_CHOICES.len() };
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         s.test_choice_cursor =
-                            crate::tui::nav::wrap_prev(s.test_choice_cursor, TEST_CHOICES.len());
+                            crate::tui::nav::wrap_prev(s.test_choice_cursor, choice_count);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         s.test_choice_cursor =
-                            crate::tui::nav::wrap_next(s.test_choice_cursor, TEST_CHOICES.len());
+                            crate::tui::nav::wrap_next(s.test_choice_cursor, choice_count);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         let choice = TEST_CHOICES[s.test_choice_cursor];
-                        if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
+                        if s.onboarding && choice == "skip-test" {
+                            s.error = Some(
+                                "Onboarding requires a successful live credential validation. Press Esc to cancel and resume later."
+                                    .into(),
+                            );
+                        } else if let Err(error) =
+                            s.run.submit(WizardAnswer::Select(choice.to_string()))
+                        {
                             s.error = Some(error);
                         } else if choice == "skip-test" {
                             s.error = Some(
@@ -1833,7 +1910,6 @@ impl SettingsCx {
                                     self.provider_fetch_root(),
                                 ));
                             }
-                            let _ = s.run.submit(WizardAnswer::Acknowledged);
                         }
                     }
                     _ => {}
@@ -1841,6 +1917,18 @@ impl SettingsCx {
             }
             Some("test-skipped") => {
                 if matches!(key.code, KeyCode::Enter) {
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+                }
+            }
+            // Normal settings may explicitly continue after a failed probe;
+            // first-run onboarding must remain resumable until a live daemon
+            // validation succeeds.
+            Some("test-key") if s.fetch.is_none() && !s.onboarding => {
+                if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+                    s.error = Some(
+                        "Live validation was attempted but setup is continuing offline; validate before first use."
+                            .into(),
+                    );
                     let _ = s.run.submit(WizardAnswer::Acknowledged);
                 }
             }
@@ -3399,11 +3487,17 @@ impl SettingsCx {
                 }
                 if s.is_step("auth-method") {
                     lines.push(Line::default());
-                    let options = [
+                    let mut options = vec![
                         ("Paste key", "store masked key as $secret:"),
                         ("Use env var", "write a $VAR reference"),
                         ("Advanced headers", "edit raw HTTP headers"),
                     ];
+                    if s.detected_env_offer.is_some() {
+                        options.push((
+                            "Copy detected value into vault",
+                            "daemon reads the detected variable and stores a $secret: reference",
+                        ));
+                    }
                     for (index, (label, description)) in options.iter().enumerate() {
                         let marker = if index == s.auth_method_cursor {
                             "▸ "
@@ -3423,6 +3517,12 @@ impl SettingsCx {
                             Span::styled((*description).to_string(), muted),
                         ]));
                     }
+                }
+                if let Some(detected) = &s.detected_env_offer {
+                    lines.push(Line::from(Span::styled(
+                        format!("Detected ${detected}; keep the reference or copy its value into the daemon vault."),
+                        muted,
+                    )));
                 }
                 if s.is_step("api-key") {
                     lines.push(Line::default());
@@ -3544,6 +3644,7 @@ impl SettingsCx {
                     ("Skip test", "save now and validate on first use"),
                 ]
                 .iter()
+                .take(if s.onboarding { 1 } else { 2 })
                 .enumerate()
                 {
                     let marker = if index == s.test_choice_cursor {
@@ -3810,6 +3911,16 @@ impl SettingsCx {
                         ),
                     ),
                 ));
+                if s.is_step("test-key") && s.fetch.is_none() {
+                    lines.push(Line::from(Span::styled(
+                        if s.onboarding {
+                            "Validation failed or the network is offline. Esc cancels safely; setup resumes here until validation succeeds."
+                        } else {
+                            "Validation failed or the network is offline. Press o to continue offline, or Esc to cancel and resume later."
+                        },
+                        muted,
+                    )));
+                }
                 lines.push(Line::from(label));
             }
         }
@@ -5803,7 +5914,16 @@ impl SettingsPage for ProvidersPage {
                     state.template_cursor = index;
                 }
                 Some("wire-api") if index < 4 => state.wire_api_cursor = index,
-                Some("auth-method") if index < 3 => state.auth_method_cursor = index,
+                Some("auth-method")
+                    if index
+                        < if state.detected_env_offer.is_some() {
+                            4
+                        } else {
+                            3
+                        } =>
+                {
+                    state.auth_method_cursor = index;
+                }
                 Some("headers") if !state.headers.is_editing() => {
                     let last = state
                         .headers
@@ -5814,7 +5934,9 @@ impl SettingsPage for ProvidersPage {
                     }
                     state.headers.cursor = index;
                 }
-                Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
+                Some("test-key-choice") if index < if state.onboarding { 1 } else { 2 } => {
+                    state.test_choice_cursor = index;
+                }
                 Some("copilot-auth") if index == 0 => {}
                 Some("test-skipped") if index == 0 => {}
                 Some("done") if index == 0 => {}
@@ -6007,8 +6129,15 @@ impl SettingsPage for ProvidersPage {
                                 .min(onboarding_ordered_templates().len().saturating_sub(1));
                         }
                         Some("auth-method") => {
-                            state.auth_method_cursor =
-                                state.auth_method_cursor.saturating_add_signed(delta).min(2);
+                            let last = if state.detected_env_offer.is_some() {
+                                3
+                            } else {
+                                2
+                            };
+                            state.auth_method_cursor = state
+                                .auth_method_cursor
+                                .saturating_add_signed(delta)
+                                .min(last);
                         }
                         Some("headers") if !state.headers.is_editing() => {
                             let last = state
@@ -6019,8 +6148,11 @@ impl SettingsPage for ProvidersPage {
                                 state.headers.cursor.saturating_add_signed(delta).min(last);
                         }
                         Some("test-key-choice") => {
-                            state.test_choice_cursor =
-                                state.test_choice_cursor.saturating_add_signed(delta).min(1);
+                            let last = if state.onboarding { 0 } else { 1 };
+                            state.test_choice_cursor = state
+                                .test_choice_cursor
+                                .saturating_add_signed(delta)
+                                .min(last);
                         }
                         Some("grok-oauth" | "codex-oauth") => {
                             if let Some(oauth) = state.oauth_auth.as_mut()

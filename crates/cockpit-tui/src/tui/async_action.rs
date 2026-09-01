@@ -168,7 +168,8 @@ impl AsyncActionKind {
                 | "sessions.preview"
                 | "sessions.inbox"
                 | "skills.list"
-                | "subagent.history.page" => ReadOnly,
+                | "subagent.history.page"
+                | "session_setup.snapshot" => ReadOnly,
                 "assistant.resolve"
                 | "btw.resolve-interrupt"
                 | "fork.create"
@@ -1569,6 +1570,10 @@ mod tests {
         for (kind, expected) in [
             (AsyncActionKind::Refresh("future-projection"), ReadOnly),
             (AsyncActionKind::Blocking("doctor.snapshot"), ReadOnly),
+            (
+                AsyncActionKind::DaemonRpc("session_setup.snapshot"),
+                ReadOnly,
+            ),
             (AsyncActionKind::Blocking("copy.file"), HostMutation),
             (
                 AsyncActionKind::DaemonRpc("settings.effect"),

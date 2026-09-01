@@ -378,6 +378,17 @@ async fn run_approval_auto_denied() {
         r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true}"#,
     )
     .expect("enable sandbox escalation");
+    let provider_config = home.config_dir().join("providers").join("local.json");
+    let mut provider_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&provider_config).expect("read local provider config"),
+    )
+    .expect("parse local provider config");
+    provider_json["context"] = serde_json::json!({ "rolling_precompaction": false });
+    std::fs::write(
+        provider_config,
+        serde_json::to_vec(&provider_json).expect("serialize local provider config"),
+    )
+    .expect("disable rolling precompaction for finite approval script");
     home.trust_project();
 
     let mut default_command = home.cockpit();

@@ -81,6 +81,7 @@ pub const HERMETIC_ENV_KEYS: [&str; 10] = [
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
+const READY_RUNNER_STATUS: &str = "[Build] · [local/scripted]";
 
 /// Sole profile variation. `RemoteOsc52` adds one literal SSH variable to
 /// the PTY child only.
@@ -504,7 +505,8 @@ impl HermeticCockpit {
     }
 
     /// Trust the isolated project, start the detached daemon, spawn the
-    /// 100×30 PTY child, and wait until the ready composer is visible.
+    /// 100×30 PTY child, and wait until its composer is attached to the
+    /// hermetic scripted runner.
     pub fn launch_ready(profile: HermeticProfile) -> Self {
         let mut session = Self::prepare(profile);
         session.start_trusted_daemon();
@@ -713,7 +715,12 @@ impl HermeticCockpit {
         let mut delay = Duration::from_millis(2);
         loop {
             let snapshot = self.snapshot();
+            // The composer is rendered before the asynchronous daemon attach
+            // completes. Treat the attached runner's deterministic hermetic
+            // status as part of readiness so a first prompt or `/exit` cannot
+            // race the lifecycle fence.
             let ready = snapshot.contains(COMPOSER_PLACEHOLDER)
+                && snapshot.contains(READY_RUNNER_STATUS)
                 && UNWANTED_STARTUP_MARKERS
                     .iter()
                     .all(|marker| !snapshot.contains(marker));

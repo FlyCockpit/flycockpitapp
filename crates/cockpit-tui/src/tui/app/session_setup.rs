@@ -34,7 +34,10 @@ impl App {
 
     pub(super) fn prepare_session_setup_for_fresh_session(&mut self) {
         self.session_setup_collapsed = false;
-        self.session_setup_focused = true;
+        // The inline pane remains visible for discovery, but a fresh session
+        // must accept typed prompts (including slash commands) immediately.
+        // Tab explicitly transfers keyboard focus to the setup controls.
+        self.session_setup_focused = false;
         self.session_setup_collapse_hint = None;
         self.session_setup_inline = Some(SessionSetupPane::loading_inline(true));
         self.request_session_setup_snapshot_refresh();
@@ -715,6 +718,10 @@ mod tests {
         );
         assert!(app.session_setup_inline_visible());
         assert!(!app.session_setup_collapsed);
+        assert!(
+            !app.session_setup_focused,
+            "the composer owns fresh-session input until Tab selects setup"
+        );
         app.collapse_session_setup_on_first_submit();
         assert!(!app.session_setup_inline_visible());
         assert!(app.session_setup_collapsed);

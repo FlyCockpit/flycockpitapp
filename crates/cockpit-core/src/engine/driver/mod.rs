@@ -260,8 +260,19 @@ pub enum DriverControl {
     /// subagent owns the foreground.
     SetToolSurfaceOverride {
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        /// Confirms the caller warned the user about a provider cache break.
+        /// The driver, not the caller, determines whether pruning is required.
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Verify that a tool-surface change can be installed without changing
+    /// the live driver. The session worker uses this before persisting the
+    /// replacement, so a failed durable write cannot leave a live-only tool
+    /// surface behind.
+    ValidateToolSurfaceOverride {
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
@@ -2986,7 +2997,16 @@ impl Driver {
             &selection,
             model_pin.clone(),
         ) {
-            Ok(rebuilt) => {
+            Ok(mut rebuilt) => {
+                // Rebuilding refreshes the Monty catalog too. When only that
+                // runtime-discovered catalog changed, retain the already
+                // rendered native schema cache; Discoverable tools never
+                // appear in the provider function schema.
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(
+                        &self.stack[active_idx].agent.tools,
+                    );
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -6415,12 +6435,22 @@ impl Driver {
             }
             DriverControl::SetToolSurfaceOverride {
                 selection,
-                prune_after_switch,
+                cache_break_acknowledged,
                 monty_nudge,
                 respond_to,
             } => {
                 let result = self
-                    .set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
+                    .set_tool_surface_override(selection, cache_break_acknowledged, monty_nudge, tx)
+                    .await;
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ValidateToolSurfaceOverride {
+                selection,
+                cache_break_acknowledged,
+                respond_to,
+            } => {
+                let result = self
+                    .validate_tool_surface_override(selection, cache_break_acknowledged, tx)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -9713,44 +9743,13 @@ impl Driver {
     async fn set_tool_surface_override(
         &mut self,
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> std::result::Result<(), String> {
-        if self.stack.len() != 1 {
-            tracing::warn!(
-                "tool surface override ignored: an interactive subagent holds the foreground"
-            );
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: "Tool surface changes were refused because an interactive subagent holds the foreground.".to_string(),
-                })
-                .await;
-            return Err("an interactive subagent holds the foreground".to_string());
-        }
-        let current = self.stack[0].agent.clone();
-        let mut args = self.spawn_args(true);
-        args.model = current.model.clone();
-        args.model_override = Some(current.model.clone());
-        args.params = current.params.clone();
-        args.vnext_grant = current.vnext_grant.clone();
-        let updated = (|| -> Result<Agent> {
-            let mut def =
-                current.definition.as_deref().cloned().ok_or_else(|| {
-                    anyhow::anyhow!("running frame has no pinned agent definition")
-                })?;
-            crate::agents::apply_tool_surface_override(&mut def, &selection)?;
-            let rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
-            let mut updated = (*current).clone();
-            // This control changes only the requested tool surface. All other
-            // running-frame state stays pinned, while the adjusted definition
-            // becomes the snapshot used by later model/config rebuilds.
-            updated.tools = rebuilt.tools;
-            updated.definition = rebuilt.definition;
-            Ok(updated)
-        })();
+        let updated = self.prepare_tool_surface_override(&selection, cache_break_acknowledged);
         match updated {
-            Ok(updated) => {
+            Ok((updated, native_schema_changed)) => {
                 self.stack[0].agent = Arc::new(updated);
                 self.schedule.set_agent(self.stack[0].agent.clone());
                 if let Some(note) = monty_nudge {
@@ -9762,24 +9761,103 @@ impl Driver {
                     })
                     .await;
                 self.emit_context_projection(tx).await;
-                if prune_after_switch {
+                if native_schema_changed {
                     self.do_prune(false, tx).await;
                 }
                 Ok(())
             }
-            Err(e) => {
-                let message = format!("{e:#}");
-                tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!(
-                            "Tool surface update failed — {e:#}. Keeping the current tool surface active."
-                        ),
-                    })
-                    .await;
-                Err(message)
-            }
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
         }
+    }
+
+    /// Prove a prospective tool-surface transition can settle before the
+    /// worker changes durable session state. This intentionally shares the
+    /// exact construction and cache-break checks used by the committing path.
+    async fn validate_tool_surface_override(
+        &self,
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        match self.prepare_tool_surface_override(&selection, cache_break_acknowledged) {
+            Ok(_) => Ok(()),
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
+        }
+    }
+
+    fn prepare_tool_surface_override(
+        &self,
+        selection: &crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+    ) -> Result<(Agent, bool)> {
+        if self.stack.len() != 1 {
+            anyhow::bail!("an interactive subagent holds the foreground");
+        }
+        let current = self.stack[0].agent.clone();
+        let mut args = self.spawn_args(true);
+        args.model = current.model.clone();
+        args.model_override = Some(current.model.clone());
+        args.params = current.params.clone();
+        args.vnext_grant = current.vnext_grant.clone();
+        (|| -> Result<(Agent, bool)> {
+            let mut def =
+                current.definition.as_deref().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("running frame has no pinned agent definition")
+                })?;
+            crate::agents::apply_tool_surface_override(&mut def, selection)?;
+            let mut rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            let native_schema_changed = !rebuilt
+                .tools
+                .native_schema_matches(&current.tools, current.tool_steering);
+            if native_schema_changed && !cache_break_acknowledged {
+                anyhow::bail!(
+                    "native tool-surface changes require cache-break acknowledgement before applying"
+                );
+            }
+            // A native-schema transition must prune the old cached context
+            // before it becomes live. Persist-on-re-entry temporarily owns
+            // started-but-unsettled sibling results, so every history
+            // rewriter (including that required prune) is fenced until their
+            // paired terminal bodies commit. Refuse instead of installing a
+            // surface whose mandatory prune would be deferred; the worker
+            // then cannot persist an unpruned acknowledged transition.
+            if native_schema_changed && self.persist_on_reentry_owns_started_unsettled_siblings() {
+                anyhow::bail!(
+                    "native tool-surface changes are unavailable while persist-on-re-entry owns sibling results"
+                );
+            }
+            if !native_schema_changed {
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(&current.tools);
+            }
+            let mut updated = (*current).clone();
+            // This control changes only the requested tool surface. All other
+            // running-frame state stays pinned, while the adjusted definition
+            // becomes the snapshot used by later model/config rebuilds.
+            updated.tools = rebuilt.tools;
+            updated.definition = rebuilt.definition;
+            Ok((updated, native_schema_changed))
+        })()
+    }
+
+    async fn reject_tool_surface_override(
+        &self,
+        error: anyhow::Error,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        let message = format!("{error:#}");
+        tracing::warn!(error = %error, "tool surface override failed to rebuild agent");
+        let text = if self.stack.len() != 1 {
+            "Tool surface changes were refused because an interactive subagent holds the foreground."
+                .to_string()
+        } else {
+            format!(
+                "Tool surface update failed — {error:#}. Keeping the current tool surface active."
+            )
+        };
+        let _ = tx.send(TurnEvent::Notice { text }).await;
+        Err(message)
     }
 
     /// Decide the cache-aware reuse-vs-fresh path for a re-queried subagent

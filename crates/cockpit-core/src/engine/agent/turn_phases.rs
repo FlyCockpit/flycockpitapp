@@ -4266,6 +4266,12 @@ mod tests {
             })
             .collect();
         assert!(adverts.is_empty(), "{history:?}");
+        assert!(
+            history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("code"))
+            ),
+            "a discoverable tool may only be found through mcp.search/describe: {history:?}"
+        );
     }
 
     #[tokio::test]

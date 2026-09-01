@@ -2332,27 +2332,7 @@ struct McpBuiltinToolEntry {
 }
 
 pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
-    if crate::tool_media_authority::is_media_tool_name(name) {
-        return false;
-    }
-    !matches!(
-        name,
-        "question"
-            | "return"
-            | "schedule"
-            | "task"
-            | "spawn"
-            | "defer_to_orchestrator"
-            | "raise"
-            | "start_build"
-            | "mcp"
-            | "read_image"
-            | "inspect_audio"
-            | "inspect_video"
-            | "extract_video_clip"
-            | "extract_audio"
-            | "transcribe_audio"
-    )
+    crate::agents::is_monty_builtin_adaptable(name)
 }
 
 impl ToolBox {
@@ -2553,8 +2533,48 @@ impl ToolBox {
                 },
             );
         }
-        self.definition_cache.lock().unwrap().clear();
+        // Discoverable tools are runtime-only Monty catalog entries. They do
+        // not enter `tools`, so neither the native function schema nor its
+        // rendered-definition cache changes.
         self
+    }
+
+    /// Retain rendered native-schema entries in a rebuilt toolbox only when
+    /// their freshly rendered definitions are identical to the previous ones.
+    ///
+    /// A tool-surface refresh reconstructs the Monty catalog as well as the
+    /// direct-native tools. Discoverable catalog changes must not invalidate a
+    /// matching native schema, but matching names alone is insufficient: tool
+    /// implementations, description overrides, and capability projection can
+    /// all change a same-named definition. Rendering the rebuilt toolbox before
+    /// comparison also gives it independent cache ownership, so a still-live
+    /// previous toolbox cannot populate its cache after the rebuild.
+    pub(crate) fn preserve_definition_cache_if_native_schema_matches(
+        &mut self,
+        previous: &Self,
+    ) -> bool {
+        let previous_entries = previous.definition_cache.lock().unwrap().clone();
+        self.definition_cache.lock().unwrap().clear();
+        previous_entries
+            .iter()
+            .all(|(steering, previous_definitions)| {
+                self.definitions(*steering) == *previous_definitions
+            })
+    }
+
+    /// Whether the provider-visible native schema is unchanged for the
+    /// steering used by an active agent. Discoverable MCP tools are absent
+    /// from this projection, so their catalog-only transitions compare equal.
+    ///
+    /// This is intentionally separate from `definition_cache`: an empty
+    /// rendered-definition cache must not make a native-schema transition look
+    /// cache-neutral.
+    pub(crate) fn native_schema_matches(
+        &self,
+        previous: &Self,
+        steering: crate::agents::ToolSteering,
+    ) -> bool {
+        self.advertised_definitions(steering) == previous.advertised_definitions(steering)
     }
 
     pub fn mcp_builtin_registry(&self) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
@@ -3194,13 +3214,15 @@ mod definition_cache_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingTool {
+        name: &'static str,
         calls: Arc<AtomicUsize>,
+        parameters: Value,
     }
 
     #[async_trait]
     impl Tool for CountingTool {
         fn name(&self) -> &str {
-            "counting"
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -3209,7 +3231,7 @@ mod definition_cache_tests {
 
         fn parameters(&self) -> Value {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            json!({ "type": "object", "properties": {} })
+            self.parameters.clone()
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -3221,7 +3243,9 @@ mod definition_cache_tests {
     fn definitions_build_schema_once_per_steering() {
         let calls = Arc::new(AtomicUsize::new(0));
         let toolbox = ToolBox::new().with(Arc::new(CountingTool {
+            name: "counting",
             calls: calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
         }));
 
         let first = toolbox.definitions(crate::agents::ToolSteering::Terse);
@@ -3232,6 +3256,136 @@ mod definition_cache_tests {
         // A different steering is a different cache key → rebuild.
         let _ = toolbox.definitions(crate::agents::ToolSteering::Verbose);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn discoverable_catalog_change_preserves_native_schema_cache() {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let discoverable_calls = Arc::new(AtomicUsize::new(0));
+        let native = Arc::new(CountingTool {
+            name: "native_counting",
+            calls: native_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let discoverable = Arc::new(CountingTool {
+            name: "discoverable_counting",
+            calls: discoverable_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let previous = ToolBox::new().with(native.clone());
+        let previous_definitions = previous.definitions(crate::agents::ToolSteering::Terse);
+        let provider_schema = serde_json::to_vec(
+            &previous.advertised_definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+
+        let mut rebuilt = ToolBox::new()
+            .with(native)
+            .with_discoverable_mcp(discoverable);
+        assert!(rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        assert_eq!(
+            serde_json::to_vec(&rebuilt.definitions(crate::agents::ToolSteering::Terse)).unwrap(),
+            serde_json::to_vec(&previous_definitions).unwrap(),
+            "Discoverable tools must not change the cached native schema"
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &rebuilt.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            provider_schema,
+            "Discoverable tools must not change the provider cache key's tool schema"
+        );
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(
+            native_calls.load(Ordering::SeqCst),
+            4,
+            "the rebuilt toolbox must cache its own verified native schema"
+        );
+        let _ = previous.definitions(crate::agents::ToolSteering::Verbose);
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Verbose);
+        assert_eq!(
+            native_calls.load(Ordering::SeqCst),
+            6,
+            "rebuilt caches must not alias a still-live previous toolbox"
+        );
+        assert_eq!(
+            discoverable_calls.load(Ordering::SeqCst),
+            0,
+            "discoverable tools must not be assembled into the native schema"
+        );
+    }
+
+    #[test]
+    fn enabled_membership_change_does_not_preserve_native_schema_cache() {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let added_calls = Arc::new(AtomicUsize::new(0));
+        let native = Arc::new(CountingTool {
+            name: "native_counting",
+            calls: native_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let added = Arc::new(CountingTool {
+            name: "added_counting",
+            calls: added_calls.clone(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        let previous = ToolBox::new().with(native.clone());
+        let provider_schema = serde_json::to_vec(
+            &previous.advertised_definitions(crate::agents::ToolSteering::Terse),
+        )
+        .unwrap();
+        let _ = previous.definitions(crate::agents::ToolSteering::Terse);
+
+        let mut rebuilt = ToolBox::new().with(native).with(added);
+        assert!(!rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        assert_ne!(
+            serde_json::to_vec(
+                &rebuilt.advertised_definitions(crate::agents::ToolSteering::Terse),
+            )
+            .unwrap(),
+            provider_schema,
+            "an Enabled membership change must change the provider schema"
+        );
+        let _ = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(added_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn same_named_schema_change_does_not_preserve_definition_cache() {
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let rebuilt_calls = Arc::new(AtomicUsize::new(0));
+        let previous = ToolBox::new().with(Arc::new(CountingTool {
+            name: "task",
+            calls: previous_calls.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "old_target": { "type": "string" } }
+            }),
+        }));
+        let previous_definitions = previous.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+
+        let mut rebuilt = ToolBox::new().with(Arc::new(CountingTool {
+            name: "task",
+            calls: rebuilt_calls.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "new_target": { "type": "string" } }
+            }),
+        }));
+        assert!(!rebuilt.preserve_definition_cache_if_native_schema_matches(&previous));
+        let rebuilt_definitions = rebuilt.definitions(crate::agents::ToolSteering::Terse);
+        assert_eq!(rebuilt_calls.load(Ordering::SeqCst), 1);
+        assert_ne!(rebuilt_definitions, previous_definitions);
+        assert!(
+            rebuilt_definitions[0].parameters["properties"]
+                .get("new_target")
+                .is_some(),
+            "the rebuilt schema must come from the current same-named tool implementation"
+        );
     }
 
     struct DormantMediaTool(&'static str);

@@ -27,96 +27,12 @@ use crate::computer::target::BackendKind;
 const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
 const MOVE_STEPS: u32 = 12;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct MacHeldInputState {
-    keys: Vec<u16>,
-    buttons: Vec<MouseButton>,
-}
-
-#[derive(Debug)]
-struct MacHeldInputJournal {
-    path: std::path::PathBuf,
-}
-
-impl MacHeldInputJournal {
-    fn for_current_user_hid_sink() -> Result<Self, ComputerError> {
-        // CGEvent reaches a host-wide HID sink, but recovery input state is
-        // authority to inject global key-up/mouse-up events. A user-private
-        // Cockpit state directory is therefore the trust boundary: only a
-        // replacement daemon for this login can consume this state. Cross-user
-        // recovery would require an authenticated privileged service, not a
-        // predictable file in a sticky directory.
-        let root = crate::config::resolve::cockpit_data_dir()
-            .map_err(input_journal_error)?
-            .join("computer-input-state");
-        cockpit_host::private_fs::ensure_private_dir(&root).map_err(input_journal_error)?;
-        Ok(Self {
-            path: root.join("macos-hid.v1.json"),
-        })
-    }
-
-    fn load(&self) -> Result<MacHeldInputState, ComputerError> {
-        let Some(bytes) =
-            cockpit_host::private_fs::read_private_file(&self.path, "macOS held-input")
-                .map_err(input_journal_error)?
-        else {
-            return Ok(empty_held_input());
-        };
-        let state = serde_json::from_slice::<MacHeldInputState>(&bytes)
-            .map_err(|_| journal_error("macOS held-input journal is malformed"))?;
-        validate_held_input_state(&state)?;
-        Ok(state)
-    }
-
-    fn store(&self, state: &MacHeldInputState) -> Result<(), ComputerError> {
-        validate_held_input_state(state)?;
-        if state.keys.is_empty() && state.buttons.is_empty() {
-            return cockpit_host::private_fs::delete_private_file(&self.path)
-                .map_err(input_journal_error);
-        }
-        let bytes = serde_json::to_vec(state).map_err(input_journal_error)?;
-        // `write_private_file` replaces the slot crash-atomically and fsyncs
-        // the containing private directory. This method is called only while
-        // the global HID lease is held.
-        cockpit_host::private_fs::write_private_file(&self.path, &bytes)
-            .map_err(input_journal_error)
-    }
-}
-
-fn empty_held_input() -> MacHeldInputState {
-    MacHeldInputState {
-        keys: Vec::new(),
-        buttons: Vec::new(),
-    }
-}
-
-fn journal_error(detail: impl Into<String>) -> ComputerError {
-    ComputerError::CommandFailed {
-        program: "computer input-state journal".to_string(),
-        detail: detail.into(),
-    }
-}
-
-fn validate_held_input_state(state: &MacHeldInputState) -> Result<(), ComputerError> {
-    if state.keys.windows(2).any(|pair| pair[0] == pair[1])
-        || state.buttons.windows(2).any(|pair| pair[0] == pair[1])
-    {
-        return Err(journal_error(
-            "macOS held-input journal contains invalid state",
-        ));
-    }
-    Ok(())
-}
-
 /// Physical macOS desktop backend. Construction performs both TCC preflights;
 /// it never opens a usable backend when Screen Recording or Accessibility /
 /// Input Monitoring access is absent.
 pub struct MacOsComputerBackend {
     source: objc2_core_foundation::CFRetained<CGEventSource>,
     geometry: DisplayGeometry,
-    held_keys: Vec<u16>,
-    held_buttons: Vec<MouseButton>,
-    held_input_journal: MacHeldInputJournal,
 }
 
 // CoreGraphics' immutable event source is safe to retain behind the backend's
@@ -156,88 +72,10 @@ impl MacOsComputerBackend {
                 detail: "CoreGraphics returned null".to_string(),
             }
         })?;
-        let held_input_journal = MacHeldInputJournal::for_current_user_hid_sink()?;
-        let held_input = held_input_journal.load()?;
         Ok(Self {
             source,
             geometry: query_geometry()?,
-            held_keys: held_input.keys,
-            held_buttons: held_input.buttons,
-            held_input_journal,
         })
-    }
-
-    /// Merge state published by a predecessor after this backend opened. The
-    /// coordinator calls `release_all` only while holding the global HID lease.
-    fn reload_held_input(&mut self) -> Result<(), ComputerError> {
-        let remembered = self.held_input_journal.load()?;
-        for key in remembered.keys {
-            if !self.held_keys.contains(&key) {
-                self.held_keys.push(key);
-            }
-        }
-        for button in remembered.buttons {
-            if !self.held_buttons.contains(&button) {
-                self.held_buttons.push(button);
-            }
-        }
-        Ok(())
-    }
-
-    fn persist_held_input(
-        &self,
-        keys: Vec<u16>,
-        buttons: Vec<MouseButton>,
-    ) -> Result<(), ComputerError> {
-        self.held_input_journal
-            .store(&MacHeldInputState { keys, buttons })
-    }
-
-    /// Persist before emitting a down event. A crash after the post is then
-    /// recovered as an intentionally harmless extra up event by the next
-    /// owner of the global HID lease.
-    fn remember_key(&mut self, key: u16) -> Result<(), ComputerError> {
-        let mut keys = self.held_keys.clone();
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-        self.persist_held_input(keys.clone(), self.held_buttons.clone())?;
-        self.held_keys = keys;
-        Ok(())
-    }
-
-    fn forget_key(&mut self, key: u16) -> Result<(), ComputerError> {
-        let keys = self
-            .held_keys
-            .iter()
-            .copied()
-            .filter(|held| *held != key)
-            .collect();
-        self.persist_held_input(keys, self.held_buttons.clone())?;
-        self.held_keys.retain(|held| *held != key);
-        Ok(())
-    }
-
-    fn remember_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
-        let mut buttons = self.held_buttons.clone();
-        if !buttons.contains(&button) {
-            buttons.push(button);
-        }
-        self.persist_held_input(self.held_keys.clone(), buttons.clone())?;
-        self.held_buttons = buttons;
-        Ok(())
-    }
-
-    fn forget_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
-        let buttons = self
-            .held_buttons
-            .iter()
-            .copied()
-            .filter(|held| *held != button)
-            .collect();
-        self.persist_held_input(self.held_keys.clone(), buttons)?;
-        self.held_buttons.retain(|held| *held != button);
-        Ok(())
     }
 
     fn capture_png(&self, region: Option<PixelRect>) -> Result<Vec<u8>, ComputerError> {
@@ -418,7 +256,6 @@ impl MacOsComputerBackend {
                 let point = self.cursor()?;
                 let flags = modifier_flags(*modifiers);
                 for click in 1..=click_repetitions(*count) {
-                    self.remember_button(*button)?;
                     self.post_mouse(
                         mouse_down_type(*button),
                         *button,
@@ -433,12 +270,10 @@ impl MacOsComputerBackend {
                         flags,
                         i64::from(click),
                     )?;
-                    self.forget_button(*button)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::MouseDown { button } => {
-                self.remember_button(*button)?;
                 self.post_mouse(
                     mouse_down_type(*button),
                     *button,
@@ -456,7 +291,6 @@ impl MacOsComputerBackend {
                     CGEventFlags::empty(),
                     1,
                 )?;
-                self.forget_button(*button)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Drag {
@@ -480,7 +314,6 @@ impl MacOsComputerBackend {
                     None,
                 )?;
                 let flags = modifier_flags(*modifiers);
-                self.remember_button(*button)?;
                 self.post_mouse(mouse_down_type(*button), *button, self.cursor()?, flags, 1)?;
                 for step in path.iter().skip(1) {
                     self.move_cursor(
@@ -491,7 +324,6 @@ impl MacOsComputerBackend {
                     )?;
                 }
                 self.post_mouse(mouse_up_type(*button), *button, self.cursor()?, flags, 1)?;
-                self.forget_button(*button)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::TypeText { text } => {
@@ -507,12 +339,10 @@ impl MacOsComputerBackend {
                 }
                 let flags = flags_for_keys(&chord.keys);
                 for code in &codes {
-                    self.remember_key(*code)?;
                     self.post_key(*code, true, flags)?;
                 }
                 for code in codes.iter().rev() {
                     self.post_key(*code, false, flags)?;
-                    self.forget_key(*code)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -521,11 +351,9 @@ impl MacOsComputerBackend {
                 let code = key_code(key).ok_or_else(|| {
                     ComputerError::Refused(format!("unsupported macOS key `{key}`"))
                 })?;
-                self.remember_key(code)?;
                 self.post_key(code, true, flags_for_keys(std::slice::from_ref(key)))?;
                 std::thread::sleep(*duration);
                 self.post_key(code, false, CGEventFlags::empty())?;
-                self.forget_key(code)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             ComputerAction::Scroll {
@@ -576,23 +404,24 @@ impl ComputerBackend for MacOsComputerBackend {
     }
 
     fn release_all(&mut self) -> Result<(), ComputerError> {
-        self.reload_held_input()?;
+        // The coordinator calls this while holding the host-wide HID lease,
+        // immediately after every physical acquisition and before injection.
+        // All keyboard events emitted by this backend use the macOS virtual
+        // key-code range 0x00..=0x7e (including the Unicode-text event's
+        // code 0); release that complete set instead of consuming a journal
+        // tied to one login user or an earlier backend construction. Extra
+        // key-up events are harmless, while this also neutralizes input left
+        // behind by a crashed predecessor from any login user.
         let mut first_error = None;
-        for code in self.held_keys.clone() {
+        for code in 0_u16..=0x7e {
             match self.post_key(code, false, CGEventFlags::empty()) {
-                Ok(()) => {
-                    if let Err(error) = self.forget_key(code)
-                        && first_error.is_none()
-                    {
-                        first_error = Some(error);
-                    }
-                }
+                Ok(()) => {}
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
         }
         let cursor = self.cursor();
-        for button in self.held_buttons.clone() {
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
             let result = cursor.as_ref().map_err(Clone::clone).and_then(|point| {
                 self.post_mouse(
                     mouse_up_type(button),
@@ -603,13 +432,7 @@ impl ComputerBackend for MacOsComputerBackend {
                 )
             });
             match result {
-                Ok(()) => {
-                    if let Err(error) = self.forget_button(button)
-                        && first_error.is_none()
-                    {
-                        first_error = Some(error);
-                    }
-                }
+                Ok(()) => {}
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -693,13 +516,6 @@ fn permission_error(permission: &str) -> ComputerError {
 fn command_error(program: &str, error: impl std::fmt::Display) -> ComputerError {
     ComputerError::CommandFailed {
         program: program.to_string(),
-        detail: error.to_string(),
-    }
-}
-
-fn input_journal_error(error: impl std::fmt::Display) -> ComputerError {
-    ComputerError::CommandFailed {
-        program: "computer input-state journal".to_string(),
         detail: error.to_string(),
     }
 }

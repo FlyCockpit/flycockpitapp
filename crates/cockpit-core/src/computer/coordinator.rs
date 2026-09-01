@@ -428,15 +428,14 @@ impl std::error::Error for HostLockError {}
 /// Production OS-level advisory lock: one lock file per [`PhysicalTargetKey`]
 /// under the private Cockpit data root.
 ///
-/// On Unix each key maps to a `0o600`, no-symlink-follow lock file on which an
-/// exclusive, non-blocking `flock(LOCK_EX | LOCK_NB)` is taken and **held for
-/// the lease lifetime** — the owning [`std::fs::File`] descriptor lives in
-/// [`FileAdvisoryLock::held`], so the kernel lock is released exactly when the
-/// arbiter releases (drops the fd). Because `flock` locks attach to the open
-/// file *description*, two independent `FileAdvisoryLock` instances that each
-/// `open` the same path obtain separate descriptions and therefore genuinely
-/// contend — even inside a single process — which is precisely the harness the
-/// FIFO/contention tests rely on.
+/// On macOS, all CGEvent injection locks the root-owned root-directory vnode:
+/// no login user can replace that object, and `flock` therefore serializes the
+/// one host-wide HID sink across users. Other Unix targets map each physical
+/// key to a `0o600`, no-symlink-follow lock file. In both cases an exclusive,
+/// non-blocking `flock(LOCK_EX | LOCK_NB)` is **held for the lease lifetime**
+/// by the [`std::fs::File`] in [`FileAdvisoryLock::held`], so descriptor drop
+/// releases it. Separate `FileAdvisoryLock` instances open separate file
+/// descriptions and genuinely contend, including within one process.
 ///
 /// On Windows the persistent lock file is opened with a zero share mode. The
 /// kernel rejects competing opens while the handle is live and closes the
@@ -446,10 +445,10 @@ impl std::error::Error for HostLockError {}
 pub struct FileAdvisoryLock {
     /// Directory that holds the per-key lock files.
     root: std::path::PathBuf,
-    /// The macOS HID event tap is one physical sink across login users. Its
-    /// lock is therefore intentionally rooted in the system sticky directory
-    /// and shared read/write, unlike every per-user Cockpit lock.
-    shared_across_users: bool,
+    /// macOS HID injection is host-wide. Its lock is taken on the root-owned
+    /// root-directory vnode rather than a user-creatable path, so every login
+    /// contends on one non-replaceable kernel lock object.
+    macos_global_hid_lock: bool,
     /// Locks currently held by this instance, keyed by the arbiter key string.
     /// The value owns the live descriptor/handle; dropping it releases the OS
     /// lock.
@@ -472,15 +471,15 @@ impl std::fmt::Debug for FileAdvisoryLock {
 }
 
 impl FileAdvisoryLock {
-    /// Open a production lock. macOS HID injection uses a user-independent
-    /// namespace under the system sticky directory; all other backends retain
-    /// the private per-user Cockpit root.
+    /// Open a production lock. macOS HID injection locks the root-owned host
+    /// root directory; all other backends retain the private per-user Cockpit
+    /// root and per-target lock files.
     pub fn new() -> Result<Self, HostLockError> {
         #[cfg(target_os = "macos")]
         {
             return Ok(Self {
-                root: std::path::PathBuf::from("/private/var/tmp"),
-                shared_across_users: true,
+                root: std::path::PathBuf::from("/"),
+                macos_global_hid_lock: true,
                 held: HashMap::new(),
             });
         }
@@ -499,7 +498,7 @@ impl FileAdvisoryLock {
         ensure_lock_root(&root)?;
         Ok(Self {
             root,
-            shared_across_users: false,
+            macos_global_hid_lock: false,
             held: HashMap::new(),
         })
     }
@@ -508,16 +507,15 @@ impl FileAdvisoryLock {
     /// string so that any two instances contending on the same key resolve to
     /// the same file, while staying filesystem-safe and bounded in length.
     fn lock_path(&self, key: &PhysicalTargetKey) -> std::path::PathBuf {
+        if self.macos_global_hid_lock {
+            return self.root.clone();
+        }
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         HostInputArbiter::key_string(key).hash(&mut hasher);
         let digest = hasher.finish();
-        let name = if self.shared_across_users {
-            format!("flycockpit-macos-global-hid-{digest:016x}.lock")
-        } else {
-            format!("computer-host-input-{digest:016x}.lock")
-        };
-        self.root.join(name)
+        self.root
+            .join(format!("computer-host-input-{digest:016x}.lock"))
     }
 
     /// Test-only accessor for the per-key lock-file path, so tests can
@@ -557,53 +555,45 @@ fn ensure_lock_root(root: &std::path::Path) -> Result<(), HostLockError> {
 #[cfg(unix)]
 fn os_lock_file(
     path: &std::path::Path,
-    shared_across_users: bool,
+    macos_global_hid_lock: bool,
 ) -> Result<std::fs::File, HostLockError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(if shared_across_users { 0o666 } else { 0o600 })
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if macos_global_hid_lock {
+        // `flock` locks the opened vnode, including a directory vnode. `/` is
+        // root-owned, cannot be unlinked or replaced by a login user, and is
+        // the same object for every macOS login. Read-only access is enough
+        // for an advisory flock; no user-writable lock file participates.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    } else {
+        options
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
         .open(path)
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
     let meta = file
         .metadata()
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-    if !meta.file_type().is_file() {
-        return Err(HostLockError::LockFileIo(
-            "lock path is not a regular file".to_string(),
-        ));
-    }
-
-    if shared_across_users {
-        // The system sticky directory prevents another user from unlinking a
-        // lock they do not own. A shared mode is required so independently
-        // logged-in Cockpit users contend on this one HID sink; if a prior
-        // creator left any other mode, fail closed rather than silently fork
-        // arbitration.
-        if meta.mode() & 0o777 != 0o666 {
-            // A newly-created file is filtered through the creator's umask.
-            // Repair through the held fd; another user's private/insecure
-            // file cannot be repaired and therefore fails closed.
-            file.set_permissions(std::fs::Permissions::from_mode(0o666))
-                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-            if file
-                .metadata()
-                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?
-                .mode()
-                & 0o777
-                != 0o666
-            {
-                return Err(HostLockError::LockFileIo(
-                    "shared macOS HID lock is not mode 0o666".to_string(),
-                ));
-            }
+    if macos_global_hid_lock {
+        if !meta.file_type().is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(HostLockError::LockFileIo(
+                "macOS global HID lock object is not a root-owned non-writable directory"
+                    .to_string(),
+            ));
         }
     } else {
+        if !meta.file_type().is_file() {
+            return Err(HostLockError::LockFileIo(
+                "lock path is not a regular file".to_string(),
+            ));
+        }
         // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
         // file may carry broader permissions or a foreign owner. Verify and tighten
         // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
@@ -646,7 +636,7 @@ fn os_lock_file(
 #[cfg(windows)]
 fn os_lock_file(
     path: &std::path::Path,
-    _shared_across_users: bool,
+    _macos_global_hid_lock: bool,
 ) -> Result<std::fs::File, HostLockError> {
     use std::os::windows::fs::OpenOptionsExt as _;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -686,7 +676,7 @@ fn os_lock_file(
 #[cfg(all(not(unix), not(windows)))]
 fn os_lock_file(
     _path: &std::path::Path,
-    _shared_across_users: bool,
+    _macos_global_hid_lock: bool,
 ) -> Result<std::fs::File, HostLockError> {
     Err(HostLockError::LockFileIo(
         "host input advisory locks are unsupported on this platform".to_string(),
@@ -702,7 +692,7 @@ impl OsAdvisoryLock for FileAdvisoryLock {
             return Ok(());
         }
         let path = self.lock_path(key);
-        let file = os_lock_file(&path, self.shared_across_users)?;
+        let file = os_lock_file(&path, self.macos_global_hid_lock)?;
         self.held.insert(key_str, HeldFileLock { _file: file });
         Ok(())
     }
@@ -4426,7 +4416,7 @@ impl ComputerActionCoordinator {
     /// The logical lease is process-local bookkeeping, so releasing it does
     /// not inject input and lets a local waiter compete for a fresh OS lease.
     /// Cleanup remains forbidden for this stale coordinator; a successful new
-    /// owner reloads and clears the backend's durable held-key journal first.
+    /// owner neutralizes input under its newly acquired lease before use.
     fn abandon_host_lease_without_input(&mut self) {
         self.input_cleanup_permitted = false;
         if let Some(token) = self.host_lease.take()

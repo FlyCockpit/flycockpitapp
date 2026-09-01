@@ -2506,9 +2506,11 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     enable_reasoning_retraction(&mut driver);
     let cancel = driver.cancel_handle();
     let (queue, tx, mut rx) = event_harness();
+    let run_queue = queue.clone();
+    let run_tx = tx.clone();
     let run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("same resend"), &queue, &tx)
+            .run_user_input(UserSubmission::text("same resend"), &run_queue, &run_tx)
             .await
             .unwrap();
         driver

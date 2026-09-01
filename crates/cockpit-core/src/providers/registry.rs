@@ -70,7 +70,10 @@ pub(crate) trait Provider: Send + Sync {
         None
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
+    /// Return an error when this provider cannot resolve credentials in the
+    /// supplied context. A credential store makes built-in OAuth providers
+    /// usable, but never makes a provider unavailable in this build usable.
+    fn auth_resolution_error(&self, _has_credential_store: bool) -> Option<&'static str> {
         None
     }
 
@@ -161,8 +164,9 @@ impl Provider for CodexProvider {
         Some(ProviderCredentialKind::CodexOAuth)
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
-        Some("Codex subscription auth required — set up OAuth in /settings → Providers.")
+    fn auth_resolution_error(&self, has_credential_store: bool) -> Option<&'static str> {
+        (!has_credential_store)
+            .then_some("Codex subscription auth required — set up OAuth in /settings → Providers.")
     }
 
     fn model_list_request(
@@ -239,8 +243,9 @@ impl Provider for GrokProvider {
         Some(ProviderCredentialKind::XaiOAuth)
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
-        Some("Grok subscription auth required — set up OAuth in /settings → Providers.")
+    fn auth_resolution_error(&self, has_credential_store: bool) -> Option<&'static str> {
+        (!has_credential_store)
+            .then_some("Grok subscription auth required — set up OAuth in /settings → Providers.")
     }
 
     fn usage_probe(&self) -> Option<&dyn ProviderUsageProbe> {
@@ -264,7 +269,7 @@ impl Provider for UnavailableGrokOAuthProvider {
         is_grok_oauth_identity(provider_id, entry)
     }
 
-    fn sync_auth_error(&self) -> Option<&'static str> {
+    fn auth_resolution_error(&self, _has_credential_store: bool) -> Option<&'static str> {
         Some(
             "Grok subscription OAuth is unavailable in this official build pending xAI authorization; use a custom OpenAI-compatible provider with auth_command instead.",
         )

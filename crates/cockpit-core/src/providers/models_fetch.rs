@@ -162,7 +162,8 @@ pub fn resolve_provider_request(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if let Some(message) = registry.provider_for(provider_id, entry).sync_auth_error() {
+    let provider = registry.provider_for(provider_id, entry);
+    if let Some(message) = provider.auth_resolution_error(false) {
         anyhow::bail!(message);
     }
     provider.request(provider_id, entry, None, &|name| std::env::var(name).ok())
@@ -191,7 +192,7 @@ where
 {
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = provider.auth_resolution_error(false) {
         anyhow::bail!(message);
     }
     resolve_provider_request_inner_with_sources(
@@ -215,7 +216,7 @@ pub async fn resolve_provider_request_async(
     }
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = provider.auth_resolution_error(false) {
         anyhow::bail!(message);
     }
     if provider.credential_kind().is_some() {
@@ -281,7 +282,7 @@ async fn resolve_provider_request_async_with_store_refresh(
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
-    if let Some(message) = provider.sync_auth_error() {
+    if let Some(message) = provider.auth_resolution_error(true) {
         anyhow::bail!(message);
     }
     let command_credential = match entry.auth_command.as_deref() {
@@ -352,7 +353,10 @@ async fn resolve_model_list_request_async_with_store(
     env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if let Some(message) = registry.provider_for(provider_id, entry).sync_auth_error() {
+    if let Some(message) = registry
+        .provider_for(provider_id, entry)
+        .auth_resolution_error(store.is_some())
+    {
         anyhow::bail!(message);
     }
     let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {

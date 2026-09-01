@@ -4500,9 +4500,10 @@ async fn production_embedder(
     // Owner-scoped resolution: the embedding provider request may only resolve
     // `$secret:` names owned by (provider, this session's project root).
     let store = session.provider_credential_store(&providers)?;
-    let embedder =
-        OpenAiCompatEmbedder::for_resolved_model_with_store(&providers, &resolved, redact, store)
-            .await?;
+    let embedder = OpenAiCompatEmbedder::for_resolved_model_with_store(
+        &providers, &resolved, redact, store, config,
+    )
+    .await?;
     Ok(Some(Arc::new(embedder)))
 }
 

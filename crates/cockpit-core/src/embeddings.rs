@@ -34,9 +34,41 @@ pub struct OpenAiCompatEmbedder {
 /// together after every refresh rather than retaining construction-time data.
 struct CommandRefresh {
     provider_id: String,
-    entry: ProviderEntry,
+    /// Live config authority. A rejection-triggered refresh may not execute
+    /// the argv from the construction-time provider entry after reload.
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    configured_generation: u64,
     store: crate::credentials::CredentialStore,
     request: Mutex<models_fetch::ResolvedRequest>,
+}
+
+impl CommandRefresh {
+    /// Resolve the command entry authorized by the current provider snapshot.
+    /// A removed command fails closed; a replacement is the only executable
+    /// this long-lived client may run.
+    fn current_entry(&self) -> Result<ProviderEntry> {
+        let snapshot = self.config.snapshot();
+        if snapshot.generation != self.configured_generation {
+            tracing::debug!(
+                provider_id = %self.provider_id,
+                configured_generation = self.configured_generation,
+                current_generation = snapshot.generation,
+                "embedding auth-command refresh re-authorized against reloaded provider config"
+            );
+        }
+        snapshot
+            .providers
+            .providers
+            .get(&self.provider_id)
+            .filter(|entry| entry.auth_command.is_some())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "provider `{}` no longer has a global auth_command authorized for embedding refresh",
+                    self.provider_id
+                )
+            })
+    }
 }
 
 impl OpenAiCompatEmbedder {
@@ -63,6 +95,7 @@ impl OpenAiCompatEmbedder {
             resolved.embedding_dimensions,
             session_redact,
             None,
+            None,
         )
         .await
     }
@@ -72,6 +105,7 @@ impl OpenAiCompatEmbedder {
         resolved: &ResolvedEmbeddingModel,
         session_redact: Arc<RedactionTable>,
         store: crate::credentials::CredentialStore,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
     ) -> Result<Self> {
         let entry = providers
             .providers
@@ -85,6 +119,7 @@ impl OpenAiCompatEmbedder {
             resolved.embedding_dimensions,
             session_redact,
             Some(store),
+            Some(config),
         )
         .await
     }
@@ -106,6 +141,7 @@ impl OpenAiCompatEmbedder {
             expected_dimensions,
             session_redact,
             None,
+            None,
         )
         .await
     }
@@ -118,6 +154,7 @@ impl OpenAiCompatEmbedder {
         expected_dimensions: Option<u32>,
         session_redact: Arc<RedactionTable>,
         store: Option<crate::credentials::CredentialStore>,
+        config: Option<&crate::daemon::session_worker::SessionConfigHandle>,
     ) -> Result<Self> {
         let request = match store.clone() {
             Some(store) => {
@@ -147,16 +184,20 @@ impl OpenAiCompatEmbedder {
         let command_request = request.clone();
         Ok(
             Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
-                .with_command_refresh(store.filter(|_| entry.auth_command.is_some()).map(
-                    |store| {
-                        Arc::new(CommandRefresh {
-                            provider_id: provider_id.to_string(),
-                            entry: entry.clone(),
-                            store,
-                            request: Mutex::new(command_request),
-                        })
-                    },
-                )),
+                .with_command_refresh(
+                    store
+                        .zip(config)
+                        .filter(|_| entry.auth_command.is_some())
+                        .map(|(store, config)| {
+                            Arc::new(CommandRefresh {
+                                provider_id: provider_id.to_string(),
+                                config: config.live(),
+                                configured_generation: providers.resolution_generation,
+                                store,
+                                request: Mutex::new(command_request),
+                            })
+                        }),
+                ),
         )
     }
 
@@ -256,9 +297,10 @@ impl Embedder for OpenAiCompatEmbedder {
             None
         };
         let response = if let Some(refresh) = refreshed {
+            let entry = refresh.current_entry()?;
             let request = models_fetch::refresh_provider_request_async_with_store(
                 &refresh.provider_id,
-                &refresh.entry,
+                &entry,
                 refresh.store.clone(),
                 |name| std::env::var(name).ok(),
                 request_generation,

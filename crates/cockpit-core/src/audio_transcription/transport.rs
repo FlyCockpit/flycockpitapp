@@ -44,8 +44,9 @@ pub(crate) async fn resolve_vetted_egress(
     use crate::config::providers::CapabilityStatus;
 
     let providers = config.providers();
+    let config_generation = providers.resolution_generation;
     let capabilities =
-        providers.resolve_effective_model_capabilities(provider_id, model_id, config.generation());
+        providers.resolve_effective_model_capabilities(provider_id, model_id, config_generation);
     if capabilities.transcription != CapabilityStatus::Supported {
         return Ok(None);
     }
@@ -86,7 +87,8 @@ pub(crate) async fn resolve_vetted_egress(
     let fingerprint = crate::image_sidecar::CredentialFingerprint::from_identity(authorization);
     let command_refresh = entry.auth_command.as_ref().map(|_| CommandRefresh {
         provider_id: provider_id.to_string(),
-        entry: entry.clone(),
+        config: config.live(),
+        configured_generation: config_generation,
         store,
         env: env.clone(),
         state: Arc::new(Mutex::new(CommandRequestState {
@@ -100,7 +102,7 @@ pub(crate) async fn resolve_vetted_egress(
         "public_network".to_string(),
         &request.headers,
         super::authorization::CredentialFingerprintDigest::from_fingerprint(&fingerprint),
-        config.generation(),
+        config_generation,
         Arc::new(crate::image_generation_runtime::TokioDnsResolver),
         command_refresh,
     )
@@ -122,10 +124,40 @@ pub struct TranscriptionHttpTransport {
 #[derive(Clone)]
 struct CommandRefresh {
     provider_id: String,
-    entry: crate::config::providers::ProviderEntry,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    configured_generation: u64,
     store: crate::credentials::CredentialStore,
     env: std::collections::HashMap<String, String>,
     state: Arc<Mutex<CommandRequestState>>,
+}
+
+impl CommandRefresh {
+    /// Resolve the command entry from the current config snapshot immediately
+    /// before a rejection-triggered refresh. A removed command fails closed;
+    /// a replacement is the only executable allowed to run.
+    fn current_entry(&self) -> anyhow::Result<crate::config::providers::ProviderEntry> {
+        let snapshot = self.config.snapshot();
+        if snapshot.generation != self.configured_generation {
+            tracing::debug!(
+                provider_id = %self.provider_id,
+                configured_generation = self.configured_generation,
+                current_generation = snapshot.generation,
+                "transcription auth-command refresh re-authorized against reloaded provider config"
+            );
+        }
+        snapshot
+            .providers
+            .providers
+            .get(&self.provider_id)
+            .filter(|entry| entry.auth_command.is_some())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "provider `{}` no longer has a global auth_command authorized for transcription refresh",
+                    self.provider_id
+                )
+            })
+    }
 }
 
 /// The exact command-authenticated headers and generation attached to a
@@ -409,10 +441,13 @@ impl TranscriptionEgressTransport for TranscriptionHttpTransport {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) && let Some(refresh) = &self.command_refresh
         {
+            let entry = refresh
+                .current_entry()
+                .map_err(|_| TranscriptionEgressError::Authentication)?;
             let refreshed =
                 crate::providers::models_fetch::refresh_provider_request_async_with_store(
                     &refresh.provider_id,
-                    &refresh.entry,
+                    &entry,
                     refresh.store.clone(),
                     |name| {
                         refresh

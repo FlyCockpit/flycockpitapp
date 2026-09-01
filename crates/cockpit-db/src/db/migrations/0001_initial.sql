@@ -48,9 +48,9 @@ CREATE TABLE assistant_inbox_items (
         AND length(replace(inbox_item_id, '-', '')) = 32
         AND replace(inbox_item_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
-    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE,
-    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    assistant_name     TEXT NOT NULL REFERENCES assistants(name) ON DELETE CASCADE ON UPDATE RESTRICT,
+    main_session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    raising_session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- Daemon-owned inference/replay scope. Provider tool-call IDs are only
     -- idempotency correlations, not globally unique operation identities.
     operation_scope    TEXT NOT NULL CHECK (length(CAST(operation_scope AS BLOB)) BETWEEN 1 AND 128),
@@ -3469,47 +3469,6 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
--- ---- scheduled jobs --------------------------------------------------------
--- The immutable insertion identity fences stale asynchronous actions when a
--- user-chosen job id is deleted and later reused.
-CREATE TABLE scheduled_jobs (
-    id                TEXT    PRIMARY KEY,
-    row_identity      TEXT    NOT NULL UNIQUE,
-    owner             TEXT    NOT NULL,
-    schedule_json     TEXT    NOT NULL CHECK (
-        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
-        AND length(CAST(schedule_json AS BLOB)) <= 65536
-    ),
-    payload_json      TEXT    NOT NULL CHECK (
-        json_valid(payload_json)
-        AND length(CAST(payload_json AS BLOB)) <= 1048576
-    ),
-    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
-    created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
-    last_run_at       INTEGER,
-    next_run_at       INTEGER,
-    last_result_json  TEXT CHECK (
-        last_result_json IS NULL OR (
-            json_valid(last_result_json)
-            AND length(CAST(last_result_json AS BLOB)) <= 1048576
-        )
-    ),
-    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
-    backoff_until     INTEGER,
-    disabled_notice   TEXT
-);
-
-CREATE INDEX idx_scheduled_jobs_next_run ON scheduled_jobs(enabled, next_run_at);
-CREATE INDEX idx_scheduled_jobs_owner ON scheduled_jobs(owner);
-
-CREATE TRIGGER scheduled_jobs_row_identity_immutable
-BEFORE UPDATE OF row_identity ON scheduled_jobs
-BEGIN
-    SELECT RAISE(ABORT, 'scheduled job row identity is immutable');
-END;
-
 -- ---- session full-text search (`history_search` / `cockpit://` recall) ------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session title/description, the text of `user_message` /
@@ -3562,6 +3521,10 @@ CREATE UNIQUE INDEX session_fts_docs_one_non_artifact_event_kind
 
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
+CREATE INDEX session_fts_docs_session_seq_idx
+    ON session_fts_docs(session_id, seq);
+CREATE INDEX session_fts_docs_session_artifact_idx
+    ON session_fts_docs(session_id, artifact_id);
 
 -- Event sync: `user_message` / `assistant_message` rows carry conversational
 -- text at data_json.'$.text'. `session_compacted` rows carry model-written

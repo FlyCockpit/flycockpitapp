@@ -1719,7 +1719,6 @@ pub(crate) fn effective_tool_tier(
     if tool == "transcribe_audio" {
         return match def.name.as_str() {
             "Build" => crate::agents::ToolTier::Enabled,
-            "Careful" | "builder" => crate::agents::ToolTier::Discoverable,
             _ => crate::agents::ToolTier::Disabled,
         };
     }
@@ -1801,8 +1800,15 @@ fn with_audio_video_tools(
         tb = match effective_tool_tier(def, name, false) {
             crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             // Source authority is direct-native only. A discoverable tier is
-            // MCP/Monty-backed, so it cannot safely represent these tools.
-            crate::agents::ToolTier::Discoverable | crate::agents::ToolTier::Disabled => tb,
+            // MCP/Monty-backed, so reject it rather than silently omitting
+            // the persisted projected tier.
+            crate::agents::ToolTier::Discoverable => {
+                bail!(
+                    "agent `{}` resolved direct-native tool `{name}` as discoverable",
+                    def.name
+                )
+            }
+            crate::agents::ToolTier::Disabled => tb,
         };
     }
     if args.media_availability.is_available() {
@@ -1811,7 +1817,10 @@ fn with_audio_video_tools(
                 add_tool_by_name(tb, "transcribe_audio", def, args)?
             }
             crate::agents::ToolTier::Discoverable => {
-                add_discoverable_tool_by_name(tb, "transcribe_audio", def, args)?
+                bail!(
+                    "agent `{}` resolved direct-native tool `transcribe_audio` as discoverable",
+                    def.name
+                )
             }
             crate::agents::ToolTier::Disabled => tb,
         };
@@ -1876,6 +1885,12 @@ fn add_discoverable_tool_by_name(
     def: &crate::agents::AgentDef,
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
+    if !crate::agents::is_monty_builtin_adaptable(name) {
+        bail!(
+            "agent `{}` may not materialize direct-native tool `{name}` as discoverable",
+            def.name
+        );
+    }
     let scratch = materialize_tool_by_name(ToolBox::new(), name, Some(def), args)?;
     let Some(tool) = scratch.get_cloned(name) else {
         return Ok(tb);
@@ -4695,6 +4710,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transcribe_audio_defaults_and_overrides_are_direct_native_only() {
+        use crate::{agents::ToolTier, tool_media_authority::MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.media_availability = MediaToolAvailability::available();
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let def = crate::agents::embedded_default(name).unwrap();
+            assert_ne!(
+                effective_tool_tier(&def, "transcribe_audio", false),
+                ToolTier::Discoverable,
+                "{name} must never default transcription to Monty discovery"
+            );
+            let agent = agent_from_def(&def, &args).unwrap();
+            assert!(
+                !agent
+                    .tools
+                    .discoverable_mcp_tool_names()
+                    .iter()
+                    .any(|tool| tool == "transcribe_audio"),
+                "{name} must never register transcription as Discoverable"
+            );
+        }
+
+        let mut invalid = crate::agents::embedded_default("Careful").unwrap();
+        invalid
+            .tool_tiers
+            .insert("transcribe_audio".to_string(), ToolTier::Discoverable);
+        assert!(crate::agents::validate_invariants(&invalid).is_err());
+        assert!(agent_from_def(&invalid, &args).is_err());
+    }
+
+    #[test]
     fn builtin_agent_grant_equivalence_to_embedded_defs() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -5581,7 +5629,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn monty_discoverability_invariant_covers_default_discoverable_tools() {
+    fn discoverable_tools_are_found_through_runtime_mcp_discovery() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         for &name in crate::agents::BUILTIN_AGENT_NAMES {
@@ -5596,9 +5644,26 @@ pub(crate) mod tests {
             for tool in agent.tools.discoverable_mcp_tool_names() {
                 assert!(
                     mcp_description.contains("grep_tool_names")
-                        || mcp_description.contains("grep_tool_definitions")
-                        || agent.role_prompt.contains(&tool),
-                    "`{name}` discoverable tool `{tool}` is not reachable through static MCP discovery or role prompt"
+                        || mcp_description.contains("grep_tool_definitions"),
+                    "`{name}` discoverable tool `{tool}` is not reachable through runtime MCP discovery"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_agent_prompts_do_not_enumerate_discoverable_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &args).unwrap();
+            let inline_code_tokens: std::collections::BTreeSet<&str> =
+                agent.role_prompt.split('`').skip(1).step_by(2).collect();
+            for tool in agent.tools.discoverable_mcp_tool_names() {
+                assert!(
+                    !inline_code_tokens.contains(&tool.as_str()),
+                    "canonical `{name}` prompt enumerates discoverable tool `{tool}`: {}",
+                    agent.role_prompt
                 );
             }
         }

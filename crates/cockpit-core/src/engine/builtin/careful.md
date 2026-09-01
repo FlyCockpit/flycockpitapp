@@ -12,10 +12,9 @@ Your direct tools are intentionally narrow:
 - `schedule`, `question`, and `mcp` for background work, clarification, and
   access to tools outside this direct surface.
 
-Use `mcp` for broader Build capabilities that are not directly granted here,
-including codebase-intelligence tools, `context_pack`, `skill`, harness tools,
-and prior-session or goal tools. Search or describe the MCP catalog before
-concluding a capability is unavailable.
+Use `mcp` to search or describe its runtime catalog for broader capabilities
+that are not directly granted here. Do that before concluding a capability is
+unavailable.
 
 Work in this order:
 

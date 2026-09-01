@@ -1490,15 +1490,18 @@ impl SettingsCx {
             return;
         }
         self.config.providers.insert(id.clone(), entry.clone());
-        self.pending_provider_add = Some((
+        self.pending_provider_add = Some(super::PendingProviderAdd {
             id,
             entry,
-            template.supports_models_endpoint,
-            detected_env.map(|variable| super::DetectedEnvironmentCopy {
-                template_id: template.id.to_string(),
-                variable,
+            supports_models_endpoint: template.supports_models_endpoint,
+            detected_environment_copy: detected_env.map(|variable| {
+                super::DetectedEnvironmentCopy {
+                    template_id: template.id.to_string(),
+                    variable,
+                }
             }),
-        ));
+            onboarding: s.onboarding,
+        });
         match self.save_config() {
             Ok(()) => {
                 // The mutation now owns the wizard. Advance to the explicit
@@ -1510,8 +1513,7 @@ impl SettingsCx {
                 s.error = Some("saving provider…".into());
             }
             Err(e) => {
-                self.pending_provider_add = None;
-                s.error = Some(format!("save failed: {e}"));
+                self.reject_pending_provider_add(e);
             }
         }
     }
@@ -1524,7 +1526,14 @@ impl SettingsCx {
         let (id, entry, supports_models_endpoint) = match completion {
             Ok(committed) => committed,
             Err(error) => {
-                s.error = Some(format!("save failed: {error}"));
+                s.run
+                    .return_to("template")
+                    .expect("provider template step exists");
+                s.saved_provider_id = None;
+                s.fetch = None;
+                s.error = Some(format!(
+                    "save failed: {error}. Choose a provider to try again."
+                ));
                 return;
             }
         };
@@ -1941,10 +1950,10 @@ impl SettingsCx {
                     let _ = s.run.submit(WizardAnswer::Acknowledged);
                 }
             }
-            // Normal settings may explicitly continue after a failed probe;
-            // first-run onboarding must remain resumable until a live daemon
-            // validation succeeds.
-            Some("test-key") if s.fetch.is_none() && !s.onboarding => {
+            // A failed probe is explicit evidence that this setup is offline
+            // or otherwise unable to validate now. First-run onboarding may
+            // continue through the manual model path in that limited state.
+            Some("test-key") if s.fetch.is_none() => {
                 if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
                     s.error = Some(
                         "Live validation was attempted but setup is continuing offline; validate before first use."
@@ -3934,11 +3943,7 @@ impl SettingsCx {
                 ));
                 if s.is_step("test-key") && s.fetch.is_none() {
                     lines.push(Line::from(Span::styled(
-                        if s.onboarding {
-                            "Validation failed or the network is offline. Esc cancels safely; setup resumes here until validation succeeds."
-                        } else {
-                            "Validation failed or the network is offline. Press o to continue offline, or Esc to cancel and resume later."
-                        },
+                        "Validation failed or the network is offline. Press o to continue with manual model setup, or Esc to cancel and resume later.",
                         muted,
                     )));
                 }
@@ -6309,6 +6314,7 @@ impl SettingsPage for ProvidersPage {
                         oauth_help_legend(OAuthHost::AddWizard, state)
                     }
                 },
+                Some("test-key") if s.fetch.is_none() => "o: continue offline  esc: cancel",
                 Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
                 Some("test-skipped") => "enter: continue",
                 Some("done") | None => "enter: back to list",

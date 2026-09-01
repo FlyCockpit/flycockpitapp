@@ -40,8 +40,9 @@ impl Default for OnboardingStage {
 struct OnboardingState {
     stage: OnboardingStage,
     /// A provider save is in flight or has committed but still needs its
-    /// required live validation. Keeping this alongside the stage lets a
-    /// restart resume validation instead of opening a fresh add wizard.
+    /// live validation. Keeping this alongside the stage lets a restart
+    /// resume validation instead of opening a fresh add wizard; an explicit
+    /// offline continuation advances the stage and clears this marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_pending_validation: Option<String>,
 }

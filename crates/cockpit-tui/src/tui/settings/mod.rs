@@ -643,6 +643,14 @@ pub(super) struct DetectedEnvironmentCopy {
     pub(super) variable: String,
 }
 
+struct PendingProviderAdd {
+    id: String,
+    entry: ProviderEntry,
+    supports_models_endpoint: bool,
+    detected_environment_copy: Option<DetectedEnvironmentCopy>,
+    onboarding: bool,
+}
+
 impl std::fmt::Debug for ProviderMutationPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderMutationPlan")
@@ -3054,7 +3062,7 @@ pub struct SettingsCx {
     completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
     completed_web_credential: Option<(String, Result<(), String>)>,
     completed_provider_auth: Option<CompletedProviderAuthMutation>,
-    pending_provider_add: Option<(String, ProviderEntry, bool, Option<DetectedEnvironmentCopy>)>,
+    pending_provider_add: Option<PendingProviderAdd>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -3408,6 +3416,38 @@ impl SettingsCx {
         self.queue_settlement_query(client_operation_id, *original);
     }
 
+    /// Resolve an add-wizard save that the daemon proved did not commit.
+    ///
+    /// A first-run add persists a validation continuation before dispatch so
+    /// cancellation cannot lose a committed provider. The opposite is also
+    /// required: once authority rejects the mutation, remove that
+    /// continuation and return the wizard to an editable state rather than
+    /// resuming validation for a provider that does not exist.
+    fn reject_pending_provider_add(&mut self, error: String) {
+        let Some(pending) = self.pending_provider_add.take() else {
+            return;
+        };
+
+        // The staged entry was never daemon-owned. Restore the last
+        // authoritative snapshot so retrying the add does not see a phantom
+        // duplicate provider.
+        self.config = self.original_config.clone();
+
+        let error = if pending.onboarding {
+            match cockpit_core::welcome::persist_onboarding_stage(
+                cockpit_core::welcome::OnboardingStage::Provider,
+            ) {
+                Ok(()) => error,
+                Err(clear_error) => format!(
+                    "{error}; could not clear the setup validation continuation: {clear_error}"
+                ),
+            }
+        } else {
+            error
+        };
+        self.completed_provider_add = Some(Err(error));
+    }
+
     /// Apply a daemon-recorded terminal rejection without feeding it back
     /// through the transport-error path. Transport failures leave authority
     /// fenced and are queried again; this path is proof that the mutation did
@@ -3425,10 +3465,7 @@ impl SettingsCx {
                 self.completed_provider_mutation = Some(Err(message.clone()));
                 self.completed_provider_mutation_navigation =
                     self.pending_provider_mutation_navigation.take();
-                if self.pending_provider_add.is_some() {
-                    self.pending_provider_add = None;
-                    self.completed_provider_add = Some(Err(message.clone()));
-                }
+                self.reject_pending_provider_add(message.clone());
             }
             PendingSettingsOperation::SimpleMutation { action, .. } => match action {
                 SettingsMutationAction::McpSave { .. } => {
@@ -4119,8 +4156,12 @@ impl SettingsCx {
                         self.completed_provider_mutation = Some(Ok(()));
                         self.completed_provider_mutation_navigation =
                             self.pending_provider_mutation_navigation.take();
-                        if let Some((id, entry, supports_models_endpoint, _)) =
-                            self.pending_provider_add.take()
+                        if let Some(PendingProviderAdd {
+                            id,
+                            entry,
+                            supports_models_endpoint,
+                            ..
+                        }) = self.pending_provider_add.take()
                         {
                             self.completed_provider_add =
                                 Some(Ok((id, entry, supports_models_endpoint)));
@@ -4135,6 +4176,7 @@ impl SettingsCx {
                             self.completed_provider_mutation = Some(Err(error.clone()));
                             self.completed_provider_mutation_navigation =
                                 self.pending_provider_mutation_navigation.take();
+                            self.reject_pending_provider_add(error.clone());
                             self.extended_warnings = vec![format!("save failed: {error}")];
                         } else {
                             tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
@@ -5811,8 +5853,8 @@ impl Dialog {
         Self::open_providers_add_mode(cwd, status, true)
     }
 
-    /// Resume the mandatory validation of a provider whose daemon-owned save
-    /// committed after the add wizard was cancelled.
+    /// Resume validation of a provider whose daemon-owned save committed
+    /// after the add wizard was cancelled.
     pub fn open_onboarding_provider_validation(cwd: &std::path::Path, provider_id: &str) -> Self {
         let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
         match path {
@@ -8970,13 +9012,11 @@ impl SettingsCx {
                 if !changed {
                     return None;
                 }
-                let detected_copy = self.pending_provider_add.as_ref().and_then(
-                    |(pending_id, _, _, detected_copy)| {
-                        (pending_id == provider_id)
-                            .then(|| detected_copy.clone())
-                            .flatten()
-                    },
-                );
+                let detected_copy = self.pending_provider_add.as_ref().and_then(|pending| {
+                    (pending.id == *provider_id)
+                        .then(|| pending.detected_environment_copy.clone())
+                        .flatten()
+                });
                 let detected_header_index = detected_copy.as_ref().and_then(|copy| {
                     let template = cockpit_core::providers::template_by_id(&copy.template_id)?;
                     let placeholder_headers =

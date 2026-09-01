@@ -759,9 +759,10 @@ pub enum Request {
     /// Begin a sealed-owner sensitive operation: mint a single-use,
     /// capability bound to one exact disposition, owner principal, minting
     /// session, and daemon-loaded scope/version. `disposition` is one of
-    /// `create|replace|rotate|recover`. Create carries `name`, `description`,
-    /// `scope_kind` (`session|project|global`), and `scope_key`;
-    /// replace/rotate/recover carry only `record_id`. Secret-free.
+    /// `create|replace|rotate|reset|promote|recover`. Create carries `name`,
+    /// `description`, `scope_kind` (`session|project|global`), and `scope_key`;
+    /// replace/rotate/reset/recover carry only `record_id`; promote carries a
+    /// `record_id` plus its target `scope_kind` and `scope_key`. Secret-free.
     BeginSealedOwnerOperation {
         disposition: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -777,7 +778,7 @@ pub enum Request {
     },
     /// Apply a sealed-owner operation against a minted capability. The `literal`
     /// carries the plaintext for a create/replace/rotate write and is absent for
-    /// a recover. It is the redacting, zeroizing [`SensitiveWireLiteral`],
+    /// reset, promote, and recover. It is the redacting, zeroizing [`SensitiveWireLiteral`],
     /// bounded by [`crate::MAX_SENSITIVE_FRAME_BYTES`]. Consumes the capability
     /// through the shared compare-and-swap.
     ApplySealedOwnerOperation {

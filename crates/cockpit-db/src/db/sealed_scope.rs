@@ -754,6 +754,35 @@ impl Db {
         .await
     }
 
+    /// Delete a session-scope sealed value only when its live version still
+    /// equals `expected_version`. This is the owner reset fence: a reset
+    /// capability minted for an older version must not delete a value that was
+    /// rotated while that capability was in flight.
+    pub async fn delete_session_sealed_value_at_version(
+        &self,
+        record_id: String,
+        expected_version: i64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            delete_session_sealed_value_at_version_conn(conn, &record_id, expected_version, now_ms)
+        })
+        .await
+    }
+
+    /// Purge every scoped sealed value owned by one ended session. Each value
+    /// is deleted through the same single-transaction lifecycle as an explicit
+    /// reset, so its record, literal, grants, and name tombstone stay in lock
+    /// step. Returns the number of removed records.
+    pub async fn purge_session_sealed_values(
+        &self,
+        session_key: String,
+        now_ms: i64,
+    ) -> Result<usize> {
+        self.transaction(move |conn| purge_session_sealed_values_conn(conn, &session_key, now_ms))
+            .await
+    }
+
     /// Stage a rotation. The record keeps serving its current version until
     /// [`Db::commit_sealed_value_rotate`] runs, so an interrupted rotation
     /// leaves the previous version live rather than a half-written new one.
@@ -1428,6 +1457,17 @@ fn delete_session_sealed_value_conn(
         params![existing.scope_key, existing.name],
     )
     .context("deleting session sealed literal")?;
+    // Every sealed version is a separate wrap-key vault item. The record is
+    // the authoritative namespace owner, so delete all of its generations in
+    // this same transaction rather than leaving superseded ciphertext behind
+    // until a later session deletion.
+    let vault_prefix = session_sealed_vault_prefix(&existing.scope_key, &existing.name);
+    conn.execute(
+        "DELETE FROM secret_vault_items
+          WHERE kind = 'session_sealed_value' AND item_id LIKE ?1 ESCAPE '\\'",
+        params![vault_prefix],
+    )
+    .context("deleting session sealed vault literals")?;
     revoke_grants_for_record_conn(conn, record_id, now_ms)?;
     let removed = conn
         .execute(
@@ -1436,6 +1476,129 @@ fn delete_session_sealed_value_conn(
         )
         .context("deleting session sealed value record")?;
     Ok(removed > 0)
+}
+
+/// Delete a session value with its version fence held inside the same
+/// transaction as the destructive mutation.
+pub fn delete_session_sealed_value_at_version_conn(
+    conn: &Connection,
+    record_id: &str,
+    expected_version: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let existing = record_conn(conn, record_id)?.context("sealed value record no longer exists")?;
+    if existing.scope != SealedScopeKind::Session {
+        bail!("session sealed value reset is only available for session scope");
+    }
+    if !existing.is_resolvable() || existing.active_version != expected_version {
+        bail!("sealed value version changed before reset");
+    }
+    delete_session_sealed_value_conn(conn, record_id, now_ms)
+}
+
+/// Purge all scoped values in a session. The list is captured before deletion
+/// because each delete removes its own record and cascades its grants.
+pub fn purge_session_sealed_values_conn(
+    conn: &Connection,
+    session_key: &str,
+    now_ms: i64,
+) -> Result<usize> {
+    let record_ids = {
+        let mut stmt = conn.prepare(
+            "SELECT record_id FROM sealed_value_records
+              WHERE scope = 'session' AND scope_key = ?1",
+        )?;
+        stmt.query_map([session_key], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for record_id in &record_ids {
+        delete_session_sealed_value_conn(conn, record_id, now_ms)?;
+    }
+    Ok(record_ids.len())
+}
+
+/// Move a live session-scoped record into a persistent target scope after its
+/// literal has been staged under `compartment_key` on this connection. The
+/// source literal, grants, and session metadata are removed atomically with
+/// the scope change; the record id and safe metadata are retained.
+pub fn promote_session_sealed_value_conn(
+    conn: &Connection,
+    record_id: &str,
+    expected_version: i64,
+    target_scope: SealedScopeKind,
+    target_scope_key: &str,
+    compartment_key: &str,
+    now_ms: i64,
+) -> Result<SealedValueRecordRow> {
+    if !target_scope.is_persistent_compartment() {
+        bail!("session sealed values may only be promoted to project or global scope");
+    }
+    if target_scope == SealedScopeKind::Global && !target_scope_key.is_empty() {
+        bail!("global sealed value promotion requires an empty scope key");
+    }
+    if target_scope == SealedScopeKind::Project && target_scope_key.is_empty() {
+        bail!("project sealed value promotion requires a non-empty scope key");
+    }
+    let existing = record_conn(conn, record_id)?.context("sealed value record no longer exists")?;
+    if existing.scope != SealedScopeKind::Session
+        || !existing.is_resolvable()
+        || existing.active_version != expected_version
+    {
+        bail!("sealed value changed before promotion");
+    }
+    if name_tombstoned_conn(conn, target_scope, target_scope_key, &existing.name)? {
+        bail!("sealed value name was retired and is never reused");
+    }
+    let collision: Option<String> = conn
+        .query_row(
+            "SELECT record_id FROM sealed_value_records
+              WHERE scope = ?1 AND scope_key = ?2 AND name = ?3",
+            params![target_scope.as_str(), target_scope_key, existing.name],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking promoted sealed value name collision")?;
+    if collision.is_some() {
+        bail!("a sealed value with that name already exists in the target scope");
+    }
+    conn.execute(
+        "UPDATE sealed_value_records
+            SET scope = ?2, scope_key = ?3, compartment_key = ?4, updated_at_ms = ?5
+          WHERE record_id = ?1",
+        params![
+            record_id,
+            target_scope.as_str(),
+            target_scope_key,
+            compartment_key,
+            now_ms
+        ],
+    )
+    .context("promoting session sealed value record")?;
+    conn.execute(
+        "DELETE FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
+        params![existing.scope_key, existing.name],
+    )
+    .context("removing promoted session sealed metadata")?;
+    let vault_prefix = session_sealed_vault_prefix(&existing.scope_key, &existing.name);
+    conn.execute(
+        "DELETE FROM secret_vault_items
+          WHERE kind = 'session_sealed_value' AND item_id LIKE ?1 ESCAPE '\\'",
+        params![vault_prefix],
+    )
+    .context("removing promoted session sealed vault literals")?;
+    revoke_grants_for_record_conn(conn, record_id, now_ms)?;
+    record_conn(conn, record_id)?.context("promoted session sealed value record vanished")
+}
+
+fn session_sealed_vault_prefix(session_key: &str, name: &str) -> String {
+    format!("{}/{}/%", escape_like(session_key), escape_like(name))
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Revoke every live grant on one record. Used by the transitions that make a
@@ -1828,5 +1991,91 @@ mod tests {
                 "a grant must not be claimable after a {transition}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_purges_scoped_values_and_tombstones_their_names() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_key, record_id) = seeded_session_value(&db).await;
+        let session_id = uuid::Uuid::parse_str(&session_key).unwrap();
+
+        db.end_session(session_id).await.unwrap();
+
+        assert!(db.sealed_value_record(record_id).await.unwrap().is_none());
+        assert!(
+            db.sealed_value_name_retired(
+                SealedScopeKind::Session,
+                session_key.clone(),
+                "prod_token".into(),
+            )
+            .await
+            .unwrap()
+        );
+        let literal_rows = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sealed_values WHERE session_id = ?1 AND value_id = 'prod_token'",
+                    [session_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(literal_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_removes_a_session_value_at_its_bound_version() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_key, record_id) = seeded_session_value(&db).await;
+
+        assert!(
+            db.delete_session_sealed_value_at_version(record_id.clone(), 1, 2_000)
+                .await
+                .unwrap()
+        );
+        assert!(db.sealed_value_record(record_id).await.unwrap().is_none());
+        assert!(
+            db.sealed_value_name_retired(
+                SealedScopeKind::Session,
+                session_key,
+                "prod_token".into(),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn promoted_session_value_survives_its_session_end() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_key, record_id) = seeded_session_value(&db).await;
+        let session_id = uuid::Uuid::parse_str(&session_key).unwrap();
+        let promoted_id = record_id.clone();
+        db.transaction(move |conn| {
+            promote_session_sealed_value_conn(
+                conn,
+                &promoted_id,
+                1,
+                SealedScopeKind::Project,
+                "project-a",
+                "a-valid-opaque-compartment-locator",
+                2_000,
+            )
+        })
+        .await
+        .unwrap();
+
+        db.end_session(session_id).await.unwrap();
+
+        let promoted = db
+            .sealed_value_record(record_id)
+            .await
+            .unwrap()
+            .expect("promoted record survives session end");
+        assert_eq!(promoted.scope, SealedScopeKind::Project);
+        assert_eq!(promoted.scope_key, "project-a");
+        assert!(promoted.is_resolvable());
     }
 }

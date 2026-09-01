@@ -8387,6 +8387,16 @@ async fn handle_serialized_request_impl(
                     .apply(owner, &directory, now_ms)
                     .await
                 }
+                crate::sealed::owner::SensitiveFrameKind::Control => {
+                    if literal.is_some() {
+                        return Err(bad_request(
+                            "a reset or promote apply must not carry a literal".to_string(),
+                        ));
+                    }
+                    crate::sealed::owner::SensitiveOwnerFrame::for_control(&stored.capability)
+                        .apply(owner, &directory, now_ms)
+                        .await
+                }
             };
             // The capability is spent whether the operation succeeded or failed
             // (the compare-and-swap fired inside `apply`), so drop the table
@@ -8399,6 +8409,11 @@ async fn handle_serialized_request_impl(
             let outcome = outcome.map_err(|error| bad_request(error.to_string()))?;
             match outcome {
                 crate::sealed::owner::SensitiveFrameOutcome::Contained { .. } => {
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: None,
+                    })
+                }
+                crate::sealed::owner::SensitiveFrameOutcome::Reset => {
                     Ok(Response::SealedOwnerOperationApplied {
                         revealed_literal: None,
                     })
@@ -29092,7 +29107,7 @@ fn validate_sealed_begin_shape(
             // key. Presence (possibly empty) is required so the wire is explicit.
             scope_key.context("create begin requires a scope key field")?;
         }
-        "replace" | "rotate" | "recover" => {
+        "replace" | "rotate" | "recover" | "reset" => {
             let record_id = record_id.context("this disposition requires a record id")?;
             crate::sealed::identity::SealedRecordId::parse(record_id)?;
             if name.is_some()
@@ -29100,11 +29115,24 @@ fn validate_sealed_begin_shape(
                 || scope_kind.is_some()
                 || scope_key.is_some()
             {
-                anyhow::bail!("replace/rotate/recover begin must carry only a record id");
+                anyhow::bail!("replace/rotate/recover/reset begin must carry only a record id");
             }
         }
+        "promote" => {
+            let record_id = record_id.context("promote requires a record id")?;
+            crate::sealed::identity::SealedRecordId::parse(record_id)?;
+            if name.is_some() || description.is_some() {
+                anyhow::bail!("promote begin must not carry a name or description");
+            }
+            let scope_kind = scope_kind.context("promote requires a target scope kind")?;
+            let target_kind = parse_sealed_owner_scope_kind(scope_kind)?;
+            if !target_kind.is_persistent_compartment() {
+                anyhow::bail!("promote target scope must be project or global");
+            }
+            scope_key.context("promote requires a target scope key field")?;
+        }
         other => anyhow::bail!(
-            "disposition must be `create`, `replace`, `rotate`, or `recover`, got `{other}`"
+            "disposition must be `create`, `replace`, `rotate`, `reset`, `promote`, or `recover`, got `{other}`"
         ),
     }
     Ok(())
@@ -29212,6 +29240,13 @@ fn build_begin_sensitive_input(
         }),
         "recover" => Ok(BeginSensitiveInput::Recover {
             record_id: SealedRecordId::parse(&record_id.context("recover requires a record id")?)?,
+        }),
+        "reset" => Ok(BeginSensitiveInput::Reset {
+            record_id: SealedRecordId::parse(&record_id.context("reset requires a record id")?)?,
+        }),
+        "promote" => Ok(BeginSensitiveInput::Promote {
+            record_id: SealedRecordId::parse(&record_id.context("promote requires a record id")?)?,
+            target_scope: build_sealed_scope_ref(scope_kind, scope_key)?,
         }),
         other => anyhow::bail!("unknown sealed-owner disposition `{other}`"),
     }

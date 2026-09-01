@@ -103,7 +103,12 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
             tool_categories.as_slice(),
             tool_allowlist.as_slice(),
         ),
-        VerificationRecipe::Inherit => (input.include_linked_files, input.last_n_reads, &[], &[]),
+        VerificationRecipe::Inherit => (
+            input.include_linked_files,
+            input.last_n_reads,
+            &[] as &[VerificationToolCategory],
+            &[] as &[String],
+        ),
     };
     let last_n = if last_n == 0 {
         input.last_n_reads

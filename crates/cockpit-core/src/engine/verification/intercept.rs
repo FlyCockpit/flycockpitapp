@@ -346,7 +346,7 @@ async fn run_verification(
                 include_linked_files,
                 last_n_reads,
                 ..
-            } => (include_linked_files, last_n_reads),
+            } => (*include_linked_files, *last_n_reads),
         };
         let recipe = assemble_recipe(RecipeAssemblyInput {
             recipe: generator_recipe.as_ref(),

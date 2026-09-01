@@ -225,6 +225,54 @@ impl CredentialStore {
         })
     }
 
+    /// Provider-scoped resolution constructor that loads only the public
+    /// credential records the provider config actually references. Reserved
+    /// descriptor/OAuth credential ids are never enumerated or read through
+    /// this path; special providers resolve those through typed loaders.
+    pub fn from_vault_provider_owner_scoped(
+        vault: Arc<SecretVault>,
+        project_root: &str,
+        referenced_names: &BTreeSet<String>,
+        foreign_scope_references: Option<&BTreeSet<String>>,
+        referenced_record_ids: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let VaultSecretContents {
+            secrets: all_secrets,
+            command_specs: all_command_specs,
+        } = load_secret_contents_from_vault(&vault)?;
+        let present: BTreeSet<String> = all_secrets
+            .keys()
+            .chain(all_command_specs.keys())
+            .cloned()
+            .collect();
+        let scoped_names = crate::secret_ownership::scope_named_secret_ownership(
+            vault.db(),
+            crate::secret_ownership::OWNER_KIND_PROVIDER,
+            project_root,
+            &present,
+            referenced_names,
+            foreign_scope_references,
+        )?;
+        let secrets = all_secrets
+            .into_iter()
+            .filter(|(name, _)| scoped_names.contains(name))
+            .collect();
+        let command_specs = all_command_specs
+            .into_iter()
+            .filter(|(name, _)| scoped_names.contains(name))
+            .collect();
+        let records =
+            load_selected_provider_records_from_vault(&vault, project_root, referenced_record_ids)?;
+        Ok(Self {
+            backend: CredentialBackend::Vault(vault),
+            records,
+            secrets,
+            command_specs,
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
+    }
+
     /// Import-only / test fixtures. Production login, refresh, logout, MCP,
     /// provider-header, `ask`, and setup paths must use [`Self::from_vault`]
     /// or [`Self::open_default`].
@@ -277,6 +325,66 @@ impl CredentialStore {
 
     pub fn get(&self, provider_id: &str) -> Option<&Value> {
         self.records.get(provider_id)
+    }
+
+    pub(crate) fn get_owned(&self, provider_id: &str) -> Result<Option<Value>> {
+        if let Some(value) = self.records.get(provider_id) {
+            return Ok(Some(value.clone()));
+        }
+        match &self.backend {
+            CredentialBackend::Vault(vault) => load_record_from_vault(vault, provider_id),
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { path } => Ok(read_credential_file_readonly(path)?
+                .records
+                .remove(provider_id)),
+        }
+    }
+
+    pub(crate) fn get_loaded_owned(&self, provider_id: &str) -> Option<Value> {
+        self.records.get(provider_id).cloned()
+    }
+
+    pub(crate) fn refresh_loaded_record_owned(&self, provider_id: &str) -> Result<Option<Value>> {
+        if !self.records.contains_key(provider_id) {
+            return Ok(None);
+        }
+        match &self.backend {
+            CredentialBackend::Vault(vault) => load_record_from_vault(vault, provider_id),
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { path } => Ok(read_credential_file_readonly(path)?
+                .records
+                .remove(provider_id)),
+        }
+    }
+
+    pub(crate) fn refreshed_loaded_records(&self) -> Result<Self> {
+        let records = match &self.backend {
+            CredentialBackend::Vault(vault) => self
+                .records
+                .keys()
+                .filter_map(|id| {
+                    load_record_from_vault(vault, id)
+                        .transpose()
+                        .map(|result| result.map(|value| (id.clone(), value)))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { path } => {
+                let mut latest = read_credential_file_readonly(path)?.records;
+                self.records
+                    .keys()
+                    .filter_map(|id| latest.remove(id).map(|value| (id.clone(), value)))
+                    .collect()
+            }
+        };
+        Ok(Self {
+            backend: self.backend.clone(),
+            records,
+            secrets: self.secrets.clone(),
+            command_specs: self.command_specs.clone(),
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
     }
 
     /// Convenience for the common API-key case.
@@ -641,9 +749,11 @@ impl CredentialStore {
     pub fn save_record_merged(&self, provider_id: &str, value: Value) -> Result<()> {
         match &self.backend {
             CredentialBackend::Vault(vault) => {
-                let mut latest = Self::from_vault(vault.clone())?;
-                latest.set(provider_id, value);
-                latest.save()
+                let bytes = serde_json::to_vec(&value)
+                    .with_context(|| format!("serializing credential {provider_id}"))?;
+                vault
+                    .put_item(record_kind(provider_id), provider_id, &bytes)
+                    .map_err(|e| anyhow::anyhow!("writing credential vault item: {e}"))
             }
             #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => {
@@ -656,11 +766,9 @@ impl CredentialStore {
 
     pub fn remove_record_merged(&self, provider_id: &str) -> Result<()> {
         match &self.backend {
-            CredentialBackend::Vault(vault) => {
-                let mut latest = Self::from_vault(vault.clone())?;
-                latest.remove(provider_id);
-                latest.save()
-            }
+            CredentialBackend::Vault(vault) => vault
+                .delete_item(record_kind(provider_id), provider_id)
+                .map_err(|e| anyhow::anyhow!("deleting credential vault item: {e}")),
             #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => {
                 let mut latest = Self::open_legacy_file(path.clone())?;
@@ -708,7 +816,25 @@ struct VaultContents {
     command_specs: BTreeMap<String, Vec<String>>,
 }
 
+struct VaultSecretContents {
+    secrets: BTreeMap<String, String>,
+    command_specs: BTreeMap<String, Vec<String>>,
+}
+
 fn load_from_vault(vault: &SecretVault) -> Result<VaultContents> {
+    let records = load_all_records_from_vault(vault)?;
+    let VaultSecretContents {
+        secrets,
+        command_specs,
+    } = load_secret_contents_from_vault(vault)?;
+    Ok(VaultContents {
+        records,
+        secrets,
+        command_specs,
+    })
+}
+
+fn load_all_records_from_vault(vault: &SecretVault) -> Result<BTreeMap<String, Value>> {
     let mut records = BTreeMap::new();
     for kind in [
         SecretVaultKind::CredentialRecord,
@@ -726,6 +852,42 @@ fn load_from_vault(vault: &SecretVault) -> Result<VaultContents> {
             records.insert(id, value);
         }
     }
+    Ok(records)
+}
+
+fn load_record_from_vault(vault: &SecretVault, id: &str) -> Result<Option<Value>> {
+    match vault.get_item(record_kind(id), id) {
+        Ok(secret) => {
+            let value: Value = serde_json::from_slice(secret.as_slice())
+                .with_context(|| format!("parsing vault credential {id}"))?;
+            Ok(Some(value))
+        }
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("reading credential vault item: {error}")),
+    }
+}
+
+fn load_selected_provider_records_from_vault(
+    vault: &SecretVault,
+    project_root: &str,
+    referenced_record_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Value>> {
+    let scoped_records = crate::secret_ownership::scope_credential_records(
+        vault.db(),
+        project_root,
+        referenced_record_ids,
+    )?;
+    let mut records = BTreeMap::new();
+    for id in scoped_records {
+        crate::auth::descriptor::ensure_public_credential_record_id(&id)?;
+        if let Some(value) = load_record_from_vault(vault, &id)? {
+            records.insert(id, value);
+        }
+    }
+    Ok(records)
+}
+
+fn load_secret_contents_from_vault(vault: &SecretVault) -> Result<VaultSecretContents> {
     let mut secrets = BTreeMap::new();
     for id in vault
         .list_item_ids(SecretVaultKind::NamedSecret)
@@ -755,8 +917,7 @@ fn load_from_vault(vault: &SecretVault) -> Result<VaultContents> {
             .with_context(|| format!("parsing command secret {id}"))?;
         command_specs.insert(id, argv);
     }
-    Ok(VaultContents {
-        records,
+    Ok(VaultSecretContents {
         secrets,
         command_specs,
     })

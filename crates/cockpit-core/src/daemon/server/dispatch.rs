@@ -16790,9 +16790,12 @@ async fn handle_serialized_request_impl(
                                 "provider credential logout is only available for OAuth providers",
                             ));
                         }
-                        provider.credential_ref.clone().ok_or_else(|| {
+                        let reference = provider.credential_ref.clone().ok_or_else(|| {
                             bad_request(format!("provider `{provider_id}` has no credential_ref"))
-                        })?
+                        })?;
+                        crate::auth::descriptor::ensure_public_credential_record_id(&reference)
+                            .map_err(|error| bad_request(error.to_string()))?;
+                        reference
                     };
                     let credential_present = match ctx.secret_vault.get_item(
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
@@ -22070,12 +22073,12 @@ async fn provider_models_fetch(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let selected_policy = on_unlisted
@@ -22430,12 +22433,12 @@ async fn provider_usage_snapshot(
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
-    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
-        crate::secret_ownership::OWNER_KIND_PROVIDER,
         &canonical_root,
         &crate::secret_ref::provider_named_secret_references(&config),
         foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
     let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
@@ -23134,7 +23137,15 @@ fn provider_owned_secret_references(
         .flat_map(|header| crate::envref::referenced_names(&header.value))
         .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
         .collect();
-    let credentials = entry.credential_ref.iter().cloned().collect();
+    // A manually authored legacy config must never grant cleanup ownership of
+    // a descriptor token record. Descriptor records are selected exclusively
+    // from `oauth` plus the provider id at their dedicated mutation boundary.
+    let credentials = entry
+        .credential_ref
+        .iter()
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
+        .cloned()
+        .collect();
     (named, credentials)
 }
 
@@ -23197,18 +23208,21 @@ async fn ensure_provider_credential_reference_available(
     ctx: &DaemonContext,
     entry: &crate::config::providers::ProviderEntry,
 ) -> std::result::Result<(), ErrorPayload> {
-    if let Some(reference) = entry.credential_ref.as_deref()
-        && ctx
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)
+            .map_err(|error| bad_request(error.to_string()))?;
+        if ctx
             .secret_vault
             .get_item(
                 cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                 reference,
             )
             .is_err()
-    {
-        return Err(bad_request(format!(
-            "provider credential reference `{reference}` is not present in the daemon vault"
-        )));
+        {
+            return Err(bad_request(format!(
+                "provider credential reference `{reference}` is not present in the daemon vault"
+            )));
+        }
     }
     Ok(())
 }
@@ -23496,6 +23510,9 @@ async fn recover_provider_config_journals_inner(
             delete_owned_named_secret(ctx, &name, "provider", &project_root).await?;
         }
         for reference in credentials {
+            if crate::auth::descriptor::is_credential_record_id(&reference) {
+                continue;
+            }
             let sole_claim =
                 release_credential_ownership(ctx, &reference, &journal.provider_id, &project_root)
                     .await?;
@@ -23525,6 +23542,9 @@ async fn recover_provider_config_journals_inner(
                     .map(|entry| provider_owned_secret_references(entry).1)
                     .unwrap_or_default();
                 for reference in references {
+                    if crate::auth::descriptor::is_credential_record_id(&reference) {
+                        continue;
+                    }
                     if retained_by_same_pair.contains(&reference) {
                         continue;
                     }
@@ -25411,6 +25431,7 @@ fn provider_credential_references_for_root(
         .providers
         .values()
         .filter_map(|provider| provider.credential_ref.clone())
+        .filter(|reference| !crate::auth::descriptor::is_credential_record_id(reference))
         .collect())
 }
 

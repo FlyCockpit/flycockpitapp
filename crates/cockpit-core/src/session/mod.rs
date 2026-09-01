@@ -1515,18 +1515,18 @@ impl Session {
         &self,
         providers: &crate::config::providers::ProvidersConfig,
     ) -> anyhow::Result<crate::credentials::CredentialStore> {
-        let mut store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+        let canonical_root =
+            crate::secret_ownership::canonical_owner_root(&self.project_root.display().to_string());
+        let mut store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
             self.secret_vault.clone(),
-            crate::secret_ownership::OWNER_KIND_PROVIDER,
-            &crate::secret_ownership::canonical_owner_root(
-                &self.project_root.display().to_string(),
-            ),
+            &canonical_root,
             &crate::secret_ref::provider_named_secret_references(providers),
             // The session boundary has no cross-config scan, so sole-ownership of
             // an unclaimed legacy name is unprovable here: never lazily claim
             // (fail closed on unclaimed). The daemon's provider settings paths
             // establish ownership with a scan; already-owned names still resolve.
             None,
+            &crate::secret_ref::provider_credential_record_references(providers),
         )?;
         // Inject resolved command outputs from the daemon cache. The store is
         // owner-scoped, so only (provider, this-workspace)-owned command names

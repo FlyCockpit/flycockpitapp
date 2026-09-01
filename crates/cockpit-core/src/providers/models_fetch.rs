@@ -648,6 +648,9 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    if let Some(reference) = entry.credential_ref.as_deref() {
+        crate::auth::descriptor::ensure_public_credential_record_id(reference)?;
+    }
     if matches!(
         entry.auth,
         Some(crate::config::providers::AuthKind::Command)
@@ -3383,6 +3386,46 @@ mod tests {
         assert!(
             !crate::credentials::default_path().unwrap().exists(),
             "models_fetch must read named secrets from the vault"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_request_rejects_legacy_reserved_ref_without_loading_reserved_victim() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let victim = crate::auth::descriptor::credential_record_id("victim");
+        vault
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &victim,
+                b"{not-json-reserved-victim",
+            )
+            .unwrap();
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://example.test/v1".into(),
+            auth: Some(crate::config::providers::AuthKind::OAuth),
+            credential_ref: Some(victim.clone()),
+            ..crate::config::providers::ProviderEntry::default()
+        };
+        let providers = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([("attacker".into(), entry.clone())]),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
+            vault,
+            "/ws/test",
+            &crate::secret_ref::provider_named_secret_references(&providers),
+            Some(&std::collections::BTreeSet::new()),
+            &crate::secret_ref::provider_credential_record_references(&providers),
+        )
+        .unwrap();
+
+        let error = resolve_provider_request_async_with_store("attacker", &entry, store, |_| None)
+            .await
+            .expect_err("legacy reserved refs must be rejected at the request boundary");
+        assert!(
+            error.to_string().contains("reserved namespace"),
+            "request must fail on the reserved ref, not while loading an unrelated reserved record: {error:#}"
         );
     }
 

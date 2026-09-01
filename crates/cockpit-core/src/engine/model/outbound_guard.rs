@@ -30,7 +30,7 @@ impl OutboundGuard {
         &self,
         store: &crate::credentials::CredentialStore,
     ) -> anyhow::Result<Self> {
-        let store = store.reopen()?;
+        let store = store.refreshed_loaded_records()?;
         let mut redact = (*self.redact).clone();
         for (origin, value) in store.provider_auth_command_entries() {
             redact = redact.with_forced_literal(value, origin)?;

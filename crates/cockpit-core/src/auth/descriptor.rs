@@ -46,6 +46,14 @@ pub(crate) fn is_credential_record_id(record_id: &str) -> bool {
     record_id.starts_with(CREDENTIAL_RECORD_PREFIX)
 }
 
+pub(crate) fn ensure_public_credential_record_id(record_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_credential_record_id(record_id),
+        "provider credential reference `{record_id}` uses a reserved namespace"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredCredential {
     configuration_identity: String,
@@ -353,10 +361,9 @@ pub(crate) async fn resolve(
     validate_descriptor(descriptor, descriptor.flow)?;
     let identity = configuration_identity(descriptor)?;
     let refresh_key = format!("oauth:{provider_id}");
-    let credential_record_id = credential_record_id(provider_id);
+    let descriptor_record_id = credential_record_id(provider_id);
     crate::auth::refresh_guard::serialized_refresh(&refresh_key, || async move {
-        let current = store.reopen()?;
-        let cached = load_cached(&current, provider_id, &identity)?
+        let cached = load_cached(&store, provider_id, &identity)?
             .with_context(|| format!("provider `{provider_id}` requires OAuth login"))?;
         let another_waiter_refreshed = force_refresh
             && rejected_refresh_generation
@@ -393,11 +400,13 @@ pub(crate) async fn resolve(
                 // changed this record before our re-open, never during this
                 // decision.  Still compare the token: a non-descriptor owner
                 // may have replaced the record externally.
-                let latest = store.reopen()?;
-                if load_cached(&latest, provider_id, &identity)?.is_some_and(|latest| {
-                    latest.token.get("refresh_token").and_then(Value::as_str) == Some(refresh_token)
-                }) {
-                    latest.remove_record_merged(&credential_record_id)?;
+                if load_cached_record(&store, &descriptor_record_id, &identity)?.is_some_and(
+                    |latest| {
+                        latest.token.get("refresh_token").and_then(Value::as_str)
+                            == Some(refresh_token)
+                    },
+                ) {
+                    store.remove_record_merged(&descriptor_record_id)?;
                 }
             }
             return Err(error);
@@ -416,8 +425,8 @@ pub(crate) async fn resolve(
             expires_at: token_expiry(&merged),
             token: merged,
         };
-        current.save_record_merged(
-            &credential_record_id,
+        store.save_record_merged(
+            &descriptor_record_id,
             serde_json::json!({ "oauth": refreshed }),
         )?;
         render_credential(descriptor, refreshed)
@@ -435,7 +444,6 @@ async fn persist_initial(
     let lock_provider_id = provider_id.clone();
     let descriptor = descriptor.clone();
     serialized_credential_mutation(&lock_provider_id, move || async move {
-        let store = store.reopen()?;
         let record = initial_record(&provider_id, &descriptor, &store, token)?;
         store.save_record_merged(&credential_record_id(&provider_id), record)
     })
@@ -486,13 +494,20 @@ fn load_cached(
     provider_id: &str,
     identity: &str,
 ) -> Result<Option<StoredCredential>> {
+    load_cached_record(store, &credential_record_id(provider_id), identity)
+}
+
+fn load_cached_record(
+    store: &CredentialStore,
+    record_id: &str,
+    identity: &str,
+) -> Result<Option<StoredCredential>> {
     store
-        .get(&credential_record_id(provider_id))
-        .and_then(|record| record.get("oauth"))
-        .cloned()
+        .get_owned(record_id)?
+        .and_then(|record| record.get("oauth").cloned())
         .map(serde_json::from_value::<StoredCredential>)
         .transpose()
-        .context("stored OAuth credential is malformed")
+        .with_context(|| format!("stored OAuth credential `{record_id}` is malformed"))
         .map(|cached| cached.filter(|cached| cached.configuration_identity == identity))
 }
 
@@ -1118,6 +1133,86 @@ mod tests {
         assert_eq!(
             store.reopen().unwrap().api_key("custom").as_deref(),
             Some("unrelated-api-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_store_resolves_descriptor_request_without_reading_other_reserved_records()
+     {
+        let descriptor = descriptor("https://example.test", OAuthFlowKind::DeviceCode);
+        let entry = ProviderEntry {
+            url: "https://api.example.test/v1".to_string(),
+            oauth: Some(descriptor.clone()),
+            ..ProviderEntry::default()
+        };
+        let providers = cockpit_config::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([("custom".to_string(), entry.clone())]),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = crate::session::Session::create_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+
+        let valid_record_id = credential_record_id("custom");
+        let victim_record_id = credential_record_id("victim");
+        let full_store = session.credential_store().unwrap();
+        full_store
+            .save_record_merged(
+                &valid_record_id,
+                serde_json::json!({
+                    "oauth": StoredCredential {
+                        configuration_identity: configuration_identity(&descriptor).unwrap(),
+                        refresh_generation: 7,
+                        expires_at: Some(i64::MAX),
+                        token: serde_json::from_value(serde_json::json!({
+                            "access_token": "descriptor-access",
+                            "account_id": "acct-7"
+                        }))
+                        .unwrap(),
+                    }
+                }),
+            )
+            .unwrap();
+        session
+            .secret_vault()
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &victim_record_id,
+                b"{not-json-reserved-victim",
+            )
+            .unwrap();
+
+        let store = session.provider_credential_store(&providers).unwrap();
+        assert!(store.get_loaded_owned(&valid_record_id).is_none());
+        assert!(store.get_loaded_owned(&victim_record_id).is_none());
+
+        let resolved = crate::providers::models_fetch::resolve_provider_request_async_with_store(
+            "custom",
+            &entry,
+            store,
+            |_| None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resolved
+                .headers
+                .iter()
+                .any(|header| header.name == "Authorization"
+                    && header.value == "Bearer descriptor-access")
+        );
+        assert!(
+            resolved
+                .headers
+                .iter()
+                .any(|header| header.name == "X-Account" && header.value == "acct-7")
         );
     }
 

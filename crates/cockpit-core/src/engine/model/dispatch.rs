@@ -1469,7 +1469,7 @@ impl Model {
         endpoint_recovery_enabled: bool,
         // Optional per-attempt egress table override. The interactive turn
         // derives this by applying `with_sealed_replacements` to the model's own
-        // effective table when (and only when) an untrusted, interactive request
+        // effective table when an interactive request
         // with a callable `use_sealed_value` holds a live exact sealed grant, so
         // a sealed literal renders the actionable marker instead of the generic
         // placeholder. `None` uses the model's own effective table (the default
@@ -1501,20 +1501,16 @@ impl Model {
         let system = redact.scrub(stable_prefix);
         let mut history = history;
         let mut prompt = prompt.clone();
-        // Trusted raw custody sends raw bytes and skips the wire walk entirely.
-        // Every untrusted route runs the fail-closed walk even when the table
-        // has no entries (the string scrub is a byte-stable no-op; the walk
-        // still fails closed on any non-renderable media channel), so
-        // `redact.is_empty()` can never skip the untrusted policy.
-        if !self.is_trusted() {
-            history = history
-                .iter()
-                .map(|m| scrub_message(redact, m))
-                .collect::<std::result::Result<Vec<Message>, _>>()
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            prompt = scrub_message(redact, &prompt)
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-        }
+        // Every completion route runs the fail-closed wire walk, even when the
+        // table has no entries. Trust is capture/write capability, never a
+        // literal-read bypass.
+        history = history
+            .iter()
+            .map(|m| scrub_message(redact, m))
+            .collect::<std::result::Result<Vec<Message>, _>>()
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        prompt = scrub_message(redact, &prompt)
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         let identity_records =
             if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
                 match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
@@ -1609,24 +1605,19 @@ impl Model {
         };
         // Scrub identically to `complete_captured` so the pre-dispatch
         // `pending` record and the terminal captured record describe
-        // byte-identical requests (GOALS §7). A trusted raw-custody route keeps
-        // the raw history; an untrusted route runs the fail-closed wire walk
-        // and propagates a non-renderable channel as a typed prep failure.
+        // byte-identical requests (GOALS §7). Every route runs the fail-closed
+        // wire walk and propagates a non-renderable channel as a typed prep
+        // failure.
         let redact = self.redact();
         let history = self.prepare_history_for_request(history);
         let system = redact.scrub(system);
-        let (mut history, mut prompt): (Vec<Message>, Message) = if self.is_trusted() {
-            (history, prompt.clone())
-        } else {
-            let scrubbed_history = history
-                .iter()
-                .map(|m| scrub_message(redact, m))
-                .collect::<std::result::Result<Vec<Message>, _>>()
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            let scrubbed_prompt = scrub_message(redact, prompt)
-                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
-            (scrubbed_history, scrubbed_prompt)
-        };
+        let mut history = history
+            .iter()
+            .map(|m| scrub_message(redact, m))
+            .collect::<std::result::Result<Vec<Message>, _>>()
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        let mut prompt = scrub_message(redact, prompt)
+            .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         let identity_metadata = if self.needs_responses_tool_identity_normalization(false) {
             match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
                 Ok(records) if !records.is_empty() => Some((
@@ -1720,22 +1711,18 @@ impl Model {
         let stripped_raw = self.prepare_history_for_request(history);
         let system_scrubbed = redact.scrub(system);
         let system = system_scrubbed.as_str();
-        // Trusted tandem keeps raw custody; an untrusted tandem runs the
-        // fail-closed wire walk. A non-renderable channel is recorded as an
-        // errored tandem outcome rather than passed unscrubbed to the wire.
+        // Tandem always runs the fail-closed wire walk. A non-renderable
+        // channel is recorded as an errored tandem outcome rather than passed
+        // unscrubbed to the wire.
         let scrub_result: std::result::Result<(Vec<Message>, Message), UnrenderableWireField> =
-            if self.is_trusted() {
-                Ok((stripped_raw, prompt.clone()))
-            } else {
-                (|| {
-                    let history = stripped_raw
-                        .iter()
-                        .map(|m| scrub_message(redact, m))
-                        .collect::<std::result::Result<Vec<Message>, _>>()?;
-                    let prompt = scrub_message(redact, prompt)?;
-                    Ok((history, prompt))
-                })()
-            };
+            (|| {
+                let history = stripped_raw
+                    .iter()
+                    .map(|m| scrub_message(redact, m))
+                    .collect::<std::result::Result<Vec<Message>, _>>()?;
+                let prompt = scrub_message(redact, prompt)?;
+                Ok((history, prompt))
+            })();
         let (stripped, prompt_scrubbed) = match scrub_result {
             Ok(pair) => pair,
             Err(field) => {
@@ -2195,7 +2182,7 @@ fn redacted_json_debug(value: &serde_json::Value) -> String {
 }
 
 impl std::fmt::Debug for TandemOutcome {
-    /// `request` / `response` (and `usage`) are the raw trusted tandem bodies;
+    /// `request` / `response` (and `usage`) are still treated as sensitive;
     /// never print them verbatim. Show each field's structural descriptor plus
     /// the (non-body) terminal status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

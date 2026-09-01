@@ -74,20 +74,15 @@ impl ResolvedDreamModel {
     }
 }
 
-/// Match the existing transcript/search model-trust boundary for the source
-/// descriptions delivered by `knowledge_dream_sources`.
+/// Source descriptions delivered by `knowledge_dream_sources` are always read
+/// as a reference-only model caller.
 pub(crate) fn history_caller_trust(
-    model: &ResolvedDreamModel,
-    providers: &ProvidersConfig,
+    _model: &ResolvedDreamModel,
+    _providers: &ProvidersConfig,
 ) -> HistoryCallerTrust {
-    if providers
-        .resolve_trust(&model.provider, &model.model)
-        .is_trusted()
-    {
-        HistoryCallerTrust::Trusted
-    } else {
-        HistoryCallerTrust::Untrusted
-    }
+    // History can contain sealed values from older sessions. Trust is capture
+    // capability, not permission to read those literals into a model prompt.
+    HistoryCallerTrust::Untrusted
 }
 
 pub fn resolve_dream_model(

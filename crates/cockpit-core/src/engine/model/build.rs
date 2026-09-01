@@ -59,11 +59,9 @@ impl Model {
             .providers
             .get(&active.provider)
             .with_context(|| format!("provider `{}` is not configured", active.provider))?;
-        // AC4: the active-model path is a potentially sensitive caller, so it
-        // declares custody through the typed request API rather than reading a
-        // trust flag. The route it gets back either carries a
-        // `TrustedCustodyGrant` for this exact target or it does not, and only
-        // a grant releases raw provider bytes.
+        // Route through the typed policy API before constructing the model.
+        // The route supplies an enforced egress table for every trust level;
+        // trust itself remains model metadata for capture/write policy.
         let custody_route =
             Self::configured_custody_route(cfg, &active.provider, &active.model, &redact).map_err(
                 |error| {
@@ -74,7 +72,9 @@ impl Model {
                     )
                 },
             )?;
-        let trusted = custody_route.trusted_custody_grant().is_some();
+        let trusted = cfg
+            .resolve_trust(&active.provider, &active.model)
+            .is_trusted();
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
         let hard_timeout_on_stall = true;
@@ -251,15 +251,13 @@ impl Model {
             .providers
             .get(provider_id)
             .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        // AC4, same boundary as [`Self::from_config_with_env`]: a utility /
-        // background target is still a potentially sensitive caller, so its
-        // custody is routed through the typed API instead of read off a trust
-        // flag.
+        // Utility/background targets use the same typed route and enforced
+        // egress table as foreground completions.
         let custody_route = Self::configured_custody_route(cfg, provider_id, model_id, &redact)
             .map_err(|error| {
                 anyhow::anyhow!("cannot route custody for `{provider_id}:{model_id}`: {error}")
             })?;
-        let trusted = custody_route.trusted_custody_grant().is_some();
+        let trusted = cfg.resolve_trust(provider_id, model_id).is_trusted();
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
         let hard_timeout_on_stall = true;

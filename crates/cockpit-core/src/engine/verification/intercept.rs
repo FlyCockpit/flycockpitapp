@@ -1441,7 +1441,6 @@ mod tests {
         ToolCtx {
             agent_id: "Build".to_string(),
             allowed_knowledge_bases: None,
-            tool_tier_preferences: std::collections::BTreeMap::new(),
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,

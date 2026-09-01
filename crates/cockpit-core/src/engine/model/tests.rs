@@ -6737,16 +6737,22 @@ async fn native_anthropic_x_api_key_auth_is_unchanged_on_the_wire() {
 }
 
 #[tokio::test]
-async fn custom_anthropic_wire_omits_prompt_caching_and_beta_headers_by_default() {
+async fn custom_anthropic_wire_omits_prompt_caching_and_all_beta_headers_by_default() {
     use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
 
     let mut provider = anthropic_capture_provider().await;
     let entry = ProviderEntry {
         url: provider.base_url(),
-        headers: vec![HeaderSpec {
-            name: "Authorization".to_string(),
-            value: "Bearer gateway-token".to_string(),
-        }],
+        headers: vec![
+            HeaderSpec {
+                name: "Authorization".to_string(),
+                value: "Bearer gateway-token".to_string(),
+            },
+            HeaderSpec {
+                name: "anthropic-beta".to_string(),
+                value: "gateway-configured-beta".to_string(),
+            },
+        ],
         capabilities: ProviderCapabilities {
             max_output_tokens: Some(128),
             ..ProviderCapabilities::default()
@@ -6778,7 +6784,8 @@ async fn custom_anthropic_wire_omits_prompt_caching_and_beta_headers_by_default(
     let request = provider.next_request().await;
     assert_eq!(
         request_header_value(&request.headers, "anthropic-beta"),
-        None
+        None,
+        "the explicit beta gate must also suppress configured beta headers"
     );
     assert!(!request_body_string(&request).contains("cache_control"));
 }

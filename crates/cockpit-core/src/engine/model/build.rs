@@ -610,7 +610,13 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         // Rig owns the x-api-key it builds from above. All other headers,
         // including Bearer Authorization, go through the custom HTTP client,
         // which removes Rig's synthetic x-api-key for the Bearer path.
-        .filter(|h| !h.name.eq_ignore_ascii_case("x-api-key"))
+        // `anthropic-beta` is a native Anthropic extension, so configured
+        // headers must obey the same explicit provider gate as headers Rig
+        // generates for caching and computer-use.
+        .filter(|h| {
+            !h.name.eq_ignore_ascii_case("x-api-key")
+                && (anthropic_features.betas || !h.name.eq_ignore_ascii_case("anthropic-beta"))
+        })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
     let http_client = if uses_bearer_auth {

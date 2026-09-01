@@ -7230,7 +7230,11 @@ async fn handle_serialized_request_impl(
                     && let Some(session_id) = session_id
                     && let Some(handle) = ctx.registry.live_handle(session_id)
                 {
-                    let _ = handle.send_work(SessionWork::Cancel).await;
+                    let _ = handle
+                        .send_work(SessionWork::Cancel {
+                            origin: crate::daemon::session_worker::CancelOrigin::Noninteractive,
+                        })
+                        .await;
                 }
                 Ok(Response::RunInvocationCancelResult { result })
             } else {
@@ -10407,7 +10411,13 @@ async fn handle_serialized_request_impl(
                         return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                     crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => {}
                 }
-                if let Err(error) = att.handle.send_work(SessionWork::Cancel).await {
+                if let Err(error) = att
+                    .handle
+                    .send_work(SessionWork::Cancel {
+                        origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                    })
+                    .await
+                {
                     let unknown = serde_json::to_vec(&serde_json::json!({"outcome":"unknown"}))
                         .map_err(internal)?;
                     ctx.db
@@ -10444,7 +10454,9 @@ async fn handle_serialized_request_impl(
                 }
             }
             att.handle
-                .send_work(SessionWork::Cancel)
+                .send_work(SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::InteractiveTurn,
+                })
                 .await
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
@@ -28178,10 +28190,11 @@ pub(super) async fn attach(
     let db = ctx.db.clone();
     let extended_cfg_for_attach = extended_cfg.clone();
     let active_subagent_for_attach = foreground.active_subagent.clone();
-    let (mut history, paused_work, replay_max_seq): (
+    let (mut history, paused_work, replay_max_seq, removed_user_message_seqs): (
         Vec<proto::HistoryEntry>,
         Vec<proto::PausedWorkSummary>,
         Option<i64>,
+        Vec<i64>,
     ) = db
         .read(move |conn| {
             let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
@@ -28189,10 +28202,24 @@ pub(super) async fn attach(
                 session_id,
                 &extended_cfg_for_attach,
             );
-            let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
+            let (history, replay_max_seq, removed_user_message_seqs) = if let Some(since_seq) = since_seq {
                 let replay_rows =
                     crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
-                let replay_max_seq = replay_rows.into_iter().map(|row| row.seq).max();
+                let replay_max_seq = replay_rows.iter().map(|row| row.seq).max();
+                // A retraction deletes its user row, so normal transcript
+                // projection has nothing to render for it. Preserve the
+                // tombstone's target identity as a narrow replay operation:
+                // clients remove only this proven-stale row and never infer
+                // deletion from an entry merely being absent from a snapshot.
+                let removed_user_message_seqs = replay_rows
+                    .iter()
+                    .filter(|row| row.kind == "user_message_retracted")
+                    .filter_map(|row| {
+                        row.data
+                            .get("retracted_seq")
+                            .and_then(serde_json::Value::as_i64)
+                    })
+                    .collect();
                 let history =
                     crate::engine::rehydrate::history_snapshot_since_with_active_subagent_conn(
                         conn,
@@ -28201,7 +28228,7 @@ pub(super) async fn attach(
                         active_subagent_for_attach.as_ref(),
                         since_seq,
                     )?;
-                (history, replay_max_seq)
+                (history, replay_max_seq, removed_user_message_seqs)
             } else {
                 let history = crate::engine::rehydrate::history_snapshot_with_active_subagent_conn(
                     conn,
@@ -28213,13 +28240,18 @@ pub(super) async fn attach(
                     tracing::warn!(error = %e, %session_id, "building attach history snapshot failed; sending empty history");
                     Vec::new()
                 });
-                (history, None)
+                (history, None, Vec::new())
             };
             let paused_work = crate::db::Db::paused_session_work_conn(conn, session_id)?
                 .into_iter()
                 .map(paused_work_to_proto)
                 .collect();
-            Ok((history, paused_work, replay_max_seq))
+            Ok((
+                history,
+                paused_work,
+                replay_max_seq,
+                removed_user_message_seqs,
+            ))
         })
         .await
         .map_err(internal)?;
@@ -28251,7 +28283,7 @@ pub(super) async fn attach(
         history
     };
     if let Some(max_seq) = replay_max_seq {
-        if !history.is_empty() {
+        if !history.is_empty() || !removed_user_message_seqs.is_empty() {
             let max_seq = history
                 .iter()
                 .map(history_entry_seq)
@@ -28260,6 +28292,7 @@ pub(super) async fn attach(
             state.pending_replay.push(proto::Event::HistoryReplay {
                 session_id,
                 entries: history,
+                removed_user_message_seqs,
                 max_seq,
             });
         }

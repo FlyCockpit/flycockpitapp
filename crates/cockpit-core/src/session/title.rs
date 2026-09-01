@@ -18,6 +18,7 @@ impl Session {
             title_nudge_slot_pending: self.title_nudge_slot_pending.load(Ordering::Relaxed),
             title_recovery_nudge_state: row.title_recovery_nudge_state,
             title_failure_noticed: self.title_failure_noticed.load(Ordering::Relaxed),
+            last_time_prelude: self.last_time_prelude.lock().unwrap().clone(),
         })
     }
 
@@ -28,6 +29,11 @@ impl Session {
         snapshot: TitleProgressSnapshot,
         generated_title: Option<&str>,
     ) -> Result<()> {
+        // This stamp is in-memory-only, so it has no title-row compare-and-
+        // set to contend with. The durable user row has already been removed
+        // before this rollback is called; restore the consumed prelude even if
+        // a concurrent manual title update wins the separate title rollback.
+        *self.last_time_prelude.lock().unwrap() = snapshot.last_time_prelude.clone();
         let session_id = self.id;
         let prior_title = snapshot.title.clone();
         let generated_title = generated_title.map(str::to_owned);
@@ -607,6 +613,30 @@ mod metadata_tests {
             crate::db::sessions::TitleRecoveryNudgeState::None
         );
         assert!(session.claim_title_failure_notice());
+    }
+
+    #[tokio::test]
+    async fn retract_restores_consumed_time_prelude_stamp() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-time"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        assert!(session.take_time_prelude(5).is_some());
+        assert!(session.take_time_prelude(5).is_none());
+
+        session
+            .restore_title_progress_after_retract(snapshot, None)
+            .await
+            .unwrap();
+
+        assert!(
+            session.take_time_prelude(5).is_some(),
+            "the retract rollback restores the pre-send time-prelude state"
+        );
     }
 
     #[test]

@@ -2767,6 +2767,10 @@ const historyReplayDataSchema = z
   .object({
     session_id: uuidSchema,
     entries: z.array(historyEntryWireSchema),
+    // Target rows removed by durable user-message retraction tombstones. This
+    // lets reconnecting clients delete only proven-stale rows without ever
+    // receiving the removed user text.
+    removed_user_message_seqs: z.array(safeI64NumberSchema).optional(),
     max_seq: safeI64NumberSchema,
   })
   .passthrough();
@@ -2852,6 +2856,9 @@ const userMessageRemovedDataSchema = z
   .object({
     session_id: uuidSchema,
     seq: safeI64NumberSchema,
+    // Opaque client submission ids identify who may restore its private draft;
+    // the removed user text is never sent in this broadcast.
+    client_submission_ids: z.array(uuidSchema),
   })
   .passthrough();
 export const userMessageTerminalDispositionSchema = z.enum([

@@ -4171,12 +4171,19 @@ fn apply_attached_payload(
                 proto::Event::HistoryReplay {
                     session_id: ctx.session_id,
                     entries: history,
+                    removed_user_message_seqs: Vec::new(),
                     max_seq,
                 },
                 ctx,
             );
         } else {
-            push_incoming_turn_event(ctx, TurnEvent::HistoryReplay { entries: history });
+            push_incoming_turn_event(
+                ctx,
+                TurnEvent::HistoryReplay {
+                    entries: history,
+                    removed_user_message_seqs: Vec::new(),
+                },
+            );
         }
     }
     active_model_state
@@ -4193,7 +4200,10 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
     let event_session_id = event_session(&event);
 
     if let proto::Event::HistoryReplay {
-        entries, max_seq, ..
+        entries,
+        removed_user_message_seqs,
+        max_seq,
+        ..
     } = event
     {
         let last = current_last_applied_seq(ctx.last_applied_seq);
@@ -4211,7 +4221,7 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
                 None => last.is_none(),
             })
             .collect();
-        if entries.is_empty() {
+        if entries.is_empty() && removed_user_message_seqs.is_empty() {
             return;
         }
         let applied_max_seq = entries
@@ -4220,7 +4230,13 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
             .max()
             .unwrap_or(max_seq);
         update_last_applied_seq(ctx.last_applied_seq, applied_max_seq);
-        push_incoming_turn_event(ctx, TurnEvent::HistoryReplay { entries });
+        push_incoming_turn_event(
+            ctx,
+            TurnEvent::HistoryReplay {
+                entries,
+                removed_user_message_seqs,
+            },
+        );
         return;
     }
 
@@ -4315,7 +4331,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             model,
             url,
         },
-        HistoryReplay { entries, .. } => TurnEvent::HistoryReplay { entries },
+        HistoryReplay {
+            entries,
+            removed_user_message_seqs,
+            ..
+        } => TurnEvent::HistoryReplay {
+            entries,
+            removed_user_message_seqs,
+        },
         InferenceWarning {
             agent,
             provider,
@@ -4433,7 +4456,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             client_submission_ids,
             preflight_cleaned,
         },
-        UserMessageRemoved { seq, .. } => TurnEvent::UserMessageRemoved { seq },
+        UserMessageRemoved {
+            seq,
+            client_submission_ids,
+            ..
+        } => TurnEvent::UserMessageRemoved {
+            seq,
+            client_submission_ids,
+        },
         QueuedUserMessagesFolded {
             text,
             display_text,
@@ -6647,7 +6677,7 @@ mod tests {
         let drained = drained_event_payloads(&events);
         assert!(matches!(
             drained.as_slice(),
-            [TurnEvent::HistoryReplay { entries }, TurnEvent::DaemonLinkResynced { active_model_state: None }]
+            [TurnEvent::HistoryReplay { entries, .. }, TurnEvent::DaemonLinkResynced { active_model_state: None }]
                 if matches!(entries.as_slice(), [proto::HistoryEntry::Assistant { text, seq: 5, .. }] if text == "replayed")
         ));
     }
@@ -7070,12 +7100,16 @@ mod tests {
         let event = proto::Event::UserMessageRemoved {
             session_id,
             seq: 17,
+            client_submission_ids: Vec::new(),
         };
         assert_eq!(event_session(&event), Some(session_id));
         assert_eq!(event_persisted_seq(&event), None);
         assert!(matches!(
             proto_event_to_turn_event(event),
-            Some(TurnEvent::UserMessageRemoved { seq: 17 })
+            Some(TurnEvent::UserMessageRemoved {
+                seq: 17,
+                client_submission_ids,
+            }) if client_submission_ids.is_empty()
         ));
     }
 
@@ -7406,6 +7440,7 @@ mod tests {
             proto::Event::HistoryReplay {
                 session_id: sid,
                 max_seq: 7,
+                removed_user_message_seqs: Vec::new(),
                 entries: vec![
                     proto::HistoryEntry::ToolCall {
                         seq: 6,

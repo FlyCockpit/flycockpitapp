@@ -772,7 +772,7 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
 /// inference and signals any foreground `bash` subprocess to die. Adopted
 /// subprocesses live in the session registry and are cancelled alongside this
 /// handle by the worker. Idempotent and safe at idle — when no run is in flight
-/// the slot is `None` and [`Self::cancel`] is a no-op.
+/// the slot is `None` and [`Self::cancel_turn`] is a no-op.
 #[derive(Clone)]
 pub struct CancelHandle {
     current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
@@ -782,13 +782,24 @@ pub struct CancelHandle {
 }
 
 impl CancelHandle {
-    /// Cancel the in-flight run, if any. Safe to call when idle (no-op),
-    /// when already cancelling (cancelling a cancelled token is a no-op),
-    /// and concurrently from multiple callers.
-    pub fn cancel(&self) {
+    /// Cancel the in-flight run for an interactive `CancelTurn`, if any.
+    /// Safe to call when idle (no-op), when already cancelling (cancelling a
+    /// cancelled token is a no-op), and concurrently from multiple callers.
+    ///
+    /// This is intentionally distinct from a lifecycle, deadline, or
+    /// `CancelAllSessionWork` cancellation: only an explicit user turn cancel
+    /// can retract the just-recorded message.
+    pub fn cancel_turn(&self) {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             self.user_requested
                 .store(true, std::sync::atomic::Ordering::Release);
+            token.cancel();
+        }
+    }
+
+    /// Cancel the in-flight run without attributing it to `CancelTurn`.
+    pub fn cancel_noninteractive(&self) {
+        if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             token.cancel();
         }
     }
@@ -4372,7 +4383,7 @@ impl Driver {
     /// A handle the session worker keeps so a user ctrl+c
     /// (`SessionWork::Cancel`) can abort the in-flight user-message run.
     /// Cheap to clone — it shares the driver's `cancel_current` slot. See
-    /// [`CancelHandle::cancel`].
+    /// [`CancelHandle::cancel_turn`].
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
             current: self.cancel_current.clone(),
@@ -11841,7 +11852,7 @@ impl Driver {
             None
         };
         // Install a fresh cancellation token for this run so a user ctrl+c
-        // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
+        // (`SessionWork::Cancel` → `CancelHandle::cancel_turn`) can abort the
         // in-flight inference and kill any running `bash` subprocess. The
         // guard clears the slot on every exit path (normal, cancel, error)
         // so a stale token can never affect a later run.
@@ -13185,6 +13196,10 @@ impl Driver {
                         let _ = tx
                             .send(TurnEvent::UserMessageRemoved {
                                 seq,
+                                client_submission_ids: client_submissions
+                                    .iter()
+                                    .map(|receipt| receipt.id)
+                                    .collect(),
                             })
                             .await;
                     }

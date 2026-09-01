@@ -1184,6 +1184,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::UserMessageRemoved {
             session_id: _,
             seq: _,
+            client_submission_ids: _,
         } => {},
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
@@ -1395,6 +1396,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::HistoryReplay {
             session_id: _,
             entries,
+            removed_user_message_seqs: _,
             max_seq: _,
         } => scrub_history_entries(entries, redact),
         proto::Event::PrimarySwapped {

@@ -1378,6 +1378,8 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "model_switch" => ModelSwitch,
         "hook_run" => HookRun,
         "agent_tree" => AgentTree,
+        "thread_anchor" => ThreadAnchor,
+        "user_message_retracted" => UserMessageRetracted,
         _ => bail!("unsupported import event type `{raw}`"),
     };
     Ok(kind)
@@ -1390,6 +1392,18 @@ mod tests {
     use super::*;
     use rusqlite::OptionalExtension;
     use zip::write::{SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn import_parser_accepts_every_closed_durable_event_kind() {
+        for kind in SessionEventKind::ALL {
+            assert_eq!(
+                parse_event_kind(kind.as_str().to_owned()).unwrap(),
+                kind,
+                "import must support exported durable kind {}",
+                kind.as_str()
+            );
+        }
+    }
 
     #[test]
     fn queued_fcm2_limit_matches_protocol_and_shared_fixture() {

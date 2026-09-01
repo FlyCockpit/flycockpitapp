@@ -1764,8 +1764,8 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
         proto::Event::UserMessageRecorded { seq, .. } => {
             json!({ "event": "user_message_recorded", "session_id": session_id, "seq": seq })
         }
-        proto::Event::UserMessageRemoved { seq, text, .. } => {
-            json!({ "event": "user_message_removed", "session_id": session_id, "seq": seq, "text": text })
+        proto::Event::UserMessageRemoved { seq, .. } => {
+            json!({ "event": "user_message_removed", "session_id": session_id, "seq": seq })
         }
         proto::Event::ToolStart {
             agent,

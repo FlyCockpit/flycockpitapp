@@ -229,9 +229,9 @@ pub enum TitleAction {
     Explicit,
 }
 
-/// Exact auto-title accounting captured before one retractable user turn.
+/// Exact per-turn accounting captured before one retractable user turn.
 /// Restoring it makes a cancelled/re-sent message consume the same title slot
-/// as a single send.
+/// and time-prelude state as a single send.
 pub(crate) struct TitleProgressSnapshot {
     title: Option<String>,
     user_renamed: bool,
@@ -241,6 +241,10 @@ pub(crate) struct TitleProgressSnapshot {
     title_nudge_slot_pending: u8,
     title_recovery_nudge_state: crate::db::sessions::TitleRecoveryNudgeState,
     title_failure_noticed: bool,
+    /// `with_time_prelude` consumes this stamp while assembling the first
+    /// provider request. A successful user-message retract must put it back
+    /// so the resend produces the same request/cache prefix.
+    last_time_prelude: Option<DateTime<Utc>>,
 }
 
 /// Work due for the cache-reusing, same-model metadata fork. The title slots

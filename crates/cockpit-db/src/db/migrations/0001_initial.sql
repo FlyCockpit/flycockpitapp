@@ -2783,15 +2783,15 @@ CREATE INDEX packages_source_url ON packages(source_url);
 --     an export of a hung/failed turn still contains the attempt.
 --
 --   * session_events — a per-session event timeline. `seq` is a globally
---     monotonic INTEGER rowid — the authoritative sort
+--     monotonic INTEGER (AUTOINCREMENT rowid) — the authoritative sort
 --     and correlation key across the whole fork tree. `ts_ms` is
 --     millisecond resolution. The `type` discriminant aligns with the
 --     engine `TurnEvent` vocabulary; per-type fields ride in `data_json`
 --     so the schema stays stable as the event set grows.
 --     Rows are append-only except for the atomic cancel-before-response
---     retraction of the latest user_message. The tail rowid is deliberately
---     reusable after that retraction so cancellation + resend is identical to
---     one accepted send.
+--     retraction of the latest user_message. Retraction appends a durable
+--     tombstone after deleting the message; AUTOINCREMENT remains mandatory
+--     so global replay and org-sync cursors can never observe a reused id.
 
 -- One row per DISPATCHED TARGET ATTEMPT of a logical inference call. The
 -- primary attempt is ordinal 0; each backup/failover attempt shares the logical
@@ -2826,7 +2826,7 @@ CREATE INDEX idx_ireq_goal_provenance
     ON inference_requests (goal_id, goal_attempt_generation);
 
 CREATE TABLE session_events (
-    seq         INTEGER PRIMARY KEY, -- globally monotonic except a retract tail
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- globally monotonic order
     session_id  TEXT    NOT NULL,
     ts_ms       INTEGER NOT NULL,                  -- epoch milliseconds
     type        TEXT    NOT NULL CHECK (type IN (
@@ -2839,7 +2839,7 @@ CREATE TABLE session_events (
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
         'model_switch', 'hook_run', 'tool_call_scheduling', 'agent_tree',
-        'thread_anchor'
+        'thread_anchor', 'user_message_retracted'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

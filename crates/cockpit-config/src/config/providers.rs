@@ -1092,6 +1092,17 @@ impl OAuthDescriptor {
         {
             return Err("OAuth headers must contain non-empty name/value mappings");
         }
+        let mut normalized_header_names = std::collections::BTreeSet::new();
+        for header in &self.headers {
+            if reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(&header.value).is_err()
+            {
+                return Err("OAuth headers must contain valid HTTP header mappings");
+            }
+            if !normalized_header_names.insert(header.name.to_ascii_lowercase()) {
+                return Err("OAuth headers must not contain duplicate names");
+            }
+        }
         Ok(())
     }
 }

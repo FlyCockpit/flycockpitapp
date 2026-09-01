@@ -159,7 +159,7 @@ pub async fn begin_device_code_login(descriptor: &OAuthDescriptor) -> Result<Dev
         interval_secs: parsed
             .interval
             .unwrap_or(DEFAULT_DEVICE_INTERVAL_SECS)
-            .max(MIN_DEVICE_INTERVAL_SECS),
+            .clamp(MIN_DEVICE_INTERVAL_SECS, MAX_DEVICE_POLL_SECS),
         expires_in_secs: parsed.expires_in.unwrap_or(MAX_DEVICE_POLL_SECS),
         configuration_identity: configuration_identity(descriptor)?,
     })
@@ -182,13 +182,39 @@ pub(crate) async fn complete_device_code_login_unpersisted(
     descriptor: &OAuthDescriptor,
     login: &DeviceCodeLogin,
 ) -> Result<Map<String, Value>> {
+    complete_device_code_login_unpersisted_for(
+        descriptor,
+        login,
+        Duration::from_secs(login.expires_in_secs.min(MAX_DEVICE_POLL_SECS)),
+        None,
+    )
+    .await
+}
+
+/// Poll a descriptor device-code flow for no longer than `maximum_wait`.
+///
+/// The daemon passes the remaining lifetime of its durable OAuth flow here so
+/// a client-side response timeout cannot leave provider polling alive beyond
+/// that flow's advertised completion deadline.
+pub(crate) async fn complete_device_code_login_unpersisted_for(
+    descriptor: &OAuthDescriptor,
+    login: &DeviceCodeLogin,
+    maximum_wait: Duration,
+    cancellation_fence: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Map<String, Value>> {
     validate_descriptor(descriptor, OAuthFlowKind::DeviceCode)?;
     validate_login_identity(descriptor, &login.configuration_identity)?;
     let deadline = std::time::Instant::now()
-        + Duration::from_secs(login.expires_in_secs.min(MAX_DEVICE_POLL_SECS));
+        + maximum_wait.min(Duration::from_secs(
+            login.expires_in_secs.min(MAX_DEVICE_POLL_SECS),
+        ));
     let mut interval = login.interval_secs;
     loop {
-        if std::time::Instant::now() >= deadline {
+        if cancellation_fence.is_some_and(|fence| fence.load(std::sync::atomic::Ordering::SeqCst)) {
+            anyhow::bail!("OAuth device-code login was cancelled");
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             anyhow::bail!("OAuth device-code login timed out; try again");
         }
         let response = token_post(
@@ -202,7 +228,16 @@ pub(crate) async fn complete_device_code_login_unpersisted(
         .await?;
         let status = response.status();
         let body = bounded_response_body(response).await?;
+        if cancellation_fence.is_some_and(|fence| fence.load(std::sync::atomic::Ordering::SeqCst)) {
+            anyhow::bail!("OAuth device-code login was cancelled");
+        }
         if status.is_success() {
+            anyhow::ensure!(
+                !deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .is_zero(),
+                "OAuth device-code login timed out; try again"
+            );
             return parse_token_response(&body);
         }
         let error = oauth_error_code(&body);
@@ -211,7 +246,14 @@ pub(crate) async fn complete_device_code_login_unpersisted(
             Some("slow_down") => interval = interval.saturating_add(5).min(30),
             _ => return Err(token_endpoint_error(status, &body)),
         }
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("OAuth device-code login timed out; try again");
+        }
+        if cancellation_fence.is_some_and(|fence| fence.load(std::sync::atomic::Ordering::SeqCst)) {
+            anyhow::bail!("OAuth device-code login was cancelled");
+        }
+        tokio::time::sleep(Duration::from_secs(interval).min(remaining)).await;
     }
 }
 
@@ -437,10 +479,24 @@ fn render_credential(
     descriptor: &OAuthDescriptor,
     cached: StoredCredential,
 ) -> Result<DescriptorCredential> {
+    let headers = render_headers(descriptor, &cached.token)?;
+    Ok(DescriptorCredential {
+        headers,
+        refresh_generation: cached.refresh_generation,
+    })
+}
+
+/// Render and validate the full HTTP projection before a token document can
+/// become durable. Token-response fields are untrusted endpoint data, so
+/// placeholder expansion alone is not sufficient validation.
+fn render_headers(
+    descriptor: &OAuthDescriptor,
+    token: &Map<String, Value>,
+) -> Result<BTreeMap<String, String>> {
     let mut headers = BTreeMap::new();
     let mut normalized_names = std::collections::BTreeSet::new();
     for mapping in &descriptor.headers {
-        let value = render_template(&mapping.value, &cached.token)?;
+        let value = render_template(&mapping.value, token)?;
         anyhow::ensure!(
             reqwest::header::HeaderName::from_bytes(mapping.name.as_bytes()).is_ok()
                 && reqwest::header::HeaderValue::from_str(&value).is_ok(),
@@ -452,17 +508,11 @@ fn render_credential(
         );
         headers.insert(mapping.name.clone(), value);
     }
-    Ok(DescriptorCredential {
-        headers,
-        refresh_generation: cached.refresh_generation,
-    })
+    Ok(headers)
 }
 
 fn validate_token_mapping(descriptor: &OAuthDescriptor, token: &Map<String, Value>) -> Result<()> {
-    for header in &descriptor.headers {
-        render_template(&header.value, token)?;
-    }
-    Ok(())
+    render_headers(descriptor, token).map(|_| ())
 }
 
 fn render_template(template: &str, token: &Map<String, Value>) -> Result<String> {
@@ -911,6 +961,61 @@ mod tests {
         );
         assert!(store.reopen().unwrap().get("custom").is_none());
         assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rendered_invalid_header_fails_closed_before_initial_persistence() {
+        let descriptor = descriptor("https://example.test", OAuthFlowKind::DeviceCode);
+        let (_temp, store) = store();
+        let error = persist_initial(
+            "custom",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({
+                "access_token": "valid\r\ninjected: value",
+                "account_id": "account"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid header"));
+        assert!(store.reopen().unwrap().get("custom").is_none());
+    }
+
+    #[tokio::test]
+    async fn rendered_invalid_header_does_not_replace_working_credential_on_refresh() {
+        let (base, server) = response_server(vec![
+            r#"{"access_token":"fresh\r\ninjected: value","expires_in":3600}"#,
+        ])
+        .await;
+        let descriptor = descriptor(&base, OAuthFlowKind::DeviceCode);
+        let (_temp, store) = store();
+        persist_initial(
+            "custom",
+            &descriptor,
+            store.clone(),
+            serde_json::from_value(serde_json::json!({
+                "access_token": "working-access",
+                "refresh_token": "refresh",
+                "expires_in": 0,
+                "account_id": "account"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = resolve("custom", &descriptor, store.clone(), false, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid header"));
+        let stored = store.reopen().unwrap().get("custom").cloned().unwrap();
+        assert_eq!(
+            stored["oauth"]["token"]["access_token"],
+            serde_json::json!("working-access")
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

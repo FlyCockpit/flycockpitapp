@@ -925,6 +925,7 @@ enum DurableOAuthFlow {
         completion_request_hash: [u8; 32],
         completion_fencing_generation: i64,
         claimed_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
     },
     Mcp {
         owner: String,
@@ -1020,9 +1021,9 @@ fn durable_oauth_expired(flow: &DurableOAuthFlow, now_unix_ms: i64) -> bool {
             expires_at_unix_ms, ..
         } => now_unix_ms >= *expires_at_unix_ms,
         DurableOAuthFlow::ProviderExchanging {
-            claimed_at_unix_ms, ..
-        }
-        | DurableOAuthFlow::McpExchanging {
+            expires_at_unix_ms, ..
+        } => now_unix_ms >= *expires_at_unix_ms,
+        DurableOAuthFlow::McpExchanging {
             claimed_at_unix_ms, ..
         } => now_unix_ms >= oauth_expiry_ms(*claimed_at_unix_ms),
         DurableOAuthFlow::ProviderCommitted {
@@ -2101,9 +2102,21 @@ impl OAuthFlowStore {
         }
     }
 
+    fn trip_provider_cancellation(flow: &ProviderOAuthFlow) {
+        if let ProviderOAuthFlow::Completing { cancelled } = flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn purge_provider(flows: &mut std::collections::HashMap<String, StoredProviderOAuthFlow>) {
         let now = Instant::now();
-        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+        flows.retain(|_, flow| {
+            let keep = now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL;
+            if !keep {
+                Self::trip_provider_cancellation(&flow.flow);
+            }
+            keep
+        });
     }
 
     fn trip_mcp_cancellation(flow: &McpOAuthFlow) {
@@ -2141,7 +2154,9 @@ impl OAuthFlowStore {
             .min_by_key(|(_, flow)| flow.created_at)
             .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
     }
 
@@ -2180,7 +2195,9 @@ impl OAuthFlowStore {
                 .min_by_key(|(_, flow)| flow.created_at)
                 .map(|(id, _)| id.clone())
         {
-            flows.remove(&id);
+            if let Some(evicted) = flows.remove(&id) {
+                Self::trip_provider_cancellation(&evicted.flow);
+            }
         }
         flows.insert(
             id,
@@ -15084,18 +15101,22 @@ async fn handle_serialized_request_impl(
                     }
                     return Ok(terminal_response.as_ref().clone());
                 }
-                let durable_begin_client_operation_id = match &durable_flow {
-                    Some(DurableOAuthFlow::Provider {
-                        owner: durable_owner,
-                        begin_client_operation_id,
-                        ..
-                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
-                    _ => {
-                        return Err(bad_request(
-                            "provider OAuth flow is unknown or belongs to another owner",
-                        ));
-                    }
-                };
+                let (durable_begin_client_operation_id, durable_expires_at_unix_ms) =
+                    match &durable_flow {
+                        Some(DurableOAuthFlow::Provider {
+                            owner: durable_owner,
+                            begin_client_operation_id,
+                            expires_at_unix_ms,
+                            ..
+                        }) if durable_owner == &owner => {
+                            (begin_client_operation_id.clone(), *expires_at_unix_ms)
+                        }
+                        _ => {
+                            return Err(bad_request(
+                                "provider OAuth flow is unknown or belongs to another owner",
+                            ));
+                        }
+                    };
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
                 // lookup instead of issuing another token set. Restore only when
@@ -15156,6 +15177,7 @@ async fn handle_serialized_request_impl(
                         completion_request_hash: request_hash,
                         completion_fencing_generation: fencing_generation,
                         claimed_at_unix_ms: oauth_wall_ms(),
+                        expires_at_unix_ms: durable_expires_at_unix_ms,
                     },
                 )
                 .await?;
@@ -15227,9 +15249,17 @@ async fn handle_serialized_request_impl(
                                         "device-code OAuth does not accept callback input",
                                     ));
                                 }
-                                crate::auth::descriptor::complete_device_code_login_unpersisted(
+                                let remaining = Duration::from_millis(
+                                    u64::try_from(
+                                        durable_expires_at_unix_ms.saturating_sub(oauth_wall_ms()),
+                                    )
+                                    .unwrap_or(0),
+                                );
+                                crate::auth::descriptor::complete_device_code_login_unpersisted_for(
                                     &descriptor,
                                     &login,
+                                    remaining,
+                                    Some(cancellation_fence.as_ref()),
                                 )
                                 .await
                                 .map_err(internal)?
@@ -15286,6 +15316,11 @@ async fn handle_serialized_request_impl(
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));
                 }
+                if oauth_wall_ms() >= durable_expires_at_unix_ms {
+                    return Err(conflict(
+                        "the OAuth flow expired before token persistence; start a new login",
+                    ));
+                }
                 let terminal_response = Response::ProviderOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
@@ -15314,6 +15349,9 @@ async fn handle_serialized_request_impl(
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        if chrono::Utc::now().timestamp_millis() >= durable_expires_at_unix_ms {
+                            anyhow::bail!("provider OAuth flow expired before token persistence");
+                        }
                         let marker = vault
                             .get_item_on_conn(
                                 conn,
@@ -15330,12 +15368,14 @@ async fn handle_serialized_request_impl(
                                 completion_client_operation_id: marker_operation,
                                 completion_request_hash: marker_hash,
                                 completion_fencing_generation: marker_fence,
+                                expires_at_unix_ms: marker_expiry,
                                 ..
                             } if marker_owner == receipt_owner
                                 && marker_provider == provider_id_owned
                                 && marker_operation == receipt_operation_id
                                 && marker_hash == request_hash
                                 && marker_fence == fencing_generation
+                                && marker_expiry == durable_expires_at_unix_ms
                         );
                         if !owns_exact_exchange {
                             anyhow::bail!(
@@ -16723,15 +16763,21 @@ async fn handle_serialized_request_impl(
                     let provider = config.providers.get(&provider_id).ok_or_else(|| {
                         bad_request(format!("provider `{provider_id}` is not configured"))
                     })?;
-                    if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
-                        return Err(bad_request(
-                            "provider credential logout is only available for OAuth providers",
-                        ));
-                    }
-                    let credential_record_id =
+                    // Declarative OAuth owns the credential record under the
+                    // configured provider id. Legacy OAuth uses an explicit
+                    // credential reference, so preserve that separate path.
+                    let credential_record_id = if provider.oauth.is_some() {
+                        provider_id.clone()
+                    } else {
+                        if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                            return Err(bad_request(
+                                "provider credential logout is only available for OAuth providers",
+                            ));
+                        }
                         provider.credential_ref.clone().ok_or_else(|| {
                             bad_request(format!("provider `{provider_id}` has no credential_ref"))
-                        })?;
+                        })?
+                    };
                     let credential_present = match ctx.secret_vault.get_item(
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                         &credential_record_id,

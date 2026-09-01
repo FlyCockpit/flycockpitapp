@@ -1719,7 +1719,7 @@ pub fn provider_entry_from_answers(
     headers: Vec<crate::config::providers::HeaderSpec>,
 ) -> Option<crate::config::providers::ProviderEntry> {
     let template = selected_provider_template(run)?;
-    let wire_api = provider_wire_api_answer(run).unwrap_or(template.default_wire_api);
+    let wire_api = provider_wire_api_for_template(run, template);
     provider_entry_for_template_with_wire_api(
         template,
         provider_url_answer(run)?,
@@ -1729,11 +1729,27 @@ pub fn provider_entry_from_answers(
     .into()
 }
 
-pub fn provider_wire_api_answer(run: &WizardRun) -> Option<crate::config::providers::WireApi> {
+fn provider_wire_api_answer(run: &WizardRun) -> Option<crate::config::providers::WireApi> {
     let WizardAnswer::Select(value) = run.answer(ProviderWizardStep::WireApi.source_id())? else {
         return None;
     };
     provider_wire_api_from_id(value)
+}
+
+/// Resolve the wire for a template from this run's answers.
+///
+/// A wire-picker answer is authoritative only for templates that expose that
+/// picker. `WizardRun::back` deliberately retains answers, so an answer from a
+/// previously selected custom template must not override a pinned template.
+pub fn provider_wire_api_for_template(
+    run: &WizardRun,
+    template: &crate::providers::ProviderTemplate,
+) -> crate::config::providers::WireApi {
+    if provider_template_exposes_wire_api_picker(template) {
+        provider_wire_api_answer(run).unwrap_or(template.default_wire_api)
+    } else {
+        template.default_wire_api
+    }
 }
 
 pub fn provider_entry_for_template(
@@ -1979,13 +1995,17 @@ fn provider_auth_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static st
 
 fn provider_template_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     let template = selected_provider_template(run)?;
-    Some(
-        if template.id == "openai-compatible" || template.default_wire_api.is_auto() {
-            ProviderWizardStep::WireApi.source_id()
-        } else {
-            ProviderWizardStep::ProviderId.source_id()
-        },
-    )
+    Some(if provider_template_exposes_wire_api_picker(template) {
+        ProviderWizardStep::WireApi.source_id()
+    } else {
+        ProviderWizardStep::ProviderId.source_id()
+    })
+}
+
+fn provider_template_exposes_wire_api_picker(
+    template: &crate::providers::ProviderTemplate,
+) -> bool {
+    template.id == "openai-compatible" || template.default_wire_api.is_auto()
 }
 
 fn provider_wire_api_from_id(value: &str) -> Option<crate::config::providers::WireApi> {
@@ -2458,6 +2478,38 @@ mod tests {
             "https://api.anthropic.com/v1".to_string(),
         ))
         .unwrap();
+        assert_eq!(
+            provider_entry_from_answers(&run, Vec::new())
+                .expect("Anthropic provider entry")
+                .wire_api,
+            WireApi::Anthropic
+        );
+    }
+
+    #[test]
+    fn pinned_provider_template_ignores_retained_custom_wire_answer_after_backtracking() {
+        use crate::config::providers::WireApi;
+
+        let mut run = WizardRun::new(provider_descriptor()).unwrap();
+        run.submit(WizardAnswer::Select("openai-compatible".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("responses".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("id"));
+        assert!(run.back());
+        assert!(run.back());
+        assert_eq!(run.current_step_id(), Some("template"));
+
+        run.submit(WizardAnswer::Select("anthropic".to_string()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("id"));
+        run.submit(WizardAnswer::Text("anthropic".to_string()))
+            .unwrap();
+        run.submit(WizardAnswer::Text(
+            "https://api.anthropic.com/v1".to_string(),
+        ))
+        .unwrap();
+
         assert_eq!(
             provider_entry_from_answers(&run, Vec::new())
                 .expect("Anthropic provider entry")

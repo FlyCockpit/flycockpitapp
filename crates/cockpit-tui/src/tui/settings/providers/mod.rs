@@ -1038,8 +1038,7 @@ fn provider_entry_from_add(
     template: &'static ProviderTemplate,
     headers: Vec<HeaderSpec>,
 ) -> ProviderEntry {
-    let wire_api =
-        cockpit_core::wizard::provider_wire_api_answer(&s.run).unwrap_or(template.default_wire_api);
+    let wire_api = cockpit_core::wizard::provider_wire_api_for_template(&s.run, template);
     cockpit_core::wizard::provider_entry_for_template_with_wire_api(
         template,
         s.url_field.text().trim_end_matches('/').to_string(),

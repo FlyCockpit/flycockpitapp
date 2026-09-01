@@ -272,7 +272,7 @@ fn stamp_builtin_posture(def: &mut AgentDef, name: &str) {
 
 /// Bundled definitions are authored by the binary, not by an editable
 /// frontmatter file. Their historic tool arrays remain host-owned factory
-/// inputs, while their ejected form is the closed v2 contract below.
+/// inputs, while their ejected form is the closed launch-v1 contract below.
 fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
     let execution_kind = if matches!(name, "Computer" | "computer") {
         ExecutionKind::Computer

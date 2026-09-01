@@ -1810,7 +1810,7 @@ impl AgentsPage {
             Ok(def) if def.vnext.is_none() => def,
             Ok(_) => {
                 self.status = Some(format!(
-                    "structured tool editing is unavailable for `{name}`: schemaVersion 2 tool authority is host-owned"
+                    "structured tool editing is unavailable for `{name}`: schemaVersion 1 tool authority is host-owned"
                 ));
                 return;
             }
@@ -3595,7 +3595,7 @@ impl SettingsCx {
         };
         if def.vnext.is_some() {
             p.status = Some(format!(
-                "structured tool editing is unavailable for `{name}`: schemaVersion 2 tool authority is host-owned; edit only declarative definition fields in the raw editor"
+                "structured tool editing is unavailable for `{name}`: schemaVersion 1 tool authority is host-owned; edit only declarative definition fields in the raw editor"
             ));
             return;
         }
@@ -4918,7 +4918,7 @@ pub(super) mod tests {
 
     fn vnext_workspace_agent(name: &str, description: &str, body: &str) -> String {
         format!(
-            "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+            "---\ndescription: {description}\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
         )
     }
 
@@ -4957,12 +4957,12 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(
             with.model, None,
-            "v2 model advice is not a binding selector"
+            "launch-v1 model advice is not a binding selector"
         );
         let without = page(&d).rows.iter().find(|r| r.name == "no-model").unwrap();
         assert_eq!(
             without.model, None,
-            "v2 definitions defer model selection to the host"
+            "launch-v1 definitions defer model selection to the host"
         );
     }
 
@@ -4997,8 +4997,8 @@ pub(super) mod tests {
         let path = agents_dir.join("mine.md");
         fs::write(&path, "---\ndescription: mine\ntools: [read]\n---\nbody\n").unwrap();
         let err = cockpit_core::agents::load_workspace_named_from_file(&path, "mine")
-            .expect_err("v2 rejects manifest tool authority");
-        assert!(format!("{err}").contains("schemaVersion: 2"));
+            .expect_err("launch-v1 rejects manifest tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 1"));
     }
 
     #[test]
@@ -5015,8 +5015,8 @@ pub(super) mod tests {
             &agents_dir.join("mine.md"),
             "mine",
         )
-        .expect_err("v2 rejects manifest tool authority");
-        assert!(format!("{err}").contains("schemaVersion: 2"));
+        .expect_err("launch-v1 rejects manifest tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 1"));
     }
 
     #[test]
@@ -5028,8 +5028,8 @@ pub(super) mod tests {
         let original = "---\ndescription: mine\nmode: subagent\ntools: [read]\n---\nbody\n";
         fs::write(&path, original).unwrap();
         let err = cockpit_core::agents::load_workspace_named_from_file(&path, "mine")
-            .expect_err("v2 rejects legacy fork and tool authority");
-        assert!(format!("{err}").contains("schemaVersion: 2"));
+            .expect_err("launch-v1 rejects legacy fork and tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 1"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
@@ -5387,7 +5387,7 @@ pub(super) mod tests {
         let mut dialog = agents_dialog(&tmp);
         focus(&mut dialog, "pointer-agent");
         // The pointer Edit action opens the in-TUI raw editor directly
-        // (edit_selected_in_tui), bypassing the v2 detail-page guard.
+        // (edit_selected_in_tui), bypassing the launch-v1 detail-page guard.
         let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Edit(row_id(&dialog, "pointer-agent")),
         );
@@ -5924,7 +5924,7 @@ pub(super) mod tests {
             let mut dialog = agents_dialog(&tmp);
             focus(&mut dialog, "pointer-agent");
             // The pointer Edit action opens the in-TUI raw editor directly
-            // (edit_selected_in_tui), bypassing the v2 detail-page guard.
+            // (edit_selected_in_tui), bypassing the launch-v1 detail-page guard.
             let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Edit(row_id(&dialog, "pointer-agent")),
             );
@@ -6089,19 +6089,19 @@ pub(super) mod tests {
                 super::super::pointer_actions::AgentsAction::Open(agent.clone()),
             );
             click_agent_action(&mut dialog, &action);
-            // All agents are schemaVersion 2; the structured tool editor is
+            // All agents are schemaVersion 1; the structured tool editor is
             // intentionally unavailable. Open still reaches the reducer and
             // sets the status message instead of opening the detail.
             assert!(
                 page(&dialog).detail.is_none(),
-                "v2 Open does not open the structured editor for {agent:?}"
+                "launch-v1 Open does not open the structured editor for {agent:?}"
             );
             assert!(
                 page(&dialog)
                     .status
                     .as_ref()
                     .is_some_and(|s| s.contains("unavailable")),
-                "v2 Open sets the unavailable status for {agent:?}"
+                "launch-v1 Open sets the unavailable status for {agent:?}"
             );
         }
 
@@ -6198,9 +6198,9 @@ pub(super) mod tests {
 
         // The structured tool surface editor (ToggleTool / CycleTier /
         // Save / OpenRawEditor) is intentionally unavailable for
-        // schemaVersion 2 agents: tool authority is host-owned.  These
+        // schemaVersion 1 agents: tool authority is host-owned.  These
         // pointer interactions were exercised when the detail page opened
-        // for v1 agents; v2 agents redirect to the raw editor instead.
+        // for v1 agents; launch-v1 agents redirect to the raw editor instead.
     }
 
     #[test]

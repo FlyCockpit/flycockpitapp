@@ -350,9 +350,9 @@ pub struct AgentDef {
     /// `standard`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_policy: Option<ContextPolicy>,
-    /// Parsed v2 declarative contract.  v2 never projects into the legacy
+    /// Parsed launch-v1 declarative contract.  launch-v1 never projects into the legacy
     /// runtime fields: a host must calculate and snapshot an
-    /// [`EffectiveVnextGrant`] before a v2 definition can receive any
+    /// [`EffectiveVnextGrant`] before a launch-v1 definition can receive any
     /// capability at all.
     #[serde(skip)]
     pub vnext: Option<VnextAgentDef>,
@@ -487,7 +487,7 @@ pub fn apply_tool_surface_override(
     def: &mut AgentDef,
     selection: &ToolSurfaceSelection,
 ) -> Result<()> {
-    // Host-owned session overrides remain valid for schemaVersion 2: v2 markdown
+    // Host-owned session overrides remain valid for launch schema v1: markdown
     // may not declare `tools:`, but the daemon/TUI still projects a concrete
     // runtime grant onto the in-memory definition before construction.
     let mut candidate = def.clone();
@@ -516,20 +516,24 @@ pub fn apply_author_tool_tier_preferences(def: &mut AgentDef) -> Result<()> {
         return Ok(());
     };
     let Some(tools) = def.tools.clone() else {
-        // The engine may derive the host grant later. `effective_tool_tier`
-        // still honors the preference while materializing that derived list.
+        // There is no resolved host grant to bound the preference yet.  The
+        // construction path resolves and projects that grant before calling
+        // this function; display-only callers leave the preference inert.
         return Ok(());
     };
     let mut tool_tiers = def.tool_tiers.clone();
-    tool_tiers.extend(
-        preferences
-            .into_iter()
-            .filter(|(tool, _)| tools.iter().any(|granted| granted == tool)),
-    );
+    for (tool, tier) in preferences {
+        if tools.iter().any(|granted| granted == &tool) {
+            // A session projection may already have set this tier.  The
+            // author preference fills the host grant's default placement;
+            // it never overwrites a session-scoped override.
+            tool_tiers.entry(tool).or_insert(tier);
+        }
+    }
     apply_tool_surface_override(def, &ToolSurfaceSelection { tools, tool_tiers })
 }
 
-/// Validate a host-projected tool grant on a v2 definition. v2
+/// Validate a host-projected tool grant on a launch-v1 definition. The
 /// [`validate_invariants`] only checks the closed declarative schema and skips
 /// legacy `tools:` rules, so the host override path applies those grant checks
 /// explicitly against the projected surface.
@@ -543,7 +547,7 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
     };
     // Reuse the same name/role checks a legacy `tools:` grant would see. Keep
     // the definition's existing mode (builtins still carry Primary/Subagent);
-    // workspace v2 documents default to `All`.
+    // workspace launch-v1 documents default to `All`.
     let mut legacy = def.clone();
     legacy.vnext = None;
     legacy.tools = Some(tools.clone());
@@ -1211,7 +1215,7 @@ impl AgentDef {
         let vnext = self
             .vnext
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 2 definition"))?;
+            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 1 definition"))?;
         let mut grant = vnext.resolve_grant(host)?;
         if let Some(delegation) = &mut grant.delegation {
             let mut package_definitions = BTreeMap::new();
@@ -1428,14 +1432,14 @@ fn parse_agent_with_scope(
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Frontmatter {
-        #[serde(rename = "schemaVersion", default)]
-        schema_version: Option<u8>,
-        #[serde(rename = "agentId", default)]
-        agent_id: Option<String>,
-        #[serde(rename = "executionKind", default)]
-        execution_kind: Option<ExecutionKind>,
-        #[serde(rename = "modelSlots", default)]
-        model_slots: Option<BTreeMap<String, ModelSlot>>,
+        #[serde(rename = "schemaVersion")]
+        schema_version: u8,
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        #[serde(rename = "executionKind")]
+        execution_kind: ExecutionKind,
+        #[serde(rename = "modelSlots")]
+        model_slots: BTreeMap<String, ModelSlot>,
         #[serde(default)]
         delegation: Option<DelegationPolicy>,
         #[serde(default)]
@@ -1448,24 +1452,6 @@ fn parse_agent_with_scope(
         tool_tier_preferences: BTreeMap<String, ToolTier>,
         #[serde(default)]
         description: String,
-        #[serde(default)]
-        mode: AgentMode,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        temperature: Option<f32>,
-        #[serde(default)]
-        tools: Option<Vec<String>>,
-        #[serde(rename = "toolTiers", default)]
-        tool_tiers: BTreeMap<String, ToolTier>,
-        #[serde(default, deserialize_with = "deserialize_tool_descriptions")]
-        tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
-        #[serde(rename = "scanToolResults", default)]
-        scan_tool_results: Option<bool>,
-        #[serde(rename = "goalSupervision", default)]
-        goal_supervision: GoalSettingsOverride,
-        #[serde(default)]
-        permission: Option<serde_json::Value>,
         #[serde(default)]
         capabilities: Option<BTreeSet<AgentCapability>>,
         #[serde(rename = "toolSteering", default)]
@@ -1482,52 +1468,37 @@ fn parse_agent_with_scope(
             source.display()
         );
     }
-    // `questions` and `verification` are closed optional objects: omission is
-    // the only spelling for off.  Accepting YAML `null` would create a second,
-    // ambiguous wire representation that profile reduction could accidentally
-    // reinterpret as enabled later.
     let raw_frontmatter: serde_yaml::Value = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
             "agent `{name}` ({}) has invalid frontmatter: {e}",
             source.display()
         )
     })?;
-    let raw_keys = if let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter {
-        if mapping
-            .get(serde_yaml::Value::String("schemaVersion".to_string()))
-            .is_some_and(serde_yaml::Value::is_null)
-        {
-            bail!(
-                "agent `{name}` ({}) must declare schemaVersion: 2; null is not accepted",
-                source.display()
-            );
-        }
-        for key in ["delegation", "questions", "verification"] {
-            if mapping
-                .get(serde_yaml::Value::String(key.to_string()))
-                .is_some_and(serde_yaml::Value::is_null)
-            {
-                bail!(
-                    "agent `{name}` ({}) must omit `{key}` to disable it; null is not accepted",
-                    source.display()
-                );
-            }
-        }
-        mapping
-            .keys()
-            .filter_map(serde_yaml::Value::as_str)
-            .collect::<BTreeSet<_>>()
-    } else {
+    let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter else {
         bail!(
             "agent `{name}` ({}) frontmatter must be a YAML mapping",
             source.display()
         );
     };
-    if !raw_keys.contains("schemaVersion") {
+    if !mapping.contains_key(serde_yaml::Value::String("schemaVersion".to_string())) {
         bail!(
-            "agent `{name}` ({}) must declare schemaVersion: 2; legacy schema-less user AgentDefs are no longer supported",
+            "agent `{name}` ({}) must declare schemaVersion: {SCHEMA_VERSION}",
             source.display()
         );
+    }
+    // These optional objects have one unambiguous off spelling: omission.
+    // Keeping `null` out of the launch schema prevents a later projection
+    // from treating an explicitly supplied null as enabled or inherited.
+    for key in ["delegation", "questions", "verification"] {
+        if mapping
+            .get(serde_yaml::Value::String(key.to_string()))
+            .is_some_and(serde_yaml::Value::is_null)
+        {
+            bail!(
+                "agent `{name}` ({}) must omit `{key}` to disable it; null is not accepted",
+                source.display()
+            );
+        }
     }
     let fm: Frontmatter = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
@@ -1542,95 +1513,43 @@ fn parse_agent_with_scope(
         );
     }
 
-    let vnext = match fm.schema_version {
-        Some(SCHEMA_VERSION) => {
-            // Presence is the wire contract here, not the deserialized
-            // value.  In particular `mode: all`, `forkEligible: false`, and
-            // every `null` legacy spelling must be rejected rather than
-            // silently becoming a v2 default.
-            const LEGACY_V1_KEYS: &[&str] = &[
-                "mode",
-                "model",
-                "temperature",
-                "tools",
-                "toolTiers",
-                "tool_descriptions",
-                "toolDescriptions",
-                "scanToolResults",
-                "goalSupervision",
-                "permission",
-                "forkEligible",
-            ];
-            if let Some(field) = LEGACY_V1_KEYS.iter().find(|key| raw_keys.contains(*key)) {
-                bail!(
-                    "agent `{name}` ({}) is schemaVersion 2 and may not declare legacy field `{field}`",
-                    source.display(),
-                );
-            }
-            let definition = VnextAgentDef {
-                schema_version: SCHEMA_VERSION,
-                agent_id: fm.agent_id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires agentId",
-                        source.display()
-                    )
-                })?,
-                execution_kind: fm.execution_kind.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires executionKind",
-                        source.display()
-                    )
-                })?,
-                model_slots: fm.model_slots.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires modelSlots",
-                        source.display()
-                    )
-                })?,
-                delegation: fm.delegation.unwrap_or_default(),
-                questions: fm.questions,
-                verification: fm.verification,
-                allowed_knowledge_bases: fm.allowed_knowledge_bases,
-                tool_tier_preferences: fm.tool_tier_preferences,
-            };
-            definition.validate_for_scope(scope).map_err(|error| {
-                anyhow::anyhow!(
-                    "agent `{name}` ({}) has invalid schemaVersion 2 definition: {error}",
-                    source.display()
-                )
-            })?;
-            Some(definition)
-        }
-        Some(version) => bail!(
-            "agent `{name}` ({}) has unsupported schemaVersion `{version}`; only 2 is accepted",
-            source.display()
-        ),
-        None => bail!(
-            "agent `{name}` ({}) must declare schemaVersion: 2; legacy schema-less user AgentDefs are no longer supported",
-            source.display()
-        ),
+    let definition = VnextAgentDef {
+        schema_version: fm.schema_version,
+        agent_id: fm.agent_id,
+        execution_kind: fm.execution_kind,
+        model_slots: fm.model_slots,
+        delegation: fm.delegation.unwrap_or_default(),
+        questions: fm.questions,
+        verification: fm.verification,
+        allowed_knowledge_bases: fm.allowed_knowledge_bases,
+        tool_tier_preferences: fm.tool_tier_preferences,
     };
+    definition.validate_for_scope(scope).map_err(|error| {
+        anyhow::anyhow!(
+            "agent `{name}` ({}) has invalid launch-v1 definition: {error}",
+            source.display()
+        )
+    })?;
 
     Ok(AgentDef {
         name: name.to_string(),
         description: fm.description,
-        // `mode` belongs exclusively to the retired schema.  It remains as an
-        // internal field only while embedded legacy definitions exist; a v2
-        // document is classified from `executionKind` at every discovery and
-        // runtime reachability seam, never translated into a legacy mode.
-        mode: fm.mode,
-        model: fm.model,
-        temperature: fm.temperature,
-        tools: fm.tools,
-        tool_tiers: fm.tool_tiers,
-        tool_descriptions: fm.tool_descriptions,
-        scan_tool_results: fm.scan_tool_results,
-        goal_supervision: fm.goal_supervision,
-        permission: fm.permission,
+        // These legacy runtime fields have no authored launch-v1 spelling.
+        // The host projects grants and session overrides onto this in-memory
+        // definition immediately before construction.
+        mode: AgentMode::default(),
+        model: None,
+        temperature: None,
+        tools: None,
+        tool_tiers: BTreeMap::new(),
+        tool_descriptions: BTreeMap::new(),
+        scan_tool_results: None,
+        goal_supervision: GoalSettingsOverride::default(),
+        permission: None,
         capabilities: fm.capabilities,
         tool_steering: fm.tool_steering,
         context_policy: fm.context_policy,
-        vnext,
+        vnext: Some(definition),
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).

@@ -311,7 +311,7 @@ fn private_assistant_agent(
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description.clone(),
-        // These retained in-memory fields are ignored by schemaVersion 2.
+        // These retained in-memory fields are ignored by schemaVersion 1.
         // They cannot be configured from the assistant specification.
         mode: AgentMode::Primary,
         model: None,
@@ -328,7 +328,7 @@ fn private_assistant_agent(
         // Assistant homes are daemon-owned definition locations, so they are
         // the sole constructor allowed to use the local publisher. Tool/model
         // selections from the legacy wizard remain host-side setup inputs and
-        // are intentionally absent from the serialized v2 definition.
+        // are intentionally absent from the serialized launch-v1 definition.
         vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt.clone(),
         prompt_overrides: std::collections::BTreeMap::new(),
@@ -535,7 +535,7 @@ fn validate_primary_assistant_config(row: &AssistantRow, home: &Path) -> Result<
     Ok(config)
 }
 
-/// The sole daemon-owned v2 template for private assistants.  CLI-side
+/// The sole daemon-owned launch-v1 template for private assistants.  CLI-side
 /// creation reuses it so both persistence paths produce the same provenance
 /// and never serialize the retired tool/model/mode contract.
 pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {

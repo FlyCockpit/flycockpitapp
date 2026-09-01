@@ -915,7 +915,7 @@ fn learn_driver(
     // `default_disabled_tools_for` (which disables `skill_manage` for Build
     // and other built-in primaries) does not remove the tool from the
     // rebuilt agent's surface during `refresh_active_tool_surface_for_turn`.
-    // The v2 format does not support `toolTiers` overrides, so the only way
+    // The launch-v1 format does not support `toolTiers` overrides, so the only way
     // to keep `skill_manage` enabled through the rebuild is to use a name
     // not in the disabled-by-default list.  The `cockpit` publisher prefix
     // is reserved for binary-owned definitions, so change the vNext agentId.
@@ -925,7 +925,7 @@ fn learn_driver(
     }
     std::fs::write(
         agents_dir.join("LearnBuild.md"),
-        build_def.to_markdown().expect("v2 bundled override"),
+        build_def.to_markdown().expect("launch-v1 bundled override"),
     )
     .unwrap();
     let mut providers = BTreeMap::new();

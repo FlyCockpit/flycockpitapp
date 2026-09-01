@@ -1,4 +1,4 @@
-//! Closed, declarative v2 agent-definition schema.
+//! Closed, declarative launch-v1 agent-definition schema.
 //!
 //! This module deliberately contains no provider, credential, tool-grant, or
 //! sandbox binding.  Those are host-owned inputs to a later effective-grant
@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::ToolTier;
 
-pub const SCHEMA_VERSION: u8 = 2;
+pub const SCHEMA_VERSION: u8 = 1;
 pub const DEFAULT_MAX_CANDIDATES: u16 = 5;
 pub const MAX_VERIFICATION_CANDIDATES: u16 = 64;
 /// Explicit self-invocation token in `delegation.allowedChildren`. Counted
@@ -873,7 +873,7 @@ impl VnextHostPolicy {
     /// Construct the daemon's session-owned policy snapshot. This is the
     /// single core seam that turns ordinary session configuration into vNext
     /// ceilings; markdown never supplies these values. It intentionally does
-    /// not reuse the legacy per-agent recursion map: v2 tree admission is
+    /// not reuse the legacy per-agent recursion map: launch-v1 tree admission is
     /// governed exclusively by [`EffectiveVnextGrant`].
     pub fn for_session_config(config: &crate::config::extended::ExtendedConfig) -> Self {
         let max_concurrent_children = u16::try_from(config.delegation.max_parallel)
@@ -1083,15 +1083,8 @@ impl VnextAgentDef {
                     tier.label()
                 );
             }
-            if matches!(
-                tool.as_str(),
-                "read_image"
-                    | "inspect_audio"
-                    | "inspect_video"
-                    | "extract_video_clip"
-                    | "extract_audio"
-            ) {
-                bail!("toolTierPreferences may not name direct-native media tool `{tool}`");
+            if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
+                bail!("toolTierPreferences may not name host-placement tool `{tool}`");
             }
         }
         Ok(())
@@ -2766,7 +2759,7 @@ mod tests {
 
     fn valid() -> VnextAgentDef {
         VnextAgentDef {
-            schema_version: 2,
+            schema_version: SCHEMA_VERSION,
             agent_id: "acme/reviewer".to_string(),
             execution_kind: ExecutionKind::Coding,
             model_slots: BTreeMap::from([(

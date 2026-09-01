@@ -30399,7 +30399,7 @@ async fn list_agents_respects_workspace_trust() {
     std::fs::create_dir_all(tmp.path().join(".cockpit").join("agents")).unwrap();
     std::fs::write(
         tmp.path().join(".cockpit").join("agents").join("Custom.md"),
-        "---\ndescription: custom primary\nschemaVersion: 2\nagentId: authored/custom\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nBody\n",
+        "---\ndescription: custom primary\nschemaVersion: 1\nagentId: authored/custom\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nBody\n",
     )
     .unwrap();
     let ctx = test_ctx();

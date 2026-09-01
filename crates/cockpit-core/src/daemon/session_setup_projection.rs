@@ -53,6 +53,14 @@ pub fn enrich_session_setup_snapshot(
         // instead of turning a read-only setup query into an internal error.
         .or_else(|| agents::embedded_default("Build"))
         .ok_or_else(|| anyhow::anyhow!("embedded Build agent is unavailable"))?;
+    if def.vnext.is_some() && def.tools.is_none() {
+        let is_assistant = def.vnext.as_ref().is_some_and(|definition| {
+            definition.execution_kind == agents::ExecutionKind::Assistant
+        });
+        let tools = crate::engine::builtin::resolved_tool_grant(&def, project_root, is_assistant);
+        let tool_tiers = def.tool_tiers.clone();
+        agents::apply_tool_surface_override(&mut def, &ToolSurfaceSelection { tools, tool_tiers })?;
+    }
     agents::apply_author_tool_tier_preferences(&mut def)?;
     if let Some(json) = tool_surface_override_json
         && let Ok(selection) = serde_json::from_str::<ToolSurfaceSelection>(json)

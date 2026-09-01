@@ -1641,7 +1641,7 @@ fn non_direct_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTr
                     && def
                         .tools
                         .as_ref()
-                        .is_none_or(|granted| granted.iter().any(|tool| tool == *name))
+                        .is_some_and(|granted| granted.iter().any(|tool| tool == *name))
             })
             .map(|(name, _tier)| name.clone()),
     );
@@ -1711,29 +1711,34 @@ fn documented_av_tool_tier(def_name: &str, tool: &str) -> Option<crate::agents::
     None
 }
 
+/// Tools whose placement is selected solely by host/runtime policy.  Keep
+/// the media half derived from the canonical authority inventory so a newly
+/// added direct-native media tool cannot become author-placeable by omission.
+pub(crate) fn author_tool_tier_preference_is_reserved(tool: &str) -> bool {
+    crate::tool_media_authority::availability::is_media_tool_name(tool)
+        || matches!(
+            tool,
+            // These documented, adapter-gated image surfaces stay fail-closed
+            // until their host policy explicitly selects a placement.
+            "ask_image"
+                | "list_image_generation_targets"
+                | "generate_image"
+                | "get_image_generation_job"
+                | "cancel_image_generation_job"
+        )
+}
+
 pub(crate) fn effective_tool_tier(
     def: &crate::agents::AgentDef,
     tool: &str,
     is_assistant: bool,
 ) -> crate::agents::ToolTier {
-    // A/V session overrides are disable-only. The author preference is
-    // considered next, then the name-based A/V default.
+    // A/V session overrides are disable-only; their placement is host-owned.
     if let Some(documented) = documented_av_tool_tier(&def.name, tool) {
         if let Some(override_tier) = def.tool_tiers.get(tool) {
             if *override_tier == crate::agents::ToolTier::Disabled {
                 return crate::agents::ToolTier::Disabled;
             }
-        }
-        if def
-            .tools
-            .as_ref()
-            .is_none_or(|granted| granted.iter().any(|name| name == tool))
-            && let Some(tier) = def
-                .vnext
-                .as_ref()
-                .and_then(|definition| definition.tool_tier_preferences.get(tool))
-        {
-            return *tier;
         }
         return documented;
     }
@@ -1743,7 +1748,7 @@ pub(crate) fn effective_tool_tier(
     if def
         .tools
         .as_ref()
-        .is_none_or(|granted| granted.iter().any(|name| name == tool))
+        .is_some_and(|granted| granted.iter().any(|name| name == tool))
         && let Some(tier) = def
             .vnext
             .as_ref()
@@ -2638,12 +2643,31 @@ fn is_primary(name: &str) -> bool {
 /// right tools); a custom agent with no grant gets the read-only
 /// investigator surface.
 pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Agent> {
-    let effective_vnext_grant = effective_vnext_grant_for(def, args)?;
-    let is_assistant = def.vnext.as_ref().map_or(
+    // Resolve the host's name grant before consulting author preferences.
+    // Definitions intentionally omit `tools:`; treating that absence as an
+    // unrestricted grant would let a portable definition arrange tools the
+    // host never supplied.  Keep the resolved grant on this construction
+    // snapshot so every tier consumer, including fixed-name tool families,
+    // sees the same bound.
+    let mut effective_def = def.clone();
+    let is_assistant = effective_def.vnext.as_ref().map_or(
         args.assistant_identity_prefix.is_some()
-            && crate::agents::embedded_default(&def.name).is_none(),
+            && crate::agents::embedded_default(&effective_def.name).is_none(),
         |definition| definition.execution_kind == crate::agents::ExecutionKind::Assistant,
     );
+    if effective_def.vnext.is_some() {
+        if effective_def.tools.is_none() {
+            let tools = resolved_tool_grant(&effective_def, &args.cwd, is_assistant);
+            let tool_tiers = effective_def.tool_tiers.clone();
+            crate::agents::apply_tool_surface_override(
+                &mut effective_def,
+                &crate::agents::ToolSurfaceSelection { tools, tool_tiers },
+            )?;
+        }
+        crate::agents::apply_author_tool_tier_preferences(&mut effective_def)?;
+    }
+    let def = &effective_def;
+    let effective_vnext_grant = effective_vnext_grant_for(def, args)?;
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
         emit_model_override_warning(def, args, &model);
@@ -2709,35 +2733,17 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         );
     let tool_args = &materialization_args;
 
-    // Resolve the tool-name grant: explicit list, else the role default.
-    let grant: Vec<String> = match &def.tools {
-        Some(t) => t.clone(),
-        None if is_assistant => default_assistant_tools(),
-        None => {
-            #[cfg(test)]
-            if let Some(tools) = test_host_tool_surface(&args.cwd, &def.name) {
-                tools
-            } else {
-                crate::agents::embedded_default(&def.name)
-                    .and_then(|d| d.tools)
-                    .unwrap_or_else(default_custom_tools)
-            }
-            #[cfg(not(test))]
-            {
-                crate::agents::embedded_default(&def.name)
-                    .and_then(|d| d.tools)
-                    .unwrap_or_else(default_custom_tools)
-            }
-        }
-    };
+    // The v1 construction snapshot above always carries a concrete host
+    // grant. Legacy in-memory definitions retain their historical fallback.
+    let grant = resolved_tool_grant(def, &args.cwd, is_assistant);
 
     let mut tb = ToolBox::new();
     for name in &grant {
         // `spawn` and `schedule` construct legacy Swarm/ephemeral forks
-        // outside the v2 child-resolution contract.  Until those forks carry
+        // outside the launch-v1 child-resolution contract.  Until those forks carry
         // an effective child grant and its admission permit end-to-end, do not
-        // expose either legacy fork surface to a v2 definition.  `task` is
-        // added below only from the v2 effective delegation grant.
+        // expose either legacy fork surface to a launch-v1 definition.  `task` is
+        // added below only from the launch-v1 effective delegation grant.
         if def.vnext.is_some() && matches!(name.as_str(), "spawn" | "schedule" | "task") {
             continue;
         }
@@ -2944,6 +2950,33 @@ fn effective_vnext_grant_for(
         .map(Some)
 }
 
+/// Resolve the concrete host grant used for this construction.  v1 agent
+/// definitions never author this list; it is either projected by the host or
+/// derived from the host's role defaults.
+pub(crate) fn resolved_tool_grant(
+    def: &crate::agents::AgentDef,
+    cwd: &Path,
+    is_assistant: bool,
+) -> Vec<String> {
+    match &def.tools {
+        Some(tools) => tools.clone(),
+        None if is_assistant => default_assistant_tools(),
+        None => {
+            #[cfg(test)]
+            if let Some(tools) = test_host_tool_surface(cwd, &def.name) {
+                return tools;
+            }
+            crate::agents::embedded_default(&def.name)
+                .and_then(|definition| definition.tools)
+                .unwrap_or_else(default_custom_tools)
+        }
+        #[cfg(not(test))]
+        None => crate::agents::embedded_default(&def.name)
+            .and_then(|definition| definition.tools)
+            .unwrap_or_else(default_custom_tools),
+    }
+}
+
 /// Default tool grant for a custom agent that names no `tools:` — the
 /// read-only investigator surface (`explore`'s grant). Conservative:
 /// never includes write/lock or structural-delegation tools.
@@ -2955,7 +2988,7 @@ fn default_custom_tools() -> Vec<String> {
 }
 
 /// Test-only host tool-surface sidecar (`.cockpit/agents/<name>.tools.json`).
-/// v2 markdown cannot declare `tools:`; concurrent-admission tests that need a
+/// launch-v1 markdown cannot declare `tools:`; concurrent-admission tests that need a
 /// constrained host surface write this sidecar beside the agent document so
 /// admission/build re-reads pick up the projected grant without reviving the
 /// author-facing field.
@@ -5486,6 +5519,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn vnext_preferences_are_bounded_by_the_resolved_host_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def = crate::agents::parse_agent(
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\ntoolTierPreferences:\n  code: discoverable\n  webfetch: discoverable\n---\nbody\n",
+            "reviewer",
+            tmp.path().join("reviewer.md"),
+        )
+        .unwrap();
+
+        let agent = agent_from_def(&def, &test_spawn_args(tmp.path())).unwrap();
+        let projected = agent.definition.expect("pinned definition");
+        assert_eq!(
+            projected.tool_tiers.get("code"),
+            Some(&crate::agents::ToolTier::Discoverable)
+        );
+        assert!(
+            !projected.tool_tiers.contains_key("webfetch"),
+            "an ungranted preference must not alter a config-layer tool"
+        );
+        assert!(
+            !projected
+                .tools
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&"webfetch".to_string()),
+            "the derived custom-agent grant must remain authoritative"
+        );
+    }
+
+    #[test]
     fn legacy_tool_tier_frontmatter_is_refused_before_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let agents_dir = tmp.path().join(".cockpit").join("agents");
@@ -5505,7 +5568,7 @@ pub(crate) mod tests {
             Err(err) => err,
         };
         let msg = format!("{err}");
-        assert!(msg.contains("schemaVersion: 2"), "{msg}");
+        assert!(msg.contains("schemaVersion: 1"), "{msg}");
 
         std::fs::write(
             agents_dir.join("discoverable-child.md"),
@@ -5519,7 +5582,7 @@ pub(crate) mod tests {
             Ok(_) => panic!("schema-less discoverable tier must be rejected"),
             Err(err) => err,
         };
-        assert!(format!("{err}").contains("schemaVersion: 2"));
+        assert!(format!("{err}").contains("schemaVersion: 1"));
     }
 
     #[test]
@@ -5848,7 +5911,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("my-reviewer.md"),
-            "---\ndescription: reviewer\nschemaVersion: 2\nagentId: authored/my-reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: reviewer\nschemaVersion: 1\nagentId: authored/my-reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         let args = test_spawn_args(tmp.path());
@@ -5869,19 +5932,19 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("custom-sub.md"),
-            "---\ndescription: custom\nschemaVersion: 2\nagentId: authored/custom-sub\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-sub\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Perform coding work\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
         )
         .unwrap();
         std::fs::write(
             agents_dir.join("custom-primary.md"),
-            "---\ndescription: custom\nschemaVersion: 2\nagentId: authored/custom-primary\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
+            "---\ndescription: custom\nschemaVersion: 1\nagentId: authored/custom-primary\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nbody\n",
         )
         .unwrap();
         let assistant_home = tmp.path().join("assistant-home");
         std::fs::create_dir_all(&assistant_home).unwrap();
         std::fs::write(
             assistant_home.join("assistant.md"),
-            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\nassistant body\n",
+            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: assistant\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 1\n---\nassistant body\n",
         )
         .unwrap();
         let db = test_assistant_db();
@@ -7341,7 +7404,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let mut def = crate::agents::embedded_default("explore").unwrap();
-        // v2 rejects this spelling at the markdown boundary, but retain the
+        // launch-v1 rejects this spelling at the markdown boundary, but retain the
         // runtime assertion as defense in depth for trusted/internal callers
         // that construct an AgentDef directly.
         def.tools = Some(vec!["task".to_string()]);
@@ -7359,7 +7422,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&shadow_dir).unwrap();
         std::fs::write(
             shadow_dir.join("nested-child.md"),
-            "---\ndescription: workspace shadow\nschemaVersion: 2\nagentId: authored/nested-child\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
+            "---\ndescription: workspace shadow\nschemaVersion: 1\nagentId: authored/nested-child\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Investigate code\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nworkspace shadow",
         )
         .unwrap();
 

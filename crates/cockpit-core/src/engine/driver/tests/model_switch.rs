@@ -2358,7 +2358,7 @@ fn write_custom_agent(root: &std::path::Path, name: &str) {
     std::fs::write(
         agents.join(format!("{name}.md")),
         format!(
-            "---\ndescription: test agent\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test model refresh\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{name} body\n"
+            "---\ndescription: test agent\nschemaVersion: 1\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test model refresh\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{name} body\n"
         ),
     )
     .unwrap();
@@ -2549,7 +2549,7 @@ async fn foreground_definition_is_pinned_while_new_children_see_fresh_definition
         std::fs::create_dir_all(&agents).unwrap();
         let definition = |body: &str| {
             format!(
-                "---\ndescription: pinned builder\nschemaVersion: 2\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+                "---\ndescription: pinned builder\nschemaVersion: 1\nagentId: cockpit/builder\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test definition pinning\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
             )
         };
         let path = agents.join("builder.md");
@@ -2666,6 +2666,72 @@ async fn active_tool_surface_refresh_retains_root_without_pinned_definition() {
             .iter()
             .any(|notice| notice.contains("no pinned definition")),
         "root reconstruction failure must be surfaced: {notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_model_refresh_repostures_prompt_before_tool_surface_rebuild_failure() {
+    use crate::config::providers::ModelTrust;
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (mut providers, provider, model) = driver
+        .test_providers_override
+        .clone()
+        .expect("model switch harness installs provider override");
+    providers
+        .providers
+        .get_mut("provider-a")
+        .expect("provider A exists")
+        .trust = Some(ModelTrust::Trusted);
+    driver.test_providers_override = Some((providers.clone(), provider, model));
+
+    let trusted_model = Arc::new(
+        crate::engine::model::Model::for_provider(
+            &providers,
+            "provider-a",
+            "model-a",
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .expect("trusted model builds"),
+    );
+    let selection = driver.active_selection_for_model(&trusted_model);
+    let prompt_args = driver.rebuild_frame_args(0, trusted_model.clone(), &selection, None);
+    let root = Arc::make_mut(&mut driver.stack[0].agent);
+    root.model = trusted_model;
+    root.system = crate::engine::builtin::compose_system_prompt_for_model(
+        &root.role_prompt,
+        root.model.as_ref(),
+        &prompt_args,
+    );
+    root.definition = None;
+    assert!(!root.system.contains("`report_leak`"));
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver
+        .refresh_active_model_for_turn(
+            0,
+            ConsumedNodeOverride {
+                model: Some(("provider-b".to_string(), "model-b".to_string())),
+            },
+            &tx,
+        )
+        .await;
+    driver
+        .refresh_active_tool_surface_for_turn(0, None, &tx)
+        .await;
+
+    assert!(
+        !driver.stack[0].agent.model.is_trusted(),
+        "the successfully refreshed model remains active after the surface rebuild failure"
+    );
+    assert!(
+        driver.stack[0].agent.system.contains("`report_leak`"),
+        "the untrusted model must retain leak-report steering when its tool surface cannot rebuild"
+    );
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices.iter().any(|notice| notice.contains("tool surface")),
+        "the failed rebuild remains visible: {notices:?}"
     );
 }
 

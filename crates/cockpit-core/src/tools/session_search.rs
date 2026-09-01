@@ -550,20 +550,10 @@ async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -
 }
 
 pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
-    let (Some(provider), Some(model)) = (ctx.session.active_provider(), ctx.session.active_model())
-    else {
-        return HistoryCallerTrust::Untrusted;
-    };
-    if ctx
-        .config
-        .providers()
-        .resolve_trust(&provider, &model)
-        .is_trusted()
-    {
-        HistoryCallerTrust::Trusted
-    } else {
-        HistoryCallerTrust::Untrusted
-    }
+    let _ = ctx;
+    // Session history is model-facing data. It must stay reference-only even
+    // when the active model is trusted for capture.
+    HistoryCallerTrust::Untrusted
 }
 
 /// `last_active_at_unix_ms` → `YYYY-MM-DD HH:MM UTC`, matching

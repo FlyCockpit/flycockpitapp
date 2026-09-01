@@ -109,6 +109,7 @@ fn same_session_replay_replaces_multi_id_optimistic_rows_in_place() {
             client_submission_ids: vec![first_id, second_id],
             origin_principal: None,
         }],
+        removed_user_message_seqs: Vec::new(),
     });
 
     let user_rows = app
@@ -140,6 +141,42 @@ fn same_session_replay_replaces_multi_id_optimistic_rows_in_place() {
         1,
         "optimistic tag rows are replaced by canonical replay metadata"
     );
+}
+
+/// A client can receive the durable record and then disconnect before the
+/// text-free removal broadcast. Reconnect replay carries the tombstone target,
+/// not the user body, so only that stale row is removed and the local owner can
+/// recover its private draft from the row it already rendered.
+#[test]
+fn replayed_retraction_removes_a_stale_recorded_user_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(temp.path()), false);
+    let submission_id = uuid::Uuid::new_v4();
+    app.history.push(HistoryEntry::User {
+        text: "disconnect before removal".to_string(),
+        cleaned: None,
+        expanded: false,
+        timestamp: chrono::Local::now(),
+        seq: None,
+        optimistic_submission_id: Some(submission_id),
+        preflight_pending: false,
+        persist_failed: false,
+    });
+    app.apply_event(TurnEvent::UserMessageRecorded {
+        seq: 44,
+        client_submission_ids: vec![submission_id],
+        preflight_cleaned: None,
+    });
+
+    // The live UserMessageRemoved was missed while disconnected. The replay
+    // contains only the durable tombstone's target seq, never user text.
+    app.apply_event(TurnEvent::HistoryReplay {
+        entries: Vec::new(),
+        removed_user_message_seqs: vec![44],
+    });
+
+    assert!(app.history.is_empty());
+    assert_eq!(app.composer.text(), "disconnect before removal");
 }
 
 /// REGRESSION (implementation note): the wire→TUI

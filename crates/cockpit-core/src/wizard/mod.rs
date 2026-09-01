@@ -568,7 +568,7 @@ pub fn model_descriptor_with_selection(
             StepDescriptor {
                 id: "trust",
                 prompt: "Provider trust (data custody)",
-                help: "Data custody only, independent of locality. untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values. Warning: marking an external provider trusted sends that provider raw secrets and environment values. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
+                help: "Capture policy only, independent of locality. All inference requests use reference-only redaction for sealed values. trusted: may participate in host-mediated secret capture; untrusted: cannot capture secrets. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
                 help_hook: Some(model_trust_help),
                 kind: StepKind::Select {
                     options: vec![
@@ -581,7 +581,7 @@ pub fn model_descriptor_with_selection(
                             id: "trusted".into(),
                             label: "trusted".into(),
                             description:
-                                "Send inference requests raw, including secrets and environment values; meant for self-hosted or no-log endpoints"
+                                "Permit host-mediated secret capture; inference requests remain reference-only"
                                     .into(),
                         },
                     ],
@@ -1776,7 +1776,7 @@ fn model_trust_help(run: &WizardRun) -> Option<String> {
     let provider = model_provider_answer(run)?;
     let trust = *model_context(run)?.provider_trust_defaults.get(&provider)?;
     Some(format!(
-        "provider default: {} · data custody only, independent of locality · untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values · exports and client display stay redacted either way.",
+        "provider default: {} · capture policy only, independent of locality · all inference requests use reference-only redaction for sealed values · trusted: host-mediated capture capable · untrusted: capture disabled · exports and client display stay redacted either way.",
         model_trust_id(trust)
     ))
 }
@@ -1968,9 +1968,8 @@ mod tests {
         }
     }
 
-    /// The model wizard must present data custody as its own decision, warn
-    /// that a trusted external provider receives raw secrets, and never
-    /// suggest that locality implies trust.
+    /// The model wizard must present capture policy as its own decision and
+    /// never suggest that locality implies trust.
     #[test]
     fn model_setup_presents_custody_independently() {
         let descriptor =
@@ -1992,22 +1991,22 @@ mod tests {
         assert!(
             trust
                 .help
-                .contains("Data custody only, independent of locality"),
+                .contains("Capture policy only, independent of locality"),
             "trust help: {}",
             trust.help
         );
         assert!(
             trust
                 .help
-                .contains("may be sent raw, including secrets and environment values"),
+                .contains("All inference requests use reference-only redaction"),
             "trust help: {}",
             trust.help
         );
         assert!(
-            trust.help.contains(
-                "marking an external provider trusted sends that provider raw secrets and environment values"
-            ),
-            "trust help must carry the explicit warning: {}",
+            trust
+                .help
+                .contains("trusted: may participate in host-mediated secret capture"),
+            "trust help must state the capture capability: {}",
             trust.help
         );
         assert!(
@@ -2031,8 +2030,8 @@ mod tests {
             .find(|option| option.id == "trusted")
             .expect("trusted option");
         assert!(
-            trusted.description.contains("raw"),
-            "trusted option must state the custody effect: {}",
+            trusted.description.contains("capture"),
+            "trusted option must state the capture effect: {}",
             trusted.description
         );
         let untrusted = options

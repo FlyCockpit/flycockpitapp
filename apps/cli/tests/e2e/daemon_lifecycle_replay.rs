@@ -238,6 +238,7 @@ async fn wait_for_replay(
                 session_id: got,
                 max_seq,
                 entries,
+                ..
             } if got == session_id => {
                 return (
                     max_seq,

@@ -1,42 +1,41 @@
-//! AC3 `trust_alone_decides_sealed_value_custody`
+//! AC3 `all_models_are_reference_only_for_sealed_values`
 //!
 //! Provider-wire rendering is owned by
 //! `sealed-value-untrusted-inference-marker`. This proves only the foundation's
-//! typed custody predicate: trust is the sole axis, and steering posture never
-//! widens custody (issue #75 removed the mode axis from the request).
+//! typed custody predicate: no policy axis, including trust, widens custody.
 
 use crate::config::providers::ModelTrust;
 use crate::sealed::custody::ALL_MODEL_TRUSTS;
 use crate::sealed::{SealedCustodyRequest, SealedLiteralCustody, sealed_literal_custody};
 
 #[test]
-fn trust_alone_decides_sealed_value_custody() {
-    // ---- the predicate resolves trust independently -----------------------
+fn all_models_are_reference_only_for_sealed_values() {
+    // ---- the predicate resolves every trust class identically -------------
     for trust in ALL_MODEL_TRUSTS {
         let custody = sealed_literal_custody(SealedCustodyRequest::new(trust));
-        let expected = match trust {
-            ModelTrust::Trusted => SealedLiteralCustody::RawLiteralPermitted,
-            ModelTrust::Untrusted => SealedLiteralCustody::ReferenceOnly,
-        };
+        let expected = SealedLiteralCustody::ReferenceOnly;
         assert_eq!(
             custody, expected,
-            "custody for {trust:?} must follow trust alone"
+            "custody for {trust:?} must remain reference-only"
         );
     }
 
-    // ---- a trust-only change always changes the predicate ------------------
+    // ---- a trust-only change never changes literal custody -----------------
     let trusted = sealed_literal_custody(SealedCustodyRequest::new(ModelTrust::Trusted));
     let untrusted = sealed_literal_custody(SealedCustodyRequest::new(ModelTrust::Untrusted));
-    assert_ne!(trusted, untrusted, "trust is the axis that decides custody");
-    assert!(trusted.permits_raw_literal());
+    assert_eq!(
+        trusted, untrusted,
+        "trust never widens sealed-value custody"
+    );
+    assert!(!trusted.permits_raw_literal());
     assert!(untrusted.is_reference_only());
 
-    // ---- the one-directional invariant -------------------------------------
-    // An untrusted caller never receives a raw literal.
+    // ---- the invariant ------------------------------------------------------
+    // No caller receives a raw literal.
     assert!(
-        !sealed_literal_custody(SealedCustodyRequest::new(ModelTrust::Untrusted))
+        !sealed_literal_custody(SealedCustodyRequest::new(ModelTrust::Trusted))
             .permits_raw_literal(),
-        "an untrusted model must never receive a raw literal"
+        "a trusted model must never receive a raw literal"
     );
 
     // Fail-closed default: an unconfigured model is untrusted.
@@ -46,7 +45,7 @@ fn trust_alone_decides_sealed_value_custody() {
         "the default trust posture is reference-only"
     );
 
-    // ---- structural: the resolver reads trust and only trust ---------------
+    // ---- structural: the resolver ignores trust ----------------------------
     let source = include_str!("../custody.rs");
     let body_start = source
         .find("pub fn sealed_literal_custody(")
@@ -55,8 +54,8 @@ fn trust_alone_decides_sealed_value_custody() {
     let body_end = body.find("\n}\n").expect("resolver body terminates");
     let body = &body[..body_end];
     assert!(
-        body.contains("match request.trust"),
-        "custody must be decided by a match on trust"
+        body.contains("let _ = request"),
+        "custody must not consult trust"
     );
     // The request carries only `trust` now; there is no steering field to read.
     assert!(

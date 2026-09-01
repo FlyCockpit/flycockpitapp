@@ -317,8 +317,8 @@ fn extended_write_repairs_product_owned_permissions() {
 
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = tmp.path().join("home/.cockpit");
-    std::fs::create_dir(&config_dir).unwrap();
+    let config_dir = tmp.path().join("home/.config/cockpit");
+    std::fs::create_dir_all(&config_dir).unwrap();
     let path = config_dir.join("config.json");
     std::fs::write(&path, "{}").unwrap();
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();

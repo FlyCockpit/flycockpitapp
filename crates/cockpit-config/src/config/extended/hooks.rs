@@ -980,7 +980,6 @@ mod tests;
 fn origin_kind(kind: &HookSourceKind) -> &'static str {
     match kind {
         HookSourceKind::Layer(ConfigDirKind::HomeXdg) => "global",
-        HookSourceKind::Layer(ConfigDirKind::HomeDot) => "user",
         HookSourceKind::Layer(ConfigDirKind::MachineLocal) => "machine",
         HookSourceKind::Layer(ConfigDirKind::Project) => "project",
         HookSourceKind::Explicit => "explicit",

@@ -395,6 +395,15 @@ export function mergeNativeHistorySnapshot(
   return mergeNativeHistoryEntries(snapshot, preserved);
 }
 
+function removeDurableNativeUserMessages(
+  history: readonly NativeHistoryEntry[],
+  seqs: readonly number[],
+) {
+  if (!seqs.length) return history;
+  const removed = new Set(seqs);
+  return history.filter((entry) => entry.kind !== "user_message" || !removed.has(entry.seq));
+}
+
 function upsertHistory(history: NativeHistoryEntry[], entry: NativeHistoryEntry) {
   return sortNativeHistory([entry, ...history.filter((item) => item.id !== entry.id)]);
 }
@@ -914,12 +923,18 @@ export function reduceNativeSessionEvent(
   }
 
   if (event.event === "history_replay") {
-    const data = event.data as { entries: HistoryEntry[] };
+    const data = event.data as { entries: HistoryEntry[]; removed_user_message_seqs?: unknown };
     const snapshot = data.entries.map((entry, index) => toNativeHistoryEntry(entry, index));
+    const removedUserMessageSeqs = Array.isArray(data.removed_user_message_seqs)
+      ? data.removed_user_message_seqs.filter((seq): seq is number => typeof seq === "number")
+      : [];
     return {
       state: {
         ...state,
-        history: mergeNativeHistorySnapshot(state.history, snapshot),
+        history: mergeNativeHistorySnapshot(
+          removeDurableNativeUserMessages(state.history, removedUserMessageSeqs),
+          snapshot,
+        ),
       },
     };
   }
@@ -1040,6 +1055,17 @@ export function reduceNativeSessionEvent(
               ? data.preflight_cleaned
               : undefined,
         }),
+      },
+    };
+  }
+
+  if (event.event === "user_message_removed") {
+    const data = eventDataRecord(event);
+    if (typeof data?.seq !== "number") return { state, warning: eventWarning(event.event) };
+    return {
+      state: {
+        ...state,
+        history: removeDurableNativeUserMessages(state.history, [data.seq]),
       },
     };
   }

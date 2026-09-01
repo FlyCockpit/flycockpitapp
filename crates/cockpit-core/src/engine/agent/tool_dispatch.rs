@@ -1251,9 +1251,14 @@ async fn execute_ordinary_call_unscoped(
     } else {
         None
     };
-    let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
-        && env.active_tools.call_availability(resolved_name)
-            != crate::engine::tool::ToolCallAvailability::NotAdvertised;
+    // Every syntactically valid provider call owns a durable lifecycle, even
+    // when it is rejected because the current tool surface does not advertise
+    // it.  In a scheduled mixed lane that rejected call is still a serial
+    // barrier, so omitting its `started` row makes the audit sequence diverge
+    // from the provider's source order.  `tool_rejected` remains the separate
+    // classification for the unavailable call; it is not a reason to erase
+    // the lifecycle attempt.
+    let lifecycle_started = placeholder_blocked || repair_outcome.valid;
     // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
     // config handle, and the pre-policy session table (captured as one Arc) — at
     // the authoring point, and reuse them for EVERY model-authored event AND the

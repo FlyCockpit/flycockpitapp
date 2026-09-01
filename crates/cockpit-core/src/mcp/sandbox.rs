@@ -19,6 +19,8 @@
 //!   returns *into the sandbox*, not into model context.
 //! - `mcp.network_configure(action, host=None) -> policy` — an explicit
 //!   human-approved owner action for this executor's governed network policy.
+//!   The returned policy reports effective hosts plus the durable and
+//!   session-scoped host sets and generation fences separately.
 //!
 //! **Lockdown (deny-by-default).** No mount points (filesystem), raw network,
 //! or env: any `OsCall` (which is how `open`/`os.getenv`/etc. surface) is
@@ -816,130 +818,202 @@ async fn configure_network_policy(
         return Err("network configuration was not approved".to_string());
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let policy = match action.as_str() {
-        "enable_requests" => {
-            ctx.session
-                .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
-                    crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
-                    now,
-                )
-                .await
-        }
-        "disable_requests" => {
-            ctx.session
-                .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
-                    crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(false),
-                    now,
-                )
-                .await
-        }
-        "require_approval" => {
-            ctx.session
+    let (agent_policy, session_policy) =
+        async {
+            Ok::<_, anyhow::Error>(match action.as_str() {
+                "enable_requests" => {
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .mutate_monty_network_agent_policy(
+                            agent_instance_id,
+                            crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(
+                                true,
+                            ),
+                            now,
+                        )
+                        .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "disable_requests" => {
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .mutate_monty_network_agent_policy(
+                            agent_instance_id,
+                            crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(
+                                false,
+                            ),
+                            now,
+                        )
+                        .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "require_approval" => {
+                    let agent_policy = ctx
+                .session
                 .db
                 .mutate_monty_network_agent_policy(
                     agent_instance_id,
                     crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(true),
                     now,
                 )
-                .await
-        }
-        "allow_unprompted_requests" => {
-            ctx.session
+                .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "allow_unprompted_requests" => {
+                    let agent_policy = ctx
+                .session
                 .db
                 .mutate_monty_network_agent_policy(
                     agent_instance_id,
                     crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(false),
                     now,
                 )
-                .await
+                .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "grant_host" => {
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .mutate_monty_network_agent_policy(
+                            agent_instance_id,
+                            crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
+                                host_name
+                                    .ok_or_else(|| anyhow::anyhow!("grant_host requires host"))?,
+                            ),
+                            now,
+                        )
+                        .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "revoke_host" => {
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .mutate_monty_network_agent_policy(
+                            agent_instance_id,
+                            crate::db::monty_network::MontyNetworkAgentMutation::RevokeHost(
+                                host_name
+                                    .ok_or_else(|| anyhow::anyhow!("revoke_host requires host"))?,
+                            ),
+                            now,
+                        )
+                        .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "revoke_all_hosts" => {
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .mutate_monty_network_agent_policy(
+                            agent_instance_id,
+                            crate::db::monty_network::MontyNetworkAgentMutation::RevokeAllHosts,
+                            now,
+                        )
+                        .await?;
+                    (
+                        agent_policy,
+                        ctx.session.monty_session_network_grant_snapshot(),
+                    )
+                }
+                "grant_session_host" => {
+                    let session_policy = ctx
+                        .session
+                        .mutate_monty_session_network_grants(
+                            super::network::SessionNetworkMutation::GrantHost(
+                                host_name.ok_or_else(|| {
+                                    anyhow::anyhow!("grant_session_host requires host")
+                                })?,
+                            ),
+                        )
+                        .await?;
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .monty_network_agent_policy(agent_instance_id)
+                        .await?;
+                    (agent_policy, session_policy)
+                }
+                "revoke_session_host" => {
+                    let session_policy = ctx
+                        .session
+                        .mutate_monty_session_network_grants(
+                            super::network::SessionNetworkMutation::RevokeHost(
+                                host_name.ok_or_else(|| {
+                                    anyhow::anyhow!("revoke_session_host requires host")
+                                })?,
+                            ),
+                        )
+                        .await?;
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .monty_network_agent_policy(agent_instance_id)
+                        .await?;
+                    (agent_policy, session_policy)
+                }
+                "revoke_all_session_hosts" => {
+                    let session_policy = ctx
+                        .session
+                        .mutate_monty_session_network_grants(
+                            super::network::SessionNetworkMutation::RevokeAllHosts,
+                        )
+                        .await?;
+                    let agent_policy = ctx
+                        .session
+                        .db
+                        .monty_network_agent_policy(agent_instance_id)
+                        .await?;
+                    (agent_policy, session_policy)
+                }
+                _ => unreachable!("action was validated before approval"),
+            })
         }
-        "grant_host" => {
-            ctx.session
-                .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
-                    crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
-                        host_name.ok_or_else(|| "grant_host requires host".to_string())?,
-                    ),
-                    now,
-                )
-                .await
-        }
-        "revoke_host" => {
-            ctx.session
-                .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
-                    crate::db::monty_network::MontyNetworkAgentMutation::RevokeHost(
-                        host_name.ok_or_else(|| "revoke_host requires host".to_string())?,
-                    ),
-                    now,
-                )
-                .await
-        }
-        "revoke_all_hosts" => {
-            ctx.session
-                .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
-                    crate::db::monty_network::MontyNetworkAgentMutation::RevokeAllHosts,
-                    now,
-                )
-                .await
-        }
-        "grant_session_host" => {
-            ctx.session
-                .mutate_monty_session_network_grants(
-                    super::network::SessionNetworkMutation::GrantHost(
-                        host_name.ok_or_else(|| "grant_session_host requires host".to_string())?,
-                    ),
-                )
-                .await
-                .map_err(|error| format!("network configuration failed: {error:#}"))?;
-            ctx.session
-                .db
-                .monty_network_agent_policy(agent_instance_id)
-                .await
-        }
-        "revoke_session_host" => {
-            ctx.session
-                .mutate_monty_session_network_grants(
-                    super::network::SessionNetworkMutation::RevokeHost(
-                        host_name.ok_or_else(|| "revoke_session_host requires host".to_string())?,
-                    ),
-                )
-                .await
-                .map_err(|error| format!("network configuration failed: {error:#}"))?;
-            ctx.session
-                .db
-                .monty_network_agent_policy(agent_instance_id)
-                .await
-        }
-        "revoke_all_session_hosts" => {
-            ctx.session
-                .mutate_monty_session_network_grants(
-                    super::network::SessionNetworkMutation::RevokeAllHosts,
-                )
-                .await
-                .map_err(|error| format!("network configuration failed: {error:#}"))?;
-            ctx.session
-                .db
-                .monty_network_agent_policy(agent_instance_id)
-                .await
-        }
-        _ => unreachable!("action was validated before approval"),
-    }
-    .map_err(|error| format!("network configuration failed: {error:#}"))?;
-    Ok(serde_json::json!({
-        "requests_enabled": policy.requests_enabled,
-        "approval_required": policy.approval_required,
-        "hosts": policy.hosts,
-        "generation": policy.generation,
-    }))
+        .await
+        .map_err(|error| format!("network configuration failed: {error:#}"))?;
+    Ok(network_configuration_policy_json(
+        agent_policy,
+        session_policy,
+    ))
+}
+
+fn network_configuration_policy_json(
+    agent_policy: crate::db::monty_network::MontyNetworkAgentPolicy,
+    session_policy: super::network::SessionNetworkGrantSnapshot,
+) -> Value {
+    let mut hosts = agent_policy.hosts.clone();
+    hosts.extend(session_policy.hosts.iter().cloned());
+    serde_json::json!({
+        "requests_enabled": agent_policy.requests_enabled,
+        "approval_required": agent_policy.approval_required,
+        "hosts": hosts,
+        "agent_hosts": agent_policy.hosts,
+        "session_hosts": session_policy.hosts,
+        "generation": {
+            "agent": agent_policy.generation,
+            "session": session_policy.generation,
+        },
+    })
 }
 
 fn governed_request_from_monty(
@@ -2570,7 +2644,7 @@ mod tests {
 
         let task = tokio::spawn(async move {
             run_with_host(
-                "mcp.network_configure('enable_requests')\nmcp.network_configure('grant_host', 'api.example.test')",
+                "durable = mcp.network_configure('grant_host', 'api.example.test')\ngranted = mcp.network_configure('grant_session_host', 'api.example.test')\nrevoked = mcp.network_configure('revoke_session_host', 'api.example.test')\n[\n  'api.example.test' in durable['hosts'],\n  'api.example.test' in granted['hosts'],\n  'api.example.test' in granted['session_hosts'],\n  granted['generation']['session'],\n  'api.example.test' in revoked['hosts'],\n  'api.example.test' in revoked['session_hosts'],\n  revoked['generation']['session'],\n]",
                 &cfg,
                 &host,
             )
@@ -2585,7 +2659,7 @@ mod tests {
             },
         )
         .await;
-        assert!(first.description.contains("Enable governed requests"));
+        assert!(first.description.contains("Grant Monty network host"));
         let second = resolve_next_interrupt(
             &db,
             session_id,
@@ -2596,13 +2670,24 @@ mod tests {
         )
         .await;
         assert!(second.description.contains("api.example.test"));
-        task.await.unwrap().unwrap();
+        let third = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(third.description.contains("Revoke Monty network host"));
+        let output = task.await.unwrap().unwrap();
+
+        assert_eq!(output, "[true,true,true,1,true,false,2]");
 
         let policy = db
             .monty_network_agent_policy(agent_instance_id)
             .await
             .unwrap();
-        assert!(policy.requests_enabled);
         assert!(policy.hosts.contains("api.example.test"));
     }
 

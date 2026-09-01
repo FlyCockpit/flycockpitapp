@@ -42,8 +42,8 @@ pub fn provider_named_secret_references(
     providers
         .providers
         .values()
-        .flat_map(|entry| entry.headers.iter())
-        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .flat_map(provider_reference_strings)
+        .flat_map(crate::envref::referenced_names)
         .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
         .collect()
 }
@@ -61,10 +61,24 @@ pub fn provider_named_secret_references_for(
         .providers
         .get(provider_id)
         .into_iter()
-        .flat_map(|entry| entry.headers.iter())
-        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .flat_map(provider_reference_strings)
+        .flat_map(crate::envref::referenced_names)
         .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
         .collect()
+}
+
+fn provider_reference_strings(entry: &ProviderEntry) -> impl Iterator<Item = &str> {
+    entry
+        .headers
+        .iter()
+        .map(|header| header.value.as_str())
+        .chain(
+            entry
+                .auth_command
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        )
 }
 
 /// CLI-owned effective provider loader. The config crate keeps header values
@@ -120,8 +134,9 @@ pub fn redact_provider_view(
             .providers
             .iter()
             .map(|(id, entry)| {
-                let credential_configured =
-                    entry.credential_ref.is_some() || !entry.headers.is_empty();
+                let credential_configured = entry.credential_ref.is_some()
+                    || !entry.headers.is_empty()
+                    || entry.auth_command.is_some();
                 let headers = entry
                     .headers
                     .iter()
@@ -138,6 +153,7 @@ pub fn redact_provider_view(
                 entry.url = proto::redact_url_for_owner_view(&entry.url);
                 entry.credential_ref = None;
                 entry.headers.clear();
+                entry.auth_command = None;
                 (
                     id.clone(),
                     proto::ProviderEntryView {

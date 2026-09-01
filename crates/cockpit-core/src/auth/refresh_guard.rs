@@ -10,17 +10,30 @@ use serde::de::DeserializeOwned;
 use crate::credentials::CredentialStore;
 
 type RefreshLock = Arc<tokio::sync::Mutex<()>>;
-type RefreshLockMap = Mutex<HashMap<&'static str, RefreshLock>>;
+type RefreshLockMap = Mutex<HashMap<String, RefreshLock>>;
 
 static REFRESH_LOCKS: OnceLock<RefreshLockMap> = OnceLock::new();
 
-fn lock_for(key: &'static str) -> Arc<tokio::sync::Mutex<()>> {
+fn lock_for(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let locks = REFRESH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks.lock().expect("OAuth refresh lock map poisoned");
     locks
-        .entry(key)
+        .entry(key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Serialize an arbitrary credential refresh by credential-store key. The
+/// caller must re-open and re-check its credential after entering `refresh`;
+/// that double-check is what lets concurrent waiters reuse the winner's value.
+pub(crate) async fn serialized_refresh<T, F, Fut>(key: &str, refresh: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let lock = lock_for(key);
+    let _guard = lock.lock().await;
+    refresh().await
 }
 
 #[allow(clippy::too_many_arguments)]

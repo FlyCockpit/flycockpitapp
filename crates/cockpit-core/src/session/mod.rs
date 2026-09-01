@@ -1422,6 +1422,23 @@ impl Session {
         providers: &crate::config::providers::ProvidersConfig,
         provider_id: &str,
     ) -> bool {
+        if let Some(entry) = providers.providers.get(provider_id)
+            && let Some(command) = entry.auth_command.as_deref()
+        {
+            let store = match self.provider_credential_store(providers) {
+                Ok(store) => store,
+                Err(_) => return false,
+            };
+            return crate::auth::command::resolve(
+                provider_id,
+                command,
+                store,
+                &|name| std::env::var(name).ok(),
+                true,
+            )
+            .await
+            .is_ok();
+        }
         let Some(cache) = self.command_secret_cache() else {
             return false;
         };

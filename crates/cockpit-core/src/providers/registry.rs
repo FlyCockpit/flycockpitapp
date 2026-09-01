@@ -37,6 +37,7 @@ impl ResolvedProviderOrigin {
 pub(crate) enum OAuthCredential {
     Bearer(String),
     Codex(crate::auth::codex_oauth::StoredTokens),
+    Command(crate::auth::command::CommandCredential),
 }
 
 impl OAuthCredential {
@@ -44,6 +45,7 @@ impl OAuthCredential {
         match self {
             OAuthCredential::Bearer(token) => token,
             OAuthCredential::Codex(tokens) => &tokens.access_token,
+            OAuthCredential::Command(credential) => &credential.token,
         }
     }
 }
@@ -287,6 +289,13 @@ impl ProviderRegistry {
     }
 
     pub(crate) fn provider_for(&self, provider_id: &str, entry: &ProviderEntry) -> &dyn Provider {
+        // Command authentication is deliberately provider-generic and always
+        // stays on the OpenAI-compatible template path. A custom entry may
+        // reuse a well-known id or URL without accidentally selecting one of
+        // Cockpit's built-in OAuth implementations.
+        if entry.auth_command.is_some() || matches!(entry.auth, Some(AuthKind::Command)) {
+            return self.template.as_ref();
+        }
         let mut matches = self
             .special
             .iter()

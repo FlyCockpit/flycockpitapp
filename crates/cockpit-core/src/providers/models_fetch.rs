@@ -188,6 +188,9 @@ pub async fn resolve_provider_request_async(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
+    if entry.auth_command.is_some() {
+        anyhow::bail!("provider `{provider_id}` auth_command requires an injected credential store");
+    }
     let registry = ProviderRegistry::standard();
     if registry
         .provider_for(provider_id, entry)
@@ -208,15 +211,29 @@ pub async fn resolve_provider_request_async_with_store(
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
-    let credential = match credential_kind {
-        Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
-        )),
-        Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
-        )),
+    let command_credential = match entry.auth_command.as_deref() {
+        Some(command) => Some(crate::auth::command::resolve(
+            provider_id,
+            command,
+            store.clone(),
+            &env_lookup,
+            false,
+        ).await?),
         None => None,
+    };
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = if let Some(credential) = command_credential {
+        Some(OAuthCredential::Command(credential))
+    } else {
+        match credential_kind {
+            Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
+                crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
+            )),
+            Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
+                crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
+            )),
+            None => None,
+        }
     };
     let env_lookup = |name: &str| env_lookup(name);
     let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
@@ -245,21 +262,38 @@ async fn resolve_model_list_request_async_with_store(
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
-    let credential = match (credential_kind, store) {
-        (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential_from_store(store).await?,
-        )),
-        (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token_from_store(store).await?,
-        )),
-        (Some(ProviderCredentialKind::CodexOAuth), None) => {
-            anyhow::bail!("Codex OAuth requires an injected credential store")
-        }
-        (Some(ProviderCredentialKind::XaiOAuth), None) => {
-            anyhow::bail!("Grok OAuth requires an injected credential store")
+    let command_credential = match (entry.auth_command.as_deref(), store.as_ref()) {
+        (Some(command), Some(store)) => Some(crate::auth::command::resolve(
+            provider_id,
+            command,
+            store.clone(),
+            &|name| std::env::var(name).ok(),
+            false,
+        ).await?),
+        (Some(_), None) => {
+            anyhow::bail!("provider `{provider_id}` auth_command requires an injected credential store")
         }
         (None, _) => None,
+    };
+    let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
+    let credential = if let Some(credential) = command_credential {
+        Some(OAuthCredential::Command(credential))
+    } else {
+        match (credential_kind, store) {
+            (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => Some(OAuthCredential::Codex(
+                crate::auth::codex_oauth::credential_from_store(store).await?,
+            )),
+            (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
+                crate::auth::xai_oauth::bearer_token_from_store(store).await?,
+            )),
+            (Some(ProviderCredentialKind::CodexOAuth), None) => {
+                anyhow::bail!("Codex OAuth requires an injected credential store")
+            }
+            (Some(ProviderCredentialKind::XaiOAuth), None) => {
+                anyhow::bail!("Grok OAuth requires an injected credential store")
+            }
+            (None, _) => None,
+        }
     };
     registry
         .provider_for(provider_id, entry)
@@ -273,7 +307,7 @@ pub fn resolve_provider_request_blocking(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
-    if registry
+    if entry.auth_command.is_none() && registry
         .provider_for(provider_id, entry)
         .credential_kind()
         .is_none()
@@ -333,7 +367,7 @@ where
     S: Fn(&str) -> Option<String>,
 {
     let registry = ProviderRegistry::standard();
-    if registry
+    if entry.auth_command.is_none() && registry
         .provider_for(provider_id, entry)
         .credential_kind()
         .is_none()
@@ -353,7 +387,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let registry = ProviderRegistry::standard();
-    if registry
+    if entry.auth_command.is_none() && registry
         .provider_for(provider_id, entry)
         .credential_kind()
         .is_none()
@@ -426,6 +460,13 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    if matches!(entry.auth, Some(crate::config::providers::AuthKind::Command))
+        && entry.auth_command.is_none()
+    {
+        anyhow::bail!(
+            "provider `{provider_id}` uses command authentication but no global auth_command is configured"
+        );
+    }
     crate::config::providers::validate_provider_headers(provider_id, &entry.headers)?;
     let origin = ProviderRegistry::standard().resolve_origin(provider_id, entry)?;
     let is_copilot = request_kind == ProviderRequestKind::Copilot;
@@ -489,24 +530,32 @@ fn resolve_provider_request_inner_with_sources(
             name: "Authorization".to_string(),
             value: format!("Bearer {token}"),
         });
-        if let OAuthCredential::Codex(mut tokens) = credential {
-            let account_id = tokens.account_id.take().ok_or_else(|| {
-                anyhow!(
-                    "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
-                )
-            })?;
-            headers.push(ResolvedHeader {
-                name: "chatgpt-account-id".to_string(),
-                value: account_id,
-            });
-            headers.push(ResolvedHeader {
-                name: "originator".to_string(),
-                value: "cockpit".to_string(),
-            });
-            headers.push(ResolvedHeader {
-                name: "OpenAI-Beta".to_string(),
-                value: "responses=experimental".to_string(),
-            });
+        match credential {
+            OAuthCredential::Codex(mut tokens) => {
+                let account_id = tokens.account_id.take().ok_or_else(|| {
+                    anyhow!(
+                        "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
+                    )
+                })?;
+                headers.push(ResolvedHeader {
+                    name: "chatgpt-account-id".to_string(),
+                    value: account_id,
+                });
+                headers.push(ResolvedHeader {
+                    name: "originator".to_string(),
+                    value: "cockpit".to_string(),
+                });
+                headers.push(ResolvedHeader {
+                    name: "OpenAI-Beta".to_string(),
+                    value: "responses=experimental".to_string(),
+                });
+            }
+            OAuthCredential::Command(command) => {
+                for (name, value) in command.headers.unwrap_or_default() {
+                    merge_header_override(&mut headers, ResolvedHeader { name, value });
+                }
+            }
+            OAuthCredential::Bearer(_) => {}
         }
     } else if let Some(auth) = auth_header {
         headers.push(auth);
@@ -556,6 +605,17 @@ fn resolve_provider_request_inner_with_sources(
         #[cfg(not(test))]
         origin,
     })
+}
+
+fn merge_header_override(headers: &mut Vec<ResolvedHeader>, replacement: ResolvedHeader) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|header| header.name.eq_ignore_ascii_case(&replacement.name))
+    {
+        *existing = replacement;
+    } else {
+        headers.push(replacement);
+    }
 }
 
 fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHeader]) -> Result<()> {
@@ -767,14 +827,20 @@ pub async fn fetch_models_for_provider_with_store(
     timeout: Duration,
     store: Option<crate::credentials::CredentialStore>,
 ) -> Result<FetchOutcome> {
-    let request =
-        resolve_model_list_request_async_with_store(provider_id, entry, resolved, store).await?;
+    let auth_store = store.clone();
+    let request = resolve_model_list_request_async_with_store(
+        provider_id,
+        entry,
+        resolved,
+        store,
+    )
+    .await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let url = provider.models_url(entry, &request.base_url);
     let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
-    let outcome = fetch_models_at_detailed(
+    let mut outcome = fetch_models_at_detailed(
         &url,
         &request.headers,
         timeout,
@@ -782,6 +848,40 @@ pub async fn fetch_models_for_provider_with_store(
     )
     .await
     .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
+    if outcome
+        .as_ref()
+        .is_err_and(|error| auth_rejection_error(error))
+        && let (Some(command), Some(store)) = (entry.auth_command.as_deref(), auth_store)
+    {
+        let credential = crate::auth::command::resolve(
+            provider_id,
+            command,
+            store.clone(),
+            &|name| std::env::var(name).ok(),
+            true,
+        )
+        .await?;
+        let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+        let refreshed = resolve_provider_request_inner_with_sources(
+            provider_id,
+            entry,
+            Some(OAuthCredential::Command(credential)),
+            ProviderRequestKind::Template,
+            &|name| std::env::var(name).ok(),
+            &secret_lookup,
+        )?;
+        let refreshed_url = provider.models_url(entry, &refreshed.base_url);
+        outcome = fetch_models_at_detailed(
+            &refreshed_url,
+            &refreshed.headers,
+            timeout,
+            ModelCatalogAbi::from(provider.request_kind()),
+        )
+        .await
+        .and_then(|result| {
+            validate_anthropic_fetch_result(entry, &refreshed.base_url, result)
+        });
+    }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
@@ -832,6 +932,11 @@ pub async fn fetch_models_for_provider_with_store(
         }
         Ok(result) => Ok(result.outcome),
     }
+}
+
+fn auth_rejection_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("returned 401") || message.contains("returned 403")
 }
 
 fn validate_anthropic_fetch_result(
@@ -2305,6 +2410,62 @@ mod tests {
 
         assert!(missing.is_empty());
         assert_eq!(resolved[0].value, "Bearer sk-request-secret");
+    }
+
+    #[test]
+    fn command_headers_override_static_and_bearer_headers() {
+        let entry = ProviderEntry {
+            url: "https://api.example.test/v1".into(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["auth-helper".into()]),
+            headers: vec![
+                HeaderSpec {
+                    name: "X-Tenant".into(),
+                    value: "static".into(),
+                },
+                HeaderSpec {
+                    name: "X-Static".into(),
+                    value: "kept".into(),
+                },
+            ],
+            ..ProviderEntry::default()
+        };
+        let credential = OAuthCredential::Command(crate::auth::command::CommandCredential {
+            token: "default-token".into(),
+            expires_at: None,
+            headers: Some(BTreeMap::from([
+                ("authorization".into(), "Token override".into()),
+                ("x-tenant".into(), "returned".into()),
+            ])),
+        });
+        let request = resolve_provider_request_inner_with_sources(
+            "custom",
+            &entry,
+            Some(credential),
+            ProviderRequestKind::Template,
+            &|_| None,
+            &|_| None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved_header_value(&request, "Authorization"), Some("Token override"));
+        assert_eq!(resolved_header_value(&request, "X-Tenant"), Some("returned"));
+        assert_eq!(resolved_header_value(&request, "X-Static"), Some("kept"));
+    }
+
+    #[test]
+    fn command_auth_always_uses_template_provider_fallback() {
+        let entry = ProviderEntry {
+            url: crate::auth::codex_oauth::DEFAULT_BASE_URL.into(),
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec!["auth-helper".into()]),
+            ..ProviderEntry::default()
+        };
+
+        assert_eq!(
+            ProviderRegistry::standard().provider_id_for("codex-oauth", &entry),
+            "template"
+        );
     }
 
     #[test]

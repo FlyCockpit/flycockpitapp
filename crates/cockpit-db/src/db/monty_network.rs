@@ -43,10 +43,7 @@ pub enum MontyNetworkAgentMutation {
     RevokeAllHosts,
 }
 
-fn read_policy(
-    conn: &rusqlite::Connection,
-    agent_id: &str,
-) -> Result<MontyNetworkAgentPolicy> {
+fn read_policy(conn: &rusqlite::Connection, agent_id: &str) -> Result<MontyNetworkAgentPolicy> {
     let header = conn
         .query_row(
             "SELECT requests_enabled, approval_required, generation FROM monty_network_agent_policies WHERE agent_id=?1",
@@ -58,9 +55,8 @@ fn read_policy(
         return Ok(MontyNetworkAgentPolicy::deny_all(agent_id));
     };
     let generation = u64::try_from(generation)?;
-    let mut statement = conn.prepare(
-        "SELECT host FROM monty_network_agent_grants WHERE agent_id=?1 ORDER BY host",
-    )?;
+    let mut statement = conn
+        .prepare("SELECT host FROM monty_network_agent_grants WHERE agent_id=?1 ORDER BY host")?;
     let hosts = statement
         .query_map([agent_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
@@ -89,7 +85,10 @@ impl Db {
         mutation: MontyNetworkAgentMutation,
         now_unix_ms: i64,
     ) -> Result<MontyNetworkAgentPolicy> {
-        ensure!(!agent_id.is_empty() && agent_id.len() <= 255, "invalid agent id");
+        ensure!(
+            !agent_id.is_empty() && agent_id.len() <= 255,
+            "invalid agent id"
+        );
         let agent_id = agent_id.to_string();
         self.transaction(move |conn| {
             conn.execute(
@@ -158,7 +157,9 @@ fn validate_canonical_host(host: &str) -> Result<()> {
     if host.is_empty()
         || host.len() > 253
         || host != host.to_ascii_lowercase()
-        || host.chars().any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
+        || host
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
     {
         bail!("network grant host is not canonical");
     }
@@ -172,7 +173,10 @@ mod tests {
     #[tokio::test]
     async fn agent_policy_is_deny_by_default_and_revocation_advances_fence() {
         let db = Db::open_in_memory().unwrap();
-        let absent = db.monty_network_agent_policy("authored/demo").await.unwrap();
+        let absent = db
+            .monty_network_agent_policy("authored/demo")
+            .await
+            .unwrap();
         assert!(!absent.requests_enabled);
         assert!(absent.hosts.is_empty());
 

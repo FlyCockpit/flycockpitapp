@@ -788,17 +788,21 @@ fn vnext_author_tool_tier_preferences_reject_unknown_or_disabled_tools() {
 
 #[test]
 fn vnext_network_hosts_are_requests_not_grants() {
-    let document = vnext_document(
-        "requestedNetworkHosts:\n  - api.example.test\nrequestsRequested: true\n",
-    );
+    let document =
+        vnext_document("requestedNetworkHosts:\n  - api.example.test\nrequestsRequested: true\n");
     let def = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
     assert_eq!(
         def.requested_network_hosts(),
         &std::collections::BTreeSet::from(["api.example.test".to_string()])
     );
+    assert!(def.requests_requested());
     assert!(def.tools.is_none());
     assert!(def.tool_tiers.is_empty());
-    assert!(def.to_markdown().unwrap().contains("requestedNetworkHosts:"));
+    assert!(
+        def.to_markdown()
+            .unwrap()
+            .contains("requestedNetworkHosts:")
+    );
 
     let invalid = vnext_document("requestedNetworkHosts:\n  - HTTPS://api.example.test\n");
     assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());

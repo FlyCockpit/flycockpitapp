@@ -103,7 +103,12 @@ impl EffectiveNetworkPolicy {
 
 pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPolicy> {
     if let Some(denial) = host.builtin_registry.monty_network_denial() {
-        bail!("{}", denial["message"].as_str().unwrap_or("fork network capability denied"));
+        bail!(
+            "{}",
+            denial["message"]
+                .as_str()
+                .unwrap_or("fork network capability denied")
+        );
     }
     let ctx = host
         .native_tool_ctx
@@ -179,9 +184,15 @@ impl GovernedRequest {
 
 pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Value> {
     let policy = effective_policy(host).await?;
-    ensure!(policy.requests_enabled, "requests is disabled for this agent");
     ensure!(
-        request.body.as_ref().is_none_or(|body| body.len() <= MAX_REQUEST_BODY_BYTES),
+        policy.requests_enabled,
+        "requests is disabled for this agent"
+    );
+    ensure!(
+        request
+            .body
+            .as_ref()
+            .is_none_or(|body| body.len() <= MAX_REQUEST_BODY_BYTES),
         "governed request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
     );
     let ctx = host
@@ -194,13 +205,22 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         "governed request redaction proof is incomplete"
     );
     let url = reqwest::Url::parse(&request.url).context("invalid governed request URL")?;
-    ensure!(matches!(url.scheme(), "http" | "https"), "only http and https are allowed");
-    ensure!(url.username().is_empty() && url.password().is_none(), "URL userinfo is forbidden");
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "only http and https are allowed"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "URL userinfo is forbidden"
+    );
     let destination = url
         .host_str()
         .context("governed request URL has no host")?
         .to_ascii_lowercase();
-    ensure!(policy.permits(&destination), "network host `{destination}` is not user-granted");
+    ensure!(
+        policy.permits(&destination),
+        "network host `{destination}` is not user-granted"
+    );
 
     if policy.approval_required {
         let approver = ctx
@@ -213,19 +233,6 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
             "network request was not approved"
         );
     }
-
-    let agent_fence = ctx
-        .session
-        .db
-        .monty_network_agent_fence_is_current(&ctx.agent_id, policy.agent_generation)
-        .await?;
-    let session_fence = ctx
-        .session
-        .monty_session_network_fence_allows(policy.session_generation, &destination);
-    ensure!(
-        agent_fence && (policy.agent_hosts.contains(&destination) || session_fence),
-        "network grant changed before dispatch; request refused"
-    );
 
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .context("invalid governed request method")?;
@@ -243,7 +250,24 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     if let Some(body) = request.body {
         builder = builder.body(body);
     }
-    let response = builder.send().await.context("governed network request failed")?;
+    // This is the last awaited/read boundary before `send`: a revocation that
+    // changed either scope after the earlier snapshot refuses this dispatch.
+    let agent_fence = ctx
+        .session
+        .db
+        .monty_network_agent_fence_is_current(&ctx.agent_id, policy.agent_generation)
+        .await?;
+    let session_fence = ctx
+        .session
+        .monty_session_network_fence_allows(policy.session_generation, &destination);
+    ensure!(
+        agent_fence && (policy.agent_hosts.contains(&destination) || session_fence),
+        "network grant changed before dispatch; request refused"
+    );
+    let response = builder
+        .send()
+        .await
+        .context("governed network request failed")?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -340,6 +364,16 @@ mod tests {
             )]),
             Vec::<(String, String)>::new(),
         )
+        .unwrap()
+        .with_forced_sealed_literal(
+            "sealed-network-secret".to_string(),
+            crate::sealed::identity::SealedRedactionIdentity {
+                scope: crate::sealed::identity::SealedScopeKind::Session,
+                record_id: None,
+                name: crate::sealed::identity::SealedName::canonical("network_token").unwrap(),
+                version: 0,
+            },
+        )
         .unwrap();
         let request = GovernedRequest {
             method: "POST".to_string(),
@@ -348,7 +382,9 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer network-secret".to_string(),
             )]),
-            body: Some("{\"token\":\"network-secret\"}".to_string()),
+            body: Some(
+                "{\"token\":\"network-secret\",\"sealed\":\"sealed-network-secret\"}".to_string(),
+            ),
         };
         let visited = request.redact_fully(&table).unwrap();
         assert_eq!(visited.visited_fields, visited.expected_fields);
@@ -359,7 +395,28 @@ mod tests {
                 .values()
                 .all(|value| !value.contains("network-secret"))
         );
-        assert!(!visited.body.unwrap().contains("network-secret"));
+        let body = visited.body.unwrap();
+        assert!(!body.contains("network-secret"));
+        assert!(!body.contains("sealed-network-secret"));
+    }
+
+    #[test]
+    fn outbound_redaction_fails_closed_when_enforced_view_cannot_be_built() {
+        let table = crate::redact::RedactionTable::empty().with_forced_enforced_view_failure();
+        let request = GovernedRequest {
+            method: "POST".to_string(),
+            url: "https://api.example.test/path".to_string(),
+            headers: BTreeMap::new(),
+            body: Some("must-not-leave".to_string()),
+        };
+
+        let error = request.redact_fully(&table).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("constructing fail-closed Monty egress redaction view"),
+            "{error:#}"
+        );
     }
 
     #[test]

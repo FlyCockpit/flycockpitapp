@@ -945,13 +945,13 @@ impl BuiltinRegistry {
             .and_then(|guard| guard.denial(tool))
     }
 
-    /// Network uses the same per-fork capability guard as native Monty calls.
-    /// Any scoped catalog must opt into no egress; foreground registries have
-    /// no guard and defer to the live user-grant policy.
+    /// Network uses the same per-fork allowlist as native Monty calls.
+    /// Current scoped catalogs omit `requests`, while foreground registries
+    /// have no guard and defer to the live user-grant policy.
     pub(crate) fn monty_network_denial(&self) -> Option<Value> {
         self.capability_guard
             .as_ref()
-            .map(|guard| guard.monty_network_denial())
+            .and_then(|guard| guard.denial("requests"))
     }
 
     /// The source-tagged effective catalog for an ephemeral metadata fork.

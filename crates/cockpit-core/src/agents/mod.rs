@@ -1060,6 +1060,14 @@ impl AgentDef {
             })
     }
 
+    /// Author preference used only to pre-fill an owner prompt. This cannot
+    /// enable the governed package or widen the effective allowlist.
+    pub fn requests_requested(&self) -> bool {
+        self.vnext
+            .as_ref()
+            .is_some_and(VnextAgentDef::requests_requested)
+    }
+
     /// The knowledge-base restriction authored in this exact definition.
     /// Running agents retain an `AgentDef` snapshot, so knowledge access is
     /// governed by that snapshot rather than a same-named reloaded definition.

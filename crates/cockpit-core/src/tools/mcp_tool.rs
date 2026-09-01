@@ -743,11 +743,11 @@ mod tests {
             .clear_session_goal(ctx.session.id)
             .await
             .unwrap();
-        assert!(
-            turn_start_advert_message(&toolbox, &ctx.session)
-                .await
-                .is_none()
-        );
+        let message = turn_start_advert_message(&toolbox, &ctx.session)
+            .await
+            .unwrap();
+        assert!(message.contains("Monty packages enabled"), "{message}");
+        assert!(!message.contains("request_compact"), "{message}");
     }
 
     #[tokio::test]

@@ -195,8 +195,10 @@ pub async fn run_envelope_with_host(
             }
             RunProgress::FunctionCall(call) => {
                 let result = if !call.method_call
-                    && matches!(call.function_name.as_str(), "emit" | "show" | "notify" | "attach")
-                {
+                    && matches!(
+                        call.function_name.as_str(),
+                        "emit" | "show" | "notify" | "attach"
+                    ) {
                     dispatch_projection(
                         &mut envelope,
                         &call.function_name,
@@ -306,8 +308,8 @@ fn rewrite_host_module_imports(script: &str, requests_enabled: bool) -> String {
                 .map_or((imported.trim(), None), |(module, alias)| {
                     (module.trim(), Some(alias.trim()))
                 });
-            let host_module = HOST_MODULES.contains(&module)
-                || (module == "requests" && requests_enabled);
+            let host_module =
+                HOST_MODULES.contains(&module) || (module == "requests" && requests_enabled);
             if host_module {
                 alias.map_or_else(String::new, |alias| format!("{alias} = {module}"))
             } else {
@@ -316,19 +318,16 @@ fn rewrite_host_module_imports(script: &str, requests_enabled: bool) -> String {
         } else if let Some(imported) = trimmed.strip_prefix("from ") {
             if let Some((module, names)) = imported.split_once(" import ") {
                 let module = module.trim();
-                let host_module = HOST_MODULES.contains(&module)
-                    || (module == "requests" && requests_enabled);
+                let host_module =
+                    HOST_MODULES.contains(&module) || (module == "requests" && requests_enabled);
                 if host_module {
                     names
                         .split(',')
                         .map(|name| {
-                            let (source, binding) = name
-                                .trim()
-                                .split_once(" as ")
-                                .map_or_else(
-                                    || (name.trim(), name.trim()),
-                                    |(source, binding)| (source.trim(), binding.trim()),
-                                );
+                            let (source, binding) = name.trim().split_once(" as ").map_or_else(
+                                || (name.trim(), name.trim()),
+                                |(source, binding)| (source.trim(), binding.trim()),
+                            );
                             format!("{binding} = {module}.{source}")
                         })
                         .collect::<Vec<_>>()
@@ -503,10 +502,8 @@ async fn dispatch(
                 .map(response_to_monty)
                 .map_err(|error| format!("requests.{name} failed: {error:#}"))
         }
-        "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent"
-        | "b64encode" | "b64decode" | "sha256" | "sha512" => {
-            dispatch_pure_host_module(name, args, kwargs)
-        }
+        "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent" | "b64encode"
+        | "b64decode" | "sha256" | "sha512" => dispatch_pure_host_module(name, args, kwargs),
         "search" => {
             let query = match args.first() {
                 Some(MontyObject::String(s)) => s.clone(),
@@ -724,9 +721,7 @@ fn governed_request_from_monty(
         }
         url = parsed.to_string();
     }
-    let headers_value = kwargs
-        .get("headers")
-        .or_else(|| args.get(url_index + 1));
+    let headers_value = kwargs.get("headers").or_else(|| args.get(url_index + 1));
     let mut headers = BTreeMap::new();
     if let Some(headers_value) = headers_value {
         let Value::Object(values) = monty_to_json(headers_value) else {
@@ -785,7 +780,9 @@ fn dispatch_pure_host_module(
     kwargs: &[(MontyObject, MontyObject)],
 ) -> Result<MontyObject, String> {
     if !kwargs.is_empty() {
-        return Err(format!("{name} does not accept keyword arguments in this sandbox"));
+        return Err(format!(
+            "{name} does not accept keyword arguments in this sandbox"
+        ));
     }
     match name {
         "reader" => {
@@ -805,7 +802,7 @@ fn dispatch_pure_host_module(
                     })
                     .map_err(|error| format!("csv.reader failed: {error}"))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(MontyObject::List(rows))
         }
         "writer" => {
@@ -913,12 +910,10 @@ fn dispatch_pure_host_module(
                 name: "Hash".to_string(),
                 type_id: u64::MAX - 2,
                 field_names: vec![],
-                attrs: vec![
-                    (
-                        MontyObject::String("_hex".to_string()),
-                        MontyObject::String(digest),
-                    ),
-                ]
+                attrs: vec![(
+                    MontyObject::String("_hex".to_string()),
+                    MontyObject::String(digest),
+                )]
                 .into(),
                 frozen: true,
             })
@@ -931,12 +926,10 @@ fn dataclass_attr(receiver: Option<&MontyObject>, name: &str) -> Option<MontyObj
     let MontyObject::Dataclass { attrs, .. } = receiver? else {
         return None;
     };
-    attrs
-        .iter()
-        .find_map(|(key, value)| match key {
-            MontyObject::String(key) if key == name => Some(value.clone()),
-            _ => None,
-        })
+    attrs.iter().find_map(|(key, value)| match key {
+        MontyObject::String(key) if key == name => Some(value.clone()),
+        _ => None,
+    })
 }
 
 fn dataclass_name(receiver: Option<&MontyObject>) -> Option<&str> {
@@ -965,10 +958,7 @@ fn response_to_monty(value: Value) -> MontyObject {
             MontyObject::String("status_code".to_string()),
             MontyObject::Int(status),
         ),
-        (
-            MontyObject::String("ok".to_string()),
-            MontyObject::Bool(ok),
-        ),
+        (MontyObject::String("ok".to_string()), MontyObject::Bool(ok)),
         (
             MontyObject::String("headers".to_string()),
             json_to_monty(&headers),
@@ -2285,6 +2275,33 @@ mod tests {
         let error = run("requests.get('https://example.test')", &cfg)
             .await
             .unwrap_err();
+        assert!(error.to_string().contains("requests"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn requests_package_requires_agent_toggle_and_scoped_fork_guard() {
+        let cfg = McpConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .mutate_monty_network_agent_policy(
+                &ctx.agent_id,
+                crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
+                1,
+            )
+            .await
+            .unwrap();
+        let host = HostContext::from_tool_ctx(&ctx);
+        let out = run_with_host("import requests\nstr(requests)", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(out.contains("requests"), "{out}");
+
+        let scoped = host.with_builtin_registry(Arc::new(
+            crate::mcp::builtin::BuiltinRegistry::metadata_fork(),
+        ));
+        let error = run_with_host("requests", &cfg, &scoped).await.unwrap_err();
         assert!(error.to_string().contains("requests"), "{error:#}");
     }
 

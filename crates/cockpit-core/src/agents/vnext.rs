@@ -1054,7 +1054,11 @@ pub struct VnextAgentDef {
     pub requested_network_hosts: BTreeSet<String>,
     /// Author preference for the governed `requests` facade. Like tool-tier
     /// preferences, this can request placement but cannot grant the package.
-    #[serde(rename = "requestsRequested", default, skip_serializing_if = "is_false")]
+    #[serde(
+        rename = "requestsRequested",
+        default,
+        skip_serializing_if = "is_false"
+    )]
     pub requests_requested: bool,
 }
 
@@ -1150,6 +1154,12 @@ impl VnextAgentDef {
     /// authority projection.
     pub fn requested_network_hosts(&self) -> &BTreeSet<String> {
         &self.requested_network_hosts
+    }
+
+    /// Safe prompt-prefill preference only; the durable per-agent toggle is
+    /// authoritative and can be changed only through a user-action mutation.
+    pub fn requests_requested(&self) -> bool {
+        self.requests_requested
     }
 
     /// Existing runtime snapshots still require a single launch lane. This is

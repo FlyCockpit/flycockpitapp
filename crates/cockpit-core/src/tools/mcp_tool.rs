@@ -216,12 +216,12 @@ fn rendered_result_output(
     envelope: crate::mcp::sandbox::ProjectionEnvelope,
     ctx: &ToolCtx,
 ) -> ToolOutput {
-    let model = ctx.redact.scrub(&envelope.model_text()).into_owned();
-    let display_lane = ctx.redact.scrub(&envelope.display_text()).into_owned();
+    let model = ctx.redact.scrub(&envelope.model_text());
+    let display_lane = ctx.redact.scrub(&envelope.display_text());
     let attachments = envelope
         .artifacts
         .iter()
-        .map(|attached| ctx.redact.scrub(attached).into_owned())
+        .map(|attached| ctx.redact.scrub(attached))
         .collect::<Vec<_>>();
     let display = (!display_lane.is_empty()).then(|| {
         if model.is_empty() {
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn projection_mapping_redacts_model_display_and_artifact_lanes() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.redact = Arc::new(projection_redaction_table(tmp.path()));
         let output = rendered_result_output(
             crate::mcp::sandbox::ProjectionEnvelope {

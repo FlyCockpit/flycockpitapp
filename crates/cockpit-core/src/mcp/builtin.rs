@@ -955,17 +955,17 @@ impl BuiltinRegistry {
             "the session-rename micro-fork",
             ["mcp"],
             vec![BuiltinFunction::new(
-            "set_session_metadata",
-            "Set this session's generated title and one-sentence description",
-            BuiltinPresentation {
-                glyph: "🏷️",
-                label: "set_session_metadata".to_string(),
-            },
-            Arc::new(set_session_metadata_schema),
-            Arc::new(set_session_metadata_availability),
-            true,
-            Arc::new(set_session_metadata),
-        )],
+                "set_session_metadata",
+                "Set this session's generated title and one-sentence description",
+                BuiltinPresentation {
+                    glyph: "🏷️",
+                    label: "set_session_metadata".to_string(),
+                },
+                Arc::new(set_session_metadata_schema),
+                Arc::new(set_session_metadata_availability),
+                true,
+                Arc::new(set_session_metadata),
+            )],
         )
     }
 
@@ -979,28 +979,28 @@ impl BuiltinRegistry {
             "the explore seed-selection micro-fork",
             ["mcp"],
             vec![BuiltinFunction::new(
-            "seed_reads",
-            "Return read-only tool calls for the implementation child to execute fresh",
-            BuiltinPresentation {
-                glyph: "🌱",
-                label: "seed_reads".to_string(),
-            },
-            Arc::new(seed_reads_schema),
-            Arc::new(|_| Availability::available()),
-            true,
-            Arc::new(move |_ctx, args| {
-                let slot = slot.clone();
-                Box::pin(async move {
-                    let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
-                        .map_err(anyhow::Error::msg)?;
-                    *slot
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
-                        Some(calls.clone());
-                    Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
-                })
-            }),
-        )],
+                "seed_reads",
+                "Return read-only tool calls for the implementation child to execute fresh",
+                BuiltinPresentation {
+                    glyph: "🌱",
+                    label: "seed_reads".to_string(),
+                },
+                Arc::new(seed_reads_schema),
+                Arc::new(|_| Availability::available()),
+                true,
+                Arc::new(move |_ctx, args| {
+                    let slot = slot.clone();
+                    Box::pin(async move {
+                        let calls = crate::engine::seed_reads::parse_seed_reads(args.get("calls"))
+                            .map_err(anyhow::Error::msg)?;
+                        *slot
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("seed_reads slot poisoned"))? =
+                            Some(calls.clone());
+                        Ok(serde_json::json!({"accepted": true, "count": calls.len()}))
+                    })
+                }),
+            )],
         )
     }
 
@@ -1866,17 +1866,13 @@ mod tests {
             .with(Arc::new(crate::knowledge::SemanticSearchTool::new(None)))
             .with(Arc::new(crate::knowledge::StructuredSearchTool::new(None)))
             .with(Arc::new(crate::tools::edit::EditTool));
-        let before = serde_json::to_vec(
-            &toolbox.definitions(crate::agents::ToolSteering::Terse),
-        )
-        .unwrap();
+        let before =
+            serde_json::to_vec(&toolbox.definitions(crate::agents::ToolSteering::Terse)).unwrap();
 
         let registry = toolbox.mcp_builtin_registry_for_context("knowledge");
         let host = HostContext::empty_for_tests().with_builtin_registry(registry.clone());
-        let after = serde_json::to_vec(
-            &toolbox.definitions(crate::agents::ToolSteering::Terse),
-        )
-        .unwrap();
+        let after =
+            serde_json::to_vec(&toolbox.definitions(crate::agents::ToolSteering::Terse)).unwrap();
         let names = available_descriptors(&host)
             .into_iter()
             .map(|descriptor| descriptor.name)

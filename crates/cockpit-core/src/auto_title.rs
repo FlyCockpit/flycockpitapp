@@ -503,10 +503,7 @@ pub(crate) async fn generate_session_metadata_fork(
             for ignored_call in calls {
                 history.push(tool_result_message(
                     &ignored_call,
-                    metadata_fork_ignored_tool_result(
-                        &fork_registry,
-                        &ignored_call.function.name,
-                    ),
+                    metadata_fork_ignored_tool_result(&fork_registry, &ignored_call.function.name),
                 ));
             }
             prompt = Message::user(metadata_fork_retry_instruction());
@@ -555,7 +552,10 @@ pub(crate) async fn generate_session_metadata_fork(
             let output = if index == monty_call_index {
                 result.clone()
             } else {
-                metadata_fork_ignored_tool_result(&host.builtin_registry, &ignored_call.function.name)
+                metadata_fork_ignored_tool_result(
+                    &host.builtin_registry,
+                    &ignored_call.function.name,
+                )
             };
             history.push(tool_result_message(&ignored_call, output));
         }
@@ -568,7 +568,10 @@ fn metadata_fork_ignored_tool_result(
     tool: &str,
 ) -> String {
     registry.capability_denial(tool).map_or_else(
-        || r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#.to_string(),
+        || {
+            r#"{"ignored":true,"reason":"The metadata fork only executes Monty calls."}"#
+                .to_string()
+        },
         |denial| denial.to_string(),
     )
 }

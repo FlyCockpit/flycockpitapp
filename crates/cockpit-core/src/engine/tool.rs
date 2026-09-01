@@ -2519,7 +2519,12 @@ impl ToolBox {
         let funcs = self
             .mcp_builtin_tools
             .iter()
-            .filter(|(name, _)| matches!(name.as_str(), "read" | "semantic_search" | "structured_search"))
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "read" | "semantic_search" | "structured_search"
+                )
+            })
             .filter(|(name, _)| !self.capability_unavailable.contains_key(*name))
             .filter_map(|(_name, entry)| {
                 crate::mcp::builtin::ToolOutputBuiltinAdapter::new(entry.tool.clone())

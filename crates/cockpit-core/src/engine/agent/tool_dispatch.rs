@@ -37,6 +37,9 @@ impl CapabilityGuard {
             let allowed = self
                 .allowed_tools
                 .iter()
+                // `mcp` is the transport wrapper, not a purpose-specific
+                // capability worth steering the model toward.
+                .filter(|name| name.as_str() != "mcp")
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -580,9 +583,16 @@ async fn authorize_revised_call(
     proposed_args: Value,
     payload: &mut InterruptParkPayload,
 ) -> Result<RevisedCallAuthorization> {
-    if let Some(denial) = env.ctx.mcp_builtin_registry.capability_denial(resolved_name) {
+    if let Some(denial) = env
+        .ctx
+        .mcp_builtin_registry
+        .capability_denial(resolved_name)
+    {
         return Ok(RevisedCallAuthorization::Refused(
-            denial["message"].as_str().unwrap_or("capability denied").to_string(),
+            denial["message"]
+                .as_str()
+                .unwrap_or("capability denied")
+                .to_string(),
         ));
     }
     let mut canonical =
@@ -1238,20 +1248,19 @@ async fn execute_ordinary_call_unscoped(
     ) {
         recheck_result = true;
     }
-    let cage_block: Option<String> =
-        if unavailable_call.is_none()
-            && capability_block.is_none()
-            && !placeholder_blocked
-            && repair_outcome.valid
-        {
-            env.ctx
-                .review_cage
-                .as_ref()
-                .and_then(|cage| cage.allow_dispatch(resolved_name).err())
-                .map(|err| err.to_string())
-        } else {
-            None
-        };
+    let cage_block: Option<String> = if unavailable_call.is_none()
+        && capability_block.is_none()
+        && !placeholder_blocked
+        && repair_outcome.valid
+    {
+        env.ctx
+            .review_cage
+            .as_ref()
+            .and_then(|cage| cage.allow_dispatch(resolved_name).err())
+            .map(|err| err.to_string())
+    } else {
+        None
+    };
 
     // Dispatch only when validate-then-repair produced a schema-valid
     // call AND the loop guard didn't reject it AND the safety gate didn't
@@ -5541,11 +5550,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
         ctx.mcp_builtin_registry = Arc::new(
-            crate::mcp::builtin::BuiltinRegistry::from_functions(Vec::new())
-                .with_capability_guard(CapabilityGuard::new(
-                    "the session-rename micro-fork",
-                    ["set_session_metadata"],
-                )),
+            crate::mcp::builtin::BuiltinRegistry::from_functions(Vec::new()).with_capability_guard(
+                CapabilityGuard::new("the session-rename micro-fork", ["set_session_metadata"]),
+            ),
         );
         let env = DispatchEnv {
             agent: &agent,
@@ -5580,7 +5587,10 @@ mod tests {
             panic!("guarded Monty call must be denied");
         };
         assert_eq!(monty_denial["kind"], "capability_guard_denied");
-        assert_eq!(monty_denial["message"], native_message);
+        assert_eq!(
+            monty_denial["message"].as_str(),
+            Some(native_message.as_str())
+        );
         assert!(native_message.contains("the session-rename micro-fork"));
         assert!(native_message.contains("`set_session_metadata`"));
         assert!(!called.load(Ordering::SeqCst));

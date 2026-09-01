@@ -259,7 +259,18 @@ fn inventory_too_large(message: String) -> ErrorPayload {
 }
 
 fn agent_mode_summary(definition: &crate::agents::AgentDef) -> &'static str {
-    match definition.vnext.as_ref().map(|vnext| vnext.execution_kind) {
+    if definition
+        .vnext
+        .as_ref()
+        .is_some_and(crate::agents::VnextAgentDef::supports_computer_use)
+    {
+        return "computer";
+    }
+    match definition
+        .vnext
+        .as_ref()
+        .map(|vnext| vnext.execution_kind())
+    {
         Some(crate::agents::ExecutionKind::Assistant) => "assistant",
         Some(crate::agents::ExecutionKind::Coding) => "coding",
         Some(crate::agents::ExecutionKind::Computer) => "computer",
@@ -339,8 +350,8 @@ fn project_model_summary(
     provider: &ProviderEntry,
     model: &ModelEntry,
 ) -> ModelSummary {
-    let native_anthropic =
-        cockpit_config::config::providers::is_anthropic_native_base_url(&provider.url);
+    let native_anthropic = providers.resolve_wire_api(provider_id, &model.id)
+        == cockpit_config::config::providers::WireApi::Anthropic;
     let native_provider_valid = if native_anthropic {
         cockpit_config::config::providers::validate_anthropic_model_configuration(
             provider, &model.id,

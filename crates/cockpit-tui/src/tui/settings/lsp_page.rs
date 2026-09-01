@@ -789,8 +789,5 @@ fn project_root_for_project_config(config_path: &Path) -> Option<PathBuf> {
     if config_dir.file_name()? != ".cockpit" {
         return None;
     }
-    if dirs::home_dir().is_some_and(|home| config_dir == home.join(".cockpit")) {
-        return None;
-    }
     config_dir.parent().map(PathBuf::from)
 }

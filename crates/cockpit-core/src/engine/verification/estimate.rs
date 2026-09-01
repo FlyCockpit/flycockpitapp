@@ -246,7 +246,7 @@ mod tests {
         SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch, VerificationPolicy,
         VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn estimate_is_at_least_tokenizer_count_on_fixtures() {
@@ -330,7 +330,8 @@ mod tests {
         VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "authored/reviewer".to_string(),
-            execution_kind: ExecutionKind::Coding,
+            roles: vec![crate::agents::AgentRole::Code],
+            capabilities: BTreeSet::new(),
             model_slots: BTreeMap::from([(
                 "primary".to_string(),
                 ModelSlot {
@@ -364,6 +365,7 @@ mod tests {
                 }],
             }),
             allowed_knowledge_bases: None,
+            tool_tier_preferences: std::collections::BTreeMap::new(),
         }
     }
 

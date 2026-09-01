@@ -64,18 +64,18 @@ pub(crate) use profile::{
 pub(crate) use vnext::DefinitionScope;
 pub(crate) use vnext::author_slot;
 pub use vnext::{
-    AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
+    AgentRole, AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
     EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
     LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
-    ModelLocality, ModelRecommendation, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded,
-    PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute,
-    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
-    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass, VerificationAction,
-    VerificationBudget, VerificationDispatch, VerificationEstimate, VerificationMode,
-    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
-    VerificationSessionReduction, VerificationSubject, VnextAgentDef, VnextHostPolicy,
-    delegation_kind_permitted, resolve_question_policy,
+    ModelLocality, ModelRecommendation, ModelSlot, ModelTrustSuggestion, OnAdjudicationFailure,
+    OnBudgetExceeded, PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK,
+    PreparedPrimarySlotRoute, ProhibitedQuestionClass, ProviderAlias, QuestionOverride,
+    QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef,
+    ToolClass, VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
+    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
+    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
+    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
@@ -89,14 +89,14 @@ pub(crate) const PACKAGE_ROOT_FILE: &str = "agent.md";
 pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 const PACKAGE_MCP_FILE: &str = "mcp.json";
 
-/// Per-agent capability grants (issue #75). These replace the four
-/// mode-gated [`crate::engine::tool::Capability`] variants: a grant is now
-/// an explicit member of the agent definition's `capabilities` set rather
-/// than a side effect of a session-global steering posture. Wire names are the
+/// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
+/// the computer-use declaration share one closed set; host policy still
+/// decides whether a declared capability is executable. Wire names are the
 /// camelCase spellings below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentCapability {
+    ComputerUse,
     FollowupSeed,
     SandboxEscalate,
     ForkContext,
@@ -106,6 +106,7 @@ pub enum AgentCapability {
 impl AgentCapability {
     pub fn from_wire(name: &str) -> Option<Self> {
         match name {
+            "computerUse" => Some(Self::ComputerUse),
             "followupSeed" => Some(Self::FollowupSeed),
             "sandboxEscalate" => Some(Self::SandboxEscalate),
             "forkContext" => Some(Self::ForkContext),
@@ -116,6 +117,7 @@ impl AgentCapability {
 
     pub fn wire_name(self) -> &'static str {
         match self {
+            Self::ComputerUse => "computerUse",
             Self::FollowupSeed => "followupSeed",
             Self::SandboxEscalate => "sandboxEscalate",
             Self::ForkContext => "forkContext",
@@ -212,10 +214,7 @@ impl ContextPolicy {
 
 /// The resolved posture of one agent node (issue #75): the single value the
 /// engine consults for capability grants. It carries
-/// the resolved capability-grant set. When the [`AgentDef`] declares
-/// `capabilities`, that set is authoritative; when it does not (`None`), the
-/// `standard` fallback grant set (empty — none of the four capabilities)
-/// applies.
+/// the resolved capability-grant set from the unified launch definition.
 ///
 /// The only constructor is [`PostureResolution::from_def`], which lives in
 /// this module: no engine site can synthesize a grant set (closure ratchet).
@@ -225,12 +224,23 @@ pub struct PostureResolution {
 }
 
 impl PostureResolution {
-    /// Resolve posture from an agent definition. When `def.capabilities` is
-    /// `Some`, the declared set is authoritative; when `None`, the `standard`
-    /// fallback (no capabilities) applies.
+    /// Resolve posture from the unified definition capability set. Computer
+    /// use is a launch capability and is intentionally not a tool-posture
+    /// grant.
     pub fn from_def(def: &AgentDef) -> Self {
         Self {
-            grants: def.capabilities.clone().unwrap_or_default(),
+            grants: def
+                .vnext
+                .as_ref()
+                .map(|definition| {
+                    definition
+                        .capabilities
+                        .iter()
+                        .copied()
+                        .filter(|capability| *capability != AgentCapability::ComputerUse)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -335,12 +345,6 @@ pub struct AgentDef {
     pub goal_supervision: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
-    /// Explicit per-agent capability grants (issue #75). `None` = "not
-    /// declared" (resolves to the `standard` fallback grant set — none of
-    /// the four capabilities); `Some(empty)` = explicitly none. The four
-    /// variants mirror the [`crate::engine::tool::Capability`] set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<BTreeSet<AgentCapability>>,
     /// Per-agent tool-description steering (issue #75). `None` = not declared
     /// (default `Terse`); `Some` selects the rendering directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,9 +354,9 @@ pub struct AgentDef {
     /// `standard`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_policy: Option<ContextPolicy>,
-    /// Parsed v2 declarative contract.  v2 never projects into the legacy
+    /// Parsed launch-v1 declarative contract.  launch-v1 never projects into the legacy
     /// runtime fields: a host must calculate and snapshot an
-    /// [`EffectiveVnextGrant`] before a v2 definition can receive any
+    /// [`EffectiveVnextGrant`] before a launch-v1 definition can receive any
     /// capability at all.
     #[serde(skip)]
     pub vnext: Option<VnextAgentDef>,
@@ -442,27 +446,51 @@ const ALL_TOOL_TIERS: &[ToolTier] = &[
     ToolTier::Disabled,
 ];
 const SAFETY_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled];
-const DIRECT_NATIVE_MEDIA_TIERS: &[ToolTier] = &[ToolTier::Enabled, ToolTier::Disabled];
+const DIRECT_NATIVE_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled, ToolTier::Disabled];
+
+/// Whether a built-in can move off the provider-visible native surface and
+/// remain available through Monty's runtime catalog instead.
+///
+/// This is shared with the tool builder and the TUI because it defines the
+/// cache boundary: only an adaptable tool's `Discoverable`/`Disabled`
+/// transition leaves the provider function schema unchanged.
+pub fn is_monty_builtin_adaptable(name: &str) -> bool {
+    if crate::tool_media_authority::is_media_tool_name(name) {
+        return false;
+    }
+    !matches!(
+        name,
+        "question"
+            | "return"
+            | "schedule"
+            | "task"
+            | "spawn"
+            | "defer_to_orchestrator"
+            | "raise"
+            | "start_build"
+            | "mcp"
+    )
+}
 
 pub fn known_tool_names() -> &'static [&'static str] {
     invariants::known_tool_names()
 }
 
-/// Computed runtime tier for display. vNext defs cannot author `toolTiers`;
-/// this is the engine's effective result, not the def.
+/// Computed runtime tier for display. vNext definitions can express only a
+/// native-vs-discoverable preference; this remains the host's effective result.
 pub fn computed_tool_tier(def: &AgentDef, tool: &str) -> ToolTier {
     let is_assistant = def
         .vnext
         .as_ref()
-        .is_some_and(|definition| definition.execution_kind == ExecutionKind::Assistant);
+        .is_some_and(|definition| definition.has_role(AgentRole::Assistant));
     crate::engine::builtin::effective_tool_tier(def, tool, is_assistant)
 }
 
 pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
-    if tool == "read_image" {
-        DIRECT_NATIVE_MEDIA_TIERS
-    } else if is_safety_tool(tool) {
+    if is_safety_tool(tool) {
         SAFETY_TOOL_TIERS
+    } else if !is_monty_builtin_adaptable(tool) {
+        DIRECT_NATIVE_TOOL_TIERS
     } else {
         ALL_TOOL_TIERS
     }
@@ -487,7 +515,7 @@ pub fn apply_tool_surface_override(
     def: &mut AgentDef,
     selection: &ToolSurfaceSelection,
 ) -> Result<()> {
-    // Host-owned session overrides remain valid for schemaVersion 2: v2 markdown
+    // Host-owned session overrides remain valid for launch schema v1: markdown
     // may not declare `tools:`, but the daemon/TUI still projects a concrete
     // runtime grant onto the in-memory definition before construction.
     let mut candidate = def.clone();
@@ -503,7 +531,39 @@ pub fn apply_tool_surface_override(
     Ok(())
 }
 
-/// Validate a host-projected tool grant on a v2 definition. v2
+/// Project the author-declared placement preference onto an already
+/// host-granted vNext surface. Preferences for names outside the host grant
+/// are intentionally ignored: a definition may influence presentation of a
+/// granted tool, never acquire a new one. This is the default path; the
+/// advanced tool-surface controls write session-scoped entries first, and
+/// those explicit entries win over the author's tier preference below.
+pub fn apply_author_tool_tier_preferences(def: &mut AgentDef) -> Result<()> {
+    let Some(preferences) = def
+        .vnext
+        .as_ref()
+        .map(|definition| definition.tool_tier_preferences.clone())
+    else {
+        return Ok(());
+    };
+    let Some(tools) = def.tools.clone() else {
+        // There is no resolved host grant to bound the preference yet.  The
+        // construction path resolves and projects that grant before calling
+        // this function; display-only callers leave the preference inert.
+        return Ok(());
+    };
+    let mut tool_tiers = def.tool_tiers.clone();
+    for (tool, tier) in preferences {
+        if tools.iter().any(|granted| granted == &tool) {
+            // A session projection may already have set this tier.  The
+            // author preference fills the host grant's default placement;
+            // it never overwrites a session-scoped override.
+            tool_tiers.entry(tool).or_insert(tier);
+        }
+    }
+    apply_tool_surface_override(def, &ToolSurfaceSelection { tools, tool_tiers })
+}
+
+/// Validate a host-projected tool grant on a launch-v1 definition. The
 /// [`validate_invariants`] only checks the closed declarative schema and skips
 /// legacy `tools:` rules, so the host override path applies those grant checks
 /// explicitly against the projected surface.
@@ -517,7 +577,7 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
     };
     // Reuse the same name/role checks a legacy `tools:` grant would see. Keep
     // the definition's existing mode (builtins still carry Primary/Subagent);
-    // workspace v2 documents default to `All`.
+    // workspace launch-v1 documents default to `All`.
     let mut legacy = def.clone();
     legacy.vnext = None;
     legacy.tools = Some(tools.clone());
@@ -955,9 +1015,11 @@ fn chat_ownable_primaries_with(cwd: &Path) -> Vec<String> {
         .filter(|listing| matches!(listing.kind, AgentKind::Custom))
         .filter_map(|listing| match listing.def {
             Ok(def)
-                if def.vnext.as_ref().is_some_and(|definition| {
-                    definition.execution_kind == ExecutionKind::Assistant
-                }) || def.vnext.is_none() && def.mode.is_chat_ownable() =>
+                if def
+                    .vnext
+                    .as_ref()
+                    .is_some_and(|definition| definition.has_role(AgentRole::Assistant))
+                    || def.vnext.is_none() && def.mode.is_chat_ownable() =>
             {
                 Some(listing.name)
             }
@@ -1136,9 +1198,6 @@ impl AgentDef {
         if let Some(perm) = &self.permission {
             fm.insert("permission".into(), serde_yaml::to_value(perm)?);
         }
-        if let Some(caps) = &self.capabilities {
-            fm.insert("capabilities".into(), serde_yaml::to_value(caps)?);
-        }
         if let Some(steering) = self.tool_steering {
             fm.insert("toolSteering".into(), serde_yaml::to_value(steering)?);
         }
@@ -1185,7 +1244,7 @@ impl AgentDef {
         let vnext = self
             .vnext
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 2 definition"))?;
+            .ok_or_else(|| anyhow::anyhow!("vNext grant requires a schemaVersion 1 definition"))?;
         let mut grant = vnext.resolve_grant(host)?;
         if let Some(delegation) = &mut grant.delegation {
             let mut package_definitions = BTreeMap::new();
@@ -1252,10 +1311,7 @@ impl AgentDef {
         let mut fm = serde_yaml::Mapping::new();
         fm.insert("schemaVersion".into(), (vnext.schema_version as u64).into());
         fm.insert("agentId".into(), vnext.agent_id.clone().into());
-        fm.insert(
-            "executionKind".into(),
-            serde_yaml::to_value(vnext.execution_kind)?,
-        );
+        fm.insert("roles".into(), serde_yaml::to_value(&vnext.roles)?);
         fm.insert(
             "modelSlots".into(),
             serde_yaml::to_value(&vnext.model_slots)?,
@@ -1278,8 +1334,17 @@ impl AgentDef {
                 serde_yaml::to_value(knowledge_bases)?,
             );
         }
-        if let Some(capabilities) = &self.capabilities {
-            fm.insert("capabilities".into(), serde_yaml::to_value(capabilities)?);
+        if !vnext.tool_tier_preferences.is_empty() {
+            fm.insert(
+                "toolTierPreferences".into(),
+                serde_yaml::to_value(&vnext.tool_tier_preferences)?,
+            );
+        }
+        if !vnext.capabilities.is_empty() {
+            fm.insert(
+                "capabilities".into(),
+                serde_yaml::to_value(&vnext.capabilities)?,
+            );
         }
         if let Some(tool_steering) = self.tool_steering {
             fm.insert("toolSteering".into(), serde_yaml::to_value(tool_steering)?);
@@ -1396,14 +1461,13 @@ fn parse_agent_with_scope(
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Frontmatter {
-        #[serde(rename = "schemaVersion", default)]
-        schema_version: Option<u8>,
-        #[serde(rename = "agentId", default)]
-        agent_id: Option<String>,
-        #[serde(rename = "executionKind", default)]
-        execution_kind: Option<ExecutionKind>,
-        #[serde(rename = "modelSlots", default)]
-        model_slots: Option<BTreeMap<String, ModelSlot>>,
+        #[serde(rename = "schemaVersion")]
+        schema_version: u8,
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        roles: Vec<AgentRole>,
+        #[serde(rename = "modelSlots")]
+        model_slots: BTreeMap<String, ModelSlot>,
         #[serde(default)]
         delegation: Option<DelegationPolicy>,
         #[serde(default)]
@@ -1412,28 +1476,12 @@ fn parse_agent_with_scope(
         verification: Option<VerificationPolicy>,
         #[serde(rename = "allowedKnowledgeBases", default)]
         allowed_knowledge_bases: Option<BTreeSet<String>>,
+        #[serde(rename = "toolTierPreferences", default)]
+        tool_tier_preferences: BTreeMap<String, ToolTier>,
         #[serde(default)]
         description: String,
         #[serde(default)]
-        mode: AgentMode,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        temperature: Option<f32>,
-        #[serde(default)]
-        tools: Option<Vec<String>>,
-        #[serde(rename = "toolTiers", default)]
-        tool_tiers: BTreeMap<String, ToolTier>,
-        #[serde(default, deserialize_with = "deserialize_tool_descriptions")]
-        tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
-        #[serde(rename = "scanToolResults", default)]
-        scan_tool_results: Option<bool>,
-        #[serde(rename = "goalSupervision", default)]
-        goal_supervision: GoalSettingsOverride,
-        #[serde(default)]
-        permission: Option<serde_json::Value>,
-        #[serde(default)]
-        capabilities: Option<BTreeSet<AgentCapability>>,
+        capabilities: BTreeSet<AgentCapability>,
         #[serde(rename = "toolSteering", default)]
         tool_steering: Option<ToolSteering>,
         #[serde(rename = "contextPolicy", default)]
@@ -1448,52 +1496,37 @@ fn parse_agent_with_scope(
             source.display()
         );
     }
-    // `questions` and `verification` are closed optional objects: omission is
-    // the only spelling for off.  Accepting YAML `null` would create a second,
-    // ambiguous wire representation that profile reduction could accidentally
-    // reinterpret as enabled later.
     let raw_frontmatter: serde_yaml::Value = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
             "agent `{name}` ({}) has invalid frontmatter: {e}",
             source.display()
         )
     })?;
-    let raw_keys = if let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter {
-        if mapping
-            .get(serde_yaml::Value::String("schemaVersion".to_string()))
-            .is_some_and(serde_yaml::Value::is_null)
-        {
-            bail!(
-                "agent `{name}` ({}) must declare schemaVersion: 2; null is not accepted",
-                source.display()
-            );
-        }
-        for key in ["delegation", "questions", "verification"] {
-            if mapping
-                .get(serde_yaml::Value::String(key.to_string()))
-                .is_some_and(serde_yaml::Value::is_null)
-            {
-                bail!(
-                    "agent `{name}` ({}) must omit `{key}` to disable it; null is not accepted",
-                    source.display()
-                );
-            }
-        }
-        mapping
-            .keys()
-            .filter_map(serde_yaml::Value::as_str)
-            .collect::<BTreeSet<_>>()
-    } else {
+    let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter else {
         bail!(
             "agent `{name}` ({}) frontmatter must be a YAML mapping",
             source.display()
         );
     };
-    if !raw_keys.contains("schemaVersion") {
+    if !mapping.contains_key(serde_yaml::Value::String("schemaVersion".to_string())) {
         bail!(
-            "agent `{name}` ({}) must declare schemaVersion: 2; legacy schema-less user AgentDefs are no longer supported",
+            "agent `{name}` ({}) must declare schemaVersion: {SCHEMA_VERSION}",
             source.display()
         );
+    }
+    // These optional objects have one unambiguous off spelling: omission.
+    // Keeping `null` out of the launch schema prevents a later projection
+    // from treating an explicitly supplied null as enabled or inherited.
+    for key in ["delegation", "questions", "verification"] {
+        if mapping
+            .get(serde_yaml::Value::String(key.to_string()))
+            .is_some_and(serde_yaml::Value::is_null)
+        {
+            bail!(
+                "agent `{name}` ({}) must omit `{key}` to disable it; null is not accepted",
+                source.display()
+            );
+        }
     }
     let fm: Frontmatter = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
@@ -1508,94 +1541,43 @@ fn parse_agent_with_scope(
         );
     }
 
-    let vnext = match fm.schema_version {
-        Some(SCHEMA_VERSION) => {
-            // Presence is the wire contract here, not the deserialized
-            // value.  In particular `mode: all`, `forkEligible: false`, and
-            // every `null` legacy spelling must be rejected rather than
-            // silently becoming a v2 default.
-            const LEGACY_V1_KEYS: &[&str] = &[
-                "mode",
-                "model",
-                "temperature",
-                "tools",
-                "toolTiers",
-                "tool_descriptions",
-                "toolDescriptions",
-                "scanToolResults",
-                "goalSupervision",
-                "permission",
-                "forkEligible",
-            ];
-            if let Some(field) = LEGACY_V1_KEYS.iter().find(|key| raw_keys.contains(*key)) {
-                bail!(
-                    "agent `{name}` ({}) is schemaVersion 2 and may not declare legacy field `{field}`",
-                    source.display(),
-                );
-            }
-            let definition = VnextAgentDef {
-                schema_version: SCHEMA_VERSION,
-                agent_id: fm.agent_id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires agentId",
-                        source.display()
-                    )
-                })?,
-                execution_kind: fm.execution_kind.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires executionKind",
-                        source.display()
-                    )
-                })?,
-                model_slots: fm.model_slots.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent `{name}` ({}) schemaVersion 2 requires modelSlots",
-                        source.display()
-                    )
-                })?,
-                delegation: fm.delegation.unwrap_or_default(),
-                questions: fm.questions,
-                verification: fm.verification,
-                allowed_knowledge_bases: fm.allowed_knowledge_bases,
-            };
-            definition.validate_for_scope(scope).map_err(|error| {
-                anyhow::anyhow!(
-                    "agent `{name}` ({}) has invalid schemaVersion 2 definition: {error}",
-                    source.display()
-                )
-            })?;
-            Some(definition)
-        }
-        Some(version) => bail!(
-            "agent `{name}` ({}) has unsupported schemaVersion `{version}`; only 2 is accepted",
-            source.display()
-        ),
-        None => bail!(
-            "agent `{name}` ({}) must declare schemaVersion: 2; legacy schema-less user AgentDefs are no longer supported",
-            source.display()
-        ),
+    let definition = VnextAgentDef {
+        schema_version: fm.schema_version,
+        agent_id: fm.agent_id,
+        roles: fm.roles,
+        capabilities: fm.capabilities,
+        model_slots: fm.model_slots,
+        delegation: fm.delegation.unwrap_or_default(),
+        questions: fm.questions,
+        verification: fm.verification,
+        allowed_knowledge_bases: fm.allowed_knowledge_bases,
+        tool_tier_preferences: fm.tool_tier_preferences,
     };
+    definition.validate_for_scope(scope).map_err(|error| {
+        anyhow::anyhow!(
+            "agent `{name}` ({}) has invalid launch-v1 definition: {error}",
+            source.display()
+        )
+    })?;
 
     Ok(AgentDef {
         name: name.to_string(),
         description: fm.description,
-        // `mode` belongs exclusively to the retired schema.  It remains as an
-        // internal field only while embedded legacy definitions exist; a v2
-        // document is classified from `executionKind` at every discovery and
-        // runtime reachability seam, never translated into a legacy mode.
-        mode: fm.mode,
-        model: fm.model,
-        temperature: fm.temperature,
-        tools: fm.tools,
-        tool_tiers: fm.tool_tiers,
-        tool_descriptions: fm.tool_descriptions,
-        scan_tool_results: fm.scan_tool_results,
-        goal_supervision: fm.goal_supervision,
-        permission: fm.permission,
-        capabilities: fm.capabilities,
+        // These legacy runtime fields have no authored launch-v1 spelling.
+        // The host projects grants and session overrides onto this in-memory
+        // definition immediately before construction.
+        mode: AgentMode::default(),
+        model: None,
+        temperature: None,
+        tools: None,
+        tool_tiers: BTreeMap::new(),
+        tool_descriptions: BTreeMap::new(),
+        scan_tool_results: None,
+        goal_supervision: GoalSettingsOverride::default(),
+        permission: None,
         tool_steering: fm.tool_steering,
         context_policy: fm.context_policy,
-        vnext,
+        vnext: Some(definition),
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).

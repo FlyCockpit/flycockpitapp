@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::credentials::CredentialStore;
 
 pub const CODEX_OAUTH_PROVIDER: &str = "codex-oauth";
+#[cfg(feature = "grok-subscription")]
 pub const GROK_OAUTH_PROVIDER: &str = "grok-oauth";
 pub const ACKNOWLEDGEMENT_TEXT: &str = "Using subscription credentials from this third-party client may violate the provider terms of service and may result in account suspension.";
 

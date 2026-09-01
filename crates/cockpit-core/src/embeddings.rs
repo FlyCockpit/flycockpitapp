@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::providers::{ProviderEntry, ProvidersConfig, ResolvedEmbeddingModel};
 use crate::engine::model::{Model, OutboundGuard};
@@ -25,7 +25,50 @@ pub struct OpenAiCompatEmbedder {
     headers: Vec<models_fetch::ResolvedHeader>,
     model: String,
     expected_dimensions: Option<u32>,
-    guard: OutboundGuard,
+    guard: Arc<Mutex<OutboundGuard>>,
+    command_refresh: Option<Arc<CommandRefresh>>,
+}
+
+/// Runtime state for a long-lived command-authenticated embedding client.
+/// The request that sends a credential owns its generation, so both must move
+/// together after every refresh rather than retaining construction-time data.
+struct CommandRefresh {
+    provider_id: String,
+    /// Live config authority. A rejection-triggered refresh may not execute
+    /// the argv from the construction-time provider entry after reload.
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    configured_generation: u64,
+    store: crate::credentials::CredentialStore,
+    request: Mutex<models_fetch::ResolvedRequest>,
+}
+
+impl CommandRefresh {
+    /// Resolve the command entry authorized by the current provider snapshot.
+    /// A removed command fails closed; a replacement is the only executable
+    /// this long-lived client may run.
+    fn current_entry(&self) -> Result<ProviderEntry> {
+        let snapshot = self.config.snapshot();
+        if snapshot.generation != self.configured_generation {
+            tracing::debug!(
+                provider_id = %self.provider_id,
+                configured_generation = self.configured_generation,
+                current_generation = snapshot.generation,
+                "embedding auth-command refresh re-authorized against reloaded provider config"
+            );
+        }
+        snapshot
+            .providers
+            .providers
+            .get(&self.provider_id)
+            .filter(|entry| entry.auth_command.is_some() || entry.oauth.is_some())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "provider `{}` no longer has global dynamic authentication authorized for embedding refresh",
+                    self.provider_id
+                )
+            })
+    }
 }
 
 impl OpenAiCompatEmbedder {
@@ -52,6 +95,7 @@ impl OpenAiCompatEmbedder {
             resolved.embedding_dimensions,
             session_redact,
             None,
+            None,
         )
         .await
     }
@@ -61,6 +105,7 @@ impl OpenAiCompatEmbedder {
         resolved: &ResolvedEmbeddingModel,
         session_redact: Arc<RedactionTable>,
         store: crate::credentials::CredentialStore,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
     ) -> Result<Self> {
         let entry = providers
             .providers
@@ -74,6 +119,7 @@ impl OpenAiCompatEmbedder {
             resolved.embedding_dimensions,
             session_redact,
             Some(store),
+            Some(config),
         )
         .await
     }
@@ -95,6 +141,7 @@ impl OpenAiCompatEmbedder {
             expected_dimensions,
             session_redact,
             None,
+            None,
         )
         .await
     }
@@ -107,8 +154,9 @@ impl OpenAiCompatEmbedder {
         expected_dimensions: Option<u32>,
         session_redact: Arc<RedactionTable>,
         store: Option<crate::credentials::CredentialStore>,
+        config: Option<&crate::daemon::session_worker::SessionConfigHandle>,
     ) -> Result<Self> {
-        let request = match store {
+        let request = match store.clone() {
             Some(store) => {
                 models_fetch::resolve_provider_request_async_with_store(
                     provider_id,
@@ -129,12 +177,24 @@ impl OpenAiCompatEmbedder {
             session_redact,
         );
         let guard = OutboundGuard::new(effective_redact);
-        Ok(Self::from_resolved_request(
-            request,
-            model.to_string(),
-            expected_dimensions,
-            guard,
-        ))
+        let command_request = request.clone();
+        Ok(
+            Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
+                .with_command_refresh(
+                    store
+                        .zip(config)
+                        .filter(|_| entry.auth_command.is_some() || entry.oauth.is_some())
+                        .map(|(store, config)| {
+                            Arc::new(CommandRefresh {
+                                provider_id: provider_id.to_string(),
+                                config: config.live(),
+                                configured_generation: providers.resolution_generation,
+                                store,
+                                request: Mutex::new(command_request),
+                            })
+                        }),
+                ),
+        )
     }
 
     #[allow(dead_code)]
@@ -150,53 +210,132 @@ impl OpenAiCompatEmbedder {
             headers: request.headers,
             model,
             expected_dimensions,
-            guard,
+            guard: Arc::new(Mutex::new(guard)),
+            command_refresh: None,
         }
     }
 
-    fn embeddings_url(&self) -> String {
-        format!("{}/embeddings", self.base_url.trim_end_matches('/'))
+    fn with_command_refresh(mut self, command_refresh: Option<Arc<CommandRefresh>>) -> Self {
+        self.command_refresh = command_refresh;
+        self
+    }
+
+    fn request<'a>(
+        &self,
+        body: &EmbeddingsRequest<'a>,
+        base_url: &str,
+        headers: &[models_fetch::ResolvedHeader],
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(format!("{}/embeddings", base_url.trim_end_matches('/')))
+            .json(body);
+        let effective_ua = headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+            .map(|header| header.value.clone())
+            .unwrap_or_else(|| crate::user_agent::user_agent().to_owned());
+        req = req.header(reqwest::header::USER_AGENT, effective_ua);
+        for header in headers {
+            if !header.name.eq_ignore_ascii_case("user-agent") {
+                req = req.header(&header.name, &header.value);
+            }
+        }
+        req
+    }
+
+    fn current_request(&self) -> (String, Vec<models_fetch::ResolvedHeader>, Option<u64>) {
+        self.command_refresh
+            .as_ref()
+            .map(|refresh| {
+                let request = refresh
+                    .request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (
+                    request.base_url.clone(),
+                    request.headers.clone(),
+                    request.command_credential_generation(),
+                )
+            })
+            .unwrap_or_else(|| (self.base_url.clone(), self.headers.clone(), None))
+    }
+
+    fn guard(&self) -> OutboundGuard {
+        self.guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
 #[async_trait]
 impl Embedder for OpenAiCompatEmbedder {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let redacted = self.guard.scrub_many(texts);
+        let redacted = self.guard().scrub_many(texts);
         let redacted_refs: Vec<&str> = redacted.iter().map(String::as_str).collect();
         let body = EmbeddingsRequest {
             model: &self.model,
             input: &redacted_refs,
         };
-        let mut req = self.client.post(self.embeddings_url()).json(&body);
-        // Canonical UA unless the provider configuration supplies one.
-        // Emit exactly once, then skip every case-insensitive User-Agent when
-        // applying the remaining resolved headers (matches catalog/auth/usage).
-        let effective_ua = self
-            .headers
-            .iter()
-            .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
-            .map(|header| header.value.as_str())
-            .unwrap_or_else(|| crate::user_agent::user_agent());
-        req = req.header(reqwest::header::USER_AGENT, effective_ua);
-        for header in &self.headers {
-            if header.name.eq_ignore_ascii_case("user-agent") {
-                continue;
-            }
-            req = req.header(&header.name, &header.value);
-        }
-
-        let response = req.send().await.context("sending embeddings request")?;
+        let (base_url, headers, request_generation) = self.current_request();
+        let response = self
+            .request(&body, &base_url, &headers)
+            .send()
+            .await
+            .context("sending embeddings request")?;
+        let refreshed = if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            self.command_refresh.as_ref()
+        } else {
+            None
+        };
+        let response = if let Some(refresh) = refreshed {
+            let request = models_fetch::refresh_provider_request_async_with_store_authorized(
+                &refresh.provider_id,
+                refresh.store.clone(),
+                |name| std::env::var(name).ok(),
+                request_generation,
+                || refresh.current_entry(),
+            )
+            .await?;
+            // The store now contains the refreshed command result. Update
+            // both request provenance and diagnostic redaction before the
+            // retry can send or surface a provider body.
+            let guard = self
+                .guard()
+                .with_current_provider_auth_command_values(&refresh.store)?;
+            *self
+                .guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
+            *refresh
+                .request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = request.clone();
+            self.request(&body, &request.base_url, &request.headers)
+                .send()
+                .await
+                .context("retrying embeddings request after credential refresh")?
+        } else {
+            response
+        };
         let status = response.status();
         let text = response
             .text()
             .await
             .context("reading embeddings response")?;
+        let diagnostic = self.guard().scrub(&text);
         if !status.is_success() {
-            anyhow::bail!("embeddings request returned {status}: {}", snippet(&text));
+            anyhow::bail!(
+                "embeddings request returned {status}: {}",
+                snippet(&diagnostic)
+            );
         }
         let parsed: EmbeddingsResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parsing embeddings response: {}", snippet(&text)))?;
+            .with_context(|| format!("parsing embeddings response: {}", snippet(&diagnostic)))?;
         if parsed.data.len() != texts.len() {
             anyhow::bail!(
                 "embeddings response count mismatch: requested {}, got {}",
@@ -268,6 +407,8 @@ fn snippet(body: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::RwLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -280,8 +421,9 @@ mod tests {
         body: String,
     }
 
-    async fn capture_embedding_server_with_response(
+    async fn capture_embedding_server_with_response_status(
         response_body: &'static str,
+        status: &'static str,
     ) -> (
         String,
         tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
@@ -325,13 +467,22 @@ mod tests {
                 }
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (format!("http://{addr}/v1"), rx)
+    }
+
+    async fn capture_embedding_server_with_response(
+        response_body: &'static str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
+    ) {
+        capture_embedding_server_with_response_status(response_body, "200 OK").await
     }
 
     async fn capture_embedding_server() -> (
@@ -395,6 +546,7 @@ mod tests {
                     name: "Authorization".into(),
                     value: "Bearer test-token".into(),
                 }],
+                is_codex_credential: false,
             },
             "text-embedding-3-small".into(),
             Some(3),
@@ -477,6 +629,101 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedding_refresh_does_not_run_a_command_revoked_while_waiting() {
+        use crate::config::providers::{AuthKind, ModelEntry, ProviderEntry, ProvidersConfig};
+        use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+
+        const PROVIDER_ID: &str = "embedding-refresh-revoked-while-waiting";
+        let temp = tempfile::tempdir().unwrap();
+        let executions = temp.path().join("auth-command-executions");
+        let (base_url, request_rx) = capture_embedding_server_with_response_status(
+            r#"{"error":"expired"}"#,
+            "401 Unauthorized",
+        )
+        .await;
+        let entry = ProviderEntry {
+            url: base_url,
+            auth: Some(AuthKind::Command),
+            auth_command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'executed\\n' >> \"$1\"; printf '%s' '{\"token\":\"test-token\",\"expires_at\":null}'"
+                    .into(),
+                "auth-command".into(),
+                executions.to_string_lossy().into_owned(),
+            ]),
+            models: vec![ModelEntry {
+                id: "text-embedding-3-small".into(),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        };
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert(PROVIDER_ID.into(), entry.clone());
+        let config = SessionConfigHandle::new(Arc::new(RwLock::new(SessionConfigSnapshot::new(
+            1,
+            providers.clone(),
+            crate::config::extended::ExtendedConfig::default(),
+        ))));
+        let store = crate::credentials::CredentialStore::open(temp.path().join("credentials.json"))
+            .unwrap();
+        let embedder = OpenAiCompatEmbedder::for_provider_entry_with_store(
+            &providers,
+            PROVIDER_ID,
+            &entry,
+            "text-embedding-3-small",
+            Some(3),
+            secret_table(),
+            Some(store),
+            Some(&config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&executions).unwrap(), "executed\n");
+
+        // Occupy the same production refresh guard so the rejected embedding
+        // request is queued when its provider config is reloaded.
+        let (guard_entered_tx, guard_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_guard_tx, release_guard_rx) = tokio::sync::oneshot::channel();
+        let guard = tokio::spawn(async move {
+            crate::auth::refresh_guard::serialized_refresh(PROVIDER_ID, || async move {
+                let _ = guard_entered_tx.send(());
+                let _ = release_guard_rx.await;
+            })
+            .await;
+        });
+        guard_entered_rx.await.unwrap();
+
+        let embedding = tokio::spawn(async move { embedder.embed(&["queued refresh"]).await });
+        let _request = request_rx.await.unwrap();
+
+        let mut revoked_providers = providers;
+        revoked_providers.providers.remove(PROVIDER_ID);
+        config.set_full_config_snapshot_for_tests(SessionConfigSnapshot::new(
+            2,
+            revoked_providers,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let _ = release_guard_tx.send(());
+        guard.await.unwrap();
+
+        let error = embedding.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer has a global auth_command")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&executions).unwrap(),
+            "executed\n",
+            "the production embedding retry must not spawn the revoked command"
+        );
+    }
+
     #[tokio::test]
     async fn embedding_user_agent_configured_override_wins() {
         let (base_url, capture_rx) = capture_embedding_server_with_response(
@@ -500,6 +747,7 @@ mod tests {
                         value: "second-ua/2".into(),
                     },
                 ],
+                is_codex_credential: false,
             },
             "text-embedding-3-small".into(),
             Some(3),
@@ -537,6 +785,7 @@ mod tests {
                         value: "configured-ua/1".into(),
                     },
                 ],
+                is_codex_credential: false,
             },
             "text-embedding-3-small".into(),
             Some(3),
@@ -556,13 +805,18 @@ mod tests {
             models_fetch::ResolvedRequest {
                 base_url: "http://127.0.0.1:1/v1".into(),
                 headers: vec![],
+                is_codex_credential: false,
             },
             "text-embedding-3-small".into(),
             Some(3),
             guard,
         );
 
-        let _: &OutboundGuard = &embedder.guard;
+        let guard = embedder
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _: &OutboundGuard = &guard;
     }
 
     #[tokio::test]
@@ -636,12 +890,17 @@ mod tests {
             models_fetch::ResolvedRequest {
                 base_url: "http://127.0.0.1:1/v1".into(),
                 headers: vec![],
+                is_codex_credential: false,
             },
             "text-embedding-3-small".into(),
             Some(3),
             guard(false),
         );
 
-        let _: &OutboundGuard = &embedder.guard;
+        let guard = embedder
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _: &OutboundGuard = &guard;
     }
 }

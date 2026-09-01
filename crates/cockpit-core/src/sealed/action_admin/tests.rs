@@ -242,16 +242,19 @@ fn https_kind_credential_placement_is_fixed_header() {
         SealedActionKind::KnowledgeBaseCopy { .. } => {
             panic!("expected HTTPS action kind");
         }
+        SealedActionKind::Command { .. } | SealedActionKind::File { .. } => {
+            panic!("expected HTTPS action kind");
+        }
     }
 }
 
 #[test]
-fn https_kind_credential_placement_query() {
+fn https_kind_credential_placement_body() {
     let origins = HttpsOriginAllowlist::from_raw(&["https://metrics.example.com"]).unwrap();
     let kind = SealedActionKind::Https {
         origins,
-        credential_placement: HttpsCredentialPlacement::Query {
-            param_name: "api_key".to_string(),
+        credential_placement: HttpsCredentialPlacement::Body {
+            content_type: "application/octet-stream".to_string(),
         },
         path_template: "/v1/publish".to_string(),
         projection: SealedProjectionId::HttpStatus,
@@ -699,12 +702,12 @@ fn https_kind_rejects_path_template_without_leading_slash() {
 }
 
 #[test]
-fn https_kind_rejects_bad_query_param_name() {
+fn https_kind_rejects_bad_body_content_type() {
     let origins = HttpsOriginAllowlist::from_raw(&["https://api.example.com"]).unwrap();
     let kind = SealedActionKind::Https {
         origins,
-        credential_placement: HttpsCredentialPlacement::Query {
-            param_name: "bad param".to_string(), // space
+        credential_placement: HttpsCredentialPlacement::Body {
+            content_type: "bad content type".to_string(),
         },
         path_template: "/v1/test".to_string(),
         projection: SealedProjectionId::None,

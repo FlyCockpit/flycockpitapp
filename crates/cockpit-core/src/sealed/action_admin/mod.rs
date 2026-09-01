@@ -17,7 +17,9 @@
 //!   IP literal, no user-info, no query, no fragment.
 //! * [`HttpsOriginAllowlist`] — a bounded, validated set of origins.
 //! * [`HttpsCredentialPlacement`] — fixed credential placement: header or
-//!   query, never body, never path, never model-supplied.
+//!   whole body, never path and never model-supplied.
+//! * command argument/environment and file sinks whose argv, environment key,
+//!   destination, persistence, and consumer are immutable Owner-owned data.
 //! * [`SealedProjectionId`] — the fixed projection enum selected by
 //!   `fixed-projection-id`. Each variant maps to a fixed set of safe response
 //!   fields.
@@ -40,6 +42,8 @@
 //!   credential placement, typed bounded non-secret parameters, host-owned
 //!   request template, redirect policy deny, fixed projection enum selected
 //!   by `fixed-projection-id`, and timeout/size limits.
+//! * Local commands never invoke a shell. Files are 0600, git-guarded, and
+//!   ephemeral by default; persistence is an explicit Owner-approved downgrade.
 //! * Updating creates a new revision, atomically retires the old one, and
 //!   revokes dependent grants before the snapshot changes.
 //! * Deletion (retire) revokes dependent grants first.
@@ -225,9 +229,9 @@ impl HttpsOriginAllowlist {
 pub enum HttpsCredentialPlacement {
     /// A fixed header name. The credential value is placed in this header.
     Header { header_name: String },
-    /// A fixed query parameter name. The credential value is placed in this
-    /// query parameter.
-    Query { param_name: String },
+    /// The complete request body. The sealed literal is sent as the body and
+    /// is never interpolated into model-authored data.
+    Body { content_type: String },
 }
 
 impl HttpsCredentialPlacement {
@@ -245,15 +249,15 @@ impl HttpsCredentialPlacement {
                     bail!("credential header name must be alphanumeric with '-' or '_'");
                 }
             }
-            Self::Query { param_name } => {
-                if param_name.is_empty() || param_name.len() > 64 {
-                    bail!("credential query param name must be 1..64 bytes");
+            Self::Body { content_type } => {
+                if content_type.is_empty() || content_type.len() > 128 {
+                    bail!("credential body content type must be 1..128 bytes");
                 }
-                if !param_name
+                if !content_type
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'-' | b'.'))
                 {
-                    bail!("credential query param name must be alphanumeric with '_' or '.'");
+                    bail!("credential body content type contains invalid bytes");
                 }
             }
         }
@@ -363,6 +367,22 @@ pub enum SealedActionKind {
         projection: SealedProjectionId,
         parameters: BTreeMap<String, SealedParamSpecJson>,
     },
+    /// A fixed local command with the literal injected into either one argv
+    /// placeholder or one environment variable. No shell is involved.
+    Command {
+        argv_template: Vec<String>,
+        executable_identity: local_executor::ExecutableIdentity,
+        injection: local_executor::CommandInjection,
+        parameters: BTreeMap<String, SealedParamSpecJson>,
+    },
+    /// Materialize to an Owner-pinned destination and optionally run a fixed
+    /// consumer. Ephemeral mode requires a consumer and deletes on every exit.
+    File {
+        destination: local_executor::FileDestination,
+        persistence: local_executor::FilePersistence,
+        consumer_argv: Vec<String>,
+        consumer_executable_identity: Option<local_executor::ExecutableIdentity>,
+    },
     /// A local-only custody transfer to exactly one immutable KB attachment.
     /// It has no outbound destination and no model-supplied parameters.
     KnowledgeBaseCopy {
@@ -458,6 +478,28 @@ impl SealedActionKind {
                 }
                 Ok(())
             }
+            Self::Command {
+                argv_template,
+                executable_identity,
+                injection,
+                parameters,
+            } => local_executor::validate_command_kind(
+                argv_template,
+                executable_identity,
+                injection,
+                parameters,
+            ),
+            Self::File {
+                destination,
+                persistence,
+                consumer_argv,
+                consumer_executable_identity,
+            } => local_executor::validate_file_kind(
+                destination,
+                persistence.clone(),
+                consumer_argv,
+                consumer_executable_identity.as_ref(),
+            ),
         }
     }
 
@@ -506,6 +548,33 @@ impl SealedActionKind {
                 descriptor.validate()?;
                 Ok(descriptor)
             }
+            Self::Command { parameters, .. } => {
+                let descriptor = SealedActionDescriptor {
+                    action_id,
+                    revision,
+                    summary: summary.to_string(),
+                    parameters: parameters
+                        .iter()
+                        .map(|(name, spec)| (name.clone(), spec.to_spec()))
+                        .collect(),
+                    completion: SealedCompletion::fixed([("outcome", "completed")]),
+                    response_after_ms: HTTPS_TIMEOUT_MS,
+                };
+                descriptor.validate()?;
+                Ok(descriptor)
+            }
+            Self::File { .. } => {
+                let descriptor = SealedActionDescriptor {
+                    action_id,
+                    revision,
+                    summary: summary.to_string(),
+                    parameters: BTreeMap::new(),
+                    completion: SealedCompletion::fixed([("outcome", "completed")]),
+                    response_after_ms: HTTPS_TIMEOUT_MS,
+                };
+                descriptor.validate()?;
+                Ok(descriptor)
+            }
         }
     }
 
@@ -514,6 +583,7 @@ impl SealedActionKind {
         match self {
             Self::Https { projection, .. } => *projection,
             Self::KnowledgeBaseCopy { .. } => SealedProjectionId::None,
+            Self::Command { .. } | Self::File { .. } => SealedProjectionId::None,
         }
     }
 
@@ -522,6 +592,7 @@ impl SealedActionKind {
         match self {
             Self::Https { origins, .. } => Some(origins),
             Self::KnowledgeBaseCopy { .. } => None,
+            Self::Command { .. } | Self::File { .. } => None,
         }
     }
 
@@ -533,6 +604,7 @@ impl SealedActionKind {
                 ..
             } => Some(credential_placement),
             Self::KnowledgeBaseCopy { .. } => None,
+            Self::Command { .. } | Self::File { .. } => None,
         }
     }
 }
@@ -570,6 +642,10 @@ impl SealedHostAction for KnowledgeBaseCopyAction {
 
     fn knowledge_base_copy_target(&self) -> Option<&SealedKnowledgeBaseId> {
         Some(&self.knowledge_base_id)
+    }
+
+    fn sink_kind(&self) -> &'static str {
+        "file"
     }
 
     async fn invoke(
@@ -682,15 +758,14 @@ impl SealedActionDirectory {
         request: CreateSealedAction,
         now_ms: i64,
     ) -> Result<SealedActionInstanceSummary> {
-        request.kind.validate()?;
+        let mut kind = request.kind;
+        pin_local_executables(&mut kind)?;
+        kind.validate()?;
         // The daemon mints the id; no caller input can choose or collide with it.
         let action_id = uuid::Uuid::new_v4().to_string();
         // Compile the descriptor to validate the id + revision before persisting.
-        request
-            .kind
-            .compile_descriptor(&action_id, 1, request.description.as_str())?;
-        let kind_json =
-            serde_json::to_string(&request.kind).context("serializing sealed action kind")?;
+        kind.compile_descriptor(&action_id, 1, request.description.as_str())?;
+        let kind_json = serde_json::to_string(&kind).context("serializing sealed action kind")?;
         self.db
             .insert_sealed_action_instance(
                 cockpit_db::db::sealed_actions::NewSealedActionInstance {
@@ -829,6 +904,37 @@ impl SealedActionDirectory {
     }
 }
 
+/// Convert local action executables into canonical absolute paths before the
+/// immutable owner snapshot is written. This is intentionally at the sole
+/// persistence entry point, so direct internal callers cannot bypass it.
+fn pin_local_executables(kind: &mut SealedActionKind) -> Result<()> {
+    match kind {
+        SealedActionKind::Command {
+            argv_template,
+            executable_identity,
+            ..
+        } => {
+            *executable_identity = local_executor::pin_argv_executable(argv_template)?;
+            Ok(())
+        }
+        SealedActionKind::File {
+            destination,
+            consumer_argv,
+            consumer_executable_identity,
+            ..
+        } => {
+            local_executor::pin_file_destination(destination)?;
+            *consumer_executable_identity = if consumer_argv.is_empty() {
+                None
+            } else {
+                Some(local_executor::pin_argv_executable(consumer_argv)?)
+            };
+            Ok(())
+        }
+        SealedActionKind::Https { .. } | SealedActionKind::KnowledgeBaseCopy { .. } => Ok(()),
+    }
+}
+
 /// Decode + REVALIDATE a persisted action kind. Derived `Deserialize` bypasses
 /// the validating constructors (`HttpsOrigin::parse`, `SealedActionKind::validate`),
 /// so a semantically-invalid-but-serde-valid stored `kind_json` (e.g. an
@@ -859,6 +965,8 @@ fn summary_from_row(
     let kind_tag = match kind {
         SealedActionKind::Https { .. } => "https",
         SealedActionKind::KnowledgeBaseCopy { .. } => "knowledge_base_copy",
+        SealedActionKind::Command { injection, .. } => injection.sink_kind(),
+        SealedActionKind::File { .. } => "file",
     };
     Ok(SealedActionInstanceSummary {
         action_id: row.action_id.clone(),
@@ -890,6 +998,7 @@ fn snapshot_from_row(
 }
 
 pub mod executor;
+pub mod local_executor;
 
 /// The shared production HTTPS transport (a redirect-disabled, proxy-ignoring
 /// reqwest client). Cheap to clone; safe to share across every action and
@@ -956,6 +1065,19 @@ pub async fn build_live_registry(
             }
             SealedActionKind::KnowledgeBaseCopy { .. } => {
                 let Ok(action) = KnowledgeBaseCopyAction::from_snapshot(&snapshot) else {
+                    continue;
+                };
+                builder = builder.with_action(std::sync::Arc::new(action))?;
+            }
+            SealedActionKind::Command { .. } => {
+                let Ok(action) = local_executor::CommandSealedAction::from_snapshot(&snapshot)
+                else {
+                    continue;
+                };
+                builder = builder.with_action(std::sync::Arc::new(action))?;
+            }
+            SealedActionKind::File { .. } => {
+                let Ok(action) = local_executor::FileSealedAction::from_snapshot(&snapshot) else {
                     continue;
                 };
                 builder = builder.with_action(std::sync::Arc::new(action))?;

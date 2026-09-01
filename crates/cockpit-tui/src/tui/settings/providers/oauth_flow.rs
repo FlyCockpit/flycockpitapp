@@ -1,7 +1,9 @@
 use super::super::pointer_actions::OAuthFlowId;
 use super::*;
 #[cfg(test)]
-use cockpit_core::auth::{codex_oauth, xai_oauth};
+use cockpit_core::auth::codex_oauth;
+#[cfg(all(test, feature = "grok-subscription"))]
+use cockpit_core::auth::xai_oauth;
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -148,7 +150,7 @@ pub(crate) fn present_oauth_on_blocking_worker(
 }
 
 #[derive(Debug, Clone)]
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) struct OAuthBrowserBegin {
     pub(crate) login: xai_oauth::ManualLogin,
     listening: bool,
@@ -157,7 +159,7 @@ pub(crate) struct OAuthBrowserBegin {
     ssh: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 impl OAuthBrowserBegin {
     pub(crate) fn for_test(listening: bool, ssh: bool) -> Self {
         Self {
@@ -170,7 +172,7 @@ impl OAuthBrowserBegin {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) struct GrokBrowserStart {
     pub(crate) begin: OAuthBrowserBegin,
     pub(crate) listener: Option<tokio::net::TcpListener>,
@@ -182,7 +184,7 @@ pub(crate) struct OAuthEffects {
         fn(&str) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
     pub(super) is_ssh: fn() -> bool,
     pub(super) open: fn(&str) -> anyhow::Result<()>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "grok-subscription"))]
     pub(super) bind: fn(u16) -> anyhow::Result<tokio::net::TcpListener>,
 }
 
@@ -223,7 +225,7 @@ impl OAuthEffects {
             copy: copy_plain_no_recovery,
             is_ssh: cockpit_host::sysinfo::is_ssh,
             open: cockpit_core::browser::open,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "grok-subscription"))]
             bind: cockpit_core::auth::xai_oauth::bind_callback_listener,
         }
     }
@@ -367,7 +369,7 @@ impl OAuthOption {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) fn prepare_grok_browser_start(
     login: xai_oauth::ManualLogin,
     effects: OAuthEffects,

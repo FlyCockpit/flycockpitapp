@@ -229,7 +229,7 @@ cockpit packages prune --dry-run
 | `cockpit agent install OWNER/REPO[@REV]:PATH --scope global\|workspace-private\|workspace` | Ask the daemon to install a versioned agent definition. |
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
-| `cockpit assistant list` | List persistent assistants. |
+| `cockpit assistants list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
@@ -840,6 +840,29 @@ its sealed payload when reconciliation observes it; retention never deletes an
 open lease row alone and leaves encrypted payload orphaned.
 
 Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are permanently redacted regardless of provider trust.
+
+### Sealed reference injection
+
+An Owner-declared sealed action can inject a granted sealed value into one
+fixed command argument, one process environment variable, an HTTPS header or
+body, or a pinned file sink. The model names only the value reference, action,
+and bounded declared parameters; it cannot choose the command, environment
+key, endpoint, header, request template, file path, persistence, or output
+projection. Command output is scrubbed before it can be projected, and each
+injection is durably audited before the sink receives plaintext.
+
+Argument and environment injection are preferred because they leave no
+plaintext on disk. File actions use mode 0600, reject symlink targets, prefer a
+private runtime directory when the consumer accepts a path, and refuse a
+Git-tracked or non-ignored destination. Ephemeral actions delete the file after
+their fixed consumer exits (including error exits). Persistent materialization
+is a separate Owner-approved downgrade.
+
+The persistent-file approval must be treated honestly: once plaintext is
+materialized, its consumer can transform or exfiltrate it (for example by
+encoding it). Redaction remains defense in depth, not a containment boundary.
+Approve only the declared action and pinned destination, and remove persistent
+material promptly when it is no longer needed.
 
 ### Limits of the protections
 

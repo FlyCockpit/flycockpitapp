@@ -166,24 +166,16 @@ impl Entry {
 }
 
 fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry) -> Entry {
-    let native_anthropic = cockpit_config::providers::is_anthropic_native_base_url(&provider.url);
     let wire_api = if !model.wire_api.is_auto() && model.wire_api_provenance.is_user_configured() {
         model.wire_api
     } else if !provider.wire_api.is_auto() {
         provider.wire_api
-    } else if let Some(wire_api) = model.capabilities.preferred_wire_api() {
-        wire_api
-    } else if !model.wire_api.is_auto() {
-        // A recovered endpoint remains useful when no fresh catalog declares
-        // an endpoint, but never outranks that catalog above.
-        model.wire_api
     } else {
-        cockpit_config::providers::WireApi::detect_for_provider_entry(
-            provider_id,
-            provider,
-            &model.id,
+        cockpit_config::providers::default_wire_api_for_template(
+            provider.effective_template(provider_id),
         )
     };
+    let native_anthropic = wire_api == cockpit_config::providers::WireApi::Anthropic;
     let reasoning_effort = if native_anthropic
         && cockpit_config::providers::validate_anthropic_model_configuration(provider, &model.id)
             .is_err()

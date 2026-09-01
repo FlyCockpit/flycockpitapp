@@ -27,6 +27,10 @@
 //!
 //! This module contains ZERO provider-specific preset strings: a preset that
 //! maps a product toggle to a concrete argv lives in the UI layer, never here.
+//!
+//! The same daemon seam also spawns sealed-action consumers with one literal
+//! injected into argv or the child environment. Those calls share the no-shell,
+//! null-stdin, timeout, capture-bound, and redacted-debug contract.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -184,6 +188,264 @@ impl CommandSecretExecutor for SubprocessCommandExecutor {
     }
 }
 
+/// Captured output from a process that consumed an injected sealed value.
+/// Debug rendering is permanently redacted; callers must pass both byte
+/// buffers through the redaction scrub before doing anything else with them.
+pub(crate) struct InjectedCommandCapture {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl std::fmt::Debug for InjectedCommandCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedCommandCapture")
+            .field("success", &self.success)
+            .field("stdout", &"<redacted>")
+            .field("stderr", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Spawn a fixed argv directly with an optional sealed environment binding.
+/// This is the common daemon seam used by command-argument, process-env, and
+/// file-consumer actions. It never invokes a shell, never writes the injected
+/// value to disk, nulls stdin, and applies the command-secret timeout.
+pub(crate) async fn run_injected_process(
+    argv: &[String],
+    environment: Option<(&str, &str)>,
+    executable_identity: Option<crate::sealed::action_admin::local_executor::ExecutableIdentity>,
+) -> Result<InjectedCommandCapture, CommandSecretError> {
+    let (program, args) = argv.split_first().ok_or(CommandSecretError::EmptySpec)?;
+    let pinned_executable = if let Some(identity) = executable_identity {
+        open_identity_pinned_executable(program, identity)?
+    } else {
+        return Err(CommandSecretError::Io("identity_pin_missing".to_string()));
+    };
+    #[cfg(test)]
+    run_after_executable_snapshot_test_hook(program);
+    let mut command = tokio::process::Command::new(pinned_executable.launch_path());
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    {
+        // Executing through procfs must not change argv[0] semantics. This is
+        // particularly important for static multi-call binaries, which choose
+        // their behavior from the approved executable's basename.
+        command.arg0(program);
+    }
+    command
+        .args(args)
+        // The action snapshot has already pinned an absolute executable. Do
+        // not donate the daemon's PATH, credentials, proxy configuration, or
+        // other ambient state to the plaintext consumer.
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().map_err(map_spawn_error)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandSecretError::Io("stdout_unavailable".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandSecretError::Io("stderr_unavailable".to_string()))?;
+    let (stdout, stderr, status) =
+        drain_capped_child(&mut child, stdout, stderr, COMMAND_SECRET_TIMEOUT).await?;
+    Ok(InjectedCommandCapture {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Open the approved executable without following its final component and
+/// prove its persisted object identity and content digest. The returned
+/// descriptor remains alive until the child has been spawned; Linux executes
+/// it through `/proc/self/fd`, so replacing the stored pathname after approval
+/// cannot redirect the child.
+fn open_identity_pinned_executable(
+    program: &str,
+    identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+) -> Result<PinnedExecutable, CommandSecretError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(program)
+            .map_err(map_spawn_error)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return PinnedExecutable::sealed_linux_snapshot(file, identity);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            return PinnedExecutable::unlinked_apple_snapshot(file, identity);
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        {
+            let _ = (file, identity);
+            Err(CommandSecretError::Io(
+                "identity_pin_unsupported".to_string(),
+            ))
+        }
+    }
+    #[cfg(windows)]
+    {
+        // CreateProcessW accepts a pathname, not an already-open executable
+        // object. A pre-existing write-sharing handle can therefore alter the
+        // verified inode before image creation even while our read lease is
+        // held. Until this funnel owns a proven Windows snapshot launch, do
+        // not silently fall back to that pathname race.
+        let _ = (program, identity);
+        Err(CommandSecretError::Io(
+            "identity_pin_unsupported".to_string(),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (program, identity);
+        Err(CommandSecretError::Io(
+            "identity_pin_unsupported".to_string(),
+        ))
+    }
+}
+
+struct PinnedExecutable {
+    _file: std::fs::File,
+    launch_path: String,
+}
+
+impl PinnedExecutable {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn sealed_linux_snapshot(
+        mut source: std::fs::File,
+        identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+    ) -> Result<Self, CommandSecretError> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let name = CString::new("cockpit-sealed-executable").expect("static memfd name");
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        if fd < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
+        }
+        let mut snapshot = unsafe { std::fs::File::from_raw_fd(fd) };
+        identity
+            .copy_approved_bytes(&mut source, &mut snapshot)
+            .map_err(|_| CommandSecretError::Io("identity_pin_changed".to_string()))?;
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
+        }
+        Ok(Self {
+            launch_path: format!("/proc/self/fd/{}", snapshot.as_raw_fd()),
+            _file: snapshot,
+        })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn unlinked_apple_snapshot(
+        mut source: std::fs::File,
+        identity: crate::sealed::action_admin::local_executor::ExecutableIdentity,
+    ) -> Result<Self, CommandSecretError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        // The directory is owner-only and the inode is new, so no outside
+        // writer can acquire it while the approved bytes are copied. Reopen it
+        // read-only, unlink it, and drop the sole writable handle before the
+        // descriptor becomes executable authority.
+        let directory = tempfile::Builder::new()
+            .prefix("cockpit-executable-")
+            .tempdir()
+            .map_err(map_spawn_error)?;
+        let path = directory.path().join("snapshot");
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .map_err(map_spawn_error)?;
+        identity
+            .copy_approved_bytes(&mut source, &mut writer)
+            .map_err(|_| CommandSecretError::Io("identity_pin_changed".to_string()))?;
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .map_err(map_spawn_error)?;
+        let snapshot = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(map_spawn_error)?;
+        std::fs::remove_file(&path).map_err(map_spawn_error)?;
+        drop(writer);
+        drop(directory);
+
+        // Scripts need the descriptor after the kernel hands `/dev/fd/N` to
+        // their interpreter, so FD_CLOEXEC must remain clear on this read-only
+        // snapshot descriptor.
+        if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            return Err(CommandSecretError::Io(io_kind_label(
+                std::io::Error::last_os_error().kind(),
+            )));
+        }
+        Ok(Self {
+            launch_path: format!("/dev/fd/{}", snapshot.as_raw_fd()),
+            _file: snapshot,
+        })
+    }
+
+    fn launch_path(&self) -> &str {
+        &self.launch_path
+    }
+}
+
+#[cfg(test)]
+type ExecutableSnapshotTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK: std::sync::Mutex<
+    Option<(String, ExecutableSnapshotTestHook)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_executable_snapshot_test_hook(program: &str) {
+    let mut slot = AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK
+        .lock()
+        .expect("executable snapshot test hook lock");
+    let hook = match slot.as_ref() {
+        Some((expected_program, _)) if expected_program == program => {
+            slot.take().map(|(_, hook)| hook)
+        }
+        _ => None,
+    };
+    drop(slot);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 async fn run_subprocess(argv: &[String]) -> Result<String, CommandSecretError> {
     run_subprocess_inner(argv, COMMAND_SECRET_TIMEOUT).await
 }
@@ -206,21 +468,7 @@ async fn run_subprocess_inner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        // NotFound (missing argv[0]) and PermissionDenied (non-executable
-        // argv[0]) both read as "cannot run this program"; fold both into
-        // NotFound so callers get one "cannot spawn" signal without a path.
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Err(CommandSecretError::NotFound);
-        }
-        Err(error) => return Err(CommandSecretError::Io(io_kind_label(error.kind()))),
-    };
+    let mut child = command.spawn().map_err(map_spawn_error)?;
 
     let stdout = child
         .stdout
@@ -231,6 +479,46 @@ async fn run_subprocess_inner(
         .take()
         .ok_or_else(|| CommandSecretError::Io("stderr_unavailable".to_string()))?;
 
+    let (out_bytes, err_bytes, status) =
+        drain_capped_child(&mut child, stdout, stderr, timeout).await?;
+
+    if !status.success() {
+        return Err(CommandSecretError::NonZeroExit {
+            code: status.code(),
+            stderr_excerpt: sanitize_stderr(&err_bytes),
+        });
+    }
+
+    let value = String::from_utf8(trim_trailing_newline(&out_bytes))
+        .map_err(|_| CommandSecretError::Io("output_not_utf8".to_string()))?;
+    if value.is_empty() {
+        return Err(CommandSecretError::EmptyOutput);
+    }
+    Ok(value)
+}
+
+fn map_spawn_error(error: std::io::Error) -> CommandSecretError {
+    match error.kind() {
+        // NotFound (missing argv[0]) and PermissionDenied (non-executable
+        // argv[0]) both read as "cannot run this program"; fold both into
+        // NotFound so callers get one "cannot spawn" signal without a path.
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            CommandSecretError::NotFound
+        }
+        kind => CommandSecretError::Io(io_kind_label(kind)),
+    }
+}
+
+/// Drain a child with bounded readers and return only after it is reaped.
+/// The first cap/IO/timeout outcome kills the child immediately. This common
+/// implementation deliberately serves both command-secret resolution and
+/// sealed-value injection so neither path can regress to `Command::output()`.
+async fn drain_capped_child(
+    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    timeout: std::time::Duration,
+) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus), CommandSecretError> {
     // Drain both pipes in independent tasks and RACE them: the first task to
     // cross its cap (or error) short-circuits so we can kill+reap immediately
     // instead of waiting for the other pipe's EOF or the 30s timeout.
@@ -280,11 +568,11 @@ async fn run_subprocess_inner(
             // A cap was crossed (or a drain errored): kill+reap NOW and return
             // the distinct error. The abandoned drain task ends on its own once
             // the killed child closes its pipe.
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(cap_or_io);
         }
         Err(_elapsed) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(CommandSecretError::Timeout);
         }
     };
@@ -295,24 +583,12 @@ async fn run_subprocess_inner(
         Ok(Ok(status)) => status,
         Ok(Err(error)) => return Err(CommandSecretError::Io(io_kind_label(error.kind()))),
         Err(_elapsed) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(CommandSecretError::Timeout);
         }
     };
 
-    if !status.success() {
-        return Err(CommandSecretError::NonZeroExit {
-            code: status.code(),
-            stderr_excerpt: sanitize_stderr(&err_bytes),
-        });
-    }
-
-    let value = String::from_utf8(trim_trailing_newline(&out_bytes))
-        .map_err(|_| CommandSecretError::Io("output_not_utf8".to_string()))?;
-    if value.is_empty() {
-        return Err(CommandSecretError::EmptyOutput);
-    }
-    Ok(value)
+    Ok((out_bytes, err_bytes, status))
 }
 
 /// The outcome of draining one capped pipe. On `Overflow` no bytes are
@@ -576,6 +852,44 @@ impl CommandResolutionStatus {
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn injected_process_executes_verified_snapshot_after_source_is_mutated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = directory.path().join("consumer");
+        std::fs::write(&program, b"#!/bin/sh\nprintf 'approved:%s' \"$1\"\n")
+            .expect("write approved consumer");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("mark consumer executable");
+        let mut argv = vec![
+            program.to_string_lossy().into_owned(),
+            "sealed plaintext".to_string(),
+        ];
+        let identity = crate::sealed::action_admin::local_executor::pin_argv_executable(&mut argv)
+            .expect("pin approved consumer");
+        let source_to_mutate = program.clone();
+        *AFTER_EXECUTABLE_SNAPSHOT_TEST_HOOK
+            .lock()
+            .expect("executable snapshot test hook lock") = Some((
+            argv[0].clone(),
+            Box::new(move || {
+                std::fs::write(source_to_mutate, b"#!/bin/sh\nprintf 'mutated:%s' \"$1\"\n")
+                    .expect("mutate approved source after snapshot verification");
+            }),
+        ));
+        let capture = run_injected_process(&argv, None, Some(identity))
+            .await
+            .expect("the immutable main-executable snapshot remains executable");
+        assert!(capture.success);
+        assert_eq!(capture.stdout, b"approved:sealed plaintext");
+        assert_eq!(
+            std::fs::read(&program).expect("read mutated source"),
+            b"#!/bin/sh\nprintf 'mutated:%s' \"$1\"\n"
+        );
+    }
 
     /// Counting fake: records every invocation and returns a canned outcome
     /// immediately.

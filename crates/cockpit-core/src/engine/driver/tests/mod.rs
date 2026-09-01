@@ -591,8 +591,8 @@ fn test_driver_with_url_vnext(
 /// called and the broad list cannot cause a resolution bail.
 fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
     use crate::agents::{
-        AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
-        ModelLocality, ModelSlot, VnextAgentDef,
+        AllowedChild, DelegationPolicy, DelegationTarget, ModelCapability, ModelLocality,
+        ModelSlot, VnextAgentDef,
     };
     let host = crate::agents::VnextHostPolicy::for_session_config(
         &crate::config::extended::load_for_cwd(root),
@@ -607,9 +607,8 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
     let definition = VnextAgentDef {
         schema_version: crate::agents::SCHEMA_VERSION,
         agent_id: "cockpit/build".to_string(),
-        // Build is a chat-ownable primary → Assistant execution kind (see
-        // `builtin_vnext` for Primary-mode names).
-        execution_kind: ExecutionKind::Assistant,
+        roles: vec![crate::agents::AgentRole::Code],
+        capabilities: std::collections::BTreeSet::new(),
         model_slots: std::collections::BTreeMap::from([(
             "primary".to_string(),
             ModelSlot {
@@ -641,6 +640,7 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
         questions: None,
         verification: None,
         allowed_knowledge_bases: None,
+        tool_tier_preferences: std::collections::BTreeMap::new(),
     };
     definition
         .resolve_grant(&host)
@@ -914,7 +914,7 @@ fn learn_driver(
     // `default_disabled_tools_for` (which disables `skill_manage` for Build
     // and other built-in primaries) does not remove the tool from the
     // rebuilt agent's surface during `refresh_active_tool_surface_for_turn`.
-    // The v2 format does not support `toolTiers` overrides, so the only way
+    // The launch-v1 format does not support `toolTiers` overrides, so the only way
     // to keep `skill_manage` enabled through the rebuild is to use a name
     // not in the disabled-by-default list.  The `cockpit` publisher prefix
     // is reserved for binary-owned definitions, so change the vNext agentId.
@@ -924,7 +924,7 @@ fn learn_driver(
     }
     std::fs::write(
         agents_dir.join("LearnBuild.md"),
-        build_def.to_markdown().expect("v2 bundled override"),
+        build_def.to_markdown().expect("launch-v1 bundled override"),
     )
     .unwrap();
     let mut providers = BTreeMap::new();

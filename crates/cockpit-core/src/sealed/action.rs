@@ -517,6 +517,15 @@ pub trait SealedHostAction: Send + Sync {
         None
     }
 
+    /// Stable safe sink classification for publish-before-effect auditing.
+    fn sink_kind(&self) -> &'static str;
+
+    /// Whether this action is the explicitly approved persistent-file
+    /// downgrade. Non-file actions and ephemeral files return `false`.
+    fn file_persistent(&self) -> bool {
+        false
+    }
+
     /// Perform the Owner-defined effect. The return value is host-side only:
     /// the runtime discards it, including the error, without inspecting it.
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()>;

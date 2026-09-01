@@ -437,10 +437,13 @@ const DISABLE_MARKER: &str = "COCKPIT_DISABLE_REDACT";
 /// uppercase hex, and percent/URL encoding (see [`encoded_secret_variants`]).
 const MAX_FORCED_SECRET_VARIANTS: usize = 4;
 
-/// Hard lower bound for every redaction pattern. Values below this length can
-/// corrupt unrelated output (for example, a timeout rendered as `120s`) and are
-/// therefore never safe to register, regardless of their source.
-const MIN_REDACTION_ENTRY_LENGTH: usize = 4;
+/// Hard lower bound for every redaction pattern, shared with report-leak
+/// admission. Values below this length can corrupt unrelated output (for
+/// example, a timeout rendered as `120s`) and are therefore never safe to
+/// register, regardless of their source. A literal below this
+/// size cannot be installed safely, so it must never be acknowledged as
+/// contained by a path that promises live redaction.
+pub(crate) const MIN_REDACTION_ENTRY_LENGTH: usize = 4;
 
 /// PEM private-key opening headers. A file under the SSH dir is treated as a
 /// private key — and its content registered as a forced secret — iff its
@@ -1002,6 +1005,24 @@ impl std::fmt::Debug for RedactionTable {
 }
 
 impl RedactionTable {
+    /// Scrub captured output from a host process that received one sealed
+    /// literal by injection. This intentionally bypasses configured redaction
+    /// disablement and candidate pruning: output from a consuming process is a
+    /// defense-in-depth boundary, and even short values must be removed.
+    pub(crate) fn scrub_injected_output(body: &str, literal: &str) -> String {
+        let mut scrubbed = body.to_string();
+        let mut variants = encoded_secret_variants(literal);
+        variants.push(literal.to_string());
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+        variants.dedup();
+        for variant in variants {
+            if !variant.is_empty() {
+                scrubbed = scrubbed.replace(&variant, "***REDACT***");
+            }
+        }
+        scrubbed
+    }
+
     /// Build a table from the OS env + the env files matched under `cwd`.
     /// Honors `enabled`, `scan_environment`, `scan_dotenv`,
     /// `dotenv_patterns`, `extra_dotenv_paths`, and `min_secret_length`.
@@ -1056,6 +1077,8 @@ impl RedactionTable {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<Vec<_>>();
         entries.extend(store.provider_credential_entries());
+        entries.extend(store.provider_auth_command_entries());
+        entries.extend(store.provider_oauth_descriptor_entries());
         Self::build_with_env_and_secrets(cfg, cwd, env, entries)
     }
 

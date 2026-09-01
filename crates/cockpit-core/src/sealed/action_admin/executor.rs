@@ -14,8 +14,8 @@
 //! * only the snapshot's DECLARED parameters are serialized, pulled from the
 //!   already-bound [`SealedParams`] — a stray caller value can never reach the
 //!   wire (finding 4, AC10);
-//! * the credential (the resolved literal) is placed in the fixed header or query
-//!   parameter the snapshot declares and NOWHERE else — never logged, never in an
+//! * the credential (the resolved literal) is placed in the fixed header or whole
+//!   body the snapshot declares and NOWHERE else — never logged, never in an
 //!   error, never returned (AC8); [`invoke`](SealedHostAction::invoke)'s return
 //!   value (including its error) is discarded by the runtime, so nothing about
 //!   the request or response can encode a bit of the literal;
@@ -46,12 +46,13 @@ use super::{
 
 /// One outbound HTTPS request the executor asks the transport to perform.
 ///
-/// The `url` and `headers` may carry the credential (the snapshot's declared
-/// placement); a transport MUST NOT log them. `timeout` and `max_response_bytes`
+/// The headers or body may carry the credential (the snapshot's declared
+/// placement); a transport MUST NOT log request fields. `timeout` and `max_response_bytes`
 /// are hard bounds the transport must enforce.
 pub struct HttpsRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
     pub timeout: Duration,
     pub max_response_bytes: usize,
 }
@@ -65,6 +66,7 @@ impl std::fmt::Debug for HttpsRequest {
                 "headers",
                 &format_args!("[{} redacted]", self.headers.len()),
             )
+            .field("body", &self.body.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
             .field("max_response_bytes", &self.max_response_bytes)
             .finish()
@@ -126,9 +128,7 @@ impl HttpsSealedAction {
                 parameters,
                 ..
             } => (origins, credential_placement, path_template, parameters),
-            SealedActionKind::KnowledgeBaseCopy { .. } => {
-                bail!("knowledge-base copy actions do not have an HTTPS executor")
-            }
+            _ => bail!("non-HTTPS actions do not have an HTTPS executor"),
         };
         let origin = origins
             .iter()
@@ -183,6 +183,13 @@ impl SealedHostAction for HttpsSealedAction {
         &self.descriptor
     }
 
+    fn sink_kind(&self) -> &'static str {
+        match &self.credential_placement {
+            HttpsCredentialPlacement::Header { .. } => "http_header",
+            HttpsCredentialPlacement::Body { .. } => "http_body",
+        }
+    }
+
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()> {
         // Re-bind the supplied parameters against this action's own descriptor
         // before use. `SealedParams::from_map` is publicly constructible and does
@@ -213,12 +220,14 @@ impl SealedHostAction for HttpsSealedAction {
         // Place the credential in the snapshot's fixed location — and nowhere
         // else. It is never added to a log line or an error string.
         let mut headers: Vec<(String, String)> = Vec::new();
+        let mut body = None;
         match &self.credential_placement {
             HttpsCredentialPlacement::Header { header_name } => {
                 headers.push((header_name.clone(), literal.expose().to_string()));
             }
-            HttpsCredentialPlacement::Query { param_name } => {
-                query.push((param_name.clone(), literal.expose().to_string()));
+            HttpsCredentialPlacement::Body { content_type } => {
+                headers.push(("Content-Type".to_string(), content_type.clone()));
+                body = Some(literal.expose().to_string());
             }
         }
         let url = self.render_url(&query)?;
@@ -227,6 +236,7 @@ impl SealedHostAction for HttpsSealedAction {
             .send(HttpsRequest {
                 url,
                 headers,
+                body,
                 timeout: Duration::from_millis(HTTPS_TIMEOUT_MS),
                 max_response_bytes: HTTPS_MAX_RESPONSE_BYTES,
             })
@@ -310,8 +320,10 @@ impl HttpsTransport for ReqwestHttpsTransport {
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
-        // Discard the reqwest source error: it retains the request URL, which for
-        // a query-placed credential carries the literal. Only a fixed, credential-
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        }
+        // Discard the reqwest source error: it may retain request metadata. Only a fixed, credential-
         // free message survives, so `{err:#}` / `{err:?}` cannot disclose it.
         let response = builder
             .send()
@@ -356,7 +368,13 @@ mod tests {
     use crate::sealed::action::{SealedParamValue, SealedParams};
     use crate::sealed::compartment::SealedLiteral;
 
-    type Captured = (String, Vec<(String, String)>, Duration, usize);
+    type Captured = (
+        String,
+        Vec<(String, String)>,
+        Option<String>,
+        Duration,
+        usize,
+    );
 
     #[derive(Debug)]
     struct FakeTransport {
@@ -384,6 +402,7 @@ mod tests {
             self.captured.lock().unwrap().push((
                 request.url.clone(),
                 request.headers.clone(),
+                request.body.clone(),
                 request.timeout,
                 request.max_response_bytes,
             ));
@@ -451,12 +470,13 @@ mod tests {
             .invoke(secret.handle(), &SealedParams::default())
             .await
             .unwrap();
-        let (url, headers, timeout, max_bytes) = transport.last();
+        let (url, headers, body, timeout, max_bytes) = transport.last();
         assert_eq!(url, "https://api.deploy.example.com/v1/notify");
         assert!(
             !url.contains("sk-live-credential-abc123"),
             "credential must never appear in the URL"
         );
+        assert!(body.is_none());
         assert!(
             headers
                 .iter()
@@ -473,6 +493,7 @@ mod tests {
         let request = HttpsRequest {
             url: "https://api.example.com/v1/notify?api_key=sk-live-secret".into(),
             headers: vec![("X-Key".into(), "sk-live-secret".into())],
+            body: Some("sk-live-secret".into()),
             timeout: Duration::from_millis(HTTPS_TIMEOUT_MS),
             max_response_bytes: HTTPS_MAX_RESPONSE_BYTES,
         };
@@ -574,10 +595,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serializes_only_declared_params_and_query_credential() {
-        // AC10 / finding 4: only the snapshot's declared parameters reach the
-        // query; a Query credential placement puts the (url-encoded) literal in
-        // the query, and nothing lands in headers.
+    async fn serializes_only_declared_params_and_body_credential() {
+        // Only declared parameters reach the query. Body placement keeps the
+        // literal out of the URL and sets the fixed content type.
         let spec = BTreeMap::from([(
             "channel".to_string(),
             SealedParamSpecJson::Choice {
@@ -586,8 +606,8 @@ mod tests {
         )]);
         let snapshot = https_snapshot(
             "https://api.deploy.example.com",
-            HttpsCredentialPlacement::Query {
-                param_name: "api_key".into(),
+            HttpsCredentialPlacement::Body {
+                content_type: "text/plain".into(),
             },
             "/v1/notify",
             spec,
@@ -600,17 +620,18 @@ mod tests {
         )]));
         let secret = SealedLiteral::new("cred-xyz");
         action.invoke(secret.handle(), &bound).await.unwrap();
-        let (url, headers, _, _) = transport.last();
+        let (url, headers, body, _, _) = transport.last();
         assert!(
             url.starts_with("https://api.deploy.example.com/v1/notify?"),
             "{url}"
         );
         assert!(url.contains("channel=primary"), "{url}");
-        assert!(url.contains("api_key=cred-xyz"), "{url}");
         assert!(
-            headers.is_empty(),
-            "a query-placed credential adds no header"
+            headers
+                .iter()
+                .any(|(name, value)| name == "Content-Type" && value == "text/plain")
         );
+        assert_eq!(body.as_deref(), Some("cred-xyz"));
     }
 
     #[tokio::test]

@@ -109,6 +109,45 @@ describe("native session event helpers", () => {
     ]);
   });
 
+  it("removes durable user rows from live and replayed retractions", () => {
+    const recorded = reduceNativeSessionEvent(initialState, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "history_replay",
+      data: {
+        session_id: sessionId,
+        max_seq: 8,
+        entries: [
+          { role: "user", seq: 7, text: "retract me", ts_ms: 1700000000000 },
+          { role: "assistant", seq: 8, agent: "Build", text: "retained", ts_ms: 1700000000001 },
+        ],
+      },
+    }).state;
+
+    const live = reduceNativeSessionEvent(recorded, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "user_message_removed",
+      data: { session_id: sessionId, seq: 7, client_submission_ids: [] },
+    });
+    expect(live.state.history.map((entry) => entry.id)).toEqual(["assistant:8"]);
+
+    const replay = reduceNativeSessionEvent(recorded, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "history_replay",
+      data: {
+        session_id: sessionId,
+        max_seq: 9,
+        removed_user_message_seqs: [7],
+        entries: [
+          { role: "assistant", seq: 8, agent: "Build", text: "retained", ts_ms: 1700000000001 },
+        ],
+      },
+    });
+    expect(replay.state.history.map((entry) => entry.id)).toEqual(["assistant:8"]);
+  });
+
   it("extracts durable submission receipts from history, replay, and queue folds", () => {
     const acceptedId = "44444444-4444-4444-8444-444444444444";
     expect(

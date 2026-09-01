@@ -870,6 +870,7 @@ impl BuiltinFunction {
 #[derive(Clone)]
 pub struct BuiltinRegistry {
     funcs: Arc<BTreeMap<String, BuiltinFunction>>,
+    capability_guard: Option<crate::engine::agent::tool_dispatch::CapabilityGuard>,
 }
 
 impl BuiltinRegistry {
@@ -880,6 +881,7 @@ impl BuiltinRegistry {
             .collect();
         Self {
             funcs: Arc::new(funcs),
+            capability_guard: None,
         }
     }
 
@@ -900,6 +902,20 @@ impl BuiltinRegistry {
         let mut funcs = control_functions();
         funcs.append(&mut native_tools);
         Self::new(funcs)
+    }
+
+    pub(crate) fn with_capability_guard(
+        mut self,
+        guard: crate::engine::agent::tool_dispatch::CapabilityGuard,
+    ) -> Self {
+        self.capability_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn capability_denial(&self, tool: &str) -> Option<Value> {
+        self.capability_guard
+            .as_ref()
+            .and_then(|guard| guard.denial(tool))
     }
 
     /// The source-tagged effective catalog for an ephemeral metadata fork.

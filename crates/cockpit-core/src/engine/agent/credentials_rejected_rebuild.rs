@@ -1,4 +1,4 @@
-//! Credentials-rejected rebuild-and-retry for command-backed secrets (AC5).
+//! Credentials-rejected rebuild-and-retry for command-based authentication.
 //!
 //! Resolution point #3 from `command-backed-secret-refs-daemon`: when a
 //! provider request fails with an auth error classified
@@ -8,9 +8,8 @@
 //! surfacing the failure immediately, the turn-dispatch seam does ONE
 //! re-resolve + **rebuild of the model client** + one retry, latched:
 //!
-//! 1. `cache.invalidate(name)` + re-resolve the referenced command secret(s) for
-//!    the failing provider via the session's OWNER-SCOPED store (the same
-//!    owner-scoped resolution the daemon-startup / provider-update paths use).
+//! 1. Refresh the failing provider's global `auth_command`, or invalidate and
+//!    re-resolve its owner-scoped command-backed named secret(s).
 //! 2. Rebuild a FRESH model client through the
 //!    [`Model::for_provider_with_store`](crate::engine::model::Model::for_provider_with_store)
 //!    template so the new client picks up the freshly-resolved secret. This is a
@@ -110,12 +109,33 @@ pub(crate) async fn rebuild_model_for_credentials(
 ) -> anyhow::Result<Option<RebuiltCredentialsModel>> {
     let (extended, providers) = config.configs();
     let provider_id = current_model.provider_id();
+    let env = env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     // (a) Eligibility + provider-scoped re-resolution: invalidate + re-resolve
     // ONLY the failing provider's owner-scoped command secret(s). Returns false
     // (⇒ no rebuild/retry) when this provider is not command-backed.
-    let reresolved = session
-        .reresolve_provider_command_secrets(&providers, provider_id)
-        .await;
+    let rejected_refresh_generation = {
+        #[cfg(not(test))]
+        {
+            current_model.command_credential_generation()
+        }
+        #[cfg(test)]
+        {
+            None
+        }
+    };
+    let reresolved = if session
+        .refresh_provider_auth_command(&providers, provider_id, &env, rejected_refresh_generation)
+        .await?
+    {
+        true
+    } else {
+        session
+            .reresolve_provider_command_secrets(&providers, provider_id)
+            .await
+    };
     if !reresolved {
         return Ok(None);
     }
@@ -124,10 +144,6 @@ pub(crate) async fn rebuild_model_for_credentials(
     // (b) Refreshed redaction table: union the current table with one built from
     // the refreshed store (which injects the fresh command output), so the NEW
     // token is scrubbed everywhere on the retry. In-memory only.
-    let env = env_overlay
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
     let refreshed_secrets = RedactionTable::build_with_env_and_credential_store(
         &extended.redact,
         &session.project_root,

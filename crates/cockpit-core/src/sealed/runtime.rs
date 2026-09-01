@@ -272,6 +272,32 @@ impl SealedRuntime {
             .await
             .map_err(|_| SealedUseDenied)?;
 
+        // Publish safe audit metadata before the sink receives plaintext. A
+        // failed durable write denies the use; there is no best-effort path.
+        // Destinations, argv, environment keys, paths, request data, values,
+        // output, and secret-derived outcomes are intentionally absent.
+        self.db
+            .insert_sealed_action_invocation_audit(
+                cockpit_db::db::sealed_actions::SealedActionInvocationAuditEntry {
+                    audit_id: uuid::Uuid::new_v4().to_string(),
+                    record_id: claimed.record_id.clone(),
+                    action_id: authorized
+                        .action
+                        .descriptor()
+                        .action_id
+                        .as_str()
+                        .to_string(),
+                    action_revision: i64::from(authorized.action.descriptor().revision.get()),
+                    grant_id: authorized.grant().grant_id.clone(),
+                    session_id: ctx.session_id.to_string(),
+                    sink_kind: authorized.action.sink_kind().to_string(),
+                    file_persistent: authorized.action.file_persistent(),
+                    created_at_ms: ctx.now_ms,
+                },
+            )
+            .await
+            .map_err(|_| SealedUseDenied)?;
+
         // ---- 6. invoke, then answer at the declared fixed deadline ------
         // The fixed-response window is anchored HERE, after resolution and
         // registration, not before them. Registration now awaits an async key

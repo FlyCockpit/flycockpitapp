@@ -58,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -83,6 +83,16 @@ use crate::{
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::{InferenceSendIdentity, Session};
+
+/// Serializes the detached automatic-title write with retraction of the user
+/// message that triggered it. A retraction either fences the write before it
+/// happens or observes its exact generated title for the rollback CAS; it can
+/// never abort the task between those two ownership steps.
+#[derive(Default)]
+struct RetractableAutoTitleState {
+    retracted: bool,
+    persisted_title: Option<String>,
+}
 
 /// Out-of-band control requests routed to the driver from the daemon
 /// worker — `/prune`, `/compact`, `/pin`. Drained on the same boundary
@@ -250,8 +260,19 @@ pub enum DriverControl {
     /// subagent owns the foreground.
     SetToolSurfaceOverride {
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        /// Confirms the caller warned the user about a provider cache break.
+        /// The driver, not the caller, determines whether pruning is required.
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Verify that a tool-surface change can be installed without changing
+    /// the live driver. The session worker uses this before persisting the
+    /// replacement, so a failed durable write cannot leave a live-only tool
+    /// surface behind.
+    ValidateToolSurfaceOverride {
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
@@ -743,27 +764,10 @@ const ID_INJECTION_EDIT: &str = "inj_edit";
 
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 
-/// Path to the global `config.json` to write override settings
-/// into: the first existing home-scoped config dir, else the first
-/// creatable one (scaffolded). Errors only when no home dir is locatable.
+/// Path to the user-owned global `config.json` for override settings.
+/// Workspace trust never selects or gates this file.
 fn global_extended_config_path() -> Result<std::path::PathBuf> {
-    use crate::config::dirs::{
-        CONFIG_FILE, ConfigDirKind, creatable_config_dirs, discover_config_dirs,
-    };
-    // Prefer an existing home-scoped layer.
-    if let Some(dir) = discover_config_dirs(std::path::Path::new("."))
-        .into_iter()
-        .find(|d| matches!(d.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
-    {
-        return Ok(dir.path.join(CONFIG_FILE));
-    }
-    // Otherwise scaffold the first creatable home location.
-    let dir = creatable_config_dirs()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no home directory to write global config into"))?;
-    std::fs::create_dir_all(&dir.path)?;
-    Ok(dir.path.join(CONFIG_FILE))
+    crate::config::dirs::global_config_file()
 }
 
 /// Handle the session worker keeps to cancel the in-flight user-message
@@ -772,17 +776,33 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
 /// inference and signals any foreground `bash` subprocess to die. Adopted
 /// subprocesses live in the session registry and are cancelled alongside this
 /// handle by the worker. Idempotent and safe at idle — when no run is in flight
-/// the slot is `None` and [`Self::cancel`] is a no-op.
+/// the slot is `None` and [`Self::cancel_turn`] is a no-op.
 #[derive(Clone)]
 pub struct CancelHandle {
     current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// The shared token is also used by deadlines and terminal invocation
+    /// state.  This bit is set only by an interactive CancelTurn.
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CancelHandle {
-    /// Cancel the in-flight run, if any. Safe to call when idle (no-op),
-    /// when already cancelling (cancelling a cancelled token is a no-op),
-    /// and concurrently from multiple callers.
-    pub fn cancel(&self) {
+    /// Cancel the in-flight run for an interactive `CancelTurn`, if any.
+    /// Safe to call when idle (no-op), when already cancelling (cancelling a
+    /// cancelled token is a no-op), and concurrently from multiple callers.
+    ///
+    /// This is intentionally distinct from a lifecycle, deadline, or
+    /// `CancelAllSessionWork` cancellation: only an explicit user turn cancel
+    /// can retract the just-recorded message.
+    pub fn cancel_turn(&self) {
+        if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
+            self.user_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            token.cancel();
+        }
+    }
+
+    /// Cancel the in-flight run without attributing it to `CancelTurn`.
+    pub fn cancel_noninteractive(&self) {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             token.cancel();
         }
@@ -795,11 +815,14 @@ impl CancelHandle {
 /// fresh first press.
 struct CancelSlotGuard {
     slot: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for CancelSlotGuard {
     fn drop(&mut self) {
         *crate::sync::lock_or_recover(&self.slot) = None;
+        self.user_requested
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1322,6 +1345,7 @@ pub struct Driver {
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    user_cancel_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Session-owned waiters for backgroundable tools that have yielded their
     /// foreground turn. Unlike `cancel_current`, this registry survives turn
     /// boundaries and is drained by the session worker.
@@ -2317,6 +2341,7 @@ impl Driver {
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
+            user_cancel_requested: self.user_cancel_requested.clone(),
             adopted_processes: self.adopted_processes.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
@@ -2688,6 +2713,7 @@ impl Driver {
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
+            user_cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
             approver: None,
             lsp: None,
@@ -2777,22 +2803,6 @@ impl Driver {
             *model = Arc::new(refreshed);
         }
         self.schedule.set_redaction_table(table);
-    }
-
-    fn refresh_wire_api_for_turn(&mut self) {
-        let providers = match self.live_providers_config() {
-            Ok(providers) => providers,
-            Err(error) => {
-                tracing::warn!(error = %error, "providers config unavailable while refreshing wire_api");
-                return;
-            }
-        };
-        for frame in &self.stack {
-            frame.agent.model.refresh_wire_api_config(&providers);
-        }
-        if let Some(model) = &self.model_override {
-            model.refresh_wire_api_config(&providers);
-        }
     }
 
     fn active_frame_index(&self) -> Option<usize> {
@@ -2971,7 +2981,16 @@ impl Driver {
             &selection,
             model_pin.clone(),
         ) {
-            Ok(rebuilt) => {
+            Ok(mut rebuilt) => {
+                // Rebuilding refreshes the Monty catalog too. When only that
+                // runtime-discovered catalog changed, retain the already
+                // rendered native schema cache; Discoverable tools never
+                // appear in the provider function schema.
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(
+                        &self.stack[active_idx].agent.tools,
+                    );
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -4361,10 +4380,11 @@ impl Driver {
     /// A handle the session worker keeps so a user ctrl+c
     /// (`SessionWork::Cancel`) can abort the in-flight user-message run.
     /// Cheap to clone — it shares the driver's `cancel_current` slot. See
-    /// [`CancelHandle::cancel`].
+    /// [`CancelHandle::cancel_turn`].
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
             current: self.cancel_current.clone(),
+            user_requested: self.user_cancel_requested.clone(),
         }
     }
 
@@ -4793,12 +4813,14 @@ impl Driver {
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_frame_for_turn(tx).await;
-        self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -6396,12 +6418,22 @@ impl Driver {
             }
             DriverControl::SetToolSurfaceOverride {
                 selection,
-                prune_after_switch,
+                cache_break_acknowledged,
                 monty_nudge,
                 respond_to,
             } => {
                 let result = self
-                    .set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
+                    .set_tool_surface_override(selection, cache_break_acknowledged, monty_nudge, tx)
+                    .await;
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ValidateToolSurfaceOverride {
+                selection,
+                cache_break_acknowledged,
+                respond_to,
+            } => {
+                let result = self
+                    .validate_tool_surface_override(selection, cache_break_acknowledged, tx)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -9407,6 +9439,25 @@ impl Driver {
             self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
+        // `system` contains model-trust-dependent leak-report steering.  Build
+        // it before publishing the replacement agent so a later best-effort
+        // tool-surface rebuild cannot leave an untrusted model with the old
+        // trusted model's prompt.
+        let prompt_args = self.rebuild_frame_args(frame_idx, new_model.clone(), selection, None);
+        let role_prompt = refreshed.definition.as_ref().map_or_else(
+            || refreshed.role_prompt.clone(),
+            |definition| {
+                definition
+                    .resolved_prompt_for_model(new_model.provider_id(), new_model.model_id_ref())
+                    .to_string()
+            },
+        );
+        refreshed.system = crate::engine::builtin::compose_system_prompt_for_model(
+            &role_prompt,
+            new_model.as_ref(),
+            &prompt_args,
+        );
+        refreshed.role_prompt = role_prompt;
         refreshed.model = new_model;
         // Posture (tool_steering/capabilities/context_policy) comes from the
         // agent def and is model-independent, so a model swap preserves it.
@@ -9675,44 +9726,13 @@ impl Driver {
     async fn set_tool_surface_override(
         &mut self,
         selection: crate::agents::ToolSurfaceSelection,
-        prune_after_switch: bool,
+        cache_break_acknowledged: bool,
         monty_nudge: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> std::result::Result<(), String> {
-        if self.stack.len() != 1 {
-            tracing::warn!(
-                "tool surface override ignored: an interactive subagent holds the foreground"
-            );
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: "Tool surface changes were refused because an interactive subagent holds the foreground.".to_string(),
-                })
-                .await;
-            return Err("an interactive subagent holds the foreground".to_string());
-        }
-        let current = self.stack[0].agent.clone();
-        let mut args = self.spawn_args(true);
-        args.model = current.model.clone();
-        args.model_override = Some(current.model.clone());
-        args.params = current.params.clone();
-        args.vnext_grant = current.vnext_grant.clone();
-        let updated = (|| -> Result<Agent> {
-            let mut def =
-                current.definition.as_deref().cloned().ok_or_else(|| {
-                    anyhow::anyhow!("running frame has no pinned agent definition")
-                })?;
-            crate::agents::apply_tool_surface_override(&mut def, &selection)?;
-            let rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
-            let mut updated = (*current).clone();
-            // This control changes only the requested tool surface. All other
-            // running-frame state stays pinned, while the adjusted definition
-            // becomes the snapshot used by later model/config rebuilds.
-            updated.tools = rebuilt.tools;
-            updated.definition = rebuilt.definition;
-            Ok(updated)
-        })();
+        let updated = self.prepare_tool_surface_override(&selection, cache_break_acknowledged);
         match updated {
-            Ok(updated) => {
+            Ok((updated, native_schema_changed)) => {
                 self.stack[0].agent = Arc::new(updated);
                 self.schedule.set_agent(self.stack[0].agent.clone());
                 if let Some(note) = monty_nudge {
@@ -9724,24 +9744,103 @@ impl Driver {
                     })
                     .await;
                 self.emit_context_projection(tx).await;
-                if prune_after_switch {
+                if native_schema_changed {
                     self.do_prune(false, tx).await;
                 }
                 Ok(())
             }
-            Err(e) => {
-                let message = format!("{e:#}");
-                tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!(
-                            "Tool surface update failed — {e:#}. Keeping the current tool surface active."
-                        ),
-                    })
-                    .await;
-                Err(message)
-            }
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
         }
+    }
+
+    /// Prove a prospective tool-surface transition can settle before the
+    /// worker changes durable session state. This intentionally shares the
+    /// exact construction and cache-break checks used by the committing path.
+    async fn validate_tool_surface_override(
+        &self,
+        selection: crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        match self.prepare_tool_surface_override(&selection, cache_break_acknowledged) {
+            Ok(_) => Ok(()),
+            Err(error) => self.reject_tool_surface_override(error, tx).await,
+        }
+    }
+
+    fn prepare_tool_surface_override(
+        &self,
+        selection: &crate::agents::ToolSurfaceSelection,
+        cache_break_acknowledged: bool,
+    ) -> Result<(Agent, bool)> {
+        if self.stack.len() != 1 {
+            anyhow::bail!("an interactive subagent holds the foreground");
+        }
+        let current = self.stack[0].agent.clone();
+        let mut args = self.spawn_args(true);
+        args.model = current.model.clone();
+        args.model_override = Some(current.model.clone());
+        args.params = current.params.clone();
+        args.vnext_grant = current.vnext_grant.clone();
+        (|| -> Result<(Agent, bool)> {
+            let mut def =
+                current.definition.as_deref().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("running frame has no pinned agent definition")
+                })?;
+            crate::agents::apply_tool_surface_override(&mut def, selection)?;
+            let mut rebuilt = crate::engine::builtin::agent_from_def(&def, &args)?;
+            let native_schema_changed = !rebuilt
+                .tools
+                .native_schema_matches(&current.tools, current.tool_steering);
+            if native_schema_changed && !cache_break_acknowledged {
+                anyhow::bail!(
+                    "native tool-surface changes require cache-break acknowledgement before applying"
+                );
+            }
+            // A native-schema transition must prune the old cached context
+            // before it becomes live. Persist-on-re-entry temporarily owns
+            // started-but-unsettled sibling results, so every history
+            // rewriter (including that required prune) is fenced until their
+            // paired terminal bodies commit. Refuse instead of installing a
+            // surface whose mandatory prune would be deferred; the worker
+            // then cannot persist an unpruned acknowledged transition.
+            if native_schema_changed && self.persist_on_reentry_owns_started_unsettled_siblings() {
+                anyhow::bail!(
+                    "native tool-surface changes are unavailable while persist-on-re-entry owns sibling results"
+                );
+            }
+            if !native_schema_changed {
+                rebuilt
+                    .tools
+                    .preserve_definition_cache_if_native_schema_matches(&current.tools);
+            }
+            let mut updated = (*current).clone();
+            // This control changes only the requested tool surface. All other
+            // running-frame state stays pinned, while the adjusted definition
+            // becomes the snapshot used by later model/config rebuilds.
+            updated.tools = rebuilt.tools;
+            updated.definition = rebuilt.definition;
+            Ok((updated, native_schema_changed))
+        })()
+    }
+
+    async fn reject_tool_surface_override(
+        &self,
+        error: anyhow::Error,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(), String> {
+        let message = format!("{error:#}");
+        tracing::warn!(error = %error, "tool surface override failed to rebuild agent");
+        let text = if self.stack.len() != 1 {
+            "Tool surface changes were refused because an interactive subagent holds the foreground."
+                .to_string()
+        } else {
+            format!(
+                "Tool surface update failed — {error:#}. Keeping the current tool surface active."
+            )
+        };
+        let _ = tx.send(TurnEvent::Notice { text }).await;
+        Err(message)
     }
 
     /// Decide the cache-aware reuse-vs-fresh path for a re-queried subagent
@@ -10033,9 +10132,12 @@ impl Driver {
         // scheduler owns this token too, so its callback timeout/drop aborts
         // the provider call instead of merely abandoning the response waiter.
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         let active_target_id = self.active_queue_target_id();
@@ -11747,7 +11849,6 @@ impl Driver {
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_frame_for_turn(tx).await;
-        self.refresh_wire_api_for_turn();
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,
         // time prelude) and are reattached when the prompt `Message` is
@@ -11823,15 +11924,18 @@ impl Driver {
             None
         };
         // Install a fresh cancellation token for this run so a user ctrl+c
-        // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
+        // (`SessionWork::Cancel` → `CancelHandle::cancel_turn`) can abort the
         // in-flight inference and kill any running `bash` subprocess. The
         // guard clears the slot on every exit path (normal, cancel, error)
         // so a stale token can never affect a later run.
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
+            self.user_cancel_requested
+                .store(false, std::sync::atomic::Ordering::Release);
             *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
             CancelSlotGuard {
                 slot: self.cancel_current.clone(),
+                user_requested: self.user_cancel_requested.clone(),
             }
         };
         // Run-invocation deadline: child cancel token so expiry aborts provider/
@@ -11976,6 +12080,7 @@ impl Driver {
         } else {
             None
         };
+        let mut recorded_user_seq = None;
         let artifact_frame = if let Some(mut oversized) = oversized_artifact_submission {
             // Long preprocessing can consume most of the original lease. Renew
             // at this final boundary, rotating the token when required, before
@@ -12159,6 +12264,7 @@ impl Driver {
                         source_artifact,
                         projection_artifact,
                     } = *materialized;
+                    recorded_user_seq = Some(event_seq);
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
@@ -12378,6 +12484,7 @@ impl Driver {
             };
             match record_outcome {
                 UserMessageRecordOutcome::Recorded(seq) => {
+                    recorded_user_seq = Some(seq);
                     // Carry the assigned `seq` (the message's stable id) back to
                     // the client so it can stamp the already-pushed user history
                     // row. UI/DB-only — the seq never enters model context.
@@ -12559,6 +12666,7 @@ impl Driver {
         // after the foreground prompt is assembled below, so its prefix is the
         // foreground history plus that exact prompt and it remains invisible to
         // the main conversation.
+        let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
         let (title_action, mut metadata_work) = if use_session_model_metadata {
@@ -12570,6 +12678,7 @@ impl Driver {
         } else {
             (self.session.note_user_content(&canonical_user_text), None)
         };
+        let mut auto_title_task = None;
         if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
@@ -12590,19 +12699,45 @@ impl Driver {
             let redact = self.redact.clone();
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
-            tokio::spawn(async move {
-                crate::auto_title::generate_session_title(
-                    session,
-                    extended,
-                    providers,
-                    redact,
-                    content_prefix,
-                    title_action,
-                    Some(shutdown_gate),
-                    tx,
-                )
-                .await;
-            });
+            let title_session = Arc::clone(&session);
+            let title_state = Arc::new(Mutex::new(RetractableAutoTitleState::default()));
+            let task_title_state = Arc::clone(&title_state);
+            auto_title_task = Some((
+                title_state,
+                tokio::spawn(async move {
+                    let session_for_persist = Arc::clone(&title_session);
+                    crate::auto_title::generate_session_title_with_persist(
+                        session,
+                        extended,
+                        providers,
+                        redact,
+                        content_prefix,
+                        title_action,
+                        Some(shutdown_gate),
+                        tx,
+                        move |title, action| {
+                            // Hold this short synchronous critical section over both
+                            // the durable write and its rollback identity handoff.
+                            // Retraction takes the same mutex before aborting this
+                            // task, so an abort cannot strand a title derived solely
+                            // from the removed user row.
+                            let mut state = task_title_state.lock().unwrap();
+                            if state.retracted {
+                                return Ok(());
+                            }
+                            let stored = session_for_persist.set_auto_title(title)?;
+                            if stored && matches!(action, crate::session::TitleAction::Eager) {
+                                session_for_persist.mark_eager_titled();
+                            }
+                            if stored {
+                                state.persisted_title = Some(title.to_owned());
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await;
+                }),
+            ));
         }
 
         // Skills auto-selection (GOALS §5): consult the cheap utility
@@ -12793,6 +12928,7 @@ impl Driver {
             }
         }
 
+        let response_window_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
@@ -12869,6 +13005,7 @@ impl Driver {
             let attempted_prompt = next_prompt.clone();
             self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
+            turn_metadata.response_window_closed = std::sync::Arc::clone(&response_window_closed);
             let fallback_models = self.resolve_failover_models(&agent.model);
             // The durable snapshot carries the accepted continuation marker
             // for *every* subsequent model/tool phase, not merely its first
@@ -13109,6 +13246,65 @@ impl Driver {
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    let retractable_direct_turn = user_prompt_source == Some("user")
+                        && submission_kind == UserSubmissionKind::User
+                        && submission_origin
+                            == crate::engine::message::SubmissionOrigin::ExternalRoot
+                        && agent
+                            .model
+                            .resolve_reasoning_params(&self.config.providers())
+                            .is_some()
+                        && self
+                            .user_cancel_requested
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
+                    if retractable_direct_turn
+                        && let Some(seq) = recorded_user_seq
+                        && self
+                            .session
+                            .db
+                            .remove_latest_user_message(self.session.id, seq)
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
+                                false
+                            })
+                    {
+                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
+                            // The state handoff and the durable title write share
+                            // one mutex. Marking retracted before aborting either
+                            // prevents a later write or captures the exact title
+                            // already written for the rollback predicate.
+                            let generated_title = {
+                                let mut state = title_state.lock().unwrap();
+                                state.retracted = true;
+                                state.persisted_title.clone()
+                            };
+                            task.abort();
+                            let _ = task.await;
+                            generated_title
+                        } else {
+                            None
+                        };
+                        if let Err(error) = self.session.restore_title_progress_after_retract(
+                            title_progress_before_turn,
+                            generated_title.as_deref(),
+                        ).await {
+                            tracing::warn!(%error, "auto_title: retract rollback lost");
+                        }
+                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
+                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                        }
+                        let _ = tx
+                            .send(TurnEvent::UserMessageRemoved {
+                                seq,
+                                client_submission_ids: client_submissions
+                                    .iter()
+                                    .map(|receipt| receipt.id)
+                                    .collect(),
+                            })
+                            .await;
+                    }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
                             .session
@@ -15281,12 +15477,12 @@ impl Driver {
     ) -> Result<crate::engine::builtin::DelegationRecursionContext, String> {
         let parent = self.stack.last().expect("stack never empty").agent.as_ref();
         if parent.vnext_grant.is_some() {
-            // v2 has no projection onto the legacy recursive-task context.
+            // launch-v1 has no projection onto the legacy recursive-task context.
             // The asynchronous task-admission seam resolves the selected child
             // under this parent's EffectiveVnextGrant immediately before
             // construction, including depth, targets, and the caller/child
             // kind matrix. `remaining_depth` is legacy wire input and cannot
-            // widen a v2 grant.
+            // widen a launch-v1 grant.
             let _ = (child_agent, requested_depth, model);
             return Ok(crate::engine::builtin::DelegationRecursionContext::default());
         }

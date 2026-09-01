@@ -188,6 +188,10 @@ impl SealedHostAction for ProbeAction {
         &self.descriptor
     }
 
+    fn sink_kind(&self) -> &'static str {
+        "command_arg"
+    }
+
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         *self.saw_literal.lock().expect("probe mutex") = Some(literal.expose().to_string());
@@ -242,6 +246,10 @@ impl SignallingAction {
 impl SealedHostAction for SignallingAction {
     fn descriptor(&self) -> &SealedActionDescriptor {
         &self.descriptor
+    }
+
+    fn sink_kind(&self) -> &'static str {
+        "command_arg"
     }
 
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, _params: &SealedParams) -> Result<()> {

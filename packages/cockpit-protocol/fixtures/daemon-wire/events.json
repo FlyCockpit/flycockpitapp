@@ -626,6 +626,7 @@
         }
       ],
       "max_seq": 7,
+      "removed_user_message_seqs": [6],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "history_replay",
@@ -1500,6 +1501,16 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_message_recorded",
+    "kind": "evt",
+    "v": 21
+  },
+  "user_message_removed": {
+    "data": {
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "user_message_removed",
     "kind": "evt",
     "v": 21
   },

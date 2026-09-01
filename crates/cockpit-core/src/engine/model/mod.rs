@@ -16,15 +16,11 @@
 //! `examples/manual_tool_calls`. Variants: `OpenAi` (every OpenAI-
 //! compatible endpoint in the user's [`crate::providers`] templates —
 //! including Claude reached via OpenRouter/Copilot/etc.), `ChatGpt`
-//! (native ChatGPT/Codex Responses), and `Anthropic` (native
-//! `api.anthropic.com`, which gets rig's provider-concrete per-block
-//! prompt caching, prompt `prompt-caching-strategy.md`).
+//! (native ChatGPT/Codex Responses), and `Anthropic` (the native Anthropic
+//! Messages wire, including explicitly configured compatible endpoints).
 //!
-//! Routing: a build site picks the native Anthropic path **only** when
-//! the resolved base URL's host is `api.anthropic.com` (see
-//! [`is_anthropic_native`]). Claude models served by any other host stay
-//! on the OpenAI-compat path — they're not native Anthropic endpoints and
-//! don't accept inline cache breakpoints.
+//! Routing: a build site picks the wire solely from the resolved `WireApi`.
+//! Provider ids, model names, and base URLs never select a request wire.
 //!
 //! Authentication: we delegate to
 //! [`crate::providers::models_fetch::resolve_provider_request`], the
@@ -33,9 +29,10 @@
 //! GitHub Copilot it also honors the documented env-var sources
 //! (`COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`)
 //! and the `COPILOT_API_URL` base-URL override. The OpenAI-compat path
-//! hands rig the bearer token; the native Anthropic path reads the
-//! resolved `x-api-key` header and lets rig set `anthropic-version`
-//! itself (plus the extended-cache beta header on the 1h opt-in).
+//! hands rig the bearer token; the native Anthropic path accepts either a
+//! resolved `x-api-key` or `Authorization: Bearer` credential. Anthropic
+//! caching and beta extensions are emitted only when the provider's explicit
+//! Anthropic feature gate enables them.
 
 use std::{
     collections::HashMap,
@@ -451,15 +448,13 @@ pub(crate) fn has_retained_native_computer_items() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {
-    configured: crate::config::providers::WireApi,
     explicit: bool,
     session_confirmed: HashMap<String, crate::config::providers::WireApi>,
 }
 
 impl LiveWireApiState {
-    fn new(configured: crate::config::providers::WireApi, explicit: bool) -> Self {
+    fn new(explicit: bool) -> Self {
         Self {
-            configured,
             explicit,
             session_confirmed: HashMap::new(),
         }
@@ -472,10 +467,10 @@ pub(crate) type LiveWireApi = Arc<Mutex<LiveWireApiState>>;
 /// as we wire more providers.
 #[derive(Clone)]
 pub enum Model {
-    /// OpenAI-compatible chat-completions endpoint. Used for the
-    /// generic openai-compatible template and every vendor that exposes
-    /// `/v1/chat/completions` (z.ai, MiniMax, OpenCode Zen, Ollama,
-    /// OpenRouter, …). The model id is what the provider's API
+    /// Generic OpenAI-wire endpoint. Used for the generic
+    /// openai-compatible template and every provider that exposes either
+    /// `/v1/chat/completions` or `/v1/responses` (z.ai, MiniMax, OpenCode
+    /// Zen, Ollama, OpenRouter, …). The model id is what the provider's API
     /// expects (e.g. `claude-opus-4-7`, `glm-4.6`, `gpt-4o-mini`).
     OpenAi {
         client: OpenAiCompatClient,
@@ -486,6 +481,11 @@ pub enum Model {
         /// backup fallback (implementation note) exactly,
         /// regardless of any plan-level model override.
         provider_id: String,
+        /// Command-credential generation that authenticated this model's
+        /// outbound requests. Retained so a 401/403 can be bound to the
+        /// credential actually sent rather than whatever is cached later.
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Known upper bound for utility `max_tokens`, resolved from model or
         /// provider max-output/context capability metadata when available.
         utility_token_limit: Option<u64>,
@@ -505,10 +505,9 @@ pub enum Model {
         /// most once. `None` (tests / utility models) skips the persist; the
         /// fallback itself still works.
         config_path: Option<PathBuf>,
-        /// Live per-session endpoint state. The build-time `wire_api` remains
-        /// the diagnostic/default endpoint, but dispatch resolves through this
-        /// cell every turn so a confirmed self-heal and turn-boundary config
-        /// refresh apply without rebuilding the model.
+        /// Per-session endpoint-recovery state. The concrete `wire_api` stays
+        /// immutable for this model instance; a config change takes effect by
+        /// rebuilding at the turn boundary, including across `Model` variants.
         live_wire_api: LiveWireApi,
         /// Resolved inference-stream timeouts (TTFT + idle) for this
         /// `(provider, model)`
@@ -554,15 +553,16 @@ pub enum Model {
         /// debug/request payloads are exact-as-sent and may contain secrets.
         redact: Arc<RedactionTable>,
     },
-    /// Native ChatGPT/Codex subscription Responses endpoint. This is distinct
-    /// from the generic OpenAI-compatible arm because the ChatGPT backend
-    /// requires top-level `instructions` on `/responses`, plus ChatGPT account
-    /// OAuth headers resolved by Cockpit's provider credential path.
+    /// Native ChatGPT/Codex Responses endpoint. Codex-only headers remain
+    /// bound to the resolved Codex credential path; generic Responses
+    /// providers use [`Model::OpenAi`].
     ChatGpt {
         model: ChatGptResponsesModel,
         model_id: String,
         /// The configured provider id this model was built from.
         provider_id: String,
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Known upper bound for utility `max_tokens`, resolved from model or
         /// provider max-output/context capability metadata when available.
         utility_token_limit: Option<u64>,
@@ -591,15 +591,14 @@ pub enum Model {
         /// Same effective outbound-provider redaction table as [`Model::OpenAi`].
         redact: Arc<RedactionTable>,
     },
-    /// Native Anthropic Messages endpoint (`api.anthropic.com`). Routed
-    /// here only when the resolved base URL host is `api.anthropic.com`
-    /// (see [`is_anthropic_native`]); Claude served by any other host
-    /// stays on [`Model::OpenAi`]. The stored `model` already has rig's
-    /// per-block prompt caching enabled (5-min `with_prompt_caching()` or,
-    /// on the 1h opt-in, top-level `with_automatic_caching_1h()`) — see
-    /// [`build_anthropic_model`]. It's `Clone`, so the per-attempt closure
-    /// builds a fresh caching-enabled agent each turn, which re-applies the
-    /// last-message cache marker over the grown history.
+    /// Anthropic Messages-wire endpoint. Routed here only by
+    /// `wire_api = anthropic`, regardless of host. The provider's explicit
+    /// Anthropic feature gate determines whether the stored `model` uses
+    /// rig's per-block prompt caching (5-min `with_prompt_caching()` or, on
+    /// the 1h opt-in, top-level `with_automatic_caching_1h()`) — see
+    /// [`build_anthropic_model`]. It is `Clone`, so each attempt gets a fresh
+    /// model and, when caching is enabled, re-applies the last-message cache
+    /// marker over the grown history.
     Anthropic {
         model: AnthropicCompletionModel,
         model_id: String,
@@ -607,6 +606,8 @@ pub enum Model {
         /// on [`Model::OpenAi`] — exact per-`(provider, model)` backup
         /// resolution (implementation note).
         provider_id: String,
+        #[cfg(not(test))]
+        command_credential_generation: Option<u64>,
         /// Explicit output limit resolved from catalog metadata, a model
         /// override, or a provider default. Native Anthropic rejects requests
         /// without this field, so construction fails before this can be absent.
@@ -939,6 +940,28 @@ impl Model {
         }
     }
 
+    /// The command credential generation sent by this model, if command
+    /// authentication constructed it. This is deliberately model-owned:
+    /// rejections can arrive after another request has refreshed the shared
+    /// credential store.
+    #[cfg(not(test))]
+    pub(crate) fn command_credential_generation(&self) -> Option<u64> {
+        match self {
+            Model::OpenAi {
+                command_credential_generation,
+                ..
+            }
+            | Model::ChatGpt {
+                command_credential_generation,
+                ..
+            }
+            | Model::Anthropic {
+                command_credential_generation,
+                ..
+            } => *command_credential_generation,
+        }
+    }
+
     fn needs_responses_tool_identity_normalization(&self, endpoint_recovery_enabled: bool) -> bool {
         match self {
             Model::OpenAi { client, .. } => {
@@ -1104,6 +1127,7 @@ impl Model {
                 crate::config::providers::WireApi::Auto => "auto",
                 crate::config::providers::WireApi::Completions => "completions",
                 crate::config::providers::WireApi::Responses => "responses",
+                crate::config::providers::WireApi::Anthropic => "anthropic",
             },
             Model::ChatGpt { .. } => "responses",
             Model::Anthropic { .. } => "messages",
@@ -1116,7 +1140,7 @@ impl Model {
                 self.resolve_live_wire_api_for_base_url(client.base_url())
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 
@@ -1156,26 +1180,6 @@ impl Model {
         }
     }
 
-    pub(crate) fn refresh_wire_api_config(
-        &self,
-        providers: &crate::config::providers::ProvidersConfig,
-    ) {
-        let Model::OpenAi {
-            provider_id,
-            model_id,
-            live_wire_api,
-            ..
-        } = self
-        else {
-            return;
-        };
-        let mut state = live_wire_api
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.configured = providers.resolve_wire_api(provider_id, model_id);
-        state.explicit = providers.is_wire_api_explicit(provider_id, model_id);
-    }
-
     pub(crate) fn with_live_wire_api(mut self, donor: &Self) -> Self {
         let Model::OpenAi {
             live_wire_api: fresh_live_wire_api,
@@ -1191,17 +1195,16 @@ impl Model {
         else {
             return self;
         };
-        let (configured, explicit) = {
+        let explicit = {
             let fresh_state = fresh_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (fresh_state.configured, fresh_state.explicit)
+            fresh_state.explicit
         };
         {
             let mut donor_state = donor_live_wire_api
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            donor_state.configured = configured;
             donor_state.explicit = explicit;
         }
         *fresh_live_wire_api = donor_live_wire_api.clone();
@@ -1210,47 +1213,18 @@ impl Model {
 
     pub(crate) fn resolve_live_wire_api_for_base_url(
         &self,
-        base_url: &str,
+        _base_url: &str,
     ) -> crate::config::providers::WireApi {
         match self {
-            Model::OpenAi {
-                provider_id,
-                model_id,
-                wire_api,
-                live_wire_api,
-                ..
-            } => {
-                let state = live_wire_api
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.explicit && !state.configured.is_auto() {
-                    return state.configured;
-                }
-                let normalized = normalize_probe_base_url(base_url);
-                if let Some(endpoint) = state.session_confirmed.get(&normalized) {
-                    return *endpoint;
-                }
-                // A freshly fetched model catalog is stronger evidence than a
-                // process-local probe from an earlier catalog generation. In
-                // particular, Copilot may move a model from Chat Completions
-                // to Responses while the old learned endpoint is still in the
-                // TTL cache. Session-confirmed recovery stays above this so a
-                // successful swap remains stable for the current session.
-                if !state.configured.is_auto() {
-                    return state.configured;
-                }
-                drop(state);
-                if let Some(learned) = learned_working_endpoint(provider_id, model_id, base_url) {
-                    return learned;
-                }
-                if !wire_api.is_auto() {
-                    *wire_api
+            Model::OpenAi { wire_api, .. } => {
+                if wire_api.is_auto() {
+                    crate::config::providers::WireApi::Completions
                 } else {
-                    crate::config::providers::WireApi::detect_for_provider(provider_id, model_id)
+                    *wire_api
                 }
             }
             Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
+            Model::Anthropic { .. } => crate::config::providers::WireApi::Anthropic,
         }
     }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::cli::{AgentCommand, AgentExecutionKindArg, AgentScopeArg};
+use crate::cli::{AgentCommand, AgentRoleArg, AgentScopeArg};
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -137,7 +137,8 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
         AgentCommand::Create {
             name,
             scope,
-            execution_kind,
+            roles,
+            computer_use,
             primary_slot,
             workspace,
             operation_key,
@@ -145,7 +146,8 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             create(
                 name,
                 scope,
-                execution_kind,
+                roles,
+                computer_use,
                 primary_slot,
                 workspace,
                 operation_key,
@@ -250,7 +252,8 @@ async fn begin(input: BeginInput) -> Result<()> {
             target_installation_id,
             replace_acknowledged,
             requested_slot,
-            execution_kind: None,
+            roles: Vec::new(),
+            computer_use: false,
             primary_slot_id: None,
             auto_select_first_exact: yes,
         }))
@@ -341,7 +344,8 @@ async fn inspect(
 async fn create(
     name: String,
     scope: Option<AgentScopeArg>,
-    execution_kind: AgentExecutionKindArg,
+    roles: Vec<AgentRoleArg>,
+    computer_use: bool,
     primary_slot: String,
     workspace: Option<PathBuf>,
     operation_key: Option<String>,
@@ -366,7 +370,8 @@ async fn create(
             target_installation_id: None,
             replace_acknowledged: false,
             requested_slot: None,
-            execution_kind: Some(execution_kind.into()),
+            roles: roles.into_iter().map(Into::into).collect(),
+            computer_use,
             primary_slot_id: Some(primary_slot),
             auto_select_first_exact: false,
         }))
@@ -609,7 +614,7 @@ fn choice_set_lines(
             .as_deref()
             .unwrap_or("local route");
         lines.push(format!(
-            "choice={} slot={} provider={} model={} recommendation={} upstream={}{}{}",
+            "choice={} slot={} provider={} model={} recommendation={} upstream={}{}{}{}",
             choice.choice_id,
             choice.slot_id,
             choice.provider_id,
@@ -625,6 +630,10 @@ fn choice_set_lines(
                 .rationale
                 .as_deref()
                 .map(|value| format!(" rationale={value}"))
+                .unwrap_or_default(),
+            choice
+                .requires_trust_confirmation
+                .then_some(" trust-confirmation=required")
                 .unwrap_or_default()
         ));
     }
@@ -1101,6 +1110,7 @@ mod tests {
                 rationale: None,
                 author_suggested: false,
                 exact_alias_match: false,
+                requires_trust_confirmation: false,
             }
         };
         let choices = vec![
@@ -1155,6 +1165,7 @@ mod tests {
                 rationale: Some(format!("why-{choice_id}")),
                 author_suggested: recommendation_id.is_some(),
                 exact_alias_match: recommendation_id.is_some(),
+                requires_trust_confirmation: false,
             }
         };
         let choices = vec![

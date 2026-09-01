@@ -398,6 +398,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             active_subagent,
             active_model_state: _,
             history,
+            removed_user_message_seqs: _,
             paused_work,
             repair_required,
             resume_compaction_offer: _,
@@ -1181,6 +1182,11 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             client_submission_ids: _,
             preflight_cleaned,
         } => scrub_option_string(preflight_cleaned, redact),
+        proto::Event::UserMessageRemoved {
+            session_id: _,
+            seq: _,
+            client_submission_ids: _,
+        } => {},
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
             text,
@@ -1391,6 +1397,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::HistoryReplay {
             session_id: _,
             entries,
+            removed_user_message_seqs: _,
             max_seq: _,
         } => scrub_history_entries(entries, redact),
         proto::Event::PrimarySwapped {

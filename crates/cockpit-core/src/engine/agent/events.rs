@@ -249,6 +249,7 @@ pub enum TurnEvent {
     /// Warm daemon reattach replay of persisted history entries.
     HistoryReplay {
         entries: Vec<crate::daemon::proto::HistoryEntry>,
+        removed_user_message_seqs: Vec<i64>,
     },
     /// A configured stream wait threshold elapsed. The TUI shows a yellow
     /// warning; without a backup the stream keeps waiting, while with a backup
@@ -356,6 +357,14 @@ pub enum TurnEvent {
         client_submission_ids: Vec<uuid::Uuid>,
         preflight_cleaned: Option<String>,
     },
+    /// The latest durable user row was retracted by an initial-thinking
+    /// cancellation. Every client removes `seq`; only an owner of a listed
+    /// submission identity restores its local composer draft, so this event
+    /// never fans out artifact-sized input.
+    UserMessageRemoved {
+        seq: i64,
+        client_submission_ids: Vec<uuid::Uuid>,
+    },
     /// One or more daemon-queued user messages were drained and folded into
     /// the next model request. This is the authoritative transcript signal for
     /// queued folds; clients must not infer it from `ThinkingStarted`.
@@ -415,7 +424,9 @@ pub enum TurnEvent {
     /// UI-only progress tick for a running tool row. Generic by design:
     /// producers send numeric progress and the client owns formatting.
     ToolProgress(ToolProgress),
-    /// Tool finished. `output` is what the model will see next turn.
+    /// Tool finished. `output` is the durable/display projection. It normally
+    /// matches model history; tools with schema-marked model-ephemeral output
+    /// may provide a richer UI-only value.
     ToolEnd {
         agent: String,
         call_id: String,

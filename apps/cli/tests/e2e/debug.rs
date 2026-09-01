@@ -28,21 +28,13 @@ fn paths_reports_locations() {
         "{text}"
     );
 
-    let home_dot = home_config
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(".cockpit");
     let home_config_row = format!("{} (present)", home_config.display());
-    let home_dot_row = format!("{} (absent)", home_dot.display());
     let local_row = format!(
         "{}/local-configs/",
         home.db_path().parent().unwrap().display()
     );
     let project_config_row = format!("{} (present)", project_config.display());
     let home_config_at = text.find(&home_config_row).expect("home config candidate");
-    let home_dot_at = text.find(&home_dot_row).expect("home dot config candidate");
     let local_at = text
         .find(&local_row)
         .expect("machine-local config candidate");
@@ -50,7 +42,7 @@ fn paths_reports_locations() {
         .find(&project_config_row)
         .expect("project config candidate");
     assert!(
-        home_config_at < home_dot_at && home_dot_at < local_at && local_at < project_config_at,
+        home_config_at < local_at && local_at < project_config_at,
         "config candidates must be least-to-most specific:
 {text}"
     );

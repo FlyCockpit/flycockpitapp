@@ -328,11 +328,18 @@ async fn build_batch(
     let mut events = Vec::new();
     let mut bytes = 0usize;
     for row in &rows {
-        if !policy.allows_kind(&row.kind) {
+        // A retract is a control record for a message that may have been
+        // accepted under an earlier policy/cursor. Never filter it out by the
+        // current content-kind policy, or a remotely persisted message could
+        // become impossible to remove after a policy change.
+        let is_retraction = row.kind == "user_message_retracted";
+        if !is_retraction && !policy.allows_kind(&row.kind) {
             batch_cursor_seq = row.seq;
             continue;
         }
-        if !policy.include_local_model_transcripts && row.model_trust.as_deref() == Some("trusted")
+        if !is_retraction
+            && !policy.include_local_model_transcripts
+            && row.model_trust.as_deref() == Some("trusted")
         {
             batch_cursor_seq = row.seq;
             continue;
@@ -402,6 +409,19 @@ async fn sync_event_json(
         "callId": row.call_id,
         "data": row.data,
     });
+    if row.kind == "user_message_retracted" {
+        let retracted_seq = row
+            .data
+            .get("retracted_seq")
+            .and_then(Value::as_i64)
+            .filter(|seq| *seq > 0)
+            .ok_or_else(|| anyhow!("user-message retract row {} lacks retracted_seq", row.seq))?;
+        // The original event may already have crossed the sync cursor while
+        // the provider was still thinking.  Upload a separate, idempotent
+        // tombstone keyed to the original immutable event so the receiver can
+        // delete it before accepting the later re-send as its replacement.
+        event["retractsIdempotencyKey"] = Value::String(format!("session_event:{retracted_seq}"));
+    }
     if row.kind == "inference_request"
         && let Some(call_id) = row.call_id.as_deref()
     {
@@ -863,6 +883,73 @@ mod tests {
         assert_eq!(
             db.list_org_sync_states().await.unwrap()[0].cursor_seq,
             second
+        );
+    }
+
+    #[tokio::test]
+    async fn retract_uploads_a_durable_tombstone_for_remote_reconciliation() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/project", "builder")
+            .await
+            .unwrap();
+        db.set_session_redaction_table_json(
+            session.session_id,
+            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
+        let removed_seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "thinking only"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.remove_latest_user_message(session.session_id, removed_seq)
+                .await
+                .unwrap()
+        );
+
+        let policy = OrgLogSyncPolicy {
+            org_id: "org-1".to_string(),
+            policy_version: Some("v1".to_string()),
+            include_event_kinds: vec!["user_message".to_string()],
+            exclude_event_kinds: Vec::new(),
+            include_local_model_transcripts: true,
+            raw: json!({}),
+        };
+        let built = build_batch(
+            &db,
+            &credential("https://app.example.test".to_string()),
+            &policy,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let BatchBuild::Ready {
+            payload,
+            event_count,
+            ..
+        } = built
+        else {
+            panic!("a retraction must be delivered as a remote tombstone");
+        };
+        assert_eq!(event_count, 1);
+        let event = &payload["events"][0];
+        assert_eq!(event["kind"], "user_message_retracted");
+        assert_eq!(
+            event["retractsIdempotencyKey"],
+            format!("session_event:{removed_seq}")
+        );
+        assert!(
+            event["data"].get("text").is_none(),
+            "the replacement protocol must never re-upload deleted user text"
         );
     }
 

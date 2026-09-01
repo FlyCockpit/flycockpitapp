@@ -44,6 +44,7 @@
 //! }
 //! ```
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -78,6 +79,8 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "favorite",
     "credential_ref",
     "auth",
+    "auth_command",
+    "oauth",
     "trust",
     "location",
     "quality_rank",
@@ -100,6 +103,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "capabilities",
     "provider_metadata",
     "last_model_fetch",
+    "usage_probe",
 ];
 
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
@@ -435,6 +439,12 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
 
+    /// Optional declarative API usage probe. When absent, built-in templates
+    /// may supply their own default probe. The probe always reuses this
+    /// provider's resolved inference headers; it never stores a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_probe: Option<UsageProbeSpec>,
+
     /// Base URL. The `/models` endpoint is `{url}/models`; chat lives at
     /// `{url}/chat/completions`. Stored without a trailing slash.
     /// Provider files that only overlay models (favorites, names) omit this
@@ -478,6 +488,26 @@ pub struct ProviderEntry {
     /// driven by `headers` + `credential_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthKind>,
+
+    /// External authentication command, expressed as an argv vector (program
+    /// followed by arguments). The command is accepted only from a global
+    /// user provider layer. Project/workspace layers strip this field before
+    /// merging, so merely opening a repository can never authorize process
+    /// execution. Each argv item supports the same `${VAR}`, `$VAR`, and
+    /// `$secret:<name>` references as provider headers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonempty_argv"
+    )]
+    pub auth_command: Option<Vec<String>>,
+
+    /// Declarative OAuth flow for custom subscription providers. Unlike
+    /// `auth_command`, this contains only data: Cockpit owns the device-code
+    /// or PKCE exchange, persists the returned token document in the
+    /// credential store, and renders selected response fields into headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthDescriptor>,
 
     /// Product-facing trust policy. `trusted` disables outbound request
     /// redaction for models inheriting it; `untrusted` keeps the session
@@ -544,6 +574,13 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Native Anthropic Messages API features accepted by this provider.
+    /// These vendor-specific request extensions are opt-in so an
+    /// Anthropic-compatible gateway receives only the portable Messages wire
+    /// unless its configuration explicitly enables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<AnthropicFeatures>,
+
     /// Delegation-shrink behavior for this provider (GOALS §10 /
     /// implementation note). Drives the parent-context
     /// shrink that hides cache-cold cost across a sub-agent delegation. A
@@ -578,10 +615,9 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub timeout: TimeoutConfig,
 
-    /// Provider-level OpenAI-compatible wire endpoint default. A concrete
-    /// `completions` or `responses` applies to models that do not pin their
-    /// own `wire_api`; `auto` leaves routing to learned state and the
-    /// provider-aware conservative default.
+    /// Provider-level request-wire default. A concrete value applies to models
+    /// that do not pin their own `wire_api`; `auto` inherits the selected
+    /// provider template's default (or Chat Completions for custom providers).
     #[serde(default, skip_serializing_if = "WireApi::is_auto")]
     pub wire_api: WireApi,
 
@@ -875,6 +911,36 @@ pub struct BackupConfig {
     pub model: String,
 }
 
+/// Native Anthropic Messages-wire features accepted by a provider.
+///
+/// Custom Anthropic-compatible endpoints default to both fields disabled.
+/// The first-party Anthropic template materializes both as enabled when it
+/// creates a provider entry.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicFeatures {
+    /// Enable Anthropic `cache_control` request blocks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_caching: bool,
+
+    /// Enable Anthropic beta headers, including extended cache TTL and
+    /// computer-use contracts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub betas: bool,
+}
+
+impl AnthropicFeatures {
+    pub const fn first_party() -> Self {
+        Self {
+            prompt_caching: true,
+            betas: true,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.prompt_caching && !self.betas
+    }
+}
+
 /// Prompt-cache configuration. Set per-provider on [`ProviderEntry`] and
 /// optionally overridden per-model on [`ModelEntry`]. Used only by the
 /// cache-cold predicate (GOALS §10) that decides whether auto-prune may
@@ -1009,6 +1075,121 @@ pub struct HeaderSpec {
     pub value: String,
 }
 
+/// A provider usage endpoint that can be fetched without vendor-specific
+/// Rust code. `endpoint` is either an absolute URL or a root-relative path;
+/// root-relative paths are resolved against the provider URL's origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageProbeSpec {
+    pub endpoint: Cow<'static, str>,
+    #[serde(default)]
+    pub method: UsageProbeMethod,
+    pub fields: Cow<'static, [UsageProbeField]>,
+}
+
+/// HTTP method for a declarative usage probe. The initial declarative probe
+/// contract intentionally supports only GET.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageProbeMethod {
+    #[default]
+    Get,
+}
+
+/// One JSON Pointer extraction from a declarative usage response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageProbeField {
+    pub pointer: Cow<'static, str>,
+    pub label: Cow<'static, str>,
+    pub kind: UsageProbeFieldKind,
+}
+
+/// Rendering target for an extracted declarative usage field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageProbeFieldKind {
+    Credits,
+    RequestsRemaining,
+    Percent,
+    Text,
+}
+
+/// OAuth flows supported by the declarative provider runner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowKind {
+    DeviceCode,
+    PkceBrowser,
+}
+
+/// Pure-data description of a custom provider's OAuth endpoints and token
+/// projection. Header values interpolate top-level token-response fields with
+/// `{field_name}` placeholders, for example `Bearer {access_token}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthDescriptor {
+    pub flow: OAuthFlowKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_endpoint: Option<String>,
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_endpoint: Option<String>,
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+    pub headers: Vec<OAuthHeaderMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthHeaderMapping {
+    pub name: String,
+    pub value: String,
+}
+
+impl OAuthDescriptor {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.client_id.is_empty() || self.token_endpoint.is_empty() {
+            return Err("OAuth client_id and token_endpoint must not be empty");
+        }
+        match self.flow {
+            OAuthFlowKind::DeviceCode
+                if self.device_endpoint.as_deref().unwrap_or("").is_empty() =>
+            {
+                return Err("device-code OAuth requires device_endpoint");
+            }
+            OAuthFlowKind::PkceBrowser
+                if self.authorize_endpoint.as_deref().unwrap_or("").is_empty()
+                    || self.redirect_uri.as_deref().unwrap_or("").is_empty() =>
+            {
+                return Err("PKCE browser OAuth requires authorize_endpoint and redirect_uri");
+            }
+            _ => {}
+        }
+        if self.headers.is_empty()
+            || self
+                .headers
+                .iter()
+                .any(|header| header.name.is_empty() || header.value.is_empty())
+        {
+            return Err("OAuth headers must contain non-empty name/value mappings");
+        }
+        let mut normalized_header_names = std::collections::BTreeSet::new();
+        for header in &self.headers {
+            if reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+                || reqwest::header::HeaderValue::from_str(&header.value).is_err()
+            {
+                return Err("OAuth headers must contain valid HTTP header mappings");
+            }
+            if !normalized_header_names.insert(header.name.to_ascii_lowercase()) {
+                return Err("OAuth headers must not contain duplicate names");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderHeaderConfigError {
     provider_id: String,
@@ -1124,8 +1305,27 @@ pub enum AuthKind {
     ApiKey,
     /// OAuth bearer resolved from the credential store at request time.
     OAuth,
+    /// Bearer token and optional headers returned by `auth_command`.
+    Command,
     /// No authentication (e.g. a self-hosted ollama server).
     None,
+}
+
+fn deserialize_optional_nonempty_argv<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Vec<String>>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(|argv| {
+        argv.is_empty() || argv.first().is_some_and(|program| program.is_empty())
+    }) {
+        return Err(serde::de::Error::custom(
+            "auth_command must contain a non-empty executable",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1775,18 +1975,20 @@ impl ProviderModelCatalog {
     }
 }
 
-/// Which OpenAI-compatible wire endpoint a model speaks.
+/// Which request wire a model speaks.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WireApi {
-    /// No explicit pin: name-detect, then self-heal via the fallback. The
-    /// default for every model so existing configs are unaffected.
+    /// No explicit pin. Resolution falls back to the provider template default
+    /// (or Chat Completions for a custom provider).
     #[default]
     Auto,
     /// Force the Chat Completions endpoint (`/chat/completions`).
     Completions,
     /// Force the Responses endpoint (`/responses`).
     Responses,
+    /// Force Anthropic's native Messages endpoint (`/v1/messages`).
+    Anthropic,
 }
 
 /// Authority of a concrete model-level [`WireApi`] value.
@@ -1813,52 +2015,9 @@ impl WireApiProvenance {
 
 impl WireApi {
     /// True for the `Auto` (unpinned) variant — the serde skip predicate and
-    /// the resolver's "fall through to auto-detect" test.
+    /// effective-resolution fallback.
     pub fn is_auto(&self) -> bool {
         matches!(self, WireApi::Auto)
-    }
-
-    /// Conservative name auto-detect for `Auto` models: a model id beginning
-    /// with `gpt-5` (case-insensitive) is responses-only → [`WireApi::Responses`];
-    /// everything else → [`WireApi::Completions`] (today's default for every
-    /// existing model). Deliberately minimal — the error-driven fallback
-    /// corrects any miss, so this list never tries to enumerate every model.
-    pub fn detect(model_id: &str) -> WireApi {
-        // Byte-compare (panic-free across UTF-8 boundaries; the prefix is pure
-        // ASCII so byte equality is exactly the case-insensitive `str` match).
-        if model_id.len() >= 5 && model_id.as_bytes()[..5].eq_ignore_ascii_case(b"gpt-5") {
-            WireApi::Responses
-        } else {
-            WireApi::Completions
-        }
-    }
-
-    /// Provider-aware conservative default. OpenAI and Copilot share the
-    /// `gpt-5*` → Responses fallback; a fetched catalog remains authoritative
-    /// whenever it advertises concrete endpoints. Arbitrary OpenAI-compatible
-    /// endpoints default to Chat Completions.
-    pub fn detect_for_provider(provider_id: &str, model_id: &str) -> WireApi {
-        match provider_id {
-            "openai" | "copilot" => Self::detect(model_id),
-            "codex-oauth" | "grok" | "grok-oauth" => WireApi::Responses,
-            _ => WireApi::Completions,
-        }
-    }
-
-    /// Provider-aware conservative default using an entry's immutable vendor
-    /// identity as well as its legacy config key.  A connection created from
-    /// the Copilot template may be renamed, so the key alone is not enough to
-    /// select Copilot's GPT-5 Responses fallback.
-    pub fn detect_for_provider_entry(
-        provider_id: &str,
-        entry: &ProviderEntry,
-        model_id: &str,
-    ) -> WireApi {
-        if entry.is_copilot_identity(provider_id) {
-            Self::detect(model_id)
-        } else {
-            Self::detect_for_provider(provider_id, model_id)
-        }
     }
 
     /// The opposite concrete endpoint — the one the error-driven fallback
@@ -1867,24 +2026,28 @@ impl WireApi {
     pub fn opposite(self) -> WireApi {
         match self {
             WireApi::Responses => WireApi::Completions,
-            WireApi::Completions | WireApi::Auto => WireApi::Responses,
+            WireApi::Completions | WireApi::Auto | WireApi::Anthropic => WireApi::Responses,
         }
     }
 }
 
-/// `true` when `base_url`'s host is the native Anthropic Messages endpoint
-/// (`api.anthropic.com`). Host-based rather than provider-id-based so renamed
-/// Anthropic providers still route natively, while Claude served by
-/// OpenRouter/Copilot/etc. remains OpenAI-compatible. Unparseable URLs are
-/// never native.
-pub fn is_anthropic_native_base_url(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|u| {
-            u.host_str()
-                .map(|h| h.eq_ignore_ascii_case("api.anthropic.com"))
-        })
-        .unwrap_or(false)
+/// The built-in template default used when a provider entry leaves
+/// [`ProviderEntry::wire_api`] unset. This deliberately depends on immutable
+/// template identity only: map keys and URLs are user-controlled and never
+/// participate in wire selection.
+pub fn default_wire_api_for_template(template: Option<&str>) -> WireApi {
+    match template {
+        Some(template) if template.eq_ignore_ascii_case("anthropic") => WireApi::Anthropic,
+        Some(template)
+            if matches!(
+                template.to_ascii_lowercase().as_str(),
+                "openai" | "codex-oauth" | "grok" | "grok-oauth"
+            ) =>
+        {
+            WireApi::Responses
+        }
+        _ => WireApi::Completions,
+    }
 }
 
 /// `true` when `base_url`'s HOST is GitHub Copilot's API host
@@ -2171,6 +2334,35 @@ impl ProviderEntry {
     /// and cannot prove registry provenance.
     pub fn effective_template(&self, _key: &str) -> Option<&str> {
         self.template.as_deref()
+    }
+
+    /// Resolve native Anthropic extensions from the provider's explicit gate.
+    /// A missing or empty gate disables both extensions. First-party defaults
+    /// are materialized when the Anthropic template creates the entry.
+    pub fn effective_anthropic_features(&self) -> AnthropicFeatures {
+        self.anthropic.unwrap_or_default()
+    }
+
+    /// Resolve the effective request wire for one model on this provider.
+    ///
+    /// Model pins win over a provider pin; an unpinned provider inherits its
+    /// immutable template default. URLs, provider ids, model names, live
+    /// catalog metadata, and learned endpoint state never participate.
+    pub fn resolve_wire_api(&self, provider_id: &str, model_id: &str) -> WireApi {
+        if let Some(wire_api) = self
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .filter(|model| model.wire_api_provenance.is_user_configured())
+            .map(|model| model.wire_api)
+            .filter(|wire_api| !wire_api.is_auto())
+        {
+            return wire_api;
+        }
+        if !self.wire_api.is_auto() {
+            return self.wire_api;
+        }
+        default_wire_api_for_template(self.effective_template(provider_id))
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.
@@ -3089,10 +3281,7 @@ impl ProvidersConfig {
     pub fn resolve_active_model_reasoning_params(&self) -> Option<Value> {
         let active = self.active_model.as_ref()?;
         if self.has_reasoning_effort_capability(&active.provider, &active.model) {
-            let wire_api = match self.resolve_wire_api(&active.provider, &active.model) {
-                WireApi::Auto => WireApi::detect_for_provider(&active.provider, &active.model),
-                wire_api => wire_api,
-            };
+            let wire_api = self.resolve_wire_api(&active.provider, &active.model);
             return self
                 .resolve_reasoning_effort_params_for_openai_endpoint(
                     &active.provider,
@@ -3191,65 +3380,23 @@ impl ProvidersConfig {
         })
     }
 
-    /// Resolve configured wire endpoint authority for `(provider, model)`.
-    /// Concrete model pins win, then concrete provider defaults, then a live
-    /// catalog's advertised endpoints. `Auto` means the caller should consult
-    /// learned state and conservative defaults.
+    /// Resolve the effective request wire for `(provider, model)`.
+    ///
+    /// Explicit model and provider configuration win. An unset entry then
+    /// inherits its immutable template default; a custom or unknown provider
+    /// defaults to Chat Completions. URLs, mutable provider ids, model names,
+    /// live catalog metadata, and learned endpoint state never participate.
     pub fn resolve_wire_api(&self, provider: &str, model: &str) -> WireApi {
         let Some(entry) = self.providers.get(provider) else {
-            return WireApi::Auto;
+            return WireApi::Completions;
         };
-        if let Some(wire_api) = entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .filter(|m| m.wire_api_provenance.is_user_configured())
-            .map(|m| m.wire_api)
-            .filter(|w| !w.is_auto())
-        {
-            return wire_api;
-        }
-        if !entry.wire_api.is_auto() {
-            return entry.wire_api;
-        }
-        if let Some(model) = entry.models.iter().find(|m| m.id == model)
-            && let Some(wire_api) = preferred_catalog_wire_api(&model.capabilities)
-        {
-            return wire_api;
-        }
-        if let Some(wire_api) = entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .filter(|m| matches!(m.wire_api_provenance, WireApiProvenance::Recovered))
-            .map(|m| m.wire_api)
-            .filter(|w| !w.is_auto())
-        {
-            return wire_api;
-        }
-        // Copilot's model catalog is authoritative when present, but a
-        // temporary/missing catalog must not make a renamed Copilot GPT-5
-        // connection start at Chat Completions. Other providers retain the
-        // historic `Auto` result so their learned-endpoint path remains
-        // unchanged.
-        if entry.is_copilot_identity(provider) {
-            WireApi::detect(model)
-        } else {
-            WireApi::Auto
-        }
+        entry.resolve_wire_api(provider, model)
     }
 
-    /// Whether the endpoint is explicitly pinned by model or provider config.
-    pub fn is_wire_api_explicit(&self, provider: &str, model: &str) -> bool {
-        let Some(entry) = self.providers.get(provider) else {
-            return false;
-        };
-        entry
-            .models
-            .iter()
-            .find(|m| m.id == model)
-            .is_some_and(|m| !m.wire_api.is_auto() && m.wire_api_provenance.is_user_configured())
-            || !entry.wire_api.is_auto()
+    /// Whether a configured provider has a fixed effective wire. Resolution is
+    /// total for configured providers, so template defaults are fixed too.
+    pub fn is_wire_api_explicit(&self, provider: &str, _model: &str) -> bool {
+        self.providers.contains_key(provider)
     }
 }
 

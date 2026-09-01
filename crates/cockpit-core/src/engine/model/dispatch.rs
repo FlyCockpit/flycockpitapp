@@ -891,7 +891,7 @@ impl Model {
                                     prompt.clone(),
                                     wire_tools,
                                     &attempt_params,
-                                    openai_additional_params(&attempt_params),
+                                    Some(openai_responses_additional_params(&attempt_params)),
                                 );
                                 drain_completion_stream(
                                     request,
@@ -1256,6 +1256,17 @@ impl Model {
                             tracing::warn!(%error, "serialize final wire tool definitions failed");
                             serde_json::Value::Array(Vec::new())
                         });
+                    let captured_params = match self {
+                        Model::OpenAi { .. } => params_for_openai_wire(&params, wire),
+                        Model::ChatGpt { .. } | Model::Anthropic { .. } => params.clone(),
+                    };
+                    captured["additional_params"] = serde_json::to_value(
+                        captured_additional_params(self.provider_label(), wire, &captured_params),
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "serialize final wire additional parameters failed");
+                        serde_json::Value::Null
+                    });
                     if let Some(path) = debug_last_message_path() {
                         write_dump(path, &captured);
                     }
@@ -1353,7 +1364,10 @@ impl Model {
                 provider_id
             }
             Model::OpenAi { .. } => "openai-compatible",
-            Model::ChatGpt { .. } => "codex-oauth",
+            // Responses is a wire, not a credential. Preserve the configured
+            // provider identity for custom Responses endpoints while the
+            // built-in Codex template naturally remains `codex-oauth`.
+            Model::ChatGpt { provider_id, .. } => provider_id,
             Model::Anthropic { .. } => "anthropic",
         }
     }
@@ -1533,10 +1547,16 @@ impl Model {
                 Vec::new()
             };
 
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_api = self.current_wire_api();
+        let params = match self {
+            Model::OpenAi { .. } => params_for_openai_wire(&params, wire_api),
+            Model::ChatGpt { .. } | Model::Anthropic { .. } => params,
+        };
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             &system,
             &history,
             &prompt,
@@ -1596,6 +1616,7 @@ impl Model {
         // model, but the session params outlive the recovery, so an
         // endpoint-scoped Responses control must not remain in a later Chat
         // Completions record.
+        let wire_api = self.current_wire_api();
         let params = match self {
             Model::OpenAi { client, .. } => params_for_openai_wire(
                 &params,
@@ -1641,10 +1662,11 @@ impl Model {
         } else {
             None
         };
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let mut captured = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             &system,
             &history,
             &prompt,
@@ -1693,6 +1715,7 @@ impl Model {
         // endpoint. In particular, a session that recovered from Responses to
         // Chat Completions must not retain a Responses-only reasoning object in
         // the tandem record or replay it to the provider.
+        let wire_api = self.current_wire_api();
         let params = match self {
             Model::OpenAi { client, .. } => params_for_openai_wire(
                 &params,
@@ -1739,10 +1762,11 @@ impl Model {
             }
         };
         let prompt = &prompt_scrubbed;
-        let wire_tools = self.definitions_for_initial_wire(tools);
+        let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let request = assembled_request(
             self.model_id(),
             self.provider_label(),
+            wire_api,
             system,
             &stripped,
             prompt,
@@ -1838,7 +1862,7 @@ impl Model {
                             prompt.clone(),
                             wire_tools,
                             &params,
-                            openai_additional_params(&params),
+                            Some(openai_responses_additional_params(&params)),
                         )
                         .send()
                         .await?;
@@ -1966,7 +1990,7 @@ async fn openai_text_completion(
                 Message::user(prompt),
                 &[],
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .send()
             .await
@@ -1974,7 +1998,8 @@ async fn openai_text_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system.unwrap_or(""),
@@ -2018,7 +2043,7 @@ async fn openai_tool_completion(
                 Message::user(prompt),
                 std::slice::from_ref(&wire_tool),
                 params,
-                openai_additional_params(params),
+                Some(openai_responses_additional_params(params)),
             )
             .tool_choice(ToolChoice::Required)
             .send()
@@ -2027,7 +2052,8 @@ async fn openai_tool_completion(
             .choice
         }
         crate::config::providers::WireApi::Completions
-        | crate::config::providers::WireApi::Auto => {
+        | crate::config::providers::WireApi::Auto
+        | crate::config::providers::WireApi::Anthropic => {
             configured_completion_request(
                 build_completion_model(client, model_id),
                 system,
@@ -2050,6 +2076,7 @@ async fn openai_tool_completion(
 pub(super) fn assembled_request(
     model_id: &str,
     provider: &str,
+    wire_api: crate::config::providers::WireApi,
     system: &str,
     history: &[Message],
     prompt: &Message,
@@ -2070,18 +2097,31 @@ pub(super) fn assembled_request(
         // computed the same way the live request computes it, so what's
         // recorded is what's sent:
         // - OpenAI-compat: vendor + native computer tools + prompt cache keys
+        // - generic Responses: the same plus enforced statelessness and
+        //   `reasoning_effort`'s Responses-wire translation
         // - codex-oauth (native ChatGPT): vendor + native computer tools only
-        // - anthropic: vendor + anthropic computer tools (per-block cache)
+        // - anthropic: vendor + Anthropic computer tools
         // Omitted when there's nothing to add.
-        "additional_params": match provider {
-            "anthropic" => anthropic_additional_params(params),
-            "codex-oauth" => chatgpt_additional_params(params),
-            _ => openai_additional_params(params),
-        },
+        "additional_params": captured_additional_params(provider, wire_api, params),
         "native_computer_beta_headers": native_computer_beta_headers(params),
         "history": history,
         "prompt": prompt,
     })
+}
+
+fn captured_additional_params(
+    provider: &str,
+    wire_api: crate::config::providers::WireApi,
+    params: &ModelParams,
+) -> Option<serde_json::Value> {
+    match provider {
+        "anthropic" => anthropic_additional_params(params),
+        "codex-oauth" => chatgpt_additional_params(params),
+        _ if wire_api == crate::config::providers::WireApi::Responses => {
+            Some(openai_responses_additional_params(params))
+        }
+        _ => openai_additional_params(params),
+    }
 }
 
 /// Write a pre-assembled request body to `path` for `--debug-last-message`.

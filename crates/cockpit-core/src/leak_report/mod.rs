@@ -529,9 +529,11 @@ pub fn report_leak_schema() -> Value {
 /// eligible route. Names the containment contract so an untrusted model that
 /// received a secret has a legal, non-oracular way to report it.
 pub const REPORT_LEAK_TOOL_DESCRIPTION: &str = "Report a secret you accidentally received (in a tool result, the environment, \
-     or your own output) so the host can contain it. You receive only 'contained' \
-     or a content-free failure; the secret is never returned to you and never \
-     reaches the conversation, logs, or any record.";
+     or your own output) so the host can contain it. Report the exact literal \
+     form you received, including base64, hexadecimal, URL-encoded, and other \
+     encoded, transformed, or derived forms; do not decode or normalize it. You \
+     receive only 'contained' or a content-free failure; the secret is never \
+     returned to you and never reaches the conversation, logs, or any record.";
 
 /// The wire [`ToolDefinition`] for `report_leak`, advertised on eligible routes.
 ///

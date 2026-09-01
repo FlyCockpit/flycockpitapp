@@ -778,6 +778,21 @@ fn report_leak_advertising_name_is_exact_and_not_a_generic_tool() {
         schema.get("additionalProperties").and_then(|v| v.as_bool()),
         Some(false)
     );
+
+    let description = report_leak_tool_definition().description;
+    for encoded_form in [
+        "exact literal",
+        "base64",
+        "hexadecimal",
+        "URL-encoded",
+        "transformed",
+        "derived",
+    ] {
+        assert!(
+            description.contains(encoded_form),
+            "report_leak description must cover {encoded_form}: {description}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

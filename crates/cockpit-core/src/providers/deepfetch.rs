@@ -553,6 +553,14 @@ pub fn collect_deepfetch_targets(
             {
                 continue;
             }
+            let supported_wire_apis = model.capabilities.supported_wire_apis.clone();
+            let automatic_wire_api = if supported_wire_apis.contains(&WireApi::Responses) {
+                WireApi::Responses
+            } else if supported_wire_apis.contains(&WireApi::Completions) {
+                WireApi::Completions
+            } else {
+                cfg.resolve_wire_api(provider_id, &model.id)
+            };
             targets.push(DeepfetchTarget {
                 provider_id: provider_id.clone(),
                 model_id: model.id.clone(),
@@ -567,8 +575,8 @@ pub fn collect_deepfetch_targets(
                     WireApi::Auto
                 },
                 inherited_wire_api: entry.wire_api,
-                supported_wire_apis: model.capabilities.supported_wire_apis.clone(),
-                automatic_wire_api: cfg.resolve_wire_api(provider_id, &model.id),
+                supported_wire_apis,
+                automatic_wire_api,
                 direct_model_scope: scope.provider.is_some() && scope.model.is_some(),
             });
         }

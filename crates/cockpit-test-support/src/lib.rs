@@ -168,7 +168,10 @@ impl TestEnvGuard {
     pub fn set_isolated_home(&self, root: &Path) {
         let home = root.join("home");
         let data = root.join("data");
-        let config = root.join("config");
+        // Match the platform default when a caller has only isolated HOME:
+        // config discovery remains XDG-aware, while fixture paths can model
+        // the canonical `~/.config/cockpit` layer without a second root.
+        let config = home.join(".config");
         let state = root.join("state");
         let runtime = root.join("runtime");
         for dir in [&home, &data, &config, &state, &runtime] {

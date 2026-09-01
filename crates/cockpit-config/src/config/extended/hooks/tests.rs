@@ -309,7 +309,7 @@ fn hooks_config_origin_is_nonpath_and_stable() {
     for (hook, expected_kind) in first
         .hooks
         .iter()
-        .zip(["global", "user", "machine", "project", "explicit"])
+        .zip(["global", "machine", "project", "explicit"])
     {
         let expected = format!(
             "{expected_kind}:{}:0",

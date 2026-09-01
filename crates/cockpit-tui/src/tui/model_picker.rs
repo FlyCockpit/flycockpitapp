@@ -1527,7 +1527,9 @@ mod tests {
             ..ModelEntry::default()
         };
         let provider = ProviderEntry {
-            url: "https://api.anthropic.com/v1".into(),
+            // Picker controls follow the configured wire, never a URL
+            // heuristic. This fixture exercises an explicitly native entry.
+            wire_api: WireApi::Anthropic,
             models: vec![model.clone()],
             ..ProviderEntry::default()
         };
@@ -1537,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_gpt5_favorite_uses_responses_fallback_for_effort_picker() {
+    fn configured_copilot_responses_favorite_offers_effort_picker() {
         let responses_only_effort = ReasoningEffortCapability {
             values: vec![CapabilityValue {
                 value: "ultra".into(),
@@ -1560,26 +1562,30 @@ mod tests {
             favorite: true,
             capabilities: ModelCapabilities {
                 reasoning_effort: Some(responses_only_effort),
-                // No catalog endpoint is present: this must follow the same
-                // Copilot GPT-5 fallback as the request resolver.
+                // No catalog endpoint is present. The control remains valid
+                // because the provider explicitly selects Responses.
                 supported_wire_apis: Vec::new(),
                 ..ModelCapabilities::default()
             },
             ..ModelEntry::default()
         };
-        let provider = ProviderEntry::default();
+        let provider = ProviderEntry {
+            template: Some("copilot".into()),
+            wire_api: WireApi::Responses,
+            ..ProviderEntry::default()
+        };
 
         let entry = picker_entry("copilot", &provider, &model);
 
         assert!(entry.is_favorite);
         assert!(
             entry.reasoning_effort.is_some(),
-            "the favorite must expose its Responses-only effort picker"
+            "an explicitly Responses-routed favorite must expose its effort picker"
         );
     }
 
     #[test]
-    fn renamed_copilot_gpt5_uses_responses_fallback_for_effort_picker() {
+    fn renamed_copilot_responses_provider_offers_effort_picker() {
         let responses_only_effort = ReasoningEffortCapability {
             values: vec![CapabilityValue {
                 value: "ultra".into(),
@@ -1608,6 +1614,7 @@ mod tests {
         };
         let provider = ProviderEntry {
             template: Some("copilot".into()),
+            wire_api: WireApi::Responses,
             ..ProviderEntry::default()
         };
 

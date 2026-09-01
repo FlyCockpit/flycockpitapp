@@ -364,8 +364,8 @@ async fn agent_cli_management_socket_default_daemon_create_list_and_collision_re
             "socket-helper",
             "--scope",
             "global",
-            "--execution-kind",
-            "coding",
+            "--role",
+            "code",
         ])
         .output()
         .expect("run daemon-backed create");
@@ -427,8 +427,8 @@ async fn agent_cli_management_socket_default_daemon_create_list_and_collision_re
             "socket-helper",
             "--scope",
             "global",
-            "--execution-kind",
-            "coding",
+            "--role",
+            "code",
         ])
         .output()
         .expect("run daemon-backed create collision");

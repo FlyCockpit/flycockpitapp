@@ -1985,7 +1985,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             tmp.path().join(".cockpit/providers/lmstudio.json"),
             serde_json::json!({
                 "url": provider.base_url(),
-                "wireApi": "completions",
+                "wire_api": "completions",
                 "models": [{ "id": "local" }]
             })
             .to_string(),

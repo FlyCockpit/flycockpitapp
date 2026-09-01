@@ -590,10 +590,7 @@ fn test_driver_with_url_vnext(
 /// directly (not via `agent_from_def`), so `vnext_reachable_subagents` is not
 /// called and the broad list cannot cause a resolution bail.
 fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
-    use crate::agents::{
-        AllowedChild, DelegationPolicy, DelegationTarget, ModelCapability, ModelLocality,
-        ModelSlot, VnextAgentDef,
-    };
+    use crate::agents::{AllowedChild, DelegationTarget};
     let host = crate::agents::VnextHostPolicy::for_session_config(
         &crate::config::extended::load_for_cwd(root),
     );
@@ -604,44 +601,27 @@ fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVne
         "cockpit/deepthink",
         "cockpit/scout",
     ];
-    let definition = VnextAgentDef {
-        schema_version: crate::agents::SCHEMA_VERSION,
-        agent_id: "cockpit/build".to_string(),
-        roles: vec![crate::agents::AgentRole::Code],
-        capabilities: std::collections::BTreeSet::new(),
-        model_slots: std::collections::BTreeMap::from([(
-            "primary".to_string(),
-            ModelSlot {
-                purpose: "Primary model for this built-in role.".to_string(),
-                min_context_tokens: 1,
-                required_capabilities: vec![ModelCapability::TextGeneration],
-                locality: ModelLocality::Any,
-                allow_default_fallback: true,
-                suggested_models: Vec::new(),
-                models: Vec::new(),
-            },
-        )]),
-        delegation: DelegationPolicy {
-            allowed_children: children
-                .iter()
-                .map(|child| AllowedChild::PortableRef {
-                    portable_agent_ref: child.to_string(),
-                })
-                .collect(),
-            max_descendant_depth: Some(4),
-            // Author exactly the host's concurrency ceiling so `resolve_grant`
-            // always admits this test grant (it REJECTS, never clamps, an
-            // authored value above the host ceiling — see vnext.rs). The batch
-            // delivery tests fan out at most three children, well under this.
-            max_concurrent_children: Some(host.max_concurrent_children),
-            targets: vec![DelegationTarget::SameRoot],
-            default_child: None,
-        },
-        questions: None,
-        verification: None,
-        allowed_knowledge_bases: None,
-        tool_tier_preferences: std::collections::BTreeMap::new(),
-    };
+    // Keep identity, roles, capabilities, and model slots exactly aligned
+    // with the production Build definition. The test root is constructed
+    // directly, but subsequent frame rebuilds use the production factory and
+    // reject a grant projected from a different definition.
+    let mut definition = crate::agents::embedded_default("Build")
+        .and_then(|definition| definition.vnext)
+        .expect("built-in Build must carry a vNext definition");
+    definition.delegation.allowed_children = children
+        .iter()
+        .map(|child| AllowedChild::PortableRef {
+            portable_agent_ref: child.to_string(),
+        })
+        .collect();
+    definition.delegation.max_descendant_depth = Some(4);
+    // Author exactly the host's concurrency ceiling so `resolve_grant`
+    // always admits this test grant (it REJECTS, never clamps, an authored
+    // value above the host ceiling — see vnext.rs). The batch delivery tests
+    // fan out at most three children, well under this.
+    definition.delegation.max_concurrent_children = Some(host.max_concurrent_children);
+    definition.delegation.targets = vec![DelegationTarget::SameRoot];
+    definition.delegation.default_child = None;
     definition
         .resolve_grant(&host)
         .expect("test vNext Build grant must resolve")
@@ -902,7 +882,7 @@ fn learn_driver(
         providers_dir.join("scripted.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "url": provider_url,
-            "wireApi": "completions"
+            "wire_api": "completions"
         }))
         .unwrap(),
     )

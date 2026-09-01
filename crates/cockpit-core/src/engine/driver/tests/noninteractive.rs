@@ -163,7 +163,7 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             providers_dir.join("lmstudio.json"),
             serde_json::json!({
                 "url": provider.base_url(),
-                "wireApi": "completions",
+                "wire_api": "completions",
                 "models": [{ "id": "local", "subagent_invokable": true }]
             })
             .to_string(),
@@ -5330,7 +5330,7 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
             providers_dir.join("lmstudio.json"),
             serde_json::json!({
                 "url": provider.base_url(),
-                "wireApi": "completions",
+                "wire_api": "completions",
                 "models": [
                     { "id": "local", "subagent_invokable": true },
                     { "id": "child-surface", "subagent_invokable": true }

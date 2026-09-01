@@ -10215,6 +10215,11 @@ async fn handle_serialized_request_impl(
             get_doctor_snapshot_response(
                 Some(ctx.db.clone()),
                 ctx.secret_vault.clone(),
+                ctx.env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .vars()
+                    .clone(),
                 project_root,
                 no_sandbox,
                 offline,
@@ -19771,6 +19776,11 @@ async fn handle_concurrent_request_impl(
             get_doctor_snapshot_response(
                 Some(ctx.db.clone()),
                 ctx.secret_vault.clone(),
+                ctx.env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .vars()
+                    .clone(),
                 project_root,
                 no_sandbox,
                 offline,
@@ -22263,15 +22273,16 @@ async fn provider_models_fetch(
             {
                 // A catalog refresh is also onboarding's live credential
                 // proof. Templates without /models use their declared cheap
-                // auth call; environment references are resolved here in the
-                // daemon process, proving daemon visibility rather than TUI
-                // visibility.
+                // auth call; environment references resolve against this
+                // request's daemon-owned snapshot, proving daemon visibility
+                // rather than TUI visibility.
                 crate::providers::auth_check::check_provider_auth_with_store(
                     &provider_id,
                     &entry,
                     template,
                     std::time::Duration::from_secs(15),
                     Some(store.clone()),
+                    |name| env.get(name).cloned(),
                 )
                 .await
                 .map(|outcome| match outcome {
@@ -29427,6 +29438,7 @@ async fn diagnose_media_reservation_response(
 async fn get_doctor_snapshot_response(
     db: Option<crate::db::Db>,
     vault: Arc<crate::secure_key::SecretVault>,
+    env: std::collections::HashMap<String, String>,
     project_root: Option<String>,
     no_sandbox: bool,
     offline: bool,
@@ -29449,6 +29461,7 @@ async fn get_doctor_snapshot_response(
         let store = crate::credentials::CredentialStore::from_vault(vault)
             .map_err(|error| error.to_string())?;
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+        let env_lookup = |name: &str| env.get(name).cloned();
         let snapshot = runtime
             .block_on(crate::diagnostics::cli_snapshot(
                 path.as_deref(),
@@ -29456,6 +29469,7 @@ async fn get_doctor_snapshot_response(
                 offline,
                 db.as_ref(),
                 Some(&secret_lookup),
+                Some(&env_lookup),
             ))
             .map_err(|error| error.to_string())?;
         Ok::<(String, bool), String>((crate::diagnostics::render(&snapshot), snapshot.has_failures))

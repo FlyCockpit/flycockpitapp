@@ -40,15 +40,24 @@ pub async fn check_provider_auth(
     template: &ProviderTemplate,
     timeout: Duration,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
-    check_provider_auth_with_store(provider_id, entry, template, timeout, None).await
+    check_provider_auth_with_store(provider_id, entry, template, timeout, None, |name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
+/// Validate credentials using the environment view owned by the caller.
+///
+/// Daemon callers must pass their authenticated RefreshEnv overlay or daemon
+/// baseline. This check resolves the request more than once when command
+/// credentials need refreshing, so every resolution must use the same view.
 pub async fn check_provider_auth_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
     template: &ProviderTemplate,
     timeout: Duration,
     store: Option<crate::credentials::CredentialStore>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
     let fetch_store = store.clone();
     let resolved = match store {
@@ -57,11 +66,20 @@ pub async fn check_provider_auth_with_store(
                 provider_id,
                 entry,
                 store,
-                |name| std::env::var(name).ok(),
+                |name| env_lookup(name),
             )
             .await
         }
-        None => models_fetch::resolve_provider_request_async(provider_id, entry).await,
+        None => {
+            if entry.auth_command.is_some() || entry.oauth.is_some() {
+                anyhow::bail!(
+                    "provider `{provider_id}` configured authentication requires an injected credential store"
+                );
+            }
+            models_fetch::resolve_provider_request_with_env(provider_id, entry, |name| {
+                env_lookup(name)
+            })
+        }
     }
     .map_err(|error| AuthCheckError::Other(error.to_string()))?;
     match template.auth_check {
@@ -72,7 +90,7 @@ pub async fn check_provider_auth_with_store(
                 &resolved,
                 timeout,
                 fetch_store,
-                |name| std::env::var(name).ok(),
+                |name| env_lookup(name),
             )
             .await
             .map_err(classify_error)?;
@@ -116,7 +134,7 @@ pub async fn check_provider_auth_with_store(
                     provider_id,
                     entry,
                     store,
-                    |name| std::env::var(name).ok(),
+                    |name| env_lookup(name),
                     resolved.command_credential_generation(),
                 )
                 .await
@@ -263,6 +281,37 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
+    async fn one_shot_server_capturing_request(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = vec![0; 4096];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let _ = request_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let response = format!(
+                "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("OK"),
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (format!("http://{addr}/v1"), request_rx)
+    }
+
     fn test_entry(base_url: String) -> ProviderEntry {
         ProviderEntry {
             url: base_url,
@@ -315,6 +364,47 @@ mod tests {
         };
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-test");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_backed_auth_check_uses_caller_environment() {
+        const OVERLAY_ONLY_KEY: &str = "AUTH_CHECK_OVERLAY_ONLY_KEY";
+        const OVERLAY_ONLY_VALUE: &str = "sk-overlay-only";
+
+        let env = crate::test_env::isolated_cockpit_home_async().await;
+        env.remove_var(OVERLAY_ONLY_KEY);
+        let (base, request_rx) =
+            one_shot_server_capturing_request(StatusCode::OK, r#"{"data":[{"id":"gpt-test"}]}"#)
+                .await;
+        let entry = ProviderEntry {
+            url: base,
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: format!("Bearer ${OVERLAY_ONLY_KEY}"),
+            }],
+            ..ProviderEntry::default()
+        };
+        let template = crate::providers::template_by_id("openai").expect("openai template");
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
+
+        let result = check_provider_auth_with_store(
+            "openai",
+            &entry,
+            template,
+            Duration::from_secs(2),
+            Some(store),
+            |name| (name == OVERLAY_ONLY_KEY).then(|| OVERLAY_ONLY_VALUE.to_string()),
+        )
+        .await;
+
+        assert!(matches!(result, Ok(AuthCheckSuccess::Models { .. })));
+        let request = request_rx.await.expect("request captured");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer sk-overlay-only"),
+            "auth check did not use the caller environment: {request}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

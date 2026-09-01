@@ -265,6 +265,10 @@ impl std::error::Error for ComputerError {}
 #[async_trait]
 pub trait ComputerBackend: Send + Sync {
     fn backend_kind(&self) -> target::BackendKind;
+    #[cfg(target_os = "linux")]
+    fn real_x11_display(&self) -> Option<&str> {
+        None
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     async fn execute_one(
         &mut self,
@@ -1170,6 +1174,10 @@ impl CaptureRunner for RealCaptureRunner {
 impl ComputerBackend for VirtualDisplayBackend {
     fn backend_kind(&self) -> target::BackendKind {
         self.backend_kind
+    }
+    #[cfg(target_os = "linux")]
+    fn real_x11_display(&self) -> Option<&str> {
+        self.real_x11_display()
     }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         #[cfg(target_os = "linux")]

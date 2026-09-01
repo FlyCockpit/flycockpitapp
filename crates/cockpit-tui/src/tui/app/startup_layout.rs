@@ -51,8 +51,7 @@ impl App {
                 let model_id =
                     first_provider_model_id(&self.config_snapshot.providers, &provider_id);
                 let dialog = match model_id.as_deref() {
-                    Some(model_id) => crate::tui::settings::Dialog::open_model_setup_preselected(
-                        &self.launch.cwd,
+                    Some(model_id) => crate::tui::settings::Dialog::open_onboarding_model_setup_preselected(
                         &provider_id,
                         model_id,
                         Some("Choose the model Cockpit should use by default.".to_string()),
@@ -77,7 +76,7 @@ impl App {
             FirstRunFlow::AwaitModel => {
                 if !self
                     .dialog
-                    .setup_wizard_is_complete(cockpit_core::wizard::MODEL_WIZARD_ID)
+                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
                 {
                     return false;
                 }

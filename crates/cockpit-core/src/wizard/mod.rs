@@ -14,12 +14,14 @@ pub use apply::{
     ModelAnswersOutcome, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, security_config_path,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
+    onboarding_model_descriptor_for_cwd, security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
 pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
+pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
 pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -554,6 +556,23 @@ pub fn model_descriptor_with_selection(
     cfg: &crate::config::providers::ProvidersConfig,
     preselect: Option<(&str, &str)>,
 ) -> WizardDescriptor {
+    model_descriptor_with_selection_mode(cfg, preselect, false)
+}
+
+pub fn onboarding_model_descriptor_with_selection(
+    cfg: &crate::config::providers::ProvidersConfig,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
+    let mut descriptor = model_descriptor_with_selection_mode(cfg, preselect, true);
+    descriptor.id = ONBOARDING_MODEL_WIZARD_ID;
+    descriptor
+}
+
+fn model_descriptor_with_selection_mode(
+    cfg: &crate::config::providers::ProvidersConfig,
+    preselect: Option<(&str, &str)>,
+    onboarding: bool,
+) -> WizardDescriptor {
     let provider_options = cfg
         .providers
         .keys()
@@ -564,7 +583,7 @@ pub fn model_descriptor_with_selection(
         })
         .collect();
     let model_context = model_wizard_context(cfg, preselect);
-    WizardDescriptor {
+    let mut descriptor = WizardDescriptor {
         id: MODEL_WIZARD_ID,
         title: "Configure model",
         description: "Set trust, capabilities, limits, thinking, delegation, and default model",
@@ -841,7 +860,11 @@ pub fn model_descriptor_with_selection(
                 branch: None,
             },
         ],
+    };
+    if !onboarding {
+        descriptor.steps.retain(|step| step.id != "configuration");
     }
+    descriptor
 }
 
 fn model_wizard_context(

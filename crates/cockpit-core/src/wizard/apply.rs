@@ -83,6 +83,15 @@ pub fn descriptor_for_cwd_with_caps(
             &current, None,
         ));
     }
+    if id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID {
+        let current = ConfigDoc::load(&global_config)
+            .ok()
+            .map(|doc| doc.providers())
+            .unwrap_or_default();
+        return Some(crate::wizard::onboarding_model_descriptor_with_selection(
+            &current, None,
+        ));
+    }
     if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
@@ -98,6 +107,18 @@ pub fn model_descriptor_for_cwd(_cwd: &Path, preselect: Option<(&str, &str)>) ->
         .map(|doc| doc.providers())
         .unwrap_or_default();
     crate::wizard::model_descriptor_with_selection(&current, preselect)
+}
+
+pub fn onboarding_model_descriptor_for_cwd(
+    _cwd: &Path,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
+    let current = global_config_file()
+        .ok()
+        .and_then(|path| ConfigDoc::load(&path).ok())
+        .map(|doc| doc.providers())
+        .unwrap_or_default();
+    crate::wizard::onboarding_model_descriptor_with_selection(&current, preselect)
 }
 
 /// Where onboarding security answers are written: the always-writable global
@@ -127,6 +148,7 @@ pub fn apply_setup_wizard_answers(
         wizard_id,
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
@@ -162,6 +184,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
         wizard_id,
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));

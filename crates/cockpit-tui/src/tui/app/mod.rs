@@ -4358,7 +4358,7 @@ impl App {
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();
-        self.dialog.tick();
+        changed |= self.dialog.tick();
         changed |= self.service_first_run_flow();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).

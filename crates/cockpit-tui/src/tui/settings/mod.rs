@@ -5885,6 +5885,19 @@ impl Dialog {
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
+    pub fn open_onboarding_model_setup_preselected(
+        provider_id: &str,
+        model_id: &str,
+        status: Option<String>,
+    ) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
+            &global_root,
+            Some((provider_id, model_id)),
+        );
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
     pub fn open_model_setup_choice(
         cwd: &std::path::Path,
         confirmed: Option<(String, String)>,
@@ -6090,15 +6103,21 @@ impl Dialog {
 
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
         match self {
-            Dialog::Settings(s) => s.tick(),
+            Dialog::Settings(s) => {
+                s.tick();
+                false
+            }
             Dialog::OnboardingWelcome {
                 frame,
                 reduced_motion,
                 ..
-            } if !*reduced_motion => *frame = frame.wrapping_add(1),
-            _ => {}
+            } if !*reduced_motion => {
+                *frame = frame.wrapping_add(1);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -9544,7 +9563,11 @@ fn apply_setup_wizard_daemon_completion(
             }
             if !changed {
                 "Global setup is already up to date.".to_string()
-            } else if wizard.run.descriptor().id == cockpit_core::wizard::MODEL_WIZARD_ID {
+            } else if matches!(
+                wizard.run.descriptor().id,
+                cockpit_core::wizard::MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+            ) {
                 let mut parts = Vec::new();
                 if model_file_written {
                     parts.push("Saved global model settings.".to_string());
@@ -10199,7 +10222,11 @@ fn render_onboarding_welcome(
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{mark}  FlyCockpit"),
-            Style::default().fg(Color::Yellow),
+            if reduced_motion {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         )),
         Line::default(),
         Line::from(description),

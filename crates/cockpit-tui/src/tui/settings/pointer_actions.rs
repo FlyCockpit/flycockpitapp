@@ -300,6 +300,7 @@ pub(super) enum WizardAuthMethod {
     PasteKey,
     EnvVar,
     AdvancedHeaders,
+    CopyDetectedEnv,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum WizardTestChoice {

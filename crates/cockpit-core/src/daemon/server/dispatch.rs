@@ -22302,6 +22302,14 @@ async fn provider_models_fetch(
                     |name| env.get(name).cloned(),
                 )
                 .await
+                .and_then(|outcome| match outcome {
+                    crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
+                        anyhow::anyhow!(
+                            "credential validation endpoint is unsupported; no authenticated response was received"
+                        ),
+                    ),
+                    outcome => Ok(outcome),
+                })
             };
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {

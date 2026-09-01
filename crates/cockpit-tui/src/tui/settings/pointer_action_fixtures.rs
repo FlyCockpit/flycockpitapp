@@ -195,6 +195,7 @@ fixture_enum!(ProvidersFixture {
     WizardAuthPasteKey,
     WizardAuthEnvVar,
     WizardAuthAdvancedHeaders,
+    WizardAuthCopyDetectedEnv,
     WizardApiKeyEdit,
     WizardEnvVarEdit,
     WizardTestKey,
@@ -374,7 +375,11 @@ impl PayloadFixtureKey {
     pub(super) fn expects_pointer_control(self) -> bool {
         !matches!(
             self,
-            Self::WizardStep(ProviderWizardStep::Saving | ProviderWizardStep::TestKey)
+            Self::WizardStep(
+                ProviderWizardStep::CopyDetectedEnv
+                    | ProviderWizardStep::Saving
+                    | ProviderWizardStep::TestKey,
+            )
         )
     }
 }
@@ -385,6 +390,7 @@ fixture_enum!(WizardPayloadControlKey {
     AuthPasteKey,
     AuthEnvVar,
     AuthAdvancedHeaders,
+    AuthCopyDetectedEnv,
     TestKey,
     SkipTest,
     OAuthLogin,
@@ -414,6 +420,9 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         }
         WizardControlId::AuthMethod(WizardAuthMethod::AdvancedHeaders) => {
             WizardPayloadControlKey::AuthAdvancedHeaders
+        }
+        WizardControlId::AuthMethod(WizardAuthMethod::CopyDetectedEnv) => {
+            WizardPayloadControlKey::AuthCopyDetectedEnv
         }
         WizardControlId::TestChoice(WizardTestChoice::TestKey) => WizardPayloadControlKey::TestKey,
         WizardControlId::TestChoice(WizardTestChoice::SkipTest) => {
@@ -502,15 +511,16 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
 }
 
 /// Wizard lifecycle states that can survive long enough to be rendered by the
-/// settings dialog. `Saving` is submitted through synchronously by
-/// `save_and_fetch_provider`; `TestKey` and `Fetching` are likewise
+/// settings dialog. `CopyDetectedEnv` and `Saving` are submitted through
+/// synchronously by their handlers; `TestKey` and `Fetching` are likewise
 /// acknowledged immediately after their fetch is spawned. These transient
 /// lifecycle states are not pointer sources.
 pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWizardStep> {
     ProviderWizardStep::ALL
         .into_iter()
         .filter(|step| match step {
-            ProviderWizardStep::Saving
+            ProviderWizardStep::CopyDetectedEnv
+            | ProviderWizardStep::Saving
             | ProviderWizardStep::TestKey
             | ProviderWizardStep::Fetching => false,
             ProviderWizardStep::Template
@@ -1007,6 +1017,7 @@ enum WizardControlKind {
     AuthPasteKey,
     AuthEnvVar,
     AuthAdvancedHeaders,
+    AuthCopyDetectedEnv,
     TestKey,
     SkipTest,
     OAuth(OAuthOption),
@@ -1027,6 +1038,9 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::AuthMethod(WizardAuthMethod::EnvVar) => WizardControlKind::AuthEnvVar,
         WizardControlId::AuthMethod(WizardAuthMethod::AdvancedHeaders) => {
             WizardControlKind::AuthAdvancedHeaders
+        }
+        WizardControlId::AuthMethod(WizardAuthMethod::CopyDetectedEnv) => {
+            WizardControlKind::AuthCopyDetectedEnv
         }
         WizardControlId::TestChoice(WizardTestChoice::TestKey) => WizardControlKind::TestKey,
         WizardControlId::TestChoice(WizardTestChoice::SkipTest) => WizardControlKind::SkipTest,
@@ -1076,6 +1090,11 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardAuthAdvancedHeaders
         }
+        ProviderWizardStep::AuthMethod
+            if matches!(control, WizardControlKind::AuthCopyDetectedEnv) =>
+        {
+            ProvidersFixture::WizardAuthCopyDetectedEnv
+        }
         ProviderWizardStep::ApiKey if matches!(control, WizardControlKind::EditText) => {
             ProvidersFixture::WizardApiKeyEdit
         }
@@ -1113,7 +1132,10 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardCopilotContinue
         }
-        ProviderWizardStep::Saving | ProviderWizardStep::TestKey | ProviderWizardStep::Fetching => {
+        ProviderWizardStep::CopyDetectedEnv
+        | ProviderWizardStep::Saving
+        | ProviderWizardStep::TestKey
+        | ProviderWizardStep::Fetching => {
             unreachable!("non-interactive provider wizard step cannot publish a pointer control")
         }
         ProviderWizardStep::Template

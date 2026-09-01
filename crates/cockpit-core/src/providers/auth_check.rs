@@ -89,7 +89,10 @@ pub async fn check_provider_auth_with_store(
                     catalog,
                     reason,
                 }),
-                FetchOutcome::Unsupported => Ok(AuthCheckSuccess::Checked),
+                FetchOutcome::Unsupported => Err(AuthCheckError::Other(
+                    "credential validation endpoint is unsupported; no authenticated response was received"
+                        .to_string(),
+                )),
             }
         }
         AuthCheckKind::ChatCompletions {
@@ -326,6 +329,20 @@ mod tests {
 
         assert!(matches!(error, AuthCheckError::CredentialsRejected(_)));
         assert!(error.to_string().contains("credentials rejected"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_key_models_unsupported_is_not_credential_proof() {
+        let base = one_shot_server(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#).await;
+        let entry = test_entry(base);
+        let template = crate::providers::template_by_id("openai").expect("openai template");
+
+        let error = check_provider_auth("openai", &entry, template, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AuthCheckError::Other(_)));
+        assert!(error.to_string().contains("no authenticated response"));
     }
 
     #[tokio::test(flavor = "current_thread")]

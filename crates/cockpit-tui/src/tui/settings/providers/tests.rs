@@ -2678,6 +2678,8 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         state.template = Some(template);
         state.id_field.set(template.id);
         state.url_field.set(template.url);
+        state.detected_env_offer =
+            Some("COCKPIT_TEST_POINTER_DETECTED_ENV_DOES_NOT_EXIST".to_string());
         state.run.return_to("auth-method").unwrap();
         dialog.page = super::super::providers_page(ProvidersPage::Add(state));
         (tmp, dialog)
@@ -2703,7 +2705,7 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 3, "all auth methods are rendered");
+    assert_eq!(actions.len(), 4, "all auth methods are rendered");
     for action in actions {
         let method = match &action {
             SettingsPointerAction::Providers(ProvidersAction::WizardControl(
@@ -2718,6 +2720,7 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
             WizardAuthMethod::PasteKey => "api-key",
             WizardAuthMethod::EnvVar => "env-var",
             WizardAuthMethod::AdvancedHeaders => "headers",
+            WizardAuthMethod::CopyDetectedEnv => "copy-detected-env",
         };
         assert!(matches!(
             fresh.test_page(),

@@ -5403,8 +5403,13 @@ fn provider_add_pointer_action(
                 WizardAuthMethod::PasteKey,
                 WizardAuthMethod::EnvVar,
                 WizardAuthMethod::AdvancedHeaders,
+                WizardAuthMethod::CopyDetectedEnv,
             ]
-            .get(index)?,
+            .get(index)
+            .filter(|method| {
+                !matches!(method, WizardAuthMethod::CopyDetectedEnv)
+                    || state.detected_env_offer.is_some()
+            })?,
         ),
         WizardStepId::TestKeyChoice => WizardControlId::TestChoice(
             *[WizardTestChoice::TestKey, WizardTestChoice::SkipTest].get(index)?,
@@ -5431,6 +5436,7 @@ fn provider_add_pointer_action(
         | WizardStepId::Url
         | WizardStepId::ApiKey
         | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::CopyDetectedEnv => return None,
         WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
         WizardStepId::TestSkipped => {
             (index == 0).then_some(WizardControlId::TestSkippedContinue)?

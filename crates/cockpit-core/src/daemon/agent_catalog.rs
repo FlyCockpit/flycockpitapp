@@ -5,7 +5,11 @@
 //! `agent.md` and requires byte-semantic equality with that advisory copy.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use cockpit_config::config::providers::ProvidersConfig;
@@ -21,6 +25,7 @@ pub const BUNDLED_FRONTIER_SLUG: &str = "frontier-coding";
 pub const BUNDLED_CATALOG_REVISION: &str = "464140ba6ee9e1669ef1c3f37d82de8c7edd83d7";
 const CATALOG_FETCH_LIMIT: usize = 1024 * 1024;
 const CATALOG_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const HARDWARE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +88,108 @@ pub enum AgentCatalogHardware {
     },
 }
 
+/// Hardware inventory used for catalog discovery.  An empty inventory is not
+/// permissive: hardware-specific agents remain hidden until the host can
+/// prove the corresponding requirement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentCatalogHostHardware {
+    pub gpu_models: Vec<String>,
+    /// Number of GPUs on a host identified as an NVIDIA DGX Spark system.
+    pub dgx_spark_gpu_count: u32,
+}
+
+impl AgentCatalogHostHardware {
+    /// Best-effort local inventory for interactive discovery.  This never
+    /// treats a missing or failed probe as compatible.
+    pub fn detect_current_host() -> Self {
+        let gpu_models = nvidia_gpu_models()
+            .and_then(|output| String::from_utf8(output).ok())
+            .map(|output| {
+                output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dgx_spark_gpu_count = u32::try_from(gpu_models.len())
+            .unwrap_or(u32::MAX)
+            .checked_mul(u32::from(is_dgx_spark_host()))
+            .unwrap_or(u32::MAX);
+        Self {
+            gpu_models,
+            dgx_spark_gpu_count,
+        }
+    }
+}
+
+/// Run the vendor probe under a hard deadline.  A wedged driver is an
+/// unknown inventory, never a reason to block catalog discovery or accept a
+/// hardware-specific package.
+fn nvidia_gpu_models() -> Option<Vec<u8>> {
+    let mut child = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (output_tx, output_rx) = mpsc::sync_channel(1);
+    let _output_reader = std::thread::Builder::new()
+        .name("catalog-gpu-probe".to_string())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let result = stdout.read_to_end(&mut output).ok().map(|_| output);
+            let _ = output_tx.send(result);
+        })
+        .ok()?;
+    let deadline = Instant::now() + HARDWARE_PROBE_TIMEOUT;
+    let status: ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                // Do not reap synchronously: an uninterruptible driver can
+                // leave `wait` blocked even after the deadline. Dropping the
+                // child handle closes its pipes and keeps this probe's
+                // failure path bounded.
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    // A descendant retaining stdout cannot extend the probe beyond its
+    // deadline; the detached reader's result is simply discarded.
+    output_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .flatten()
+}
+
+impl AgentCatalogHardware {
+    pub fn is_satisfied_by(&self, host: &AgentCatalogHostHardware) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Gpu {
+                gpu_model,
+                gpu_count,
+            } => {
+                host.gpu_models
+                    .iter()
+                    .filter(|detected| hardware_model_matches(gpu_model, detected))
+                    .count()
+                    >= usize::try_from(*gpu_count).unwrap_or(usize::MAX)
+            }
+            Self::DgxSpark { gpu_count } => host.dgx_spark_gpu_count >= *gpu_count,
+        }
+    }
+}
+
 impl AgentCatalogIndex {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let catalog: Self = serde_json::from_slice(bytes).context("decoding agent catalog")?;
@@ -112,22 +219,36 @@ impl AgentCatalogIndex {
         Ok(())
     }
 
-    /// Suggestions whose primary slot has at least one compatible configured
-    /// model. The bundled frontier fallback remains discoverable even when
-    /// offline, but it is not presented as usable until a route exists.
+    /// Suggestions whose primary slot has a compatible configured model and
+    /// whose catalog hardware requirement is satisfied by this host.
     pub fn suggestions_for_models(&self, providers: &ProvidersConfig) -> Vec<&AgentCatalogEntry> {
+        self.suggestions_for_models_and_hardware(
+            providers,
+            &AgentCatalogHostHardware::detect_current_host(),
+        )
+    }
+
+    /// Hardware-injectable form of [`Self::suggestions_for_models`].  The
+    /// catalog owns this predicate so every discovery consumer gets identical
+    /// model and hardware eligibility.
+    pub fn suggestions_for_models_and_hardware(
+        &self,
+        providers: &ProvidersConfig,
+        hardware: &AgentCatalogHostHardware,
+    ) -> Vec<&AgentCatalogEntry> {
         let offerings = super::agent_installation::setup_offerings(providers);
         self.agents
             .iter()
             .filter(|entry| {
-                entry
-                    .definition
-                    .model_slots
-                    .get("primary")
-                    .is_some_and(|slot| {
-                        !crate::agents::ranked_compatible_offerings(slot, &offerings, providers)
-                            .is_empty()
-                    })
+                entry.is_eligible_for_hardware(hardware)
+                    && entry
+                        .definition
+                        .model_slots
+                        .get("primary")
+                        .is_some_and(|slot| {
+                            !crate::agents::ranked_compatible_offerings(slot, &offerings, providers)
+                                .is_empty()
+                        })
             })
             .collect()
     }
@@ -138,6 +259,10 @@ impl AgentCatalogIndex {
 }
 
 impl AgentCatalogEntry {
+    pub fn is_eligible_for_hardware(&self, hardware: &AgentCatalogHostHardware) -> bool {
+        self.catalog.hardware.is_satisfied_by(hardware)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             valid_slug(&self.catalog.slug),
@@ -204,6 +329,77 @@ impl AgentCatalogEntry {
             "{}@{}:{}",
             FIRST_PARTY_REPOSITORY, revision, self.catalog.definition_path
         ))
+    }
+}
+
+fn hardware_model_matches(required: &str, detected: &str) -> bool {
+    let required: Vec<_> = required
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    let detected: Vec<_> = detected
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    !required.is_empty() && detected.ends_with(required.as_slice())
+}
+
+#[cfg(target_os = "linux")]
+fn is_dgx_spark_host() -> bool {
+    std::fs::read_to_string("/sys/class/dmi/id/product_name")
+        .ok()
+        .is_some_and(|product_name| product_name.to_ascii_lowercase().contains("dgx spark"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_dgx_spark_host() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardware_requirements_fail_closed_and_require_matching_gpu_count() {
+        let requirement = AgentCatalogHardware::Gpu {
+            gpu_model: "RTX 3090".to_string(),
+            gpu_count: 2,
+        };
+        assert!(!requirement.is_satisfied_by(&AgentCatalogHostHardware::default()));
+        assert!(!requirement.is_satisfied_by(&AgentCatalogHostHardware {
+            gpu_models: vec!["NVIDIA GeForce RTX 3090".to_string()],
+            dgx_spark_gpu_count: 0,
+        }));
+        assert!(requirement.is_satisfied_by(&AgentCatalogHostHardware {
+            gpu_models: vec![
+                "NVIDIA GeForce RTX 3090".to_string(),
+                "NVIDIA GeForce RTX 3090".to_string(),
+            ],
+            dgx_spark_gpu_count: 0,
+        }));
+        assert!(!requirement.is_satisfied_by(&AgentCatalogHostHardware {
+            gpu_models: vec![
+                "NVIDIA GeForce RTX 3090 Ti".to_string(),
+                "NVIDIA GeForce RTX 3090 Ti".to_string(),
+            ],
+            dgx_spark_gpu_count: 0,
+        }));
+    }
+
+    #[test]
+    fn dgx_spark_requirement_uses_the_dgx_inventory_only() {
+        let requirement = AgentCatalogHardware::DgxSpark { gpu_count: 2 };
+        assert!(!requirement.is_satisfied_by(&AgentCatalogHostHardware {
+            gpu_models: vec!["NVIDIA GB10".to_string(), "NVIDIA GB10".to_string(),],
+            dgx_spark_gpu_count: 0,
+        }));
+        assert!(requirement.is_satisfied_by(&AgentCatalogHostHardware {
+            gpu_models: Vec::new(),
+            dgx_spark_gpu_count: 2,
+        }));
     }
 }
 

@@ -3717,27 +3717,7 @@ impl AgentInstallationService {
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
         if source.owner == "FlyCockpit" && source.repository == "agents" {
-            let catalog =
-                if fetched.commit_sha == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION {
-                    crate::daemon::agent_catalog::ResolvedAgentCatalog {
-                        revision: fetched.commit_sha.clone(),
-                        origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
-                        index: crate::daemon::agent_catalog::cached_catalog()?,
-                    }
-                } else {
-                    crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
-                        .await
-                        .context("fetching pinned first-party catalog index")?
-                };
-            let entry = catalog
-                .index
-                .agents
-                .iter()
-                .find(|entry| entry.catalog.definition_path == source.markdown_path)
-                .context("pinned first-party agent is absent from its catalog index")?;
-            entry
-                .validate_fetched_agent_markdown(&fetched.markdown)
-                .context("first-party catalog definition mismatch")?;
+            validate_first_party_catalog_source(&source, &fetched).await?;
         }
         let vnext = definition
             .vnext
@@ -3913,6 +3893,9 @@ impl AgentInstallationService {
         let definition =
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
+        if source.owner == "FlyCockpit" && source.repository == "agents" {
+            validate_first_party_catalog_source(&source, &fetched).await?;
+        }
         ensure!(
             definition.vnext.is_some(),
             "installed agent must be a vNext AgentDef"
@@ -4837,6 +4820,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn is_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+/// The first-party catalog is the authority for both the package definition
+/// and whether that package is installable on this host.  This is called at
+/// prefetch and again immediately before publication because an idempotent
+/// replay may use durable staged bytes instead of taking the fresh path.
+async fn validate_first_party_catalog_source(
+    source: &CanonicalAgentSource,
+    fetched: &FetchedAgentSource,
+) -> Result<()> {
+    let catalog = if fetched.commit_sha == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION {
+        crate::daemon::agent_catalog::ResolvedAgentCatalog {
+            revision: fetched.commit_sha.clone(),
+            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+            index: crate::daemon::agent_catalog::cached_catalog()?,
+        }
+    } else {
+        crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
+            .await
+            .context("fetching pinned first-party catalog index")?
+    };
+    let entry = catalog
+        .index
+        .agents
+        .iter()
+        .find(|entry| entry.catalog.definition_path == source.markdown_path)
+        .context("pinned first-party agent is absent from its catalog index")?;
+    entry
+        .validate_fetched_agent_markdown(&fetched.markdown)
+        .context("first-party catalog definition mismatch")?;
+    ensure!(
+        entry.is_eligible_for_hardware(
+            &crate::daemon::agent_catalog::AgentCatalogHostHardware::detect_current_host()
+        ),
+        "selected catalog agent is not eligible for this host's hardware"
+    );
+    Ok(())
+}
+
 fn validate_idempotency_key(value: &str) -> Result<()> {
     ensure!(
         !value.trim().is_empty() && value.len() <= 256,

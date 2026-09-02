@@ -219,6 +219,12 @@ pub fn build_onboarding_agent_plan(
         .definition
         .validate_catalog_definition()
         .context("selected catalog definition is invalid")?;
+    ensure!(
+        entry.is_eligible_for_hardware(
+            &crate::daemon::agent_catalog::AgentCatalogHostHardware::detect_current_host()
+        ),
+        "selected catalog agent is not eligible for this host's hardware"
+    );
 
     let offerings = crate::daemon::agent_installation::setup_offerings(providers);
     let primary = entry

@@ -194,6 +194,13 @@ pub(super) async fn fork_session(
     let session_id = Uuid::new_v4();
     let now = chrono::Utc::now().timestamp_millis();
     let fork_point = fork_point_turn_id.clone();
+    crate::session::lifecycle::copy_vault_session_secrets(
+        &ctx.db,
+        &ctx.secret_vault,
+        parent_session_id,
+        session_id,
+    )
+    .map_err(internal)?;
     commit_session_remote_mutation(ctx, ledger, "fork_session", move |conn| {
         if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
             return Err(UnknownRemoteSession(parent_session_id).into());

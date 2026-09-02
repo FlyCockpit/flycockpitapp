@@ -32,7 +32,7 @@ fn copy_vault_item(
     }
 }
 
-fn copy_vault_session_secrets(
+pub(crate) fn copy_vault_session_secrets(
     db: &crate::db::Db,
     vault: &crate::secure_key::SecretVault,
     parent: uuid::Uuid,
@@ -85,18 +85,38 @@ fn copy_vault_session_secrets(
             "session sealed vault item",
         )?;
     }
-    db.blocking_write_for_sync_maintenance({
-        let child_key = child_key.clone();
-        move |conn| {
-            conn.execute(
-                "UPDATE sealed_values SET value = NULL WHERE session_id = ?1",
-                rusqlite::params![child_key],
-            )?;
-            Ok(())
-        }
-    })
-    .context("clearing plaintext sealed-value columns on forked session")?;
     Ok(())
+}
+
+/// Copy vault redaction/sealed-secret custody, then persist the child.
+///
+/// The child session row is not created until the vault copy succeeds, so a
+/// failed copy cannot leave a resumable fork without its redaction boundary.
+/// `create_fork_row_conn` already inserts `sealed_values.value` as NULL.
+pub(crate) fn persist_fork_with_redaction_custody(
+    db: &crate::db::Db,
+    vault: &crate::secure_key::SecretVault,
+    parent_session_id: uuid::Uuid,
+    fork_point_turn_id: Option<String>,
+    ephemeral: bool,
+    fresh_thread: bool,
+) -> Result<crate::db::sessions::SessionRow> {
+    let session_id = uuid::Uuid::new_v4();
+    let now_unix_ms = Utc::now().timestamp_millis();
+    copy_vault_session_secrets(db, vault, parent_session_id, session_id)
+        .context("copying vault sealed values and redaction table into fork")?;
+    db.blocking_write_for_sync_maintenance(move |conn| {
+        crate::db::Db::create_fork_conn(
+            conn,
+            parent_session_id,
+            fork_point_turn_id,
+            ephemeral,
+            fresh_thread,
+            session_id,
+            now_unix_ms,
+        )
+    })
+    .context("creating fork session row")
 }
 
 fn persist_redaction_table_to_vault(
@@ -372,21 +392,15 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let row = db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::create_fork_conn(
-                    conn,
-                    parent_session_id,
-                    fork_point_turn_id,
-                    false,
-                    false,
-                    Uuid::new_v4(),
-                    Utc::now().timestamp_millis(),
-                )
-            })
-            .context("creating test fork session row")?;
-        copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
-            .context("copying vault sealed values and redaction table into test fork")?;
+        let row = persist_fork_with_redaction_custody(
+            &db,
+            &vault,
+            parent_session_id,
+            fork_point_turn_id,
+            false,
+            false,
+        )
+        .context("creating test fork session row")?;
         let (project_root, initialize_workspace_scratch) =
             Self::test_workspace_root(PathBuf::from(&row.project_root));
         Self::from_row(
@@ -794,21 +808,14 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
-        let row = db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::create_fork_conn(
-                    conn,
-                    parent_session_id,
-                    fork_point_turn_id,
-                    false,
-                    false,
-                    Uuid::new_v4(),
-                    Utc::now().timestamp_millis(),
-                )
-            })
-            .context("creating fork session row")?;
-        copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
-            .context("copying vault sealed values and redaction table into fork")?;
+        let row = persist_fork_with_redaction_custody(
+            &db,
+            &vault,
+            parent_session_id,
+            fork_point_turn_id,
+            false,
+            false,
+        )?;
         let project_root = PathBuf::from(&row.project_root);
         Self::from_row(db, project_root, row, resolver, vault, false, true, false)
     }
@@ -1415,7 +1422,7 @@ mod vault_unification_tests {
         )
         .unwrap();
         let err = Session::create_fork_for_test(
-            db,
+            db.clone(),
             parent.id,
             None,
             crate::session::test_redaction_key_resolver(),
@@ -1425,6 +1432,23 @@ mod vault_unification_tests {
         assert!(
             message.contains("refusing to proceed unredacted"),
             "visible fail-closed signal missing: {message}"
+        );
+        let child_ids: Vec<String> = db
+            .blocking_write_for_sync_maintenance({
+                let parent_id = parent.id.to_string();
+                move |conn| {
+                    let mut stmt = conn
+                        .prepare("SELECT session_id FROM sessions WHERE parent_session_id = ?1")?;
+                    let ids = stmt
+                        .query_map(rusqlite::params![parent_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(ids)
+                }
+            })
+            .unwrap();
+        assert!(
+            child_ids.is_empty(),
+            "failed fork must not leave a persisted child: {child_ids:?}"
         );
     }
 }

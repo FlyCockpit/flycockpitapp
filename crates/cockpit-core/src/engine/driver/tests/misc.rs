@@ -25,7 +25,7 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
     std::fs::write(tmp.path().join(".env"), "NEW_SECRET=turn-boundary-secret\n").unwrap();
     let (tx, _rx) = mpsc::channel(8);
 
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
 
     for scrubbed in [
         driver.redact.scrub("turn-boundary-secret"),
@@ -54,7 +54,7 @@ async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secr
         store.save().unwrap();
     }
     let (tx, mut rx) = mpsc::channel(8);
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
     assert!(
         !driver.redact.scrub(SECRET).contains(SECRET),
         "named secret must enter the live table on a successful store open"
@@ -75,7 +75,10 @@ async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secr
         "injected vault corruption must fail store open"
     );
 
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver
+        .refresh_redaction_table_for_turn(&tx)
+        .await
+        .expect_err("store-open failure must abort the refresh so the turn cannot send");
     let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
         .expect("store-open failure must surface a notice")
@@ -170,7 +173,7 @@ async fn driver_refresh_does_not_drop_a_committed_sealed_adoption() {
     .unwrap();
 
     let (tx, _turn_rx) = mpsc::channel(8);
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
 
     // Core J2 property: the refresh unioned onto the LATEST shared table under
     // the write lock, so the DURABLE table still scrubs the committed sealed

@@ -20,6 +20,11 @@ impl Approver {
         required: SandboxPathAccess,
         detail: Option<CommandDetail>,
     ) -> Result<Decision> {
+        // Issue #297 fail-closed store health gate: path decisions consult
+        // the approvals files for standing grants/rejects, and this entry is
+        // also reached directly (outside `Approver::authorize`) by the
+        // native sandbox path choke.
+        self.ensure_approvals_store_healthy()?;
         let target = path.display().to_string();
         // Standing reject short-circuit (checked before allow). A rejected
         // path auto-denies the out-of-cwd access with no prompt; recorded with

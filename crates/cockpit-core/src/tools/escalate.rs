@@ -229,6 +229,18 @@ async fn approval_for_escalation(
     row: &crate::db::tool_calls::ToolCallEvent,
     grant_offer: Option<&crate::approval::SandboxEscalationGrantOffer>,
 ) -> Result<EscalationApproval> {
+    // Issue #297 fail-closed store health gate: Auto and Manual escalations
+    // consult the approvals store for standing rejects before deciding (and
+    // in Auto mode a dropped reject could otherwise fall through to an
+    // unconfined run). A corrupt store refuses with a repair-oriented error.
+    // Yolo consults nothing, so it skips the gate.
+    if matches!(
+        ctx.session.approval_mode(),
+        ApprovalMode::Manual | ApprovalMode::Auto
+    ) && let Some(approver) = ctx.approver.as_ref()
+    {
+        approver.store().approvals_store_health()?;
+    }
     match ctx.session.approval_mode() {
         ApprovalMode::Yolo => Ok(EscalationApproval::RunUnconfinedOnce),
         ApprovalMode::Manual => prompt_user(ctx, command, row, grant_offer).await,

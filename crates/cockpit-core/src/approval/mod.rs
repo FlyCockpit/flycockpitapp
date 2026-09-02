@@ -608,9 +608,21 @@ pub struct Approver {
 }
 
 impl Approver {
+    /// Fail-closed approvals-store gate (issue #297), checked at every
+    /// approval-decision boundary before any grant/reject lookup: a corrupt
+    /// `approvals.json` refuses the action with a repair-oriented error
+    /// instead of silently dropping standing allow/reject decisions.
+    fn ensure_approvals_store_healthy(&self) -> Result<()> {
+        self.store.approvals_store_health()
+    }
+
     // Central authorization chokepoint for every executable tool effect.
     // Exhaustive by design: no `_` arm is permitted here.
     pub async fn authorize(&self, request: AuthorizationRequest<'_>) -> Result<Decision> {
+        // Every decision past this point consults the approvals store
+        // (standing grants and rejects) or persists into it, so the
+        // fail-closed store health gate runs first.
+        self.ensure_approvals_store_healthy()?;
         match request {
             AuthorizationRequest::Command { command } => {
                 self.approve_command_inner(command, None).await

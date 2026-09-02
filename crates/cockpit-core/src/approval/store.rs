@@ -446,9 +446,7 @@ impl GrantStore {
                 return Err(anyhow::Error::msg(corrupt.refusal_message()));
             }
             if let Some(residue) = find_quarantine_residue(dir) {
-                return Err(anyhow::Error::msg(quarantine_residue_refusal(
-                    &residue,
-                )));
+                return Err(anyhow::Error::msg(quarantine_residue_refusal(&residue)));
             }
         }
         Ok(())
@@ -1532,9 +1530,7 @@ impl GrantStore {
     /// refusal instead of being silently treated as empty. Used to clear
     /// the opposite polarity before writing.
     fn file_remove(&self, dir: &Path, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
-        mutate_approvals(dir, |file| {
-            (verdict_remove(file, kind, verdict, key), ())
-        })
+        mutate_approvals(dir, |file| (verdict_remove(file, kind, verdict, key), ()))
     }
 }
 
@@ -1923,9 +1919,7 @@ impl CorruptApprovalsStore {
 /// normal first-run state. A corrupt/unreadable file is an error: the
 /// corrupt bytes are renamed aside — never deleted — so they survive for
 /// diagnosis and can never be silently overwritten by a later write.
-fn load_approvals(
-    dir: &Path,
-) -> std::result::Result<Option<ApprovalsFile>, CorruptApprovalsStore> {
+fn load_approvals(dir: &Path) -> std::result::Result<Option<ApprovalsFile>, CorruptApprovalsStore> {
     let path = dir.join(APPROVALS_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -2042,8 +2036,8 @@ fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let lock_path = dir.join(APPROVALS_LOCK_FILE);
-    let file =
-        open_private_file(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    let file = open_private_file(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
     // `File::lock` is the std blocking exclusive advisory lock (flock on
     // unix, LockFileEx on windows): cross-process and cross-thread.
     file.lock()
@@ -2083,8 +2077,7 @@ fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
     let path = dir.join(APPROVALS_FILE);
     let tmp = dir.join(format!("{APPROVALS_FILE}.tmp"));
     let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
-    let mut out =
-        open_private_file(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    let mut out = open_private_file(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
     {
         use std::io::Write as _;
         out.write_all(&json)

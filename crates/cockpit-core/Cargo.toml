@@ -197,7 +197,7 @@ jsonc-parser = { workspace = true }
 # quick-xml 0.41.0 is the first release fixing RUSTSEC-2026-0194 (quadratic
 # duplicate-attribute check) and RUSTSEC-2026-0195 (unbounded namespace
 # allocation); both advisories affect 0.39.x, which parsed model-generated SVG.
-quick-xml = { version = "=0.41.0", default-features = false }
+quick-xml = { version = "=0.42.0", default-features = false }
 svg-hush = { version = "=0.9.6", default-features = false }
 
 # Native secure key store: keyring-core on every target; exactly one native

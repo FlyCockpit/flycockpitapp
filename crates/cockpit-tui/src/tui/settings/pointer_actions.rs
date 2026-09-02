@@ -300,24 +300,18 @@ pub(super) enum WizardAuthMethod {
     PasteKey,
     EnvVar,
     AdvancedHeaders,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum WizardTestChoice {
-    TestKey,
-    SkipTest,
+    CopyDetectedEnv,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum WizardControlId {
     Template(String),
     WireApi(String),
     AuthMethod(WizardAuthMethod),
-    TestChoice(WizardTestChoice),
     OAuth(super::providers::OAuthOption),
     Header(HeaderName),
     AddHeader,
     ContinueHeaders,
     CopilotContinue,
-    TestSkippedContinue,
     DoneContinue,
     EditText,
 }

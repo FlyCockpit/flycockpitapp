@@ -1397,6 +1397,59 @@ mod tests {
     }
 
     #[test]
+    fn apply_setup_wizard_answers_persists_onboarding_profile_from_client_answers_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        let answers_json = run.answers_json().expect("client answers_json");
+
+        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("daemon apply infers profile-save and persists the name");
+        assert!(changed);
+        assert!(!model_file_written);
+        assert!(default_scope.is_none());
+
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("TUI completion submit after daemon apply");
+        assert!(run.is_complete());
+
+        let config_path = global_config_file().unwrap();
+        let cfg = crate::config::extended::ExtendedConfigDoc::load(&config_path)
+            .unwrap()
+            .config();
+        assert_eq!(cfg.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn apply_setup_wizard_answers_accepts_blank_onboarding_profile_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text(String::new())).unwrap();
+        let answers_json = run.answers_json().expect("client answers_json");
+
+        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("blank name is a skip, not a missing saving step");
+        assert!(!changed);
+        assert!(!model_file_written);
+        assert!(default_scope.is_none());
+
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("TUI completion submit after skipped name");
+        assert!(run.is_complete());
+    }
+
+    #[test]
     fn model_wizard_thinking_step_hidden_without_reasoning() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));

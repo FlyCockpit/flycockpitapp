@@ -432,19 +432,18 @@ pub enum ProviderWizardStep {
     AuthMethod,
     ApiKey,
     EnvVar,
+    CopyDetectedEnv,
     CopilotAuth,
     GrokOAuth,
     CodexOAuth,
     Saving,
-    TestKeyChoice,
     TestKey,
-    TestSkipped,
     Fetching,
     Done,
 }
 
 impl ProviderWizardStep {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 16] = [
         Self::Template,
         Self::WireApi,
         Self::ProviderId,
@@ -453,13 +452,12 @@ impl ProviderWizardStep {
         Self::AuthMethod,
         Self::ApiKey,
         Self::EnvVar,
+        Self::CopyDetectedEnv,
         Self::CopilotAuth,
         Self::GrokOAuth,
         Self::CodexOAuth,
         Self::Saving,
-        Self::TestKeyChoice,
         Self::TestKey,
-        Self::TestSkipped,
         Self::Fetching,
         Self::Done,
     ];
@@ -473,13 +471,12 @@ impl ProviderWizardStep {
             Self::AuthMethod => "auth-method",
             Self::ApiKey => "api-key",
             Self::EnvVar => "env-var",
+            Self::CopyDetectedEnv => "copy-detected-env",
             Self::CopilotAuth => "copilot-auth",
             Self::GrokOAuth => "grok-oauth",
             Self::CodexOAuth => "codex-oauth",
             Self::Saving => "saving",
-            Self::TestKeyChoice => "test-key-choice",
             Self::TestKey => "test-key",
-            Self::TestSkipped => "test-skipped",
             Self::Fetching => "fetching",
             Self::Done => "done",
         }
@@ -495,13 +492,12 @@ impl ProviderWizardStep {
             "auth-method" => Self::AuthMethod,
             "api-key" => Self::ApiKey,
             "env-var" => Self::EnvVar,
+            "copy-detected-env" => Self::CopyDetectedEnv,
             "copilot-auth" => Self::CopilotAuth,
             "grok-oauth" => Self::GrokOAuth,
             "codex-oauth" => Self::CodexOAuth,
             "saving" => Self::Saving,
-            "test-key-choice" => Self::TestKeyChoice,
             "test-key" => Self::TestKey,
-            "test-skipped" => Self::TestSkipped,
             "fetching" => Self::Fetching,
             "done" => Self::Done,
             _ => panic!("provider wizard descriptor used an unsealed step id `{id}`"),
@@ -1094,10 +1090,16 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                             label: "Advanced headers".into(),
                             description: "Edit HTTP headers directly".into(),
                         },
+                        SelectOption {
+                            id: "copy-detected-env".into(),
+                            label: "Copy detected value".into(),
+                            description:
+                                "Copy a detected shell value into Cockpit's encrypted vault".into(),
+                        },
                     ],
                 },
                 default_answer: Some(WizardAnswer::Select("paste-key".to_string())),
-                prefill: None,
+                prefill: Some(provider_auth_method_prefill),
                 validate: Some(validate_select),
                 write: None,
                 branch: Some(provider_auth_method_branch),
@@ -1144,6 +1146,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 "Waiting for device authorization…",
                 Some(action_to_saving),
             ),
+            action_step(
+                ProviderWizardStep::CopyDetectedEnv.source_id(),
+                "Copy detected environment credential",
+                "Copying detected credential into Cockpit's encrypted vault…",
+                Some(action_to_saving),
+            ),
             StepDescriptor {
                 id: ProviderWizardStep::Saving.source_id(),
                 prompt: "Save provider",
@@ -1158,49 +1166,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 write: None,
                 branch: Some(provider_after_save_branch),
             },
-            StepDescriptor {
-                id: ProviderWizardStep::TestKeyChoice.source_id(),
-                prompt: "Test key now?",
-                help: "Default: test now. Choose skip-test to save without validation.",
-                help_hook: None,
-                kind: StepKind::Select {
-                    options: vec![
-                        SelectOption {
-                            id: "test".into(),
-                            label: "Test key".into(),
-                            description: "Validate credentials now".into(),
-                        },
-                        SelectOption {
-                            id: "skip-test".into(),
-                            label: "Skip test".into(),
-                            description: "Save now and validate on first use".into(),
-                        },
-                    ],
-                },
-                default_answer: Some(WizardAnswer::Select("test".to_string())),
-                prefill: None,
-                validate: Some(validate_select),
-                write: None,
-                branch: Some(provider_test_choice_branch),
-            },
             action_step(
                 ProviderWizardStep::TestKey.source_id(),
                 "Test key",
                 "Testing provider credentials…",
                 Some(fetching_to_done),
             ),
-            StepDescriptor {
-                id: ProviderWizardStep::TestSkipped.source_id(),
-                prompt: "key saved but unverified — it will be tested on your first message.",
-                help: "Continue to finish provider setup.",
-                help_hook: None,
-                kind: StepKind::Info,
-                default_answer: None,
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: Some(fetching_to_done),
-            },
             action_step(
                 ProviderWizardStep::Fetching.source_id(),
                 "Fetch models",
@@ -1619,6 +1590,10 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
+/// Shared action-step constructor. Provider-wizard actions pass an explicit
+/// branch (`saving` or `done`). Terminal save actions (`profile-save`,
+/// `security-save`, `model-save`) must pass `None` so they finish the wizard
+/// instead of branching into the provider `saving` step.
 fn action_step(
     id: &'static str,
     prompt: &'static str,
@@ -2046,6 +2021,16 @@ fn provider_env_var_prefill(run: &WizardRun) -> Option<WizardAnswer> {
     ))
 }
 
+/// Prefer a reference when this onboarding process can see one of the
+/// template's declared credential variables. The daemon still proves that it
+/// can resolve the reference during the mandatory live check; detection here
+/// never reads or copies the credential bytes.
+fn provider_auth_method_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let template = selected_provider_template(run)?;
+    crate::providers::detected_env_var(template)
+        .map(|_| WizardAnswer::Select("env-var".to_string()))
+}
+
 fn model_context(run: &WizardRun) -> Option<&ModelWizardContext> {
     run.descriptor.model_context.as_ref()
 }
@@ -2227,6 +2212,7 @@ fn provider_auth_method_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&
         WizardAnswer::Select(value) if value == "paste-key" => "api-key",
         WizardAnswer::Select(value) if value == "env-var" => "env-var",
         WizardAnswer::Select(value) if value == "advanced-headers" => "headers",
+        WizardAnswer::Select(value) if value == "copy-detected-env" => "copy-detected-env",
         _ => "auth-method",
     })
 }
@@ -2241,18 +2227,11 @@ fn fetching_to_done(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
 
 fn provider_after_save_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     Some(if selected_provider_template(run)?.api_key.is_some() {
-        "test-key-choice"
+        "test-key"
     } else if selected_provider_template(run)?.supports_models_endpoint {
         "fetching"
     } else {
         "done"
-    })
-}
-
-fn provider_test_choice_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
-    Some(match answer {
-        WizardAnswer::Select(value) if value == "skip-test" => "test-skipped",
-        _ => "test-key",
     })
 }
 
@@ -2261,6 +2240,49 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn api_key_provider_setup_enters_live_validation_without_a_skip_branch() {
+        let mut run = WizardRun::new(provider_descriptor_with_template(Some("openai"))).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.return_to(ProviderWizardStep::Saving.source_id())
+            .unwrap();
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+
+        assert_eq!(
+            run.current_step_id(),
+            Some(ProviderWizardStep::TestKey.source_id()),
+            "saving an API-key provider must enter live credential validation"
+        );
+        assert!(
+            !ProviderWizardStep::ALL
+                .iter()
+                .any(|step| step.source_id().contains("skip")),
+            "the provider wizard must not expose an unvalidated completion branch"
+        );
+    }
+
+    #[test]
+    fn onboarding_profile_save_completes_without_a_saving_branch() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action, not a branch to `saving`");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), Some("Ada".into()));
+    }
+
+    #[test]
+    fn onboarding_profile_blank_name_is_a_skip_that_still_completes() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text(String::new())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("skipping the name still completes profile-save");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), None);
+    }
 
     #[test]
     fn onboarding_model_wizard_accepts_manual_model_id_and_context() {
@@ -2669,6 +2691,36 @@ mod tests {
             run.prefill(),
             Some(WizardAnswer::Text("openai".to_string()))
         );
+    }
+
+    #[test]
+    fn provider_wizard_offers_detected_environment_copy_before_saving() {
+        let descriptor = provider_descriptor_with_template(Some("openai"));
+        let auth = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "auth-method")
+            .expect("auth method step");
+        let StepKind::Select { options } = &auth.kind else {
+            panic!("auth method must be a select")
+        };
+        assert!(options.iter().any(|option| option.id == "env-var"));
+        assert!(
+            options
+                .iter()
+                .any(|option| option.id == "copy-detected-env")
+        );
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("https://api.openai.com/v1".into()))
+            .unwrap();
+        run.submit(WizardAnswer::Select("copy-detected-env".into()))
+            .unwrap();
+        assert_eq!(run.current_step_id(), Some("copy-detected-env"));
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+        assert_eq!(run.current_step_id(), Some("saving"));
     }
 
     #[cfg(not(feature = "grok-subscription"))]

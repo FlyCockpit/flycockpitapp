@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use cockpit_db::secret_vault::SecretVaultKind;
@@ -53,6 +53,11 @@ enum CredentialBackend {
 pub struct CredentialStore {
     backend: CredentialBackend,
     records: BTreeMap<String, Value>,
+    /// A doctor snapshot may exercise command or OAuth refresh logic, but
+    /// doctor is read-only. Its transient record layer accepts only the
+    /// refresh cache writes needed by that one check and never reaches the
+    /// durable backend.
+    transient_records: Option<Arc<Mutex<BTreeMap<String, Value>>>>,
     /// Resolved named-secret values: literal specs, plus any command-backed
     /// output the daemon has injected in-memory for this session
     /// (`inject_resolved_command_output`). Sync `$secret:` lookups read this
@@ -130,6 +135,7 @@ impl CredentialStore {
         Ok(Self {
             backend: CredentialBackend::Vault(vault),
             records: contents.records,
+            transient_records: None,
             secrets: contents.secrets,
             command_specs: contents.command_specs,
             record_mutations: Vec::new(),
@@ -218,6 +224,7 @@ impl CredentialStore {
         Ok(Self {
             backend: CredentialBackend::Vault(vault),
             records,
+            transient_records: None,
             secrets,
             command_specs,
             record_mutations: Vec::new(),
@@ -266,6 +273,7 @@ impl CredentialStore {
         Ok(Self {
             backend: CredentialBackend::Vault(vault),
             records,
+            transient_records: None,
             secrets,
             command_specs,
             record_mutations: Vec::new(),
@@ -289,6 +297,7 @@ impl CredentialStore {
         Ok(Self {
             backend: CredentialBackend::LegacyFile { path },
             records: data.records,
+            transient_records: None,
             secrets: data.secrets,
             // The test-only leftover file has no vault-kind namespace, so it
             // carries literal named secrets only; command specs are vault-only.
@@ -316,6 +325,7 @@ impl CredentialStore {
         Ok(Self {
             backend: CredentialBackend::LegacyFile { path },
             records: data.records,
+            transient_records: None,
             secrets: data.secrets,
             command_specs: BTreeMap::new(),
             record_mutations: Vec::new(),
@@ -327,7 +337,24 @@ impl CredentialStore {
         self.records.get(provider_id)
     }
 
+    /// Make a read-only credential view for a live diagnostic. Dynamic
+    /// provider authentication may update its command/OAuth refresh cache;
+    /// these writes remain in this detached store so `cockpit doctor` never
+    /// changes the daemon vault.
+    pub(crate) fn for_diagnostic_auth(&self) -> Self {
+        let mut store = self.clone();
+        store.transient_records = Some(Arc::new(Mutex::new(self.records.clone())));
+        store
+    }
+
     pub(crate) fn get_owned(&self, provider_id: &str) -> Result<Option<Value>> {
+        if let Some(records) = &self.transient_records {
+            return Ok(records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(provider_id)
+                .cloned());
+        }
         if let Some(value) = self.records.get(provider_id) {
             return Ok(Some(value.clone()));
         }
@@ -341,10 +368,24 @@ impl CredentialStore {
     }
 
     pub(crate) fn get_loaded_owned(&self, provider_id: &str) -> Option<Value> {
+        if let Some(records) = &self.transient_records {
+            return records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(provider_id)
+                .cloned();
+        }
         self.records.get(provider_id).cloned()
     }
 
     pub(crate) fn refresh_loaded_record_owned(&self, provider_id: &str) -> Result<Option<Value>> {
+        if let Some(records) = &self.transient_records {
+            return Ok(records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(provider_id)
+                .cloned());
+        }
         if !self.records.contains_key(provider_id) {
             return Ok(None);
         }
@@ -358,6 +399,14 @@ impl CredentialStore {
     }
 
     pub(crate) fn refreshed_loaded_records(&self) -> Result<Self> {
+        if let Some(records) = &self.transient_records {
+            let mut refreshed = self.clone();
+            refreshed.records = records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            return Ok(refreshed);
+        }
         let records = match &self.backend {
             CredentialBackend::Vault(vault) => self
                 .records
@@ -380,6 +429,7 @@ impl CredentialStore {
         Ok(Self {
             backend: self.backend.clone(),
             records,
+            transient_records: None,
             secrets: self.secrets.clone(),
             command_specs: self.command_specs.clone(),
             record_mutations: Vec::new(),
@@ -624,6 +674,9 @@ impl CredentialStore {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        if self.transient_records.is_some() {
+            anyhow::bail!("diagnostic credential views cannot persist mutations");
+        }
         match &self.backend {
             CredentialBackend::Vault(vault) => {
                 save_mutations_to_vault(vault, &self.record_mutations, &self.secret_mutations)?;
@@ -689,6 +742,9 @@ impl CredentialStore {
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<()> {
+        if self.transient_records.is_some() {
+            anyhow::bail!("diagnostic credential views cannot persist mutations");
+        }
         let name = name.into();
         let value = value.into();
         match &self.backend {
@@ -721,6 +777,9 @@ impl CredentialStore {
         owner_kind: &str,
         project_root: &str,
     ) -> Result<()> {
+        if self.transient_records.is_some() {
+            anyhow::bail!("diagnostic credential views cannot persist mutations");
+        }
         let name = name.into();
         let value = value.into();
         match &self.backend {
@@ -747,6 +806,13 @@ impl CredentialStore {
     }
 
     pub fn save_record_merged(&self, provider_id: &str, value: Value) -> Result<()> {
+        if let Some(records) = &self.transient_records {
+            records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(provider_id.to_string(), value);
+            return Ok(());
+        }
         match &self.backend {
             CredentialBackend::Vault(vault) => {
                 let bytes = serde_json::to_vec(&value)
@@ -765,6 +831,13 @@ impl CredentialStore {
     }
 
     pub fn remove_record_merged(&self, provider_id: &str) -> Result<()> {
+        if let Some(records) = &self.transient_records {
+            records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(provider_id);
+            return Ok(());
+        }
         match &self.backend {
             CredentialBackend::Vault(vault) => vault
                 .delete_item(record_kind(provider_id), provider_id)
@@ -1983,6 +2056,32 @@ mod tests {
         let saved = CredentialStore::open(path).unwrap();
         assert_eq!(saved.api_key("stale").as_deref(), Some("new"));
         assert_eq!(saved.api_key("other").as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn diagnostic_auth_cache_never_persists_to_the_credential_backend() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.json");
+        let store = CredentialStore::open(path.clone()).unwrap();
+        let diagnostic_store = store.for_diagnostic_auth();
+
+        diagnostic_store
+            .save_record_merged("dynamic-provider", serde_json::json!({ "token": "fresh" }))
+            .unwrap();
+
+        assert_eq!(
+            diagnostic_store
+                .get_owned("dynamic-provider")
+                .unwrap()
+                .unwrap()["token"],
+            "fresh"
+        );
+        assert!(
+            CredentialStore::open(path)
+                .unwrap()
+                .get("dynamic-provider")
+                .is_none()
+        );
     }
 
     #[test]

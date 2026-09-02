@@ -160,6 +160,13 @@ pub(crate) trait TerminalActionHandler {
         run: &'a WizardRun,
         io: &'a mut dyn TerminalIo,
     ) -> ActionFuture<'a>;
+
+    /// Returns an interactive step to retry from after an action failure only
+    /// when the handler has not transferred ownership of the action's data or
+    /// made a durable change.
+    fn retry_step_after_action_error(&self, _step_id: &'static str) -> Option<&'static str> {
+        None
+    }
 }
 
 pub(crate) async fn run_terminal_wizard(
@@ -227,7 +234,19 @@ pub(crate) async fn run_terminal_wizard(
             }
             StepKind::Action { progress } => {
                 io.write_line(progress)?;
-                actions.run_action(step.id, &run, io).await?;
+                if let Err(error) = actions.run_action(step.id, &run, io).await {
+                    let Some(retry_step) = actions.retry_step_after_action_error(step.id) else {
+                        return Err(error);
+                    };
+                    run.return_to(retry_step).map_err(|return_error| {
+                        anyhow!(
+                            "action `{}` failed ({error}) and could not return to `{retry_step}`: {return_error}",
+                            step.id
+                        )
+                    })?;
+                    io.write_line(&format!("{error}. Choose another credential method."))?;
+                    continue;
+                }
                 submit(&mut run, WizardAnswer::Acknowledged, io)?;
             }
             StepKind::Info => {
@@ -803,6 +822,7 @@ struct ProviderSetupActions {
     cwd: PathBuf,
     headers: Vec<HeaderSpec>,
     saved: Option<(String, PathBuf)>,
+    referenced_env: Vec<String>,
     security_saved: Option<PathBuf>,
     model_saved: Option<PathBuf>,
     host_capabilities: Option<cockpit_proto::HostCapabilitySnapshot>,
@@ -814,6 +834,7 @@ impl ProviderSetupActions {
             cwd,
             headers: Vec::new(),
             saved: None,
+            referenced_env: Vec::new(),
             security_saved: None,
             model_saved: None,
             host_capabilities: None,
@@ -849,6 +870,27 @@ impl ProviderSetupActions {
                 let template =
                     selected_provider_template(run).context("provider template answer")?;
                 self.headers = crate::providers::default_headers_for(template);
+            }
+            "copy-detected-env" => {
+                let template =
+                    selected_provider_template(run).context("provider template answer")?;
+                let variable = crate::providers::detected_env_var(template).ok_or_else(|| {
+                    anyhow!(
+                        "none of the declared credential variables for {} is available; choose Use env var or Paste key",
+                        template.display
+                    )
+                })?;
+                let value = zeroize::Zeroizing::new(std::env::var(variable).map_err(|_| {
+                    anyhow!("${variable} disappeared before it could be copied; choose Paste key")
+                })?);
+                if value.trim().is_empty() {
+                    bail!("${variable} is empty; choose Paste key");
+                }
+                self.headers = crate::providers::headers_for_pasted_key(template, value.as_str());
+                io.write_line(&format!(
+                    "Copying ${variable} into {}.",
+                    secret_store_description(self.host_capabilities.as_ref())
+                ))?;
             }
             #[cfg(feature = "grok-subscription")]
             "grok-oauth" => {
@@ -953,7 +995,8 @@ impl ProviderSetupActions {
         // The daemon stages vault bytes and the reference-only config entry
         // under one recoverable journal.  The CLI never allocates predictable
         // vault names or performs a secret/config two-step.
-        let header_reference_notice = env_var_reference_notice(&entry.headers);
+        self.referenced_env = env_var_reference_names(&entry.headers);
+        let header_reference_notice = env_var_reference_notice(&self.referenced_env);
         let header_secrets = entry
             .headers
             .iter_mut()
@@ -1078,6 +1121,7 @@ impl ProviderSetupActions {
         let daemon = ensure_persistent_daemon()
             .await
             .context("starting persistent daemon for provider test")?;
+        let visibility_hint = daemon_visibility_hint(&self.referenced_env);
         let response = daemon
             .client
             .request(Request::FetchProviderModels {
@@ -1089,7 +1133,9 @@ impl ProviderSetupActions {
                 allow_fallback: false,
             })
             .await?
-            .map_err(|error| anyhow!("daemon rejected provider key test: {error}"))?;
+            .map_err(|error| {
+                anyhow!("daemon rejected provider credential validation: {error}{visibility_hint}")
+            })?;
         let Response::ProviderModelsFetched { results, .. } = response else {
             bail!("daemon returned unexpected provider key test response: {response:?}");
         };
@@ -1099,21 +1145,21 @@ impl ProviderSetupActions {
                 io.write_line(&format!("key verified · {} models", models.len()))?
             }
             Some(crate::daemon::proto::ProviderModelFetchOutcome::Unsupported) => {
-                io.write_line("key test unavailable: provider does not support model discovery")?
+                io.write_line("credential verified with the provider")?
             }
             Some(crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
                 unlisted_count,
             }) => io.write_line(&format!(
-                "Model fetch needs a keep/remove decision for {unlisted_count} configured model(s)."
+                "credential verified · model fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
             ))?,
             Some(crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
                 reason,
                 ..
-            }) => io.write_line(&format!("Model fetch fallback available: {reason}"))?,
+            }) => bail!("live provider credential validation failed: {reason}{visibility_hint}"),
             Some(crate::daemon::proto::ProviderModelFetchOutcome::Error { message }) => {
-                io.write_line(&format!("key test failed: {message}"))?
+                bail!("live provider credential validation failed: {message}{visibility_hint}")
             }
-            None => io.write_line("key test failed: daemon returned no provider result")?,
+            None => bail!("live provider credential validation failed: daemon returned no provider result"),
         }
         Ok(())
     }
@@ -1198,7 +1244,7 @@ fn provider_headers_for_answers(
     }
 }
 
-fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
+fn env_var_reference_names(headers: &[HeaderSpec]) -> Vec<String> {
     // Setup is a daemon client.  Inspecting process environment values here
     // would make the CLI a second secret resolver; syntax metadata is enough
     // to remind the user which variables the daemon will resolve later.
@@ -1210,6 +1256,10 @@ fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
             }
         }
     }
+    referenced
+}
+
+fn env_var_reference_notice(referenced: &[String]) -> Option<String> {
     if referenced.is_empty() {
         None
     } else {
@@ -1217,6 +1267,35 @@ fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
             "Environment variable reference detected; make sure to set it before use: {}",
             referenced.join(", ")
         ))
+    }
+}
+
+fn daemon_visibility_hint(referenced: &[String]) -> String {
+    if referenced.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ". The daemon must be able to resolve {}; if it cannot, go back and copy the detected value into Cockpit's encrypted vault",
+            referenced
+                .iter()
+                .map(|name| format!("${name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn secret_store_description(
+    capabilities: Option<&cockpit_proto::HostCapabilitySnapshot>,
+) -> &'static str {
+    match capabilities.map(|snapshot| snapshot.secret_store.effective_placement) {
+        Some(cockpit_proto::SecretStorePlacement::Keyring) => {
+            "Cockpit's encrypted vault (wrapping key in the OS keyring)"
+        }
+        Some(cockpit_proto::SecretStorePlacement::Database) => {
+            "Cockpit's encrypted vault (machine-bound local wrapping-key file)"
+        }
+        _ => "Cockpit's encrypted vault (the daemon will select the configured placement)",
     }
 }
 
@@ -1228,6 +1307,14 @@ impl TerminalActionHandler for ProviderSetupActions {
         io: &'a mut dyn TerminalIo,
     ) -> ActionFuture<'a> {
         Box::pin(self.handle_action(step_id, run, io))
+    }
+
+    fn retry_step_after_action_error(&self, step_id: &'static str) -> Option<&'static str> {
+        // CopyDetectedEnv reads the process environment before it creates
+        // headers or hands a provider mutation to the daemon. A race with the
+        // shell environment is therefore safe to recover by returning to the
+        // credential choice; save/fetch/OAuth errors are not equivalently safe.
+        (step_id == "copy-detected-env").then_some("auth-method")
     }
 }
 
@@ -1387,6 +1474,7 @@ mod tests {
         saved: Option<(String, String)>,
         fetches: usize,
         headers: Vec<HeaderSpec>,
+        copy_detected_env_failure: bool,
     }
 
     impl TerminalActionHandler for TestActions {
@@ -1398,6 +1486,9 @@ mod tests {
         ) -> ActionFuture<'a> {
             Box::pin(async move {
                 match step_id {
+                    "copy-detected-env" if self.copy_detected_env_failure => {
+                        anyhow::bail!("$OPENAI_API_KEY disappeared before it could be copied")
+                    }
                     "headers" => {
                         let template =
                             selected_provider_template(run).context("provider template")?;
@@ -1411,14 +1502,19 @@ mod tests {
                         self.saved = Some((id, entry.url));
                         io.write_line("saved")?;
                     }
-                    "fetching" => {
+                    "fetching" | "test-key" => {
                         self.fetches += 1;
-                        io.write_line("fetched")?;
+                        io.write_line("credential validated")?;
                     }
                     _ => {}
                 }
                 Ok(())
             })
+        }
+
+        fn retry_step_after_action_error(&self, step_id: &'static str) -> Option<&'static str> {
+            (self.copy_detected_env_failure && step_id == "copy-detected-env")
+                .then_some("auth-method")
         }
     }
 
@@ -1820,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_renderer_runs_provider_wizard() {
-        let mut io = ScriptIo::new(&["openai", "", "", "advanced-headers", "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "advanced-headers"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -1840,8 +1936,36 @@ mod tests {
                 "https://api.openai.com/v1".to_string()
             ))
         );
-        assert_eq!(actions.fetches, 0);
+        assert_eq!(actions.fetches, 1, "the provider credential was validated");
         assert!(io.output.contains("Choose a provider template"));
+    }
+
+    #[tokio::test]
+    async fn terminal_renderer_retries_copy_detected_env_from_auth_method() {
+        let mut io = ScriptIo::new(&["openai", "", "", "copy-detected-env", "advanced-headers"]);
+        let mut actions = TestActions {
+            copy_detected_env_failure: true,
+            ..Default::default()
+        };
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.is_complete());
+        assert_eq!(
+            actions.saved,
+            Some((
+                "openai".to_string(),
+                "https://api.openai.com/v1".to_string()
+            ))
+        );
+        assert!(io.output.contains("Choose another credential method."));
     }
 
     #[tokio::test]
@@ -1869,15 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_renderer_back_navigation() {
-        let mut io = ScriptIo::new(&[
-            "openai",
-            "back",
-            "openai",
-            "",
-            "",
-            "advanced-headers",
-            "skip-test",
-        ]);
+        let mut io = ScriptIo::new(&["openai", "back", "openai", "", "", "advanced-headers"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -1912,19 +2028,18 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
         let secret = "sk-provider-secret-abcdefghijklmnopqrstuvwxyz";
-        let mut io = ScriptIo::new(&["openai", "", "", "", secret, "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "", secret]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
-
-        assert!(run.is_complete());
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty());
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
@@ -1950,20 +2065,18 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
         let secret = "nr-provider-secret-abcdefghijklmnopqrstuvwxyz";
-        // Explicit paste-key + skip-test so we never hit the network.
-        let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret, "skip-test"]);
+        let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .expect("wizard completes");
-
-        assert!(run.is_complete(), "output={}", io.output);
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty(), "output={}", io.output);
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
                 .expect("provider path");
@@ -1986,9 +2099,9 @@ mod tests {
             let state_home = tmp.path().join("state");
             let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
             trust_workspace_via_daemon(tmp.path()).await;
-            let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret, "skip-test"]);
+            let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret]);
             let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
-            let run = tokio::time::timeout(
+            let error = tokio::time::timeout(
                 Duration::from_secs(30),
                 run_terminal_wizard(
                     crate::wizard::provider_descriptor(),
@@ -1999,8 +2112,8 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("paste-key wizard timed out; output={}", io.output))
-            .expect("wizard completes");
-            assert!(run.is_complete(), "output={}", io.output);
+            .expect_err("setup must not finish before the fabricated key validates");
+            assert!(!error.to_string().is_empty(), "output={}", io.output);
             let provider_path =
                 crate::config::providers::provider_file_path_for_config(&config_path, "baseten")
                     .expect("provider path");
@@ -2018,8 +2131,7 @@ mod tests {
             let _env2 =
                 CockpitConfigEnvGuard::set_with_state_async(&config_path2, &state_home2).await;
             trust_workspace_via_daemon(tmp2.path()).await;
-            let mut io2 =
-                ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY", "skip-test"]);
+            let mut io2 = ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY"]);
             let mut actions2 = ProviderSetupActions::new(tmp2.path().to_path_buf());
             tokio::time::timeout(
                 Duration::from_secs(30),
@@ -2032,7 +2144,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("env-var wizard timed out; output={}", io2.output))
-            .expect("env wizard");
+            .expect_err("setup must not finish before the daemon resolves the env var");
             let raw2 = std::fs::read_to_string(
                 crate::config::providers::provider_file_path_for_config(&config_path2, "baseten")
                     .expect("path"),
@@ -2049,24 +2161,17 @@ mod tests {
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
-        let mut io = ScriptIo::new(&[
-            "nous-research",
-            "",
-            "",
-            "env-var",
-            "NOUS_API_KEY",
-            "skip-test",
-        ]);
+        let mut io = ScriptIo::new(&["nous-research", "", "", "env-var", "NOUS_API_KEY"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .expect("wizard completes");
-        assert!(run.is_complete(), "output={}", io.output);
+        .expect_err("setup must not finish before the daemon resolves the env var");
+        assert!(!error.to_string().is_empty(), "output={}", io.output);
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
                 .expect("provider path");
@@ -2087,20 +2192,18 @@ mod tests {
             "",
             "",
             "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
-            "skip-test",
         ]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
-
-        assert!(run.is_complete());
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty());
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
@@ -2109,10 +2212,7 @@ mod tests {
             "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
         )
         .await;
-        assert!(
-            io.output
-                .contains("key saved but unverified — it will be tested on your first message.")
-        );
+        assert!(io.output.contains("Saved provider `openai`."));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2122,17 +2222,18 @@ mod tests {
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
-        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
+        .expect_err("setup must not finish before the daemon resolves the env var");
+        assert!(!error.to_string().is_empty());
 
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
@@ -2150,8 +2251,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn wizard_skip_test_shows_unverified() {
-        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+    async fn wizard_runs_live_validation_before_completion() {
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -2164,9 +2265,29 @@ mod tests {
         .unwrap();
 
         assert!(run.is_complete());
-        assert!(
-            io.output
-                .contains("key saved but unverified — it will be tested on your first message.")
+        assert_eq!(actions.fetches, 1, "the live validation action ran once");
+        assert!(io.output.contains("credential validated"));
+    }
+
+    #[test]
+    fn referenced_environment_failure_explains_daemon_visibility_fallback() {
+        let referenced = vec!["OPENAI_API_KEY".to_string()];
+        let hint = daemon_visibility_hint(&referenced);
+        assert!(hint.contains("daemon must be able to resolve $OPENAI_API_KEY"));
+        assert!(hint.contains("copy the detected value"));
+        assert_eq!(
+            secret_store_description(Some(&cockpit_proto::HostCapabilitySnapshot {
+                generation: 1,
+                features: Vec::new(),
+                dependencies: Vec::new(),
+                secret_store: cockpit_proto::SecretStoreSnapshot {
+                    intent: cockpit_proto::SecretStoreIntent::Database,
+                    effective_placement: cockpit_proto::SecretStorePlacement::Database,
+                    fail_closed_reason: None,
+                    fix_command: None,
+                },
+            })),
+            "Cockpit's encrypted vault (machine-bound local wrapping-key file)"
         );
     }
 

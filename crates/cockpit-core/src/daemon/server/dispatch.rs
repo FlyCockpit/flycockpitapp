@@ -10219,16 +10219,7 @@ async fn handle_serialized_request_impl(
             project_root,
             no_sandbox,
             offline,
-        } => {
-            get_doctor_snapshot_response(
-                Some(ctx.db.clone()),
-                ctx.secret_vault.clone(),
-                project_root,
-                no_sandbox,
-                offline,
-            )
-            .await
-        }
+        } => get_doctor_snapshot_response(ctx, project_root, no_sandbox, offline).await,
         // Owner-remoted, read-only, serialized: the docs pipeline creates a
         // `"docs"` session and runs a full turn, so it is not a snapshot-correct
         // concurrent read. Runs on this per-client serialized executor.
@@ -17009,6 +17000,7 @@ async fn handle_serialized_request_impl(
                 mutation_intent_hash,
                 mutation,
                 settings_capability_owner(state),
+                provider_env_snapshot(ctx, state),
             )
             .await
         }
@@ -19809,16 +19801,7 @@ async fn handle_concurrent_request_impl(
             project_root,
             no_sandbox,
             offline,
-        } => {
-            get_doctor_snapshot_response(
-                Some(ctx.db.clone()),
-                ctx.secret_vault.clone(),
-                project_root,
-                no_sandbox,
-                offline,
-            )
-            .await
-        }
+        } => get_doctor_snapshot_response(&ctx, project_root, no_sandbox, offline).await,
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("request `{request_kind}` is not marked concurrent"),
@@ -20358,6 +20341,7 @@ async fn apply_provider_mutation(
     mutation_intent_hash: String,
     mutation: cockpit_proto::ProviderMutationBatch,
     capability_owner: String,
+    provider_env: std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
     if observed_intent_hash != mutation_intent_hash {
@@ -20464,6 +20448,7 @@ async fn apply_provider_mutation(
             &expected_revision,
             capability.config_generation,
             &mutation_intent_hash,
+            &provider_env,
         )
         .await?;
         {
@@ -21572,6 +21557,7 @@ async fn stage_and_recover_provider_batch(
     consumed_revision: &str,
     consumed_config_generation: u64,
     mutation_intent_hash: &str,
+    provider_env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
@@ -21695,7 +21681,12 @@ async fn stage_and_recover_provider_batch(
                     &entry_for_secret_resolution,
                     &header_name,
                     &header_value,
-                    |variable| std::env::var(variable),
+                    |variable| {
+                        provider_env
+                            .get(variable)
+                            .cloned()
+                            .ok_or(std::env::VarError::NotPresent)
+                    },
                 )?;
                 let slug = upsert
                     .provider_id
@@ -22305,15 +22296,16 @@ async fn provider_models_fetch(
             {
                 // A catalog refresh is also onboarding's live credential
                 // proof. Templates without /models use their declared cheap
-                // auth call; environment references are resolved here in the
-                // daemon process, proving daemon visibility rather than TUI
-                // visibility.
+                // auth call; environment references resolve against this
+                // request's daemon-owned snapshot, proving daemon visibility
+                // rather than TUI visibility.
                 crate::providers::auth_check::check_provider_auth_with_store(
                     &provider_id,
                     &entry,
                     template,
                     std::time::Duration::from_secs(15),
                     Some(store.clone()),
+                    |name| env.get(name).cloned(),
                 )
                 .await
                 .map(|outcome| match outcome {
@@ -22344,6 +22336,14 @@ async fn provider_models_fetch(
                     |name| env.get(name).cloned(),
                 )
                 .await
+                .and_then(|outcome| match outcome {
+                    crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
+                        anyhow::anyhow!(
+                            "credential validation endpoint is unsupported; no authenticated response was received"
+                        ),
+                    ),
+                    outcome => Ok(outcome),
+                })
             };
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
@@ -29460,8 +29460,7 @@ async fn diagnose_media_reservation_response(
 }
 
 async fn get_doctor_snapshot_response(
-    db: Option<crate::db::Db>,
-    vault: Arc<crate::secure_key::SecretVault>,
+    ctx: &Arc<DaemonContext>,
     project_root: Option<String>,
     no_sandbox: bool,
     offline: bool,
@@ -29474,23 +29473,56 @@ async fn get_doctor_snapshot_response(
     // already-open `Db` (a cheap Arc-backed shared handle) so the snapshot never
     // opens a second DB. The vault-backed secret lookup lets the credential
     // check resolve `$secret:<name>` references after the literal-header
-    // migration has rewritten provider config files.
+    // migration has rewritten provider config files; dynamic auth receives a
+    // detached credential cache so this read-only diagnostic cannot mutate
+    // the vault while refreshing a command or OAuth credential. Provider
+    // diagnostics are still provider network operations, so their store is
+    // scoped to this diagnostic root before it crosses into the blocking
+    // snapshot worker; a foreign workspace's named secret or credential record
+    // must fail as missing rather than authenticate this request.
+    let path = project_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.canonical_cwd.clone());
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&path.display().to_string());
+    // Doctor intentionally does not require workspace trust. This mirrors its
+    // bootstrap config projection (which reads configuration without resolving
+    // credentials) solely to enumerate the references the diagnostic may use.
+    let config = crate::config::providers::ConfigDoc::load_effective(&path);
+    let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
+        .await
+        .ok();
+    let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
+        ctx.secret_vault.clone(),
+        &canonical_root,
+        &crate::secret_ref::provider_named_secret_references(&config),
+        foreign_refs.as_ref(),
+        &crate::secret_ref::provider_credential_record_references(&config),
+    )
+    .map_err(internal)?;
+    let db = ctx.db.clone();
+    let env = ctx
+        .env_baseline
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .vars()
+        .clone();
     let (rendered, has_failures) = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let path = project_root.map(PathBuf::from);
-        let store = crate::credentials::CredentialStore::from_vault(vault)
-            .map_err(|error| error.to_string())?;
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+        let provider_credential_store = store.for_diagnostic_auth();
+        let env_lookup = |name: &str| env.get(name).cloned();
         let snapshot = runtime
             .block_on(crate::diagnostics::cli_snapshot(
-                path.as_deref(),
+                Some(&path),
                 no_sandbox,
                 offline,
-                db.as_ref(),
+                Some(&db),
                 Some(&secret_lookup),
+                Some(&provider_credential_store),
+                Some(&env_lookup),
             ))
             .map_err(|error| error.to_string())?;
         Ok::<(String, bool), String>((crate::diagnostics::render(&snapshot), snapshot.has_failures))

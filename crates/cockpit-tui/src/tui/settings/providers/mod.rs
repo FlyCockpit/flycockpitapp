@@ -963,7 +963,6 @@ pub(super) struct AddState {
     pub(super) auth_method_cursor: usize,
     pub(super) api_key_field: Box<TextField>,
     pub(super) env_var_field: Box<TextField>,
-    pub(super) test_choice_cursor: usize,
     pub(super) headers: Box<HeaderEditor>,
     pub(super) error: Option<String>,
     pub(super) fetch: Option<FetchHandle>,
@@ -1008,7 +1007,6 @@ impl AddState {
             auth_method_cursor: 0,
             api_key_field: Box::new(TextField::default()),
             env_var_field: Box::new(TextField::default()),
-            test_choice_cursor: 0,
             headers: Box::new(HeaderEditor::new(Vec::new(), true)),
             error: None,
             fetch: None,
@@ -1041,7 +1039,7 @@ impl AddState {
 
     pub(super) fn resume_onboarding_validation(&mut self, provider_id: &str) {
         self.run
-            .return_to("test-key-choice")
+            .return_to("test-key")
             .expect("provider validation step exists");
         self.saved_provider_id = Some(provider_id.to_string());
         self.error = Some("Resume setup: test the saved credential with the daemon.".into());
@@ -1080,11 +1078,47 @@ impl EditState {
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 impl SettingsDialog {
+    /// Resume a saved onboarding provider by immediately repeating the required
+    /// daemon-owned live validation. The only continuation without a successful
+    /// result remains the explicit offline fallback after this fetch fails.
+    pub(super) fn resume_onboarding_provider_validation(
+        &mut self,
+        state: &mut AddState,
+        provider_id: &str,
+    ) {
+        state.resume_onboarding_validation(provider_id);
+        let entry = self
+            .config
+            .providers
+            .get(provider_id)
+            .expect("caller verified saved provider exists")
+            .clone();
+        state.fetch = Some(FetchHandle::spawn(
+            self.lifecycle.clone(),
+            provider_id.to_string(),
+            entry,
+            self.provider_fetch_root(),
+        ));
+    }
+
     pub(super) fn apply_fetch_result(
         &mut self,
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let referenced_environment = self
+            .config
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .flat_map(|entry| &entry.headers)
+            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
+            .filter(|name| !name.starts_with("secret:"))
+            .collect::<Vec<_>>();
+        let daemon_visibility_guidance = result
+            .as_ref()
+            .err()
+            .and_then(|error| daemon_visibility_guidance(&referenced_environment, error));
         let onboarding_validation = self
             .page
             .downcast_ref::<ProvidersPage>()
@@ -1196,6 +1230,10 @@ impl SettingsDialog {
                         entry.mark_model_fetch_failed_kept_existing(reason.clone());
                     }
                     message = match self.save_config() {
+                        Ok(()) if daemon_visibility_guidance.is_some() => format!(
+                            "{}; saving failure status…",
+                            daemon_visibility_guidance.as_deref().unwrap_or_default()
+                        ),
                         Ok(()) => format!("fetch failed: {reason}; saving failure status…"),
                         Err(error) => {
                             format!("fetch failed: {reason}; status save failed: {error}")
@@ -1283,6 +1321,23 @@ impl SettingsDialog {
             _ => {}
         }
     }
+}
+
+fn daemon_visibility_guidance(referenced: &[String], error: &str) -> Option<String> {
+    if referenced.is_empty()
+        || !(error.contains("references missing environment variable")
+            || error.contains("Configured Authorization refs were unset"))
+    {
+        return None;
+    }
+    Some(format!(
+        "The daemon cannot resolve {}. Go back and choose ‘Copy detected value into vault’, or export the variable where the daemon starts",
+        referenced
+            .iter()
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 impl SettingsCx {
     /// All provider side effects use the project selected for this dialog;
@@ -1570,11 +1625,17 @@ impl SettingsCx {
                 self.provider_fetch_root(),
             ));
             let _ = s.run.submit(WizardAnswer::Acknowledged);
-        } else if s.is_step("test-key-choice") {
+        } else if s.is_step("test-key") {
             s.error = Some(match notice {
-                Some(notice) => format!("saved. {notice}"),
-                None => "saved.".into(),
+                Some(notice) => format!("saved. {notice} Testing key via /models…"),
+                None => "saved. Testing key via /models…".into(),
             });
+            s.fetch = Some(FetchHandle::spawn(
+                self.lifecycle.clone(),
+                id,
+                entry,
+                self.provider_fetch_root(),
+            ));
         } else if !supports_models_endpoint {
             s.error = Some(match notice {
                 Some(notice) => format!("saved. {notice} Provider has no /models endpoint"),
@@ -1753,18 +1814,43 @@ impl SettingsCx {
                             let env_var = s
                                 .detected_env_offer
                                 .as_deref()
-                                .expect("copy choice requires detected env");
+                                .expect("copy choice requires detected env")
+                                .to_string();
                             let template = s.template.expect("template chosen");
                             let id = s.id_field.text().trim().to_string();
-                            let headers = templates::headers_for_pasted_key(template, "");
+                            // This process detected the variable, so it owns
+                            // the fallback copy. Asking the daemon to read it
+                            // again would make this option useless precisely
+                            // when a long-lived daemon cannot see a shell-local
+                            // export. Keep the bytes zeroizing while building
+                            // the same staged-secret mutation as a pasted key.
+                            //
+                            // The read is deliberately before the wizard
+                            // transition: CopyDetectedEnv is non-interactive,
+                            // so a missing value must leave this attempt at
+                            // AuthMethod where the user can choose another
+                            // credential source.
+                            let value = match std::env::var(&env_var) {
+                                Ok(value) if !value.trim().is_empty() => {
+                                    zeroize::Zeroizing::new(value)
+                                }
+                                _ => {
+                                    s.error = Some(format!(
+                                        "${env_var} is no longer available in this process; paste the key instead"
+                                    ));
+                                    return Nav::Stay;
+                                }
+                            };
+                            if let Err(error) =
+                                s.run.submit(WizardAnswer::Select(choice.to_string()))
+                            {
+                                s.error = Some(error);
+                                return Nav::Stay;
+                            }
+                            let headers =
+                                templates::headers_for_pasted_key(template, value.as_str());
                             let entry = provider_entry_from_add(s, template, headers);
-                            self.save_and_fetch_provider_with_detected_env(
-                                s,
-                                id,
-                                entry,
-                                template,
-                                Some(env_var.to_string()),
-                            );
+                            self.save_and_fetch_provider(s, id, entry, template);
                             return Nav::Stay;
                         }
                         if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
@@ -1913,54 +1999,6 @@ impl SettingsCx {
                         let entry = provider_entry_from_add(s, template, Vec::new());
                         self.save_and_fetch_provider(s, id, entry, template);
                     }
-                }
-            }
-            Some("test-key-choice") => {
-                const TEST_CHOICES: [&str; 2] = ["test", "skip-test"];
-                let choice_count = if s.onboarding { 1 } else { TEST_CHOICES.len() };
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        s.test_choice_cursor =
-                            crate::tui::nav::wrap_prev(s.test_choice_cursor, choice_count);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        s.test_choice_cursor =
-                            crate::tui::nav::wrap_next(s.test_choice_cursor, choice_count);
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        let choice = TEST_CHOICES[s.test_choice_cursor];
-                        if s.onboarding && choice == "skip-test" {
-                            s.error = Some(
-                                "Onboarding requires a successful live credential validation. Press Esc to cancel and resume later."
-                                    .into(),
-                            );
-                        } else if let Err(error) =
-                            s.run.submit(WizardAnswer::Select(choice.to_string()))
-                        {
-                            s.error = Some(error);
-                        } else if choice == "skip-test" {
-                            s.error = Some(
-                                "key saved but unverified — it will be tested on your first message."
-                                    .into(),
-                            );
-                        } else if let Some(id) = s.saved_provider_id.clone() {
-                            if let Some(entry) = self.config.providers.get(&id).cloned() {
-                                s.error = Some("Testing key via /models…".into());
-                                s.fetch = Some(FetchHandle::spawn(
-                                    self.lifecycle.clone(),
-                                    id,
-                                    entry,
-                                    self.provider_fetch_root(),
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("test-skipped") => {
-                if matches!(key.code, KeyCode::Enter) {
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
                 }
             }
             // A failed probe is explicit evidence that this setup is offline
@@ -3530,15 +3568,24 @@ impl SettingsCx {
                 }
                 if s.is_step("auth-method") {
                     lines.push(Line::default());
+                    let vault = crate::tui::capability_gate::secret_store_row_value(
+                        &self.host_capabilities,
+                    );
                     let mut options = vec![
-                        ("Paste key", "store masked key as $secret:"),
-                        ("Use env var", "write a $VAR reference"),
-                        ("Advanced headers", "edit raw HTTP headers"),
+                        ("Paste key".to_string(), format!("copy into {vault}")),
+                        (
+                            "Use env var".to_string(),
+                            "keep a $VAR reference; the daemon validates visibility".to_string(),
+                        ),
+                        (
+                            "Advanced headers".to_string(),
+                            "edit raw HTTP headers".to_string(),
+                        ),
                     ];
                     if s.detected_env_offer.is_some() {
                         options.push((
-                            "Copy detected value into vault",
-                            "daemon reads the detected variable and stores a $secret: reference",
+                            "Copy detected value into vault".to_string(),
+                            format!("copy this process's value into {vault}"),
                         ));
                     }
                     for (index, (label, description)) in options.iter().enumerate() {
@@ -3555,15 +3602,23 @@ impl SettingsCx {
                         controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
                             Span::raw(marker),
-                            Span::styled((*label).to_string(), style),
+                            Span::styled(label.clone(), style),
                             Span::raw(" — "),
-                            Span::styled((*description).to_string(), muted),
+                            Span::styled(description.clone(), muted),
                         ]));
                     }
                 }
                 if let Some(detected) = &s.detected_env_offer {
                     lines.push(Line::from(Span::styled(
                         format!("Detected ${detected}; keep the reference or copy its value into the daemon vault."),
+                        muted,
+                    )));
+                }
+                if self.host_capabilities.secret_store.effective_placement
+                    == cockpit_proto::SecretStorePlacement::Database
+                {
+                    lines.push(Line::from(Span::styled(
+                        "Local vault mode is machine-bound; losing its private wrapping-key file makes stored credentials unrecoverable.",
                         muted,
                     )));
                 }
@@ -3676,47 +3731,6 @@ impl SettingsCx {
                     OAuthFlowView::OAuth(state),
                     OAuthHost::AddWizard,
                 ));
-            }
-            Some("test-key-choice") => {
-                lines.push(Line::from(Span::styled(
-                    "Test key now?".to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                for (index, (label, description)) in [
-                    ("Test key", "validate credentials now"),
-                    ("Skip test", "save now and validate on first use"),
-                ]
-                .iter()
-                .take(if s.onboarding { 1 } else { 2 })
-                .enumerate()
-                {
-                    let marker = if index == s.test_choice_cursor {
-                        "▸ "
-                    } else {
-                        "  "
-                    };
-                    let style = if index == s.test_choice_cursor {
-                        yellow.add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    controls.push((lines.len(), index));
-                    lines.push(Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled((*label).to_string(), style),
-                        Span::raw(" — "),
-                        Span::styled((*description).to_string(), muted),
-                    ]));
-                }
-            }
-            Some("test-skipped") => {
-                lines.push(Line::from(Span::styled(
-                    "key saved but unverified — it will be tested on your first message."
-                        .to_string(),
-                    muted,
-                )));
-                controls.push((lines.len(), 0));
-                lines.push(Line::from("[Continue]"));
             }
             Some("saving" | "fetching" | "test-key") => {
                 lines.push(Line::from(Span::styled(
@@ -5319,7 +5333,7 @@ fn provider_add_pointer_action(
 ) -> Option<super::pointer_actions::SettingsPointerAction> {
     use super::pointer_actions::{
         HeaderName, ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
-        WizardStepId, WizardTestChoice,
+        WizardStepId,
     };
     let step = state.run.current_provider_step()?;
     let control = match step {
@@ -5334,11 +5348,13 @@ fn provider_add_pointer_action(
                 WizardAuthMethod::PasteKey,
                 WizardAuthMethod::EnvVar,
                 WizardAuthMethod::AdvancedHeaders,
+                WizardAuthMethod::CopyDetectedEnv,
             ]
-            .get(index)?,
-        ),
-        WizardStepId::TestKeyChoice => WizardControlId::TestChoice(
-            *[WizardTestChoice::TestKey, WizardTestChoice::SkipTest].get(index)?,
+            .get(index)
+            .filter(|method| {
+                !matches!(method, WizardAuthMethod::CopyDetectedEnv)
+                    || state.detected_env_offer.is_some()
+            })?,
         ),
         WizardStepId::GrokOAuth | WizardStepId::CodexOAuth => {
             WizardControlId::OAuth(state.oauth_auth.as_deref().and_then(|oauth| {
@@ -5362,10 +5378,8 @@ fn provider_add_pointer_action(
         | WizardStepId::Url
         | WizardStepId::ApiKey
         | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::CopyDetectedEnv => return None,
         WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
-        WizardStepId::TestSkipped => {
-            (index == 0).then_some(WizardControlId::TestSkippedContinue)?
-        }
         WizardStepId::Done => (index == 0).then_some(WizardControlId::DoneContinue)?,
         WizardStepId::Saving | WizardStepId::TestKey | WizardStepId::Fetching => return None,
     };
@@ -5973,11 +5987,7 @@ impl SettingsPage for ProvidersPage {
                     }
                     state.headers.cursor = index;
                 }
-                Some("test-key-choice") if index < if state.onboarding { 1 } else { 2 } => {
-                    state.test_choice_cursor = index;
-                }
                 Some("copilot-auth") if index == 0 => {}
-                Some("test-skipped") if index == 0 => {}
                 Some("done") if index == 0 => {}
                 Some("grok-oauth" | "codex-oauth")
                     if state.oauth_auth.as_ref().is_some_and(|oauth| {
@@ -6186,13 +6196,6 @@ impl SettingsPage for ProvidersPage {
                             state.headers.cursor =
                                 state.headers.cursor.saturating_add_signed(delta).min(last);
                         }
-                        Some("test-key-choice") => {
-                            let last = if state.onboarding { 0 } else { 1 };
-                            state.test_choice_cursor = state
-                                .test_choice_cursor
-                                .saturating_add_signed(delta)
-                                .min(last);
-                        }
                         Some("grok-oauth" | "codex-oauth") => {
                             if let Some(oauth) = state.oauth_auth.as_mut()
                                 && !oauth.paste_focused
@@ -6302,7 +6305,7 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::Add(s) => match s.run.current_step_id() {
                 Some("template") => "↑/↓  enter: choose  esc: cancel",
                 Some("id" | "url") => "type to edit  enter: next  esc: cancel",
-                Some("auth-method" | "test-key-choice") => "↑/↓  enter: choose  esc: cancel",
+                Some("auth-method") => "↑/↓  enter: choose  esc: cancel",
                 Some("api-key" | "env-var") => "type/paste  enter: save  esc: cancel",
                 Some("headers") => {
                     if s.headers.is_editing() {
@@ -6329,7 +6332,6 @@ impl SettingsPage for ProvidersPage {
                 },
                 Some("test-key") if s.fetch.is_none() => "o: continue offline  esc: cancel",
                 Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
-                Some("test-skipped") => "enter: continue",
                 Some("done") | None => "enter: back to list",
                 Some(_) => "esc: cancel",
             },

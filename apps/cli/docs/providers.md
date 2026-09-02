@@ -119,7 +119,9 @@ that support it also receive the configured reasoning-effort control.
 
 Provider config stores non-secret policy and references in layered `.cockpit/` config. Raw pasted secrets and OAuth tokens live in Cockpit's private credential store, not in project files. A project can name a provider or model, but workspace trust controls whether project config is loaded at all.
 
-Environment-variable references are kept as references. For example, `Bearer $OPENAI_API_KEY` means Cockpit reads `OPENAI_API_KEY` from the process environment when it needs to call the provider.
+Environment-variable references are kept as references. For example, `Bearer $OPENAI_API_KEY` means Cockpit reads `OPENAI_API_KEY` from the daemon environment when it needs to call the provider. Setup detects non-empty variables declared by the selected provider template and prefers that reference automatically. Its live credential check runs through the daemon, so a shell-only variable that the daemon cannot resolve is reported as a failed import with a prompt to copy the detected value into Cockpit's encrypted vault instead.
+
+Copying or pasting a credential uses the installation's #233 secret-placement choice; setup shows whether the wrapping key is in the OS keyring or the machine-bound local wrapping-key file. Only an opaque `$secret:` reference remains in provider configuration. Local vault mode is machine-bound, so losing its private wrapping-key file makes the encrypted credentials unrecoverable.
 
 ## Custom Grok subscription authentication
 

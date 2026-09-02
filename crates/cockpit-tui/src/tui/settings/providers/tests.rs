@@ -19,6 +19,19 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+#[test]
+fn missing_daemon_environment_gets_copy_to_vault_guidance() {
+    let references = vec!["OPENAI_API_KEY".to_string()];
+    let guidance = daemon_visibility_guidance(
+        &references,
+        "Authorization references missing environment variable(s): OPENAI_API_KEY",
+    )
+    .expect("missing daemon environment must be actionable");
+    assert!(guidance.contains("daemon cannot resolve $OPENAI_API_KEY"));
+    assert!(guidance.contains("Copy detected value into vault"));
+    assert!(daemon_visibility_guidance(&references, "credentials rejected").is_none());
+}
+
 thread_local! {
     static PROVIDER_DAEMON_FIXTURE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -475,8 +488,8 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_api_key_field_renders_and_dispatches_from_fresh_state();
     pointer_add_env_var_field_renders_and_dispatches_from_fresh_state();
     pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state();
-    pointer_add_test_key_choices_render_and_dispatch_from_fresh_state();
-    pointer_add_test_skipped_continue_renders_and_dispatches_from_fresh_state();
+    pointer_add_test_key_waiting_surface_has_no_validation_bypass_action();
+    onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline();
     pointer_add_done_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
@@ -2665,6 +2678,8 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         state.template = Some(template);
         state.id_field.set(template.id);
         state.url_field.set(template.url);
+        state.detected_env_offer =
+            Some("COCKPIT_TEST_POINTER_DETECTED_ENV_DOES_NOT_EXIST".to_string());
         state.run.return_to("auth-method").unwrap();
         dialog.page = super::super::providers_page(ProvidersPage::Add(state));
         (tmp, dialog)
@@ -2690,7 +2705,7 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 3, "all auth methods are rendered");
+    assert_eq!(actions.len(), 4, "all auth methods are rendered");
     for action in actions {
         let method = match &action {
             SettingsPointerAction::Providers(ProvidersAction::WizardControl(
@@ -2701,16 +2716,26 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         };
         let (_tmp, mut fresh) = fixture();
         click_rendered_provider_action(&mut fresh, &action);
-        let expected_step = match method {
-            WizardAuthMethod::PasteKey => "api-key",
-            WizardAuthMethod::EnvVar => "env-var",
-            WizardAuthMethod::AdvancedHeaders => "headers",
-        };
-        assert!(matches!(
-            fresh.test_page(),
-            TestPageRef::Providers(ProvidersPage::Add(state))
-                if state.is_step(expected_step)
-        ));
+        if method == WizardAuthMethod::CopyDetectedEnv {
+            assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step("auth-method")
+                        && state.error.as_deref().is_some_and(|error| error.contains("no longer available"))
+            ));
+        } else {
+            let expected_step = match method {
+                WizardAuthMethod::PasteKey => "api-key",
+                WizardAuthMethod::EnvVar => "env-var",
+                WizardAuthMethod::AdvancedHeaders => "headers",
+                WizardAuthMethod::CopyDetectedEnv => unreachable!(),
+            };
+            assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step(expected_step)
+            ));
+        }
     }
 }
 
@@ -2871,9 +2896,9 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
             fresh.test_page(),
             TestPageRef::Providers(ProvidersPage::Add(state))
                 if state.saved_provider_id.as_deref() == Some("copilot")
-                    && state.fetch.is_none()
-                    && state.is_step("test-key-choice")
-                    && state.error.as_deref() == Some("saved.")
+                    && state.fetch.is_some()
+                    && state.is_step("test-key")
+                    && state.error.as_deref() == Some("saved. Testing key via /models…")
         ));
         let saved = load_provider(&fresh.config_path, "copilot");
         assert_eq!(saved.url, "https://api.githubcopilot.com");
@@ -2884,138 +2909,38 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
 }
 
 #[test]
-fn pointer_add_test_key_choices_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("provider key-test pointer runtime");
-    let _runtime_guard = runtime.enter();
-    use super::super::pointer_actions::{
-        ProvidersAction, SettingsPointerAction, WizardControlId, WizardTestChoice,
-    };
+fn pointer_add_test_key_waiting_surface_has_no_validation_bypass_action() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
 
-    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
-        let template = templates::template_by_id("anthropic").unwrap();
-        let mut config = ProvidersConfig::default();
-        config
-            .providers
-            .insert("anthropic".into(), ProviderEntry::default());
-        let (tmp, mut dialog) = dialog_with_config(config);
-        let mut state = AddState::new();
-        state.template = Some(template);
-        state.id_field.set(template.id);
-        state.url_field.set(template.url);
-        state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
-        (tmp, dialog)
-    }
+    let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+    let mut state = AddState::new_with_onboarding(true);
+    state.saved_provider_id = Some("anthropic".into());
+    state
+        .run
+        .return_to(ProviderWizardStep::TestKey.source_id())
+        .expect("provider validation step exists");
+    dialog.page = super::super::providers_page(ProvidersPage::Add(state));
 
-    let (_tmp, source) = fixture();
-    let _ = render_provider_rows(&source, 110, 60);
-    let actions = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .filter_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        _,
-                        WizardControlId::TestChoice(_),
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 2, "both test-key choices are rendered");
-    for action in actions {
-        let choice = match &action {
-            SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                _,
-                WizardControlId::TestChoice(choice),
-            )) => *choice,
-            _ => unreachable!(),
-        };
-        let (_tmp, mut fresh) = fixture();
-        click_rendered_provider_action(&mut fresh, &action);
-        match choice {
-            WizardTestChoice::TestKey => assert!(matches!(
-                fresh.test_page(),
-                TestPageRef::Providers(ProvidersPage::Add(state))
-                    if state.fetch.is_some()
-                        && state.error.as_deref() == Some("Testing key via /models…")
-                        && !state.is_step("test-key-choice")
-            )),
-            WizardTestChoice::SkipTest => assert!(matches!(
-                fresh.test_page(),
-                TestPageRef::Providers(ProvidersPage::Add(state))
-                    if state.is_step("test-skipped")
-                        && state.error.as_deref().is_some_and(|message| message.contains("unverified"))
-            )),
-        }
-    }
-}
-
-#[test]
-fn pointer_add_test_skipped_continue_renders_and_dispatches_from_fresh_state() {
-    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
-
-    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
-        let template = templates::template_by_id("anthropic").unwrap();
-        let mut config = ProvidersConfig::default();
-        config
-            .providers
-            .insert("anthropic".into(), ProviderEntry::default());
-        let (tmp, mut dialog) = dialog_with_config(config);
-        let mut state = AddState::new();
-        state.template = Some(template);
-        state.id_field.set(template.id);
-        state.url_field.set(template.url);
-        state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        state.test_choice_cursor = 1;
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("test-skipped"));
-        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
-        (tmp, dialog)
-    }
-
-    let (_tmp, source) = fixture();
-    let _ = render_provider_rows(&source, 110, 60);
-    let action = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .find_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        ProviderWizardStep::TestSkipped,
-                        WizardControlId::TestSkippedContinue,
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .expect("TestSkipped publishes its exact Continue source");
-
-    let (_tmp, mut fresh) = fixture();
-    click_rendered_provider_action(&mut fresh, &action);
-    assert!(matches!(
-        fresh.test_page(),
-        TestPageRef::Providers(ProvidersPage::Add(state))
-            if state.is_step("done")
-                && state.saved_provider_id.as_deref() == Some("anthropic")
-                && state.fetch.is_none()
-                && state.error.as_deref().is_some_and(|message| message.contains("unverified"))
-    ));
+    let _ = render_provider_rows(&dialog, 110, 60);
+    assert!(
+        !dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                matches!(
+                    &target.action,
+                    super::super::shell::SettingsPointerAction::Page(
+                        SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            ProviderWizardStep::TestKey,
+                            _,
+                        )),
+                    )
+                )
+            }),
+        "live credential validation must not publish a clickable bypass action"
+    );
 }
 
 #[test]
@@ -3034,12 +2959,8 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
         state.id_field.set(template.id);
         state.url_field.set(template.url);
         state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        state.test_choice_cursor = 1;
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("test-skipped"));
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("done"));
+        state.run.return_to("done").unwrap();
+        state.error = Some("validated credential".into());
         dialog.page = super::super::providers_page(ProvidersPage::Add(state));
         (tmp, dialog)
     }
@@ -3070,7 +2991,7 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
     assert!(matches!(
         fresh.test_page(),
         TestPageRef::Providers(ProvidersPage::List { status, .. })
-            if status.as_deref().is_some_and(|message| message.contains("unverified"))
+            if status.as_deref() == Some("validated credential")
     ));
     assert!(fresh.config.providers.contains_key("anthropic"));
     let _saved = load_provider(&fresh.config_path, "anthropic");

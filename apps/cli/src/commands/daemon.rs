@@ -259,6 +259,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 snapshot_db.as_ref(),
                 None,
                 None,
+                None,
             )
             .await?;
             println!(

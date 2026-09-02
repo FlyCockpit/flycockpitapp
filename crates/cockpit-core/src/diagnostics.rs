@@ -89,6 +89,11 @@ impl<'a> DiagnosticDb<'a> {
 /// pass `None`.
 pub type SecretLookup<'a> = Option<&'a dyn Fn(&str) -> Option<String>>;
 
+/// Optional credential store for provider network checks. A daemon snapshot
+/// supplies a detached vault-derived view so command and OAuth authentication
+/// resolve through the same credential authority without making doctor write.
+pub type ProviderCredentialStore<'a> = Option<&'a crate::credentials::CredentialStore>;
+
 /// Optional authoritative environment view for provider network checks. A
 /// daemon snapshot supplies its baseline; offline/in-process diagnostics use
 /// their own process environment.
@@ -123,6 +128,7 @@ pub async fn cli_snapshot(
     offline: bool,
     db: Option<&crate::db::Db>,
     secret_lookup: SecretLookup<'_>,
+    provider_credential_store: ProviderCredentialStore<'_>,
     provider_env_lookup: ProviderEnvLookup<'_>,
 ) -> Result<DiagnosticsSnapshot> {
     #[cfg(feature = "test-support")]
@@ -175,8 +181,13 @@ pub async fn cli_snapshot(
     .context("dependency diagnostics worker join")??;
     snapshot.has_failures |= snapshot.dependencies.has_required_failures();
     let providers = crate::config::providers::ConfigDoc::load_effective(Path::new(&snapshot.cwd));
-    let (network, network_failed) =
-        provider_network_lines(&providers, offline, provider_env_lookup).await;
+    let (network, network_failed) = provider_network_lines(
+        &providers,
+        offline,
+        provider_credential_store,
+        provider_env_lookup,
+    )
+    .await;
     snapshot.network = network;
     snapshot.has_failures |= network_failed;
     let (database, database_failed) = database_lines(&db_source, &extended).await;
@@ -1169,6 +1180,7 @@ where
 async fn provider_network_lines(
     cfg: &crate::config::providers::ProvidersConfig,
     offline: bool,
+    provider_credential_store: ProviderCredentialStore<'_>,
     provider_env_lookup: ProviderEnvLookup<'_>,
 ) -> (Vec<String>, bool) {
     if offline {
@@ -1209,7 +1221,7 @@ async fn provider_network_lines(
             provider,
             template,
             Duration::from_secs(5),
-            None,
+            provider_credential_store.cloned(),
             |name| match provider_env_lookup {
                 Some(lookup) => lookup(name),
                 None => std::env::var(name).ok(),
@@ -2307,7 +2319,7 @@ mod tests {
         let ok_url = one_shot_server("200 OK", r#"{"ok":true}"#).await;
         let cfg = network_cfg(ok_url);
         let before = serde_json::to_value(&cfg).unwrap();
-        let (lines, failed) = provider_network_lines(&cfg, false, None).await;
+        let (lines, failed) = provider_network_lines(&cfg, false, None, None).await;
         assert!(!failed, "{lines:?}");
         assert!(
             lines
@@ -2319,7 +2331,7 @@ mod tests {
 
         let rejected_url = one_shot_server("401 Unauthorized", r#"{"error":"bad key"}"#).await;
         let cfg = network_cfg(rejected_url);
-        let (lines, failed) = provider_network_lines(&cfg, false, None).await;
+        let (lines, failed) = provider_network_lines(&cfg, false, None, None).await;
         assert!(failed, "{lines:?}");
         assert!(
             lines
@@ -2329,10 +2341,42 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn doctor_network_check_injects_a_store_for_dynamic_provider_auth() {
+        let _env = crate::test_env::isolated_cockpit_home_async().await;
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
+        let mut cfg = network_cfg("http://127.0.0.1:9/v1".to_string());
+        let provider = cfg.providers.get_mut("zai-test").expect("test provider");
+        provider.auth = Some(AuthKind::Command);
+        provider.auth_command = Some(vec![
+            "cockpit-doctor-intentionally-missing-auth-command".into(),
+        ]);
+
+        let (without_store, failed_without_store) =
+            provider_network_lines(&cfg, false, None, None).await;
+        assert!(failed_without_store, "{without_store:?}");
+        assert!(
+            without_store
+                .iter()
+                .any(|line| line.contains("requires an injected credential store")),
+            "{without_store:?}"
+        );
+
+        let (with_store, failed_with_store) =
+            provider_network_lines(&cfg, false, Some(&store), None).await;
+        assert!(failed_with_store, "{with_store:?}");
+        assert!(
+            !with_store
+                .iter()
+                .any(|line| line.contains("requires an injected credential store")),
+            "{with_store:?}"
+        );
+    }
+
     #[tokio::test]
     async fn doctor_offline_skips_network() {
         let cfg = network_cfg("http://127.0.0.1:9/v1".to_string());
-        let (lines, failed) = provider_network_lines(&cfg, true, None).await;
+        let (lines, failed) = provider_network_lines(&cfg, true, None, None).await;
 
         assert!(!failed);
         assert_eq!(lines, ["network checks: skipped (--offline)"]);
@@ -2341,7 +2385,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_unreachable_invokable_host_warns_without_failing() {
         let cfg = network_cfg_with_invokable("http://127.0.0.1:9/v1".to_string());
-        let (lines, failed) = provider_network_lines(&cfg, false, None).await;
+        let (lines, failed) = provider_network_lines(&cfg, false, None, None).await;
 
         assert!(!failed, "{lines:?}");
         assert!(

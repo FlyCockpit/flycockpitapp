@@ -16980,6 +16980,7 @@ async fn handle_serialized_request_impl(
                 mutation_intent_hash,
                 mutation,
                 settings_capability_owner(state),
+                provider_env_snapshot(ctx, state),
             )
             .await
         }
@@ -20326,6 +20327,7 @@ async fn apply_provider_mutation(
     mutation_intent_hash: String,
     mutation: cockpit_proto::ProviderMutationBatch,
     capability_owner: String,
+    provider_env: std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
     if observed_intent_hash != mutation_intent_hash {
@@ -20432,6 +20434,7 @@ async fn apply_provider_mutation(
             &expected_revision,
             capability.config_generation,
             &mutation_intent_hash,
+            &provider_env,
         )
         .await?;
         {
@@ -21540,6 +21543,7 @@ async fn stage_and_recover_provider_batch(
     consumed_revision: &str,
     consumed_config_generation: u64,
     mutation_intent_hash: &str,
+    provider_env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
@@ -21663,7 +21667,12 @@ async fn stage_and_recover_provider_batch(
                     &entry_for_secret_resolution,
                     &header_name,
                     &header_value,
-                    |variable| std::env::var(variable),
+                    |variable| {
+                        provider_env
+                            .get(variable)
+                            .cloned()
+                            .ok_or(std::env::VarError::NotPresent)
+                    },
                 )?;
                 let slug = upsert
                     .provider_id
@@ -29451,7 +29460,9 @@ async fn get_doctor_snapshot_response(
     // already-open `Db` (a cheap Arc-backed shared handle) so the snapshot never
     // opens a second DB. The vault-backed secret lookup lets the credential
     // check resolve `$secret:<name>` references after the literal-header
-    // migration has rewritten provider config files.
+    // migration has rewritten provider config files; dynamic auth receives a
+    // detached credential cache so this read-only diagnostic cannot mutate
+    // the vault while refreshing a command or OAuth credential.
     let (rendered, has_failures) = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -29461,6 +29472,7 @@ async fn get_doctor_snapshot_response(
         let store = crate::credentials::CredentialStore::from_vault(vault)
             .map_err(|error| error.to_string())?;
         let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+        let provider_credential_store = store.for_diagnostic_auth();
         let env_lookup = |name: &str| env.get(name).cloned();
         let snapshot = runtime
             .block_on(crate::diagnostics::cli_snapshot(
@@ -29469,6 +29481,7 @@ async fn get_doctor_snapshot_response(
                 offline,
                 db.as_ref(),
                 Some(&secret_lookup),
+                Some(&provider_credential_store),
                 Some(&env_lookup),
             ))
             .map_err(|error| error.to_string())?;

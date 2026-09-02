@@ -15,6 +15,12 @@ name: CLI CI
       - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Supply-chain gates (issue #306): advisory/license/ban policy and the
+      # CI-wired guardrail scripts must re-run when their config changes.
+      - "deny.toml"
+      - "scripts/check-production-secret-opens.sh"
+      - "scripts/check-advisory-exceptions.sh"
+      - "scripts/check-unsafe-safety-comments.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -27,8 +33,23 @@ name: CLI CI
       - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Supply-chain gates (issue #306): advisory/license/ban policy and the
+      # CI-wired guardrail scripts must re-run when their config changes.
+      - "deny.toml"
+      - "scripts/check-production-secret-opens.sh"
+      - "scripts/check-advisory-exceptions.sh"
+      - "scripts/check-unsafe-safety-comments.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
+  # Weekly advisory sweep (issue #306): RustSec advisories and yanks can land
+  # against an UNCHANGED Cargo.lock, so path-filtered push/PR runs would leave
+  # main green indefinitely while shipping a vulnerable lockfile. Scheduled
+  # runs ignore the paths filters above and run on the default branch; the
+  # heavy build jobs below opt out via `github.event_name != 'schedule'`, so
+  # the sweep runs the supply-chain gate (audit + deny + exception expiry)
+  # without paying for the full matrix.
+  schedule:
+    - cron: "0 6 * * MON"
   workflow_dispatch:
     inputs:
       remote_conformance:
@@ -38,7 +59,10 @@ name: CLI CI
         type: boolean
 
 concurrency:
-  group: cli-ci-${{ github.ref }}
+  # Event name in the group keeps the weekly advisory sweep (schedule) from
+  # canceling an in-progress push run on the same ref — cancel-in-progress
+  # would otherwise silently replace the full gate with the light sweep.
+  group: cli-ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -56,6 +80,9 @@ jobs:
   gates:
     name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
     needs: runners
+    # The weekly scheduled run only needs the supply-chain sweep; the build
+    # matrix re-validates unchanged code against an unchanged toolchain.
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -73,22 +100,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install stable Rust
         if: matrix.toolchain == 'stable'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy, rustfmt
 
       - name: Install MSRV Rust
         if: matrix.toolchain == '1.95.0'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
           workspaces: . -> target
@@ -112,7 +139,12 @@ jobs:
         run: cargo build --locked --workspace --exclude tenant-authority --target x86_64-pc-windows-msvc
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        # Pinned install-action: the shorthand @nextest tag is a moving ref
+        # that bundles "latest action + latest cargo-nextest"; pin the action
+        # by SHA (issue #306) and let the tool version float deliberately.
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-nextest
 
       # The dependency-inventory test intentionally resolves every supported
       # target with `--offline`. Fetch the complete locked graph first: target
@@ -145,6 +177,16 @@ jobs:
       - name: Check Code-root constructor inventory
         run: bash scripts/check-code-root-constructors.sh
 
+      # Vault-open guardrail (issue #306): no CI job or hook ran this before;
+      # it is now part of the serialized Rust gate on every leg.
+      - name: Check production-path secret opens
+        run: bash scripts/check-production-secret-opens.sh
+
+      # SAFETY-comment ratchet (issue #306): the undocumented-unsafe-site count
+      # may not grow past the ceiling recorded in the script.
+      - name: Check unsafe SAFETY comment ratchet
+        run: bash scripts/check-unsafe-safety-comments.sh
+
       - name: Doc tests
         run: cargo test --locked --workspace --exclude tenant-authority --doc
 
@@ -167,27 +209,77 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  supply-chain:
+    name: Cargo audit + deny
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Prebuilt, checksum-verified binaries from GitHub Releases; versions
+      # pinned and bumped deliberately (issue #306). The action itself is
+      # SHA-pinned: this job is the supply-chain gate, so its entry path must
+      # not run attacker-mutable action code (a moved @v2 tag could serve
+      # audit/deny binaries that always pass). Dependabot's github-actions
+      # ecosystem keeps the SHA current.
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+
+      # Exception policy gate (issue #306): every deny.toml [advisories].ignore
+      # entry must carry a review-by date that has not passed, and the
+      # cargo-audit --ignore flags are derived from that same array so audit
+      # and deny can never drift. Outputs the flags for the audit step below.
+      - name: Check advisory exception policy (expiry + audit flags)
+        id: advisory-exceptions
+        run: |
+          flags="$(bash scripts/check-advisory-exceptions.sh)"
+          echo "audit-flags=$flags" >> "$GITHUB_OUTPUT"
+
+      # Fails on any RUSTSEC advisory affecting the locked graph except the
+      # time-bounded, audited exceptions (owner decision 2026-09-01, issue
+      # #306), with the ignore list mechanically derived from deny.toml.
+      - name: cargo audit
+        run: cargo audit ${{ steps.advisory-exceptions.outputs.audit-flags }}
+
+      # Advisory, license, ban, and source policy against the whole locked
+      # graph (all targets union, all features). New advisories outside the
+      # deny.toml exceptions, off-allowlist licenses, yanked crates outside
+      # the crate-spec exceptions in [advisories].ignore, any
+      # OpenSSL/native-TLS outside the pinned firecrawl stack, and unknown
+      # registries or git sources all fail (issue #306).
+      - name: cargo deny
+        run: cargo deny --config deny.toml check advisories bans licenses sources
+
   grok-subscription:
     name: SuperGrok subscription feature
     needs: runners
+    if: github.event_name != 'schedule'
     runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: grok-subscription
           workspaces: . -> target
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        # Pinned install-action: the shorthand @nextest tag is a moving ref
+        # that bundles "latest action + latest cargo-nextest"; pin the action
+        # by SHA (issue #306) and let the tool version float deliberately.
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-nextest
 
       # Keep the retained implementation compiling and lint-clean even though
       # official release artifacts leave this feature disabled.
@@ -213,16 +305,21 @@ jobs:
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        # Pinned install-action: the shorthand @nextest tag is a moving ref
+        # that bundles "latest action + latest cargo-nextest"; pin the action
+        # by SHA (issue #306) and let the tool version float deliberately.
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-nextest
 
       - name: Install and initialize SoftHSM2
         run: |
@@ -261,16 +358,21 @@ jobs:
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        # Pinned install-action: the shorthand @nextest tag is a moving ref
+        # that bundles "latest action + latest cargo-nextest"; pin the action
+        # by SHA (issue #306) and let the tool version float deliberately.
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-nextest
 
       # The immutable digest keeps the conformance server binary reproducible.
       - name: Start pinned coturn (UDP/TCP/TLS, long-term credentials)

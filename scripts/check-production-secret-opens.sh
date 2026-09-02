@@ -16,30 +16,24 @@ FORBIDDEN = (
 )
 
 # Exact file + symbol + occurrence count. A new open in an allow-listed file fails.
-CLI_ALLOWED = {
-    ("commands/ask.rs", "Db::open_default"): 1,
-    ("commands/ask.rs", "vault_for_db"): 1,
-    ("commands/assistant.rs", "Db::open_default"): 4,
-    ("commands/connect.rs", "Db::open_default"): 1,
-    ("commands/connect.rs", "vault_for_db"): 1,
-    ("commands/debug.rs", "Db::open_default"): 1,
-    ("commands/export.rs", "Db::open_default"): 1,
-    ("commands/export.rs", "vault_for_db"): 1,
-    ("commands/kcl.rs", "Db::open_default"): 1,
-    ("commands/packages.rs", "Db::open_default"): 4,
-    ("commands/session.rs", "Db::open_default"): 2,
-    ("commands/sync.rs", "Db::open_default"): 1,
-    ("commands/sync.rs", "vault_for_db"): 1,
-}
+# CLI is empty since the CLI commands moved onto daemon RPCs (issue #306
+# re-wired this guardrail into CI after the refactor): any direct CLI open is
+# now a hard failure.
+CLI_ALLOWED = {}
 
 CORE_ALLOWED = {
     ("daemon/server/mod.rs", "Db::open_default"): 1,
     ("daemon/server/mod.rs", "open_for_db"): 1,
+    # `Db::open_default_read_only_diagnostic()` is the sanctioned read-only
+    # `cockpit doctor` / hidden diagnostic-snapshot opener; the needle below
+    # matches its `Db::open_default` prefix.
+    ("daemon/diagnostics_probe.rs", "Db::open_default"): 1,
     ("secure_key/mod.rs", "vault_for_db"): 1,
     ("secure_key/mod.rs", "open_for_db"): 1,
     ("secure_key/resolve.rs", "vault_for_db"): 1,
     ("secure_key/resolve.rs", "open_for_db"): 2,
     ("assistants/self_improvement.rs", "open_for_db"): 1,
+    ("assistants/mod.rs", "open_for_db"): 1,
 }
 
 

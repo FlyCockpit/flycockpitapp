@@ -787,6 +787,33 @@ fn vnext_author_tool_tier_preferences_reject_unknown_or_disabled_tools() {
 }
 
 #[test]
+fn vnext_network_hosts_are_requests_not_grants() {
+    let document =
+        vnext_document("requestedNetworkHosts:\n  - api.example.test\nrequestsRequested: true\n");
+    let def = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
+    assert_eq!(
+        def.requested_network_hosts(),
+        &std::collections::BTreeSet::from([crate::db::monty_network::CanonicalNetworkHost::parse(
+            "api.example.test"
+        )
+        .unwrap()])
+    );
+    assert!(def.requests_requested());
+    assert!(def.tools.is_none());
+    assert!(def.tool_tiers.is_empty());
+    assert!(
+        def.to_markdown()
+            .unwrap()
+            .contains("requestedNetworkHosts:")
+    );
+
+    let invalid = vnext_document("requestedNetworkHosts:\n  - HTTPS://api.example.test\n");
+    assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+    let with_port = vnext_document("requestedNetworkHosts:\n  - api.example.test:443\n");
+    assert!(parse_agent(&with_port, "reviewer", "reviewer.md".into()).is_err());
+}
+
+#[test]
 fn agent_vnext_every_editable_builtin_ejects_closed_launch_schema_v1() {
     for &name in crate::agents::BUILTIN_AGENT_NAMES {
         let embedded = embedded_default(name).unwrap();

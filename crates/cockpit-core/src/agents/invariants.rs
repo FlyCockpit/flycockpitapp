@@ -847,6 +847,8 @@ mod grant_tests {
             verification: None,
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         });
         // A launch-v1 definition has no user-authored tool authority, so legacy tool
         // validation must not reinterpret its ignored internal fields.

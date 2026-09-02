@@ -5,14 +5,18 @@ use std::sync::Arc;
 
 use cockpit_db::installation_identity::{InstallationIdentity, ensure_installation_identity_conn};
 use cockpit_db::secret_vault::{
-    SecretVaultAuthorityRow, SecretVaultPlacement, list_open_sagas_conn, load_authority_conn,
+    SecretVaultAuthorityRow, SecretVaultFileKekMode, SecretVaultPlacement, list_open_sagas_conn,
+    load_authority_conn, load_passphrase_kdf_conn,
 };
 use cockpit_proto::{SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot};
 
 use crate::db::Db;
 
 use super::error::SecureKeyError;
-use super::kek_store::{FileKekStore, KekStore, KeyringKekStore, file_kek_supported};
+use super::kek_store::{
+    FileKekStore, KekStore, KeyringKekStore, Passphrase, PassphraseKdfParams, PassphraseKekStore,
+    file_kek_supported,
+};
 use super::namespace::{
     LEAK_REPORT_V1_NAMESPACE, Namespace, REDACTION_HISTORY_V1_NAMESPACE, SECURE_KEY_SERVICE,
     manifest_account, version_account,
@@ -24,6 +28,88 @@ use super::vault::SecretVault;
 use super::vault_store::classify_account;
 
 pub const DEFAULT_FIX_COMMAND: &str = "Install and unlock a platform keyring (Linux Secret Service, macOS Keychain, or Windows Credential Manager).";
+pub const MACHINE_BOUND_FILE_VAULT_WARNING: &str =
+    "The machine-bound file vault is weaker than the OS keychain against a local-root attacker.";
+
+/// First-run placement chosen by onboarding. `Automatic` preserves the
+/// established keyring-when-available behavior; the file choices deliberately
+/// override it and are persisted in the vault authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FirstRunSecretStoreIntent {
+    #[default]
+    Automatic,
+    Keyring,
+    FileMachineBound,
+    FilePassphrase,
+}
+
+impl FirstRunSecretStoreIntent {
+    fn placement(self) -> Option<SecretVaultPlacement> {
+        match self {
+            Self::Automatic => None,
+            Self::Keyring => Some(SecretVaultPlacement::Keyring),
+            Self::FileMachineBound | Self::FilePassphrase => Some(SecretVaultPlacement::Database),
+        }
+    }
+
+    fn file_kek_mode(self) -> Option<SecretVaultFileKekMode> {
+        match self {
+            Self::FileMachineBound => Some(SecretVaultFileKekMode::MachineBound),
+            Self::FilePassphrase => Some(SecretVaultFileKekMode::Passphrase),
+            Self::Automatic | Self::Keyring => None,
+        }
+    }
+}
+
+/// Input supplied by onboarding when bootstrapping or reopening a vault. A
+/// passphrase is consumed to derive the KEK once, then zeroized.
+#[derive(Default)]
+pub struct SecretVaultOpenOptions {
+    pub first_run_intent: FirstRunSecretStoreIntent,
+    pub passphrase: Option<Passphrase>,
+}
+
+/// Read-only status for onboarding. It deliberately reuses the platform probe
+/// fields (including remedy text) rather than duplicating platform policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstRunSecretStoreCapabilities {
+    pub keyring: KeyringProbeResult,
+    pub file_vault_available: bool,
+    pub file_vault_reason: Option<String>,
+    pub file_vault_fix_command: Option<String>,
+    pub machine_bound_warning: &'static str,
+}
+
+pub fn first_run_secret_store_capabilities(
+    keyring: &KeyringProbeResult,
+) -> FirstRunSecretStoreCapabilities {
+    match file_kek_supported() {
+        Ok(()) => FirstRunSecretStoreCapabilities {
+            keyring: keyring.clone(),
+            file_vault_available: true,
+            file_vault_reason: None,
+            file_vault_fix_command: None,
+            machine_bound_warning: MACHINE_BOUND_FILE_VAULT_WARNING,
+        },
+        Err(SecureKeyError::KekUnavailable {
+            reason,
+            fix_command,
+        }) => FirstRunSecretStoreCapabilities {
+            keyring: keyring.clone(),
+            file_vault_available: false,
+            file_vault_reason: Some(reason),
+            file_vault_fix_command: fix_command,
+            machine_bound_warning: MACHINE_BOUND_FILE_VAULT_WARNING,
+        },
+        Err(error) => FirstRunSecretStoreCapabilities {
+            keyring: keyring.clone(),
+            file_vault_available: false,
+            file_vault_reason: Some(error.to_string()),
+            file_vault_fix_command: None,
+            machine_bound_warning: MACHINE_BOUND_FILE_VAULT_WARNING,
+        },
+    }
+}
 
 /// Injected stores for tests. Production leaves these `None`.
 #[derive(Default)]
@@ -197,7 +283,34 @@ pub fn resolve_secret_store(
     authority: Option<&SecretVaultAuthorityRow>,
     keyring_probe: &KeyringProbeResult,
 ) -> Result<SecretVaultPlacement, KekUnavailable> {
+    resolve_secret_store_with_intent(
+        authority,
+        keyring_probe,
+        FirstRunSecretStoreIntent::Automatic,
+    )
+}
+
+/// Pure placement decision with the persisted first-run choice. A file intent
+/// may select the file vault even while the keyring probe is available.
+pub fn resolve_secret_store_with_intent(
+    authority: Option<&SecretVaultAuthorityRow>,
+    keyring_probe: &KeyringProbeResult,
+    first_run_intent: FirstRunSecretStoreIntent,
+) -> Result<SecretVaultPlacement, KekUnavailable> {
     match authority {
+        None if first_run_intent == FirstRunSecretStoreIntent::Keyring
+            && !keyring_available(keyring_probe) =>
+        {
+            Err(KekUnavailable {
+                reason: keyring_probe.reason.clone(),
+                fix_command: keyring_probe
+                    .fix_command
+                    .clone()
+                    .or_else(|| Some(DEFAULT_FIX_COMMAND.to_string())),
+                intent: SecretStoreIntent::Keyring,
+            })
+        }
+        None if let Some(placement) = first_run_intent.placement() => Ok(placement),
         None if keyring_available(keyring_probe) => Ok(SecretVaultPlacement::Keyring),
         None if keyring_probe_failed(keyring_probe) => Err(KekUnavailable {
             reason: keyring_probe.reason.clone(),
@@ -231,6 +344,25 @@ pub fn ensure_secret_vault(
     kek_dir: &Path,
     injected: SecretStoreInjected,
 ) -> Result<EffectiveSecretStore, KekUnavailable> {
+    ensure_secret_vault_with_options(
+        db,
+        keyring_probe,
+        kek_dir,
+        injected,
+        SecretVaultOpenOptions::default(),
+    )
+}
+
+/// Open or initialize the vault using a first-run placement and optional
+/// passphrase. The derived passphrase KEK is retained only by the returned
+/// vault/store for the daemon lifetime.
+pub fn ensure_secret_vault_with_options(
+    db: &Db,
+    keyring_probe: &KeyringProbeResult,
+    kek_dir: &Path,
+    injected: SecretStoreInjected,
+    mut options: SecretVaultOpenOptions,
+) -> Result<EffectiveSecretStore, KekUnavailable> {
     let installation = db
         .blocking_write_for_sync_maintenance(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
@@ -257,8 +389,38 @@ pub fn ensure_secret_vault(
             intent: SecretStoreIntent::Unconfigured,
         })?;
 
+    if authority.is_none()
+        && options.passphrase.is_some()
+        && options.first_run_intent != FirstRunSecretStoreIntent::FilePassphrase
+    {
+        return Err(KekUnavailable {
+            reason: "a passphrase may be supplied only with the FilePassphrase first-run intent"
+                .into(),
+            fix_command: None,
+            intent: SecretStoreIntent::Unconfigured,
+        });
+    }
+    if authority.is_none()
+        && options.first_run_intent == FirstRunSecretStoreIntent::FilePassphrase
+        && options.passphrase.is_none()
+    {
+        return Err(KekUnavailable {
+            reason: "first-run passphrase vault initialization requires a passphrase".into(),
+            fix_command: None,
+            intent: SecretStoreIntent::Database,
+        });
+    }
+
     if let Some(auth) = authority.as_ref() {
-        resume_open_kek_migrate(db, kek_dir, &installation, &injected, keyring_probe, auth)?;
+        resume_open_kek_migrate(
+            db,
+            kek_dir,
+            &installation,
+            &injected,
+            keyring_probe,
+            auth,
+            &mut options.passphrase,
+        )?;
         // Resume may activate a new placement and delete the source KEK.
         // Re-read before resolve/open so we do not open the deleted store.
         authority = db
@@ -270,11 +432,43 @@ pub fn ensure_secret_vault(
             })?;
     }
 
-    let first_run = authority.is_none();
-    let placement = resolve_secret_store(authority.as_ref(), keyring_probe)?;
+    if authority
+        .as_ref()
+        .is_some_and(|row| row.file_kek_mode != Some(SecretVaultFileKekMode::Passphrase))
+        && options.passphrase.is_some()
+    {
+        return Err(KekUnavailable {
+            reason: "a passphrase was supplied for a vault that is not passphrase-backed".into(),
+            fix_command: None,
+            intent: SecretStoreIntent::Unconfigured,
+        });
+    }
 
-    let kek_store =
-        kek_store_for_placement(placement, kek_dir, &installation, &injected, first_run)?;
+    let first_run = authority.is_none();
+    let placement = resolve_secret_store_with_intent(
+        authority.as_ref(),
+        keyring_probe,
+        options.first_run_intent,
+    )?;
+
+    let file_kek_mode = authority
+        .as_ref()
+        .and_then(|row| row.file_kek_mode)
+        .or_else(|| options.first_run_intent.file_kek_mode())
+        .or_else(|| {
+            (placement == SecretVaultPlacement::Database)
+                .then_some(SecretVaultFileKekMode::MachineBound)
+        });
+    let kek_store = kek_store_for_vault(
+        db,
+        placement,
+        file_kek_mode,
+        kek_dir,
+        &installation,
+        &injected,
+        first_run,
+        &mut options.passphrase,
+    )?;
 
     let vault = if first_run {
         match SecretVault::initialize(
@@ -345,6 +539,7 @@ fn resume_open_kek_migrate(
     injected: &SecretStoreInjected,
     keyring_probe: &KeyringProbeResult,
     _authority: &SecretVaultAuthorityRow,
+    passphrase: &mut Option<Passphrase>,
 ) -> Result<(), KekUnavailable> {
     let open = db
         .blocking_write_for_sync_maintenance(list_open_sagas_conn)
@@ -356,15 +551,51 @@ fn resume_open_kek_migrate(
     let Some(saga) = open.into_iter().next() else {
         return Ok(());
     };
-    let source = kek_store_for_placement(
-        saga.source_placement,
+    let dest = kek_store_for_vault(
+        db,
+        saga.dest_placement,
+        saga.dest_file_kek_mode,
         kek_dir,
         installation,
         injected,
         false,
+        passphrase,
     )?;
-    let dest =
-        kek_store_for_placement(saga.dest_placement, kek_dir, installation, injected, false)?;
+    // Before activation the source is still authoritative and must be opened
+    // to recover the KEK. After activation, a passphrase source has no
+    // durable KEK to retire: its `delete_kek` only clears a process-local
+    // derived value, which cannot survive the crash being recovered from.
+    // Other source stores still need opening in Activated to delete their
+    // durable KEK. SourceDeleted and Complete never need the retired store.
+    let source = match saga.phase {
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Prepared => Some(kek_store_for_vault(
+            db,
+            saga.source_placement,
+            saga.source_file_kek_mode,
+            kek_dir,
+            installation,
+            injected,
+            false,
+            passphrase,
+        )?),
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Activated
+            if !passphrase_source_is_already_retired(&saga) =>
+        {
+            Some(kek_store_for_vault(
+                db,
+                saga.source_placement,
+                saga.source_file_kek_mode,
+                kek_dir,
+                installation,
+                injected,
+                false,
+                passphrase,
+            )?)
+        }
+        cockpit_db::secret_vault::SecretVaultSagaPhase::Activated
+        | cockpit_db::secret_vault::SecretVaultSagaPhase::SourceDeleted
+        | cockpit_db::secret_vault::SecretVaultSagaPhase::Complete => None,
+    };
     super::migrate::resume_kek_migrate(
         db,
         source,
@@ -382,6 +613,13 @@ fn resume_open_kek_migrate(
         intent: placement_intent(saga.dest_placement),
     })?;
     Ok(())
+}
+
+fn passphrase_source_is_already_retired(
+    saga: &cockpit_db::secret_vault::SecretVaultSagaRow,
+) -> bool {
+    saga.source_placement == SecretVaultPlacement::Database
+        && saga.source_file_kek_mode == Some(SecretVaultFileKekMode::Passphrase)
 }
 
 fn kek_store_for_placement(
@@ -426,6 +664,68 @@ fn kek_store_for_placement(
                 return Ok(store.clone());
             }
             Ok(Arc::new(KeyringKekStore::new(installation.as_hex())) as Arc<dyn KekStore>)
+        }
+    }
+}
+
+fn kek_store_for_vault(
+    db: &Db,
+    placement: SecretVaultPlacement,
+    file_kek_mode: Option<SecretVaultFileKekMode>,
+    kek_dir: &Path,
+    installation: &InstallationIdentity,
+    injected: &SecretStoreInjected,
+    first_run: bool,
+    passphrase: &mut Option<Passphrase>,
+) -> Result<Arc<dyn KekStore>, KekUnavailable> {
+    match (placement, file_kek_mode) {
+        (SecretVaultPlacement::Database, Some(SecretVaultFileKekMode::Passphrase)) => {
+            let passphrase = passphrase.take().ok_or_else(|| KekUnavailable {
+                reason: "this passphrase vault requires the passphrase after every daemon restart"
+                    .into(),
+                fix_command: None,
+                intent: SecretStoreIntent::Database,
+            })?;
+            let store = if first_run {
+                PassphraseKekStore::new_first_run(passphrase)
+            } else {
+                let row = db
+                    .blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+                    .map_err(|error| KekUnavailable {
+                        reason: format!("loading passphrase vault KDF parameters: {error}"),
+                        fix_command: None,
+                        intent: SecretStoreIntent::Database,
+                    })?
+                    .ok_or_else(|| KekUnavailable {
+                        reason: "passphrase vault KDF parameters are missing".into(),
+                        fix_command: None,
+                        intent: SecretStoreIntent::Database,
+                    })?;
+                let params = PassphraseKdfParams::from_db(row).map_err(|error| KekUnavailable {
+                    reason: error.to_string(),
+                    fix_command: None,
+                    intent: SecretStoreIntent::Database,
+                })?;
+                PassphraseKekStore::open(passphrase, params)
+            };
+            store
+                .map(|store| Arc::new(store) as Arc<dyn KekStore>)
+                .map_err(|error| KekUnavailable {
+                    reason: error.to_string(),
+                    fix_command: None,
+                    intent: SecretStoreIntent::Database,
+                })
+        }
+        (SecretVaultPlacement::Database, None) => Err(KekUnavailable {
+            reason: "database vault authority is missing its durable file KEK mode".into(),
+            fix_command: None,
+            intent: SecretStoreIntent::Database,
+        }),
+        (SecretVaultPlacement::Database, _) => {
+            kek_store_for_placement(placement, kek_dir, installation, injected, first_run)
+        }
+        (SecretVaultPlacement::Keyring, _) => {
+            kek_store_for_placement(placement, kek_dir, installation, injected, first_run)
         }
     }
 }

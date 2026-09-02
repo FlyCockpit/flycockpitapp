@@ -1008,9 +1008,10 @@ where
     F: FnOnce(ContainmentLease) -> Fut,
     Fut: Future<Output = ChildRunOutcome>,
 {
-    // Transient program/args/cwd for the lease. They are NOT persisted: the
-    // actor records only `operation_id` + content-free `SafeLocator`; env and
-    // stdin never reach the lease at all.
+    // Transient program/args/cwd for the lease identity. They are NOT
+    // persisted and MUST NOT be executed by the adapter: the actor records
+    // only `operation_id` + content-free `SafeLocator`; env and stdin never
+    // reach the lease at all. This runner is the only spawn of user code.
     let operation_id = format!("hook-{}", Uuid::new_v4());
     let lease = match handle
         .create_and_spawn(session_id, operation_id, program, args, cwd, true)
@@ -1073,11 +1074,15 @@ where
 
 /// Spawn the real hook child via `tokio::process` and capture bounded output.
 ///
-/// This is the production execution seam — a plain cross-platform
+/// This is the production execution seam — a cross-platform
 /// `tokio::process::Command` with `env_clear`, piped stdio, an independent
 /// stdout cap, and `kill_on_drop(true)` (in addition to the lease terminate +
-/// empty barrier that owns cancellation). It is invoked from inside
-/// [`run_hook_child_contained`] only after a proven lease exists.
+/// empty barrier that owns cancellation). When `tree` is present (Windows Job
+/// Object lease), the child is created suspended, assigned, then resumed only
+/// after this function is already running under [`HookLeaseGuard`]. It is
+/// invoked from inside [`run_hook_child_contained`] only after a proven lease
+/// exists.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_real_hook_child(
     executable: &Path,
     args: &[String],
@@ -1085,6 +1090,7 @@ async fn spawn_real_hook_child(
     working_directory: &HookWorkingDirectory,
     stdin: &str,
     timeout: Duration,
+    tree: Option<&cockpit_host::process::ProcessTreeGuard>,
 ) -> ChildRunOutcome {
     // Keep the existing `Command::new(executable)` dispatch on Windows. Rust's
     // Windows implementation recognizes `.cmd` / `.bat`, resolves the system
@@ -1143,6 +1149,9 @@ async fn spawn_real_hook_child(
     // Drop-safety for the local child handle, IN ADDITION TO the lease
     // terminate + empty barrier (never the sole authority).
     cmd.kill_on_drop(true);
+    if let Some(tree) = tree {
+        tree.apply_spawn_flags(&mut cmd);
+    }
 
     #[cfg(windows)]
     if let Some(directory) = &retained_windows_cwd {
@@ -1170,6 +1179,29 @@ async fn spawn_real_hook_child(
             };
         }
     };
+    if let Some(tree) = tree {
+        if tree.assign(&child).is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+        if tree.resume(&child).is_err() {
+            let _ = tree.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+    }
 
     // Take all three pipes so stdin write, stdout capture, and stderr drain run
     // CONCURRENTLY. Writing the whole stdin before reading (or never reading
@@ -1295,9 +1327,58 @@ pub(crate) async fn spawn_real_hook_child_for_test(
     stdin: &str,
     timeout: Duration,
 ) -> (String, bool, bool) {
-    let output =
-        spawn_real_hook_child(executable, args, env, working_directory, stdin, timeout).await;
+    let output = spawn_real_hook_child(
+        executable,
+        args,
+        env,
+        working_directory,
+        stdin,
+        timeout,
+        None,
+    )
+    .await;
     (output.stdout, output.spawn_failed, output.timed_out)
+}
+
+fn spawn_failed_outcome() -> ChildRunOutcome {
+    ChildRunOutcome {
+        stdout: String::new(),
+        exit_code: None,
+        spawn_failed: true,
+        timed_out: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_hook_child_for_lease(
+    handle: &ProcessContainmentHandle,
+    lease: &ContainmentLease,
+    executable: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    working_directory: &HookWorkingDirectory,
+    stdin: &str,
+    timeout: Duration,
+) -> ChildRunOutcome {
+    let tree = match handle.process_tree_guard(lease).await {
+        Ok(tree) => tree,
+        Err(_) => return spawn_failed_outcome(),
+    };
+    #[cfg(windows)]
+    if tree.is_none() {
+        // A Proven Windows lease without a Job Object would spawn uncontained.
+        return spawn_failed_outcome();
+    }
+    spawn_real_hook_child(
+        executable,
+        args,
+        env,
+        working_directory,
+        stdin,
+        timeout,
+        tree.as_deref(),
+    )
+    .await
 }
 
 /// Production command runner using tokio::process under a containment lease.
@@ -1363,6 +1444,7 @@ impl CommandRunner for TokioCommandRunner {
         let working_directory = HookWorkingDirectory::Path(cwd.to_path_buf());
         let env_owned = env.clone();
         let stdin_owned = stdin.to_string();
+        let tree_handle = handle.clone();
         run_hook_child_contained(
             &handle,
             session_id,
@@ -1370,8 +1452,10 @@ impl CommandRunner for TokioCommandRunner {
             args_owned.clone(),
             cwd.to_path_buf(),
             start,
-            move |_lease| async move {
-                spawn_real_hook_child(
+            move |lease| async move {
+                spawn_hook_child_for_lease(
+                    &tree_handle,
+                    &lease,
                     &program,
                     &args_owned,
                     &env_owned,
@@ -1411,6 +1495,7 @@ impl CommandRunner for TokioCommandRunner {
         // label / grouping input. It never determines the child's cwd: the
         // spawn closure below performs capability-backed fchdir on Unix.
         let containment_cwd = ambient_workspace_root.to_path_buf();
+        let tree_handle = handle.clone();
         run_hook_child_contained(
             &handle,
             session_id,
@@ -1418,8 +1503,10 @@ impl CommandRunner for TokioCommandRunner {
             args_owned.clone(),
             containment_cwd,
             start,
-            move |_lease| async move {
-                spawn_real_hook_child(
+            move |lease| async move {
+                spawn_hook_child_for_lease(
+                    &tree_handle,
+                    &lease,
                     &program,
                     &args_owned,
                     &env_owned,

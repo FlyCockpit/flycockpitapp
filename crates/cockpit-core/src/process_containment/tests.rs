@@ -321,6 +321,8 @@ fn containment_platform_compile_inventory() {
         let names = crate::process_containment::windows::job_symbols::inventory_symbol_names();
         assert!(names.contains(&"CreateJobObjectW"));
         assert!(names.contains(&"AssignProcessToJobObject"));
+        assert!(names.contains(&"IsProcessInJob"));
+        assert!(names.contains(&"GetCurrentProcess"));
         assert!(names.contains(&"QueryInformationJobObject"));
         assert!(names.contains(&"TerminateJobObject"));
     }

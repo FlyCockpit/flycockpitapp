@@ -1,8 +1,9 @@
 //! Daemon-owned ProcessContainment actor.
 //!
 //! One bounded command queue serializes state transitions per containment.
-//! Callers receive a non-serializable [`ContainmentLease`] and must not spawn
-//! user code outside this actor.
+//! Callers receive a non-serializable [`ContainmentLease`] and must spawn user
+//! code only into that lease's process-tree guard when the adapter provides
+//! one. The adapter must not run `req.program`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -85,6 +86,11 @@ enum Op {
         kind: LateCallbackKind,
         reply: Reply<()>,
     },
+    ProcessTreeGuard {
+        lease: ContainmentLease,
+        reply:
+            Reply<Result<Option<Arc<cockpit_host::process::ProcessTreeGuard>>, ContainmentError>>,
+    },
     Shutdown {
         reply: Reply<()>,
     },
@@ -118,7 +124,7 @@ impl ProcessContainmentHandle {
             .map_err(|_| ContainmentError::Internal("actor dropped reply".into()))
     }
 
-    /// Create containment and place the initial process before user code.
+    /// Allocate a containment generation. Does not run user instructions.
     pub async fn create_and_spawn(
         &self,
         session_id: Uuid,
@@ -242,6 +248,21 @@ impl ProcessContainmentHandle {
         })?;
         Self::await_reply(rx).await?;
         Ok(())
+    }
+
+    /// Borrow the process-tree guard for this lease so the caller can place
+    /// its own child into the generation. `None` on adapters that do not own a
+    /// bindable kernel job/group object.
+    pub async fn process_tree_guard(
+        &self,
+        lease: &ContainmentLease,
+    ) -> Result<Option<Arc<cockpit_host::process::ProcessTreeGuard>>, ContainmentError> {
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::ProcessTreeGuard {
+            lease: lease.clone(),
+            reply,
+        })?;
+        Self::await_reply(rx).await?
     }
 }
 
@@ -450,8 +471,33 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
                 }
                 let _ = reply.send(());
             }
+            Op::ProcessTreeGuard { lease, reply } => {
+                let result = process_tree_guard_one(&state, &lease);
+                let _ = reply.send(result);
+            }
         }
     }
+}
+
+fn process_tree_guard_one(
+    state: &ActorState,
+    lease: &ContainmentLease,
+) -> Result<Option<Arc<cockpit_host::process::ProcessTreeGuard>>, ContainmentError> {
+    let entry = state
+        .live
+        .get(&lease.containment_id)
+        .ok_or(ContainmentError::NotFound(lease.containment_id))?;
+    if entry.record.generation != lease.generation {
+        return Err(ContainmentError::GenerationMismatch {
+            expected: entry.record.generation,
+            got: lease.generation,
+        });
+    }
+    let handle = entry
+        .handle
+        .as_ref()
+        .ok_or_else(|| ContainmentError::Internal("missing handle".into()))?;
+    Ok(state.adapter.process_tree_guard(handle))
 }
 
 async fn create_native(

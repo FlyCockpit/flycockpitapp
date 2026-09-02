@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cockpit_host::process::ProcessTreeGuard;
 use uuid::Uuid;
 
 use super::types::{
@@ -15,8 +16,11 @@ use super::types::{
     SafeLocator,
 };
 
-/// Request to place the initial process inside kernel/runtime containment
-/// before any user-controlled instruction runs.
+/// Request to allocate a native containment generation.
+///
+/// `program` / `args` / `cwd` identify the intended child for audit; adapters
+/// must not execute them. The caller spawns the real process (with its own
+/// env and stdio) into [`ContainmentAdapter::process_tree_guard`].
 #[derive(Debug, Clone)]
 pub struct NativeSpawnRequest {
     pub containment_id: Uuid,
@@ -70,9 +74,11 @@ pub trait ContainmentAdapter: Send + Sync + 'static {
     /// Probe capability without allocating. Never spawns user code.
     async fn probe(&self) -> Result<SafeContainmentMetadata, ContainmentError>;
 
-    /// Native path: create containment object, place initial process, prove
-    /// membership before user code. Returns Unsupported before user code when
-    /// the platform cannot provide Proven.
+    /// Native path: create the containment object. Must not run user
+    /// instructions (`req.program` is identity/audit input, not a spawn).
+    /// Callers place their own child via [`Self::process_tree_guard`], prove
+    /// membership, then resume. Returns Unsupported before user code when the
+    /// platform cannot provide Proven.
     async fn create_and_spawn(
         &self,
         req: NativeSpawnRequest,
@@ -104,6 +110,13 @@ pub trait ContainmentAdapter: Send + Sync + 'static {
         locator: &SafeLocator,
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError>;
+
+    /// Kernel job/group object the caller must spawn into. `None` on adapters
+    /// that do not own a bindable object (fakes, macOS, Linux-without-broker).
+    fn process_tree_guard(&self, handle: &AdapterHandle) -> Option<Arc<ProcessTreeGuard>> {
+        let _ = handle;
+        None
+    }
 }
 
 pub type SharedAdapter = Arc<dyn ContainmentAdapter>;

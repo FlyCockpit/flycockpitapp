@@ -2,7 +2,9 @@
 //!
 //! Provides a daemon-owned [`ProcessContainmentActor`] with durable
 //! `execution_containments` rows. Callers receive a non-serializable
-//! [`ContainmentLease`] and must not spawn user code outside this actor.
+//! [`ContainmentLease`] and must spawn user code only into that lease's
+//! process-tree guard when the adapter provides one. The adapter must not
+//! run `req.program`.
 //!
 //! ContainmentGuarantee is Proven or Unsupported only — no BestEffort.
 

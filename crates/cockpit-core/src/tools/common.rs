@@ -39,7 +39,22 @@ pub fn truncation_marker(next_offset: usize) -> String {
 /// stderr, a non-zero exit line, a panic message) survives. The elided
 /// middle is replaced with a one-line `[truncated N bytes]` marker.
 /// Returns `s` unchanged when it already fits.
-pub fn truncate_head_tail(s: &str, cap: usize) -> String {
+///
+/// This is the redacting output truncator (issue #294): the ONLY head/tail
+/// truncator, and every output-truncation site routes through it. The
+/// retained head's END and the retained tail's START each abut the elided
+/// middle, and a registered secret straddling either boundary would
+/// otherwise leave a PREFIX (head end) or SUFFIX (tail start) that the
+/// downstream whole-value §7 scrub cannot match — a partial-secret leak.
+/// The unsafe margin on each side is elided (RAW coordinates, via the
+/// table's fixpoint cuts) so only WHOLE secrets — which §7 scrubs normally
+/// — remain in the emitted text. The marker itself is a fixed constant
+/// scrubbed whole by §7. Output stays within `cap`.
+pub(crate) fn truncate_head_tail_redacted(
+    table: &crate::redact::RedactionTable,
+    s: &str,
+    cap: usize,
+) -> String {
     if s.len() <= cap {
         return s.to_string();
     }
@@ -51,14 +66,17 @@ pub fn truncate_head_tail(s: &str, cap: usize) -> String {
     let tail_budget = budget - head_budget;
     let head_end = floor_char_boundary(s, head_budget);
     let tail_start = ceil_char_boundary(s, s.len().saturating_sub(tail_budget));
-    let elided = tail_start.saturating_sub(head_end);
-    let mut out = String::with_capacity(head_end + (s.len() - tail_start) + marker_reserve);
-    out.push_str(&s[..head_end]);
+    // The head slice ends at, and the tail slice starts at, the elided middle.
+    let safe_head = drop_back_margin(table, &s[..head_end]);
+    let safe_tail = drop_front_margin(table, &s[tail_start..]);
+    let elided = s.len() - safe_head.len() - safe_tail.len();
+    let mut out = String::with_capacity(safe_head.len() + safe_tail.len() + marker_reserve);
+    out.push_str(safe_head);
     if !out.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(&format!("... [truncated {elided} bytes] ...\n"));
-    out.push_str(&s[tail_start..]);
+    out.push_str(safe_tail);
     out
 }
 
@@ -116,43 +134,6 @@ pub(crate) fn drop_back_margin<'a>(table: &crate::redact::RedactionTable, seg: &
         return "";
     }
     &seg[..cut]
-}
-
-/// Boundary-safe [`truncate_head_tail`]. Keeps the same head, `[truncated N bytes]`
-/// marker, and tail shape, but the retained head's END and the retained tail's START
-/// each abut the elided middle. A registered secret straddling either boundary would
-/// otherwise leave a PREFIX (head end) or SUFFIX (tail start) that the downstream
-/// whole-value §7 scrub cannot match — a partial-secret leak. This elides the
-/// unsafe margin on each side (RAW coordinates, via the table's fixpoint cuts) so
-/// only WHOLE secrets — which §7 scrubs normally — remain in the emitted text.
-/// The marker itself is a fixed constant scrubbed whole by §7. Output stays
-/// within `cap` (it only ever drops MORE than [`truncate_head_tail`]).
-pub(crate) fn truncate_head_tail_redacted(
-    table: &crate::redact::RedactionTable,
-    s: &str,
-    cap: usize,
-) -> String {
-    if s.len() <= cap {
-        return s.to_string();
-    }
-    let marker_reserve = 48;
-    let budget = cap.saturating_sub(marker_reserve);
-    let head_budget = budget * 3 / 5;
-    let tail_budget = budget - head_budget;
-    let head_end = floor_char_boundary(s, head_budget);
-    let tail_start = ceil_char_boundary(s, s.len().saturating_sub(tail_budget));
-    // The head slice ends at, and the tail slice starts at, the elided middle.
-    let safe_head = drop_back_margin(table, &s[..head_end]);
-    let safe_tail = drop_front_margin(table, &s[tail_start..]);
-    let elided = s.len() - safe_head.len() - safe_tail.len();
-    let mut out = String::with_capacity(safe_head.len() + safe_tail.len() + marker_reserve);
-    out.push_str(safe_head);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&format!("... [truncated {elided} bytes] ...\n"));
-    out.push_str(safe_tail);
-    out
 }
 
 /// Result of [`read_slice`]: the line-numbered body, whether it was
@@ -550,10 +531,17 @@ mod tests {
         );
     }
 
+    fn empty_table() -> crate::redact::RedactionTable {
+        crate::redact::RedactionTable::empty()
+    }
+
     #[tokio::test]
 
-    async fn truncate_head_tail_short_input_unchanged() {
-        assert_eq!(truncate_head_tail("hello", 100), "hello");
+    async fn truncate_head_tail_redacted_short_input_unchanged() {
+        assert_eq!(
+            truncate_head_tail_redacted(&empty_table(), "hello", 100),
+            "hello"
+        );
     }
 
     #[tokio::test]
@@ -633,12 +621,12 @@ mod tests {
 
     #[tokio::test]
 
-    async fn truncate_head_tail_never_panics_on_multibyte_boundary() {
+    async fn truncate_head_tail_redacted_never_panics_on_multibyte_boundary() {
         // The bug this guards: `String::truncate` panics if the cap
         // lands mid-codepoint. Build a string of 4-byte chars so most
         // byte offsets are NOT char boundaries.
         let s = "🚀".repeat(2000); // 8000 bytes, no ASCII boundaries
-        let out = truncate_head_tail(&s, 8 * 1024 / 2); // cap below len
+        let out = truncate_head_tail_redacted(&empty_table(), &s, 8 * 1024 / 2); // cap below len
         assert!(out.len() <= 8 * 1024 / 2 + 64);
         assert!(out.contains("truncated"));
         // Output must be valid UTF-8 (guaranteed by &str) and split on
@@ -651,9 +639,9 @@ mod tests {
 
     #[tokio::test]
 
-    async fn truncate_head_tail_keeps_head_and_tail() {
+    async fn truncate_head_tail_redacted_keeps_head_and_tail() {
         let s = format!("{}TAILMARKER", "x".repeat(20_000));
-        let out = truncate_head_tail(&s, 1000);
+        let out = truncate_head_tail_redacted(&empty_table(), &s, 1000);
         assert!(out.starts_with("xxxx"));
         assert!(out.ends_with("TAILMARKER"));
         assert!(out.contains("truncated"));
@@ -667,8 +655,9 @@ mod tests {
 
     // A registered secret straddling the truncate HEAD→middle boundary leaves only
     // its PREFIX at the head end. The whole-value scrub cannot match a prefix, so
-    // the plain `truncate_head_tail` leaks it; the redacted variant elides the
-    // back margin so nothing partial survives. FAILS against the plain helper.
+    // a boundary-unsafe cut would leak it; the redacting truncator — now the only
+    // head/tail truncator, wired into every output-truncation site (issue #294) —
+    // elides the back margin so nothing partial survives the §7 scrub.
     #[tokio::test]
     async fn truncate_head_tail_redacted_drops_head_end_straddling_prefix() {
         const SECRET: &str = "sk-live-HEADSTRADDLE-0123456789abcdefXY"; // 39 bytes
@@ -679,14 +668,7 @@ mod tests {
         assert!(s.len() > cap);
         let prefix = &SECRET[..16]; // the head-end survivor a blind cut would keep
 
-        // Current (plain) behavior leaks the straddling prefix past the scrub.
-        let leaky = table.scrub(&truncate_head_tail(&s, cap));
-        assert!(
-            leaky.contains(prefix),
-            "precondition: plain truncate must leak the head-end prefix"
-        );
-
-        // Boundary-safe variant: neither the full secret nor its prefix survives.
+        // Redacting truncator: neither the full secret nor its prefix survives.
         let fixed = table.scrub(&truncate_head_tail_redacted(&table, &s, cap));
         assert!(!fixed.contains(SECRET));
         assert!(
@@ -698,7 +680,8 @@ mod tests {
     }
 
     // Mirror: a secret straddling the truncate middle→TAIL boundary leaves only
-    // its SUFFIX at the tail start. FAILS against the plain helper.
+    // its SUFFIX at the tail start; the redacting truncator elides the front
+    // margin so nothing partial survives the §7 scrub.
     #[tokio::test]
     async fn truncate_head_tail_redacted_drops_tail_start_straddling_suffix() {
         const SECRET: &str = "sk-live-TAILSTRADDLE-0123456789abcdefXY"; // 39 bytes
@@ -708,12 +691,6 @@ mod tests {
         let s = format!("{}{SECRET}{}", "A".repeat(8736), "B".repeat(3225));
         assert_eq!(s.len(), 12000);
         let suffix = &SECRET[SECRET.len() - 20..];
-
-        let leaky = table.scrub(&truncate_head_tail(&s, cap));
-        assert!(
-            leaky.contains(suffix),
-            "precondition: plain truncate must leak the tail-start suffix"
-        );
 
         let fixed = table.scrub(&truncate_head_tail_redacted(&table, &s, cap));
         assert!(!fixed.contains(SECRET));

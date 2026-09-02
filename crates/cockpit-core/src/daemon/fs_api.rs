@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine as _;
 use ignore::Match;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
@@ -19,8 +18,6 @@ use crate::daemon::proto::{
 use crate::daemon::server::DaemonContext;
 
 const FS_LIST_ENTRY_CAP: usize = 1_000;
-const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
-const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
 const GIT_REVIEW_PR_REFERENCE_BYTE_CAP: usize = 256;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 const SETTINGS_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
@@ -171,22 +168,30 @@ pub(crate) fn fs_read_sync(
     #[cfg(test)]
     apply_fs_read_block_for_test(&resolved);
 
-    let bytes = std::fs::read(&resolved).map_err(internal)?;
-    let hash = content_hash(&bytes);
-    let binary = crate::tools::common::looks_binary(&bytes);
+    let limits = crate::resource_limits::ResourceLimits::defaults();
+    let prefixed =
+        crate::resource_limits::read_for_fs_read(&resolved).map_err(|error| match error {
+            crate::resource_limits::ResourceLimitError::ByteLimit { .. } => {
+                bad_request(error.to_string())
+            }
+            other => internal(other),
+        })?;
+    let hash = crate::resource_limits::sha256_hex_array(&prefixed.digest);
+    let binary = crate::tools::common::looks_binary(&prefixed.prefix);
     let kind = read_kind_for_path(&resolved, binary);
+    let total = usize::try_from(prefixed.len).unwrap_or(usize::MAX);
     if binary || wants_base64 {
         if !wants_base64 && !matches!(kind, FsReadKind::Image) {
             return Ok(Response::FsRead {
                 content: None,
                 hash,
-                truncated: bytes.len() > FS_BINARY_READ_BYTE_CAP,
+                truncated: total > limits.fs_read_binary_bytes,
                 kind,
             });
         }
-        let cap = FS_BINARY_READ_BYTE_CAP.min(bytes.len());
-        let truncated = bytes.len() > cap;
-        let content = base64::engine::general_purpose::STANDARD.encode(&bytes[..cap]);
+        let cap = limits.fs_read_binary_bytes.min(prefixed.prefix.len());
+        let truncated = total > cap;
+        let content = base64::engine::general_purpose::STANDARD.encode(&prefixed.prefix[..cap]);
         return Ok(Response::FsRead {
             content: Some(content),
             hash,
@@ -194,9 +199,10 @@ pub(crate) fn fs_read_sync(
             kind,
         });
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let cap = cockpit_host::text::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
-    let truncated = text.len() > cap;
+    let text = String::from_utf8_lossy(&prefixed.prefix).into_owned();
+    let cap =
+        cockpit_host::text::floor_char_boundary(&text, limits.fs_read_text_bytes.min(text.len()));
+    let truncated = total > cap;
     Ok(Response::FsRead {
         content: Some(text[..cap].to_string()),
         hash,
@@ -2238,13 +2244,7 @@ fn clean_relative_path(path: &str) -> Result<PathBuf, ErrorPayload> {
 }
 
 fn content_hash(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    crate::resource_limits::sha256_hex(bytes)
 }
 
 fn path_outside_root(path: &str) -> ErrorPayload {
@@ -2671,6 +2671,60 @@ mod tests {
             serde_json::to_value(sync).unwrap(),
             serde_json::to_value(async_result).unwrap()
         );
+    }
+
+    #[test]
+    fn fs_read_rejects_a_file_over_the_hard_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("huge.bin");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let ctx = test_ctx(root);
+        let err = fs_read_sync(
+            &ctx,
+            &ClientPrincipal::owner(),
+            root.to_str().unwrap(),
+            "huge.bin",
+            false,
+        )
+        .expect_err("oversized file must fail closed");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("filesystem read"), "{}", err.message);
+    }
+
+    #[test]
+    fn fs_read_truncates_text_without_loading_the_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let body = "x".repeat(limits.fs_read_text_bytes + 64);
+        std::fs::write(root.join("long.txt"), &body).unwrap();
+        let ctx = test_ctx(root);
+        let Response::FsRead {
+            content,
+            truncated,
+            hash,
+            kind,
+        } = fs_read_sync(
+            &ctx,
+            &ClientPrincipal::owner(),
+            root.to_str().unwrap(),
+            "long.txt",
+            false,
+        )
+        .expect("in-cap file streams")
+        else {
+            panic!("expected fs_read");
+        };
+        assert!(truncated);
+        assert_eq!(kind, FsReadKind::Text);
+        let content = content.expect("text content");
+        assert!(content.len() <= limits.fs_read_text_bytes);
+        assert_eq!(hash, crate::resource_limits::sha256_hex(body.as_bytes()));
     }
 
     /// A valid, non-empty registry: one hosted OpenAI-images endpoint plus an

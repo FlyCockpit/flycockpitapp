@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::notification::Notification;
 use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument, PublishDiagnostics};
 use lsp_types::request::Request;
@@ -1175,14 +1175,32 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
         || right.starts_with(left)
 }
 
-async fn read_lsp_message(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<Value> {
+async fn read_lsp_message<R>(reader: &mut R) -> Result<Value>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let limits = crate::resource_limits::ResourceLimits::defaults();
     let mut content_len = None;
+    let mut header_lines = 0usize;
     loop {
+        if header_lines >= limits.lsp_header_line_count {
+            bail!(
+                "LSP header exceeds the {} line limit",
+                limits.lsp_header_line_count
+            );
+        }
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
             return Err(anyhow!("LSP stdout closed"));
         }
+        if line.len() > limits.lsp_header_line_bytes {
+            bail!(
+                "LSP header line exceeds the {} byte limit",
+                limits.lsp_header_line_bytes
+            );
+        }
+        header_lines += 1;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -1192,6 +1210,11 @@ async fn read_lsp_message(reader: &mut BufReader<tokio::process::ChildStdout>) -
         }
     }
     let len = content_len.context("missing Content-Length")?;
+    crate::resource_limits::ensure_declared_len(
+        len as u64,
+        limits.lsp_message_bytes as u64,
+        "LSP message",
+    )?;
     let mut body = vec![0; len];
     reader.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)
@@ -1757,6 +1780,53 @@ mod tests {
         let cfg = crate::config::extended::LspConfig::default();
         assert_eq!(cfg.idle_ttl_secs, 30 * 60);
         assert_eq!(cfg.max_cached_clients, 16);
+    }
+
+    #[tokio::test]
+    async fn read_lsp_message_rejects_content_length_over_the_cap() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let over = limits.lsp_message_bytes + 1;
+        let frame = format!("Content-Length: {over}\r\n\r\n");
+        let mut reader = BufReader::new(std::io::Cursor::new(frame.into_bytes()));
+        let err = read_lsp_message(&mut reader)
+            .await
+            .expect_err("oversized Content-Length must not allocate");
+        let text = err.to_string();
+        assert!(text.contains("LSP message"), "{text}");
+        assert!(text.contains(&over.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_lsp_message_accepts_a_small_payload() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let frame = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let mut reader = BufReader::new(std::io::Cursor::new(frame));
+        let value = read_lsp_message(&mut reader)
+            .await
+            .expect("in-cap LSP frame");
+        assert_eq!(value["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn read_lsp_message_rejects_an_oversized_header_line() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let line = format!(
+            "X-Pad: {}\r\n\r\n",
+            "a".repeat(limits.lsp_header_line_bytes)
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(line.into_bytes()));
+        let err = read_lsp_message(&mut reader)
+            .await
+            .expect_err("header line over the cap must fail closed");
+        assert!(
+            err.to_string().contains("header line"),
+            "{}",
+            err.to_string()
+        );
     }
 
     #[test]

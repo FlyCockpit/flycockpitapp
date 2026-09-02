@@ -12,8 +12,42 @@ use crate::process_containment::adapter::ContainmentAdapter;
 use crate::process_containment::fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};
 use crate::process_containment::macos::MacosNativeAdapter;
 use crate::process_containment::types::{
-    ContainmentError, ContainmentGuarantee, EmptyOutcome, LateCallbackKind, PlatformKind,
+    ContainmentError, ContainmentGuarantee, EmptyOutcome, JOB_ACTIVE_PROCESSES_NONZERO,
+    LateCallbackKind, PROCESS_GROUP_STILL_POPULATED, PlatformKind,
 };
+
+#[test]
+fn drain_in_progress_is_only_retryable_populated_reasons() {
+    assert!(
+        EmptyOutcome::Uncertain {
+            generation: 1,
+            reason: PROCESS_GROUP_STILL_POPULATED.into(),
+        }
+        .is_drain_in_progress()
+    );
+    assert!(
+        EmptyOutcome::Uncertain {
+            generation: 1,
+            reason: JOB_ACTIVE_PROCESSES_NONZERO.into(),
+        }
+        .is_drain_in_progress()
+    );
+    assert!(
+        !EmptyOutcome::Uncertain {
+            generation: 1,
+            reason: "process_group_membership_unattributable".into(),
+        }
+        .is_drain_in_progress()
+    );
+    assert!(
+        !EmptyOutcome::Uncertain {
+            generation: 1,
+            reason: "forced_uncertain".into(),
+        }
+        .is_drain_in_progress()
+    );
+    assert!(!EmptyOutcome::ProvenEmpty { generation: 1 }.is_drain_in_progress());
+}
 
 async fn seed_session(db: &Db) -> Uuid {
     db.create_session("proj", "/tmp/containment", "orchestrator-build")
@@ -223,6 +257,57 @@ async fn daemon_shutdown_waits_for_descendants() {
         .await_all_empty(Some(Duration::from_secs(1)))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn await_empty_until_retries_drain_in_progress() {
+    let db = Db::open_in_memory().unwrap();
+    let session = seed_session(&db).await;
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_drain_probes(3);
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(fake));
+    let handle = actor.handle();
+    let lease = handle
+        .create_and_spawn(session, "op", "/bin/true", vec![], "/tmp", true)
+        .await
+        .unwrap();
+    handle.terminate(lease.clone()).await.unwrap();
+    match handle
+        .await_empty_until(lease, Duration::from_secs(1))
+        .await
+        .unwrap()
+    {
+        EmptyOutcome::ProvenEmpty { .. } => {}
+        o => panic!("drain-in-progress must be retried until ProvenEmpty, got {o:?}"),
+    }
+}
+
+#[tokio::test]
+async fn await_empty_until_does_not_retry_terminal_uncertain() {
+    let db = Db::open_in_memory().unwrap();
+    let session = seed_session(&db).await;
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_empty_mode(FakeEmptyMode::Uncertain);
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(fake));
+    let handle = actor.handle();
+    let lease = handle
+        .create_and_spawn(session, "op", "/bin/true", vec![], "/tmp", true)
+        .await
+        .unwrap();
+    handle.terminate(lease.clone()).await.unwrap();
+    let started = std::time::Instant::now();
+    match handle
+        .await_empty_until(lease, Duration::from_secs(10))
+        .await
+        .unwrap()
+    {
+        EmptyOutcome::Uncertain { reason, .. } => assert_eq!(reason, "forced_uncertain"),
+        o => panic!("terminal Uncertain must not be retried, got {o:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "terminal Uncertain must return immediately, not wait the drain deadline"
+    );
 }
 
 #[tokio::test]

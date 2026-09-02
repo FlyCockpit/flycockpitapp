@@ -4146,6 +4146,24 @@ async fn tool_hook_runner_uncertain_after_spawn_fails_open() {
 }
 
 #[tokio::test]
+async fn tool_hook_runner_drain_in_progress_then_empty_keeps_output() {
+    // A delivered SIGKILL that has not yet drained must not discard a
+    // completed hook's stdout: the barrier re-probes until ProvenEmpty.
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_drain_probes(3);
+    let stdout = r#"{"decision":"allow"}"#;
+    let (result, ran) = drive_contained_hook(Arc::new(fake.clone()), child_completed(stdout)).await;
+    assert!(ran, "the child ran under a proven lease");
+    assert_eq!(
+        result.failure_reason, None,
+        "drain-in-progress Uncertain must be retried until ProvenEmpty, not mapped to containment_failure"
+    );
+    assert_eq!(result.stdout, stdout);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!fake.terminate_log().is_empty());
+}
+
+#[tokio::test]
 async fn tool_hook_runner_actor_terminate_error_is_failed() {
     // A terminate/await actor error fails open as `descendant_containment_failed`.
     let fake = FakeProvenAdapter::new(PlatformKind::Fake);

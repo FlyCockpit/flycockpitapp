@@ -191,6 +191,10 @@ impl ProcessContainmentHandle {
     }
 
     /// Await same-generation empty oracle.
+    ///
+    /// This is a probe: a delivered SIGKILL that has not yet drained returns
+    /// drain-in-progress Uncertain and keeps the live oracle. Callers that
+    /// need ProvenEmpty must use [`Self::await_empty_until`].
     pub async fn await_empty(
         &self,
         lease: ContainmentLease,
@@ -198,6 +202,33 @@ impl ProcessContainmentHandle {
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::AwaitEmpty { lease, reply })?;
         Self::await_reply(rx).await?
+    }
+
+    /// Re-probe [`Self::await_empty`] until ProvenEmpty, a terminal
+    /// (non-drain) outcome, or `deadline`.
+    ///
+    /// A delivered SIGKILL that has not yet drained
+    /// ([`EmptyOutcome::is_drain_in_progress`]) is retried. Terminal
+    /// Uncertain (unattributable membership, missing locator, forced
+    /// fixture) is returned immediately so fail-open paths do not wait
+    /// the full deadline.
+    pub async fn await_empty_until(
+        &self,
+        lease: ContainmentLease,
+        deadline: Duration,
+    ) -> Result<EmptyOutcome, ContainmentError> {
+        let until = Instant::now() + deadline;
+        loop {
+            let outcome = self.await_empty(lease.clone()).await?;
+            if !outcome.is_drain_in_progress() {
+                return Ok(outcome);
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Ok(outcome);
+            }
+            tokio::time::sleep((until - now).min(Duration::from_millis(5))).await;
+        }
     }
 
     /// Startup recovery for durable rows.

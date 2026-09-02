@@ -37,6 +37,8 @@ use super::adapter::{
     AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
     NativeSpawnRequest,
 };
+#[cfg(unix)]
+use super::types::PROCESS_GROUP_STILL_POPULATED;
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
     SafeLocator,
@@ -473,9 +475,12 @@ async fn unix_wait_group_empty(
     handle: &AdapterHandle,
     generation: u64,
 ) -> EmptyOutcome {
-    // Brief poll so a just-SIGKILL'd group that has already drained is
-    // observed Empty on this call. Still-populated groups stay Uncertain;
-    // after SIGKILL the live oracle is kept so a later probe can settle.
+    // Brief probe so a just-SIGKILL'd group that has already drained is
+    // observed Empty on this call. Still-populated groups stay Uncertain
+    // (`PROCESS_GROUP_STILL_POPULATED`); after SIGKILL the live oracle is
+    // kept so a later probe can settle. Callers that need ProvenEmpty
+    // re-probe (`await_empty_until`, `await_all_empty`) until Empty or
+    // their deadline.
     for _ in 0..20 {
         let population = {
             let live = adapter.live.lock().unwrap();
@@ -511,7 +516,7 @@ async fn unix_wait_group_empty(
     }
     EmptyOutcome::Uncertain {
         generation,
-        reason: "process_group_still_populated".into(),
+        reason: PROCESS_GROUP_STILL_POPULATED.into(),
     }
 }
 
@@ -657,6 +662,52 @@ mod unix_settlement_invariants {
     }
 
     #[tokio::test]
+    async fn second_assign_cannot_launder_unattributable_into_empty() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated guard");
+        let mut outsider = tokio::process::Command::new("/bin/sh");
+        outsider
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut first = outsider.spawn().expect("spawn outside the lease group");
+        assert!(tree.assign(&first).is_err());
+        assert!(tree.group_is_unattributable());
+
+        let mut leader = tokio::process::Command::new("/bin/sh");
+        leader
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        tree.apply_spawn_flags(&mut leader);
+        let mut second = leader.spawn().expect("spawn group leader");
+        assert!(
+            tree.assign(&second).is_err(),
+            "unattributable membership is terminal for assign"
+        );
+        assert!(tree.group_is_unattributable());
+        adapter
+            .terminate(&allocated.handle, 1)
+            .expect("unattributable terminate is a no-op");
+        let _ = first.start_kill();
+        let _ = first.wait().await;
+        let _ = second.start_kill();
+        let _ = second.wait().await;
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { generation, reason } => {
+                assert_eq!(generation, 1);
+                assert_eq!(reason, PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE);
+            }
+            o => panic!("second assign must not fabricate ProvenEmpty: {o:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn reap_without_signal_settles_uncertain_and_drops_authority() {
         let adapter = native_adapter();
         let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
@@ -742,7 +793,7 @@ mod unix_settlement_invariants {
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::Uncertain { generation, reason } => {
                 assert_eq!(generation, 1);
-                assert_eq!(reason, "process_group_still_populated");
+                assert_eq!(reason, PROCESS_GROUP_STILL_POPULATED);
             }
             o => panic!("unreaped SIGKILL'd leader must not fabricate Empty: {o:?}"),
         }

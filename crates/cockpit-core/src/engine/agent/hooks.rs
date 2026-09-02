@@ -117,9 +117,10 @@ pub(crate) const REASON_UNKNOWN_OR_MISSING_DECISION: &str = "unknown or missing 
 /// never launched because attached KB access is read-only.
 pub(crate) const REASON_LOCAL_KNOWLEDGE_WRITE_FENCE: &str = "local_knowledge_write_fence";
 
-/// Bounded deadline for the post-run empty barrier. A single `terminate` +
-/// single `await_empty` actor round-trip already bounds the common case; this
-/// deadline guarantees that even a stuck platform oracle can never hang the
+/// Bounded deadline for the post-run empty barrier. `terminate` plus
+/// re-probes of `await_empty` until ProvenEmpty or a terminal Uncertain
+/// run under this cap so a delivered SIGKILL that has not yet drained has
+/// a path to ProvenEmpty, while a stuck actor/platform can never hang the
 /// turn — on elapse the outcome is treated as uncertain (recovery row kept),
 /// never as proven-empty settlement.
 pub(crate) const CONTAINMENT_EMPTY_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -918,12 +919,16 @@ async fn terminate_and_await_empty(
     handle: &ProcessContainmentHandle,
     lease: ContainmentLease,
 ) -> EmptyBarrier {
-    // A single terminate + single await_empty actor round-trip — NOT a busy
-    // loop. The WHOLE sequence (both `terminate` and `await_empty`) is under one
-    // deadline so a stuck actor/platform on EITHER call can never hang the turn.
+    // Terminate once, then re-probe await_empty while the oracle reports
+    // drain-in-progress. Adapter `await_empty` is a short probe (~100ms on
+    // Unix); a delivered SIGKILL that has not yet drained must still reach
+    // ProvenEmpty inside this deadline. The WHOLE sequence is under one
+    // timeout so a stuck actor/platform can never hang the turn.
     let sequence = async {
         handle.terminate(lease.clone()).await?;
-        handle.await_empty(lease).await
+        handle
+            .await_empty_until(lease, CONTAINMENT_EMPTY_BARRIER_TIMEOUT)
+            .await
     };
     match tokio::time::timeout(CONTAINMENT_EMPTY_BARRIER_TIMEOUT, sequence).await {
         Ok(Ok(EmptyOutcome::ProvenEmpty { .. })) => EmptyBarrier::ProvenEmpty,
@@ -968,8 +973,7 @@ impl Drop for HookLeaseGuard {
             return;
         };
         // A dropped future cannot await; hand the SAME bounded terminate +
-        // await_empty to a detached task if a runtime is available. This is a
-        // single terminate + single await — never a busy loop.
+        // drain re-probe to a detached task if a runtime is available.
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let handle = self.handle.clone();
             rt.spawn(async move {
@@ -987,8 +991,10 @@ impl Drop for HookLeaseGuard {
 ///    [`REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED`] WITHOUT running the child.
 /// 2. Run the real child (`spawn_child`) under the lease, guarded so a dropped
 ///    future still terminates it.
-/// 3. Bounded `terminate` + `await_empty`. Only `EmptyOutcome::ProvenEmpty`
-///    settles the real outcome; `Uncertain`/`Unsupported`-after-spawn yields
+/// 3. Bounded `terminate` + re-probed `await_empty` until ProvenEmpty, a
+///    terminal Uncertain, or [`CONTAINMENT_EMPTY_BARRIER_TIMEOUT`]. Only
+///    `EmptyOutcome::ProvenEmpty` settles the real outcome;
+///    `Uncertain`/`Unsupported`-after-spawn yields
 ///    [`REASON_DESCENDANT_CONTAINMENT_UNCERTAIN`] (recovery row kept) and an
 ///    actor error yields [`REASON_DESCENDANT_CONTAINMENT_FAILED`].
 ///

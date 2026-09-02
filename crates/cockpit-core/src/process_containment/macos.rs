@@ -66,6 +66,8 @@ impl_unix_host_adapter!(MacosNativeAdapter);
 
 #[cfg(test)]
 mod macos_process_tree_guard {
+    #[cfg(target_os = "macos")]
+    use super::super::types::PROCESS_GROUP_STILL_POPULATED;
     use super::*;
 
     fn sleeper_request(generation: u64) -> NativeSpawnRequest {
@@ -126,7 +128,7 @@ mod macos_process_tree_guard {
             .expect("kernel membership after assign");
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::Uncertain { reason, .. } => {
-                assert_eq!(reason, "process_group_still_populated");
+                assert_eq!(reason, PROCESS_GROUP_STILL_POPULATED);
             }
             o => panic!("live group must not fabricate empty: {o:?}"),
         }

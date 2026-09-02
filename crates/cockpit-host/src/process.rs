@@ -52,6 +52,9 @@ enum UnixGroup {
     },
     /// A child ran (or assign failed after spawn) but this guard does not
     /// hold an attributable pgid. Never empty; never a signal target.
+    /// Terminal for this guard: [`ProcessTreeGuard::assign`] must not re-bind
+    /// a later child, or a subsequent Empty would fabricate ProvenEmpty for
+    /// the unobserved earlier membership.
     Unattributable,
 }
 
@@ -189,6 +192,11 @@ impl ProcessTreeGuard {
     /// replacement own-group child at the same pid until `terminate` has
     /// returned. [`wait_for_exit_without_reaping`] is the observe-then-
     /// terminate-then-reap protocol that keeps the pin held.
+    ///
+    /// Only an unbound guard may bind. Bound and unattributable membership
+    /// are terminal for this guard: a second `assign` must not replace them,
+    /// or a later empty probe would fabricate ProvenEmpty for an unobserved
+    /// earlier membership.
     pub fn assign(&self, child: &tokio::process::Child) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
@@ -196,8 +204,14 @@ impl ProcessTreeGuard {
                 .group
                 .lock()
                 .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
-            if matches!(*group, UnixGroup::Bound { .. }) {
-                return Err(anyhow::anyhow!("process group already bound"));
+            match *group {
+                UnixGroup::Bound { .. } => {
+                    return Err(anyhow::anyhow!("process group already bound"));
+                }
+                UnixGroup::Unattributable => {
+                    return Err(anyhow::anyhow!(PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE));
+                }
+                UnixGroup::Unbound => {}
             }
             let result = (|| -> anyhow::Result<(libc::pid_t, crate::daemon_lifecycle::ProcessStartIdentity)> {
                 let pid = child
@@ -1412,8 +1426,37 @@ mod tests {
             guard.group_is_unattributable(),
             "release after empty proof must not wash assign-failure into unbound-empty"
         );
+        // A second assign of a real group leader must not launder this
+        // terminal membership into a fresh Bound identity.
+        let mut leader = tokio::process::Command::new("sh");
+        leader
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        guard.apply_spawn_flags(&mut leader);
+        let mut second = leader.spawn().expect("spawn group leader");
+        let second_err = guard
+            .assign(&second)
+            .expect_err("unattributable assign must be rejected");
+        assert!(
+            second_err
+                .to_string()
+                .contains(PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE),
+            "reject reason must name unattributable membership, got {second_err}"
+        );
+        assert!(
+            guard.group_is_unattributable(),
+            "rejected second assign must not overwrite Unattributable"
+        );
+        assert_eq!(
+            guard.group_population().expect("population"),
+            GroupPopulation::Unattributable
+        );
         let _ = child.start_kill();
         let _ = child.wait().await;
+        let _ = second.start_kill();
+        let _ = second.wait().await;
     }
 
     #[cfg(unix)]
@@ -1441,7 +1484,22 @@ mod tests {
         guard
             .terminate()
             .expect("unattributable terminate is a no-op");
+        let mut leader = tokio::process::Command::new("sh");
+        leader
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        guard.apply_spawn_flags(&mut leader);
+        let mut second = leader.spawn().expect("spawn group leader");
+        assert!(
+            guard.assign(&second).is_err(),
+            "released signal authority is terminal; assign must not re-bind"
+        );
+        assert!(guard.group_is_unattributable());
         let _ = child.wait().await;
+        let _ = second.start_kill();
+        let _ = second.wait().await;
     }
 
     #[cfg(unix)]

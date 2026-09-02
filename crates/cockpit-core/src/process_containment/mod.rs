@@ -45,7 +45,8 @@ pub use macos::{
 pub use observability::{doctor_lines, error_audit_fields, sanitize_reason};
 pub use types::{
     ContainmentError, ContainmentGuarantee, ContainmentLease, ContainmentState, EmptyOutcome,
-    LateCallbackKind, PlatformKind, SafeContainmentMetadata, SafeLocator,
+    JOB_ACTIVE_PROCESSES_NONZERO, LateCallbackKind, PROCESS_GROUP_STILL_POPULATED, PlatformKind,
+    SafeContainmentMetadata, SafeLocator,
 };
 pub use windows::{
     WINDOWS_JOB_EMPTY_MEMBERSHIP_UNPROVEN, WINDOWS_JOB_UNAVAILABLE_ON_HOST, WindowsJobAdapter,

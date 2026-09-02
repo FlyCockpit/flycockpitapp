@@ -118,6 +118,14 @@ impl PlatformKind {
     }
 }
 
+/// Unix empty-oracle reason: SIGKILL delivered, the process group still has
+/// members. Not a terminal Uncertain — a later probe can observe Empty.
+pub const PROCESS_GROUP_STILL_POPULATED: &str = "process_group_still_populated";
+
+/// Windows empty-oracle reason: job terminate delivered, ActiveProcesses > 0.
+/// Not a terminal Uncertain — a later probe can observe Empty.
+pub const JOB_ACTIVE_PROCESSES_NONZERO: &str = "active_processes_nonzero";
+
 /// Result of await_empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmptyOutcome {
@@ -127,6 +135,21 @@ pub enum EmptyOutcome {
     Uncertain { generation: u64, reason: String },
     /// Platform cannot provide Proven containment.
     Unsupported { reason: String },
+}
+
+impl EmptyOutcome {
+    /// True when terminate has been applied but the platform empty oracle
+    /// still sees members. This is not a terminal Uncertain: a later probe
+    /// can still observe Empty. Callers that need ProvenEmpty must re-probe
+    /// until this is false or their deadline fires.
+    pub fn is_drain_in_progress(&self) -> bool {
+        match self {
+            Self::Uncertain { reason, .. } => {
+                reason == PROCESS_GROUP_STILL_POPULATED || reason == JOB_ACTIVE_PROCESSES_NONZERO
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Typed errors from the containment actor.

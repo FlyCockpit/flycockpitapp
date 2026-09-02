@@ -25,6 +25,8 @@ use super::adapter::{
     AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
     NativeSpawnRequest,
 };
+#[cfg(windows)]
+use super::types::JOB_ACTIVE_PROCESSES_NONZERO;
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
     SafeLocator,
@@ -334,7 +336,7 @@ impl ContainmentAdapter for WindowsJobAdapter {
                                 }
                                 Ok(_) => EmptyOutcome::Uncertain {
                                     generation,
-                                    reason: "active_processes_nonzero".into(),
+                                    reason: JOB_ACTIVE_PROCESSES_NONZERO.into(),
                                 },
                                 Err(e) => EmptyOutcome::Uncertain {
                                     generation,
@@ -550,7 +552,7 @@ mod windows_job_spawn_before_resume {
             .expect("kernel membership after AssignProcessToJobObject");
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::Uncertain { reason, .. } => {
-                assert_eq!(reason, "active_processes_nonzero");
+                assert_eq!(reason, JOB_ACTIVE_PROCESSES_NONZERO);
             }
             o => panic!("live job must not fabricate empty: {o:?}"),
         }

@@ -349,6 +349,7 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         &events,
         &mut history,
         !ledger_fallback,
+        root_agent,
         redaction,
     )?;
 
@@ -373,6 +374,7 @@ fn apply_text_artifact_tool_projections(
     events: &[SessionEventRow],
     history: &mut [Message],
     include_prune_projections: bool,
+    root_agent: &str,
     redaction: &crate::redact::RedactionTable,
 ) -> Result<()> {
     use crate::db::text_artifacts::{TextArtifact, TextArtifactRelation};
@@ -404,8 +406,22 @@ fn apply_text_artifact_tool_projections(
         }
     }
 
+    // Same in-place `/compact` boundary as the user-artifact pass: rebuilt
+    // model history no longer contains pre-compaction tool turns, so their
+    // `tool_call` / `context_pruned` projections must not be required to map
+    // into it. Tail messages already carry the live frames for any retained
+    // pre-compaction tool results.
+    let compact_seq = last_root_compaction_cursor(events, root_agent)?.map(|(seq, _prefix)| seq);
+    let precedes_compaction = |seq: i64| compact_seq.is_some_and(|cursor| seq <= cursor);
+    if let Some(seq) = compact_seq {
+        artifacts_by_owner.retain(|(event_seq, _), _| *event_seq > seq);
+    }
+
     let mut projections_by_call = std::collections::BTreeMap::<String, (String, bool)>::new();
     for event in events {
+        if precedes_compaction(event.seq) {
+            continue;
+        }
         match event.kind.as_str() {
             "tool_call" => {
                 let projection = event.data.get("artifact_projection");
@@ -829,31 +845,55 @@ fn render_rehydrated_tool_artifact_frame<'a>(
     }
 }
 
+/// Model-history prefix a root `session_compacted` event replaces live
+/// history with: one handoff user message plus the retained tail.
+///
+/// Shared by `rebuild_history` and the post-rebuild artifact-projection
+/// cursor so the materialized prefix and the skip offset cannot drift.
+fn compacted_model_history(event: &SessionEventRow) -> Result<Vec<Message>> {
+    let handoff = event
+        .data
+        .get("handoff_text")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            event
+                .data
+                .get("brief_text")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or("")
+        .to_string();
+    let mut history = vec![Message::user(handoff)];
+    if let Some(tail) = event.data.get("tail_messages") {
+        let tail: Vec<Message> = serde_json::from_value(tail.clone())
+            .map_err(|error| anyhow!("decoding compacted tail_messages: {error}"))?;
+        history.extend(tail);
+    }
+    Ok(history)
+}
+
 /// Last in-place `/compact` boundary in `events`, if any.
 ///
 /// `rebuild_history` clears model history at a root `session_compacted` event
-/// and replaces it with the handoff plus retained tail. `/compact` is in-place
-/// (`successor_session_id` is this session), so pre-compaction `user_message`
-/// rows remain in the log. Text-artifact projection must not replay those
-/// rows against the post-compact history.
+/// and replaces it with [`compacted_model_history`]. `/compact` is in-place
+/// (`successor_session_id` is this session), so pre-compaction transcript
+/// rows remain in the log. Post-rebuild text-artifact projection must not
+/// replay those rows (`user_message`, `tool_call`, `context_pruned`) against
+/// the post-compact history.
 ///
 /// Returns `(seq, history_prefix)`: `seq` is the last root compaction event;
-/// `history_prefix` is the handoff (always one user message) plus
-/// `tail_messages.len()`, matching the prefix `rebuild_history` materializes
+/// `history_prefix` is the length of the prefix `rebuild_history` materializes
 /// so post-compaction turns still line up.
 fn last_root_compaction_cursor(
     events: &[SessionEventRow],
     root_agent: &str,
-) -> Option<(i64, usize)> {
-    let event = events.iter().rev().find(|event| {
+) -> Result<Option<(i64, usize)>> {
+    let Some(event) = events.iter().rev().find(|event| {
         event.kind == "session_compacted" && event.agent.as_deref() == Some(root_agent)
-    })?;
-    let tail_len = event
-        .data
-        .get("tail_messages")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, Vec::len);
-    Some((event.seq, 1 + tail_len))
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some((event.seq, compacted_model_history(event)?.len())))
 }
 
 /// Replace only the authored text part of materialized oversized-user events.
@@ -885,7 +925,7 @@ fn apply_text_artifact_user_projections(
         }
     }
 
-    let (compact_seq, mut next_history) = last_root_compaction_cursor(events, root_agent)
+    let (compact_seq, mut next_history) = last_root_compaction_cursor(events, root_agent)?
         .map(|(seq, prefix)| (Some(seq), prefix))
         .unwrap_or((None, 0));
     let precedes_compaction = |seq: i64| compact_seq.is_some_and(|cursor| seq <= cursor);
@@ -2496,20 +2536,7 @@ fn rebuild_history(
             }
             "session_compacted" if ev.agent.as_deref() == Some(root_agent) => {
                 std::mem::take(&mut pending).flush(&mut history);
-                let handoff = ev
-                    .data
-                    .get("handoff_text")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-                history.clear();
-                history.push(Message::user(handoff));
-                if let Some(tail) = ev.data.get("tail_messages") {
-                    let tail: Vec<Message> = serde_json::from_value(tail.clone())
-                        .map_err(|error| anyhow!("decoding compacted tail_messages: {error}"))?;
-                    history.extend(tail);
-                }
+                history = compacted_model_history(ev)?;
             }
             "subagent_spawned" if ev.agent.as_deref() == Some(root_agent) => {
                 let Some(call_id) = ev.call_id.as_deref() else {
@@ -3473,6 +3500,139 @@ mod tests {
                 "wire_input": wire,
                 "output": output,
             }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn record_tool_with_model_artifact(
+        s: &Session,
+        call_id: &str,
+        tool: &str,
+        output: &str,
+        artifact_body: &str,
+    ) {
+        s.record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::default(),
+            tool: tool.into(),
+            path: None,
+            mcp_server: None,
+            original_input_json: json!({ "path": "/f" }),
+            wire_input_json: json!({ "path": "/f" }),
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: output.into(),
+            truncated: false,
+            duration_ms: 1,
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .await
+        .unwrap();
+        s.db.record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+            session_id: s.id,
+            kind: crate::db::session_log::SessionEventKind::ToolCall,
+            agent: Some("Build".into()),
+            call_id: Some(call_id.into()),
+            context: Default::default(),
+            ts_ms: chrono::Utc::now().timestamp_millis(),
+            data_json: json!({
+                "tool": tool,
+                "original_input": { "path": "/f" },
+                "wire_input": { "path": "/f" },
+                "output": output,
+            })
+            .to_string(),
+            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                projection_slot: Some(0),
+                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                content: artifact_body.into(),
+                host_captured_bytes: artifact_body.len(),
+                host_original_bytes: artifact_body.len(),
+                host_dropped_bytes: 0,
+                stored_source_bytes: artifact_body.len(),
+                provenance_json: json!({
+                    "agent_id": "Build",
+                    "tool": tool,
+                    "call_id": call_id,
+                })
+                .to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            }],
+            staged_blob_paths: Vec::new(),
+            unavailable_projection: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn record_prune_with_model_artifact(s: &Session, call_id: &str, artifact_body: &str) {
+        s.record_context_pruned_with_artifacts(
+            "Build",
+            false,
+            4,
+            2,
+            100,
+            50,
+            &[call_id.to_string()],
+            "budget",
+            50,
+            None,
+            None,
+            vec![crate::db::text_artifacts::TextArtifactCandidate {
+                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                projection_slot: Some(0),
+                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                capture_reason: crate::db::text_artifacts::CaptureReason::PruneBoundary,
+                content: artifact_body.into(),
+                host_captured_bytes: artifact_body.len(),
+                host_original_bytes: artifact_body.len(),
+                host_dropped_bytes: 0,
+                stored_source_bytes: artifact_body.len(),
+                provenance_json: json!({
+                    "agent_id": "Build",
+                    "tool": "bash",
+                    "call_id": call_id,
+                })
+                .to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn record_inplace_compact(s: &Session, handoff: &str, tail: &[Message]) {
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id(),
+                seed_tool_count: 0,
+                brief_text: "brief",
+                handoff_text: handoff,
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 500,
+                tokens_after: 100,
+                turns_summarized: 3,
+                tail_kept: 1,
+                tail_trimmed: 0,
+                tail_messages: tail,
+            },
+            None,
         )
         .await
         .unwrap();
@@ -7674,6 +7834,268 @@ mod tests {
                     vec![Message::user("exact handoff")],
                     tail,
                     vec![Message::user("after compact")]
+                ]
+                .concat()
+            )
+            .unwrap()
+        );
+    }
+
+    /// REGRESSION (#276 class sweep): pre-compaction oversized tool results
+    /// and prune-boundary projections stay in the log after in-place
+    /// `/compact`. Rehydrate must not require those projections to map into
+    /// the rebuilt (cleared) model history, while still projecting
+    /// post-compaction tool artifacts.
+    #[tokio::test]
+    async fn compacted_model_history_skips_pre_compaction_tool_artifact_projections() {
+        let s = root_session();
+        record_user(&s, "first question").await;
+        record_assistant(&s, "a1", "calling tool").await;
+        record_tool_with_model_artifact(
+            &s,
+            "pre-compact-tool",
+            "bash",
+            "capped",
+            "pre-compact-body",
+        )
+        .await;
+        record_prune_with_model_artifact(&s, "pre-compact-pruned", "pre-compact-pruned-body").await;
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        record_inplace_compact(&s, "exact handoff", &tail).await;
+        record_user(&s, "after compact").await;
+        record_assistant(&s, "a2", "calling again").await;
+        record_tool_with_model_artifact(
+            &s,
+            "post-compact-tool",
+            "bash",
+            "capped-after",
+            "post-compact-body",
+        )
+        .await;
+
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(user_text(&restored[0]), "exact handoff");
+        assert_eq!(user_text(&restored[1]), "recent user");
+        assert_eq!(assistant_text(&restored[2]), "recent answer");
+        assert_eq!(user_text(&restored[3]), "after compact");
+        let dump = format!("{restored:?}");
+        assert!(
+            !dump.contains("pre-compact-body") && !dump.contains("pre-compact-pruned-body"),
+            "pre-compaction tool/prune bodies must not leak into rebuilt history: {dump}"
+        );
+        assert!(
+            matches!(
+                &restored[5],
+                Message::User { content }
+                    if matches!(
+                        content.as_slice(),
+                        [UserContent::ToolResult(result)]
+                            if result.call.to_string() == "post-compact-tool"
+                                && result.content.iter().any(|part| {
+                                    matches!(
+                                        part,
+                                        ToolResultContent::Text(text)
+                                            if text.text.starts_with("<cockpit_artifact_v1 ")
+                                    )
+                                })
+                    )
+            ),
+            "post-compaction tool artifact must still project: {:?}",
+            restored.get(5)
+        );
+    }
+
+    /// Pre-compaction oversized user artifacts are dropped from validation
+    /// (`by_event.retain`) because they are no longer in model context.
+    /// Resume must succeed rather than abort on those leftover owner rows.
+    #[tokio::test]
+    async fn compacted_model_history_skips_pre_compaction_user_artifacts() {
+        struct AllowJoin;
+        impl crate::db::message_attachments::MessageAcceptanceJoin for AllowJoin {
+            fn validate_and_join(
+                &self,
+                _: &rusqlite::Connection,
+                _: &crate::db::message_attachments::AcceptMessageInput,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let s = root_session();
+        let source = "x".repeat(65_537);
+        let operation_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
+        let reserved =
+            s.db.accept_message_with_text_artifact_reservation(
+                crate::db::message_attachments::AcceptMessageInput {
+                    session_id: s.id,
+                    operation_id: *operation_id.as_bytes(),
+                    actor: crate::db::message_attachments::MessageActor::LocalOwner,
+                    request_hash: [7; 32],
+                    message_request_digest: [8; 32],
+                    attachment_set_digest: [9; 32],
+                    client_submission_id: *submission_id.as_bytes(),
+                    queue_item_id: *submission_id.as_bytes(),
+                    canonical_message: b"FCM2\x02".to_vec(),
+                    attachments: Vec::new(),
+                    outbox_sequence: 0,
+                    now_ms: 10,
+                    tool_media_subject_binding: None,
+                },
+                Arc::new(AllowJoin),
+                crate::db::text_artifacts::source_digest(&source),
+                source.len(),
+            )
+            .await
+            .unwrap();
+        let reservation = match reserved {
+            crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
+                reservation
+            }
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let envelope = json!({
+            "version": 3,
+            "prelude": [],
+            "parts": [{"type":"authored_text_slot"}]
+        });
+        let source_blob_path = stage_user_blob(&s, &source).await;
+        s.db.materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: envelope.to_string(),
+                source_text: source,
+                source_blob_path: Some(source_blob_path),
+                source_preview_lines: None,
+                model_projection_blob_path: None,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                now_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        record_inplace_compact(&s, "exact handoff", &tail).await;
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value([vec![Message::user("exact handoff")], tail].concat()).unwrap()
+        );
+    }
+
+    /// Offloaded compaction payloads (`handoff_ref`) must hydrate before the
+    /// projection cursor reads `tail_messages`; otherwise the history prefix
+    /// is 1 and a follow-up user turn mismatches the retained tail.
+    #[tokio::test]
+    async fn compacted_model_history_with_offloaded_handoff_and_prior_turns_rehydrates() {
+        let s = root_session();
+        record_user(&s, "first question").await;
+        record_assistant(&s, "a1", "first answer").await;
+        let handoff = format!("## Decisions\n{}", "durable ".repeat(3_000));
+        let tail = vec![
+            Message::user(format!("recent {}", "tail ".repeat(1_000))),
+            Message::assistant("recent answer"),
+        ];
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id(),
+                seed_tool_count: 0,
+                brief_text: &handoff,
+                handoff_text: &handoff,
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 9_000,
+                tokens_after: 3_000,
+                turns_summarized: 3,
+                tail_kept: 1,
+                tail_trimmed: 0,
+                tail_messages: &tail,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let session_id = s.id;
+        let raw_data: String = s
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT data_json FROM session_events WHERE session_id = ?1 AND type = 'session_compacted'",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        let raw_data: serde_json::Value = serde_json::from_str(&raw_data).unwrap();
+        assert!(
+            raw_data["handoff_ref"].as_str().is_some(),
+            "expected offloaded compaction payload, got {raw_data}"
+        );
+        record_user(&s, "after compact").await;
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(user_text(&restored[0]), handoff);
+        assert_eq!(restored.len(), 1 + tail.len() + 1);
+        assert_eq!(user_text(restored.last().unwrap()), "after compact");
+    }
+
+    /// `last_root_compaction_cursor` must use the last root compaction, not
+    /// the first: turns between two in-place `/compact`s are summarized away
+    /// by the later boundary.
+    #[tokio::test]
+    async fn compacted_model_history_uses_last_of_multiple_compaction_boundaries() {
+        let s = root_session();
+        record_user(&s, "first question").await;
+        record_assistant(&s, "a1", "first answer").await;
+        let first_tail = vec![
+            Message::user("first tail user"),
+            Message::assistant("first tail answer"),
+        ];
+        record_inplace_compact(&s, "first handoff", &first_tail).await;
+        record_user(&s, "between compacts").await;
+        record_assistant(&s, "a2", "between answer").await;
+        let second_tail = vec![
+            Message::user("second tail user"),
+            Message::assistant("second tail answer"),
+        ];
+        record_inplace_compact(&s, "second handoff", &second_tail).await;
+        record_user(&s, "after second compact").await;
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(
+                [
+                    vec![Message::user("second handoff")],
+                    second_tail,
+                    vec![Message::user("after second compact")]
                 ]
                 .concat()
             )

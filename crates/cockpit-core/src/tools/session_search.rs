@@ -667,10 +667,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let thread = db
-            .create_thread(parent_session_id, anchor.to_string())
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let thread = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db,
+            &vault,
+            parent_session_id,
+            Some(anchor.to_string()),
+            false,
+            true,
+        )
+        .unwrap();
         db.insert_session_event(
             thread.session_id,
             SessionEventKind::UserMessage,

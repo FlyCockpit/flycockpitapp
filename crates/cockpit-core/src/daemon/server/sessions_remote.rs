@@ -240,12 +240,19 @@ pub(super) async fn create_btw_fork(
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
     let now = chrono::Utc::now().timestamp_millis();
+    let vault = ctx.secret_vault.clone();
     commit_session_remote_mutation(ctx, ledger, "btw_create", move |conn| {
         if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
             return Err(UnknownRemoteSession(parent_session_id).into());
         }
-        let result =
-            crate::db::Db::create_btw_fork_conn(conn, parent_session_id, tangent, session_id, now)?;
+        let result = crate::session::lifecycle::persist_btw_fork_with_redaction_custody_on_conn(
+            conn,
+            &vault,
+            parent_session_id,
+            tangent,
+            session_id,
+            now,
+        )?;
         if result.created
             && let Some(tag) = created_by.as_deref()
         {

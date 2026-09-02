@@ -271,8 +271,17 @@ impl Db {
         &self,
         graph: SessionArchiveImportGraph,
     ) -> Result<ArchiveImportResult> {
-        self.transaction(move |conn| import_session_archive_graph_conn(conn, graph))
+        self.transaction(move |conn| Self::import_session_archive_graph_conn(conn, graph))
             .await
+    }
+
+    /// Conn-level import body so callers can compose vault redaction custody
+    /// in the same SQLite transaction as the restored session rows.
+    pub fn import_session_archive_graph_conn(
+        conn: &Connection,
+        graph: SessionArchiveImportGraph,
+    ) -> Result<ArchiveImportResult> {
+        import_session_archive_graph_conn(conn, graph)
     }
 }
 

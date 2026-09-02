@@ -1856,6 +1856,11 @@ impl Db {
         // fork that cannot reach the bad state. The property this relies
         // on is pinned by
         // `btw_fork_never_inherits_sealed_values_of_either_kind`.
+        // Redaction-table custody is not established here: cockpit-core's
+        // `persist_btw_fork_with_redaction_custody` copies the parent table
+        // in the same transaction as this insert. Callers that insert a
+        // `/btw` row without that wrapper leave a resumable session without
+        // a redaction boundary.
         let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
         let short_id = generate_unique_short_id(conn, &parent.project_id)

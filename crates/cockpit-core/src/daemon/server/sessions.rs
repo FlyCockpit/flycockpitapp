@@ -300,11 +300,14 @@ pub(super) async fn create_btw_fork(
         Err(e) => return Err(internal(e)),
     }
     let created_by = principal.tag();
-    let result = ctx
-        .db
-        .create_btw_fork(parent_session_id, tangent)
-        .await
-        .map_err(internal)?;
+    let result = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        parent_session_id,
+        tangent,
+    )
+    .await
+    .map_err(internal)?;
     if result.created
         && let Some(tag) = created_by
     {

@@ -42,6 +42,27 @@ fn copy_optional_sealed_vault_item(
     }
 }
 
+fn copy_vault_redaction_table(
+    vault: &crate::secure_key::SecretVault,
+    parent: uuid::Uuid,
+    child: uuid::Uuid,
+    context: &'static str,
+) -> Result<()> {
+    let json = require_redaction_table_json_from_vault(vault, parent, context)?;
+    persist_redaction_table_to_vault(vault, child, json.as_bytes())
+}
+
+fn copy_vault_redaction_table_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    parent: uuid::Uuid,
+    child: uuid::Uuid,
+    context: &'static str,
+) -> Result<()> {
+    let json = require_redaction_table_json_from_vault_on_conn(vault, conn, parent, context)?;
+    persist_redaction_table_to_vault_on_conn(vault, conn, child, json.as_bytes())
+}
+
 pub(crate) fn copy_vault_session_secrets(
     db: &crate::db::Db,
     vault: &crate::secure_key::SecretVault,
@@ -50,18 +71,12 @@ pub(crate) fn copy_vault_session_secrets(
 ) -> Result<()> {
     let parent_key = parent.to_string();
     let child_key = child.to_string();
-    let json = require_redaction_table_json_from_vault(
+    copy_vault_redaction_table(
         vault,
         parent,
+        child,
         "copying parent redaction table for session fork",
     )?;
-    vault
-        .put_item(
-            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-            &crate::secure_key::redaction_table_item_id(&child_key),
-            json.as_bytes(),
-        )
-        .map_err(|error| anyhow::anyhow!("copying redaction table vault item: {error}"))?;
     let sealed_ids: Vec<(String, i64)> = db
         .blocking_write_for_sync_maintenance({
             let parent_key = parent_key.clone();
@@ -130,6 +145,63 @@ pub(crate) fn persist_fork_with_redaction_custody(
     .context("creating fork session row")
 }
 
+/// Copy parent redaction-table custody, then persist the `/btw` child.
+///
+/// `/btw` copies transcript state for a non-tangent fork and never copies
+/// sealed values. Missing parent table custody is fail-closed. The child row
+/// and its vault item commit in one transaction so a failed copy cannot leave
+/// a resumable `/btw` session without its redaction boundary. Idempotent:
+/// an existing live `/btw` fork is returned without a second copy.
+pub(crate) async fn persist_btw_fork_with_redaction_custody(
+    db: &crate::db::Db,
+    vault: Arc<crate::secure_key::SecretVault>,
+    parent_session_id: uuid::Uuid,
+    tangent: bool,
+) -> Result<crate::db::sessions::BtwForkCreateResult> {
+    let session_id = uuid::Uuid::new_v4();
+    let now_unix_ms = Utc::now().timestamp_millis();
+    db.transaction(move |conn| {
+        persist_btw_fork_with_redaction_custody_on_conn(
+            conn,
+            &vault,
+            parent_session_id,
+            tangent,
+            session_id,
+            now_unix_ms,
+        )
+    })
+    .await
+    .context("creating /btw fork with redaction custody")
+}
+
+/// Snapshot-consistent variant of [`persist_btw_fork_with_redaction_custody`].
+pub(crate) fn persist_btw_fork_with_redaction_custody_on_conn(
+    conn: &rusqlite::Connection,
+    vault: &crate::secure_key::SecretVault,
+    parent_session_id: uuid::Uuid,
+    tangent: bool,
+    session_id: uuid::Uuid,
+    now_unix_ms: i64,
+) -> Result<crate::db::sessions::BtwForkCreateResult> {
+    let result = crate::db::Db::create_btw_fork_conn(
+        conn,
+        parent_session_id,
+        tangent,
+        session_id,
+        now_unix_ms,
+    )?;
+    if result.created {
+        copy_vault_redaction_table_on_conn(
+            vault,
+            conn,
+            parent_session_id,
+            result.info.session_id,
+            "copying parent redaction table for /btw fork",
+        )?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_REDACTION_VAULT_WRITE: std::cell::Cell<bool> =
@@ -151,6 +223,41 @@ fn persist_initial_empty_redaction_table(
     persist_redaction_table_to_vault(vault, session_id, json.as_bytes())
 }
 
+fn persist_empty_redaction_table_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    session_id: uuid::Uuid,
+) -> Result<()> {
+    let json = crate::redact::RedactionTable::empty().to_persisted_json()?;
+    persist_redaction_table_to_vault_on_conn(vault, conn, session_id, json.as_bytes())
+}
+
+/// Create empty vault custody when a durable session is inserted without a
+/// table yet. Existing items (spawn already persisted the live scan) are left
+/// untouched so this cannot clobber accumulated secrets.
+fn ensure_redaction_table_custody_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    session_id: uuid::Uuid,
+) -> Result<()> {
+    let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+    match vault.get_item_on_conn(
+        conn,
+        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+        &item_id,
+    ) {
+        Ok(_) => Ok(()),
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => {
+            persist_empty_redaction_table_on_conn(vault, conn, session_id)
+        }
+        Err(error) => Err(crate::redact::RedactionTableUnavailable::new(
+            "ensuring session redaction table custody",
+            format!("session {session_id}: {error}"),
+        )
+        .into()),
+    }
+}
+
 fn persist_redaction_table_to_vault(
     vault: &crate::secure_key::SecretVault,
     session_id: uuid::Uuid,
@@ -170,6 +277,27 @@ fn persist_redaction_table_to_vault(
         .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
 }
 
+fn persist_redaction_table_to_vault_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    session_id: uuid::Uuid,
+    json: &[u8],
+) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+        return Err(anyhow::anyhow!("injected redaction vault write failure"));
+    }
+    let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+    vault
+        .put_item_on_conn(
+            conn,
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &item_id,
+            json,
+        )
+        .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
+}
+
 pub(crate) fn write_redaction_table_json_to_vault(
     db: &crate::db::Db,
     session_id: uuid::Uuid,
@@ -178,6 +306,30 @@ pub(crate) fn write_redaction_table_json_to_vault(
     let vault = crate::secure_key::vault_for_db(db)
         .map_err(|error| anyhow::anyhow!("opening vault for redaction table: {error}"))?;
     persist_redaction_table_to_vault(&vault, session_id, json.as_bytes())
+}
+
+pub(crate) fn write_redaction_table_json_to_vault_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    session_id: uuid::Uuid,
+    json: &str,
+) -> Result<()> {
+    persist_redaction_table_to_vault_on_conn(vault, conn, session_id, json.as_bytes())
+}
+
+/// Establish empty vault custody for each newly inserted durable session in
+/// the same SQLite transaction as the rows. Archives never carry secret
+/// literals, so imported history is covered by an empty committed table
+/// rather than a missing item that resume would treat as "no secrets."
+pub(crate) fn persist_empty_redaction_tables_for_imported_sessions_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    session_ids: &[uuid::Uuid],
+) -> Result<()> {
+    for session_id in session_ids {
+        persist_empty_redaction_table_on_conn(vault, conn, *session_id)?;
+    }
+    Ok(())
 }
 
 fn redaction_table_json_from_required_vault_bytes(
@@ -204,9 +356,11 @@ fn redaction_table_json_from_required_vault_bytes(
 /// Optional vault load used while a session may not yet have initial custody
 /// (deferred construction, spawn adopt, own cache before the first persist).
 ///
-/// Once a session can own history, security-relevant loads must use
-/// [`require_redaction_table_json_from_vault`]: `NotFound` is lost custody,
-/// never an empty table.
+/// Once a session is durable — its `sessions` row is visible to resume —
+/// security-relevant loads must use [`require_redaction_table_json_from_vault`]:
+/// `NotFound` is lost custody, never an empty table. Constructors that insert
+/// that row (`persist_if_needed`, `/btw`, archive import, assistant create,
+/// fork) establish custody in the same operation.
 pub(crate) fn load_redaction_table_from_vault(
     vault: &crate::secure_key::SecretVault,
     session_id: uuid::Uuid,
@@ -853,8 +1007,16 @@ impl Session {
             }
         };
         let row_for_db = row.clone();
+        let vault = Arc::clone(&self.secret_vault);
+        let session_id_for_vault = row.session_id;
         match self.db.blocking_write_for_sync_maintenance(move |conn| {
-            crate::db::Db::insert_session_row_conn(conn, &row_for_db)
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin persist_if_needed tx")?;
+            let persisted = crate::db::Db::insert_session_row_conn(&tx, &row_for_db)?;
+            ensure_redaction_table_custody_on_conn(&vault, &tx, session_id_for_vault)?;
+            tx.commit().context("commit persist_if_needed tx")?;
+            Ok(persisted)
         }) {
             Ok(persisted) => {
                 if let Some(short_id) = persisted.short_id {
@@ -1075,8 +1237,19 @@ impl Session {
                 None
             }
         };
-        let redaction_table_json = load_redaction_table_from_vault(&vault, row.session_id)
-            .context("loading vault redaction table while resuming session")?;
+        let redaction_table_json = if freshly_created {
+            // Deferred construction and the first persist of a brand-new row
+            // may not yet own vault custody. Resume of an existing durable
+            // session must not treat a missing item as "no historical secrets."
+            load_redaction_table_from_vault(&vault, row.session_id)
+                .context("loading vault redaction table while creating session")?
+        } else {
+            Some(require_redaction_table_json_from_vault(
+                &vault,
+                row.session_id,
+                "loading vault redaction table while resuming session",
+            )?)
+        };
         // Durable workspace scratch is a required production session
         // capability. Test-support sessions with synthetic roots receive the
         // same per-session path but must not publish a reverse-map marker for
@@ -1300,18 +1473,32 @@ impl Session {
 
     /// Load the last committed redaction table. The in-memory cache is a
     /// committed-table mirror, never a speculative write.
+    ///
+    /// `Ok(None)` is only for a not-yet-durable deferred session that has never
+    /// written a vault item. A persisted session with a missing item is lost
+    /// custody, never an empty table.
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
         if let Some(json) = self.redaction_table_json.lock().unwrap().clone() {
             return crate::redact::RedactionTable::from_persisted_json(&json)
                 .map(Some)
                 .context("loading persisted session redaction table");
         }
-        match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
-            Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
-                .map(Some)
-                .context("loading vault session redaction table"),
-            None => Ok(None),
+        if !self.is_persisted() {
+            return match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
+                Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
+                    .map(Some)
+                    .context("loading vault session redaction table"),
+                None => Ok(None),
+            };
         }
+        let json = require_redaction_table_json_from_vault(
+            &self.secret_vault,
+            self.id,
+            "loading persisted session redaction table",
+        )?;
+        crate::redact::RedactionTable::from_persisted_json(&json)
+            .map(Some)
+            .context("loading vault session redaction table")
     }
 
     /// Drop the in-memory redaction cache so the next load hits the vault.
@@ -1620,6 +1807,148 @@ mod vault_unification_tests {
         assert!(
             child_ids.is_empty(),
             "failed fork must not leave a persisted child: {child_ids:?}"
+        );
+    }
+
+    #[test]
+    fn resume_fails_closed_when_redaction_vault_item_is_missing() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        crate::secure_key::vault_for_db(&db)
+            .unwrap()
+            .delete_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&session.id.to_string()),
+            )
+            .unwrap();
+        let session_id = session.id;
+        drop(session);
+        let err = Session::resume_for_test(
+            db,
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect_err("resume must refuse a durable session without redaction custody");
+        let message = format!("{err:#}");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&err),
+            "missing table must be a typed redaction failure: {message}"
+        );
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_fork_copies_parent_redaction_table() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        const SECRET: &str = "btw-parent-redaction-secret-abcdef123";
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "test".to_string())
+            .unwrap();
+        parent.persist_redaction_table(&table).unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let seeded = persist_btw_fork_with_redaction_custody(&db, vault, parent.id, false)
+            .await
+            .expect("seeded /btw must copy parent redaction custody");
+        assert!(seeded.created);
+        let child = Session::resume_for_test(
+            db,
+            seeded.info.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("seeded /btw child");
+        assert_ne!(
+            child
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(SECRET),
+            SECRET,
+            "non-tangent /btw must inherit parent redaction coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_fork_fails_closed_when_parent_redaction_vault_item_is_missing() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        crate::secure_key::vault_for_db(&db)
+            .unwrap()
+            .delete_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&parent.id.to_string()),
+            )
+            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let err = persist_btw_fork_with_redaction_custody(&db, vault, parent.id, false)
+            .await
+            .expect_err("/btw must refuse to proceed without the parent redaction table");
+        let message = format!("{err:#}");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&err),
+            "missing parent table must be a typed redaction failure: {message}"
+        );
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
+        );
+        let child_ids: Vec<String> = db
+            .blocking_write_for_sync_maintenance({
+                let parent_id = parent.id.to_string();
+                move |conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT session_id FROM sessions WHERE btw_parent_session_id = ?1",
+                    )?;
+                    let ids = stmt
+                        .query_map(rusqlite::params![parent_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(ids)
+                }
+            })
+            .unwrap();
+        assert!(
+            child_ids.is_empty(),
+            "failed /btw must not leave a persisted child: {child_ids:?}"
+        );
+    }
+
+    #[test]
+    fn persist_if_needed_establishes_redaction_custody() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_deferred_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        assert!(session.persist_if_needed().unwrap());
+        session.clear_cached_redaction_table_for_test();
+        assert!(
+            session.persisted_redaction_table().unwrap().is_some(),
+            "flushing a deferred session must establish vault custody"
         );
     }
 

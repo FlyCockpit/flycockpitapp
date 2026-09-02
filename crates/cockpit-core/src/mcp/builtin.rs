@@ -3449,7 +3449,11 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let side = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db, &vault, parent.id, None, true, false,
+        )
+        .unwrap();
         let session = Arc::new(
             crate::session::Session::resume_for_test(
                 db,
@@ -3552,7 +3556,11 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let side = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db, &vault, parent.id, None, true, false,
+        )
+        .unwrap();
         let session = Arc::new(
             crate::session::Session::resume_for_test(
                 db,

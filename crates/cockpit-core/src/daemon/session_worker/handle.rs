@@ -2584,9 +2584,14 @@ pub enum CancelOrigin {
 /// Union a persisted redaction table onto the live scan. Load and union
 /// failures are fail-closed: returning the live table alone would drop
 /// previously accumulated sealed/named secrets and leak them on send.
+///
+/// `Ok(None)` is first custody only for a not-yet-durable deferred session.
+/// A persisted session missing its vault item must not start with the live
+/// scan and then persist that reduced table as the replacement.
 pub(crate) fn adopt_persisted_redaction_table(
     persisted: anyhow::Result<Option<RedactionTable>>,
     live: Arc<RedactionTable>,
+    require_durable_table: bool,
 ) -> anyhow::Result<Arc<RedactionTable>> {
     match persisted {
         Ok(Some(persisted)) => persisted.union(&live).map(Arc::new).map_err(|error| {
@@ -2596,6 +2601,11 @@ pub(crate) fn adopt_persisted_redaction_table(
             )
             .into()
         }),
+        Ok(None) if require_durable_table => Err(crate::redact::RedactionTableUnavailable::new(
+            "loading persisted redaction table",
+            "durable session is missing its redaction table vault item",
+        )
+        .into()),
         Ok(None) => Ok(live),
         Err(error) => Err(crate::redact::RedactionTableUnavailable::new(
             "loading persisted redaction table",
@@ -2718,8 +2728,12 @@ pub(crate) fn spawn(
             Vec::new()
         }
     };
-    let redact = adopt_persisted_redaction_table(session.persisted_redaction_table(), redact)
-        .context("loading persisted redaction table; refusing to start session unredacted")?;
+    let redact = adopt_persisted_redaction_table(
+        session.persisted_redaction_table(),
+        redact,
+        session.is_persisted(),
+    )
+    .context("loading persisted redaction table; refusing to start session unredacted")?;
     // H1: this initial persist needs no redaction-table write lock. It runs
     // during session-worker construction, strictly BEFORE the shared live table
     // (`redaction`, below) and the per-session `InterruptHub` that owns the write

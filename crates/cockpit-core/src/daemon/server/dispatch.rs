@@ -9483,6 +9483,7 @@ async fn handle_serialized_request_impl(
             }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
+            let vault = ctx.secret_vault.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
@@ -9510,7 +9511,18 @@ async fn handle_serialized_request_impl(
                                     &assistant_for_db,
                                     &assistant_for_db,
                                 )?;
-                                (crate::db::Db::insert_session_row_conn(conn, &row)?, true)
+                                let tx = conn
+                                    .unchecked_transaction()
+                                    .context("begin assistant session insert tx")?;
+                                let row = crate::db::Db::insert_session_row_conn(&tx, &row)?;
+                                crate::session::lifecycle::write_redaction_table_json_to_vault_on_conn(
+                                    &vault,
+                                    &tx,
+                                    row.session_id,
+                                    &crate::redact::RedactionTable::empty().to_persisted_json()?,
+                                )?;
+                                tx.commit().context("commit assistant session insert tx")?;
+                                (row, true)
                             }
                         };
                     let summary = crate::db::Db::list_session_summaries_conn(

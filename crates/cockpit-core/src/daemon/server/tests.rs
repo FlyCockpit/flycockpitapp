@@ -11104,6 +11104,14 @@ async fn discard_session_reused_operation_conflict_rejects_before_detach() {
 async fn create_btw_fork_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
@@ -34661,6 +34669,14 @@ async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
 
     let first = handle_request(
         Request::CreateBtwFork {
@@ -34791,11 +34807,14 @@ async fn btw_concurrent_with_parent_turn() {
     };
     assert_eq!(parent_submission.text, "parent work");
 
-    let created = ctx
-        .db
-        .create_btw_fork(parent_row.session_id, true)
-        .await
-        .unwrap();
+    let created = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        parent_row.session_id,
+        true,
+    )
+    .await
+    .unwrap();
     let btw_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),

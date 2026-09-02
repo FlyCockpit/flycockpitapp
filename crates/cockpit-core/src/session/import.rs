@@ -45,7 +45,19 @@ const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportResult> {
     let mut archive = archive;
     stage_blob_backed_import_artifacts(db, &mut archive).await?;
-    db.import_session_archive_graph(archive).await
+    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
+        anyhow!("opening vault for imported session redaction custody: {error}")
+    })?;
+    db.transaction(move |conn| {
+        let result = Db::import_session_archive_graph_conn(conn, archive)?;
+        crate::session::lifecycle::persist_empty_redaction_tables_for_imported_sessions_on_conn(
+            &vault,
+            conn,
+            &result.imported,
+        )?;
+        Ok(result)
+    })
+    .await
 }
 
 /// Archive members contain the complete portable body, while the source
@@ -1646,6 +1658,13 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        crate::session::lifecycle::require_redaction_table_json_from_vault(
+            &vault,
+            imported.imported[0],
+            "imported session redaction custody",
+        )
+        .expect("import must establish vault redaction custody for the destination session");
     }
 
     #[tokio::test]

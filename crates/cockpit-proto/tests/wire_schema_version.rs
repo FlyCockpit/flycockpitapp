@@ -122,6 +122,15 @@ impl Ledger {
             .find(|frozen| frozen.version == version)
             .map(|frozen| frozen.chain.as_str())
     }
+
+    /// Mint-time archive-chain prefix for `version`: the prior version's
+    /// chain, or `genesis` when `version` is the first archived version.
+    fn chain_before<'a>(&'a self, version: u32, genesis: &'a str) -> &'a str {
+        version
+            .checked_sub(1)
+            .and_then(|previous| self.chain_through(previous))
+            .unwrap_or(genesis)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -571,7 +580,7 @@ fn assert_ledger_entries_match_frozen_bytes(ledger: &Ledger, root: &Path) {
 }
 
 fn assert_ledger_chains_are_consistent(ledger: &Ledger) {
-    let mut previous = hex_digest(ARCHIVE_CHAIN_DOMAIN.as_bytes());
+    let mut previous = archive_chain_genesis();
     for frozen in &ledger.versions {
         let mut payload = previous.clone().into_bytes();
         payload.push(b'\n');
@@ -590,6 +599,7 @@ fn assert_ledger_chains_are_consistent(ledger: &Ledger) {
 }
 
 fn assert_frozen_mint_anchors_match_ledger_prefixes(ledger: &Ledger, root: &Path) {
+    let genesis = archive_chain_genesis();
     for frozen in &ledger.versions {
         let digest_path = root
             .join(format!("v{}", frozen.version))
@@ -609,10 +619,7 @@ fn assert_frozen_mint_anchors_match_ledger_prefixes(ledger: &Ledger, root: &Path
              bytes or re-freeze the version from a consistent state",
             version = frozen.version,
         );
-        let previous_chain = match ledger.chain_through(frozen.version.saturating_sub(1)) {
-            Some(chain) => chain,
-            None => hex_digest(ARCHIVE_CHAIN_DOMAIN.as_bytes()),
-        };
+        let previous_chain = ledger.chain_before(frozen.version, &genesis);
         assert_eq!(
             canonical.archive_chain,
             previous_chain,
@@ -734,6 +741,10 @@ fn assert_is_digest(value: &str) {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
         "malformed sha256 digest \"{value}\""
     );
+}
+
+fn archive_chain_genesis() -> String {
+    hex_digest(ARCHIVE_CHAIN_DOMAIN.as_bytes())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

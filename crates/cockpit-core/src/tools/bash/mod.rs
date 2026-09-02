@@ -13,7 +13,10 @@
 //! silently on macOS.
 //!
 //! Safety:
-//!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`].
+//!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`], and every
+//!     truncation routes through the redacting truncator
+//!     (`crate::tools::common::truncate_head_tail_redacted`) so a secret
+//!     straddling a truncation boundary never leaves a partial in model text.
 //!   - The env scrub list from plan §3c removes the well-known
 //!     injection-vector vars (`BASH_ENV`, `PROMPT_COMMAND`, …) and
 //!     anything matching shared secret-name patterns.
@@ -30,8 +33,9 @@ use crate::engine::tool::{
     ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolEffect, ToolOutput,
     ToolOutputSidecar, ToolPresentation, single_line_preview, string_field,
 };
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use crate::tools::common::{
+    OUTPUT_BYTE_CAP, boundary_safe_capture, boundary_safe_join, truncate_head_tail_redacted,
+};
 use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
@@ -1087,6 +1091,7 @@ async fn call_bash_inner(
     let body = render_output(
         &final_outcome,
         compress,
+        &ctx.redact,
         command,
         &cwd,
         BashOutputAnnotations {
@@ -1112,10 +1117,17 @@ async fn call_bash_inner(
     let knowledge_source = attached_knowledge_read.then(|| body.clone());
     let mut out = if truncated_for_display {
         // Head+tail so the `exit:` line and any stderr at the tail
-        // survive — the failure signal usually lives there.
-        let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&body))
-            .with_bash_meta(meta, &resource_meta);
+        // survive — the failure signal usually lives there. The redacting
+        // truncator additionally elides the unsafe margin at the head→middle
+        // and middle→tail boundaries so a boundary-straddling secret PARTIAL
+        // never survives into the §7 whole-value scrub.
+        let mut out = ToolOutput::truncated_text(truncate_head_tail_redacted(
+            &ctx.redact,
+            &body,
+            OUTPUT_BYTE_CAP,
+        ))
+        .with_text_artifact_capture(boundary_safe_capture(&ctx.redact, &body))
+        .with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }
@@ -1926,6 +1938,7 @@ struct BashOutputAnnotations<'a> {
 fn render_output(
     o: &ShellOutcome,
     compress: bool,
+    redact: &crate::redact::RedactionTable,
     command: &str,
     cwd: &Path,
     annotations: BashOutputAnnotations<'_>,
@@ -1935,10 +1948,12 @@ fn render_output(
     let (stdout, stderr): (std::borrow::Cow<str>, std::borrow::Cow<str>) = if compress {
         (
             std::borrow::Cow::Owned(crate::tools::shell_compress::compress_stream(
+                redact,
                 command,
                 &stdout_raw,
             )),
             std::borrow::Cow::Owned(crate::tools::shell_compress::compress_stream(
+                redact,
                 command,
                 &stderr_raw,
             )),
@@ -2710,6 +2725,7 @@ fn render_bash_outcome(
     let body = render_output(
         &final_outcome,
         compress,
+        &ctx.redact,
         command,
         cwd,
         BashOutputAnnotations {
@@ -2729,9 +2745,13 @@ fn render_bash_outcome(
     let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
     let sidecar = bash_output_sidecar(command, cwd, &final_outcome, &body, truncated_for_display);
     let mut out = if truncated_for_display {
-        ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&body))
-            .with_bash_meta(meta, resource_meta)
+        ToolOutput::truncated_text(truncate_head_tail_redacted(
+            &ctx.redact,
+            &body,
+            OUTPUT_BYTE_CAP,
+        ))
+        .with_text_artifact_capture(boundary_safe_capture(&ctx.redact, &body))
+        .with_bash_meta(meta, resource_meta)
     } else {
         ToolOutput::text(body).with_bash_meta(meta, resource_meta)
     };
@@ -3025,14 +3045,22 @@ async fn run_prepared_command(
                 resource_lease.take(),
                 attached_knowledge_read,
                 identity_accounting,
+                ctx.redact.clone(),
             )
             .await;
             return RunOutcome::Backgrounded(job_id);
         },
     };
 
-    let stdout = stdout_task.join().await.bytes;
-    let stderr = stderr_task.join().await.bytes;
+    // The bounded drain kept a HEAD + TAIL and omitted the middle when the
+    // stream overflowed: joining raw `.bytes` would preserve a registered
+    // secret straddling the omission boundary as two PARTIALS the downstream
+    // whole-value §7 scrub cannot match (issue #294). Join through the
+    // boundary-safe path so the unsafe margins at the junction are elided
+    // BEFORE the raw text flows anywhere (display body, compression,
+    // artifact capture, sidecar, export).
+    let stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await).into_bytes();
+    let stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await).into_bytes();
     let exit = status.code().unwrap_or(-1);
     let signaled = !status.success() && status.code().is_none();
 
@@ -3063,6 +3091,7 @@ async fn spawn_adopted_shell_completion(
     resource_lease: Option<ResourceLeaseGuard>,
     attached_knowledge_read: bool,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    redact: std::sync::Arc<crate::redact::RedactionTable>,
 ) {
     let adopted_cancel = cancel.child_token();
     let waiter_cancel = adopted_cancel.clone();
@@ -3099,16 +3128,13 @@ async fn spawn_adopted_shell_completion(
                 };
                 let outcome = match wait_result {
                     Ok(Ok(status)) => {
-                        let stdout = stdout_task.join().await.bytes;
-                        let stderr = stderr_task.join().await.bytes;
+                        // Boundary-safe join for the bounded-drain omission
+                        // junction (issue #294), mirroring the foreground path.
+                        let stdout = boundary_safe_join(&redact, stdout_task.join().await);
+                        let stderr = boundary_safe_join(&redact, stderr_task.join().await);
                         let exit = status.code().unwrap_or(-1);
                         let signaled = !status.success() && status.code().is_none();
-                        format_combined(
-                            &String::from_utf8_lossy(&stdout),
-                            &String::from_utf8_lossy(&stderr),
-                            exit,
-                            signaled,
-                        )
+                        format_combined(&stdout, &stderr, exit, signaled)
                     }
                     Ok(Err(error)) => {
                         // A failed wait leaves adopted-process ownership
@@ -3143,8 +3169,12 @@ async fn spawn_adopted_shell_completion(
                 } else {
                     outcome
                 };
+                // The adopted result lands as a steering submission, i.e.
+                // model-facing text: truncate through the redacting truncator
+                // so a boundary-straddling secret PARTIAL never survives into
+                // the §7 whole-value scrub.
                 let bounded = if outcome.len() > OUTPUT_BYTE_CAP {
-                    truncate_head_tail(&outcome, OUTPUT_BYTE_CAP)
+                    truncate_head_tail_redacted(&redact, &outcome, OUTPUT_BYTE_CAP)
                 } else {
                     outcome
                 };

@@ -932,8 +932,9 @@ fn build_zip_with_options_and_env_conn(
         // bundled session's persisted redaction-table union (column or vault),
         // then folded IN-SNAPSHOT with each bundled session's rehydrated
         // protected-history literals (the resolver must be present and warm).
-        // Fails closed if a persisted/vault table cannot be parsed or a literal
-        // cannot be rehydrated.
+        // Fails closed if a bundled session's vault table is missing, a
+        // persisted/vault table cannot be parsed, or a literal cannot be
+        // rehydrated.
         let resolver =
             resolver.context("a redacted export requires a warm redaction key resolver")?;
         export_redaction_table_for_bundle(vault, store, Some(conn), target, bundle, env, resolver)?
@@ -1943,43 +1944,24 @@ pub fn scrub_export_json_value(value: &mut Value, redactor: &RedactionTable) {
     redact_value_for_export(value, redactor);
 }
 
-fn session_persisted_or_vault_redaction_json(
-    vault: Option<&crate::secure_key::SecretVault>,
+fn session_required_vault_redaction_json(
+    vault: &crate::secure_key::SecretVault,
     conn: Option<&Connection>,
     session: &SessionRow,
-) -> Result<Option<String>> {
-    if let Some(json) = session
-        .redaction_table_json
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(Some(json.to_string()));
-    }
-    let Some(vault) = vault else {
-        return Ok(None);
-    };
-    let item_id = crate::secure_key::redaction_table_item_id(&session.session_id.to_string());
-    let loaded = match conn {
-        Some(conn) => vault.get_item_on_conn(
+) -> Result<String> {
+    const CONTEXT: &str = "loading session redaction table for export";
+    match conn {
+        Some(conn) => crate::session::lifecycle::require_redaction_table_json_from_vault_on_conn(
+            vault,
             conn,
-            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-            &item_id,
+            session.session_id,
+            CONTEXT,
         ),
-        None => vault.get_item(
-            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-            &item_id,
+        None => crate::session::lifecycle::require_redaction_table_json_from_vault(
+            vault,
+            session.session_id,
+            CONTEXT,
         ),
-    };
-    match loaded {
-        Ok(secret) => {
-            let json = String::from_utf8(secret.as_slice().to_vec())
-                .context("redaction table vault item is not UTF-8")?;
-            Ok(Some(json))
-        }
-        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
-        Err(error) => Err(anyhow::anyhow!(
-            "reading redaction table vault item: {error}"
-        )),
     }
 }
 
@@ -1987,8 +1969,8 @@ fn session_persisted_or_vault_redaction_json(
 /// live scan unioned with **every** bundled session's persisted redaction-table
 /// union, forced enforced. Every bundled session's historically-persisted
 /// entries are included, so a secret the bundle's sessions saw is scrubbed even
-/// if it has since been rotated out of the live environment. Fails closed on
-/// any unparseable persisted table.
+/// if it has since been rotated out of the live environment. Fails closed on a
+/// missing vault, a missing session table, or any unparseable persisted table.
 #[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_bundle(
     vault: Option<&crate::secure_key::SecretVault>,
@@ -2016,17 +1998,23 @@ fn export_redaction_table_for_sessions(
 ) -> Result<RedactionTable> {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    let mut table = match store {
-        Some(store) => {
-            RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
-        }
-        None => RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env),
-    }
-    .context("building export redaction table")?;
+    let vault = vault.ok_or_else(|| {
+        crate::redact::RedactionTableUnavailable::new(
+            "building export redaction table",
+            "redacted export requires a session vault",
+        )
+    })?;
+    let store = store.ok_or_else(|| {
+        crate::redact::RedactionTableUnavailable::new(
+            "building export redaction table",
+            "redacted export requires an opened credential store",
+        )
+    })?;
+    let mut table =
+        RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
+            .context("building export redaction table")?;
     for session in sessions {
-        let Some(json) = session_persisted_or_vault_redaction_json(vault, conn, session)? else {
-            continue;
-        };
+        let json = session_required_vault_redaction_json(vault, conn, session)?;
         // Fail closed: a persisted or vault table that cannot be parsed aborts
         // the export rather than silently dropping historically-classified secrets.
         let persisted = RedactionTable::from_persisted_json(&json).with_context(|| {

@@ -53,11 +53,14 @@ impl Tool for ThreadStartTool {
             .ok_or_else(|| {
                 invalid_input("`message_seq` must be a positive recorded message sequence")
             })?;
-        let thread = ctx
-            .session
-            .db
-            .create_thread(ctx.session.id, seq.to_string())
-            .await?;
+        let thread = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &ctx.session.db,
+            ctx.session.secret_vault(),
+            ctx.session.id,
+            Some(seq.to_string()),
+            false,
+            true,
+        )?;
         let short_id = thread
             .short_id
             .unwrap_or_else(|| thread.session_id.to_string());

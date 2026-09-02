@@ -1239,7 +1239,7 @@ mod tests {
     fn test_session_id(ctx: &DaemonContext) -> Uuid {
         ctx.db
             .blocking_write_for_sync_maintenance(|conn| {
-                crate::db::Db::insert_session_row_conn(
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(conn, "project", "/repo", "Build")?,
                 )

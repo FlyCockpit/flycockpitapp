@@ -70,7 +70,12 @@ pub(crate) fn parse_line_record(line: &str, order: usize) -> Option<LineRecord> 
     None
 }
 
-pub(crate) fn thin_line_output(body: &str, query: &str, limits: ThinLimits) -> (String, bool) {
+pub(crate) fn thin_line_output(
+    redact: &crate::redact::RedactionTable,
+    body: &str,
+    query: &str,
+    limits: ThinLimits,
+) -> (String, bool) {
     let lines: Vec<&str> = body.lines().collect();
     let mut parsed = Vec::new();
     let mut unparsable = Vec::new();
@@ -138,7 +143,6 @@ pub(crate) fn thin_line_output(body: &str, query: &str, limits: ThinLimits) -> (
         }
     }
 
-    let mut rows = Vec::new();
     let mut omitted_by_file: BTreeMap<String, usize> = BTreeMap::new();
     let mut all_records: Vec<LineRecord> = by_file.values().flatten().cloned().collect();
     all_records.sort_by_key(|record| record.order);
@@ -155,9 +159,70 @@ pub(crate) fn thin_line_output(body: &str, query: &str, limits: ThinLimits) -> (
         }
     }
 
+    // Margin-safe assembly (issue #294): the thinning drops records at
+    // arbitrary interior positions, so a retained row may abut omitted
+    // records on either side. A registered secret straddling such a boundary
+    // — a multi-line literal spanning several retained rows included — would
+    // leave a PARTIAL the downstream §7 whole-value scrub cannot match.
+    // Group the retained rows into contiguous runs (consecutive `order`s,
+    // no omitted record and no omission marker between), elide the unsafe
+    // margin at each run edge that abets an omission (in joined raw
+    // coordinates), and keep the synthetic omission markers as their own
+    // rows (constants; §7 scrubs them whole).
     let last_kept_by_file = last_kept_by_file(&by_order);
+    let mut rows: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut run_front_omitted = false;
+    let mut run_back_omitted = false;
+    let mut prev_order: Option<usize> = None;
+
+    fn flush_run(
+        redact: &crate::redact::RedactionTable,
+        rows: &mut Vec<String>,
+        run: &mut Vec<String>,
+        front_omitted: bool,
+        back_omitted: bool,
+    ) {
+        if run.is_empty() {
+            return;
+        }
+        let joined = run.join("\n");
+        let safe = if front_omitted {
+            crate::tools::common::drop_front_margin(redact, &joined)
+        } else {
+            &joined[..]
+        };
+        let safe = if back_omitted {
+            crate::tools::common::drop_back_margin(redact, safe)
+        } else {
+            safe
+        };
+        rows.extend(safe.split('\n').map(str::to_string));
+        run.clear();
+    }
+
     for (order, line) in by_order {
-        let marker = parse_line_record(&line, order).and_then(|record| {
+        let contiguous =
+            prev_order.is_some_and(|p| order == p + 1) || (prev_order.is_none() && order == 0);
+        if !contiguous {
+            // An omitted record (or the stream head) precedes this row: close
+            // the previous run with a back omission and open a front-elided one.
+            if prev_order.is_some() {
+                run_back_omitted = true;
+            }
+            flush_run(
+                redact,
+                &mut rows,
+                &mut run,
+                run_front_omitted,
+                run_back_omitted,
+            );
+            run_front_omitted = prev_order.is_some() || order > 0;
+            run_back_omitted = false;
+        }
+        run.push(line);
+        prev_order = Some(order);
+        let marker = parse_line_record(run.last().unwrap(), order).and_then(|record| {
             (last_kept_by_file.get(&record.path) == Some(&order))
                 .then(|| {
                     omitted_by_file
@@ -166,14 +231,37 @@ pub(crate) fn thin_line_output(body: &str, query: &str, limits: ThinLimits) -> (
                 })
                 .flatten()
         });
-        rows.push(line);
         if let Some((path, omitted)) = marker {
+            // An omission marker is itself an emission discontinuity: even
+            // when the adjacent original records were contiguous, the inserted
+            // marker row splits them in the emitted text, so the run before it
+            // gets the back elision and the run after it the front elision.
+            run_back_omitted = true;
+            flush_run(
+                redact,
+                &mut rows,
+                &mut run,
+                run_front_omitted,
+                run_back_omitted,
+            );
+            run_front_omitted = true;
+            run_back_omitted = false;
             rows.push(format!(
                 "... [{omitted} more matches in {path} omitted; narrow query or path]"
             ));
         }
     }
-
+    let trailing_omissions = !omitted_by_file.is_empty();
+    if trailing_omissions {
+        run_back_omitted = true;
+    }
+    flush_run(
+        redact,
+        &mut rows,
+        &mut run,
+        run_front_omitted,
+        run_back_omitted,
+    );
     for (path, omitted) in omitted_by_file {
         rows.push(format!(
             "... [{omitted} more matches in {path} omitted; narrow query or path]"
@@ -252,6 +340,7 @@ mod tests {
 
     fn thin_for_test(body: &str, query: &str) -> (String, bool) {
         thin_line_output(
+            &crate::redact::RedactionTable::empty(),
             body,
             query,
             ThinLimits {
@@ -312,5 +401,39 @@ mod tests {
         assert!(out.contains("more matches in src/a.rs omitted"));
         assert!(out.contains("src/b.rs:1:"));
         assert!(out.contains("src/b.rs:4:"));
+    }
+    // A multi-line registered literal spanning a kept/omitted record boundary
+    // leaves a PARTIAL the downstream whole-value scrub cannot match. The
+    // run-edge margin elision must remove it (issue #294).
+    #[test]
+    fn thin_run_edge_elides_multi_line_straddling_secret() {
+        const SECRET: &str = "HEADSECRET-0123456789\nTAILSECRET-0123456789";
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$leak:thin".to_string())
+            .unwrap();
+        // First + last records are always kept; the middle (scored by the
+        // query) is dropped by the total cap, so both run edges abut an
+        // omission — the secret head sits at the first run's back edge and
+        // its tail at the second run's front edge.
+        let body = "src/a.rs:1: HEADSECRET-0123456789\nsrc/a.rs:2: TAILSECRET-0123456789 findme\nsrc/a.rs:3: filler three\n";
+        let (out, thinned) = thin_line_output(
+            &table,
+            body,
+            "findme",
+            ThinLimits {
+                total_records: 2,
+                per_file_records: 1,
+            },
+        );
+        assert!(thinned);
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains("HEADSECRET-0123456789"),
+            "run back-edge partial leaked: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("TAILSECRET-0123456789"),
+            "run front-edge partial leaked: {scrubbed}"
+        );
     }
 }

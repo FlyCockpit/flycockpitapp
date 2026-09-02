@@ -86,7 +86,9 @@ impl Session {
         let (project_root, project_id) = Self::test_session_identity(project_root);
         let project_root = project_root.to_string_lossy().into_owned();
         let active_agent = active_agent.to_string();
-        db.write(move |conn| {
+        let vault = crate::secure_key::vault_for_db(db)
+            .map_err(|error| anyhow::anyhow!("opening vault for test session row: {error}"))?;
+        db.transaction(move |conn| {
             let mut row = match options.assistant {
                 Some(assistant) => {
                     if let Some(entry_mode) = options.session_entry_mode {
@@ -130,7 +132,7 @@ impl Session {
             if let Some(entry_mode) = options.session_entry_mode {
                 row.session_entry_mode = entry_mode.as_str().to_string();
             }
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            super::lifecycle::persist_session_row_with_redaction_custody_on_conn(conn, &vault, &row)
         })
         .await
     }

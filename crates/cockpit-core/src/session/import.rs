@@ -42,7 +42,17 @@ const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportResult> {
     let mut archive = archive;
     stage_blob_backed_import_artifacts(db, &mut archive).await?;
-    db.import_session_archive_graph(archive).await
+    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
+        anyhow!("opening vault for imported session redaction custody: {error}")
+    })?;
+    db.transaction(move |conn| {
+        Db::import_session_archive_graph_conn(conn, archive, |conn, session_id| {
+            crate::session::lifecycle::persist_empty_redaction_table_on_conn(
+                &vault, conn, session_id,
+            )
+        })
+    })
+    .await
 }
 
 /// Archive members contain the complete portable body, while the source
@@ -1676,7 +1686,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
-            Db::insert_session_row_conn(conn, &row)?;
+            Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
         .await
@@ -1690,6 +1700,13 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        crate::session::lifecycle::require_redaction_table_json_from_vault(
+            &vault,
+            imported.imported[0],
+            "imported session redaction custody",
+        )
+        .expect("import must establish vault redaction custody for the destination session");
     }
 
     #[tokio::test]
@@ -1700,7 +1717,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
-            Db::insert_session_row_conn(conn, &row)?;
+            Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
         .await
@@ -2128,7 +2145,7 @@ mod tests {
                     "/tmp/approval-import",
                     "Build",
                 )?;
-                Db::insert_session_row_conn(conn, &row)
+                Db::insert_session_row_without_redaction_custody_conn(conn, &row)
             })
             .await
             .unwrap();
@@ -2189,7 +2206,7 @@ mod tests {
                 row.provider = Some(row_active_model.provider.clone());
                 row.model = Some(row_active_model.model.clone());
                 row.model_selection_json = Some(serde_json::to_string(&row_active_model)?);
-                Db::insert_session_row_conn(conn, &row)
+                Db::insert_session_row_without_redaction_custody_conn(conn, &row)
             })
             .await
             .unwrap();

@@ -2836,8 +2836,15 @@ mod tests {
     async fn monty_adapter_does_not_recursively_capture_inner_pages() {
         let tmp = tempfile::tempdir().unwrap();
         let full = "retained-output\n".repeat(2000);
-        let delivered =
-            crate::tools::common::truncate_head_tail(&full, crate::tools::common::OUTPUT_BYTE_CAP);
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        // The native tool's delivered body is what the redacting truncator
+        // produces against the session table (empty here, so the shape is
+        // the plain head+marker+tail split).
+        let delivered = crate::tools::common::truncate_head_tail_redacted(
+            &ctx.redact,
+            &full,
+            crate::tools::common::OUTPUT_BYTE_CAP,
+        );
         let tool = Arc::new(
             MontyAdapterTool::new("large_native", delivered).with_capture(TextArtifactCapture {
                 content: full.clone(),
@@ -2847,7 +2854,6 @@ mod tests {
                 stored_source_bytes: full.len(),
             }),
         );
-        let ctx = crate::tools::common::test_ctx(tmp.path());
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
         let monty = invoke(&host, "large_native", serde_json::json!({}))
@@ -2856,7 +2862,11 @@ mod tests {
         let body = monty.as_str().unwrap();
         assert_eq!(
             body,
-            crate::tools::common::truncate_head_tail(&full, crate::tools::common::OUTPUT_BYTE_CAP,)
+            crate::tools::common::truncate_head_tail_redacted(
+                &ctx.redact,
+                &full,
+                crate::tools::common::OUTPUT_BYTE_CAP,
+            )
         );
     }
 
@@ -3449,7 +3459,11 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let side = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db, &vault, parent.id, None, true, false,
+        )
+        .unwrap();
         let session = Arc::new(
             crate::session::Session::resume_for_test(
                 db,
@@ -3552,7 +3566,11 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let side = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db, &vault, parent.id, None, true, false,
+        )
+        .unwrap();
         let session = Arc::new(
             crate::session::Session::resume_for_test(
                 db,

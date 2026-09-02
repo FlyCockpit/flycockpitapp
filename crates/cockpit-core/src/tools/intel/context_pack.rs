@@ -138,7 +138,8 @@ impl Tool for ContextPackTool {
         match kind {
             ContextPackKind::Auto => unreachable!("auto is resolved above"),
             ContextPackKind::Overview => {
-                let mut out = context_pack_overview(&index, &files, depth, limit).await?;
+                let mut out =
+                    context_pack_overview(&ctx.redact, &index, &files, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -151,7 +152,8 @@ impl Tool for ContextPackTool {
                         "path target `{target}` was not found; try `context_pack` without `target` or run `code` with kind `tree`"
                     )));
                 };
-                let mut out = context_pack_path(&index, &files, &rel, depth, limit).await?;
+                let mut out =
+                    context_pack_path(&ctx.redact, &index, &files, &rel, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -159,7 +161,8 @@ impl Tool for ContextPackTool {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=symbol"));
                 };
-                let mut out = context_pack_symbol(&index, &files, target, depth, limit).await?;
+                let mut out =
+                    context_pack_symbol(&ctx.redact, &index, &files, target, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -298,6 +301,7 @@ fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) 
 }
 
 async fn context_pack_overview(
+    redact: &crate::redact::RedactionTable,
     index: &Index,
     files: &[ContextFileMeta],
     depth: usize,
@@ -322,6 +326,7 @@ async fn context_pack_overview(
     for (lang, count) in lang_rows.into_iter().take(limit) {
         if !write_retained_line(&mut writer, &format!("  {lang}: {count}")) {
             return Ok(finish(
+                redact,
                 writer,
                 "\n... [truncated; lower `limit` or target a path]\n",
             ));
@@ -350,7 +355,7 @@ async fn context_pack_overview(
                     file.path, file.centrality, file.symbols
                 ),
             ) {
-                return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
+                return Ok(finish(redact, writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
     }
@@ -371,7 +376,7 @@ async fn context_pack_overview(
                 line_count_label(file.lines)
             ),
         ) {
-            return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
+            return Ok(finish(redact, writer, "\n... [truncated; lower `limit`]\n"));
         }
     }
 
@@ -397,7 +402,7 @@ async fn context_pack_overview(
                     line_count_label(file.lines)
                 ),
             ) {
-                return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
+                return Ok(finish(redact, writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
     }
@@ -409,7 +414,11 @@ async fn context_pack_overview(
     } else {
         for s in entries {
             if !write_retained_line(&mut writer, &format_symbol_line(&s)) {
-                return Ok(finish(writer, "\n... [truncated; target a symbol]\n"));
+                return Ok(finish(
+                    redact,
+                    writer,
+                    "\n... [truncated; target a symbol]\n",
+                ));
             }
         }
     }
@@ -420,6 +429,7 @@ async fn context_pack_overview(
     for cycle in cycles.into_iter().take(limit.min(5)) {
         if !write_retained_line(&mut writer, &format!("  {}", cycle.join(" -> "))) {
             return Ok(finish(
+                redact,
                 writer,
                 "\n... [truncated; use `graph` kind `cycles`]\n",
             ));
@@ -427,12 +437,14 @@ async fn context_pack_overview(
     }
     writer.writeln(&format!("next: context_pack {{target:<path|symbol>, depth:{depth}}}; code kind=outline path=<path>; graph kind=deps path=<path>; code kind=symbol_find name=<name>"));
     Ok(finish(
+        redact,
         writer,
         "\n... [truncated; target a path, symbol, or query]\n",
     ))
 }
 
 async fn context_pack_path(
+    redact: &crate::redact::RedactionTable,
     index: &Index,
     files: &[ContextFileMeta],
     rel: &str,
@@ -485,7 +497,7 @@ async fn context_pack_path(
     } else {
         for (target, line) in imports.iter().take(limit) {
             if !write_retained_line(&mut writer, &format!("  {rel}:{line} -> {target}")) {
-                return Ok(finish(writer, "\n... [truncated; lower `limit`]\n"));
+                return Ok(finish(redact, writer, "\n... [truncated; lower `limit`]\n"));
             }
         }
         write_omitted(&mut writer, imports.len(), limit, "imports");
@@ -498,6 +510,7 @@ async fn context_pack_path(
         for s in symbols.iter().take(limit) {
             if !write_retained_line(&mut writer, &format!("  {}", format_symbol_line(s))) {
                 return Ok(finish(
+                    redact,
                     writer,
                     "\n... [truncated; use `code` kind `outline`]\n",
                 ));
@@ -510,6 +523,7 @@ async fn context_pack_path(
     writer.writeln("  forward:");
     if !write_dep_rows(&mut writer, &forward, limit) {
         return Ok(finish(
+            redact,
             writer,
             "
 ... [truncated; use `graph` kind `deps`]
@@ -519,6 +533,7 @@ async fn context_pack_path(
     writer.writeln("  reverse:");
     if !write_dep_rows(&mut writer, &reverse, limit) {
         return Ok(finish(
+            redact,
             writer,
             "
 ... [truncated; use `graph` kind `importers`]
@@ -533,6 +548,7 @@ async fn context_pack_path(
                 &format!("    {}: {}", edge.line, edge.raw_target),
             ) {
                 return Ok(finish(
+                    redact,
                     writer,
                     "\n... [truncated; use `graph` kind `importers`]\n",
                 ));
@@ -554,7 +570,7 @@ async fn context_pack_path(
                     s.path, start, len, s.name
                 ),
             ) {
-                return Ok(finish(writer, "\n... [truncated]\n"));
+                return Ok(finish(redact, writer, "\n... [truncated]\n"));
             }
         }
     }
@@ -562,12 +578,14 @@ async fn context_pack_path(
         "next: code kind=outline path={rel}; graph kind=importers path={rel} hops={depth}; read narrow ranges above"
     ));
     Ok(finish(
+        redact,
         writer,
         "\n... [truncated; use `code` kind `outline` or `graph` kind `deps`]\n",
     ))
 }
 
 async fn context_pack_symbol(
+    redact: &crate::redact::RedactionTable,
     index: &Index,
     files: &[ContextFileMeta],
     target: &str,
@@ -600,6 +618,7 @@ async fn context_pack_symbol(
             &format!("  {} centrality={:.2}", format_symbol_line(s), score),
         ) {
             return Ok(finish(
+                redact,
                 writer,
                 "\n... [truncated; narrow with exact target/path]\n",
             ));
@@ -629,6 +648,7 @@ async fn context_pack_symbol(
                 &format!("    caller {caller_file}:{caller_line}{in_sym}"),
             ) {
                 return Ok(finish(
+                    redact,
                     writer,
                     "\n... [truncated; use `graph` kind `callers`]\n",
                 ));
@@ -640,6 +660,7 @@ async fn context_pack_symbol(
                 &format!("    calls {callee} -> {def_file}:{def_line}"),
             ) {
                 return Ok(finish(
+                    redact,
                     writer,
                     "\n... [truncated; use `graph` kind `calls`]\n",
                 ));
@@ -660,13 +681,14 @@ async fn context_pack_symbol(
                 s.path, s.line, len, s.name
             ),
         ) {
-            return Ok(finish(writer, "\n... [truncated]\n"));
+            return Ok(finish(redact, writer, "\n... [truncated]\n"));
         }
     }
     writer.writeln(&format!(
         "next: graph kind=callers/calls name={target:?}; read suggested ranges; code kind=word token={target:?}"
     ));
     Ok(finish(
+        redact,
         writer,
         "\n... [truncated; narrow target or use `graph` kind `callers`/`calls`]\n",
     ))
@@ -695,7 +717,11 @@ async fn context_pack_query(
     } else {
         for s in symbol_hits.iter().take(limit) {
             if !write_retained_line(&mut writer, &format!("  {}", format_symbol_line(s))) {
-                return Ok(finish(writer, "\n... [truncated; narrow query]\n"));
+                return Ok(finish(
+                    &ctx.redact,
+                    writer,
+                    "\n... [truncated; narrow query]\n",
+                ));
             }
         }
     }
@@ -718,6 +744,7 @@ async fn context_pack_query(
                 .join(",");
             if !write_retained_line(&mut writer, &format!("  {path}: {joined}")) {
                 return Ok(finish(
+                    &ctx.redact,
                     writer,
                     "\n... [truncated; use `code` kind `word`]\n",
                 ));
@@ -732,13 +759,18 @@ async fn context_pack_query(
     } else {
         for (path, line) in text_hits.into_iter().take(limit) {
             if !write_retained_line(&mut writer, &format!("  {path}:{line}")) {
-                return Ok(finish(writer, "\n... [truncated; use `search`]\n"));
+                return Ok(finish(
+                    &ctx.redact,
+                    writer,
+                    "\n... [truncated; use `search`]\n",
+                ));
             }
         }
     }
 
     writer.writeln(&format!("next: search pattern={target:?}; code kind=symbol_find name={target:?}; code kind=word token={target:?}; read promising anchors"));
     Ok(finish(
+        &ctx.redact,
         writer,
         "\n... [truncated; narrow query or use `search`]\n",
     ))

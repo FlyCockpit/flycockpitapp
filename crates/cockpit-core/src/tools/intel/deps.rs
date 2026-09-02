@@ -91,7 +91,7 @@ impl Tool for DepsTool {
             writer.writeln(&format!("forward ({}):", reached.len()));
             for (dist, p) in &reached {
                 if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
-                    let mut out = finish(writer, "\n... [truncated]\n");
+                    let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
                     append_freshen_note(&mut out, &freshen_report);
                     return Ok(out);
                 }
@@ -102,7 +102,7 @@ impl Tool for DepsTool {
             writer.writeln(&format!("reverse ({}):", reached.len()));
             for (dist, p) in &reached {
                 if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
-                    let mut out = finish(writer, "\n... [truncated]\n");
+                    let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
                     append_freshen_note(&mut out, &freshen_report);
                     return Ok(out);
                 }
@@ -116,7 +116,7 @@ impl Tool for DepsTool {
                 }
             }
         }
-        let mut out = finish(writer, "\n... [truncated]\n");
+        let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
         append_freshen_note(&mut out, &freshen_report);
         Ok(out)
     }

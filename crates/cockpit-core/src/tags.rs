@@ -382,18 +382,33 @@ pub struct TagPolicy {
     allow_root: PathBuf,
     allow: Vec<String>,
     caps: TagInlineCaps,
+    /// Session redaction table for the inline expansion's truncation
+    /// boundaries: the per-file line/byte caps can cut a registered secret
+    /// mid-value, and the downstream whole-value §7 scrub cannot match the
+    /// surviving partial (issue #294).
+    redact: std::sync::Arc<crate::redact::RedactionTable>,
 }
 
 impl TagPolicy {
     #[cfg(test)]
     fn new(cwd: &Path, allow: Vec<String>) -> Self {
-        Self::new_for_caps(cwd, allow, TagInlineCaps::STANDARD)
+        Self::new_for_caps(
+            cwd,
+            allow,
+            TagInlineCaps::STANDARD,
+            std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+        )
     }
 
     /// Build a policy with an explicit inline-caps profile (issue #75). The
     /// mode axis no longer selects caps; callers pass the resolved
     /// [`TagInlineCaps`] (typically from [`TagInlineCaps::for_def`]).
-    pub fn new_for_caps(cwd: &Path, allow: Vec<String>, caps: TagInlineCaps) -> Self {
+    pub fn new_for_caps(
+        cwd: &Path,
+        allow: Vec<String>,
+        caps: TagInlineCaps,
+        redact: std::sync::Arc<crate::redact::RedactionTable>,
+    ) -> Self {
         let cwd_resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
         Self {
@@ -402,6 +417,7 @@ impl TagPolicy {
             allow_root,
             allow,
             caps,
+            redact,
         }
     }
 
@@ -641,6 +657,11 @@ fn try_inline(
     let caps = policy
         .map(TagPolicy::caps)
         .unwrap_or(TagInlineCaps::STANDARD);
+    // No policy (bare `expand_tags`) has no session table; the driver and
+    // TUI paths always construct one.
+    let redact = policy
+        .map(|p| p.redact.clone())
+        .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
     let meta = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(e) => {
@@ -734,7 +755,7 @@ fn try_inline(
         }
     }
 
-    let (block, lines_shown) = render_file(&text, path_part, range, caps);
+    let (block, lines_shown) = render_file(&text, path_part, range, caps, &redact);
     Expanded {
         wire_piece: block,
         expansion: TagExpansion {
@@ -853,13 +874,14 @@ fn render_file(
     display_path: &str,
     range: Option<(usize, usize)>,
     caps: TagInlineCaps,
+    redact: &crate::redact::RedactionTable,
 ) -> (String, usize) {
     let (offset, limit) = match range {
         Some((start, usize::MAX)) => (start, caps.max_lines),
         Some((start, end)) => (start, end - start + 1),
         None => (1, caps.max_lines),
     };
-    let slice = read_slice_with_byte_cap(text, offset, limit, caps.max_bytes);
+    let slice = read_slice_with_byte_cap(redact, text, offset, limit, caps.max_bytes);
     let lines_shown = slice.numbered.lines().count();
     let mut out = format!("\n<file path=\"{display_path}\">\n{}", slice.numbered);
     if !out.ends_with('\n') {
@@ -953,7 +975,17 @@ mod tests {
     }
 
     fn policy_for(cwd: &Path) -> TagPolicy {
-        TagPolicy::new_for_caps(cwd, Vec::new(), TagInlineCaps::STANDARD)
+        policy_for_with_redact(
+            cwd,
+            std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+        )
+    }
+
+    fn policy_for_with_redact(
+        cwd: &Path,
+        redact: std::sync::Arc<crate::redact::RedactionTable>,
+    ) -> TagPolicy {
+        TagPolicy::new_for_caps(cwd, Vec::new(), TagInlineCaps::STANDARD, redact)
     }
 
     fn expand_with(buffer: &str, cwd: &Path) -> ExpandResult {
@@ -1096,6 +1128,44 @@ mod tests {
             shown < lines && shown > 0,
             "byte-capped range should inline a proper prefix, not the full request: {}",
             res.expansions[0].detail
+        );
+    }
+
+    // Issue #294: the inline expansion truncates at the line/byte caps and
+    // at offset-read fronts; a registered secret straddling such a cut
+    // leaves a PARTIAL the downstream whole-value §7 scrub cannot match.
+    // The policy's table must drive the boundary elision (the TUI submit
+    // path builds this table fail-closed for exactly this reason).
+    #[test]
+    fn range_tag_offset_front_edge_elides_secret_straddling_omitted_line() {
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = std::sync::Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(secret, "tag-offset-straddle-test".to_string())
+                .unwrap(),
+        );
+        let root = tmp_root();
+        fs::write(
+            root.path().join("notes.txt"),
+            format!("prelude {HALF_A}\n{HALF_B} epilogue\n"),
+        )
+        .unwrap();
+        // The range starts at line 2: line 1 (holding the secret's first
+        // half) is omitted, so a boundary-unsafe slice would open the block
+        // with the secret's unmatchable SUFFIX.
+        let policy = policy_for_with_redact(root.path(), table.clone());
+        let res = expand_tags_with_policy("@notes.txt:2", &policy);
+        assert!(
+            res.wire.contains("<file path=\"notes.txt\">"),
+            "tag must still inline the file block: {}",
+            res.wire
+        );
+        let scrubbed = table.scrub(&res.wire);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "range-tag offset front edge leaked a secret suffix: {scrubbed}"
         );
     }
 

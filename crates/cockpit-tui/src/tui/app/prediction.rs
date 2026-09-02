@@ -40,13 +40,17 @@ impl App {
         let slot = Arc::clone(&self.prediction_result);
         tokio::spawn(async move {
             let (extended, providers) = cockpit_core::auto_title::load_configs_for(&cwd);
-            // Build the same non-bypassable redaction table the driver uses
-            // (GOALS §7) so the prediction prompt is scrubbed before send.
+            // Scrub env/dotenv/ssh material before the local utility call
+            // (GOALS §7). Named secrets live in the daemon-owned vault and
+            // cannot be opened from this process while the daemon holds the
+            // database; daemon-emitted history is already scrubbed. A table
+            // build failure refuses the prediction send rather than
+            // proceeding unredacted.
             let redactor = match cockpit_core::redact::RedactionTable::build(&extended.redact, &cwd)
             {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
-                    tracing::debug!(error = %e, "predict: redaction table build failed; no ghost");
+                    tracing::warn!(error = %e, "predict: redaction table build failed; no ghost");
                     return;
                 }
             };

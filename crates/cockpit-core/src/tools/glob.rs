@@ -132,11 +132,16 @@ impl Tool for GlobTool {
         let denied_knowledge_roots =
             crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let root = canonical_root.clone();
+        // Owned table clone for the 'static blocking worker: the record budget
+        // and the retained artifact capture elide their omission boundaries
+        // under the session table the §7 egress scrub will use.
+        let redact = ctx.redact.clone();
         let out = tokio::task::spawn_blocking(move || {
             glob_blocking(
                 &set,
                 &walk_root,
                 &root,
+                &redact,
                 &secret_paths,
                 &attached_knowledge_roots,
                 &denied_knowledge_roots,
@@ -152,6 +157,7 @@ fn glob_blocking(
     set: &globset::GlobSet,
     walk_root: &Path,
     canonical_root: &Path,
+    redact: &crate::redact::RedactionTable,
     secret_paths: &crate::secret_paths::SecretPathMatcher,
     attached_knowledge_roots: &[std::path::PathBuf],
     denied_knowledge_roots: &[std::path::PathBuf],
@@ -215,8 +221,8 @@ fn glob_blocking(
         return Ok(ToolOutput::text("No matching files.".to_string()));
     }
     let truncated = writer.is_truncated() || hit_cap;
-    let capture = writer.text_artifact_capture();
-    let mut body = writer.into_string();
+    let capture = writer.text_artifact_capture_redacted(redact);
+    let mut body = writer.into_string_redacted(redact);
     let mut output = if truncated {
         body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
         let output = ToolOutput::truncated_text(body);

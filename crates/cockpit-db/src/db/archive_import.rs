@@ -267,18 +267,36 @@ fn thread_anchor_sources(
 impl Db {
     /// Restore all sessions, events, sidecars, artifact associations, and
     /// import provenance inside one database-owned writer transaction.
+    ///
+    /// `establish_redaction_custody` runs for each destination session id
+    /// before that row is inserted. The insert primitive requires a
+    /// `redaction_table` vault item on this connection.
     pub async fn import_session_archive_graph(
         &self,
         graph: SessionArchiveImportGraph,
+        establish_redaction_custody: impl FnMut(&Connection, Uuid) -> Result<()> + Send + 'static,
     ) -> Result<ArchiveImportResult> {
-        self.transaction(move |conn| import_session_archive_graph_conn(conn, graph))
-            .await
+        self.transaction(move |conn| {
+            Self::import_session_archive_graph_conn(conn, graph, establish_redaction_custody)
+        })
+        .await
+    }
+
+    /// Conn-level import body so callers can compose vault redaction custody
+    /// in the same SQLite transaction as the restored session rows.
+    pub fn import_session_archive_graph_conn(
+        conn: &Connection,
+        graph: SessionArchiveImportGraph,
+        establish_redaction_custody: impl FnMut(&Connection, Uuid) -> Result<()>,
+    ) -> Result<ArchiveImportResult> {
+        import_session_archive_graph_conn(conn, graph, establish_redaction_custody)
     }
 }
 
 fn import_session_archive_graph_conn(
     conn: &Connection,
     mut graph: SessionArchiveImportGraph,
+    mut establish_redaction_custody: impl FnMut(&Connection, Uuid) -> Result<()>,
 ) -> Result<ArchiveImportResult> {
     let source_ids: BTreeSet<Uuid> = graph
         .sessions
@@ -461,7 +479,12 @@ fn import_session_archive_graph_conn(
             row.last_active_at_unix_ms = session.started_at_unix_ms;
             row.ended_at_unix_ms = session.ended_at_unix_ms;
             row.title = session.title;
-            Db::insert_session_row_conn(conn, &row)?;
+            establish_redaction_custody(conn, row.session_id)?;
+            let custody = crate::db::sessions::SessionRedactionCustody::require_on_conn(
+                conn,
+                row.session_id,
+            )?;
+            Db::insert_session_row_conn(conn, &row, custody)?;
             conn.execute(
                 "UPDATE sessions
                     SET parent_session_id = ?1, fork_point_turn_id = ?2, ended_at_unix_ms = ?3,

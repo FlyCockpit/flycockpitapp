@@ -1,5 +1,7 @@
 //! Plan-to-Build handoff tool.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -69,15 +71,14 @@ impl Tool for StartBuildTool {
             )));
         }
 
-        let row = ctx
-            .session
-            .db
-            .create_session(
-                &ctx.session.project_id,
-                &ctx.session.project_root.to_string_lossy(),
-                "Build",
-            )
-            .await?;
+        let row = crate::session::lifecycle::persist_session_with_redaction_custody(
+            &ctx.session.db,
+            Arc::clone(ctx.session.secret_vault()),
+            &ctx.session.project_id,
+            &ctx.session.project_root.to_string_lossy(),
+            "Build",
+        )
+        .await?;
         insert_user_message(&ctx.session.db, row.session_id, &doc.content)
             .await
             .context("recording Build kickoff message")?;
@@ -361,13 +362,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "Build");
 
+        let build_id = Uuid::parse_str(&rows[0].0).unwrap();
         let events: Vec<(String, serde_json::Value)> = db
             .read(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT type, data_json FROM session_events WHERE session_id = ?1 ORDER BY seq",
                 )?;
                 let rows = stmt
-                    .query_map([rows[0].0.as_str()], |row| {
+                    .query_map([build_id.to_string()], |row| {
                         let kind: String = row.get(0)?;
                         let data: String = row.get(1)?;
                         Ok((kind, serde_json::from_str(&data).unwrap()))
@@ -381,6 +383,14 @@ mod tests {
         assert_eq!(events[0].0, "user_message");
         assert_eq!(events[0].1["text"], "Standalone implementation plan");
         assert_eq!(events[1].0, "user_note");
+
+        crate::session::Session::resume_for_test(
+            db,
+            build_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("start_build session must resume with redaction custody");
     }
 
     #[tokio::test]

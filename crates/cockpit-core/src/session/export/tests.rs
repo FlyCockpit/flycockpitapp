@@ -72,6 +72,11 @@ async fn trusted_build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) 
     .await
 }
 
+fn persist_test_redaction_custody(db: &crate::db::Db, session_id: Uuid) {
+    let json = RedactionTable::empty().to_persisted_json().unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(db, session_id, &json).unwrap();
+}
+
 async fn create_test_session(
     db: &crate::db::Db,
     project_id: &str,
@@ -81,17 +86,20 @@ async fn create_test_session(
     let project_id = project_id.to_string();
     let project_root = project_root.to_string();
     let active_agent = active_agent.to_string();
-    db.write(move |conn| {
-        let row = crate::db::Db::build_new_session_row_conn(
-            conn,
-            &project_id,
-            &project_root,
-            &active_agent,
-        )?;
-        crate::db::Db::insert_session_row_conn(conn, &row)
-    })
-    .await
-    .unwrap()
+    let row = db
+        .write(move |conn| {
+            let row = crate::db::Db::build_new_session_row_conn(
+                conn,
+                &project_id,
+                &project_root,
+                &active_agent,
+            )?;
+            crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &row)
+        })
+        .await
+        .unwrap();
+    persist_test_redaction_custody(db, row.session_id);
+    row
 }
 
 async fn stage_text_artifact_blob(db: &crate::db::Db, session_id: Uuid, text: &str) -> String {
@@ -103,19 +111,9 @@ async fn stage_text_artifact_blob(db: &crate::db::Db, session_id: Uuid, text: &s
 }
 
 async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
-    db.write(move |conn| {
-        crate::db::Db::create_fork_conn(
-            conn,
-            parent_session_id,
-            None,
-            false,
-            false,
-            Uuid::new_v4(),
-            chrono::Utc::now().timestamp_millis(),
-        )
-    })
-    .await
-    .unwrap()
+    let row = db.create_fork(parent_session_id, None).await.unwrap();
+    persist_test_redaction_custody(db, row.session_id);
+    row
 }
 
 async fn get_test_session(db: &crate::db::Db, session_id: Uuid) -> SessionRow {
@@ -3798,6 +3796,40 @@ async fn redaction_failure_aborts_export() {
     );
 }
 
+#[tokio::test]
+async fn missing_session_redaction_vault_item_aborts_export() {
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", "/proj", "builder").await;
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+    vault
+        .delete_item(
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &crate::secure_key::redaction_table_item_id(&session.session_id.to_string()),
+        )
+        .unwrap();
+    let target = get_test_session(&db, session.session_id).await;
+
+    let error = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        crate::session::test_redaction_key_resolver(),
+        std::collections::HashMap::new(),
+    )
+    .await
+    .expect_err("export must refuse to proceed without the session redaction table");
+    let message = format!("{error:#}");
+    assert!(
+        crate::redact::RedactionTableUnavailable::in_chain(&error),
+        "missing table must be a typed redaction failure: {message}"
+    );
+    assert!(
+        message.contains("refusing to proceed unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+}
+
 /// Insert one captured inference call: an `inference_calls` row (carrying
 /// the `is_utility` flag), the request payload, and the timeline event the
 /// export iterates. Returns the call_id.
@@ -5203,9 +5235,12 @@ async fn redacted_export_scrubs_secret_from_every_member_including_manifest_and_
         [("PLANTED".to_string(), SECRET.to_string())],
     )
     .unwrap();
-    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &db,
+        sid,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
 
     let target = get_test_session(&db, sid).await;
     let vault = crate::secure_key::vault_for_db(&db).unwrap();
@@ -5402,9 +5437,12 @@ async fn single_scrub_redacts_placeholder_substring_literal_without_corrupting_o
         ],
     )
     .unwrap();
-    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &db,
+        sid,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
 
     let target = get_test_session(&db, sid).await;
     let vault = crate::secure_key::vault_for_db(&db).unwrap();

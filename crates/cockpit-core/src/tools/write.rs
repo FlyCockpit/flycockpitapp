@@ -311,9 +311,12 @@ impl Tool for WriteTool {
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
-        if let Some(note) =
-            crate::tools::data_syntax::data_syntax_note(&path, &normalized, &config.data_syntax)
-        {
+        if let Some(note) = crate::tools::data_syntax::data_syntax_note(
+            &ctx.redact,
+            &path,
+            &normalized,
+            &config.data_syntax,
+        ) {
             message.push_str(&note);
         }
         if let Some(advisory) = outcome.advisory() {

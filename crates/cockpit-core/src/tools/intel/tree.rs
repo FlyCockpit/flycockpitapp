@@ -136,6 +136,7 @@ impl Tool for TreeTool {
             return Ok(out);
         }
         let mut out = finish(
+            &ctx.redact,
             writer,
             "\n... [truncated; pass `path` to scope to a subtree]\n",
         );

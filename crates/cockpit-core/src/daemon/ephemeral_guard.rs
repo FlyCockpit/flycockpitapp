@@ -899,6 +899,7 @@ mod tests {
                     Body::Request {
                         id,
                         request: Request::DaemonStatus,
+                        ..
                     } => id,
                     _ => panic!("expected daemon lifetime confirmation"),
                 }
@@ -916,7 +917,7 @@ mod tests {
             RecvFrame::Envelope(envelope) => {
                 let Envelope { body, .. } = *envelope;
                 match body {
-                    Body::Request { id, request } => {
+                    Body::Request { id, request, .. } => {
                         assert!(matches!(request, Request::StopDaemon { grace_secs: None }));
                         id
                     }
@@ -1422,6 +1423,7 @@ mod tests {
                     Body::Request {
                         id,
                         request: Request::DaemonStatus,
+                        ..
                     } => id,
                     other => panic!("expected daemon lifetime confirmation, got {other:?}"),
                 },

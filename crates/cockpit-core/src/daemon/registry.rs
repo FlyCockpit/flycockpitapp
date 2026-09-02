@@ -3771,13 +3771,15 @@ mod tests {
         )
         .unwrap();
         parent.set_active_model("lmstudio", "parent-model").unwrap();
-        let fork = reg
-            .inner
-            .db
-            .create_btw_fork(parent.id, false)
-            .await
-            .expect("btw fork")
-            .info;
+        let fork = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+            &reg.inner.db,
+            crate::secure_key::vault_for_db(&reg.inner.db).expect("test vault"),
+            parent.id,
+            false,
+        )
+        .await
+        .expect("btw fork")
+        .info;
         let fork_session = Session::resume_for_test(
             reg.inner.db.clone(),
             fork.session_id,

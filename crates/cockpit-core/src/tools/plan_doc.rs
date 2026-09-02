@@ -362,13 +362,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "Build");
 
+        let build_id = Uuid::parse_str(&rows[0].0).unwrap();
         let events: Vec<(String, serde_json::Value)> = db
             .read(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT type, data_json FROM session_events WHERE session_id = ?1 ORDER BY seq",
                 )?;
                 let rows = stmt
-                    .query_map([rows[0].0.as_str()], |row| {
+                    .query_map([build_id.to_string()], |row| {
                         let kind: String = row.get(0)?;
                         let data: String = row.get(1)?;
                         Ok((kind, serde_json::from_str(&data).unwrap()))
@@ -383,7 +384,6 @@ mod tests {
         assert_eq!(events[0].1["text"], "Standalone implementation plan");
         assert_eq!(events[1].0, "user_note");
 
-        let build_id = Uuid::parse_str(&rows[0].0).unwrap();
         crate::session::Session::resume_for_test(
             db,
             build_id,

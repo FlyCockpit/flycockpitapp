@@ -3919,9 +3919,10 @@ async fn spawn_fails_closed_when_persisted_redaction_table_cannot_load() {
         std::time::Instant::now(),
         None,
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
-        SessionConfigSnapshot::new(0, providers, extended),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
-    .expect_err("spawn must refuse to start with an unloadable redaction table");
+    .err()
+    .expect("spawn must refuse to start with an unloadable redaction table");
     let message = format!("{err:#}");
     assert!(
         message.contains("refusing to proceed unredacted")
@@ -4003,9 +4004,10 @@ async fn spawn_fails_closed_when_persisted_redaction_table_is_missing() {
         std::time::Instant::now(),
         None,
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
-        SessionConfigSnapshot::new(0, providers, extended),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
-    .expect_err("spawn must refuse to start a durable session without redaction custody");
+    .err()
+    .expect("spawn must refuse to start a durable session without redaction custody");
     let message = format!("{err:#}");
     assert!(
         message.contains("refusing to proceed unredacted")

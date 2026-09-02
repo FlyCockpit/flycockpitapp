@@ -1816,7 +1816,8 @@ mod vault_unification_tests {
             None,
             crate::session::test_redaction_key_resolver(),
         )
-        .expect_err("fork must refuse to proceed without the parent redaction table");
+        .err()
+        .expect("fork must refuse to proceed without the parent redaction table");
         let message = format!("{err:#}");
         assert!(
             message.contains("refusing to proceed unredacted"),
@@ -1864,7 +1865,8 @@ mod vault_unification_tests {
             None,
             crate::session::test_redaction_key_resolver(),
         )
-        .expect_err("fork must refuse to proceed without the parent redaction table");
+        .err()
+        .expect("fork must refuse to proceed without the parent redaction table");
         let message = format!("{err:#}");
         assert!(
             crate::redact::RedactionTableUnavailable::in_chain(&err),
@@ -1917,7 +1919,8 @@ mod vault_unification_tests {
             session_id,
             crate::session::test_redaction_key_resolver(),
         )
-        .expect_err("resume must refuse a durable session without redaction custody");
+        .err()
+        .expect("resume must refuse a durable session without redaction custody");
         let message = format!("{err:#}");
         assert!(
             crate::redact::RedactionTableUnavailable::in_chain(&err),

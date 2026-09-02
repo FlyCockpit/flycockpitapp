@@ -59,13 +59,14 @@ use crate::computer::{
 };
 
 #[derive(Debug)]
-pub struct WindowsDesktopBackend {
+pub(crate) struct WindowsDesktopBackend {
     geometry: DisplayGeometry,
     origin_x: i32,
     origin_y: i32,
     held_keyboard_inputs: Vec<HeldKeyboardInput>,
     held_input_journal: WindowsHeldInputJournal,
     held_buttons: Vec<MouseButton>,
+    physical_capability: Option<crate::computer::coordinator::PhysicalDispatchCapability>,
 }
 
 /// Every keyboard down event is made durable before `SendInput`. Recovery uses
@@ -136,7 +137,7 @@ impl WindowsHeldInputJournal {
 }
 
 impl WindowsDesktopBackend {
-    pub fn construct(
+    pub(crate) fn construct(
         target: DisplayTarget,
         grant_store: Option<&RealDesktopGrantStore>,
     ) -> Result<Self, ComputerError> {
@@ -158,7 +159,17 @@ impl WindowsDesktopBackend {
             held_keyboard_inputs,
             held_input_journal,
             held_buttons: Vec::new(),
+            physical_capability: None,
         })
+    }
+
+    fn require_physical_capability(&self) -> Result<(), ComputerError> {
+        self.physical_capability
+            .as_ref()
+            .ok_or_else(|| {
+                ComputerError::Refused("physical backend is not coordinator-bound".into())
+            })?
+            .recheck(BackendKind::RealDesktopWindows)
     }
 
     fn reload_held_keyboard_inputs(&mut self) -> Result<(), ComputerError> {
@@ -388,6 +399,7 @@ impl ComputerBackend for WindowsDesktopBackend {
         &mut self,
         action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
+        self.require_physical_capability()?;
         match action.effect() {
             NormalizedComputerEffect::CaptureFull => Ok(captured(self, None, None)?),
             NormalizedComputerEffect::CaptureRegion { rect } => {
@@ -546,6 +558,15 @@ impl ComputerBackend for WindowsDesktopBackend {
             }
         }
         first.map_or(Ok(()), Err)
+    }
+
+    fn bind_physical_capability(
+        &mut self,
+        capability: crate::computer::coordinator::PhysicalDispatchCapability,
+    ) -> Result<(), ComputerError> {
+        capability.recheck(BackendKind::RealDesktopWindows)?;
+        self.physical_capability = Some(capability);
+        Ok(())
     }
 }
 

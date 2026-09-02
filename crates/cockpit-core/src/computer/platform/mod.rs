@@ -11,6 +11,10 @@ pub mod windows;
 mod windows_native;
 pub mod x11;
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::MacActiveConsoleSession;
+#[cfg(target_os = "macos")]
+pub use macos::MacOsTargetEvidenceAdapter;
 pub use macos::{
     AU_DEFAUDITSID, CgSessionKey, MacAxAttribute, MacAxNotification, MacCallbackGate,
     MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,
@@ -24,7 +28,7 @@ pub use windows::{
     WindowsEvidenceLogic, WindowsSessionParts, windows_monitor_display_id, windows_session_id,
 };
 #[cfg(target_os = "windows")]
-pub use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdapter};
+pub(crate) use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdapter};
 #[cfg(target_os = "linux")]
 pub use x11::X11TargetEvidenceAdapter;
 pub use x11::{

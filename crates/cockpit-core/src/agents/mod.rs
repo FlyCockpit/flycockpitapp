@@ -101,6 +101,10 @@ pub enum AgentCapability {
     SandboxEscalate,
     ForkContext,
     ScopedParallelWrite,
+    /// Request for the host-only trusted-child acquisition sub-profile. A
+    /// definition can declare the request, but ordinary posture resolution
+    /// never turns it into authority; only the owner acquisition action does.
+    SealedAcquisitionCapture,
 }
 
 impl AgentCapability {
@@ -111,6 +115,7 @@ impl AgentCapability {
             "sandboxEscalate" => Some(Self::SandboxEscalate),
             "forkContext" => Some(Self::ForkContext),
             "scopedParallelWrite" => Some(Self::ScopedParallelWrite),
+            "sealedAcquisitionCapture" => Some(Self::SealedAcquisitionCapture),
             _ => None,
         }
     }
@@ -122,6 +127,7 @@ impl AgentCapability {
             Self::SandboxEscalate => "sandboxEscalate",
             Self::ForkContext => "forkContext",
             Self::ScopedParallelWrite => "scopedParallelWrite",
+            Self::SealedAcquisitionCapture => "sealedAcquisitionCapture",
         }
     }
 }
@@ -237,7 +243,13 @@ impl PostureResolution {
                         .capabilities
                         .iter()
                         .copied()
-                        .filter(|capability| *capability != AgentCapability::ComputerUse)
+                        .filter(|capability| {
+                            !matches!(
+                                capability,
+                                AgentCapability::ComputerUse
+                                    | AgentCapability::SealedAcquisitionCapture
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -572,6 +584,11 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
         return validate_invariants(def);
     };
     vnext.validate()?;
+    // Admission of the complete acquisition-private class must inspect the
+    // original definition: its empty source + portable id + capability are
+    // binary-stamped provenance. Never ask a provenance-stripped legacy clone
+    // to reconstruct that fact.
+    validate_invariants(def)?;
     let Some(tools) = &def.tools else {
         return Ok(());
     };
@@ -580,7 +597,19 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
     // workspace launch-v1 documents default to `All`.
     let mut legacy = def.clone();
     legacy.vnext = None;
-    legacy.tools = Some(tools.clone());
+    legacy.tools = Some(
+        tools
+            .iter()
+            .filter(|tool| !invariants::is_acquisition_private_tool(tool))
+            .cloned()
+            .collect(),
+    );
+    legacy
+        .tool_tiers
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
+    legacy
+        .tool_descriptions
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
     validate_invariants(&legacy)
 }
 
@@ -1048,6 +1077,30 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// Author-requested host names for owner-prompt prefill. This is not the
+    /// effective network policy and never widens it.
+    pub fn requested_network_hosts(
+        &self,
+    ) -> &BTreeSet<crate::db::monty_network::CanonicalNetworkHost> {
+        self.vnext
+            .as_ref()
+            .map(VnextAgentDef::requested_network_hosts)
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<
+                    BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
+                > = std::sync::OnceLock::new();
+                EMPTY.get_or_init(BTreeSet::new)
+            })
+    }
+
+    /// Author preference used only to pre-fill an owner prompt. This cannot
+    /// enable the governed package or widen the effective allowlist.
+    pub fn requests_requested(&self) -> bool {
+        self.vnext
+            .as_ref()
+            .is_some_and(VnextAgentDef::requests_requested)
+    }
+
     /// The knowledge-base restriction authored in this exact definition.
     /// Running agents retain an `AgentDef` snapshot, so knowledge access is
     /// governed by that snapshot rather than a same-named reloaded definition.
@@ -1340,6 +1393,15 @@ impl AgentDef {
                 serde_yaml::to_value(&vnext.tool_tier_preferences)?,
             );
         }
+        if !vnext.requested_network_hosts.is_empty() {
+            fm.insert(
+                "requestedNetworkHosts".into(),
+                serde_yaml::to_value(&vnext.requested_network_hosts)?,
+            );
+        }
+        if vnext.requests_requested {
+            fm.insert("requestsRequested".into(), true.into());
+        }
         if !vnext.capabilities.is_empty() {
             fm.insert(
                 "capabilities".into(),
@@ -1478,6 +1540,10 @@ fn parse_agent_with_scope(
         allowed_knowledge_bases: Option<BTreeSet<String>>,
         #[serde(rename = "toolTierPreferences", default)]
         tool_tier_preferences: BTreeMap<String, ToolTier>,
+        #[serde(rename = "requestedNetworkHosts", default)]
+        requested_network_hosts: BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
+        #[serde(rename = "requestsRequested", default)]
+        requests_requested: bool,
         #[serde(default)]
         description: String,
         #[serde(default)]
@@ -1552,6 +1618,8 @@ fn parse_agent_with_scope(
         verification: fm.verification,
         allowed_knowledge_bases: fm.allowed_knowledge_bases,
         tool_tier_preferences: fm.tool_tier_preferences,
+        requested_network_hosts: fm.requested_network_hosts,
+        requests_requested: fm.requests_requested,
     };
     definition.validate_for_scope(scope).map_err(|error| {
         anyhow::anyhow!(

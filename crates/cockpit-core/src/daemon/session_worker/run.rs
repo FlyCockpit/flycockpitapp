@@ -12070,7 +12070,34 @@ pub(super) async fn run_worker(
                 SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,
+                    governed_network_attachment,
                 } => {
+                    // The permit was acquired atomically by the exact
+                    // attachment that successfully received this prompt and
+                    // remains held across every durable read and settlement
+                    // below. Detach cannot invalidate the proven handoff, and
+                    // a later attachment cannot mint the same permit.
+                    let governed_network_operation = match session
+                        .db
+                        .interrupt_governed_network_operation_kind(session_id, interrupt_id)
+                        .await
+                    {
+                        Ok(classified) => classified,
+                        Err(error) => {
+                            tracing::warn!(%error, %interrupt_id, "classifying interrupt settlement failed");
+                            interrupts.emit_queue_state().await;
+                            continue;
+                        }
+                    };
+                    if governed_network_operation.is_some()
+                        && !governed_network_attachment
+                            .as_ref()
+                            .is_some_and(|permit| permit.belongs_to(session_id))
+                    {
+                        tracing::warn!(%interrupt_id, "rejecting governed network answer without its rendering attachment permit");
+                        interrupts.emit_queue_state().await;
+                        continue;
+                    }
                     // A QuestionTool interrupt is both the legacy continuation
                     // rendezvous and an AgentTree decision.  Settle the latter
                     // first; only a successful/idempotent terminal receipt may

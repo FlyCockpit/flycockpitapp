@@ -64,10 +64,11 @@ pub(crate) async fn open_native_computer_for_delegation(
     } else {
         None
     };
-    let backend: Box<dyn crate::computer::ComputerBackend> = match construct_native_backend(
+    let backend_result = crate::computer::coordinator::construct_platform_backend(
         candidate.target,
         grant_store.as_ref(),
-    ) {
+    );
+    let backend = match backend_result {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(error = %error, "native computer backend open failed");
@@ -134,7 +135,25 @@ pub(crate) async fn open_native_computer_for_delegation(
                     ))),
                 )
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            {
+                let adapter = crate::computer::platform::MacOsTargetEvidenceAdapter::new()
+                    .map_err(|reason| {
+                        anyhow::anyhow!("real desktop target evidence unavailable: {reason:?}")
+                    })?;
+                let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
+                    .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;
+                (
+                    Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::computer::coordinator::HostInputArbiter::new(
+                            Box::new(file_lock),
+                            owner_instance,
+                        ),
+                    ))),
+                )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 unreachable!("unsupported real desktop construction fails closed")
             }
@@ -192,19 +211,6 @@ pub(crate) async fn open_native_computer_for_delegation(
             Ok(None)
         }
     }
-}
-
-fn construct_native_backend(
-    target: crate::computer::DisplayTarget,
-    grant_store: Option<&crate::computer::RealDesktopGrantStore>,
-) -> Result<Box<dyn crate::computer::ComputerBackend>, crate::computer::ComputerError> {
-    #[cfg(target_os = "windows")]
-    if target == crate::computer::DisplayTarget::RealDesktop {
-        return crate::computer::platform::WindowsDesktopBackend::construct(target, grant_store)
-            .map(|backend| Box::new(backend) as Box<dyn crate::computer::ComputerBackend>);
-    }
-    crate::computer::VirtualDisplayBackend::construct(target, grant_store)
-        .map(|backend| Box::new(backend) as Box<dyn crate::computer::ComputerBackend>)
 }
 
 /// Reconcile the live coordinator with the agent's *current* wire and policy

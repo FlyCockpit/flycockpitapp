@@ -108,6 +108,69 @@ async fn bash_large_output_is_bounded_at_pipe() {
     assert!(!stdout.is_empty());
 }
 
+// Issue #294 regression: a registered secret in bash output that straddles
+// the head→middle truncation boundary must never leave a PARTIAL in the
+// model-facing text. A boundary-unsafe cut would keep the secret's 16-byte
+// prefix just below the cut, past what the §7 whole-value scrub can match;
+// the redacting truncator elides the unsafe back margin so nothing partial
+// survives, while a secret fully contained in the retained head is still
+// scrubbed to the placeholder normally.
+#[tokio::test]
+async fn bash_output_secret_straddling_truncation_boundary_is_redacted() {
+    const SECRET: &str = "sk-live-BASHSTRADDLE-0123456789abcdefXY"; // 39 bytes
+    const CONTAINED: &str = "sk-live-BASHCONTAINED-0123456789abcdef"; // 38 bytes
+    let tmp = tempfile::tempdir().unwrap();
+    // Body shape: "stdout:\n" + stdout + "\nexit: 0\n". The head cut lands
+    // 4886 bytes into the body, so the secret at stdout offset 4862 straddles
+    // it with 16 bytes on the retained side; CONTAINED sits well inside the
+    // retained head and must stay scrubbable.
+    let stdout = format!(
+        "{}{CONTAINED}{}{SECRET}{}",
+        "A".repeat(100),
+        "A".repeat(4862 - 100 - CONTAINED.len()),
+        "B".repeat(7200)
+    );
+    std::fs::write(tmp.path().join("big.txt"), &stdout).unwrap();
+    let command = "cat big.txt";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let table = crate::redact::RedactionTable::empty()
+        .with_forced_literal(SECRET.to_string(), "bash-straddle-test".to_string())
+        .unwrap()
+        .with_forced_literal(CONTAINED.to_string(), "bash-contained-test".to_string())
+        .unwrap();
+    ctx.redact = std::sync::Arc::new(table);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(output.truncated);
+    assert!(
+        output.content.len() <= OUTPUT_BYTE_CAP,
+        "{}",
+        output.content.len()
+    );
+    // Simulate the §7 whole-value scrub applied downstream of the tool.
+    let scrubbed = ctx.redact.scrub(&output.content);
+    assert!(
+        !scrubbed.contains(SECRET),
+        "full secret survived truncation + scrub"
+    );
+    assert!(
+        !scrubbed.contains(&SECRET[..16]),
+        "straddling secret prefix leaked past the truncation boundary: {}",
+        &scrubbed[..80.min(scrubbed.len())]
+    );
+    assert!(
+        scrubbed.contains(ctx.redact.placeholder()),
+        "contained secret was over-elided out of scrub range: {}",
+        &scrubbed[..80.min(scrubbed.len())]
+    );
+}
+
 #[tokio::test]
 async fn bash_untruncated_output_carries_no_text_artifact_capture() {
     let tmp = tempfile::tempdir().unwrap();
@@ -134,6 +197,7 @@ async fn bash_truncated_output_carries_capture_on_the_container_render_path() {
     let expected_body = render_output(
         &shell_out(&stdout, "", 0),
         false,
+        &crate::redact::RedactionTable::empty(),
         command,
         tmp.path(),
         BashOutputAnnotations::default(),
@@ -2816,6 +2880,7 @@ async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "printf blocked",
         tmp.path(),
         BashOutputAnnotations {
@@ -2885,6 +2950,7 @@ async fn confined_success_body_is_unchanged() {
     let expected = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "printf ok",
         tmp.path(),
         BashOutputAnnotations::default(),
@@ -3526,6 +3592,7 @@ async fn missing_binary_diagnostic_names_cockpit_environment() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "npm run build",
         Path::new("/repo"),
         BashOutputAnnotations::default(),
@@ -3584,6 +3651,7 @@ async fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "cargo test",
         Path::new("/repo"),
         BashOutputAnnotations::default(),

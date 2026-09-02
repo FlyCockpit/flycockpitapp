@@ -665,6 +665,19 @@ fn authoritative_registry_selection_does_not_promote_unrelated_layer() {
 }
 
 #[test]
+fn read_document_refuses_an_oversized_config_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let handle = std::fs::File::create(&path).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+    let err = read_document(&path).unwrap_err().to_string();
+    assert!(err.contains("byte limit") || err.contains("file"), "{err}");
+}
+
+#[test]
 fn not_yet_created_target_is_bound_to_canonical_existing_ancestor() {
     let temp = tempfile::tempdir().unwrap();
     let alias_spelling = temp

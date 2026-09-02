@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -1034,9 +1034,9 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
             );
         }
     }
-    let existing = match fs::read_to_string(&exclude_path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let existing = match crate::resource_limits::read_project_text(&exclude_path) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => String::new(),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()));
@@ -3218,7 +3218,7 @@ fn read_private_sidecar_bytes(
         let name = sidecar
             .file_name()
             .context("knowledge sidecar has no file name")?;
-        let mut file = cockpit_host::private_fs::open_private_file_in_dir_fd(
+        let file = cockpit_host::private_fs::open_private_file_in_dir_fd(
             &process_lock.directory,
             name,
             cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
@@ -3226,10 +3226,9 @@ fn read_private_sidecar_bytes(
         )
         .map_err(anyhow::Error::from)
         .context("opening retained private knowledge sidecar")?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("reading knowledge sidecar {label}"))?;
-        return Ok(bytes);
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        return cockpit_host::bounded::read_reader_at_most(file, cap, "knowledge sidecar")
+            .with_context(|| format!("reading knowledge sidecar {label}"));
     }
     #[cfg(not(unix))]
     {
@@ -3249,9 +3248,9 @@ fn read_private_sidecar_bytes(
             cockpit_host::private_fs::repair_private_file(sidecar, label)
                 .map_err(anyhow::Error::from)?;
         }
-        cockpit_host::private_fs::read_private_file(sidecar, label)
-            .map_err(anyhow::Error::from)?
-            .context("knowledge sidecar disappeared before its verified read")
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        cockpit_host::bounded::read_at_most(sidecar, cap)
+            .with_context(|| format!("reading knowledge sidecar {label}"))
     }
 }
 
@@ -6302,8 +6301,8 @@ fn read_human_knowledge_concept_nofollow(
         file.metadata()?.is_file(),
         "human knowledge concept is not a regular file"
     );
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+    let bytes = cockpit_host::bounded::read_reader_at_most(file, cap, "human knowledge concept")
         .context("reading human knowledge concept through held parent")?;
     Ok(Some(bytes))
 }
@@ -7272,9 +7271,9 @@ impl KnowledgeDreamWriteRollback {
         for write in writes {
             let path = PathBuf::from(&write.path);
             let target = root.join(&path);
-            let contents = match fs::read(&target) {
+            let contents = match crate::resource_limits::read_for_tool(&target) {
                 Ok(contents) => Some(contents),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) if error.is_not_found() => None,
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("capturing pre-dream output {}", write.path));

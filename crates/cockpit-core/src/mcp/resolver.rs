@@ -598,7 +598,7 @@ pub fn discover_effective_catalog_from_layers(
 
 fn load_and_merge_paths(catalog: &mut EffectiveCatalog, layers: &[(ConfigDirKind, PathBuf)]) {
     for (kind, path) in layers {
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Some(raw) = crate::mcp::config::read_layer_text_lossy(path) else {
             continue;
         };
         match McpConfig::parse(&raw) {

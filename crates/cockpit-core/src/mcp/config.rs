@@ -463,7 +463,7 @@ impl McpConfig {
     fn discover_from_paths(paths: &[std::path::PathBuf]) -> Self {
         let mut merged = Self::default();
         for path in paths {
-            let Ok(raw) = std::fs::read_to_string(path) else {
+            let Some(raw) = read_layer_text_lossy(path) else {
                 continue;
             };
             match Self::parse(&raw) {
@@ -478,6 +478,14 @@ impl McpConfig {
             }
         }
         merged
+    }
+
+    /// Read one `mcp.json` layer with the project-file cap. Absence is `Ok(None)`.
+    /// Over-cap, non-regular files, and invalid UTF-8 fail closed.
+    pub(crate) fn read_layer_text(
+        path: &Path,
+    ) -> std::result::Result<Option<String>, crate::resource_limits::ResourceLimitError> {
+        crate::resource_limits::read_project_text(path)
     }
 
     pub fn write_private(&self, path: &Path) -> Result<()> {
@@ -500,6 +508,23 @@ impl McpConfig {
     pub fn has_reserved_builtin_server_config(&self) -> bool {
         self.servers
             .contains_key(crate::mcp::builtin::BUILTIN_SERVER_ID)
+    }
+}
+
+/// Catalog discovery skips unreadable layers (including over-cap) rather than
+/// aborting the merge. The read itself is still capped so a huge `mcp.json`
+/// cannot OOM the daemon.
+pub(crate) fn read_layer_text_lossy(path: &Path) -> Option<String> {
+    match McpConfig::read_layer_text(path) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "skipping unreadable mcp config layer"
+            );
+            None
+        }
     }
 }
 
@@ -1211,6 +1236,26 @@ mod tests {
             Some("https://project/mcp")
         );
         assert!(cfg.servers.contains_key("home_only"));
+    }
+
+    #[test]
+    fn discover_from_paths_skips_an_oversized_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let small = tmp.path().join("small.json");
+        let huge = tmp.path().join("huge.json");
+        std::fs::write(
+            &small,
+            r#"{ "servers": { "ok": { "transport": "stdio", "command": "ok" } } }"#,
+        )
+        .unwrap();
+        let handle = std::fs::File::create(&huge).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let cfg = McpConfig::discover_from_paths(&[small, huge]);
+        assert!(cfg.servers.contains_key("ok"));
+        assert_eq!(cfg.servers.len(), 1);
     }
 
     #[test]

@@ -2335,23 +2335,26 @@ fn validate_loaded_def(def: &AgentDef) -> Result<()> {
 }
 
 fn read_agent_markdown(path: &Path) -> Result<String> {
-    let len = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("statting agent file {}: {e}", path.display()))?
-        .len();
-    if len > MAX_MARKDOWN_BYTES {
-        tracing::warn!(
-            path = %path.display(),
-            size = len,
-            limit = MAX_MARKDOWN_BYTES,
-            "skipping oversized agent markdown"
-        );
-        bail!(
-            "agent file {} exceeds {} byte limit",
-            path.display(),
-            MAX_MARKDOWN_BYTES
-        );
-    }
-    std::fs::read_to_string(path)
+    let bytes = match cockpit_host::bounded::read_at_most(path, MAX_MARKDOWN_BYTES) {
+        Ok(bytes) => bytes,
+        Err(cockpit_host::bounded::BoundedIoError::Limit { actual, .. }) => {
+            tracing::warn!(
+                path = %path.display(),
+                size = actual,
+                limit = MAX_MARKDOWN_BYTES,
+                "skipping oversized agent markdown"
+            );
+            bail!(
+                "agent file {} exceeds {} byte limit",
+                path.display(),
+                MAX_MARKDOWN_BYTES
+            );
+        }
+        Err(error) => {
+            bail!("reading agent file {}: {error}", path.display());
+        }
+    };
+    String::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("reading agent file {}: {e}", path.display()))
 }
 

@@ -53,6 +53,9 @@ pub struct SwarmRunCtx {
     /// Driver command channel — the runner posts a child's own
     /// `spawn` back to main (the single authority) here.
     pub cmd_tx: mpsc::Sender<ScheduleCommand>,
+    /// Session-work child token. Stop cancels in-flight child inference
+    /// rather than leaving the provider request running after task abort.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -162,7 +165,22 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         turn_tx,
         event_tx,
         cmd_tx,
+        cancel,
     } = run;
+
+    if cancel.is_cancelled() {
+        let _ = event_tx
+            .send(ScheduleEvent::Completed {
+                job_id,
+                label: label.clone(),
+                kind: ScheduleKind::Swarm,
+                result: format!("swarm `{label}` cancelled"),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await;
+        return;
+    }
 
     // Announce the child START to the driver as this task's FIRST action, on the
     // same channel and by the same task that sends its terminal `Completed`
@@ -213,7 +231,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         None
     };
 
-    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx).await;
+    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx, &cancel).await;
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -247,6 +265,19 @@ pub async fn run_swarm(run: SwarmRunCtx) {
             }
             text
         }
+        Err(e) if crate::engine::model::is_cancelled(&e) || cancel.is_cancelled() => {
+            let _ = event_tx
+                .send(ScheduleEvent::Completed {
+                    job_id,
+                    label: label.clone(),
+                    kind: ScheduleKind::Swarm,
+                    result: format!("swarm `{label}` cancelled"),
+                    failed: false,
+                    requests: Vec::new(),
+                })
+                .await;
+            return;
+        }
         Err(e) => {
             // A failure bypasses the loop gate; the driver fires the terminal
             // `subagentStop` (`failed`) at the `Completed` drain instead.
@@ -267,7 +298,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     let body = if spec.worker.is_goal_control() {
         result.trim().to_string()
     } else {
-        budget_result(&label, &spec, &result)
+        budget_result(&ctx.redact, &label, &spec, &result)
     };
     let _ = event_tx
         .send(ScheduleEvent::Completed {
@@ -289,6 +320,7 @@ async fn run_swarm_loop(
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let SwarmChild {
         agent,
@@ -306,12 +338,12 @@ async fn run_swarm_loop(
     let mut next_prompt = Message::user(brief);
 
     // A background swarm child is a leaf with no human on the other end:
-    // a detached interrupt hub + a fresh cancel token satisfy `turn`'s
-    // signature (same rationale as the loop-fork runner). No approver →
+    // a detached interrupt hub satisfies `turn`'s signature (same rationale
+    // as the loop-fork runner). Cancellation is the session-work child the
+    // authority minted — TUI Ctrl+C does not fire it, Stop does. No approver →
     // native tools skip the boundary prompt (never deny); the loop guard is
     // inert without one.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-    let cancel = tokio_util::sync::CancellationToken::new();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     // This detached child owns its `subagentStop` continuation budget for its
@@ -360,6 +392,13 @@ async fn run_swarm_loop(
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
+        if cancel.is_cancelled() {
+            return Err(anyhow::Error::new(
+                crate::engine::model::InferenceCancelled {
+                    phase: crate::engine::model::InferencePhase::Prep,
+                },
+            ));
+        }
         // Keep the continuation owned until its exact paired terminal row has
         // committed. A persist failure must leave the plan in
         // `pending_scheduled_turn` rather than dropping it via `take` on the
@@ -915,7 +954,12 @@ fn compose_child_brief(spec: &SpawnSpec) -> String {
 /// Budget-cap the child's terminal result for injection into main context
 /// (GOALS §10). Leads with a pointer to the write scope so the aggregating
 /// parent knows where the detail lives.
-fn budget_result(label: &str, spec: &SpawnSpec, result: &str) -> String {
+fn budget_result(
+    redact: &crate::redact::RedactionTable,
+    label: &str,
+    spec: &SpawnSpec,
+    result: &str,
+) -> String {
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     let _ = writer.writeln(&format!("swarm `{label}` finished."));
     let _ = writer.writeln(&format!("output saved under: {}", spec.write_scope));
@@ -924,7 +968,10 @@ fn budget_result(label: &str, spec: &SpawnSpec, result: &str) -> String {
         let _ = writer.writeln("summary:");
         let _ = writer.writeln(trimmed);
     }
-    writer.into_string()
+    // The budget can cut the last retained line mid-line; elide the cut's
+    // back margin so a boundary-straddling secret never survives as a
+    // partial past the downstream whole-value scrub (issue #294).
+    writer.into_string_redacted(redact)
 }
 
 /// A stable-ish progress key for the parent swarm job (the depth + brief
@@ -1272,7 +1319,14 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            run_swarm_loop("job-test", &spec, &ctx, &turn_tx, &cmd_tx),
+            run_swarm_loop(
+                "job-test",
+                &spec,
+                &ctx,
+                &turn_tx,
+                &cmd_tx,
+                &tokio_util::sync::CancellationToken::new(),
+            ),
         )
         .await
         .expect("the swarm loop must finish against the local endpoint");
@@ -1461,6 +1515,7 @@ mod tests {
                 turn_tx,
                 event_tx,
                 cmd_tx,
+                cancel: tokio_util::sync::CancellationToken::new(),
             }),
         )
         .await
@@ -1492,6 +1547,148 @@ mod tests {
             vec!["started", "gate"],
             "run_swarm must emit SwarmChildStopGateCompleted (FIFO) after the start \
              and before Completed; a dropped marker fails here"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_in_flight_swarm_inference() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+        let mut provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Hang)
+            .start()
+            .await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        std::fs::write(&config_path, r#"{}"#).unwrap();
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "cloud".into(),
+            crate::config::providers::ProviderEntry {
+                url: provider.base_url(),
+                trust: Some(crate::config::providers::ModelTrust::Untrusted),
+                timeout: crate::config::providers::TimeoutConfig {
+                    ttft_secs: 10,
+                    idle_secs: 10,
+                },
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "worker".into(),
+                    subagent_invokable: Some(true),
+                    can_delegate: Some(true),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+        doc.write(&providers).unwrap();
+
+        let table = Arc::new(crate::redact::RedactionTable::empty());
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let (_extended, effective_providers) =
+            crate::engine::model_roles::load_model_role_config(&config);
+        let parent_model = Arc::new(
+            crate::engine::model::Model::for_provider(
+                &effective_providers,
+                "cloud",
+                "worker",
+                table.clone(),
+            )
+            .unwrap(),
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "Swarm",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let parent = Agent {
+            name: "Swarm".to_string(),
+            system: "s".to_string(),
+            role_prompt: "s".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model: parent_model,
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: true,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
+            lock_identity: "Swarm".to_string(),
+            write_scope: None,
+            workspace_lease: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
+            assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
+        };
+        let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
+            session,
+            locks,
+            redact: table,
+            cwd: tmp.path().to_path_buf(),
+            config,
+            guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+            agent: Arc::new(parent),
+            write_scope: None,
+        };
+
+        let mut spec = spec(1, 3);
+        spec.worker = SpawnWorkerKind::Scout;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (turn_tx, mut turn_rx) = mpsc::channel(256);
+        tokio::spawn(async move { while turn_rx.recv().await.is_some() {} });
+        let (event_tx, mut event_rx) = mpsc::channel::<ScheduleEvent>(64);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let run = tokio::spawn(run_swarm(SwarmRunCtx {
+            job_id: "job-stop-inflight".to_string(),
+            label: "scout".to_string(),
+            spec,
+            ctx,
+            turn_tx,
+            event_tx,
+            cmd_tx,
+            cancel: cancel.clone(),
+        }));
+
+        let _captured = provider.next_request().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("Stop must abort in-flight swarm inference")
+            .expect("run_swarm join");
+
+        match event_rx.recv().await {
+            Some(ScheduleEvent::SwarmChildStarted { .. }) => {}
+            other => panic!("expected SwarmChildStarted first, got {other:?}"),
+        }
+        match event_rx.recv().await {
+            Some(ScheduleEvent::Completed { failed, result, .. }) => {
+                assert!(!failed, "cancellation is not a job failure: {result}");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected cancelled Completed, got {other:?}"),
+        }
+        assert_eq!(
+            provider.request_count(),
+            1,
+            "Stop must not start another billed swarm request"
         );
     }
 

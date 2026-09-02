@@ -1499,6 +1499,10 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       kind: z.literal("req"),
       id: requestIdSchema,
       operation: remoteOperationIdentityV1Schema.optional(),
+      // Daemon-private owner capability. Optional; required for `owner_only`
+      // RPCs on the Unix-socket path. Absent on in-process and remote
+      // connections. Mirrors Rust `Body::Request.owner_capability`.
+      owner_capability: z.string().optional(),
       ...variant.shape,
     })
     .strict(),
@@ -2238,7 +2242,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         next_chunk_index: u32Schema,
         received_bytes: canonicalU64DecimalStringSchema,
         complete: z.boolean(),
-        /** Advertised deadline: how long the daemon holds an idle transfer. */
+        /** Remaining non-renewable lease, milliseconds from first reservation. Writes do not extend it. */
         idle_timeout_ms: u32Schema,
       })
       .passthrough(),

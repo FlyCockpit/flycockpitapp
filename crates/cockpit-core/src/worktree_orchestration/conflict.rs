@@ -159,7 +159,7 @@ impl ConflictSpecialist {
                 self.lease.visibility_root.display()
             );
         }
-        Ok(std::fs::read(path)?)
+        Ok(crate::resource_limits::read_for_tool(path)?)
     }
 
     /// Resolve left/right patches. Disjoint paths combine; overlapping paths

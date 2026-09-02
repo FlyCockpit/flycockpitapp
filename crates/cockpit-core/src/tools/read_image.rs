@@ -63,10 +63,12 @@ pub const JPEG_QUALITY: u8 = 90;
 pub const READ_IMAGE_SCHEMA_VERSION: u8 = 1;
 
 /// Maximum input image bytes accepted (decompression bomb guard).
-pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_INPUT_BYTES: usize =
+    crate::resource_limits::ResourceLimits::defaults().image_max_input_bytes;
 
 /// Maximum output image bytes before the result is rejected (central limit).
-pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_OUTPUT_BYTES: usize =
+    crate::resource_limits::ResourceLimits::defaults().image_max_output_bytes;
 
 // ---------------------------------------------------------------------------
 // Schema (argument validation)

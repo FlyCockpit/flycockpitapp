@@ -85,6 +85,44 @@ fn mcp_oauth_json_registers_each_token_leaf() {
 }
 
 #[test]
+fn store_open_failure_does_not_emit_an_empty_redaction_table() {
+    let dir = TempDir::new().unwrap();
+    const SECRET: &str = "named-store-secret-value-xyz123";
+    let err = RedactionTable::build_with_env_and_store(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        Err(anyhow::anyhow!("database is locked")),
+    )
+    .expect_err("store-open failure must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+    let leaked = RedactionTable::build_with_env_and_secrets(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .unwrap();
+    assert_eq!(
+        leaked.scrub(SECRET),
+        SECRET,
+        "the previous empty-store fallback would have leaked the named secret"
+    );
+    let covered = RedactionTable::build_with_env_and_secrets(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        [("PLANTED".to_string(), SECRET.to_string())],
+    )
+    .unwrap();
+    assert!(!covered.scrub(SECRET).contains(SECRET));
+}
+
+#[test]
 fn disabled_passes_through() {
     let mut cfg = enabled_cfg();
     cfg.enabled = false;
@@ -138,6 +176,29 @@ fn dotenv_stray_line_does_not_void_file() {
     assert_eq!(t.scrub("sk-super-secret-token-1234"), "***REDACT***");
     assert!(t.unsupported_files().is_empty());
     assert!(!t.is_empty());
+}
+
+#[test]
+fn dotenv_over_cap_fails_the_table_build() {
+    let dir = TempDir::new().unwrap();
+    let env_path = dir.path().join(".env");
+    let handle = std::fs::File::create(&env_path).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let err = RedactionTable::build(&cfg, dir.path()).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("exceeds the daemon file size limit"),
+        "{text}"
+    );
+    assert!(
+        super::build_would_miss_secrets(&err),
+        "over-cap must be detectable by automatic refresh consumers"
+    );
 }
 
 #[test]
@@ -2565,7 +2626,8 @@ async fn untrusted_embedding_chokepoint_stays_generic_with_live_grant() {
         "text-embedding-3-small".into(),
         None,
         guard,
-    );
+    )
+    .unwrap();
     let _ = embedder.embed(&[sealed_literal, "clean text"]).await;
 
     // The captured wire body carries only the generic placeholder.

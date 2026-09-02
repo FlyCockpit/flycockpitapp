@@ -1625,8 +1625,9 @@ fn set_readdir_errno_zero() {
 fn set_readdir_errno_zero() {}
 
 fn validate_consolidation_forward(deleted: &Skill, umbrella: &Skill) -> Result<()> {
-    let umbrella_raw = std::fs::read_to_string(&umbrella.source)
-        .with_context(|| format!("reading umbrella skill {}", umbrella.source.display()))?;
+    let umbrella_raw = crate::resource_limits::read_project_text(&umbrella.source)
+        .with_context(|| format!("reading umbrella skill {}", umbrella.source.display()))?
+        .ok_or_else(|| anyhow::anyhow!("reading umbrella skill {}", umbrella.source.display()))?;
     if !umbrella_raw.contains(&deleted.frontmatter.name) {
         bail!(
             "absorbed_into skill `{}` must reference absorbed skill `{}` before delete",
@@ -1716,12 +1717,14 @@ pub(crate) fn ensure_plain_write_allowed(skill: &Skill, package: &Path) -> Resul
 
 fn read_provenance(package: &Path) -> Result<Option<SkillProvenance>> {
     let path = package.join(PROVENANCE_FILE);
-    match std::fs::read(&path) {
+    match crate::resource_limits::read_for_tool(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))
             .map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => {
+            Err(anyhow::Error::from(error).context(format!("reading {}", path.display())))
+        }
     }
 }
 

@@ -25,7 +25,7 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
     std::fs::write(tmp.path().join(".env"), "NEW_SECRET=turn-boundary-secret\n").unwrap();
     let (tx, _rx) = mpsc::channel(8);
 
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
 
     for scrubbed in [
         driver.redact.scrub("turn-boundary-secret"),
@@ -42,6 +42,110 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
         assert!(!scrubbed.contains("turn-boundary-secret"));
         assert!(scrubbed.contains("REDACTED"));
     }
+}
+
+#[tokio::test]
+async fn turn_boundary_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
+    let (mut driver, tmp) = test_driver(1);
+    std::fs::write(tmp.path().join(".env"), "KEEP=turn-boundary-keep-secret\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret")
+    );
+    while rx.try_recv().is_ok() {}
+
+    let handle = std::fs::File::create(tmp.path().join(".env")).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+
+    driver
+        .refresh_redaction_table_for_turn(&tx)
+        .await
+        .expect_err("over-cap dotenv must abort the refresh so the turn cannot send");
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret"),
+        "over-cap must not wipe the previously committed table"
+    );
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("over-cap must surface a notice")
+        .expect("notice channel closed");
+    match notice {
+        TurnEvent::Notice { text } => {
+            assert!(
+                text.contains("refusing to send unredacted"),
+                "visible fail-closed signal missing: {text}"
+            );
+            assert!(
+                text.contains("exceeds the daemon file size limit"),
+                "over-cap cause missing: {text}"
+            );
+        }
+        other => panic!("expected Notice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secrets() {
+    let (mut driver, _tmp) = test_driver(1);
+    const SECRET: &str = "driver-store-secret-value-xyz987";
+    {
+        let mut store = driver.session.credential_store().unwrap();
+        store.set_named_secret("PLANTED", SECRET);
+        store.save().unwrap();
+    }
+    let (tx, mut rx) = mpsc::channel(8);
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
+    assert!(
+        !driver.redact.scrub(SECRET).contains(SECRET),
+        "named secret must enter the live table on a successful store open"
+    );
+    while rx.try_recv().is_ok() {}
+
+    driver
+        .session
+        .secret_vault()
+        .put_item(
+            cockpit_db::secret_vault::SecretVaultKind::Command,
+            "corrupt",
+            b"not-json-\xff-garbage",
+        )
+        .unwrap();
+    assert!(
+        driver.session.credential_store().is_err(),
+        "injected vault corruption must fail store open"
+    );
+
+    driver
+        .refresh_redaction_table_for_turn(&tx)
+        .await
+        .expect_err("store-open failure must abort the refresh so the turn cannot send");
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("store-open failure must surface a notice")
+        .expect("notice channel closed");
+    match notice {
+        TurnEvent::Notice { text } => {
+            assert!(
+                text.contains("refusing to send unredacted"),
+                "visible fail-closed signal missing: {text}"
+            );
+        }
+        other => panic!("expected Notice, got {other:?}"),
+    }
+    assert!(
+        !driver.redact.scrub(SECRET).contains(SECRET),
+        "a failed store open must not replace the live table with an empty secret set"
+    );
 }
 
 // J2 regression: a driver's per-turn redaction refresh must never overwrite the
@@ -119,7 +223,7 @@ async fn driver_refresh_does_not_drop_a_committed_sealed_adoption() {
     .unwrap();
 
     let (tx, _turn_rx) = mpsc::channel(8);
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
 
     // Core J2 property: the refresh unioned onto the LATEST shared table under
     // the write lock, so the DURABLE table still scrubs the committed sealed

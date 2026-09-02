@@ -13,7 +13,7 @@ pub(super) use crate::engine::tool::{
     Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args,
 };
 pub(super) use crate::engine::{ToolProgress, TurnEvent};
-pub(super) use crate::intel::budget::{BudgetedWriter, capture_text_artifact_body};
+pub(super) use crate::intel::budget::BudgetedWriter;
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
 pub(super) use crate::intel::{
@@ -90,17 +90,21 @@ pub(super) fn rel_path(arg: &str, ctx: &ToolCtx) -> String {
     }
 }
 
-pub(super) fn finish(writer: BudgetedWriter, note: &str) -> ToolOutput {
+pub(super) fn finish(
+    redact: &crate::redact::RedactionTable,
+    writer: BudgetedWriter,
+    note: &str,
+) -> ToolOutput {
     if writer.is_truncated() {
-        let capture = writer.text_artifact_capture();
-        let mut out = writer.into_string();
+        let capture = writer.text_artifact_capture_redacted(redact);
+        let mut out = writer.into_string_redacted(redact);
         out.push_str(note);
         match capture {
             Some(capture) => ToolOutput::truncated_text(out).with_text_artifact_capture(capture),
             None => ToolOutput::truncated_text(out),
         }
     } else {
-        ToolOutput::text(writer.into_string())
+        ToolOutput::text(writer.into_string_redacted(redact))
     }
 }
 
@@ -398,7 +402,7 @@ pub(crate) fn list_file_metas(
 }
 
 pub(super) fn count_lines(abs: &Path) -> usize {
-    match std::fs::read(abs) {
+    match crate::resource_limits::read_for_tool(abs) {
         Ok(b) if !b.contains(&0u8) => bytecount(&b),
         _ => 0,
     }

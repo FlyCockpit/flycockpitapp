@@ -2628,6 +2628,9 @@ fn oauth_owner(state: &MutableClientState) -> String {
 ///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
 ///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
 ///   verified constructors). A caller cannot present itself as `Owner`.
+///   Issue #296: socket Owner is still blanket; secret RPCs additionally
+///   require the daemon-private capability. Follow-up #337 replaces this with
+///   authenticated per-peer identity.
 /// - `remote_operation` is produced only by `admit_remote_operation` from a
 ///   daemon-verified device actor binding; a genuine local owner always yields
 ///   `None` (admission short-circuits on `is_owner()`), and it cannot be forged.
@@ -4259,6 +4262,13 @@ fn bulk_user_message_transfer_owner_impl(
         crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
             session_id, &identity,
         ),
+    )
+}
+
+fn bulk_staging_quota(principal: &ClientPrincipal) -> crate::resource_limits::ClientQuotaKey {
+    crate::resource_limits::ClientQuotaKey::hash_material(
+        b"flycockpit-bulk-staging-quota-v1",
+        principal.steer_origin().as_bytes(),
     )
 }
 
@@ -9483,6 +9493,7 @@ async fn handle_serialized_request_impl(
             }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
+            let vault = ctx.secret_vault.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
@@ -9510,7 +9521,16 @@ async fn handle_serialized_request_impl(
                                     &assistant_for_db,
                                     &assistant_for_db,
                                 )?;
-                                (crate::db::Db::insert_session_row_conn(conn, &row)?, true)
+                                let tx = conn
+                                    .unchecked_transaction()
+                                    .context("begin assistant session insert tx")?;
+                                let row = crate::session::lifecycle::persist_session_row_with_redaction_custody_on_conn(
+                                    &tx,
+                                    &vault,
+                                    &row,
+                                )?;
+                                tx.commit().context("commit assistant session insert tx")?;
+                                (row, true)
                             }
                         };
                     let summary = crate::db::Db::list_session_summaries_conn(
@@ -10450,6 +10470,7 @@ async fn handle_serialized_request_impl(
                 include_generated_artifacts,
                 include_sensitive,
                 local_owner_action,
+                &bulk_staging_quota(&state.principal),
             )
             .await
         }
@@ -10532,7 +10553,14 @@ async fn handle_serialized_request_impl(
                 } else {
                     None
                 };
-            write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
+            write_bulk_transfer_chunk(
+                &transfer,
+                chunk_index,
+                &data_base64,
+                owner.as_ref(),
+                &bulk_staging_quota(&state.principal),
+            )
+            .await
         }
         Request::ReadBulkTransferChunk {
             transfer_id,
@@ -19471,6 +19499,7 @@ async fn handle_concurrent_request_impl(
                 include_generated_artifacts,
                 include_sensitive,
                 local_owner_action,
+                &bulk_staging_quota(&shared.principal),
             )
             .await
         }
@@ -19509,7 +19538,14 @@ async fn handle_concurrent_request_impl(
                 } else {
                     None
                 };
-            write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
+            write_bulk_transfer_chunk(
+                &transfer,
+                chunk_index,
+                &data_base64,
+                owner.as_ref(),
+                &bulk_staging_quota(&shared.principal),
+            )
+            .await
         }
         Request::ReadBulkTransferChunk {
             transfer_id,
@@ -22494,12 +22530,9 @@ fn redacted_mcp_config_snapshot(
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
     let path = canonical_mcp_target_path(&path)?;
-    let prior = match std::fs::read_to_string(&path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
-        }
-        Err(error) => return Err(internal(error)),
+    let prior = match mcp_layer_text(&path)? {
+        Some(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        None => crate::mcp::config::McpConfig::default(),
     };
     crate::mcp::config::redact_config_for_owner_view(&mut config);
     let catalog = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
@@ -22576,13 +22609,12 @@ fn canonical_mcp_target_path(
 }
 
 fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<String, ErrorPayload> {
-    let value: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(raw) => {
+    let value: serde_json::Value = match mcp_layer_text(path)? {
+        Some(raw) => {
             crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
             serde_json::from_str(&raw).map_err(internal)?
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(internal(error)),
+        None => serde_json::json!({}),
     };
     let json = serde_json::to_string(&value).map_err(internal)?;
     use sha2::Digest as _;
@@ -25284,17 +25316,14 @@ async fn save_mcp_config(
     // from a caller-supplied list of arbitrary vault names. A malformed prior
     // layer is a hard failure: treating it as empty could delete credentials
     // still needed by that layer.
-    let prior_config = match std::fs::read_to_string(&path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
-        }
-        Err(error) => return Err(internal(error)),
+    let prior_raw = mcp_layer_text(&path)?;
+    let prior_config = match &prior_raw {
+        Some(raw) => crate::mcp::config::McpConfig::parse(raw).map_err(internal)?,
+        None => crate::mcp::config::McpConfig::default(),
     };
-    let mut raw_document: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(internal(error)),
+    let mut raw_document: serde_json::Value = match &prior_raw {
+        Some(raw) => serde_json::from_str(raw).map_err(internal)?,
+        None => serde_json::json!({}),
     };
     let root = raw_document
         .as_object_mut()
@@ -26013,10 +26042,8 @@ fn mcp_live_secret_references(
     for path in
         cockpit_config::config::dirs::mcp_file_paths_for_load(std::path::Path::new(project_root))
     {
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(internal(error)),
+        let Some(raw) = mcp_layer_text(&path)? else {
+            continue;
         };
         let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
         for (name, server) in layer.servers {
@@ -26052,10 +26079,8 @@ fn mcp_config_from_paths(
 ) -> std::result::Result<crate::mcp::config::McpConfig, ErrorPayload> {
     let mut merged = crate::mcp::config::McpConfig::default();
     for path in paths {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(internal(error)),
+        let Some(raw) = mcp_layer_text(path)? else {
+            continue;
         };
         let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
         for (name, server) in layer.servers {
@@ -26063,6 +26088,22 @@ fn mcp_config_from_paths(
         }
     }
     Ok(merged)
+}
+
+fn mcp_layer_text(path: &std::path::Path) -> std::result::Result<Option<String>, ErrorPayload> {
+    match crate::mcp::config::McpConfig::read_layer_text(path) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            if matches!(
+                error,
+                crate::resource_limits::ResourceLimitError::ByteLimit { .. }
+            ) {
+                Err(bad_request(error.to_string()))
+            } else {
+                Err(internal(error))
+            }
+        }
+    }
 }
 
 fn mcp_and_provider_live_secret_references(
@@ -30707,6 +30748,7 @@ pub(super) async fn write_bulk_transfer_chunk(
     chunk_index: u32,
     data_base64: &str,
     owner: Option<&crate::daemon::bulk_staging::BulkTransferOwner>,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<Response, ErrorPayload> {
     if data_base64.len() > cockpit_proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
         return Err(ErrorPayload {
@@ -30723,15 +30765,21 @@ pub(super) async fn write_bulk_transfer_chunk(
     let accepted = match transfer.mime_class {
         cockpit_proto::bulk_transfer::BulkMimeClass::Opaque => {
             let owner = owner.ok_or_else(unavailable_bulk_user_message_transfer)?;
-            crate::daemon::bulk_staging::write_chunk_owned(transfer, owner, chunk_index, &chunk)
-                .map_err(|error| match error {
-                    crate::daemon::bulk_staging::BulkStagingError::OwnerMismatch => {
-                        unavailable_bulk_user_message_transfer()
-                    }
-                    other => staging_error(other),
-                })?
+            crate::daemon::bulk_staging::write_chunk_owned(
+                transfer,
+                owner,
+                quota,
+                chunk_index,
+                &chunk,
+            )
+            .map_err(|error| match error {
+                crate::daemon::bulk_staging::BulkStagingError::OwnerMismatch => {
+                    unavailable_bulk_user_message_transfer()
+                }
+                other => staging_error(other),
+            })?
         }
-        _ => crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk)
+        _ => crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk, quota)
             .map_err(staging_error)?,
     };
     Ok(Response::BulkTransferChunkAccepted {
@@ -30740,8 +30788,9 @@ pub(super) async fn write_bulk_transfer_chunk(
             accepted.received_bytes,
         ),
         complete: accepted.complete,
-        // Advertise the deadline so the peer is never surprised by expiry.
-        idle_timeout_ms: crate::daemon::bulk_staging::STAGED_TRANSFER_TTL_MS as u32,
+        // Advertise remaining non-renewable lease so the peer is never
+        // surprised by expiry.
+        idle_timeout_ms: u32::try_from(accepted.lease_remaining_ms).unwrap_or(u32::MAX),
     })
 }
 
@@ -30800,6 +30849,7 @@ pub(super) async fn import_session_archive(
 fn stage_export_bytes(
     bytes: &[u8],
     mime_class: cockpit_proto::bulk_transfer::BulkMimeClass,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<cockpit_proto::bulk_transfer::BulkTransferRef, ErrorPayload> {
     use rand::RngExt as _;
     let mut transfer_id = [0u8; 16];
@@ -30808,7 +30858,7 @@ fn stage_export_bytes(
     if transfer_id.iter().all(|b| *b == 0) {
         transfer_id[0] = 1;
     }
-    crate::daemon::bulk_staging::stage(bytes, mime_class, transfer_id).map_err(staging_error)
+    crate::daemon::bulk_staging::stage(bytes, mime_class, transfer_id, quota).map_err(staging_error)
 }
 
 /// Serve one chunk of a REDACTED export transfer to an owner-remoted caller.
@@ -30843,6 +30893,7 @@ pub(super) async fn export_session_data(
     include_generated_artifacts: bool,
     include_sensitive: bool,
     local_owner_action: bool,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<Response, ErrorPayload> {
     use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
     // AC1: the raw, unredacted export is owner-LOCAL only. A remoted caller (a
@@ -30928,7 +30979,7 @@ pub(super) async fn export_session_data(
                 .await
                 .map_err(internal)?
             };
-            let transfer = stage_export_bytes(&bytes, mime_class)?;
+            let transfer = stage_export_bytes(&bytes, mime_class, quota)?;
             proto::ExportSessionData {
                 session_id,
                 kind,
@@ -30978,7 +31029,7 @@ pub(super) async fn export_session_data(
                 .await
                 .map_err(internal)?
             };
-            let transfer = stage_export_bytes(&bundle.bytes, mime_class)?;
+            let transfer = stage_export_bytes(&bundle.bytes, mime_class, quota)?;
             proto::ExportSessionData {
                 session_id,
                 kind,
@@ -31043,8 +31094,17 @@ pub(super) async fn auto_title_request(
     } else {
         let table = match session.persisted_redaction_table().map_err(internal)? {
             Some(table) => table,
-            None => crate::redact::RedactionTable::build(&extended.redact, &session.project_root)
-                .map_err(internal)?,
+            None => {
+                let store = session.credential_store().map_err(internal)?;
+                let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+                crate::redact::RedactionTable::build_with_env_and_credential_store(
+                    &extended.redact,
+                    &session.project_root,
+                    &env,
+                    &store,
+                )
+                .map_err(internal)?
+            }
         };
         std::sync::Arc::new(table)
     };

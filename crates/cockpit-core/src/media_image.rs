@@ -43,19 +43,21 @@ pub struct ImageProfile {
 /// Maximum single RGBA allocation accepted by screenshot decode and resize
 /// paths. Keep native computer zoom preflight on the same resource boundary as
 /// the image pipeline that performs the allocation.
-pub const SCREENSHOT_MAX_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+pub const SCREENSHOT_MAX_ALLOC_BYTES: u64 =
+    crate::resource_limits::ResourceLimits::defaults().image_max_alloc_bytes;
 
 impl ImageProfile {
     /// Read-image tool: 64 MiB in/out, Default/Adaptive PNG, Lanczos3 scale.
     pub fn read_image() -> Self {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
         Self {
             name: "read_image",
-            max_input_bytes: 64 * 1024 * 1024,
-            max_output_bytes: 64 * 1024 * 1024,
-            max_width: None,
-            max_height: None,
-            max_pixels: None,
-            max_alloc: Some(512 * 1024 * 1024),
+            max_input_bytes: limits.image_max_input_bytes,
+            max_output_bytes: limits.image_max_output_bytes,
+            max_width: Some(limits.image_max_width),
+            max_height: Some(limits.image_max_height),
+            max_pixels: Some(limits.image_max_pixels),
+            max_alloc: Some(limits.image_max_alloc_bytes),
             png_compression: CompressionType::Default,
             png_filter: FilterType::Adaptive,
             resize_filter: ResizeFilter::Lanczos3,
@@ -65,14 +67,15 @@ impl ImageProfile {
 
     /// Canonical storage derivatives: Level(6)/Paeth PNG, 8192 edge, 40M pixels.
     pub fn storage() -> Self {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
         Self {
             name: "storage",
             max_input_bytes: usize::MAX,
             max_output_bytes: usize::MAX,
-            max_width: Some(8_192),
-            max_height: Some(8_192),
-            max_pixels: Some(40_000_000),
-            max_alloc: Some(160_000_000),
+            max_width: Some(limits.image_max_width),
+            max_height: Some(limits.image_max_height),
+            max_pixels: Some(limits.image_max_pixels),
+            max_alloc: Some(limits.image_max_alloc_bytes),
             png_compression: CompressionType::Level(6),
             png_filter: FilterType::Paeth,
             resize_filter: ResizeFilter::Triangle,
@@ -82,13 +85,14 @@ impl ImageProfile {
 
     /// Screenshot processing: nearest-neighbor resize.
     pub fn screenshot() -> Self {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
         Self {
             name: "screenshot",
             max_input_bytes: usize::MAX,
             max_output_bytes: usize::MAX,
-            max_width: None,
-            max_height: None,
-            max_pixels: None,
+            max_width: Some(limits.image_max_width),
+            max_height: Some(limits.image_max_height),
+            max_pixels: Some(limits.image_max_pixels),
             max_alloc: Some(SCREENSHOT_MAX_ALLOC_BYTES),
             png_compression: CompressionType::Default,
             png_filter: FilterType::Adaptive,
@@ -100,14 +104,15 @@ impl ImageProfile {
     /// Browser previews are bounded PNGs with a 256-pixel edge. An RGBA image
     /// at that bound is below 512 KiB even before compression.
     pub fn browser_thumbnail() -> Self {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
         Self {
             name: "browser_thumbnail",
             max_input_bytes: usize::MAX,
             max_output_bytes: 512 * 1024,
-            max_width: None,
-            max_height: None,
-            max_pixels: None,
-            max_alloc: Some(160_000_000),
+            max_width: Some(limits.image_max_width),
+            max_height: Some(limits.image_max_height),
+            max_pixels: Some(limits.image_max_pixels),
+            max_alloc: Some(limits.image_max_alloc_bytes),
             png_compression: CompressionType::Level(6),
             png_filter: FilterType::Paeth,
             resize_filter: ResizeFilter::Triangle,
@@ -414,6 +419,16 @@ fn skip_gif_sub_blocks(input: &[u8], offset: &mut usize) -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn encode_solid_rgb_png(width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb([0x20, 0x40, 0x60]));
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(img.as_raw(), width, height, ExtendedColorType::Rgb8)
+        .expect("encode test png");
+    bytes
+}
+
 fn check_output(bytes: Vec<u8>, profile: &ImageProfile) -> Result<Vec<u8>> {
     if bytes.len() > profile.max_output_bytes {
         bail!(
@@ -432,9 +447,7 @@ fn decode_bounded(bytes: &[u8], profile: &ImageProfile) -> Result<DynamicImage> 
     limits.max_image_height = profile.max_height;
     limits.max_alloc = profile.max_alloc;
     reader.limits(limits);
-    let decoder = reader
-        .into_decoder()
-        .map_err(|e| anyhow!("failed to decode image: {e}"))?;
+    let decoder = reader.into_decoder().map_err(map_decode_error)?;
     let (width, height) = decoder.dimensions();
     if let Some(max_w) = profile.max_width {
         ensure!(width > 0 && width <= max_w, "resource_limit");
@@ -450,7 +463,14 @@ fn decode_bounded(bytes: &[u8], profile: &ImageProfile) -> Result<DynamicImage> 
             "resource_limit"
         );
     }
-    DynamicImage::from_decoder(decoder).map_err(|e| anyhow!("failed to decode image: {e}"))
+    DynamicImage::from_decoder(decoder).map_err(map_decode_error)
+}
+
+fn map_decode_error(error: image::ImageError) -> anyhow::Error {
+    match error {
+        image::ImageError::Limits(_) => anyhow!("resource_limit"),
+        other => anyhow!("failed to decode image: {other}"),
+    }
 }
 
 /// Locate a raw EXIF TIFF payload without decoding pixels.
@@ -1203,6 +1223,38 @@ mod tests {
         &from[..end]
     }
 
+    fn unbounded_decode_profile() -> ImageProfile {
+        let mut profile = ImageProfile::read_image();
+        profile.max_width = None;
+        profile.max_height = None;
+        profile.max_pixels = None;
+        profile.max_alloc = None;
+        profile
+    }
+
+    #[test]
+    fn decode_rejects_width_and_height_over_the_central_limit() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let over_width = encode_solid_rgb_png(limits.image_max_width + 1, 1);
+        decode_and_orient(&over_width, &unbounded_decode_profile())
+            .expect("fixture must decode when dimension bounds are absent");
+        let err = decode_and_orient(&over_width, &ImageProfile::read_image()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("resource_limit"),
+            "width over the cap must fail closed, got {text}"
+        );
+        let over_height = encode_solid_rgb_png(1, limits.image_max_height + 1);
+        decode_and_orient(&over_height, &unbounded_decode_profile())
+            .expect("fixture must decode when dimension bounds are absent");
+        let err = decode_and_orient(&over_height, &ImageProfile::read_image()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("resource_limit"),
+            "height over the cap must fail closed, got {text}"
+        );
+    }
+
     #[test]
     fn media_image_profiles() {
         let read = ImageProfile::read_image();
@@ -1211,7 +1263,13 @@ mod tests {
         assert_eq!(read.png_compression, CompressionType::Default);
         assert_eq!(read.png_filter, FilterType::Adaptive);
         assert_eq!(read.resize_filter, ResizeFilter::Lanczos3);
+        let limits = crate::resource_limits::ResourceLimits::defaults();
         assert_eq!(read.max_input_bytes, 64 * 1024 * 1024);
+        assert_eq!(read.max_width, Some(limits.image_max_width));
+        assert_eq!(read.max_height, Some(limits.image_max_height));
+        assert_eq!(read.max_pixels, Some(limits.image_max_pixels));
+        assert_eq!(read.max_alloc, Some(limits.image_max_alloc_bytes));
+        assert_eq!(screenshot.max_width, Some(limits.image_max_width));
         assert_eq!(storage.png_compression, CompressionType::Level(6));
         assert_eq!(storage.png_filter, FilterType::Paeth);
         assert_eq!(screenshot.resize_filter, ResizeFilter::Nearest);

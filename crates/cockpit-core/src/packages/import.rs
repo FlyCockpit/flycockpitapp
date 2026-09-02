@@ -130,7 +130,9 @@ pub(super) fn derive_package_identifier(package_dir: &Path) -> String {
 }
 
 fn package_name_from_cargo(package_dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(package_dir.join("Cargo.toml")).ok()?;
+    let text = crate::resource_limits::read_project_text(&package_dir.join("Cargo.toml"))
+        .ok()
+        .flatten()?;
     let parsed = toml::from_str::<toml::Value>(&text).ok()?;
     parsed
         .get("package")
@@ -142,7 +144,9 @@ fn package_name_from_cargo(package_dir: &Path) -> Option<String> {
 }
 
 fn package_name_from_package_json(package_dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(package_dir.join("package.json")).ok()?;
+    let text = crate::resource_limits::read_project_text(&package_dir.join("package.json"))
+        .ok()
+        .flatten()?;
     let parsed = serde_json::from_str::<serde_json::Value>(&text).ok()?;
     parsed
         .get("name")
@@ -153,7 +157,9 @@ fn package_name_from_package_json(package_dir: &Path) -> Option<String> {
 }
 
 fn package_name_from_pyproject(package_dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(package_dir.join("pyproject.toml")).ok()?;
+    let text = crate::resource_limits::read_project_text(&package_dir.join("pyproject.toml"))
+        .ok()
+        .flatten()?;
     let parsed = toml::from_str::<toml::Value>(&text).ok()?;
     parsed
         .get("project")

@@ -998,6 +998,38 @@ pub async fn terminate_group_and_reap_status_async(
     }
 }
 
+/// SIGTERM a Unix process group whose leader pid is `pgid` (spawned with
+/// `process_group(0)`). Does not reap and does not require a live `Child`,
+/// so a handle can group-kill after the runner task has been aborted.
+/// No-op on non-Unix targets (no process groups).
+pub fn terminate_process_group(pgid: u32) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(pgid) {
+            let _ = signal_group(pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+    }
+}
+
+/// SIGKILL a Unix process group whose leader pid is `pgid`. Does not reap.
+/// No-op on non-Unix targets.
+pub fn kill_process_group(pgid: u32) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(pgid) {
+            let _ = signal_group(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+    }
+}
+
 /// Begin terminating a Tokio child and, on Unix, every process in the child
 /// process group. This is the non-async counterpart used from `Drop` paths
 /// that can finish cleanup later; callers that can await should use

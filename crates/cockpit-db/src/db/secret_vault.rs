@@ -593,6 +593,25 @@ fn upsert_item_locked(
     Ok(())
 }
 
+/// Whether `session_id` owns a `redaction_table` vault item.
+///
+/// The item id is the session UUID string. [`crate::db::sessions::SessionRedactionCustody`]
+/// is the only constructor that turns this probe into a typed insert witness;
+/// `Db::insert_session_row_conn` will not create a visible row without it.
+pub fn session_redaction_table_vault_item_exists_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM secret_vault_items WHERE kind = ?1 AND item_id = ?2
+        )",
+        params![SecretVaultKind::RedactionTable.as_str(), session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 pub fn load_item_conn(
     conn: &rusqlite::Connection,
     kind: SecretVaultKind,

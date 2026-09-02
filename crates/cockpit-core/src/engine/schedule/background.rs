@@ -44,6 +44,10 @@ pub struct BackgroundHandle {
     attached_knowledge_read: bool,
     /// Set when the job is asked to die; the spawned task observes it.
     kill_tx: tokio::sync::watch::Sender<bool>,
+    /// Leader pid of the shell's process group, published once the child
+    /// is spawned. `kill()` SIGTERMs this group even if the runner has
+    /// already been aborted and cannot poll `cancel` / `kill_rx`.
+    pgid: Arc<Mutex<Option<u32>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,51 +149,63 @@ pub fn background_launch_gate(
 impl BackgroundHandle {
     /// Budget-capped tail of the last `lines` output lines, scrubbed for
     /// secrets. Returns an empty string when no output has been produced.
-    pub fn tail(&self, lines: usize, _redact: &RedactionTable) -> String {
-        let snapshot: Vec<String> = {
+    pub fn tail(&self, lines: usize, redact: &RedactionTable) -> String {
+        let snap: RingSnapshot = {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
         };
         let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
-        // Tail: keep the most recent lines, so write from the end forward
-        // and reverse — but BudgetedWriter is forward-only, so we just
-        // write oldest→newest of the requested window and accept that an
-        // over-cap window drops its *oldest* lines (the head of the
-        // window), keeping the freshest output.
-        let start = snapshot
-            .len()
-            .saturating_sub(window_that_fits(&snapshot, TAIL_TOKEN_CAP));
-        for line in &snapshot[start..] {
-            if !writer.writeln(line) {
-                break;
-            }
-        }
-        let body = writer.into_string();
+        // Tail: keep the most recent lines. The window is a SUFFIX of the
+        // stream — requested-tail slicing, ring eviction, and the token cap
+        // all omit OLDER content — so `write_budget_window` also elides the
+        // unsafe FRONT margin of the first retained line (plus the flagged
+        // FRONT/BACK margins of the retained lines themselves) under the
+        // table the CALLER (the driver, at `background.tail` time) holds —
+        // the current session table.
+        let source = write_budget_window(&mut writer, redact, &snap, TAIL_TOKEN_CAP, false);
+        // The tail budget can cut the last retained line mid-line; elide the
+        // cut's back margin under that same current session table.
+        let body = writer.into_string_redacted(redact);
         if body.is_empty() {
             format!("`{}` has produced no output yet", self.label)
+        } else if self.attached_knowledge_read {
+            crate::knowledge::fence_knowledge_model_text_if_needed(&body, &source)
         } else {
-            let source = snapshot[start..].join("\n");
-            if self.attached_knowledge_read {
-                crate::knowledge::fence_knowledge_model_text_if_needed(&body, &source)
-            } else {
-                body
-            }
+            body
         }
     }
 
-    /// Signal the spawned task to kill the child. Idempotent.
+    /// Group-kill the shell, then signal the runner. Idempotent.
+    ///
+    /// The process-group SIGTERM (and a delayed SIGKILL) is issued from this
+    /// handle so Stop / `background.cancel` still contains descendants when
+    /// the authority aborts the runner immediately afterward. The watch send
+    /// remains so a still-running runner can `terminate_group_async` itself.
     pub fn kill(&self) {
+        let pgid = self
+            .pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pgid) = pgid {
+            cockpit_host::process::terminate_process_group(pgid);
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cockpit_host::process::kill_process_group(pgid);
+            });
+        }
         let _ = self.kill_tx.send(true);
     }
 }
 
 /// Compute how many trailing lines of `lines` fit under `cap` tokens, so
 /// `tail` keeps the freshest output rather than the oldest.
-fn window_that_fits(lines: &[String], cap: usize) -> usize {
+fn window_that_fits(lines: &[&str], cap: usize) -> usize {
     let mut probe = BudgetedWriter::new(cap);
     let mut count = 0;
     for line in lines.iter().rev() {
-        if probe.writeln(line) {
+        if probe.writeln(*line) {
             count += 1;
         } else {
             break;
@@ -198,13 +214,163 @@ fn window_that_fits(lines: &[String], cap: usize) -> usize {
     count
 }
 
+/// Write the freshest `cap`-token window of `snap` (whole lines, freshest
+/// kept, per [`window_that_fits`]) into `writer`, redaction-aware at the
+/// window's FRONT edge (issue #294).
+///
+/// The budget drops whole OLDEST lines first, so the retained window is a
+/// SUFFIX of the stream, and every omission ahead of it — ring-evicted
+/// lines, requested-tail-skipped lines, budget-elided lines, or a previous
+/// physical line's discarded over-cap tail (the [`RingLine`] flags) — puts
+/// the first retained line's front at an omission boundary. A registered
+/// multi-line secret beginning in that omitted content and ending in the
+/// first retained line would leave only its SUFFIX there, which the
+/// downstream whole-value §7 scrub cannot match; the unsafe front margin of
+/// the first written STREAM line (and of every flagged line, wherever it
+/// falls in the window) is therefore elided under `redact` — the table
+/// CURRENT at render time, never a stale launch snapshot. The synthetic
+/// overflow marker is a fixed constant and never elided; the budget
+/// omitting the marker alone removes no stream content and creates no
+/// secret-bearing boundary.
+///
+/// Each retained line's OWN truncation boundary gets the same render-time
+/// treatment (issue #294, stale-table back edge): a line flagged
+/// `back_abuts_omission` was cut at the per-line byte cap at PUSH time and
+/// its stored head stays RAW, so a secret registered after that push still
+/// has its straddling PREFIX elided HERE, under `redact` — the table current
+/// when this render crosses to the model. The window budget's own cut (the
+/// writer refusing a following line) is elided separately by
+/// [`BudgetedWriter::into_string_redacted`]; when the last written line is
+/// itself line-cap-truncated those two back treatments address overlapping
+/// boundaries and may over-elide — fail-closed, never a leak.
+///
+/// When `elided_note` is set and the budget omitted anything, a fixed
+/// `[earlier output elided…]` note line is written first (it counts against
+/// the cap, matching the completion path's historical inline note).
+///
+/// Returns the RAW (pre-elision) join of exactly the lines written, for
+/// downstream knowledge-fence scanning of the delivered window.
+fn write_budget_window(
+    writer: &mut BudgetedWriter,
+    redact: &RedactionTable,
+    snap: &RingSnapshot,
+    cap: usize,
+    elided_note: bool,
+) -> String {
+    let probe: Vec<&str> = snap
+        .overflow
+        .as_deref()
+        .into_iter()
+        .chain(snap.lines.iter().map(|line| line.text.as_str()))
+        .collect();
+    let fit = window_that_fits(&probe, cap);
+    let start = probe.len().saturating_sub(fit);
+    let overflow_count = usize::from(snap.overflow.is_some());
+    // Stream-line index where the written window begins (a present overflow
+    // marker occupies `start == 0`).
+    let line_start = start.saturating_sub(overflow_count);
+    // Only omitted STREAM lines create a secret-bearing front boundary;
+    // omitting just the synthetic marker does not.
+    let front_cut = line_start > 0;
+    if elided_note && fit < probe.len() {
+        let _ = writer.writeln(&format!(
+            "[earlier output elided — {fit} of {} line(s) shown]",
+            probe.len()
+        ));
+    }
+    let mut raw_written: Vec<&str> = Vec::new();
+    if start == 0 {
+        if let Some(marker) = &snap.overflow {
+            if writer.writeln(marker) {
+                raw_written.push(marker);
+            }
+        }
+    }
+    for (i, line) in snap.lines[line_start..].iter().enumerate() {
+        let elide_front = line.front_abuts_omission || (i == 0 && front_cut);
+        let mut text: &str = line.text.as_str();
+        if elide_front {
+            text = crate::tools::common::drop_front_margin(redact, text);
+        }
+        // Per-line back edge: a line cut at the per-line byte cap at PUSH
+        // time keeps its RAW head, so this render — the first time the
+        // stored bytes cross to the model — elides the straddling-secret
+        // PREFIX under `redact`, the table CURRENT now (issue #294).
+        if line.back_abuts_omission {
+            text = crate::tools::common::drop_back_margin(redact, text);
+        }
+        if !writer.writeln(text) {
+            break;
+        }
+        raw_written.push(line.text.as_str());
+    }
+    raw_written.join("\n")
+}
+
+/// One retained output line with its omission-boundary metadata.
+#[derive(Debug, Clone)]
+struct RingLine {
+    text: String,
+    /// True when this line's FRONT abuts omitted stream content: earlier
+    /// ring lines were evicted ahead of it, the preceding physical line's
+    /// over-cap tail was discarded at the line/read cap, or the preceding
+    /// stream line was dropped whole. A registered multi-line secret
+    /// beginning in that omitted content and ending in this line would
+    /// leave only its SUFFIX here — a partial the downstream whole-value §7
+    /// scrub cannot match (issue #294). The unsafe front margin is elided
+    /// once, at RENDER time ([`write_budget_window`]), so the table CURRENT
+    /// at the cut applies — never a stale launch snapshot.
+    front_abuts_omission: bool,
+    /// True when this line's END abuts omitted stream content: the physical
+    /// line was longer than the per-line byte cap and its over-cap tail was
+    /// discarded (by the ring's line cap or the capped reader) after the
+    /// stored head. A registered secret straddling that cut leaves only its
+    /// PREFIX here — a partial the downstream whole-value §7 scrub cannot
+    /// match (issue #294). Like the front flag, the unsafe back margin is
+    /// elided once, at RENDER time ([`write_budget_window`]), under the
+    /// table CURRENT then — never the table the line arrived under, which
+    /// cannot know a secret registered after the push.
+    back_abuts_omission: bool,
+}
+
+/// A ring window ready for rendering: the synthetic overflow marker (earlier
+/// output evicted from the ring) and the retained raw lines with their
+/// omission-boundary flags (front and back). Lines stay RAW here; the
+/// redaction-aware boundary elision happens exactly once, in
+/// [`write_budget_window`], under the render-time table.
+#[derive(Debug)]
+struct RingSnapshot {
+    overflow: Option<String>,
+    lines: Vec<RingLine>,
+}
+
+impl RingSnapshot {
+    /// RAW (pre-elision) join of the whole snapshot — the marker and every
+    /// retained line — for downstream knowledge-fence scanning, which must
+    /// see the full retained window, not just the budget-visible slice.
+    fn raw_joined(&self) -> String {
+        let mut parts: Vec<&str> = Vec::with_capacity(self.lines.len() + 1);
+        if let Some(marker) = &self.overflow {
+            parts.push(marker);
+        }
+        parts.extend(self.lines.iter().map(|line| line.text.as_str()));
+        parts.join("\n")
+    }
+}
+
 #[derive(Debug)]
 struct BoundedOutputRing {
-    lines: VecDeque<String>,
+    lines: VecDeque<RingLine>,
     bytes: usize,
     dropped_lines: usize,
     dropped_bytes: usize,
     max_bytes: usize,
+    /// True when the NEXT pushed stream line's front abuts omitted content:
+    /// the previous physical line was truncated at the line cap (its tail
+    /// discarded by the ring or the capped reader), or the previous stream
+    /// line was dropped whole (larger than the entire ring). The synthetic
+    /// truncation-note line between the two never consumes this flag.
+    next_stream_front_abuts_omission: bool,
 }
 
 impl BoundedOutputRing {
@@ -215,60 +381,126 @@ impl BoundedOutputRing {
             dropped_lines: 0,
             dropped_bytes: 0,
             max_bytes: max_bytes.max(1),
+            next_stream_front_abuts_omission: false,
         }
     }
 
     fn push(&mut self, line: String) {
+        let front_abuts_omission = self.next_stream_front_abuts_omission;
         let (line, truncated) = truncate_line(line, BACKGROUND_LINE_BYTE_CAP);
-        self.push_one(line);
+        // The retained head's END abuts the discarded tail of the physical
+        // line: a registered secret straddling the cap would leave only its
+        // PREFIX, past what the downstream whole-value §7 scrub can match.
+        // Record it as a flag (not a push-time mutation): the stored head
+        // stays RAW and the elision happens at RENDER time, under the table
+        // CURRENT then — a push-time cut under the line-arrival table could
+        // not know a secret registered after this push, and would preserve
+        // that later secret's straddling PREFIX forever (issue #294:
+        // stale-table boundary treatment).
+        //
+        // The discarded tail also puts the NEXT physical line's front at an
+        // omission boundary: a secret spanning the discarded tail into that
+        // line would surface as an unmatchable SUFFIX there. Same story —
+        // a flag, so the elision uses the render-time table.
+        self.next_stream_front_abuts_omission = truncated;
+        let head_dropped = self.push_one(
+            RingLine {
+                text: line,
+                front_abuts_omission,
+                back_abuts_omission: truncated,
+            },
+            true,
+        );
         if truncated {
-            self.push_one(format!(
-                "[background output line truncated at {BACKGROUND_LINE_BYTE_CAP} bytes]"
-            ));
+            self.push_one(
+                RingLine {
+                    text: format!(
+                        "[background output line truncated at {BACKGROUND_LINE_BYTE_CAP} bytes]"
+                    ),
+                    // Synthetic constant: no registered secret can
+                    // straddle into or out of it, and evicting everything
+                    // ahead of it never makes its front secret-bearing.
+                    front_abuts_omission: false,
+                    back_abuts_omission: false,
+                },
+                false,
+            );
+        }
+        if head_dropped {
+            // The head itself was dropped whole (larger than the entire
+            // ring): the next stream line's front abuts its omitted bytes.
+            self.next_stream_front_abuts_omission = true;
         }
     }
 
-    fn push_one(&mut self, line: String) {
-        let line_bytes = line.len();
+    /// Push one line, evicting oldest lines to fit. Returns `true` when the
+    /// line was dropped whole (larger than the entire ring).
+    ///
+    /// `flag_front_if_evicted_to_front` marks the incoming line's front as
+    /// abutting omission when eviction empties the ring and the incoming
+    /// line becomes the front — true for stream lines, false for the
+    /// synthetic truncation note (a fixed constant).
+    fn push_one(&mut self, mut line: RingLine, flag_front_if_evicted_to_front: bool) -> bool {
+        let line_bytes = line.text.len();
         while self.bytes.saturating_add(line_bytes) > self.max_bytes {
             let Some(old) = self.lines.pop_front() else {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(old.len());
+            self.bytes = self.bytes.saturating_sub(old.text.len());
             self.dropped_lines = self.dropped_lines.saturating_add(1);
-            self.dropped_bytes = self.dropped_bytes.saturating_add(old.len());
+            self.dropped_bytes = self.dropped_bytes.saturating_add(old.text.len());
+            // Eviction is a front-omission boundary for whatever now leads
+            // the ring: a secret beginning in the evicted lines and ending
+            // in the new front line leaves an unmatchable SUFFIX there.
+            if let Some(front) = self.lines.front_mut() {
+                front.front_abuts_omission = true;
+            } else if flag_front_if_evicted_to_front {
+                line.front_abuts_omission = true;
+            }
         }
         if line_bytes <= self.max_bytes {
             self.bytes = self.bytes.saturating_add(line_bytes);
             self.lines.push_back(line);
+            false
         } else {
             self.dropped_lines = self.dropped_lines.saturating_add(1);
             self.dropped_bytes = self.dropped_bytes.saturating_add(line_bytes);
+            true
         }
     }
 
-    fn snapshot_all(&self) -> Vec<String> {
-        let mut out = self.overflow_prefix();
-        out.extend(self.lines.iter().cloned());
-        out
+    fn snapshot_all(&self) -> RingSnapshot {
+        RingSnapshot {
+            overflow: self.overflow_marker(),
+            lines: self.lines.iter().cloned().collect(),
+        }
     }
 
-    fn snapshot_tail(&self, lines: usize) -> Vec<String> {
+    fn snapshot_tail(&self, lines: usize) -> RingSnapshot {
         let n = lines.min(self.lines.len());
-        let mut out = self.overflow_prefix();
-        out.extend(self.lines.iter().skip(self.lines.len() - n).cloned());
-        out
+        let skip = self.lines.len() - n;
+        let mut lines: Vec<RingLine> = self.lines.iter().skip(skip).cloned().collect();
+        // The requested-tail slice omitted `skip` retained lines, putting
+        // the window's first line at an omission boundary exactly like
+        // eviction does.
+        if skip > 0 {
+            if let Some(first) = lines.first_mut() {
+                first.front_abuts_omission = true;
+            }
+        }
+        RingSnapshot {
+            overflow: self.overflow_marker(),
+            lines,
+        }
     }
 
-    fn overflow_prefix(&self) -> Vec<String> {
-        if self.dropped_lines == 0 {
-            Vec::new()
-        } else {
-            vec![format!(
+    fn overflow_marker(&self) -> Option<String> {
+        (self.dropped_lines > 0).then(|| {
+            format!(
                 "[earlier background output discarded: {} bytes across {} line(s)]",
                 self.dropped_bytes, self.dropped_lines
-            )]
-        }
+            )
+        })
     }
 }
 
@@ -294,21 +526,24 @@ pub fn spawn(
         command,
         cwd,
         launch,
-        redact,
+        redact_probe,
         turn_tx,
         event_tx,
+        cancel,
     }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
     let ring: Arc<Mutex<BoundedOutputRing>> =
         Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP)));
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
     let attached_knowledge_read = !launch.attached_knowledge_paths.is_empty();
+    let pgid = Arc::new(Mutex::new(None));
 
     let handle = BackgroundHandle {
         label: label.clone(),
         ring: ring.clone(),
         attached_knowledge_read,
         kill_tx,
+        pgid: pgid.clone(),
     };
 
     let task = spawn_guarded_background(
@@ -319,10 +554,12 @@ pub fn spawn(
             cwd,
             launch,
             ring,
-            redact,
+            redact_probe,
             turn_tx,
             event_tx.clone(),
             kill_rx,
+            cancel,
+            pgid,
         ),
         event_tx,
         job_id,
@@ -331,15 +568,28 @@ pub fn spawn(
     (handle, task)
 }
 
+/// Live probe for the session redaction table. The ring stores RAW truncated
+/// lines with omission-boundary flags and applies every margin elision at
+/// RENDER time, so a background job must elide under the table CURRENT when
+/// its output crosses the model boundary — the session can register a new
+/// secret after the job launched. The completion render consults this probe
+/// once, at completion time, never holding a launch snapshot (issue #294:
+/// stale-snapshot redaction identity).
+pub type RedactionProbe = Arc<dyn Fn() -> Arc<RedactionTable> + Send + Sync>;
+
 pub struct BackgroundSpawn {
     pub job_id: String,
     pub label: String,
     pub command: String,
     pub cwd: std::path::PathBuf,
     pub launch: BackgroundLaunch,
-    pub redact: Arc<RedactionTable>,
+    pub redact_probe: RedactionProbe,
     pub turn_tx: mpsc::Sender<TurnEvent>,
     pub event_tx: mpsc::Sender<ScheduleEvent>,
+    /// Session-work child token. Stop fires this so a still-running runner
+    /// kills the subprocess; [`BackgroundHandle::kill`] group-kills even if
+    /// the runner is aborted first.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 fn spawn_guarded_background<F>(
@@ -500,11 +750,26 @@ async fn run_background(
     cwd: std::path::PathBuf,
     launch: BackgroundLaunch,
     ring: Arc<Mutex<BoundedOutputRing>>,
-    _redact: Arc<RedactionTable>,
+    redact_probe: RedactionProbe,
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: tokio_util::sync::CancellationToken,
+    pgid: Arc<Mutex<Option<u32>>>,
 ) {
+    if cancel.is_cancelled() {
+        let _ = event_tx
+            .send(ScheduleEvent::Completed {
+                job_id,
+                label: label.clone(),
+                kind: ScheduleKind::Background,
+                result: format!("background `{label}` was cancelled"),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await;
+        return;
+    }
     let mut cmd = match build_background_command(&command, &cwd, &launch).await {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -538,6 +803,11 @@ async fn run_background(
             return;
         }
     };
+    if let Some(id) = child.id() {
+        *pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -549,6 +819,12 @@ async fn run_background(
     let mut err_lines =
         CappedLineReader::new(stderr.expect("stderr piped"), BACKGROUND_LINE_READ_CAP);
 
+    // Raw intake: the ring stores each line truncated to the per-line cap
+    // with omission-boundary flags; every redaction-aware margin elision
+    // happens at RENDER time (`write_budget_window` /
+    // `BudgetedWriter::into_string_redacted`) under the table current THEN,
+    // so a secret registered mid-stream is treated on the first render
+    // after its registration — there is no per-line probe to go stale.
     let push = |ring: &Arc<Mutex<BoundedOutputRing>>, line: String| {
         ring.lock().unwrap().push(line);
     };
@@ -565,6 +841,17 @@ async fn run_background(
 
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => {
+                killed = true;
+                let pid = child.id();
+                cockpit_host::process::terminate_group_async(
+                    &mut child,
+                    pid,
+                    Duration::from_millis(200),
+                )
+                .await;
+                break;
+            }
             // Kill request from the authority / `background.cancel`.
             changed = kill_rx.changed(), if !kill_watch_closed => {
                 match changed {
@@ -620,26 +907,30 @@ async fn run_background(
     let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
 
     // Build the budget-capped result from the ring's freshest output.
-    let snapshot: Vec<String> = {
+    let snap: RingSnapshot = {
         let r = ring.lock().unwrap();
         r.snapshot_all()
     };
+    // The knowledge fence below scans the FULL retained window (raw,
+    // pre-elision) so a finding beyond the budget-visible slice cannot
+    // arrive as a seemingly clean event.
+    let raw_all = snap.raw_joined();
+    // The completion window is a SUFFIX of the stream (ring eviction and
+    // the token cap omit older content), so `write_budget_window` elides
+    // the unsafe FRONT margin of the first retained line — and, for every
+    // line flagged at push time, its FRONT/BACK omission margins — under
+    // the table current at completion; the budget's own back-edge cut is
+    // elided by `into_string_redacted` below.
+    let redact_now = redact_probe();
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
-    let fit = window_that_fits(&snapshot, ASYNC_RESULT_TOKEN_CAP);
-    let start = snapshot.len().saturating_sub(fit);
-    if fit < snapshot.len() {
-        let _ = writer.writeln(&format!(
-            "[earlier output elided — {} of {} line(s) shown]",
-            fit,
-            snapshot.len()
-        ));
-    }
-    for line in &snapshot[start..] {
-        if !writer.writeln(line) {
-            break;
-        }
-    }
-    let body = writer.into_string();
+    write_budget_window(
+        &mut writer,
+        &redact_now,
+        &snap,
+        ASYNC_RESULT_TOKEN_CAP,
+        true,
+    );
+    let body = writer.into_string_redacted(&redact_now);
 
     let (result, failed) = if killed {
         (format!("background `{label}` was cancelled"), false)
@@ -652,10 +943,10 @@ async fn run_background(
         (format!("{header}{body}"), !success)
     };
     let result = if !killed && !launch.attached_knowledge_paths.is_empty() {
-        // `body` is budget-capped, but `snapshot` retains every line that can
+        // `body` is budget-capped, but `raw_all` retains every line that can
         // still cross this job's output boundary. Scan the latter so a finding
         // beyond the visible window cannot arrive as a seemingly clean event.
-        crate::knowledge::fence_knowledge_model_text_if_needed(&result, &snapshot.join("\n"))
+        crate::knowledge::fence_knowledge_model_text_if_needed(&result, &raw_all)
     } else {
         result
     };
@@ -831,23 +1122,47 @@ mod tests {
         turn_tx: mpsc::Sender<TurnEvent>,
         event_tx: mpsc::Sender<ScheduleEvent>,
     ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        spawn_test_job_with_cancel(
+            label,
+            command,
+            cwd,
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    fn spawn_test_job_with_cancel(
+        label: &str,
+        command: &str,
+        cwd: std::path::PathBuf,
+        launch: BackgroundLaunch,
+        redact: Arc<RedactionTable>,
+        turn_tx: mpsc::Sender<TurnEvent>,
+        event_tx: mpsc::Sender<ScheduleEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
         spawn(BackgroundSpawn {
             job_id: "job-1".to_string(),
             label: label.to_string(),
             command: command.to_string(),
             cwd,
             launch,
-            redact,
+            redact_probe: Arc::new(move || redact.clone()),
             turn_tx,
             event_tx,
+            cancel,
         })
     }
 
     #[test]
     fn window_that_fits_keeps_freshest() {
         let lines: Vec<String> = (0..50).map(|i| format!("line number {i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
         // A tiny cap fits only a couple of trailing lines.
-        let fit = window_that_fits(&lines, 6);
+        let fit = window_that_fits(&refs, 6);
         assert!(fit >= 1 && fit < lines.len());
     }
 
@@ -875,9 +1190,176 @@ mod tests {
     fn output_line_cap_truncates_with_note() {
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push("x".repeat(BACKGROUND_LINE_BYTE_CAP + 100));
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
-        assert!(snapshot[1].contains("line truncated"));
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(snap.lines[1].text.contains("line truncated"));
+    }
+
+    // A registered secret straddling the per-line head cut leaves only its
+    // PREFIX in the retained line; the render-time margin elision must
+    // remove it so the whole-value scrub never sees a fragment it cannot
+    // match. The cut happens at PUSH time, but the elision happens at RENDER
+    // time — so the sequence that must hold is: the overlong line is stored
+    // under a table that does not know the secret yet, the secret is
+    // registered afterwards, and the render still elides the partial prefix
+    // under the CURRENT table (issue #294: stale-table back edge).
+    #[test]
+    fn output_line_cap_back_edge_redacts_secret_registered_after_push() {
+        const SECRET: &str = "******************************************"; // 40 bytes
+        // The secret starts 20 bytes before the cap, so a boundary-unsafe
+        // stored head keeps its first 20 bytes past the cut.
+        let line = format!(
+            "{}{SECRET}{}",
+            "x".repeat(BACKGROUND_LINE_BYTE_CAP - 20),
+            "y".repeat(50)
+        );
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        // Stale table at push time: the secret is not registered yet, so a
+        // push-time elision (the old design) would preserve the prefix.
+        ring.push(line);
+        // The secret is registered only AFTER the overlong line was stored.
+        let table = RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "bg-line-straddle-test".to_string())
+            .unwrap();
+        // The render — with a budget big enough that the writer's own cap
+        // never cuts — must elide the stored line's back margin under the
+        // table current NOW, or the straddling prefix crosses to the model.
+        let out = rendered_window(&ring, &table);
+        assert!(
+            out.contains("line truncated"),
+            "fixture must show the truncation note: {out}"
+        );
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains(&SECRET[..16]),
+            "straddling prefix leaked under a post-push registration: {scrubbed}"
+        );
+        assert!(!scrubbed.contains(SECRET));
+    }
+
+    // The ring's omission boundaries (issue #294): eviction, requested-tail
+    // slicing, and the token-budget window all make the retained output a
+    // SUFFIX of the stream, so a registered multi-line secret beginning in
+    // the omitted content and ending in the first retained line leaves only
+    // its SUFFIX there (a FRONT edge); a line cut at the per-line cap leaves
+    // a straddling secret's PREFIX in its stored head (a BACK edge). Both
+    // are partials the downstream whole-value scrub cannot match, and both
+    // unsafe margins must elide at render time, under the table current then
+    // — including a secret registered only AFTER the lines were pushed.
+
+    /// Render the ring's whole retained window through `write_budget_window`
+    /// with a generous cap (no budget cut of its own).
+    fn rendered_window(ring: &BoundedOutputRing, table: &RedactionTable) -> String {
+        let snap = ring.snapshot_all();
+        let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
+        write_budget_window(&mut writer, table, &snap, ASYNC_RESULT_TOKEN_CAP, false);
+        writer.into_string_redacted(table)
+    }
+
+    #[test]
+    fn ring_eviction_front_edge_elides_secret_straddling_evicted_line() {
+        // The multi-line secret spans two adjacent lines; the ring is sized
+        // so the second push evicts the first (both lines fit alone).
+        const HALF_A: &str = "front-half-A";
+        const HALF_B: &str = "back-half-B";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-evict-straddle-test".to_string())
+            .unwrap();
+        let line_one = format!("lead {HALF_A}");
+        let line_two = format!("{HALF_B} close out the ledger now");
+        let mut ring = BoundedOutputRing::new(line_one.len() + line_two.len() - 1);
+        ring.push(line_one);
+        ring.push(line_two);
+        assert!(ring.dropped_lines > 0, "fixture must evict the first line");
+        let out = rendered_window(&ring, &table);
+        assert!(out.contains("ledger"), "rendered window: {out}");
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "eviction front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn tail_slice_front_edge_elides_secret_straddling_skipped_line() {
+        // No eviction here: the requested-tail slice itself omits the
+        // retained line holding the secret's first half.
+        const HALF_A: &str = "front-half-A";
+        const HALF_B: &str = "back-half-B";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-tail-straddle-test".to_string())
+            .unwrap();
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(format!("lead {HALF_A}"));
+        ring.push(format!("{HALF_B} close out the ledger now"));
+        let snap = ring.snapshot_tail(1);
+        let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
+        write_budget_window(&mut writer, &table, &snap, TAIL_TOKEN_CAP, false);
+        let body = writer.into_string_redacted(&table);
+        assert!(body.contains("ledger"), "tail body: {body}");
+        let scrubbed = table.scrub(&body);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "requested-tail front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn budget_window_front_edge_elides_secret_straddling_budget_elided_line() {
+        // The budget keeps only the freshest line, so the line before it —
+        // holding the secret's first half — is omitted by the cap itself.
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-budget-straddle-test".to_string())
+            .unwrap();
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push("old output".to_string());
+        ring.push(format!("prefix {HALF_A} {}", "x".repeat(600)));
+        ring.push(format!("{HALF_B} fresh tail keeps running"));
+        // A cap that fits the last line but never the 600-x line before it.
+        let cap = crate::tokens::count("BBBBBBBBBB fresh tail keeps running") + 4;
+        let snap = ring.snapshot_all();
+        let mut writer = BudgetedWriter::new(cap);
+        write_budget_window(&mut writer, &table, &snap, cap, false);
+        let body = writer.into_string_redacted(&table);
+        assert!(!body.is_empty(), "budget window must render the last line");
+        let scrubbed = table.scrub(&body);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "budget window front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn truncated_line_follower_front_edge_elides_secret_straddling_discarded_tail() {
+        // The secret's first half sits just past the line cap (discarded with
+        // the over-cap tail); its second half leads the NEXT physical line.
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-follower-straddle-test".to_string())
+            .unwrap();
+        // Line one: cap bytes of filler then the secret's first half exactly
+        // at the end — truncated at the cap, so HALF_A is discarded.
+        let overlong = format!("{}{HALF_A}", "x".repeat(BACKGROUND_LINE_BYTE_CAP));
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(overlong);
+        ring.push(format!("{HALF_B} after the cut"));
+        let out = rendered_window(&ring, &table);
+        assert!(
+            out.contains("line truncated"),
+            "fixture must show the truncation note: {out}"
+        );
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "discarded-tail follower edge leaked a secret suffix: {scrubbed}"
+        );
     }
 
     #[tokio::test]
@@ -925,9 +1407,9 @@ mod tests {
         assert!(line.len() > BACKGROUND_LINE_BYTE_CAP);
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line);
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
-        assert!(snapshot[1].contains("line truncated"));
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(snap.lines[1].text.contains("line truncated"));
     }
 
     #[tokio::test]
@@ -950,10 +1432,10 @@ mod tests {
         assert!(line.ends_with('\r'));
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line);
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
         assert!(
-            snapshot[1].contains("line truncated"),
+            snap.lines[1].text.contains("line truncated"),
             "truncation note must survive a \\r at the cap boundary"
         );
     }
@@ -999,10 +1481,14 @@ mod tests {
         ring.push("first".to_string());
         ring.push("second".to_string());
         ring.push("third".to_string());
-        let snapshot = ring.snapshot_all();
-        assert!(snapshot[0].contains("earlier background output discarded"));
-        assert!(!snapshot.iter().any(|line| line == "first"));
-        assert!(snapshot.iter().any(|line| line == "third"));
+        let snap = ring.snapshot_all();
+        assert!(
+            snap.overflow
+                .as_deref()
+                .is_some_and(|marker| marker.contains("earlier background output discarded"))
+        );
+        assert!(!snap.lines.iter().any(|line| line.text == "first"));
+        assert!(snap.lines.iter().any(|line| line.text == "third"));
     }
 
     #[test]
@@ -1017,6 +1503,7 @@ mod tests {
             ring,
             attached_knowledge_read: true,
             kill_tx,
+            pgid: Arc::new(Mutex::new(None)),
         };
 
         let tail = handle.tail(10, &RedactionTable::empty());
@@ -1387,6 +1874,109 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn session_cancel_token_kills_running_shell() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, _task) = spawn_test_job_with_cancel(
+            "slow",
+            "printf 'progress one\\nprogress two\\n'; sleep 30",
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact.clone(),
+            turn_tx,
+            event_tx,
+            cancel.clone(),
+        );
+
+        let mut waited = 0;
+        loop {
+            let t = handle.tail(40, &redact);
+            if t.contains("progress two") {
+                break;
+            }
+            assert!(waited < 100, "lines never appeared in tail: {t}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+
+        cancel.cancel();
+        let completed = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("session Stop must complete the background shell")
+            .unwrap();
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(!failed, "a cancelled scheduled task isn't a failure");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_kill_group_terminates_descendants_after_runner_abort() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let heartbeat = tmp.path().join("heartbeat");
+        let ready = tmp.path().join("ready");
+        let script = format!(
+            "( while true; do touch '{}'; sleep 0.1; done ) & touch '{}'; sleep 30",
+            heartbeat.display(),
+            ready.display()
+        );
+        let (handle, task) = spawn_test_job(
+            "group-kill",
+            &script,
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact,
+            turn_tx,
+            event_tx,
+        );
+
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "shell never created the ready file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        while !heartbeat.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "descendant never created the heartbeat file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+        let _ = task.await;
+        handle.kill();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let mtime_after_kill = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let mtime_later = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        assert_eq!(
+            mtime_after_kill, mtime_later,
+            "descendant heartbeat kept updating after handle.kill() with the runner already aborted"
+        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};

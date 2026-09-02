@@ -532,8 +532,9 @@ async fn render_lineage(
 
 /// Build the model-visible redactor for one history target. A target session's
 /// persisted table is durable knowledge of secrets it observed, so it must be
-/// unioned with the caller's table even for same-workspace recall. Parse and
-/// union errors fail the search rather than exposing an unredacted snippet.
+/// unioned with the caller's table even for same-workspace recall. Missing
+/// custody, parse errors, and union errors fail the search rather than
+/// exposing an unredacted snippet.
 async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -> Result<String> {
     let Some(target_table) = ctx
         .session
@@ -666,10 +667,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let thread = db
-            .create_thread(parent_session_id, anchor.to_string())
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let thread = crate::session::lifecycle::persist_fork_with_redaction_custody(
+            &db,
+            &vault,
+            parent_session_id,
+            Some(anchor.to_string()),
+            false,
+            true,
+        )
+        .unwrap();
         db.insert_session_event(
             thread.session_id,
             SessionEventKind::UserMessage,
@@ -803,14 +810,12 @@ mod tests {
         let target_redaction = crate::redact::RedactionTable::empty()
             .with_forced_literal(secret.to_string(), "test".to_string())
             .unwrap();
-        ctx.session
-            .db
-            .set_session_redaction_table_json(
-                other.session_id,
-                Some(target_redaction.to_persisted_json().unwrap()),
-            )
-            .await
-            .unwrap();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &ctx.session.db,
+            other.session_id,
+            &target_redaction.to_persisted_json().unwrap(),
+        )
+        .unwrap();
 
         let found = HistorySearchTool
             .call(json!({ "query": secret }), &ctx)

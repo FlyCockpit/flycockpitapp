@@ -535,9 +535,11 @@ async fn sealed_session_adoption_journals_protected_history() {
             live.scrub(LIT).contains(LIT),
             "the live redaction table must not adopt the literal when journaling fails"
         );
-        assert!(
-            session.persisted_redaction_table().unwrap().is_none(),
-            "no redaction table is persisted when the adoption rolls back"
+        let persisted = session.persisted_redaction_table().unwrap().unwrap();
+        assert_eq!(
+            persisted.scrub(LIT),
+            LIT,
+            "the rolled-back literal must not be adopted into the persisted table"
         );
     }
 }
@@ -657,7 +659,7 @@ async fn concurrent_sealed_adoption_and_secret_file_registration_lose_neither_li
     // The DURABLE table keeps the sealed literal (disk-derived approved-file
     // values are intentionally excluded from persistence). This is the core H1
     // property: a concurrent non-sealed persist did NOT drop the committed sealed
-    // adoption from `redaction_table_json`, so the live table and the still-
+    // adoption from the vault redaction table, so the live table and the still-
     // committed history row stay consistent (decision 10.1 adopted-table invariant).
     let persisted = session.persisted_redaction_table().unwrap().unwrap();
     assert!(

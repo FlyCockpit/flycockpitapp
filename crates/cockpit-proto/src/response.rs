@@ -837,13 +837,14 @@ pub enum Response {
         received_bytes: crate::wire_scalar::CanonicalU64DecimalStringV1,
         /// True once the staged bytes match the reference's length and digest.
         complete: bool,
-        /// How long the daemon will hold this transfer without further
-        /// activity before reclaiming it.
+        /// Remaining non-renewable lease, milliseconds from first reservation.
+        /// Writes do not extend it.
         ///
         /// The deadline is advertised rather than implicit: a peer that may be
         /// backpressured or stalled knows exactly how long it has, and can
-        /// resume, keep the transfer alive, or restart it deliberately instead
-        /// of discovering an unannounced expiry as a mysterious failure.
+        /// resume within the original lease or restart the transfer
+        /// deliberately instead of discovering an unannounced expiry as a
+        /// mysterious failure.
         idle_timeout_ms: u32,
     },
 

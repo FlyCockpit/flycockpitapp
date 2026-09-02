@@ -325,7 +325,7 @@ async fn unbounded_loop_headless_is_rejected_even_with_config_opt_in() {
 
 #[tokio::test]
 async fn primary_round_ceiling_zero_is_disabled() {
-    let (driver, _tmp) = test_driver(1);
+    let (mut driver, _tmp) = test_driver(1);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 
     assert!(
@@ -339,7 +339,7 @@ async fn primary_round_ceiling_zero_is_disabled() {
 
 #[tokio::test]
 async fn primary_round_ceiling_headless_stops_with_notice() {
-    let (driver, _tmp) = test_driver(1);
+    let (mut driver, _tmp) = test_driver(1);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 
     assert!(
@@ -355,6 +355,17 @@ async fn primary_round_ceiling_headless_stops_with_notice() {
         }
         other => panic!("expected notice, got {other:?}"),
     }
+    // The headless ceiling stop ends the turn without completing it, so it
+    // must declare a truthful non-success reason — never the `Completed`
+    // default a daemon scheduler would read as a successful run (#275).
+    assert_eq!(
+        driver.take_idle_reason(false).await,
+        crate::engine::IdleReason::Error {
+            class: crate::engine::model::InferenceErrorClass::Other(
+                "max_primary_rounds_exceeded".to_string(),
+            ),
+        }
+    );
 }
 
 #[test]

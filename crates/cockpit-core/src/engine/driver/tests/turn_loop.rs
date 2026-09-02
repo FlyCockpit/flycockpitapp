@@ -1026,6 +1026,25 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         );
         assert_eq!(provider_posts(&provider).len(), 0);
 
+        // #275: the deferred retry must not settle the acked id. The
+        // requeued submission still owns that queue id — the first idle
+        // boundary after the durable-write failure stays silent and the
+        // retry re-binds the same id to publish the truthful outcome when
+        // it actually runs — so a scheduler watching the acked id can
+        // never observe a success (or any settlement) for a turn that
+        // never started.
+        let deferred = drain_events(&mut rx);
+        assert!(
+            !deferled.iter().any(|event| matches!(
+                event,
+                TurnEvent::AgentIdle {
+                    turn_id: Some(turn_id),
+                    ..
+                } if *turn_id == id.to_string()
+            )),
+            "a durable-record retry defers the acked id instead of idling it: {deferred:?}"
+        );
+
         let mut expected = submission;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);

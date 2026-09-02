@@ -1886,6 +1886,50 @@ async fn emit_turn_idle_if_settled_emits_only_after_a_turn() {
     assert!(driver.current_lifecycle_turn_id.is_none());
 }
 
+/// #275: an idle published under a bound queue id may only carry a success
+/// reason when the bound turn actually reached its terminal outcome. A
+/// post-bind exit that never completed (durable-record retry, admission
+/// refusal, run-invocation gate) must fail closed with a non-success reason
+/// — the settlement layer maps `Completed`/`GoalComplete` to a successful
+/// run, so a fabricated success would record a job that never ran.
+#[tokio::test]
+async fn post_bind_exit_never_idles_as_success() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+    // A bound turn that never reached a terminal outcome idles fail-closed.
+    driver.current_lifecycle_turn_id = Some("turn-1".into());
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle { reason, .. }) => assert!(
+            !matches!(
+                reason,
+                crate::engine::IdleReason::Completed | crate::engine::IdleReason::GoalComplete
+            ),
+            "an uncompleted turn must not idle with a success reason, got {reason:?}"
+        ),
+        other => panic!("expected fail-closed AgentIdle, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
+
+    // Only a turn marked as having reached its terminal outcome may take
+    // the goal-aware success default.
+    driver.current_lifecycle_turn_id = Some("turn-2".into());
+    driver.current_lifecycle_turn_completed = true;
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle {
+            turn_id: Some(turn_id),
+            reason,
+        }) => {
+            assert_eq!(turn_id, "turn-2");
+            assert_eq!(reason, crate::engine::IdleReason::Completed);
+        }
+        other => panic!("expected completed AgentIdle, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
+}
+
 /// Install a test providers override with the given context thresholds,
 /// cache mode, and the active model's `context_length` so the
 /// auto-prune/auto-compact triggers resolve deterministically.

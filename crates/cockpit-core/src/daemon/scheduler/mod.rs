@@ -2817,6 +2817,49 @@ mod tests {
         assert!(summary.contains("completed scheduled turn"), "{summary}");
     }
 
+    /// #275: settling the acked turn id is only a success when the idle
+    /// carries a success reason. A turn that idled without completing
+    /// (preflight rejection, parked interrupt, budget/usage limit, an
+    /// admission-refusal `Error`) resolves as `DidNotComplete` and must
+    /// fail the scheduled job at runtime, not just at the exhaustive
+    /// compile-time match.
+    #[tokio::test]
+    async fn agent_idle_did_not_complete_fails_the_scheduled_job() {
+        let PromptRunnerFixture {
+            db,
+            runner,
+            session_id,
+            handle,
+            mut work_rx,
+            job,
+        } = prompt_runner_fixture("job-did-not-complete");
+        let turn_id = Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            runner
+                .run_prompt_turn(
+                    &db,
+                    &job,
+                    session_id,
+                    "Build",
+                    "summarize the workspace".to_string(),
+                    empty_env_snapshot(),
+                )
+                .await
+        });
+        ack_scheduled_prompt(&mut work_rx, turn_id).await;
+        wait_for_pending_turn_watcher(&handle, turn_id).await;
+
+        handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some(turn_id.to_string()),
+            reason: crate::engine::IdleReason::PreflightRejected,
+        });
+
+        let err = task.await.unwrap().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("ended without completing"), "{text}");
+    }
+
     #[tokio::test]
     async fn scheduler_failure_backoff_disable() {
         let (scheduler, clock, executor) = scheduler(1_000, true);

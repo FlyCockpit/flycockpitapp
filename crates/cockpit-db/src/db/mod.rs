@@ -352,17 +352,18 @@ impl ReadPool {
 
     fn checkout(&self) -> Result<Connection> {
         loop {
-            if let Some(conn) = self
+            let mut guard = self
                 .idle
                 .lock()
-                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?
-                .pop()
-            {
+                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
+
+            if let Some(conn) = guard.pop() {
                 return Ok(conn);
             }
 
             let total = self.total.load(Ordering::SeqCst);
             if total < self.max {
+                drop(guard);
                 if self
                     .total
                     .compare_exchange(total, total + 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -380,17 +381,13 @@ impl ReadPool {
                 continue;
             }
 
-            let guard = self
-                .idle
-                .lock()
-                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
-            let mut guard = self
-                .available
-                .wait(guard)
-                .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
-            if let Some(conn) = guard.pop() {
-                return Ok(conn);
+            while guard.is_empty() {
+                guard = self
+                    .available
+                    .wait(guard)
+                    .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
             }
+            return Ok(guard.pop().expect("idle non-empty after condvar wait"));
         }
     }
 
@@ -5169,6 +5166,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn read_pool_saturated_concurrent_readers_do_not_hang() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(Db::open(&tmp.path().join("pool-stress.db")).unwrap());
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE pool_stress (value INTEGER NOT NULL);")?;
+            conn.execute("INSERT INTO pool_stress (value) VALUES (42)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let stress = async {
+            let num_readers = 8;
+            let iterations = 100;
+            let mut handles = Vec::with_capacity(num_readers);
+            for _ in 0..num_readers {
+                let db = db.clone();
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..iterations {
+                        let value: i64 = db
+                            .read(|conn| {
+                                Ok(conn.query_row("SELECT value FROM pool_stress", [], |row| {
+                                    row.get(0)
+                                })?)
+                            })
+                            .await
+                            .unwrap();
+                        assert_eq!(value, 42);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), stress)
+            .await
+            .expect("read pool stress test hung");
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_config::config::providers::ProvidersConfig;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 pub const FIRST_PARTY_REPOSITORY: &str = "FlyCockpit/agents";
@@ -18,6 +19,8 @@ pub const BUNDLED_FRONTIER_SLUG: &str = "frontier-coding";
 /// this immutable identity alongside the bytes makes offline installation as
 /// auditable and replayable as an online catalog install.
 pub const BUNDLED_CATALOG_REVISION: &str = "464140ba6ee9e1669ef1c3f37d82de8c7edd83d7";
+const CATALOG_FETCH_LIMIT: usize = 1024 * 1024;
+const CATALOG_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,4 +230,112 @@ pub fn bundled_frontier_entry() -> Result<AgentCatalogEntry> {
     );
     entry.validate_fetched_agent_markdown(bundled_frontier_markdown())?;
     Ok(entry)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCatalogOrigin {
+    Live,
+    Cached,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedAgentCatalog {
+    pub revision: String,
+    pub origin: AgentCatalogOrigin,
+    pub index: AgentCatalogIndex,
+}
+
+/// Prefer the live first-party catalog, falling back to the in-binary snapshot
+/// for offline first-run. The returned live revision is always a resolved
+/// commit SHA; callers must use it in the eventual install locator.
+pub async fn preferred_catalog() -> Result<ResolvedAgentCatalog> {
+    match fetch_live_catalog().await {
+        Ok(catalog) => Ok(catalog),
+        Err(_) => Ok(ResolvedAgentCatalog {
+            revision: BUNDLED_CATALOG_REVISION.to_string(),
+            origin: AgentCatalogOrigin::Cached,
+            index: cached_catalog()?,
+        }),
+    }
+}
+
+pub async fn fetch_live_catalog() -> Result<ResolvedAgentCatalog> {
+    let client = catalog_http_client()?;
+    let commit_bytes = fetch_bounded(
+        &client,
+        "https://api.github.com/repos/FlyCockpit/agents/commits/main",
+    )
+    .await
+    .context("resolving live agent catalog revision")?;
+    let commit: serde_json::Value =
+        serde_json::from_slice(&commit_bytes).context("decoding catalog commit response")?;
+    let revision = commit
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .context("catalog commit response omitted sha")?;
+    fetch_catalog_at_revision_with_client(&client, revision, AgentCatalogOrigin::Live).await
+}
+
+pub async fn fetch_catalog_at_revision(revision: &str) -> Result<ResolvedAgentCatalog> {
+    let client = catalog_http_client()?;
+    fetch_catalog_at_revision_with_client(&client, revision, AgentCatalogOrigin::Live).await
+}
+
+async fn fetch_catalog_at_revision_with_client(
+    client: &reqwest::Client,
+    revision: &str,
+    origin: AgentCatalogOrigin,
+) -> Result<ResolvedAgentCatalog> {
+    ensure!(valid_commit_sha(revision), "catalog revision must be a commit SHA");
+    let url = format!(
+        "https://raw.githubusercontent.com/FlyCockpit/agents/{revision}/index.json"
+    );
+    let bytes = fetch_bounded(client, &url)
+        .await
+        .context("fetching pinned agent catalog index")?;
+    Ok(ResolvedAgentCatalog {
+        revision: revision.to_string(),
+        origin,
+        index: AgentCatalogIndex::parse(&bytes)?,
+    })
+}
+
+fn catalog_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(CATALOG_FETCH_TIMEOUT)
+        .user_agent("flycockpit-agent-catalog")
+        .build()
+        .context("building agent catalog client")
+}
+
+async fn fetch_bounded(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let response = tokio::time::timeout(CATALOG_FETCH_TIMEOUT, client.get(url).send())
+        .await
+        .context("agent catalog request timed out")??;
+    ensure!(
+        response.status().is_success(),
+        "agent catalog request failed"
+    );
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= CATALOG_FETCH_LIMIT as u64),
+        "agent catalog response exceeds 1MiB"
+    );
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("streaming agent catalog response")?;
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= CATALOG_FETCH_LIMIT,
+            "agent catalog response exceeds 1MiB"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn valid_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

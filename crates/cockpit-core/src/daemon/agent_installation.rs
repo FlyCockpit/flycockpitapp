@@ -2652,6 +2652,12 @@ impl AgentInstallationService {
                 request.operation,
                 AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
             ) {
+            let source = CanonicalAgentSource::parse(&request.source_locator)?;
+            ensure!(
+                (source.owner == "FlyCockpit" && source.repository == "agents")
+                    || request.third_party_trust_confirmed,
+                "third-party agent installation requires explicit security confirmation"
+            );
             Some(
                 self.prefetch_fresh_source(
                     &request,
@@ -3698,6 +3704,30 @@ impl AgentInstallationService {
         let definition =
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
+        if source.owner == "FlyCockpit" && source.repository == "agents" {
+            let catalog = if fetched.commit_sha
+                == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION
+            {
+                crate::daemon::agent_catalog::ResolvedAgentCatalog {
+                    revision: fetched.commit_sha.clone(),
+                    origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+                    index: crate::daemon::agent_catalog::cached_catalog()?,
+                }
+            } else {
+                crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
+                    .await
+                    .context("fetching pinned first-party catalog index")?
+            };
+            let entry = catalog
+                .index
+                .agents
+                .iter()
+                .find(|entry| entry.catalog.definition_path == source.markdown_path)
+                .context("pinned first-party agent is absent from its catalog index")?;
+            entry
+                .validate_fetched_agent_markdown(&fetched.markdown)
+                .context("first-party catalog definition mismatch")?;
+        }
         let vnext = definition
             .vnext
             .as_ref()
@@ -7597,6 +7627,7 @@ mod tests {
                 source_locator: "owner/repo@main:agents/helper.md".into(),
                 target_installation_id: None,
                 replace_acknowledged: false,
+                third_party_trust_confirmed: true,
                 requested_slot: None,
                 roles: Vec::new(),
                 computer_use: false,
@@ -10333,6 +10364,7 @@ mod tests {
                     source_locator: "owner/repo@main:agents/helper.md".into(),
                     target_installation_id: Some(installation_id.clone()),
                     replace_acknowledged: true,
+                third_party_trust_confirmed: true,
                     ..ServiceHarness::request("dirty-update")
                 },
                 2,

@@ -2262,6 +2262,8 @@ pub struct VerificationRule {
     pub on_budget_exceeded: Option<OnBudgetExceeded>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<VerificationMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_dispatch: Option<VerificationCandidateDispatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generators: Vec<GeneratorSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2289,6 +2291,7 @@ impl Default for VerificationRule {
             adjudicator_slot: None,
             on_budget_exceeded: None,
             mode: None,
+            candidate_dispatch: None,
             generators: Vec::new(),
             profile: None,
             on_adjudication_failure: None,
@@ -2304,6 +2307,18 @@ pub enum VerificationMode {
     #[default]
     Gate,
     Revise,
+}
+
+/// How verification candidates are sent to a shared model slot. Parallel is
+/// the latency-preserving default. Warm-then-fanout is an opt-in cache-spend
+/// optimization: one candidate warms a slot-local prefix before its siblings
+/// are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCandidateDispatch {
+    #[default]
+    Parallel,
+    WarmThenFanout,
 }
 
 /// What to do when the adjudicator fails or times out. Never hang the turn.
@@ -2348,7 +2363,24 @@ pub enum VerificationRecipe {
         include_linked_files: bool,
         #[serde(default = "default_last_n_reads", rename = "lastNReads")]
         last_n_reads: u8,
+        #[serde(
+            default = "default_clean_room_tool_categories",
+            rename = "toolCategories"
+        )]
+        tool_categories: Vec<VerificationToolCategory>,
+        #[serde(default, rename = "toolAllowlist")]
+        tool_allowlist: Vec<String>,
     },
+}
+
+/// Curated evidence categories eligible for a clean-room verification
+/// projection. A recipe can additionally name individual tools through its
+/// `toolAllowlist`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationToolCategory {
+    Reads,
+    Exploration,
 }
 
 impl<'de> Deserialize<'de> for VerificationRecipe {
@@ -2361,6 +2393,13 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
             include_linked_files: bool,
             #[serde(default = "default_last_n_reads", rename = "lastNReads")]
             last_n_reads: u8,
+            #[serde(
+                default = "default_clean_room_tool_categories",
+                rename = "toolCategories"
+            )]
+            tool_categories: Vec<VerificationToolCategory>,
+            #[serde(default, rename = "toolAllowlist")]
+            tool_allowlist: Vec<String>,
         }
 
         fn from_clean_room_value<E: serde::de::Error>(
@@ -2370,6 +2409,8 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
             Ok(VerificationRecipe::CleanRoom {
                 include_linked_files: fields.include_linked_files,
                 last_n_reads: fields.last_n_reads,
+                tool_categories: fields.tool_categories,
+                tool_allowlist: fields.tool_allowlist,
             })
         }
 
@@ -2402,8 +2443,17 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
     }
 }
 
+pub const DEFAULT_CLEAN_ROOM_LAST_N_READS: u8 = 5;
+
 fn default_last_n_reads() -> u8 {
-    3
+    DEFAULT_CLEAN_ROOM_LAST_N_READS
+}
+
+fn default_clean_room_tool_categories() -> Vec<VerificationToolCategory> {
+    vec![
+        VerificationToolCategory::Reads,
+        VerificationToolCategory::Exploration,
+    ]
 }
 
 impl Default for VerificationRecipe {
@@ -2421,6 +2471,8 @@ impl VerificationRecipe {
         Self::CleanRoom {
             include_linked_files: false,
             last_n_reads: default_last_n_reads(),
+            tool_categories: default_clean_room_tool_categories(),
+            tool_allowlist: Vec::new(),
         }
     }
 }
@@ -2529,13 +2581,17 @@ impl VerificationRule {
         self.mode.unwrap_or(VerificationMode::Gate)
     }
 
+    pub fn resolved_candidate_dispatch(&self) -> VerificationCandidateDispatch {
+        self.candidate_dispatch.unwrap_or_default()
+    }
+
     pub fn resolved_on_adjudication_failure(&self) -> OnAdjudicationFailure {
         self.on_adjudication_failure
             .unwrap_or(OnAdjudicationFailure::DispatchOriginal)
     }
 
-    /// Custody note: inherit generators on untrusted slots see a redacted
-    /// transcript and produce placeholder-bearing (invalid) candidates.
+    /// Custody note: foreign inherit generators receive the curated clean-room
+    /// projection. Candidates remain invalid when redaction inserts placeholders.
     pub fn inherit_untrusted_slot_warnings(
         &self,
         untrusted_slots: &BTreeSet<String>,
@@ -2548,7 +2604,7 @@ impl VerificationRule {
             })
             .map(|generator| {
                 format!(
-                    "verification inherit generator on untrusted slot `{}` will receive a redacted transcript; placeholder-bearing candidates are invalid and never selectable",
+                    "verification inherit generator on untrusted slot `{}` will receive the curated clean-room projection; placeholder-bearing candidates are invalid and never selectable",
                     generator.slot
                 )
             })
@@ -2579,6 +2635,7 @@ impl VerificationRule {
                     || rule.adjudicator_slot.is_some()
                     || rule.on_budget_exceeded.is_some()
                     || rule.mode.is_some()
+                    || rule.candidate_dispatch.is_some()
                     || !rule.generators.is_empty()
                     || rule.profile.is_some()
                     || rule.on_adjudication_failure.is_some()
@@ -2618,6 +2675,13 @@ impl VerificationRule {
                         && last_n_reads == 0
                     {
                         bail!("verification cleanRoom.lastNReads must be positive");
+                    }
+                    if let VerificationRecipe::CleanRoom { tool_allowlist, .. } = &generator.recipe
+                        && tool_allowlist.iter().any(|tool| tool.trim().is_empty())
+                    {
+                        bail!(
+                            "verification cleanRoom.toolAllowlist must not contain empty tool names"
+                        );
                     }
                 }
             }
@@ -4065,13 +4129,18 @@ mod tests {
         clean.validate().unwrap();
         let compiled = clean.verification.unwrap().compile();
         assert_eq!(compiled.regions[0].rule.generators.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             compiled.regions[0].rule.generators[0].recipe,
             VerificationRecipe::CleanRoom {
                 include_linked_files: false,
-                last_n_reads: 3
+                last_n_reads: 5,
+                tool_categories: vec![
+                    VerificationToolCategory::Reads,
+                    VerificationToolCategory::Exploration,
+                ],
+                tool_allowlist: vec![],
             }
-        ));
+        );
     }
 
     #[test]
@@ -4227,6 +4296,8 @@ generators:
       cleanRoom:
         includeLinkedFiles: true
         lastNReads: 4
+        toolCategories: [exploration]
+        toolAllowlist: [context_pack]
 "#;
         let rule: VerificationRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.mode, Some(VerificationMode::Revise));
@@ -4240,11 +4311,41 @@ generators:
             rule.generators[1].recipe,
             VerificationRecipe::CleanRoom {
                 include_linked_files: true,
-                last_n_reads: 4
+                last_n_reads: 4,
+                tool_categories: vec![VerificationToolCategory::Exploration],
+                tool_allowlist: vec!["context_pack".into()],
             }
         );
         let encoded = serde_yaml::to_string(&rule).unwrap();
         let decoded: VerificationRule = serde_yaml::from_str(&encoded).unwrap();
         assert_eq!(decoded, rule);
+    }
+
+    #[test]
+    fn verification_candidate_dispatch_defaults_to_parallel_and_accepts_warm_then_fanout() {
+        let default_rule: VerificationRule = serde_yaml::from_str(
+            r#"
+selector: {}
+action: off
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_rule.resolved_candidate_dispatch(),
+            VerificationCandidateDispatch::Parallel
+        );
+
+        let warm_rule: VerificationRule = serde_yaml::from_str(
+            r#"
+selector: {}
+action: off
+candidate_dispatch: warm_then_fanout
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            warm_rule.resolved_candidate_dispatch(),
+            VerificationCandidateDispatch::WarmThenFanout
+        );
     }
 }

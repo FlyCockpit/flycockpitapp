@@ -64,6 +64,35 @@ fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {
     .context("capability guard denial must form a canonical tool result")
 }
 
+/// The sole ordinary-tool host-effect boundary. Verification may select
+/// original or revised arguments (including a parked replay), but every
+/// authorized selection reaches this helper before any toolbox `Tool::call`.
+async fn dispatch_authorized_tool(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: Value,
+    call_id: &str,
+) -> (Result<ToolOutput>, u64) {
+    if resolved_name == "acquire_sealed_value" {
+        let started = std::time::Instant::now();
+        let result =
+            crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
+                env, &args,
+            )
+            .await;
+        (result, started.elapsed().as_millis() as u64)
+    } else {
+        dispatch_one_timed(
+            env.active_tools,
+            resolved_name,
+            args,
+            env.ctx,
+            Some(call_id),
+        )
+        .await
+    }
+}
+
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
     crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
         .or_else(|| {
@@ -1245,7 +1274,9 @@ async fn execute_ordinary_call_unscoped(
     if should_scan_tool_result(
         resolved_name,
         env.agent.scan_tool_results,
-        env.session.approval_mode(),
+        crate::tools::trusted_child_acquisition::effective_approval_mode(
+            env.session.approval_mode(),
+        ),
         guard.threshold,
     ) {
         recheck_result = true;
@@ -1441,7 +1472,7 @@ async fn execute_ordinary_call_unscoped(
     if selected_replay_denied_before_intercept {
         cancel_replayed_reserved_dispatch(env.session, replay_verification_memo.as_ref()).await?;
     }
-    let (result, duration_ms) = if reserved_native_computer {
+    let (mut result, duration_ms) = if reserved_native_computer {
         // Refuse with zero backend input — never call `dispatch_one_timed`.
         // The model reads back a deterministic diagnostic; the native computer
         // path is the only route that executes these items.
@@ -1832,12 +1863,11 @@ async fn execute_ordinary_call_unscoped(
                             let dispatched = crate::engine::interrupt::with_interrupt_park_payload(
                                 payload,
                                 async {
-                                    dispatch_one_timed(
-                                        env.active_tools,
+                                    dispatch_authorized_tool(
+                                        env,
                                         resolved_name,
                                         args.clone(),
-                                        env.ctx,
-                                        Some(&tc.id),
+                                        tc.id.as_str(),
                                     )
                                     .await
                                 },
@@ -1853,12 +1883,11 @@ async fn execute_ordinary_call_unscoped(
             DispatchVerificationOutcome::Skip => {
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    dispatch_one_timed(
-                        env.active_tools,
+                    dispatch_authorized_tool(
+                        env,
                         resolved_name,
                         args.clone(),
-                        env.ctx,
-                        Some(&tc.id),
+                        tc.id.as_str(),
                     )
                     .await
                 })
@@ -1899,12 +1928,11 @@ async fn execute_ordinary_call_unscoped(
                 tool_was_dispatched = true;
                 let dispatched =
                     crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                        dispatch_one_timed(
-                            env.active_tools,
+                        dispatch_authorized_tool(
+                            env,
                             resolved_name,
                             args.clone(),
-                            env.ctx,
-                            Some(&tc.id),
+                            tc.id.as_str(),
                         )
                         .await
                     })
@@ -1922,6 +1950,17 @@ async fn execute_ordinary_call_unscoped(
             .unwrap_or_else(|| format!("`{resolved_name}` arguments failed schema validation"));
         (Err(invalid_input(msg)), 0)
     };
+    // Acquisition outputs cross their containment boundary at production,
+    // before hooks, audit rows, artifacts, events, or history can retain the
+    // plaintext. Outside the host-conferred task-local profile this is a no-op.
+    if let Ok(output) = &mut result {
+        crate::tools::trusted_child_acquisition::quarantine_bash_result(
+            tc.id.as_str(),
+            resolved_name,
+            output,
+        );
+    }
+
     // This is the outer approval scope's exact effect outcome. The nested
     // timeout scope has already completed any approval raised *inside* the
     // tool; this records the result for approvals raised by the loop/safety/
@@ -3350,6 +3389,23 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
+
+    #[test]
+    fn acquisition_parent_dispatch_has_one_authoritative_effect_seam() {
+        let source = include_str!("tool_dispatch.rs");
+        let parent_seam = ["run_parent_", "acquisition_tool("].concat();
+        let toolbox_seam = ["dispatch_one_", "timed("].concat();
+        assert_eq!(
+            source.matches(&parent_seam).count(),
+            1,
+            "all original/revised/replay branches must share one parent acquisition seam"
+        );
+        assert_eq!(
+            source.matches(&toolbox_seam).count(),
+            1,
+            "verification branches must not call the toolbox effect boundary directly"
+        );
+    }
 
     #[test]
     fn timeout_or_cancel_after_executing_settles_unknown_not_succeeded() {

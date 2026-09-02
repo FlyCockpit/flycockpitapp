@@ -38077,7 +38077,7 @@ async fn create_project_sealed_value(
     .await
     .expect("inventory");
     match inventory {
-        Response::SealedOwnerInventory { items } => {
+        Response::SealedOwnerInventory { items, .. } => {
             let item = items
                 .iter()
                 .find(|item| item.name == name)
@@ -38340,7 +38340,7 @@ async fn sealed_owner_edit_description_updates_inventory() {
     .await
     .expect("inventory");
     match inventory {
-        Response::SealedOwnerInventory { items } => {
+        Response::SealedOwnerInventory { items, .. } => {
             let item = items
                 .iter()
                 .find(|item| item.record_id == record_id)
@@ -38494,7 +38494,7 @@ async fn sealed_session_create_and_rotate_journal_protected_history_through_disp
     .await
     .expect("session inventory");
     match inventory {
-        Response::SealedOwnerInventory { items } => {
+        Response::SealedOwnerInventory { items, .. } => {
             let item = items
                 .iter()
                 .find(|item| item.record_id == record_id)

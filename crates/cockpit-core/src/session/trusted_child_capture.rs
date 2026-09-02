@@ -10,16 +10,16 @@
 //! parsed, stored, or redaction-installed, and consumes the authority
 //! single-use.
 //!
-//! The flow this supports (the coordinator that drives it is a **separate**
-//! follow-up, sub-increment 2c-3, and is intentionally NOT built here):
+//! The coordinator drives this registry as follows:
 //!
 //! 1. The host calls [`TrustedChildCaptureRegistry::begin_capture`] to allocate
 //!    ONE pending [`PendingCapture`] record for a session and mint ONE exact
 //!    [`TrustedChildCaptureAuthority`] bound to
 //!    `(record_id, project, session, generation, version, source_tool_call_id)`.
 //!    At most one acquisition may be in flight per session (the rate limit).
-//! 2. A trusted child runs and produces a candidate literal.
-//! 3. The host presents the claimed authority (as the closed
+//! 2. A trusted child runs a command whose output is quarantined by the host.
+//! 3. The child selects the exact source tool-call reference; the host resolves
+//!    its quarantined output and presents the claimed authority (as the closed
 //!    [`ProtectedSensitiveIngress::TrustedChildCapture`] variant) plus the raw
 //!    candidate value to [`TrustedChildCaptureRegistry::verify_and_capture`].
 //!    Replay, expiry, cancel, wrong project/session/generation/value/version,
@@ -38,12 +38,12 @@
 //!
 //! ## Transfer is in-process only (AC8)
 //!
-//! On an exact match the captured literal is written through
-//! [`Session::set_sealed_value`] — the in-process host write that unions the
-//! live redaction table, journals protected history, and stores the vault item
-//! atomically. The value never routes through any generic MCP/Tool/event/
-//! transcript path (that broader sweep is sub-increment 2c-4), and the Monty
-//! `set_sealed_value` tool stays retired.
+//! On an exact match the captured literal is written through the dedicated
+//! create-only agent-acquired session path, which unions the live redaction
+//! table, journals protected history, stores the vault item, and terminalizes
+//! the audit row atomically. The value never routes through a generic
+//! MCP/tool/event/transcript path, and the Monty `set_sealed_value` tool stays
+//! retired.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -53,7 +53,6 @@ use zeroize::Zeroizing;
 use super::Session;
 use crate::leak_report::ProtectedSensitiveIngress;
 use crate::redact::RedactionTable;
-use crate::sealed::OwnerAuthority;
 
 /// How long a minted acquisition stays live before it fails closed on expiry.
 /// A trusted-child round-trip is short; an authority older than this is stale
@@ -126,10 +125,11 @@ impl TrustedChildCaptureAuthority {
     }
 }
 
-/// The raw candidate literal a trusted child produced, held in a
+/// The raw command output the host resolved from a child-selected reference,
+/// held in a
 /// [`Zeroizing`] frame so it is wiped on drop. It is **not** validated or
 /// parsed at construction — the value is opaque until an exact authority match
-/// hands it to [`Session::set_sealed_value`]. The type deliberately does not
+/// hands it to the create-only agent-acquired write. The type deliberately does not
 /// derive `Clone`/`Display` and its `Debug` is redacting, mirroring
 /// [`crate::leak_report::ReportLeakRequest`], so a stray copy or `{:?}` cannot
 /// defeat the containment guarantees.
@@ -169,7 +169,7 @@ impl std::fmt::Debug for SealedCaptureValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustedChildCaptureOutcome {
     /// The value matched an exact live authority and was written in-process via
-    /// [`Session::set_sealed_value`]; the live redaction table now scrubs it and
+    /// the create-only agent-acquired write; the live redaction table now scrubs it and
     /// the pending record is consumed.
     Captured { record_id: String },
     /// The capture was refused. Indistinguishable across missing record, wrong
@@ -186,6 +186,9 @@ pub enum BeginCaptureError {
     /// An acquisition is already in flight for this session (the one-per-session
     /// rate limit). The host must await or cancel it before starting another.
     AlreadyInFlight,
+    /// Agent acquisition is create-only and therefore always publishes value
+    /// version one; a host request for any other destination version is invalid.
+    InvalidCreateVersion,
 }
 
 impl std::fmt::Display for BeginCaptureError {
@@ -193,6 +196,9 @@ impl std::fmt::Display for BeginCaptureError {
         match self {
             Self::AlreadyInFlight => {
                 f.write_str("a trusted-child capture is already in flight for this session")
+            }
+            Self::InvalidCreateVersion => {
+                f.write_str("agent-acquired sealed values must be created at value version one")
             }
         }
     }
@@ -205,15 +211,15 @@ impl std::error::Error for BeginCaptureError {}
 /// written under, and the expiry deadline. Carries no secret.
 #[derive(Debug, Clone)]
 struct PendingCapture {
+    acquisition_id: String,
     record_id: String,
     project: String,
     session: String,
     generation: i64,
     version: i64,
-    source_tool_call_id: String,
+    source_tool_call_id: Option<String>,
     value_id: String,
     reason: String,
-    origin: String,
     expires_at_ms: i64,
 }
 
@@ -250,12 +256,15 @@ impl TrustedChildCaptureRegistry {
         record_id: &str,
         value_id: &str,
         reason: &str,
-        origin: &str,
+        _origin: &str,
         generation: i64,
         version: i64,
         source_tool_call_id: &str,
         now_ms: i64,
     ) -> Result<TrustedChildCaptureAuthority, BeginCaptureError> {
+        if version != 1 {
+            return Err(BeginCaptureError::InvalidCreateVersion);
+        }
         let session_key = session.id.to_string();
         let project = session.project_id.clone();
         let mut pending = self.pending.lock().unwrap();
@@ -268,15 +277,15 @@ impl TrustedChildCaptureRegistry {
             return Err(BeginCaptureError::AlreadyInFlight);
         }
         let record = PendingCapture {
+            acquisition_id: record_id.to_owned(),
             record_id: record_id.to_owned(),
             project: project.clone(),
             session: session_key.clone(),
             generation,
             version,
-            source_tool_call_id: source_tool_call_id.to_owned(),
+            source_tool_call_id: Some(source_tool_call_id.to_owned()),
             value_id: value_id.to_owned(),
             reason: reason.to_owned(),
-            origin: origin.to_owned(),
             expires_at_ms: now_ms + TRUSTED_CHILD_CAPTURE_TTL_MS,
         };
         pending.insert(session_key.clone(), record);
@@ -290,11 +299,94 @@ impl TrustedChildCaptureRegistry {
         })
     }
 
+    /// Reserve the one-in-flight session slot before dispatch, while the source
+    /// tool-call id does not exist yet. The host binds that final field exactly
+    /// once with [`Self::bind_source_tool_call`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_capture(
+        &self,
+        session: &Session,
+        acquisition_id: &str,
+        record_id: &str,
+        value_id: &str,
+        reason: &str,
+        _origin: &str,
+        generation: i64,
+        version: i64,
+        now_ms: i64,
+    ) -> Result<(), BeginCaptureError> {
+        if version != 1 {
+            return Err(BeginCaptureError::InvalidCreateVersion);
+        }
+        let session_key = session.id.to_string();
+        let project = session.project_id.clone();
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(existing) = pending.get(&session_key)
+            && now_ms <= existing.expires_at_ms
+        {
+            return Err(BeginCaptureError::AlreadyInFlight);
+        }
+        pending.insert(
+            session_key.clone(),
+            PendingCapture {
+                acquisition_id: acquisition_id.to_owned(),
+                record_id: record_id.to_owned(),
+                project,
+                session: session_key,
+                generation,
+                version,
+                source_tool_call_id: None,
+                value_id: value_id.to_owned(),
+                reason: reason.to_owned(),
+                expires_at_ms: now_ms + TRUSTED_CHILD_CAPTURE_TTL_MS,
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind the child-selected source reference once. Destination metadata
+    /// remains host-held and the child never receives the returned authority.
+    pub fn bind_source_tool_call(
+        &self,
+        session_id: &str,
+        acquisition_id: &str,
+        source_tool_call_id: &str,
+        now_ms: i64,
+    ) -> Option<TrustedChildCaptureAuthority> {
+        let mut pending = self.pending.lock().unwrap();
+        let record = pending.get_mut(session_id)?;
+        if record.acquisition_id != acquisition_id
+            || now_ms > record.expires_at_ms
+            || record.source_tool_call_id.is_some()
+            || source_tool_call_id.is_empty()
+        {
+            return None;
+        }
+        record.source_tool_call_id = Some(source_tool_call_id.to_owned());
+        Some(TrustedChildCaptureAuthority {
+            record_id: record.record_id.clone(),
+            project: record.project.clone(),
+            session: record.session.clone(),
+            generation: record.generation,
+            version: record.version,
+            source_tool_call_id: source_tool_call_id.to_owned(),
+        })
+    }
+
     /// Cancel any in-flight acquisition for a session, freeing the slot. A
     /// subsequent verify for a cancelled record fails closed (indistinguishably
     /// from a missing record).
-    pub fn cancel(&self, session_id: &str) {
-        self.pending.lock().unwrap().remove(session_id);
+    pub fn cancel(&self, session_id: &str, acquisition_id: &str) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending
+            .get(session_id)
+            .is_some_and(|record| record.acquisition_id == acquisition_id)
+        {
+            pending.remove(session_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a live (non-expired) acquisition is in flight for a session.
@@ -331,7 +423,7 @@ impl TrustedChildCaptureRegistry {
         // single-use removal so a concurrent replay cannot double-spend, then
         // drop it before the async transfer (a std Mutex guard must not cross an
         // await). The value is NOT touched here — it is parsed only after an
-        // exact match, inside `set_sealed_value`.
+        // exact match, inside the create-only write.
         let proceed = {
             let mut pending = self.pending.lock().unwrap();
             match self.decide(&mut pending, session, claimed, now_ms) {
@@ -340,20 +432,22 @@ impl TrustedChildCaptureRegistry {
             }
         };
 
-        // Exact match: perform the in-process host write. `set_sealed_value`
+        // Exact match: perform the in-process host write. The session helper
         // validates the literal, unions the live redaction table, journals
         // protected history, and writes the vault item in ONE atomic
         // transaction. It is the ONLY consumer of the literal — no generic
         // MCP/Tool/event/transcript path sees it. A write failure fails closed
         // (the record is already consumed; the host must begin a new capture).
         match session
-            .set_sealed_value(
-                OwnerAuthority::for_owner_request(),
+            .create_agent_acquired_sealed_value(
                 redaction,
+                &proceed.acquisition_id,
+                &proceed.record_id,
                 &proceed.value_id,
-                value.as_str(),
                 &proceed.reason,
-                &proceed.origin,
+                value.as_str(),
+                &proceed.source_tool_call_id,
+                now_ms,
             )
             .await
         {
@@ -406,7 +500,7 @@ impl TrustedChildCaptureRegistry {
             && record.session == *claim_session
             && record.generation == *generation
             && record.version == *version
-            && record.source_tool_call_id == *source_tool_call_id;
+            && record.source_tool_call_id.as_deref() == Some(source_tool_call_id.as_str());
         if !bindings_match {
             return None;
         }
@@ -421,10 +515,11 @@ impl TrustedChildCaptureRegistry {
         //    replay now finds no record (step 2) and is denied.
         let record = pending.remove(&session_key)?;
         Some(Proceed {
+            acquisition_id: record.acquisition_id,
             record_id: record.record_id,
             value_id: record.value_id,
             reason: record.reason,
-            origin: record.origin,
+            source_tool_call_id: record.source_tool_call_id?,
         })
     }
 }
@@ -432,10 +527,11 @@ impl TrustedChildCaptureRegistry {
 /// The host-held destination metadata extracted on an exact match, carried out
 /// of the critical section into the async transfer. Carries no secret.
 struct Proceed {
+    acquisition_id: String,
     record_id: String,
     value_id: String,
     reason: String,
-    origin: String,
+    source_tool_call_id: String,
 }
 
 #[cfg(test)]

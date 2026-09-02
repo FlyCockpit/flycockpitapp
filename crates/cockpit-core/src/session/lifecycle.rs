@@ -1044,7 +1044,7 @@ impl Session {
             title_failure_noticed: std::sync::atomic::AtomicBool::new(false),
             redaction_placeholder_noticed: std::sync::atomic::AtomicBool::new(false),
             last_usage: Mutex::new(None),
-            last_cache_hit_endpoint: Mutex::new(None),
+            observed_cache_hit_endpoints: Mutex::new(BTreeSet::new()),
             last_send_at: Mutex::new(None),
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),

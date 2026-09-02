@@ -115,7 +115,9 @@ pub(super) async fn safety_gate_decision_with_configs(
     if !is_gated_tool(tool) {
         return GateOutcome::Run { recheck: false };
     }
-    match ctx.session.approval_mode() {
+    match crate::tools::trusted_child_acquisition::effective_approval_mode(
+        ctx.session.approval_mode(),
+    ) {
         // `manual`: the utility-model gate is not invoked because the human
         // is the gate. Bash asks in its grant-or-ask paths when a command
         // would run unconfined; `escalate` prompts through its Manual route.

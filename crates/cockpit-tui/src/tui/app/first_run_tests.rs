@@ -10,8 +10,19 @@ use tokio::sync::mpsc;
 fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
     let cockpit = cwd.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
-    let path = cockpit.join("config.json");
-    let mut doc = ConfigDoc::load(&path).unwrap();
+    write_providers_at(&cockpit.join("config.json"), cfg);
+}
+
+fn write_global_config(cfg: &ProvidersConfig) {
+    let path = cockpit_config::dirs::global_config_file().unwrap();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    write_providers_at(&path, cfg);
+}
+
+fn write_providers_at(path: &std::path::Path, cfg: &ProvidersConfig) {
+    let mut doc = ConfigDoc::load(path).unwrap();
     doc.write(cfg).unwrap();
     // `active_model` is layer-wide default policy: an ordinary provider save
     // can no longer carry it, and only the authoritative effective-default
@@ -72,7 +83,7 @@ fn first_run_chains_provider_then_model() {
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
     advance_welcome_and_profile(&mut app, tmp.path());
-    write_config(tmp.path(), &config_with_provider("p", "m"));
+    write_global_config(&config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
@@ -93,9 +104,7 @@ fn first_run_chains_provider_then_model() {
     );
     assert_eq!(
         app.dialog.test_setup_prefill(),
-        Some(cockpit_core::wizard::WizardAnswer::Select(
-            "p:m".to_string()
-        ))
+        Some(cockpit_core::wizard::WizardAnswer::Text("m".to_string()))
     );
 }
 
@@ -106,7 +115,7 @@ fn first_run_flow_completes_end_to_end() {
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
     advance_welcome_and_profile(&mut app, tmp.path());
-    write_config(tmp.path(), &config_with_provider("p", "m"));
+    write_global_config(&config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));

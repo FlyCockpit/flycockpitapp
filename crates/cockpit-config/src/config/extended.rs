@@ -643,6 +643,15 @@ pub struct ExtendedConfig {
     #[serde(rename = "defaultApprovalMode", default)]
     pub default_approval_mode: ApprovalMode,
 
+    /// Consent policy for trusted-child sealed acquisition. Audit-only is the
+    /// launch default; `approval` requires an owner decision before dispatch.
+    #[serde(
+        rename = "sealedAcquisitionConsent",
+        default,
+        skip_serializing_if = "SealedAcquisitionConsent::is_default"
+    )]
+    pub sealed_acquisition_consent: SealedAcquisitionConsent,
+
     /// Approval risk policy overrides. Defaults are conservative in the
     /// approval layer; this config can cap remembered scopes by risk tier,
     /// program (`"rm"`), or command key (`"gh pr"`).
@@ -1262,6 +1271,20 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SealedAcquisitionConsent {
+    #[default]
+    AuditOnly,
+    Approval,
+}
+
+impl SealedAcquisitionConsent {
+    fn is_default(&self) -> bool {
+        *self == Self::AuditOnly
+    }
+}
+
 /// Computer-use reachability tier.
 ///
 /// The declaration order is the safety order: `disabled < ask < yolo`.
@@ -1869,6 +1892,7 @@ impl Default for ExtendedConfig {
             translation: TranslationConfig::default(),
             sandbox_escalation_enabled: true,
             default_approval_mode: ApprovalMode::default(),
+            sealed_acquisition_consent: SealedAcquisitionConsent::default(),
             approval_policy: ApprovalPolicyConfig::default(),
             predict_next_message: PredictNextMessage::default(),
             shell_compression: ShellCompression::default(),
@@ -2958,6 +2982,7 @@ impl ExtendedConfigDoc {
         parse_field!("schedule", schedule);
         parse_field!("resourceScheduler", resource_scheduler);
         parse_field!("sandbox", sandbox);
+        parse_field!("daemon", daemon);
         parse_field!("mediaResources", media_resources);
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);
@@ -3016,6 +3041,7 @@ impl ExtendedConfigDoc {
         parse_field!("sandboxEscalationEnabled", sandbox_escalation_enabled);
         parse_field!("sandbox_escalation_enabled", sandbox_escalation_enabled);
         parse_field!("defaultApprovalMode", default_approval_mode);
+        parse_field!("sealedAcquisitionConsent", sealed_acquisition_consent);
         parse_field!("approvalPolicy", approval_policy);
         parse_field!("predictNextMessage", predict_next_message);
         parse_field!("shellCompression", shell_compression);

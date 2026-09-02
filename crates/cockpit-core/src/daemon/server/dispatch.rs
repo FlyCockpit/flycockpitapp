@@ -9514,12 +9514,10 @@ async fn handle_serialized_request_impl(
                                 let tx = conn
                                     .unchecked_transaction()
                                     .context("begin assistant session insert tx")?;
-                                let row = crate::db::Db::insert_session_row_conn(&tx, &row)?;
-                                crate::session::lifecycle::write_redaction_table_json_to_vault_on_conn(
-                                    &vault,
+                                let row = crate::session::lifecycle::persist_session_row_with_redaction_custody_on_conn(
                                     &tx,
-                                    row.session_id,
-                                    &crate::redact::RedactionTable::empty().to_persisted_json()?,
+                                    &vault,
+                                    &row,
                                 )?;
                                 tx.commit().context("commit assistant session insert tx")?;
                                 (row, true)

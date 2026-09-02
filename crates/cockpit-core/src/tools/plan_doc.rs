@@ -1,5 +1,7 @@
 //! Plan-to-Build handoff tool.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -69,15 +71,14 @@ impl Tool for StartBuildTool {
             )));
         }
 
-        let row = ctx
-            .session
-            .db
-            .create_session(
-                &ctx.session.project_id,
-                &ctx.session.project_root.to_string_lossy(),
-                "Build",
-            )
-            .await?;
+        let row = crate::session::lifecycle::persist_session_with_redaction_custody(
+            &ctx.session.db,
+            Arc::clone(ctx.session.secret_vault()),
+            &ctx.session.project_id,
+            &ctx.session.project_root.to_string_lossy(),
+            "Build",
+        )
+        .await?;
         insert_user_message(&ctx.session.db, row.session_id, &doc.content)
             .await
             .context("recording Build kickoff message")?;
@@ -381,6 +382,15 @@ mod tests {
         assert_eq!(events[0].0, "user_message");
         assert_eq!(events[0].1["text"], "Standalone implementation plan");
         assert_eq!(events[1].0, "user_note");
+
+        let build_id = Uuid::parse_str(&rows[0].0).unwrap();
+        crate::session::Session::resume_for_test(
+            db,
+            build_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("start_build session must resume with redaction custody");
     }
 
     #[tokio::test]

@@ -1551,6 +1551,13 @@ impl Db {
             .transpose()
     }
 
+    /// Insert a `sessions` row **without** redaction-table vault custody.
+    ///
+    /// This is a test/fixture constructor. A visible durable session must own
+    /// a `secret_vault_items` redaction-table row before it can be resumed or
+    /// attached; cockpit-core's `persist_*_with_redaction_custody` helpers
+    /// establish that item in the same transaction as the insert. Production
+    /// code must not call this method.
     pub async fn create_session(
         &self,
         project_id: &str,
@@ -1615,6 +1622,12 @@ impl Db {
         build_session_row(project_id, project_root, active_agent, Some(short_id), None)
     }
 
+    /// Insert an assistant `sessions` row **without** redaction-table vault
+    /// custody.
+    ///
+    /// Same fixture-only contract as [`Self::create_session`]: production
+    /// callers must use cockpit-core's custody-aware persist helpers so the
+    /// visible row and its vault item commit together.
     pub async fn create_assistant_session(
         &self,
         project_id: &str,
@@ -1705,6 +1718,10 @@ impl Db {
     /// [`Self::new_session_row`] for the deferred-persistence path; also the
     /// second half of [`Self::create_session`]. Idempotent at the
     /// application layer is **not** assumed — callers persist exactly once.
+    ///
+    /// This primitive does not establish redaction-table vault custody.
+    /// Production inserts must compose it with a vault write in the same
+    /// transaction (cockpit-core's `persist_session_row_with_redaction_custody_on_conn`).
     pub async fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
         let row = row.clone();
         self.write(move |conn| Self::insert_session_row_conn(conn, &row))

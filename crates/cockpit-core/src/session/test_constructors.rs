@@ -86,57 +86,55 @@ impl Session {
         let (project_root, project_id) = Self::test_session_identity(project_root);
         let project_root = project_root.to_string_lossy().into_owned();
         let active_agent = active_agent.to_string();
-        let row = db
-            .write(move |conn| {
-                let mut row = match options.assistant {
-                    Some(assistant) => {
-                        if let Some(entry_mode) = options.session_entry_mode {
-                            anyhow::ensure!(
-                                entry_mode == crate::daemon::proto::SessionEntryMode::Assistant,
-                                "assistant test row requires assistant entry mode"
-                            );
-                        }
-                        crate::db::Db::build_new_assistant_session_row_conn(
-                            conn,
-                            &project_id,
-                            &project_root,
-                            &active_agent,
-                            &assistant.name,
-                        )?
+        let vault = crate::secure_key::vault_for_db(db)
+            .map_err(|error| anyhow::anyhow!("opening vault for test session row: {error}"))?;
+        db.transaction(move |conn| {
+            let mut row = match options.assistant {
+                Some(assistant) => {
+                    if let Some(entry_mode) = options.session_entry_mode {
+                        anyhow::ensure!(
+                            entry_mode == crate::daemon::proto::SessionEntryMode::Assistant,
+                            "assistant test row requires assistant entry mode"
+                        );
                     }
-                    None => crate::db::Db::build_new_session_row_conn(
+                    crate::db::Db::build_new_assistant_session_row_conn(
                         conn,
                         &project_id,
                         &project_root,
                         &active_agent,
-                    )?,
-                };
-                match options.model_selection {
-                    TestModelSelectionFields::None => {}
-                    TestModelSelectionFields::Active(selection) => {
-                        row.provider = Some(selection.provider.clone());
-                        row.model = Some(selection.model.clone());
-                        row.model_selection_json = Some(serde_json::to_string(&selection)?);
-                    }
-                    TestModelSelectionFields::Raw {
-                        provider,
-                        model,
-                        model_selection_json,
-                    } => {
-                        row.provider = provider;
-                        row.model = model;
-                        row.model_selection_json = model_selection_json;
-                    }
+                        &assistant.name,
+                    )?
                 }
-                if let Some(entry_mode) = options.session_entry_mode {
-                    row.session_entry_mode = entry_mode.as_str().to_string();
+                None => crate::db::Db::build_new_session_row_conn(
+                    conn,
+                    &project_id,
+                    &project_root,
+                    &active_agent,
+                )?,
+            };
+            match options.model_selection {
+                TestModelSelectionFields::None => {}
+                TestModelSelectionFields::Active(selection) => {
+                    row.provider = Some(selection.provider.clone());
+                    row.model = Some(selection.model.clone());
+                    row.model_selection_json = Some(serde_json::to_string(&selection)?);
                 }
-                crate::db::Db::insert_session_row_conn(conn, &row)
-            })
-            .await?;
-        let json = crate::redact::RedactionTable::empty().to_persisted_json()?;
-        super::lifecycle::write_redaction_table_json_to_vault(db, row.session_id, &json)?;
-        Ok(row)
+                TestModelSelectionFields::Raw {
+                    provider,
+                    model,
+                    model_selection_json,
+                } => {
+                    row.provider = provider;
+                    row.model = model;
+                    row.model_selection_json = model_selection_json;
+                }
+            }
+            if let Some(entry_mode) = options.session_entry_mode {
+                row.session_entry_mode = entry_mode.as_str().to_string();
+            }
+            super::lifecycle::persist_session_row_with_redaction_custody_on_conn(conn, &vault, &row)
+        })
+        .await
     }
 
     pub fn create_for_test(

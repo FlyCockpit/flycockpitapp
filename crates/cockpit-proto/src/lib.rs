@@ -1583,6 +1583,29 @@ mod owner_capability_token_tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+
+    #[test]
+    fn present_owner_capability_is_a_top_level_envelope_string() {
+        let id = Uuid::nil();
+        let token = OwnerCapabilityToken::new("0123456789abcdef".repeat(4));
+        let envelope =
+            Envelope::request_with_owner_capability(id, Request::DaemonStatus, Some(token.clone()));
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            json.get("owner_capability")
+                .and_then(|value| value.as_str()),
+            Some(token.as_str())
+        );
+        let decoded: Envelope = serde_json::from_value(json).unwrap();
+        match decoded.body {
+            Body::Request {
+                owner_capability: Some(got),
+                request: Request::DaemonStatus,
+                ..
+            } => assert_eq!(got.as_str(), token.as_str()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
 
 impl Envelope {

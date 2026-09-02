@@ -1037,6 +1037,212 @@ mod tests {
         }
     }
 
+    /// Issue #296 acceptance: a confined child cannot read the owner-capability
+    /// file or reach the daemon socket, even when those paths sit under an
+    /// allowed parent (cwd). Policy-content assertions above cannot catch a
+    /// defect in zerobox deny translation or deny-over-allow precedence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_child_cannot_reach_daemon_socket_or_owner_capability() {
+        init();
+        let env = crate::test_env::lock_async().await;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let runtime_home = cwd.path().join("xdg-runtime");
+        let state_home = cwd.path().join("xdg-state");
+        std::fs::create_dir_all(&runtime_home).unwrap();
+        std::fs::create_dir_all(&state_home).unwrap();
+        env.set_var("XDG_RUNTIME_DIR", &runtime_home);
+        env.set_var("XDG_STATE_HOME", &state_home);
+
+        let cockpit_runtime = runtime_home.join("cockpit");
+        std::fs::create_dir_all(&cockpit_runtime).unwrap();
+        let socket = cockpit_runtime.join("cockpit.sock");
+        let capability = cockpit_runtime.join("cockpit.owner-capability");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind test socket");
+        std::fs::write(&capability, "owner-capability-must-not-leak\n").unwrap();
+
+        let allowed_marker = cwd.path().join("allowed.txt");
+        std::fs::write(&allowed_marker, "visible\n").unwrap();
+
+        let denied = crate::daemon::control_plane_deny_paths();
+        assert!(
+            denied.contains(&cockpit_runtime),
+            "runtime dir must resolve to the test control plane: {denied:?}"
+        );
+        assert!(
+            denied.contains(&state_home.join("cockpit")),
+            "state dir must resolve to the test control plane: {denied:?}"
+        );
+        let policy = sandbox_policy(
+            cwd.path(),
+            None,
+            &std::collections::HashMap::new(),
+            &[],
+            None,
+        );
+        for path in &denied {
+            assert!(
+                policy.deny_paths.contains(path),
+                "sandbox policy must deny {}",
+                path.display()
+            );
+        }
+
+        let extra_env = [
+            (
+                "COCKPIT_TEST_MARKER".to_string(),
+                allowed_marker.display().to_string(),
+            ),
+            (
+                "COCKPIT_TEST_CAP".to_string(),
+                capability.display().to_string(),
+            ),
+            (
+                "COCKPIT_TEST_SOCK".to_string(),
+                socket.display().to_string(),
+            ),
+        ];
+        let session_env = std::collections::HashMap::from([(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )]);
+        let command = r#"
+marker=0; cap=0; sock=0; connected=0
+if cat "$COCKPIT_TEST_MARKER" >/dev/null 2>&1; then marker=1; fi
+if cat "$COCKPIT_TEST_CAP" >/dev/null 2>&1; then cap=1; fi
+if [ -e "$COCKPIT_TEST_SOCK" ]; then sock=1; fi
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$COCKPIT_TEST_SOCK" >/dev/null 2>&1 && connected=1
+else
+  connected=$sock
+fi
+printf 'marker=%s cap=%s sock=%s connected=%s\n' "$marker" "$cap" "$sock" "$connected"
+"#;
+        let mut cmd = build_sandboxed_command(
+            command,
+            cwd.path(),
+            None,
+            &extra_env,
+            &session_env,
+            &[],
+            None,
+        )
+        .await
+        .expect("sandbox command builds");
+
+        let argv_blob = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for path in &denied {
+            let rendered = path.display().to_string();
+            let canonical = path
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| rendered.clone());
+            assert!(
+                argv_blob.contains(&rendered) || argv_blob.contains(&canonical),
+                "prepared sandbox command must carry deny path {rendered}: {argv_blob}"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let profile = linux_permission_profile_json(&cmd)
+                .expect("Linux helper argv must carry --permission-profile JSON");
+            for path in &denied {
+                let rendered = path.display().to_string();
+                let canonical = path
+                    .canonicalize()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| rendered.clone());
+                assert!(
+                    json_has_fs_access(&profile, &rendered, "none")
+                        || json_has_fs_access(&profile, &canonical, "none"),
+                    "zerobox profile must deny {rendered} (canonical {canonical}): {profile}"
+                );
+            }
+            assert!(
+                json_has_fs_access(&profile, "/run", "read"),
+                "net-enabled sandbox must still grant /run so the control-plane deny is the load-bearing carve-out: {profile}"
+            );
+        }
+
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+            .await
+            .expect("confined child must not hang")
+            .expect("spawn confined child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.contains("marker=") {
+            // Helper re-exec / userns blocked: deny translation was still
+            // asserted on the prepared command. A successful exit without
+            // the reachability line would be a silent fail-open.
+            assert!(
+                !output.status.success(),
+                "confined child exited 0 without reporting reachability: stdout={stdout:?} stderr={stderr:?}"
+            );
+            return;
+        }
+        assert!(
+            stdout.contains("marker=1"),
+            "child must have run inside the box so denials are not a spawn-failed false pass: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("cap=0"),
+            "confined child must not read the owner-capability file: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("sock=0"),
+            "confined child must not see the daemon socket: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("connected=0"),
+            "confined child must not connect to the daemon socket: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_permission_profile_json(cmd: &tokio::process::Command) -> Option<serde_json::Value> {
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        args.windows(2)
+            .find(|pair| pair[0] == "--permission-profile")
+            .and_then(|pair| serde_json::from_str(&pair[1]).ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn json_has_fs_access(value: &serde_json::Value, path: &str, access: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                let this_path = map.get("path").and_then(|path_value| {
+                    path_value
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| path_value.as_str())
+                });
+                let this_access = map.get("access").and_then(serde_json::Value::as_str);
+                (this_path == Some(path) && this_access == Some(access))
+                    || map
+                        .values()
+                        .any(|child| json_has_fs_access(child, path, access))
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|child| json_has_fs_access(child, path, access)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn sandbox_profile_narrows_write_to_scope() {
         let cwd = tempfile::tempdir().unwrap();

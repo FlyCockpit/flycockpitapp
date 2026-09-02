@@ -612,23 +612,30 @@ fn dispatched_cache_read_count(
     }
 }
 
-async fn collect_dispatch_group<T, F>(
+async fn collect_dispatch_group<T, F, I>(
     slot: &str,
     candidates: &[T],
     plan: &CandidateDispatchPlan,
-    candidate_index: impl Fn(&T) -> usize,
+    candidate_index: I,
     collect_one: F,
 ) -> Result<CollectedDispatchGroup>
 where
+    T: Sync,
+    I: Fn(&T) -> usize + Sync,
     F: for<'candidate> Fn(
-        &'candidate T,
-        Option<&'candidate AtomicBool>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<CandidateExecution>> + 'candidate>,
-    >,
+            &'candidate T,
+            Option<&'candidate AtomicBool>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<CandidateExecution>> + Send + 'candidate>,
+        > + Sync,
 {
     let mut collected = Vec::new();
     let candidate_count = candidates.len();
+    // The fan-out futures must share these immutable callbacks. Capturing the
+    // callbacks by value would move them into the first future constructed by
+    // `Iterator::map`, leaving no callback for the remaining candidates.
+    let candidate_index = &candidate_index;
+    let collect_one = &collect_one;
     if let Some(warm_index) = plan.warm_candidate {
         let warm = candidates
             .iter()

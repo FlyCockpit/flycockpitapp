@@ -3437,7 +3437,13 @@ async fn keep_warm_yields_to_queued_user_reentry() {
     install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
     driver.session.note_send();
     driver.session.note_cache_hit_for_endpoint(
-        driver.active_agent().model.cache_endpoint_identity(),
+        driver
+            .stack
+            .last()
+            .unwrap()
+            .agent
+            .model
+            .cache_endpoint_identity(),
         crate::tokens::TokenUsage {
             input_tokens: 100,
             output_tokens: 1,
@@ -3620,7 +3626,13 @@ async fn keep_warm_does_not_extend_the_idle_window_during_preparation() {
     install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
     driver.session.note_send();
     driver.session.note_cache_hit_for_endpoint(
-        driver.active_agent().model.cache_endpoint_identity(),
+        driver
+            .stack
+            .last()
+            .unwrap()
+            .agent
+            .model
+            .cache_endpoint_identity(),
         crate::tokens::TokenUsage {
             input_tokens: 100,
             output_tokens: 1,
@@ -3671,7 +3683,13 @@ async fn keep_warm_cancels_an_in_flight_refresh_at_the_idle_deadline() {
     install_test_providers(&mut driver, CacheMode::Ephemeral, context, 100);
     driver.session.note_send();
     driver.session.note_cache_hit_for_endpoint(
-        driver.active_agent().model.cache_endpoint_identity(),
+        driver
+            .stack
+            .last()
+            .unwrap()
+            .agent
+            .model
+            .cache_endpoint_identity(),
         crate::tokens::TokenUsage {
             input_tokens: 100,
             output_tokens: 1,

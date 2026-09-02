@@ -9924,7 +9924,13 @@ impl Driver {
         };
         let context = providers.resolve_context(&provider, &model);
         let profile = providers.resolve_cache_retention_profile(&provider, &model);
-        let endpoint = self.active_agent().model.cache_endpoint_identity();
+        let endpoint = self
+            .stack
+            .last()
+            .expect("safe boundary has an active agent")
+            .agent
+            .model
+            .cache_endpoint_identity();
         let observed_cache_hit = self.session.has_observed_cache_hit_for_endpoint(&endpoint);
         let decision = crate::keep_warm::decide(
             context.keep_warm,

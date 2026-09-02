@@ -623,7 +623,10 @@ mod tests {
         let decoded: OnboardingState =
             serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
         let progress = decoded.wizard_progress.unwrap();
-        assert_eq!(progress.wizard_id, crate::wizard::ONBOARDING_MODEL_WIZARD_ID);
+        assert_eq!(
+            progress.wizard_id,
+            crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+        );
         assert!(!progress.answers_json.contains("Secret"));
     }
 

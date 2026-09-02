@@ -9797,8 +9797,7 @@ fn submit_setup_wizard_answer(
                 cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            ) && let Err(error) =
-                cockpit_core::welcome::persist_onboarding_wizard_progress(run)
+            ) && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(run)
             {
                 *status = Some(format!("Could not save setup progress: {error}"));
             }

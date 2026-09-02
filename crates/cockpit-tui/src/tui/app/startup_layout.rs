@@ -183,30 +183,27 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
-                if !self.persist_first_run_stage(
-                    cockpit_core::welcome::OnboardingStage::Lifetime,
-                ) {
+                if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Lifetime) {
                     return false;
                 }
-                self.dialog = match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(
-                    Some(
-                        "Choose whether agents stay available for later reattachment."
-                            .to_string(),
-                    ),
-                ) {
-                    Ok(dialog) => dialog,
-                    Err(error) => {
-                        self.show_toast(error, super::ToastKind::Error);
-                        return false;
-                    }
-                };
+                self.dialog =
+                    match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(Some(
+                        "Choose whether agents stay available for later reattachment.".to_string(),
+                    )) {
+                        Ok(dialog) => dialog,
+                        Err(error) => {
+                            self.show_toast(error, super::ToastKind::Error);
+                            return false;
+                        }
+                    };
                 self.first_run_flow = FirstRunFlow::AwaitLifetime;
                 true
             }
             FirstRunFlow::AwaitLifetime => {
-                if !self.dialog.setup_wizard_is_complete(
-                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-                ) {
+                if !self
+                    .dialog
+                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+                {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();

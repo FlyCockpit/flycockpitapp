@@ -1066,8 +1066,7 @@ impl AddState {
 
     fn checkpoint(&mut self) {
         if self.onboarding
-            && let Err(error) =
-                cockpit_core::welcome::persist_onboarding_wizard_progress(&self.run)
+            && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(&self.run)
         {
             self.error = Some(format!("could not save setup progress: {error}"));
         }
@@ -1085,8 +1084,11 @@ impl AddState {
             .iter()
             .position(|candidate| candidate.id == template.id)
             .unwrap_or(0);
-        self.id_field
-            .set(if template.use_id_as_default { template.id } else { "" });
+        self.id_field.set(if template.use_id_as_default {
+            template.id
+        } else {
+            ""
+        });
         self.url_field.set(template.url);
         self.env_var_field.set(
             cockpit_core::providers::detected_env_var(template)

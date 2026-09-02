@@ -816,7 +816,7 @@ async fn record_usage_blocking(
     usage: crate::tokens::TokenUsage,
     model: &Model,
 ) -> anyhow::Result<()> {
-    session.note_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref(), usage);
+    session.note_cache_hit_for_endpoint(model.cache_endpoint_identity(), usage);
     session.record_usage(call_id, usage).await
 }
 

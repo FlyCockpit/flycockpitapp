@@ -2262,6 +2262,8 @@ pub struct VerificationRule {
     pub on_budget_exceeded: Option<OnBudgetExceeded>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<VerificationMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_dispatch: Option<VerificationCandidateDispatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generators: Vec<GeneratorSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2289,6 +2291,7 @@ impl Default for VerificationRule {
             adjudicator_slot: None,
             on_budget_exceeded: None,
             mode: None,
+            candidate_dispatch: None,
             generators: Vec::new(),
             profile: None,
             on_adjudication_failure: None,
@@ -2304,6 +2307,18 @@ pub enum VerificationMode {
     #[default]
     Gate,
     Revise,
+}
+
+/// How verification candidates are sent to a shared model slot. Parallel is
+/// the latency-preserving default. Warm-then-fanout is an opt-in cache-spend
+/// optimization: one candidate warms a slot-local prefix before its siblings
+/// are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCandidateDispatch {
+    #[default]
+    Parallel,
+    WarmThenFanout,
 }
 
 /// What to do when the adjudicator fails or times out. Never hang the turn.
@@ -2566,6 +2581,10 @@ impl VerificationRule {
         self.mode.unwrap_or(VerificationMode::Gate)
     }
 
+    pub fn resolved_candidate_dispatch(&self) -> VerificationCandidateDispatch {
+        self.candidate_dispatch.unwrap_or_default()
+    }
+
     pub fn resolved_on_adjudication_failure(&self) -> OnAdjudicationFailure {
         self.on_adjudication_failure
             .unwrap_or(OnAdjudicationFailure::DispatchOriginal)
@@ -2616,6 +2635,7 @@ impl VerificationRule {
                     || rule.adjudicator_slot.is_some()
                     || rule.on_budget_exceeded.is_some()
                     || rule.mode.is_some()
+                    || rule.candidate_dispatch.is_some()
                     || !rule.generators.is_empty()
                     || rule.profile.is_some()
                     || rule.on_adjudication_failure.is_some()
@@ -4299,5 +4319,33 @@ generators:
         let encoded = serde_yaml::to_string(&rule).unwrap();
         let decoded: VerificationRule = serde_yaml::from_str(&encoded).unwrap();
         assert_eq!(decoded, rule);
+    }
+
+    #[test]
+    fn verification_candidate_dispatch_defaults_to_parallel_and_accepts_warm_then_fanout() {
+        let default_rule: VerificationRule = serde_yaml::from_str(
+            r#"
+selector: {}
+action: off
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_rule.resolved_candidate_dispatch(),
+            VerificationCandidateDispatch::Parallel
+        );
+
+        let warm_rule: VerificationRule = serde_yaml::from_str(
+            r#"
+selector: {}
+action: off
+candidate_dispatch: warm_then_fanout
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            warm_rule.resolved_candidate_dispatch(),
+            VerificationCandidateDispatch::WarmThenFanout
+        );
     }
 }

@@ -221,6 +221,7 @@ pub async fn adjudicate(
             interrupts,
             agent_name,
             cancel,
+            provider_handoff: None,
             deadline_unix_ms: Some(deadline_unix_ms),
         },
         request,

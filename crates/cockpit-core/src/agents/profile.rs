@@ -30,7 +30,7 @@ use super::{
     AgentDef, AllowedChild, EffectiveQuestionPolicy, ExecutionKind, ModelCapability, ModelLocality,
     ModelRecommendation, ModelSlot, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy,
     ResolverOrder, SelectorPredicate, SlotModelRef, VerificationAction, VerificationBudget,
-    VnextHostPolicy, resolve_question_policy,
+    VerificationCandidateDispatch, VnextHostPolicy, resolve_question_policy,
 };
 
 /// Trusted classification of the installation source.  A definition never
@@ -1735,6 +1735,12 @@ fn snapshot_verification_regions(
                     mode: match region.rule.resolved_mode() {
                         crate::agents::VerificationMode::Gate => "gate".to_string(),
                         crate::agents::VerificationMode::Revise => "revise".to_string(),
+                    },
+                    candidate_dispatch: match region.rule.resolved_candidate_dispatch() {
+                        VerificationCandidateDispatch::Parallel => "parallel".to_string(),
+                        VerificationCandidateDispatch::WarmThenFanout => {
+                            "warm_then_fanout".to_string()
+                        }
                     },
                     generators: region
                         .rule

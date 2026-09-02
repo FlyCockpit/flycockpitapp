@@ -4,7 +4,7 @@
 //! Verification rows store a digest-only audit projection because raw
 //! candidate bodies are intentionally non-durable.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -44,6 +44,20 @@ fn verification_audit_projection(
     }))
 }
 
+/// Cache evidence belongs to the endpoint that produced this utility response,
+/// not to the session's active authoring model. Verification generators can
+/// use dedicated profile slots, so omitting this update would permanently
+/// prevent those slots from becoming eligible for cache-aware dispatch.
+fn note_verification_cache_hit(
+    session: &Session,
+    endpoint: crate::engine::model::CacheEndpointIdentity,
+    usage: Option<crate::tokens::TokenUsage>,
+) {
+    if let Some(usage) = usage {
+        session.note_cache_hit_for_endpoint(endpoint, usage);
+    }
+}
+
 struct VerificationInferenceInput<'a> {
     session: Arc<Session>,
     model: &'a Model,
@@ -57,6 +71,9 @@ struct VerificationInferenceInput<'a> {
     agent_name: &'a str,
     site: UtilityCallSite,
     cancel: &'a tokio_util::sync::CancellationToken,
+    /// Set once the model has successfully established its provider stream.
+    /// Callers use this as an execution fact, never as a completion signal.
+    provider_handoff: Option<&'a AtomicBool>,
     /// Optional caller-owned absolute deadline. The inference barrier owns
     /// the timeout so a deadline cannot drop a provider future while leaving
     /// either audit journal pending.
@@ -71,6 +88,9 @@ pub(super) struct VerificationInferenceRuntime<'a> {
     pub interrupts: &'a crate::engine::interrupt::InterruptHub,
     pub agent_name: &'a str,
     pub cancel: &'a tokio_util::sync::CancellationToken,
+    /// Set once the model has successfully established its provider stream.
+    /// Callers use this as an execution fact, never as a completion signal.
+    pub provider_handoff: Option<&'a AtomicBool>,
     pub deadline_unix_ms: Option<i64>,
 }
 
@@ -92,6 +112,7 @@ pub(super) async fn journaled_generator_inference(
         agent_name: runtime.agent_name,
         site: UtilityCallSite::VerificationVariant,
         cancel: runtime.cancel,
+        provider_handoff: runtime.provider_handoff,
         deadline_unix_ms: runtime.deadline_unix_ms,
         assembled_provider_payload: Some(assembled_provider_payload),
     })
@@ -115,6 +136,7 @@ pub(super) async fn journaled_adjudication_inference(
         agent_name: runtime.agent_name,
         site: UtilityCallSite::VerificationAdjudication,
         cancel: runtime.cancel,
+        provider_handoff: runtime.provider_handoff,
         deadline_unix_ms: runtime.deadline_unix_ms,
         assembled_provider_payload: None,
     })
@@ -258,20 +280,43 @@ async fn journaled_verification_inference(
             ))
         });
     let started = std::time::Instant::now();
-    let completion = match tokio::time::timeout(
-        timeout,
-        input.model.complete_captured(
-            &system,
-            input.history,
-            prompt,
-            &tools,
-            params,
-            input.agent_name,
-            None,
-            input.cancel,
-            None,
-        ),
-    )
+    let completion = match tokio::time::timeout(timeout, async {
+        match input.provider_handoff {
+            Some(provider_handoff) => {
+                input
+                    .model
+                    .complete_captured_with_provider_handoff(
+                        &system,
+                        input.history,
+                        prompt,
+                        &tools,
+                        params,
+                        input.agent_name,
+                        None,
+                        input.cancel,
+                        None,
+                        provider_handoff,
+                    )
+                    .await
+            }
+            None => {
+                input
+                    .model
+                    .complete_captured(
+                        &system,
+                        input.history,
+                        prompt,
+                        &tools,
+                        params,
+                        input.agent_name,
+                        None,
+                        input.cancel,
+                        None,
+                    )
+                    .await
+            }
+        }
+    })
     .await
     {
         Ok(result) => result,
@@ -315,6 +360,7 @@ async fn journaled_verification_inference(
             return Err(error);
         }
     };
+    note_verification_cache_hit(&input.session, input.model.cache_endpoint_identity(), usage);
     if input
         .session
         .advance_inference_request(
@@ -466,6 +512,38 @@ mod tests {
         assert_eq!(projected["projection"], "verification_inference_v1");
         assert_eq!(projected["classification"], "verification_adjudication");
         assert_eq!(projected["request_digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn verification_provider_usage_learns_cache_evidence_for_its_exact_endpoint() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let generator_endpoint =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "generator", 1);
+        let other_endpoint =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "author", 1);
+
+        note_verification_cache_hit(
+            &session,
+            generator_endpoint.clone(),
+            Some(crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            }),
+        );
+
+        assert!(session.has_observed_cache_hit_for_endpoint(&generator_endpoint));
+        assert!(
+            !session.has_observed_cache_hit_for_endpoint(&other_endpoint),
+            "verification usage must not authorize a different slot's endpoint"
+        );
     }
 
     #[tokio::test]

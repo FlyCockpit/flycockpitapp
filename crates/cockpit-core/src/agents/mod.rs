@@ -73,10 +73,10 @@ pub use vnext::{
     PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute, ProhibitedQuestionClass,
     ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
     SelectorPredicate, SlotModelRef, ToolClass, VerificationAction, VerificationBudget,
-    VerificationDispatch, VerificationEstimate, VerificationMode, VerificationPolicy,
-    VerificationRecipe, VerificationRule, VerificationSelector, VerificationSessionReduction,
-    VerificationSubject, VerificationToolCategory, VnextAgentDef, VnextHostPolicy,
-    delegation_kind_permitted, resolve_question_policy,
+    VerificationCandidateDispatch, VerificationDispatch, VerificationEstimate, VerificationMode,
+    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
+    VerificationSessionReduction, VerificationSubject, VerificationToolCategory, VnextAgentDef,
+    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;

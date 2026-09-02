@@ -16,8 +16,9 @@ use uuid::Uuid;
 use crate::{
     agents::{
         GeneratorSpec, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
-        VerificationAction, VerificationBudget, VerificationEstimate, VerificationMode,
-        VerificationRecipe, VerificationRule, VerificationSelector, VerificationSubject,
+        VerificationAction, VerificationBudget, VerificationCandidateDispatch,
+        VerificationEstimate, VerificationMode, VerificationRecipe, VerificationRule,
+        VerificationSelector, VerificationSubject,
     },
     db::{
         stats::PriceTable,
@@ -136,6 +137,11 @@ fn rule_from_snapshot(
         "revise" => VerificationMode::Revise,
         _ => anyhow::bail!("verification snapshot has an invalid mode"),
     };
+    let candidate_dispatch = match plan.candidate_dispatch.as_str() {
+        "parallel" => VerificationCandidateDispatch::Parallel,
+        "warm_then_fanout" => VerificationCandidateDispatch::WarmThenFanout,
+        _ => anyhow::bail!("verification snapshot has an invalid candidate dispatch mode"),
+    };
     let on_budget_exceeded = match plan.on_budget_exceeded.as_str() {
         "refuse" => OnBudgetExceeded::Refuse,
         "dispatch_original" => OnBudgetExceeded::DispatchOriginal,
@@ -196,6 +202,7 @@ fn rule_from_snapshot(
         adjudicator_slot: region.adjudicator_slot.clone(),
         on_budget_exceeded: Some(on_budget_exceeded),
         mode: Some(mode),
+        candidate_dispatch: Some(candidate_dispatch),
         generators,
         profile: None,
         on_adjudication_failure: Some(on_adjudication_failure),
@@ -582,6 +589,7 @@ async fn run_verification(
             resolved_name: input.resolved_name,
             args: input.args,
             generators: &generators,
+            candidate_dispatch: rule.resolved_candidate_dispatch(),
             max_candidates: requested.max_candidates,
             operation_id: created.operation_id,
             expected_revision: created.revision,

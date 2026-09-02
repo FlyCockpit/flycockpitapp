@@ -618,6 +618,48 @@ mod input_policy {
         let err = transform_bytes(&oversized, None, None, None, OutputFormat::Png).unwrap_err();
         assert!(err.to_string().contains("decompression bomb"));
     }
+
+    #[test]
+    fn read_image_transform_rejects_dimensions_over_the_central_limit() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        fn png_with_ihdr_dimensions(width: u32, height: u32) -> Vec<u8> {
+            fn crc32(data: &[u8]) -> u32 {
+                let mut crc = 0xFFFF_FFFFu32;
+                for &byte in data {
+                    crc ^= u32::from(byte);
+                    for _ in 0..8 {
+                        crc = if crc & 1 != 0 {
+                            (crc >> 1) ^ 0xEDB8_8320
+                        } else {
+                            crc >> 1
+                        };
+                    }
+                }
+                !crc
+            }
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(b"IHDR");
+            ihdr.extend_from_slice(&width.to_be_bytes());
+            ihdr.extend_from_slice(&height.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+            let crc = crc32(&ihdr);
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(&ihdr);
+            png.extend_from_slice(&crc.to_be_bytes());
+            png.extend_from_slice(&0u32.to_be_bytes());
+            png.extend_from_slice(b"IEND");
+            png.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+            png
+        }
+        let bomb = png_with_ihdr_dimensions(limits.image_max_width + 1, 8);
+        let err = transform_bytes(&bomb, None, None, None, OutputFormat::Png).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("resource_limit") || text.contains("decode"),
+            "{text}"
+        );
+    }
 }
 
 // ===========================================================================

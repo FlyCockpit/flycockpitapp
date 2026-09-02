@@ -26,6 +26,8 @@ const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 /// then assigns the process before resuming its primary thread. Other targets
 /// fail closed instead of pretending a direct-child kill contains descendants.
 pub struct ProcessTreeGuard {
+    #[cfg(unix)]
+    pgid: Mutex<Option<libc::pid_t>>,
     #[cfg(windows)]
     job: Mutex<Option<windows_sys::Win32::Foundation::HANDLE>>,
 }
@@ -42,7 +44,9 @@ impl ProcessTreeGuard {
     pub fn allocate() -> anyhow::Result<Self> {
         #[cfg(unix)]
         {
-            Ok(Self {})
+            Ok(Self {
+                pgid: Mutex::new(None),
+            })
         }
         #[cfg(windows)]
         {
@@ -130,7 +134,26 @@ impl ProcessTreeGuard {
     pub fn assign(&self, child: &tokio::process::Child) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            let _ = (self, child);
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
+            let pid = libc::pid_t::try_from(pid)
+                .map_err(|_| anyhow::anyhow!("child pid is not a valid process-group id"))?;
+            // SAFETY: `pid` is the child we just spawned and have not reaped;
+            // `getpgid` only queries the kernel process-group identity.
+            let pgid = unsafe { libc::getpgid(pid) };
+            if pgid < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if pgid != pid {
+                return Err(anyhow::anyhow!(
+                    "child is not the leader of its process group"
+                ));
+            }
+            *self
+                .pgid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))? = Some(pgid);
             Ok(())
         }
         #[cfg(windows)]
@@ -175,8 +198,11 @@ impl ProcessTreeGuard {
         let _ = self;
         #[cfg(unix)]
         {
+            // Unix has no CREATE_SUSPENDED equivalent that `Command::spawn`
+            // can return from: `process_group(0)` already placed the child in
+            // a fresh group before exec. Resume is a no-op.
             let _ = child;
-            Ok(())
+            return Ok(());
         }
         #[cfg(windows)]
         {
@@ -237,6 +263,20 @@ impl ProcessTreeGuard {
     }
 
     pub fn terminate(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            let pgid = *self
+                .pgid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
+            if let Some(pgid) = pgid {
+                match signal_group(pgid, libc::SIGKILL) {
+                    Ok(()) => {}
+                    Err(error) if is_esrch(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         #[cfg(windows)]
         {
             let job = self
@@ -249,6 +289,38 @@ impl ProcessTreeGuard {
             }
         }
         Ok(())
+    }
+
+    /// Forget the bound Unix process-group identity after the empty oracle
+    /// has fired, so Drop cannot signal a recycled pgid.
+    #[cfg(unix)]
+    pub fn release_group(&self) {
+        *self
+            .pgid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// Whether a process-group leader has been assigned to this guard.
+    #[cfg(unix)]
+    pub fn group_is_bound(&self) -> bool {
+        self.pgid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Whether the bound process group still has at least one member.
+    ///
+    /// This is the Unix empty oracle: `kill(-pgid, 0)`, not a local counter,
+    /// child-exit wait, or `/proc` poll. Unbound guards are empty.
+    #[cfg(unix)]
+    pub fn group_is_populated(&self) -> anyhow::Result<bool> {
+        let pgid = *self
+            .pgid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
+        Ok(pgid.map(group_exists).unwrap_or(false))
     }
 
     /// Close the owned Windows job as the kill-on-close fallback. The handle is
@@ -350,6 +422,14 @@ pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+        self.release_group();
     }
 }
 
@@ -917,7 +997,62 @@ mod tests {
         let mut command = tokio::process::Command::new("prohibited-real-process");
         let guard = ProcessTreeGuard::prepare(&mut command);
         assert!(guard.is_ok());
+        let guard = guard.expect("allocate");
+        assert!(
+            !guard.group_is_bound(),
+            "allocate must not place a process-group member"
+        );
+        assert!(
+            !guard.group_is_populated().expect("unbound group is empty"),
+            "allocate must not fabricate a populated group"
+        );
         assert_eq!(unix_group_signal_target(41), -41);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_process_tree_guard_tracks_assigned_process_group() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate process-group guard");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn stopped child");
+        guard
+            .assign(&child)
+            .expect("record process-group membership");
+        assert!(
+            guard.group_is_bound(),
+            "assign must bind the process-group identity"
+        );
+        assert!(
+            guard
+                .group_is_populated()
+                .expect("process-group existence probe"),
+            "membership must be visible after assign"
+        );
+        guard.resume(&child).expect("unix resume is a no-op");
+        guard.terminate().expect("SIGKILL process group");
+        let _ = child.wait().await;
+        let mut empty = false;
+        for _ in 0..50 {
+            if !guard
+                .group_is_populated()
+                .expect("process-group existence probe")
+            {
+                empty = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(empty, "SIGKILL plus reap must drain the process group");
+        guard.release_group();
+        assert!(!guard.group_is_bound());
     }
 
     #[cfg(unix)]

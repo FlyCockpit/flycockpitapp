@@ -2,7 +2,11 @@
 //!
 //! Proven uses a fresh non-breakaway Job Object per generation with
 //! JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. CreateProcessW starts suspended;
-//! AssignProcessToJobObject succeeds before ResumeThread.
+//! AssignProcessToJobObject succeeds before ResumeThread. Kernel accounting
+//! (`QueryInformationJobObject` ActiveProcesses) is the empty oracle.
+//!
+//! The host `ProcessTreeGuard` owns those syscalls. This adapter never
+//! fabricates Proven from an in-memory log.
 //!
 //! Direct `windows-sys = "=0.61.2"` feature request lives on this crate's
 //! target-specific dependency (not via cockpit-config).
@@ -19,6 +23,9 @@ use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
     SafeLocator,
 };
+
+/// Off-Windows hosts cannot create Job Objects.
+pub const WINDOWS_JOB_UNAVAILABLE_ON_HOST: &str = "windows_job_objects_unavailable_on_this_host";
 
 /// Nested-job or breakaway conditions force Unsupported.
 #[derive(Debug, Clone)]
@@ -38,20 +45,21 @@ impl Default for WindowsJobConfig {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+/// Live generation bound to a real Job Object (Windows) or absent (tests).
+#[cfg_attr(not(windows), allow(dead_code))]
 struct JobLive {
     generation: u64,
-    active_processes: u32,
-    handles_open: bool,
-    kill_on_close: bool,
-    suspended_then_assigned: bool,
+    #[cfg(windows)]
+    guard: cockpit_host::process::ProcessTreeGuard,
+    #[cfg(windows)]
+    child: tokio::process::Child,
 }
 
 /// Windows Job Object containment adapter.
 ///
-/// On non-Windows hosts this still compiles as a logic/test adapter; real
-/// CreateJobObjectW symbols are only linked on Windows via windows-sys.
+/// On non-Windows hosts this still compiles as a logic/test adapter and
+/// reports Unsupported; real CreateJobObjectW symbols are only linked on
+/// Windows via windows-sys / `ProcessTreeGuard`.
 pub struct WindowsJobAdapter {
     config: WindowsJobConfig,
     jobs: Mutex<std::collections::HashMap<String, JobLive>>,
@@ -75,22 +83,7 @@ impl WindowsJobAdapter {
     }
 
     pub fn production() -> Self {
-        #[cfg(windows)]
-        {
-            // Production detection: Job Objects are available on supported Windows.
-            Self::new(WindowsJobConfig::default())
-        }
-        #[cfg(not(windows))]
-        {
-            // Non-Windows graphs exclude the windows-sys direct dependency path
-            // for this adapter's Job Object symbols; capability is Unsupported
-            // when not on Windows for native job provenance.
-            Self::new(WindowsJobConfig {
-                nested_job_restricted: true,
-                breakaway_ok: false,
-                completion_port_ok: false,
-            })
-        }
+        Self::new(WindowsJobConfig::default())
     }
 
     fn reason_if_unsupported(&self) -> Option<&'static str> {
@@ -103,11 +96,96 @@ impl WindowsJobAdapter {
         if !self.config.completion_port_ok {
             return Some("completion_port_unavailable");
         }
+        #[cfg(not(windows))]
+        {
+            return Some(WINDOWS_JOB_UNAVAILABLE_ON_HOST);
+        }
+        #[cfg(windows)]
         None
     }
 
     fn push_order(&self, step: &'static str) {
         self.order_log.lock().unwrap().push(step);
+    }
+
+    fn unavailable(reason: impl Into<String>) -> ContainmentError {
+        ContainmentError::DescendantContainmentUnavailable {
+            reason: reason.into(),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn spawn_contained(
+        &self,
+        req: NativeSpawnRequest,
+    ) -> Result<AllocatedContainment, ContainmentError> {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new(&req.program);
+        command
+            .args(&req.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        if !req.cwd.as_os_str().is_empty() {
+            command.current_dir(&req.cwd);
+        }
+
+        let guard = cockpit_host::process::ProcessTreeGuard::prepare(&mut command)
+            .map_err(|_| Self::unavailable("job_object_prepare_failed"))?;
+        self.push_order("CreateJobObjectW");
+        self.push_order("SetInformationJobObject_KILL_ON_CLOSE");
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return Err(Self::unavailable("process_spawn_failed")),
+        };
+        self.push_order("CreateProcessW_CREATE_SUSPENDED");
+
+        if guard.attach(&child).is_err() {
+            let _ = guard.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(Self::unavailable("job_object_assign_or_resume_failed"));
+        }
+        self.push_order("AssignProcessToJobObject");
+        self.push_order("ResumeThread");
+
+        // Fail closed if the job handle is already gone; do not claim Proven.
+        if !guard.job_is_open() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(Self::unavailable("job_object_closed_before_membership"));
+        }
+
+        let key = format!("job-{}-{}", req.containment_id, req.generation);
+        self.jobs.lock().unwrap().insert(
+            key.clone(),
+            JobLive {
+                generation: req.generation,
+                guard,
+                child,
+            },
+        );
+        Ok(AllocatedContainment {
+            locator: SafeLocator {
+                locator_key: Some(key.clone()),
+                nonce: Some(format!("wj{}", req.generation)),
+                ..Default::default()
+            },
+            guarantee: ContainmentGuarantee::Proven,
+            handle: AdapterHandle { key },
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn spawn_contained(
+        &self,
+        req: NativeSpawnRequest,
+    ) -> Result<AllocatedContainment, ContainmentError> {
+        let _ = (self, req);
+        Err(Self::unavailable(WINDOWS_JOB_UNAVAILABLE_ON_HOST))
     }
 }
 
@@ -144,48 +222,16 @@ impl ContainmentAdapter for WindowsJobAdapter {
         req: NativeSpawnRequest,
     ) -> Result<AllocatedContainment, ContainmentError> {
         if let Some(reason) = self.reason_if_unsupported() {
-            return Err(ContainmentError::DescendantContainmentUnavailable {
-                reason: reason.into(),
-            });
+            return Err(Self::unavailable(reason));
         }
-        // Exact order: create job → create suspended → assign → resume.
-        self.push_order("CreateJobObjectW");
-        self.push_order("SetInformationJobObject_KILL_ON_CLOSE");
-        self.push_order("CreateProcessW_CREATE_SUSPENDED");
-        self.push_order("AssignProcessToJobObject");
-        // Assignment failure → Unsupported path would return before resume.
-        self.push_order("ResumeThread");
-        self.push_order("AssociateCompletionPort");
-
-        let key = format!("job-{}-{}", req.containment_id, req.generation);
-        self.jobs.lock().unwrap().insert(
-            key.clone(),
-            JobLive {
-                generation: req.generation,
-                active_processes: 1,
-                handles_open: true,
-                kill_on_close: true,
-                suspended_then_assigned: true,
-            },
-        );
-        Ok(AllocatedContainment {
-            locator: SafeLocator {
-                locator_key: Some(key.clone()),
-                nonce: Some(format!("wj{}", req.generation)),
-                ..Default::default()
-            },
-            guarantee: ContainmentGuarantee::Proven,
-            handle: AdapterHandle { key },
-        })
+        self.spawn_contained(req).await
     }
 
     async fn create_container_and_exec(
         &self,
         _req: ContainerExecRequest,
     ) -> Result<AllocatedContainment, ContainmentError> {
-        Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: "windows_adapter_is_native_only".into(),
-        })
+        Err(Self::unavailable("windows_adapter_is_native_only"))
     }
 
     async fn terminate(
@@ -201,8 +247,14 @@ impl ContainmentAdapter for WindowsJobAdapter {
                     got: generation,
                 });
             }
+            #[cfg(windows)]
+            {
+                job.guard
+                    .terminate()
+                    .map_err(|_| Self::unavailable("job_object_terminate_failed"))?;
+                let _ = job.child.try_wait();
+            }
             self.push_order("TerminateJobObject");
-            job.active_processes = 0;
         }
         Ok(())
     }
@@ -214,14 +266,36 @@ impl ContainmentAdapter for WindowsJobAdapter {
     ) -> Result<EmptyOutcome, ContainmentError> {
         let jobs = self.jobs.lock().unwrap();
         match jobs.get(&handle.key) {
-            Some(job) if job.generation == generation && job.active_processes == 0 => {
-                self.push_order("ActiveProcessZero");
-                Ok(EmptyOutcome::ProvenEmpty { generation })
+            Some(job) if job.generation == generation => {
+                #[cfg(windows)]
+                {
+                    if !job.guard.job_is_open() {
+                        self.push_order("ActiveProcessZero");
+                        return Ok(EmptyOutcome::ProvenEmpty { generation });
+                    }
+                    match job.guard.active_process_count() {
+                        Ok(0) => {
+                            self.push_order("ActiveProcessZero");
+                            Ok(EmptyOutcome::ProvenEmpty { generation })
+                        }
+                        Ok(_) => Ok(EmptyOutcome::Uncertain {
+                            generation,
+                            reason: "active_processes_nonzero".into(),
+                        }),
+                        Err(_) => Ok(EmptyOutcome::Uncertain {
+                            generation,
+                            reason: "job_object_query_failed".into(),
+                        }),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = job;
+                    Ok(EmptyOutcome::Unsupported {
+                        reason: WINDOWS_JOB_UNAVAILABLE_ON_HOST.into(),
+                    })
+                }
             }
-            Some(job) if job.generation == generation => Ok(EmptyOutcome::Uncertain {
-                generation,
-                reason: "active_processes_nonzero".into(),
-            }),
             Some(_) => Ok(EmptyOutcome::Uncertain {
                 generation,
                 reason: "job_generation_mismatch".into(),
@@ -239,14 +313,31 @@ impl ContainmentAdapter for WindowsJobAdapter {
         // After daemon death, previously Active is Uncertain until named job absent.
         let key = locator.locator_key.clone().unwrap_or_default();
         let jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get(&key)
-            && job.handles_open
-            && job.active_processes > 0
-        {
-            return Ok(EmptyOutcome::Uncertain {
-                generation,
-                reason: "job_still_active_after_restart".into(),
-            });
+        if let Some(job) = jobs.get(&key) {
+            #[cfg(windows)]
+            {
+                if job.guard.job_is_open() {
+                    match job.guard.active_process_count() {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            return Ok(EmptyOutcome::Uncertain {
+                                generation,
+                                reason: "job_still_active_after_restart".into(),
+                            });
+                        }
+                        Err(_) => {
+                            return Ok(EmptyOutcome::Uncertain {
+                                generation,
+                                reason: "job_object_query_failed".into(),
+                            });
+                        }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = job;
+            }
         }
         // No reusable locator accepted across generations.
         Ok(EmptyOutcome::ProvenEmpty { generation })
@@ -257,7 +348,14 @@ impl WindowsJobAdapter {
     /// Close every process/thread/job handle on all branches.
     pub fn close_handles(&self, handle: &AdapterHandle) {
         if let Some(job) = self.jobs.lock().unwrap().get_mut(&handle.key) {
-            job.handles_open = false;
+            #[cfg(windows)]
+            {
+                let _ = job.guard.close_job();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = job;
+            }
             self.push_order("CloseHandle_all");
         }
     }
@@ -276,8 +374,9 @@ pub mod job_symbols {
     pub use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     pub use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
@@ -289,6 +388,7 @@ pub mod job_symbols {
             "CreateJobObjectW",
             "SetInformationJobObject",
             "AssignProcessToJobObject",
+            "QueryInformationJobObject",
             "TerminateJobObject",
             "JobObjectAssociateCompletionPortInformation",
             "CreateProcessW",
@@ -302,20 +402,32 @@ pub mod job_symbols {
 mod windows_job_spawn_before_resume {
     use super::*;
 
+    fn sleeper_request(generation: u64) -> NativeSpawnRequest {
+        NativeSpawnRequest {
+            containment_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            operation_id: "op".into(),
+            program: "cmd.exe".into(),
+            args: vec![
+                "/C".into(),
+                "ping".into(),
+                "-n".into(),
+                "20".into(),
+                "127.0.0.1".into(),
+            ],
+            cwd: ".".into(),
+            require_proven: true,
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn exact_suspended_create_assign_resume_order() {
         let adapter = WindowsJobAdapter::new(WindowsJobConfig::default());
-        let req = NativeSpawnRequest {
-            containment_id: uuid::Uuid::new_v4(),
-            session_id: uuid::Uuid::new_v4(),
-            generation: 1,
-            operation_id: "op".into(),
-            program: "cmd.exe".into(),
-            args: vec![],
-            cwd: ".".into(),
-            require_proven: true,
-        };
-        let allocated = adapter.create_and_spawn(req).await.unwrap();
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Proven);
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        assert_eq!(allocated.guarantee, ContainmentGuarantee::Proven);
         let order = adapter.order();
         let create_job = order.iter().position(|s| *s == "CreateJobObjectW").unwrap();
         let suspend = order
@@ -332,6 +444,13 @@ mod windows_job_spawn_before_resume {
         assert!(assign < resume);
         assert!(order.contains(&"SetInformationJobObject_KILL_ON_CLOSE"));
 
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { reason, .. } => {
+                assert_eq!(reason, "active_processes_nonzero");
+            }
+            o => panic!("live job must not fabricate empty: {o:?}"),
+        }
+
         adapter.terminate(&allocated.handle, 1).await.unwrap();
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
@@ -341,12 +460,60 @@ mod windows_job_spawn_before_resume {
         assert!(adapter.order().contains(&"CloseHandle_all"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn spawn_failure_is_unsupported_not_proven() {
+        let adapter = WindowsJobAdapter::production();
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Proven);
+        let err = adapter
+            .create_and_spawn(NativeSpawnRequest {
+                containment_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                operation_id: "op".into(),
+                program: "cockpit_missing_job_object_probe.exe".into(),
+                args: vec![],
+                cwd: ".".into(),
+                require_proven: true,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            ContainmentError::DescendantContainmentUnavailable { reason } => {
+                assert_eq!(reason, "process_spawn_failed");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn production_adapter_is_unsupported_off_windows() {
+        let adapter = WindowsJobAdapter::production();
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Unsupported);
+        assert_eq!(
+            adapter.safe_metadata().capability_reason.as_deref(),
+            Some(WINDOWS_JOB_UNAVAILABLE_ON_HOST)
+        );
+        let err = adapter
+            .create_and_spawn(sleeper_request(1))
+            .await
+            .unwrap_err();
+        match err {
+            ContainmentError::DescendantContainmentUnavailable { reason } => {
+                assert_eq!(reason, WINDOWS_JOB_UNAVAILABLE_ON_HOST);
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn nested_job_failure_is_unsupported() {
         let adapter = WindowsJobAdapter::new(WindowsJobConfig {
             nested_job_restricted: true,
             ..Default::default()
         });
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Unsupported);
         let err = adapter
             .create_and_spawn(NativeSpawnRequest {
                 containment_id: uuid::Uuid::new_v4(),

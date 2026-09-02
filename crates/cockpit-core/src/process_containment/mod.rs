@@ -39,4 +39,4 @@ pub use types::{
     ContainmentError, ContainmentGuarantee, ContainmentLease, ContainmentState, EmptyOutcome,
     LateCallbackKind, PlatformKind, SafeContainmentMetadata, SafeLocator,
 };
-pub use windows::WindowsJobAdapter;
+pub use windows::{WINDOWS_JOB_UNAVAILABLE_ON_HOST, WindowsJobAdapter};

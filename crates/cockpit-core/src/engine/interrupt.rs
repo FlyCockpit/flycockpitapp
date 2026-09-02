@@ -1570,11 +1570,14 @@ impl InterruptHub {
             Ok(table) => Arc::new(table),
             Err(error) => {
                 // Never overwrite the committed table (which may hold a sealed
-                // literal) with a bare disk scan on a union error: keep the
-                // committed table live and defer the disk delta to the next
-                // refresh.
-                tracing::warn!(error = %error, "unioning redaction table failed; keeping committed table");
-                return Ok(Some(base));
+                // literal) with a bare disk scan on a union error. Leave the
+                // committed table live and fail closed so this turn cannot
+                // send without the turn-boundary scan.
+                return Err(crate::redact::RedactionTableUnavailable::new(
+                    "unioning redaction table for turn refresh",
+                    error,
+                )
+                .into());
             }
         };
         // Persist BEFORE swapping the live table: a persist failure must not

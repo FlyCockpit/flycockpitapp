@@ -334,7 +334,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
 libc = { workspace = true }
 
 [dev-dependencies]
-cockpit-db = { path = "../cockpit-db", features = ["host-approval-test-support"] }
+cockpit-db = { path = "../cockpit-db", features = ["host-approval-test-support", "test-support"] }
 flycockpit-relay-protocol = { path = "../relay-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }

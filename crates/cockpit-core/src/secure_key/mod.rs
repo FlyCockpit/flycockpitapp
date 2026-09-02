@@ -71,6 +71,8 @@ pub use resolve::{
 pub use resolve::{
     TestInjectedVault, test_available_keyring_probe, test_missing_keyring_probe, test_open_db,
 };
+#[cfg(test)]
+pub use vault::tamper_item_ciphertext;
 pub use vault::{
     SecretVault, SecretVaultItemSnapshot, SecretVaultMutation, redaction_table_item_id,
     session_sealed_item_id,

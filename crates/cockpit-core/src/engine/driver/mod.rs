@@ -3076,7 +3076,33 @@ impl Driver {
         self.config.extended().max_primary_rounds
     }
 
-    async fn refresh_redaction_table_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+    async fn refuse_unredacted_send(
+        tx: &mpsc::Sender<TurnEvent>,
+        error: impl std::fmt::Display,
+    ) -> Result<()> {
+        tracing::warn!(error = %error, "refreshing redaction table failed");
+        let _ = tx
+            .send(TurnEvent::Notice {
+                text: format!("Redaction refresh failed; refusing to send unredacted: {error:#}"),
+            })
+            .await;
+        Err(anyhow!(
+            "redaction refresh failed; refusing to send unredacted: {error:#}"
+        ))
+    }
+
+    fn redaction_refresh_idle_reason() -> crate::engine::IdleReason {
+        crate::engine::IdleReason::Error {
+            class: crate::engine::model::InferenceErrorClass::Other(
+                "redaction_refresh_failed".to_string(),
+            ),
+        }
+    }
+
+    async fn refresh_redaction_table_for_turn(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
         let cwd = self.cwd.clone();
         let scan_environment_override = self.redaction_scan_environment_override;
         let scan_dotenv_override = self.redaction_scan_dotenv_override;
@@ -3100,12 +3126,12 @@ impl Driver {
         if let Some(v) = scan_ssh_keys_override {
             cfg.scan_ssh_keys = v;
         }
-        let store = self.session.credential_store().ok();
-        match tokio::task::spawn_blocking(move || match store.as_ref() {
-            Some(store) => {
-                RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, store)
-            }
-            None => RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env),
+        let store = match self.session.credential_store() {
+            Ok(store) => store,
+            Err(error) => return Self::refuse_unredacted_send(tx, error).await,
+        };
+        match tokio::task::spawn_blocking(move || {
+            RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, &store)
         })
         .await
         {
@@ -3116,15 +3142,7 @@ impl Driver {
                     .await
                 {
                     Ok(table) => table,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "adding machine-scoped sealed redactions failed");
-                        let _ = tx
-                            .send(TurnEvent::Notice {
-                                text: format!("Redaction refresh failed: {error:#}"),
-                            })
-                            .await;
-                        return;
-                    }
+                    Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
                 // J2: route the per-turn refresh through the hub so it unions the
                 // disk scan onto the LATEST shared table under the same
@@ -3147,23 +3165,23 @@ impl Driver {
                         let table = match self.redact.union(&new_table) {
                             Ok(table) => Arc::new(table),
                             Err(error) => {
-                                tracing::warn!(error = %error, "unioning redaction table failed");
-                                Arc::new(new_table)
+                                return Self::refuse_unredacted_send(tx, error).await;
                             }
                         };
                         if let Err(error) = self.session.persist_redaction_table(&table) {
                             // Fail-closed: do not advance `self.redact` ahead of
-                            // the durable table when the persist did not commit.
-                            tracing::warn!(error = %error, "persisting redaction table failed");
-                            return;
+                            // the durable table when the persist did not commit,
+                            // and do not send with a table that omitted this
+                            // turn's scan (rotated / newly introduced secrets).
+                            return Self::refuse_unredacted_send(tx, error).await;
                         }
                         table
                     }
                     Err(error) => {
                         // The committed table is left live under the hub lock;
-                        // skip this refresh rather than clobber it.
-                        tracing::warn!(error = %error, "refreshing redaction table under hub lock failed");
-                        return;
+                        // abort this send rather than proceeding without the
+                        // turn-boundary scan.
+                        return Self::refuse_unredacted_send(tx, error).await;
                     }
                 };
                 for path in table.unsupported_files() {
@@ -3179,13 +3197,10 @@ impl Driver {
                     }
                 }
                 self.set_redaction_table(table);
+                Ok(())
             }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "refreshing redaction table failed");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "refreshing redaction table task join failed");
-            }
+            Ok(Err(e)) => Self::refuse_unredacted_send(tx, e).await,
+            Err(e) => Self::refuse_unredacted_send(tx, e).await,
         }
     }
 
@@ -4940,7 +4955,10 @@ impl Driver {
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
-        self.refresh_redaction_table_for_turn(tx).await;
+        if let Err(error) = self.refresh_redaction_table_for_turn(tx).await {
+            self.mark_bound_turn_refused(Self::redaction_refresh_idle_reason());
+            return Err(error);
+        }
         self.refresh_active_frame_for_turn(tx).await;
         let cancel = self.session_work_cancel.child();
         let _cancel_guard = {
@@ -12088,7 +12106,13 @@ impl Driver {
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
-        self.refresh_redaction_table_for_turn(tx).await;
+        if let Err(_error) = self.refresh_redaction_table_for_turn(tx).await {
+            // Notice already published by the refresh. Settle this bound
+            // turn without a provider request: keeping the previous table
+            // would omit newly introduced or rotated secrets.
+            self.mark_bound_turn_refused(Self::redaction_refresh_idle_reason());
+            return Ok(());
+        }
         self.refresh_active_frame_for_turn(tx).await;
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,

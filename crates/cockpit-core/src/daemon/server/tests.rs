@@ -7045,13 +7045,12 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         [("PLANTED_API_KEY".to_string(), SECRET.to_string())],
     )
     .unwrap();
-    ctx.db
-        .set_session_redaction_table_json(
-            session.session_id,
-            Some(table.to_persisted_json().unwrap()),
-        )
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        session.session_id,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
     ctx.db
         .insert_session_event(
             session.session_id,
@@ -11076,6 +11075,14 @@ async fn remote_archive_stops_worker_before_committing_archive() {
 async fn fork_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
@@ -11218,6 +11225,14 @@ async fn discard_session_reused_operation_conflict_rejects_before_detach() {
 async fn create_btw_fork_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
@@ -15162,12 +15177,14 @@ async fn boot_ephemeral_sweep_continues_after_delete_failure() {
             let mut blocked =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/blocked", "Build")?;
             blocked.ephemeral = true;
-            let blocked = crate::db::Db::insert_session_row_conn(conn, &blocked)?;
+            let blocked =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &blocked)?;
 
             let mut removed =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/removed", "Build")?;
             removed.ephemeral = true;
-            let removed = crate::db::Db::insert_session_row_conn(conn, &removed)?;
+            let removed =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &removed)?;
             conn.execute(
                 "UPDATE sessions SET ephemeral = 1 WHERE session_id IN (?1, ?2)",
                 [
@@ -19073,7 +19090,7 @@ async fn authz_cross_session_paused_work_scenario(
                 &target_root_str,
                 "Build",
             )?;
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
         .unwrap();
@@ -34795,6 +34812,14 @@ async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
 
     let first = handle_request(
         Request::CreateBtwFork {
@@ -34926,11 +34951,14 @@ async fn btw_concurrent_with_parent_turn() {
     };
     assert_eq!(parent_submission.text, "parent work");
 
-    let created = ctx
-        .db
-        .create_btw_fork(parent_row.session_id, true)
-        .await
-        .unwrap();
+    let created = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        parent_row.session_id,
+        true,
+    )
+    .await
+    .unwrap();
     let btw_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),

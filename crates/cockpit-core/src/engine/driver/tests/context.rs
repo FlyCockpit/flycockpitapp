@@ -989,12 +989,16 @@ async fn ephemeral_session_writes_no_rows() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
     let (parent, _tmp) = test_driver_without_network(8);
-    let row = parent
-        .session
-        .db
-        .create_ephemeral_fork(parent.session.id, None)
-        .await
-        .unwrap();
+    let vault = crate::secure_key::vault_for_db(&parent.session.db).expect("test vault");
+    let row = crate::session::lifecycle::persist_fork_with_redaction_custody(
+        &parent.session.db,
+        &vault,
+        parent.session.id,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
     let session = Arc::new(
         Session::resume_for_test(
             parent.session.db.clone(),

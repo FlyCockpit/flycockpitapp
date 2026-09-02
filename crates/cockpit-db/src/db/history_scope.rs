@@ -109,34 +109,35 @@ impl Db {
         .await
     }
 
-    /// Fetch a target session's legacy redaction projection only when the
-    /// reader can access that session in this statement's consent snapshot.
-    /// The outer option distinguishes an inaccessible/nonexistent session
-    /// from an accessible session whose legacy projection is absent.
-    pub async fn session_redaction_table_json_for_reader_project(
+    /// Whether `session_id` is visible to `reader_project` in this statement's
+    /// consent snapshot. Callers then load the session's vault redaction table
+    /// only after this returns true.
+    pub async fn session_visible_to_reader_project(
         &self,
         reader_project: &str,
         session_id: Uuid,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<bool> {
         validate_project_id(reader_project)?;
         let reader_project = reader_project.to_string();
         self.read(move |conn| {
-            conn.query_row(
-                "SELECT s.redaction_table_json
-                   FROM sessions AS s
-                  WHERE s.session_id = ?1
-                    AND (s.project_id = ?2
-                         OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
-                                     WHERE reader.project_id = ?2
-                                       AND reader.outbound_enabled = 1)
-                             AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
-                                         WHERE target.project_id = s.project_id
-                                           AND target.inbound_enabled = 1)))",
-                params![session_id.to_string(), reader_project],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("reading consent-scoped session redaction projection")
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1
+                       FROM sessions AS s
+                      WHERE s.session_id = ?1
+                        AND (s.project_id = ?2
+                             OR (EXISTS (SELECT 1 FROM workspace_history_scopes AS reader
+                                         WHERE reader.project_id = ?2
+                                           AND reader.outbound_enabled = 1)
+                                 AND EXISTS (SELECT 1 FROM workspace_history_scopes AS target
+                                             WHERE target.project_id = s.project_id
+                                               AND target.inbound_enabled = 1)))",
+                    params![session_id.to_string(), reader_project],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading consent-scoped session visibility")?;
+            Ok(found.is_some())
         })
         .await
     }

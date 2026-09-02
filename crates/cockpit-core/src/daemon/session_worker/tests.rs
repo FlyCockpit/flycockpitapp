@@ -3790,6 +3790,240 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
         .unwrap();
 }
 
+#[test]
+fn persisted_redaction_load_error_fails_closed_instead_of_empty_table() {
+    const SECRET: &str = "spawn-persisted-secret-abcdef123456";
+    let live = Arc::new(RedactionTable::empty());
+    assert_eq!(
+        live.scrub(SECRET),
+        SECRET,
+        "live scan without the persisted table would leak"
+    );
+    let err =
+        adopt_persisted_redaction_table(Err(anyhow::anyhow!("database is locked")), live, true)
+            .expect_err("SQLite busy must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+}
+
+#[test]
+fn persisted_redaction_missing_item_fails_closed_for_durable_session() {
+    const SECRET: &str = "spawn-missing-vault-secret-abcdef123456";
+    let live = Arc::new(RedactionTable::empty());
+    assert_eq!(
+        live.scrub(SECRET),
+        SECRET,
+        "live scan without the persisted table would leak"
+    );
+    let err = adopt_persisted_redaction_table(Ok(None), live, true)
+        .expect_err("a durable session missing its vault item must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+    assert!(
+        crate::redact::RedactionTableUnavailable::in_chain(&err),
+        "missing table must be a typed redaction failure: {message}"
+    );
+}
+
+#[test]
+fn persisted_redaction_missing_item_is_first_custody_for_deferred_session() {
+    let live = Arc::new(
+        RedactionTable::empty()
+            .with_forced_literal("deferred-live-secret".to_string(), "test".to_string())
+            .unwrap(),
+    );
+    let adopted = adopt_persisted_redaction_table(Ok(None), live.clone(), false)
+        .expect("deferred sessions may establish first custody from the live scan");
+    assert_ne!(
+        adopted.scrub("deferred-live-secret"),
+        "deferred-live-secret"
+    );
+}
+
+#[tokio::test]
+async fn spawn_fails_closed_when_persisted_redaction_table_cannot_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(
+        Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    const SECRET: &str = "spawn-vault-busy-secret-xyz987654";
+    let persisted = RedactionTable::empty()
+        .with_forced_literal(SECRET.to_string(), "test".to_string())
+        .unwrap();
+    session.persist_redaction_table(&persisted).unwrap();
+    session.clear_cached_redaction_table_for_test();
+    crate::secure_key::tamper_item_ciphertext(
+        &db,
+        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+        &crate::secure_key::redaction_table_item_id(&session.id.to_string()),
+        |ciphertext| ciphertext[0] ^= 0xff,
+    )
+    .unwrap();
+
+    let live = Arc::new(RedactionTable::empty());
+    assert_eq!(live.scrub(SECRET), SECRET);
+    let providers = lmstudio_test_providers();
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+    let model =
+        Arc::new(crate::engine::model::Model::from_config(&providers, live.clone()).unwrap());
+    let trust_policy = trusted_test_policy(tmp.path());
+    let err = spawn(
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
+        Arc::new(LockManager::in_memory(db.clone())),
+        live,
+        model,
+        None,
+        None,
+        None,
+        tmp.path().to_path_buf(),
+        test_workspace_root_authority(tmp.path(), &trust_policy),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        None,
+        Arc::new(StdMutex::new(None)),
+        Arc::new(StdMutex::new(None)),
+        None,
+        trust_policy,
+        0,
+        None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
+    )
+    .err()
+    .expect("spawn must refuse to start with an unloadable redaction table");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted")
+            || message.contains("refusing to start session unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+}
+
+#[tokio::test]
+async fn spawn_fails_closed_when_persisted_redaction_table_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(
+        Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    const SECRET: &str = "spawn-vault-missing-secret-xyz987654";
+    let persisted = RedactionTable::empty()
+        .with_forced_literal(SECRET.to_string(), "test".to_string())
+        .unwrap();
+    session.persist_redaction_table(&persisted).unwrap();
+    session.clear_cached_redaction_table_for_test();
+    crate::secure_key::vault_for_db(&db)
+        .unwrap()
+        .delete_item(
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &crate::secure_key::redaction_table_item_id(&session.id.to_string()),
+        )
+        .unwrap();
+
+    let live = Arc::new(RedactionTable::empty());
+    assert_eq!(live.scrub(SECRET), SECRET);
+    let providers = lmstudio_test_providers();
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+    let model =
+        Arc::new(crate::engine::model::Model::from_config(&providers, live.clone()).unwrap());
+    let trust_policy = trusted_test_policy(tmp.path());
+    let err = spawn(
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
+        Arc::new(LockManager::in_memory(db.clone())),
+        live,
+        model,
+        None,
+        None,
+        None,
+        tmp.path().to_path_buf(),
+        test_workspace_root_authority(tmp.path(), &trust_policy),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        None,
+        Arc::new(StdMutex::new(None)),
+        Arc::new(StdMutex::new(None)),
+        None,
+        trust_policy,
+        0,
+        None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
+    )
+    .err()
+    .expect("spawn must refuse to start a durable session without redaction custody");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted")
+            || message.contains("refusing to start session unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+    session.clear_cached_redaction_table_for_test();
+    let still_missing = session
+        .persisted_redaction_table()
+        .expect_err("failed spawn must not replace a missing table with the live scan");
+    assert!(
+        crate::redact::RedactionTableUnavailable::in_chain(&still_missing),
+        "missing-table evidence must remain: {still_missing:#}"
+    );
+}
+
 /// An [`ExtendedConfig`] pinning `defaultPrimaryAgent` for fallback tests.
 fn cfg_with(
     default_primary: crate::config::extended::DefaultPrimaryAgent,

@@ -438,27 +438,44 @@ async fn refresh_redaction_for_turn(
                         // failure never leaves the live table advanced ahead of the
                         // durable one (a restart would then lose the accumulated
                         // entry). On failure keep the previously-committed table live
-                        // and surface the error.
+                        // and refuse this send: the turn-boundary scan did not
+                        // commit, so newly introduced or rotated secrets would be
+                        // omitted.
                         match session.persist_redaction_table(&unioned) {
                             Ok(()) => {
                                 set_current_redaction(accumulated_redact, unioned.clone());
-                                unioned
+                                Ok(unioned)
                             }
-                            Err(error) => {
-                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed; keeping previously committed redaction table live");
-                                base
-                            }
+                            Err(error) => Err(error),
                         }
                     }
                     Err(error) => {
                         // K6: never overwrite the committed table (which may hold a
                         // sealed literal adopted this turn) with a bare disk scan on
                         // a union error. Keep the committed `base` live and durable
-                        // and defer the disk delta to the next refresh, mirroring
-                        // `InterruptHub::refresh_union_redaction`'s union-error branch.
-                        tracing::warn!(error = %error, %session_id, "unioning redaction table failed; keeping committed redaction table live");
-                        base
+                        // and refuse this send rather than proceeding without the
+                        // turn-boundary scan.
+                        Err(error)
                     }
+                }
+            };
+            let table = match table {
+                Ok(table) => table,
+                Err(error) => {
+                    tracing::warn!(error = %error, %session_id, "refreshing redaction table failed; refusing to send unredacted");
+                    send_current_session_event(
+                        session,
+                        event_tx,
+                        accumulated_redact,
+                        proto::Event::Notice {
+                            session_id,
+                            text: format!(
+                                "Redaction refresh failed; refusing to send unredacted: {error:#}"
+                            ),
+                        },
+                        NoticeSource::DaemonDirect,
+                    );
+                    return false;
                 }
             };
             for path in table.unsupported_files() {
@@ -494,6 +511,17 @@ async fn refresh_redaction_for_turn(
         }
         Err(e) => {
             tracing::warn!(error = %e, "refreshing redaction table failed");
+            send_current_session_event(
+                session,
+                event_tx,
+                accumulated_redact,
+                proto::Event::Notice {
+                    session_id,
+                    text: format!("Redaction refresh failed; refusing to send unredacted: {e:#}"),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            return false;
         }
     }
     true

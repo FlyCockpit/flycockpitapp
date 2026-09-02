@@ -372,8 +372,7 @@ impl ReadPool {
                     match self.open_conn() {
                         Ok(conn) => return Ok(conn),
                         Err(e) => {
-                            self.total.fetch_sub(1, Ordering::SeqCst);
-                            self.available.notify_one();
+                            let _ = self.release_capacity_and_notify();
                             return Err(e);
                         }
                     }
@@ -399,6 +398,19 @@ impl ReadPool {
         Ok(())
     }
 
+    /// Decrement live-connection count and wake a waiter. Must hold `idle` across
+    /// the mutation and notify so a waiter cannot miss the signal between
+    /// predicate check and condvar wait.
+    fn release_capacity_and_notify(&self) -> Result<()> {
+        let _guard = self
+            .idle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
+        self.total.fetch_sub(1, Ordering::SeqCst);
+        self.available.notify_one();
+        Ok(())
+    }
+
     fn run<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
@@ -417,8 +429,7 @@ impl ReadPool {
             }
             Err(_) => {
                 drop(conn);
-                self.total.fetch_sub(1, Ordering::SeqCst);
-                self.available.notify_one();
+                let _ = self.release_capacity_and_notify();
                 Err(annotate_database_storage_failure(anyhow::anyhow!(
                     "db read job panicked"
                 )))
@@ -5154,6 +5165,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values, vec![1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn panicking_read_returns_error_and_pool_keeps_serving() {
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(Db::open(&tmp.path().join("read-panic.db")).unwrap());
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE after_read_panic (value INTEGER NOT NULL);")?;
+            conn.execute("INSERT INTO after_read_panic (value) VALUES (7)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let err = db
+            .read(|_conn| -> Result<i64> { panic!("intentional db read panic") })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("panicked"));
+
+        let num_readers = 8;
+        let mut handles = Vec::with_capacity(num_readers);
+        for _ in 0..num_readers {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                db.read(|conn| {
+                    Ok(conn.query_row("SELECT value FROM after_read_panic", [], |row| row.get(0))?)
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), 7);
+        }
     }
 
     #[tokio::test]

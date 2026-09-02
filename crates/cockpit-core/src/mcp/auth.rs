@@ -679,10 +679,9 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
 }
 
 pub(crate) fn oauth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::providers::provider_http::client_builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building MCP OAuth HTTP client")
 }

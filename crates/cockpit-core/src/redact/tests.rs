@@ -2603,7 +2603,8 @@ async fn untrusted_embedding_chokepoint_stays_generic_with_live_grant() {
         "text-embedding-3-small".into(),
         None,
         guard,
-    );
+    )
+    .unwrap();
     let _ = embedder.embed(&[sealed_literal, "clean text"]).await;
 
     // The captured wire body carries only the generic placeholder.

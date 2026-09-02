@@ -281,7 +281,8 @@ security-framework-sys = "=2.17.0"
 # Computer target identity — exact audited pins from computer-use-target-identity-and-denylist.
 mach2 = { version = "=0.6.0", default-features = false }
 block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace"] }
+# `libc` gates `NSRunningApplication::processIdentifier` (pid_t return).
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc", "NSRunningApplication", "NSWorkspace"] }
 objc2-application-services = { version = "=0.3.2", default-features = false, features = ["std", "AXError", "AXUIElement", "AXValue", "HIServices", "libc"] }
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"] }
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGSession", "CGWindow", "libc"] }

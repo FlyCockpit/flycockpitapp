@@ -1499,6 +1499,10 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       kind: z.literal("req"),
       id: requestIdSchema,
       operation: remoteOperationIdentityV1Schema.optional(),
+      // Daemon-private owner capability. Optional; required for `owner_only`
+      // RPCs on the Unix-socket path. Absent on in-process and remote
+      // connections. Mirrors Rust `Body::Request.owner_capability`.
+      owner_capability: z.string().optional(),
       ...variant.shape,
     })
     .strict(),

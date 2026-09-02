@@ -1448,6 +1448,14 @@ pub(super) async fn authorize_request(
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
     if principal.is_owner() {
+        // Issue #296: Owner-for-all is still assigned at the socket accept
+        // seam (follow-up #337). Secret-bearing rows additionally require
+        // the daemon-private capability a confined child cannot present.
+        if principal::request_requires_owner_capability(request) && !state.has_owner_capability {
+            return Err(authorization_error(
+                "request requires the daemon-private owner capability",
+            ));
+        }
         return Ok(());
     }
 
@@ -1552,6 +1560,11 @@ pub(super) async fn authorize_request_shared(
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &shared.principal;
     if principal.is_owner() {
+        if principal::request_requires_owner_capability(request) && !shared.has_owner_capability {
+            return Err(authorization_error(
+                "request requires the daemon-private owner capability",
+            ));
+        }
         return Ok(());
     }
 

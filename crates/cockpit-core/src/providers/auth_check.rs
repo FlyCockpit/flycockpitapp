@@ -173,7 +173,7 @@ async fn post_chat_completion_probe(
             format!("/{path}")
         }
     );
-    let client = reqwest::Client::builder()
+    let client = crate::providers::provider_http::client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| AuthCheckError::Other(error.to_string()))?;
@@ -594,5 +594,44 @@ mod tests {
         assert!(req.contains("Hermes-4.3-36B"));
         assert!(req.contains("\"max_tokens\":1") || req.contains("\"max_tokens\": 1"));
         assert!(req.contains("\"stream\":false") || req.contains("\"stream\": false"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_probe_rejects_redirect_without_replaying_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://credential-leak.invalid/chat/completions\r\n",
+                "Content-Length: 0\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            request
+        });
+
+        let template = z_ai_template();
+        let entry = test_entry(format!("http://{addr}/v1"));
+        let result = check_provider_auth("z-ai", &entry, &template, Duration::from_secs(2)).await;
+        let Err(AuthCheckError::Other(message)) = result else {
+            panic!("redirected auth check must fail closed: {result:?}");
+        };
+        assert!(message.contains("302"), "{message}");
+        let captured = handle.await.expect("request captured");
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("authorization: bearer"),
+            "{captured}"
+        );
     }
 }

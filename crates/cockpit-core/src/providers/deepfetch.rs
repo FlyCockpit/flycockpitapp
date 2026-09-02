@@ -330,9 +330,7 @@ async fn send_probe(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<ProbeRawOutcome> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
+    let client = crate::providers::provider_http::build_with_timeout(timeout)
         .context("building deepfetch HTTP client")?;
     let url = match endpoint {
         ProbeEndpoint::Completions => {
@@ -370,9 +368,7 @@ async fn send_probe_once(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<ProbeRawOutcome> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
+    let client = crate::providers::provider_http::build_with_timeout(timeout)
         .context("building deepfetch HTTP client")?;
     let url = match endpoint {
         ProbeEndpoint::Completions => {
@@ -1648,5 +1644,69 @@ mod tests {
         assert_eq!(completed.capabilities.context_tokens, Some(64000));
         let cancelled = &cfg.providers["p"].models[1];
         assert_eq!(cancelled.capabilities.context_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn deepfetch_probe_rejects_redirect_without_replaying_credentials() {
+        use std::collections::BTreeMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind deepfetch redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0_u8; 4096];
+            let read = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://credential-leak.invalid/chat/completions\r\n",
+                "Content-Length: 0\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+            request
+        });
+
+        let mut resolved = BTreeMap::new();
+        resolved.insert(
+            "p".into(),
+            ResolvedRequest {
+                base_url: format!("http://{addr}/v1"),
+                headers: vec![ResolvedHeader {
+                    name: "x-api-key".into(),
+                    value: "leaked-secret".into(),
+                }],
+                is_codex_credential: false,
+            },
+        );
+        let mut client = HttpDeepfetchProbeClient::new(resolved, Duration::from_secs(2));
+        let outcome = client
+            .probe_endpoint(EndpointProbeRequest {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                endpoint: ProbeEndpoint::Completions,
+            })
+            .await
+            .expect("probe dispatch");
+        assert!(
+            matches!(
+                outcome,
+                ProbeRawOutcome::HttpError(ProbeHttpError { status: 302, .. })
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        let captured = handle.await.expect("server task");
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("x-api-key: leaked-secret"),
+            "{captured}"
+        );
     }
 }

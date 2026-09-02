@@ -772,10 +772,13 @@ fn global_extended_config_path() -> Result<std::path::PathBuf> {
     crate::config::dirs::global_config_file()
 }
 
-/// Handle the session worker keeps to cancel the in-flight user-message
-/// run on a ctrl+c (`SessionWork::Cancel`). Shares the driver's
-/// `cancel_current` slot; cancelling the live token aborts the in-flight
-/// inference and signals any foreground `bash` subprocess to die. Adopted
+/// Handle the session worker keeps to cancel in-flight work.
+///
+/// Shares the driver's `cancel_current` slot (the live foreground turn)
+/// and the session-wide [`crate::engine::schedule::SessionWorkCancel`] root
+/// (scheduled loops, swarm children, background shells, background
+/// delegates). Cancelling the live turn token aborts in-flight inference
+/// and signals any foreground `bash` subprocess to die. Adopted
 /// subprocesses live in the session registry and are cancelled alongside this
 /// handle by the worker. Idempotent and safe at idle — when no run is in flight
 /// the slot is `None` and [`Self::cancel_turn`] is a no-op.
@@ -785,6 +788,7 @@ pub struct CancelHandle {
     /// The shared token is also used by deadlines and terminal invocation
     /// state.  This bit is set only by an interactive CancelTurn.
     user_requested: Arc<std::sync::atomic::AtomicBool>,
+    session_work: crate::engine::schedule::SessionWorkCancel,
 }
 
 impl CancelHandle {
@@ -794,7 +798,8 @@ impl CancelHandle {
     ///
     /// This is intentionally distinct from a lifecycle, deadline, or
     /// `CancelAllSessionWork` cancellation: only an explicit user turn cancel
-    /// can retract the just-recorded message.
+    /// can retract the just-recorded message. Session-owned loops, swarm
+    /// children, background shells, and background delegates keep running.
     pub fn cancel_turn(&self) {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             self.user_requested
@@ -808,6 +813,19 @@ impl CancelHandle {
         if let Some(token) = crate::sync::lock_or_recover(&self.current).as_ref() {
             token.cancel();
         }
+    }
+
+    /// Stop-all: cancel the live turn slot, then every descendant of the
+    /// session-work root (scheduled loops, swarm children, background shells,
+    /// background delegates), and rotate the root so later work is not
+    /// pre-cancelled. The live slot is cancelled *before* rotate so a run
+    /// that installs a fresh-root child into the slot cannot be killed by a
+    /// trailing `cancel_noninteractive`. Returns the generation that Stop
+    /// cancelled; a later `ScheduleCommand::CancelAll` must carry that
+    /// generation so it cannot sweep work admitted after the rotate.
+    pub fn cancel_all_session_work(&self) -> u64 {
+        self.cancel_noninteractive();
+        self.session_work.cancel_and_rotate()
     }
 }
 
@@ -1350,15 +1368,19 @@ pub struct Driver {
     /// success reason for a turn that never completed (#275).
     current_lifecycle_turn_completed: bool,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
-    /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
-    /// [`CancellationToken`] here at the start of each run and clears it on
-    /// exit; the session worker holds a clone of the `Arc` so a
+    /// `CancelTurn`, GOALS §3a). `run_user_input` installs a *child* of
+    /// [`Self::session_work_cancel`] here at the start of each run and clears
+    /// it on exit; the session worker holds a clone of the `Arc` so a
     /// `SessionWork::Cancel` can read the live token and fire it. `None`
     /// when idle — cancelling then is a safe no-op. Threaded into every
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
     user_cancel_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Session-wide cancellation root. Survives turn boundaries so Stop
+    /// (`CancelAllSessionWork`) can abort scheduled loops, swarm children,
+    /// background shells, and background delegates even when idle.
+    session_work_cancel: crate::engine::schedule::SessionWorkCancel,
     /// Session-owned waiters for backgroundable tools that have yielded their
     /// foreground turn. Unlike `cancel_current`, this registry survives turn
     /// boundaries and is drained by the session worker.
@@ -2242,6 +2264,7 @@ impl Driver {
             tx.clone(),
             ctx,
             crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES,
+            self.session_work_cancel.clone(),
         );
         Self {
             session: self.session.clone(),
@@ -2358,6 +2381,7 @@ impl Driver {
             current_lifecycle_turn_completed: false,
             cancel_current: self.cancel_current.clone(),
             user_cancel_requested: self.user_cancel_requested.clone(),
+            session_work_cancel: self.session_work_cancel.clone(),
             adopted_processes: self.adopted_processes.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
@@ -2623,12 +2647,14 @@ impl Driver {
         // rebinds it via [`ScheduleAuthority::set_turn_tx`] before any job can
         // start, so no UI signal is ever lost.
         let (dummy_tx, _dummy_rx) = mpsc::channel::<TurnEvent>(1);
+        let session_work_cancel = crate::engine::schedule::SessionWorkCancel::new();
         let schedule = ScheduleAuthority::new(
             job_event_tx,
             job_cmd_tx,
             dummy_tx,
             ctx,
             max_concurrent_schedules,
+            session_work_cancel.clone(),
         );
         let initial_tools = root.tools.clone();
         if publish_active_tools {
@@ -2731,6 +2757,7 @@ impl Driver {
             current_lifecycle_turn_completed: false,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             user_cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_work_cancel,
             adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
             approver: None,
             lsp: None,
@@ -3956,6 +3983,31 @@ impl Driver {
         self.schedule.command_sender()
     }
 
+    /// Drain a schedule command from the worker (or an in-task timer).
+    /// `CancelAll` also aborts background-delegate join handles of that
+    /// generation: token fire is cooperative, and Stop must halt inference
+    /// that has not yet polled its token.
+    fn handle_schedule_command(&mut self, cmd: ScheduleCommand) {
+        let stop_generation = match &cmd {
+            ScheduleCommand::CancelAll { through_generation } => Some(*through_generation),
+            _ => None,
+        };
+        self.schedule.handle_command(cmd);
+        if let Some(through_generation) = stop_generation {
+            self.abort_noninteractive_jobs_through(through_generation);
+        }
+    }
+
+    /// Apply the job-lifecycle half of Stop: authority registry sweep plus
+    /// background-delegate abort, filtered by the generation captured at
+    /// rotate. Tests that cannot go through the worker command channel use
+    /// this so they exercise the same pair the driver main loop runs.
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn apply_session_work_stop(&mut self, through_generation: u64) {
+        self.schedule.cancel_all_through(through_generation);
+        self.abort_noninteractive_jobs_through(through_generation);
+    }
+
     /// Attach the worker's one durable root identity before the first driver
     /// turn.  Child IDs are attached at the task-delegation creation boundary.
     pub fn set_root_agent_instance_id(&mut self, agent_instance_id: uuid::Uuid) {
@@ -4458,7 +4510,18 @@ impl Driver {
         CancelHandle {
             current: self.cancel_current.clone(),
             user_requested: self.user_cancel_requested.clone(),
+            session_work: self.session_work_cancel.clone(),
         }
+    }
+
+    /// The live turn token when a run is in flight, otherwise a fresh child
+    /// of the session-work root. Callers that must abort on Stop even at
+    /// idle (parked-tool replay, keep-alive inference) use this instead of
+    /// a never-cancelled default.
+    fn live_or_session_cancel(&self) -> tokio_util::sync::CancellationToken {
+        crate::sync::lock_or_recover(&self.cancel_current)
+            .clone()
+            .unwrap_or_else(|| self.session_work_cancel.child())
     }
 
     /// Bind an accepted late-steer receipt to the exact frame immediately
@@ -4609,7 +4672,7 @@ impl Driver {
             cwd: self.cwd.clone(),
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel: self.live_or_session_cancel(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             image_generation_dispatch: self.session.image_generation_dispatch(),
@@ -4897,7 +4960,7 @@ impl Driver {
             return Err(error);
         }
         self.refresh_active_frame_for_turn(tx).await;
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = self.session_work_cancel.child();
         let _cancel_guard = {
             self.user_cancel_requested
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -5752,7 +5815,7 @@ impl Driver {
                 cmd = self.job_cmd_rx.recv() => {
                     goal_watchdog = None;
                     if let Some(cmd) = cmd {
-                        self.schedule.handle_command(cmd);
+                        self.handle_schedule_command(cmd);
                         continue;
                     } else {
                         break;
@@ -6350,12 +6413,7 @@ impl Driver {
                     // what makes this a genuine warm-parent route. The packet
                     // remains redacted and the resolver owns no tools.
                     Some((model, params, system, mut history, agent_name)) => {
-                        let cancel = self
-                            .cancel_current
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone()
-                            .unwrap_or_default();
+                        let cancel = self.live_or_session_cancel();
                         crate::engine::write_edit_arg_elision::reconcile_deferred_signed_turns_and_elide(
                             &self.session,
                             &agent_name,
@@ -10724,14 +10782,10 @@ impl Driver {
         // frame's own history is never touched until we resolve.
         let agent = self.stack.last().expect("stack never empty").agent.clone();
         let strategy = tracker.strategy();
-        // Reuse the run-scoped cancel so a user ctrl+c aborts a `compact`
-        // shrink's model call too — never a parallel cancel.
-        let cancel = self
-            .cancel_current
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
+        // Reuse the run-scoped cancel so a user ctrl+c or Stop aborts a
+        // `compact` shrink's model call too — never a parallel cancel. At
+        // idle the session-work child still observes Stop.
+        let cancel = self.live_or_session_cancel();
 
         let delay = match timing {
             ShrinkTiming::Eager => std::time::Duration::ZERO,
@@ -12136,12 +12190,14 @@ impl Driver {
         } else {
             None
         };
-        // Install a fresh cancellation token for this run so a user ctrl+c
+        // Install a child of the session-work root so a user ctrl+c
         // (`SessionWork::Cancel` → `CancelHandle::cancel_turn`) can abort the
-        // in-flight inference and kill any running `bash` subprocess. The
-        // guard clears the slot on every exit path (normal, cancel, error)
+        // in-flight inference and kill any running `bash` subprocess, while
+        // Stop (`CancelAllSessionWork`) still reaches this turn after the
+        // slot is cleared because background delegates cloned this child.
+        // The guard clears the slot on every exit path (normal, cancel, error)
         // so a stale token can never affect a later run.
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = self.session_work_cancel.child();
         let _cancel_guard = {
             self.user_cancel_requested
                 .store(false, std::sync::atomic::Ordering::Release);

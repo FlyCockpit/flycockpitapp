@@ -34,7 +34,8 @@ impl FirstPartyEgressClient {
         Ok(Some(Self {
             db,
             credential,
-            http: reqwest::Client::new(),
+            http: crate::providers::provider_http::build()
+                .context("building first-party egress HTTP client")?,
             server_url,
         }))
     }

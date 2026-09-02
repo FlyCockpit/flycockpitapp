@@ -155,9 +155,10 @@ struct StagedTransfer {
     /// staging intentionally has no attached-session owner because those
     /// transfer classes have separate authorization/consumption boundaries.
     owner: Option<BulkTransferOwner>,
-    /// Client charged for this reservation. Daemon-produced exports are
-    /// `None` and count only against the global budget.
-    quota: Option<ClientQuotaKey>,
+    /// Client charged for this reservation. Every request-triggered insert
+    /// (peer `write_chunk` and daemon-produced `stage`/`stage_owned`) carries
+    /// a principal so one peer cannot squat the global budget.
+    quota: ClientQuotaKey,
 }
 
 /// Storage identity for a staged transfer. Opaque ingress deliberately carries
@@ -215,7 +216,7 @@ impl Store {
         let mut bytes = 0u64;
         let mut count = 0usize;
         for transfer in self.transfers.values() {
-            if transfer.quota.as_ref() == Some(quota) {
+            if transfer.quota == *quota {
                 bytes = bytes.saturating_add(transfer.total_length);
                 count += 1;
             }
@@ -226,7 +227,7 @@ impl Store {
     fn can_reserve(
         &self,
         total_length: u64,
-        quota: Option<&ClientQuotaKey>,
+        quota: &ClientQuotaKey,
     ) -> Result<(), BulkStagingError> {
         if self.transfers.len() >= MAX_STAGED_TRANSFERS {
             return Err(BulkStagingError::CapacityExceeded);
@@ -234,9 +235,6 @@ impl Store {
         if self.staged_bytes + total_length > MAX_STAGED_BYTES {
             return Err(BulkStagingError::CapacityExceeded);
         }
-        let Some(quota) = quota else {
-            return Ok(());
-        };
         let (bytes, count) = self.client_reserved(quota);
         if count >= MAX_STAGED_TRANSFERS_PER_CLIENT {
             return Err(BulkStagingError::CapacityExceeded);
@@ -335,30 +333,38 @@ pub fn chunk_count(total_length: u64) -> u32 {
 /// Stage daemon-produced non-opaque bytes (export/archive) and return their
 /// reference.
 ///
-/// Opaque user-message bytes must use [`stage_owned`]. An opaque transfer id
-/// is a locator, not a bearer credential, so the low-level store must not
-/// retain an ownerless opaque entry that another attached client could later
-/// consume by guessing its id.
+/// `quota` is the requesting principal: request-triggered staging is charged
+/// the same way as a peer `write_chunk`, so an abandoned export cannot occupy
+/// the whole store. Opaque user-message bytes must use [`stage_owned`]. An
+/// opaque transfer id is a locator, not a bearer credential, so the low-level
+/// store must not retain an ownerless opaque entry that another attached
+/// client could later consume by guessing its id.
 pub fn stage(
     bytes: &[u8],
     mime_class: RemoteBulkMimeClass,
     transfer_id_bytes: [u8; 16],
+    quota: &ClientQuotaKey,
 ) -> Result<RemoteBulkTransferRef, BulkStagingError> {
-    stage_with_owner(bytes, mime_class, transfer_id_bytes, None)
+    stage_with_owner(bytes, mime_class, transfer_id_bytes, None, quota)
 }
 
 /// Stage a complete opaque user-message body under its exact attached
 /// session/authenticated-actor owner.
+///
+/// `quota` is the per-peer staging identity, not the owner binding: one
+/// principal attached to many sessions still shares one budget.
 pub fn stage_owned(
     bytes: &[u8],
     owner: &BulkTransferOwner,
     transfer_id_bytes: [u8; 16],
+    quota: &ClientQuotaKey,
 ) -> Result<RemoteBulkTransferRef, BulkStagingError> {
     stage_with_owner(
         bytes,
         RemoteBulkMimeClass::Opaque,
         transfer_id_bytes,
         Some(owner),
+        quota,
     )
 }
 
@@ -367,6 +373,7 @@ fn stage_with_owner(
     mime_class: RemoteBulkMimeClass,
     transfer_id_bytes: [u8; 16],
     owner: Option<&BulkTransferOwner>,
+    quota: &ClientQuotaKey,
 ) -> Result<RemoteBulkTransferRef, BulkStagingError> {
     match (mime_class, owner) {
         (RemoteBulkMimeClass::Opaque, None) => return Err(BulkStagingError::OwnerMismatch),
@@ -389,7 +396,7 @@ fn stage_with_owner(
     if guard.transfers.contains_key(&key) {
         return Err(BulkStagingError::DuplicateTransfer);
     }
-    guard.can_reserve(total_length, None)?;
+    guard.can_reserve(total_length, quota)?;
     guard.staged_bytes += total_length;
     guard.transfers.insert(
         key,
@@ -405,7 +412,7 @@ fn stage_with_owner(
             complete: true,
             created_ms: now,
             owner: owner.cloned(),
-            quota: None,
+            quota: *quota,
         },
     );
     drop(guard);
@@ -432,7 +439,7 @@ pub fn write_chunk(
     chunk: &[u8],
     quota: &ClientQuotaKey,
 ) -> Result<ChunkAccepted, BulkStagingError> {
-    write_chunk_with_owner(reference, None, Some(quota), chunk_index, chunk)
+    write_chunk_with_owner(reference, None, quota, chunk_index, chunk)
 }
 
 /// Accept an opaque user-message chunk under its attached-session/actor owner.
@@ -446,13 +453,13 @@ pub fn write_chunk_owned(
     chunk_index: u32,
     chunk: &[u8],
 ) -> Result<ChunkAccepted, BulkStagingError> {
-    write_chunk_with_owner(reference, Some(owner), Some(quota), chunk_index, chunk)
+    write_chunk_with_owner(reference, Some(owner), quota, chunk_index, chunk)
 }
 
 fn write_chunk_with_owner(
     reference: &RemoteBulkTransferRef,
     owner: Option<&BulkTransferOwner>,
-    quota: Option<&ClientQuotaKey>,
+    quota: &ClientQuotaKey,
     chunk_index: u32,
     chunk: &[u8],
 ) -> Result<ChunkAccepted, BulkStagingError> {
@@ -495,7 +502,7 @@ fn write_chunk_with_owner(
                 complete: false,
                 created_ms: now,
                 owner: owner.cloned(),
-                quota: quota.copied(),
+                quota: *quota,
             },
         );
     }
@@ -862,7 +869,7 @@ mod tests {
         let owner = BulkTransferOwner::for_attached_identity(Uuid::from_u128(4), b"actor-a");
 
         assert!(matches!(
-            stage(payload, RemoteBulkMimeClass::Opaque, id(213)),
+            stage(payload, RemoteBulkMimeClass::Opaque, id(213), &quota()),
             Err(BulkStagingError::OwnerMismatch)
         ));
         assert!(matches!(
@@ -904,7 +911,7 @@ mod tests {
         let payload: Vec<u8> = (0..(STAGED_CHUNK_BYTES * 2 + 17))
             .map(|i| (i % 251) as u8)
             .collect();
-        let reference = stage(&payload, RemoteBulkMimeClass::Export, id(1)).unwrap();
+        let reference = stage(&payload, RemoteBulkMimeClass::Export, id(1), &quota()).unwrap();
         assert_eq!(reference.total_length_value(), payload.len() as u64);
 
         let before = staged_bytes();
@@ -938,8 +945,8 @@ mod tests {
     #[test]
     fn bulk_staging_take_all_keeps_sibling_references_retryable() {
         let owner = BulkTransferOwner::for_attached_identity(Uuid::from_u128(5), b"actor-a");
-        let source = stage_owned(b"source", &owner, id(110)).unwrap();
-        let missing = stage_owned(b"display", &owner, id(111)).unwrap();
+        let source = stage_owned(b"source", &owner, id(110), &quota()).unwrap();
+        let missing = stage_owned(b"display", &owner, id(111), &quota()).unwrap();
         discard_owned(id(111), &owner);
 
         assert!(matches!(
@@ -952,8 +959,8 @@ mod tests {
             "a missing display sibling must not consume the source"
         );
 
-        let source = stage_owned(b"source", &owner, id(112)).unwrap();
-        let display = stage_owned(b"display", &owner, id(113)).unwrap();
+        let source = stage_owned(b"source", &owner, id(112), &quota()).unwrap();
+        let display = stage_owned(b"display", &owner, id(113), &quota()).unwrap();
         assert_eq!(
             take_all_owned(&[&source, &display], &owner).unwrap(),
             vec![b"source".to_vec(), b"display".to_vec()],
@@ -973,11 +980,17 @@ mod tests {
         let redacted = b"redacted export payload".to_vec();
         let raw = b"RAW SECRET payload sk-XXXX".to_vec();
         let key = id(70);
-        stage(&redacted, RemoteBulkMimeClass::RedactedExport, key).unwrap();
+        stage(
+            &redacted,
+            RemoteBulkMimeClass::RedactedExport,
+            key,
+            &quota(),
+        )
+        .unwrap();
 
         // Restaging the same id to raw is rejected, not silently applied.
         assert!(matches!(
-            stage(&raw, RemoteBulkMimeClass::Export, key),
+            stage(&raw, RemoteBulkMimeClass::Export, key, &quota()),
             Err(BulkStagingError::DuplicateTransfer)
         ));
 
@@ -990,7 +1003,7 @@ mod tests {
 
         // A raw-kinded read of a redacted id is refused (and vice versa).
         let other = id(71);
-        stage(&raw, RemoteBulkMimeClass::Export, other).unwrap();
+        stage(&raw, RemoteBulkMimeClass::Export, other, &quota()).unwrap();
         assert!(matches!(
             read_chunk_of_kind(other, 0, RemoteBulkMimeClass::RedactedExport),
             Err(BulkStagingError::WrongKind)
@@ -1008,7 +1021,7 @@ mod tests {
         let baseline = staged_bytes();
         for round in 0..4u8 {
             let key = id(40 + round);
-            stage(&payload, RemoteBulkMimeClass::Export, key).unwrap();
+            stage(&payload, RemoteBulkMimeClass::Export, key, &quota()).unwrap();
             assert!(staged_bytes() > baseline);
             let total = chunk_count(payload.len() as u64);
             for index in 0..total {
@@ -1261,6 +1274,81 @@ mod tests {
             "owner binding is authorization, not a second quota identity"
         );
         discard(id(91));
+    }
+
+    #[test]
+    fn request_triggered_stage_charges_the_same_principal_quota_as_writes() {
+        struct DrainOnDrop {
+            ids: Vec<[u8; 16]>,
+        }
+        impl Drop for DrainOnDrop {
+            fn drop(&mut self) {
+                for id in &self.ids {
+                    discard(*id);
+                }
+            }
+        }
+
+        let client = ClientQuotaKey::for_test(31);
+        let other = ClientQuotaKey::for_test(32);
+        let mut drain = DrainOnDrop { ids: Vec::new() };
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(140)).unwrap();
+        let reserved = RemoteBulkTransferRef::new(
+            transfer_id,
+            MAX_STAGED_BYTES_PER_CLIENT,
+            digest_of(&[]),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+        write_chunk(&reserved, 0, &[], &client).unwrap();
+        drain.ids.push(id(140));
+
+        assert!(
+            matches!(
+                stage(b"x", RemoteBulkMimeClass::Export, id(141), &client),
+                Err(BulkStagingError::CapacityExceeded)
+            ),
+            "daemon-produced staging must not bypass the writer's per-client cap"
+        );
+        stage(b"x", RemoteBulkMimeClass::Export, id(142), &other).unwrap();
+        drain.ids.push(id(142));
+    }
+
+    #[test]
+    fn request_triggered_stage_enforces_per_client_entry_quota() {
+        struct DrainOnDrop {
+            ids: Vec<[u8; 16]>,
+        }
+        impl Drop for DrainOnDrop {
+            fn drop(&mut self) {
+                for id in &self.ids {
+                    discard(*id);
+                }
+            }
+        }
+
+        let client = ClientQuotaKey::for_test(33);
+        let other = ClientQuotaKey::for_test(34);
+        let mut drain = DrainOnDrop { ids: Vec::new() };
+        for nth in 0..MAX_STAGED_TRANSFERS_PER_CLIENT {
+            let mut raw = [0u8; 16];
+            raw[0] = 0xD0;
+            raw[1..9].copy_from_slice(&(nth as u64).to_be_bytes());
+            stage(b"e", RemoteBulkMimeClass::Export, raw, &client).unwrap();
+            drain.ids.push(raw);
+        }
+        let mut extra = [0u8; 16];
+        extra[0] = 0xD1;
+        extra[15] = 1;
+        assert!(
+            matches!(
+                stage(b"e", RemoteBulkMimeClass::Export, extra, &client),
+                Err(BulkStagingError::CapacityExceeded)
+            ),
+            "one principal must not fill the global entry cap via abandoned exports"
+        );
+        stage(b"e", RemoteBulkMimeClass::Export, extra, &other).unwrap();
+        drain.ids.push(extra);
     }
 
     /// A transfer that goes quiet for a long — but sub-deadline — interval must

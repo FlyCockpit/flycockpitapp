@@ -1680,22 +1680,34 @@ fn load_indexed_paths(conn: &Connection, root_key: &str) -> Result<HashSet<Strin
     Ok(rows)
 }
 
+fn large_file_stub(f: &DiskFile) -> ParsedFile {
+    ParsedFile {
+        rel: f.rel.clone(),
+        language: f.language,
+        mtime_ns: f.mtime_ns,
+        size: f.size,
+        lines: None,
+        content_hash: String::new(),
+        extraction: Extraction::default(),
+    }
+}
+
 /// Read + parse one file off the executor (rayon worker). Returns
 /// `Ok(None)` for binary files (skipped). Large files are still recorded
 /// (`tree` visibility) but parsed to an empty extraction.
 fn parse_one(f: &DiskFile) -> Result<Option<ParsedFile>> {
     if f.size as u64 >= LARGE_FILE_BYTES {
-        return Ok(Some(ParsedFile {
-            rel: f.rel.clone(),
-            language: f.language,
-            mtime_ns: f.mtime_ns,
-            size: f.size,
-            lines: None,
-            content_hash: String::new(),
-            extraction: Extraction::default(),
-        }));
+        return Ok(Some(large_file_stub(f)));
     }
-    let bytes = std::fs::read(&f.abs).with_context(|| format!("reading {}", f.abs.display()))?;
+    let bytes = match cockpit_host::bounded::read_at_most(&f.abs, LARGE_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(cockpit_host::bounded::BoundedIoError::Limit { .. }) => {
+            return Ok(Some(large_file_stub(f)));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error).context(format!("reading {}", f.abs.display())));
+        }
+    };
     // Binary files: skip entirely (no index row) — `tree` reads the FS
     // for those via the same gitignore walk in the tool, and `read`
     // already detects binaries.
@@ -1879,7 +1891,8 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 fn hash_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
+    let bytes = cockpit_host::bounded::read_at_most(path, LARGE_FILE_BYTES)
+        .with_context(|| format!("hashing {}", path.display()))?;
     Ok(hash_bytes(&bytes))
 }
 
@@ -1986,6 +1999,42 @@ mod tests {
         assert!(parsed.extraction.imports.is_empty());
         assert!(parsed.extraction.identifiers.is_empty());
         assert!(parsed.extraction.callsites.is_empty());
+    }
+
+    #[test]
+    fn parse_one_treats_a_grown_file_as_large_without_loading_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("grown.rs");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(LARGE_FILE_BYTES + 1)
+            .unwrap();
+        let file = DiskFile {
+            rel: "grown.rs".to_string(),
+            language: Language::Rust,
+            mtime_ns: 0,
+            size: 16,
+            abs: path,
+        };
+        let parsed = parse_one(&file).unwrap().unwrap();
+        assert!(parsed.lines.is_none());
+        assert!(parsed.content_hash.is_empty());
+        assert!(parsed.extraction.symbols.is_empty());
+    }
+
+    #[test]
+    fn hash_file_rejects_a_file_over_the_parse_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.rs");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(LARGE_FILE_BYTES + 1)
+            .unwrap();
+        let error = hash_file(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("byte limit") || error.contains("hashing"),
+            "{error}"
+        );
     }
 
     #[test]

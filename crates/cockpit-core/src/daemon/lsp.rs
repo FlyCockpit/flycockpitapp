@@ -231,7 +231,7 @@ impl LspManager {
         let Some(client) = self.client_for_file(&operation, cwd, file, config).await else {
             return String::new();
         };
-        let text = match tokio::fs::read_to_string(file).await {
+        let text = match read_file_for_diagnostics(file) {
             Ok(t) => t,
             Err(e) => {
                 debug!("lsp read after write skipped for {}: {e}", file.display());
@@ -1174,6 +1174,14 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
         || right.starts_with(left)
 }
 
+/// Snapshot the file for an LSP `textDocument/didOpen`/`didChange` after a
+/// write. Caps during the read so a concurrently grown file cannot OOM the
+/// daemon; non-UTF-8 bodies are skipped the same way `read_to_string` was.
+fn read_file_for_diagnostics(file: &Path) -> Result<String> {
+    let bytes = crate::resource_limits::read_for_tool(file)?;
+    String::from_utf8(bytes).context("LSP document is not valid UTF-8")
+}
+
 async fn read_lsp_message<R>(reader: &mut R) -> Result<Value>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -1779,6 +1787,31 @@ mod tests {
         let cfg = crate::config::extended::LspConfig::default();
         assert_eq!(cfg.idle_ttl_secs, 30 * 60);
         assert_eq!(cfg.max_cached_clients, 16);
+    }
+
+    #[test]
+    fn diagnostics_read_rejects_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("over.rs");
+        let file = std::fs::File::create(&path).unwrap();
+        let over = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1;
+        file.set_len(over).unwrap();
+        drop(file);
+        let err = read_file_for_diagnostics(&path).expect_err("over-cap document must not load");
+        let text = err.to_string();
+        assert!(text.contains("file"), "{text}");
+        assert!(text.contains(&over.to_string()), "{text}");
+    }
+
+    #[test]
+    fn diagnostics_read_accepts_a_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        assert_eq!(
+            read_file_for_diagnostics(&path).expect("in-cap document"),
+            "fn main() {}\n"
+        );
     }
 
     #[tokio::test]

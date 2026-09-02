@@ -679,15 +679,25 @@ fn try_inline(
         };
     }
 
-    let bytes = match std::fs::read(&resolved) {
+    // Assembly with no range never inlines the body; skip the snapshot read
+    // so a huge project file cannot OOM the daemon on a lazy @-reference.
+    if range.is_none() && matches!(mode, ExpansionMode::Assembly) {
+        return lazy_reference("read", path_part, raw, "file reference");
+    }
+
+    let bytes = match crate::resource_limits::read_for_tool(&resolved) {
         Ok(b) => b,
         Err(e) => {
+            let detail = match e {
+                crate::resource_limits::ResourceLimitError::ByteLimit { .. } => "too large",
+                _ => "unreadable",
+            };
             return skip(
                 "read",
                 path_part,
                 raw,
                 format!("could not be inlined: {e}"),
-                "unreadable",
+                detail,
             );
         }
     };
@@ -707,9 +717,6 @@ fn try_inline(
     // context bloat the token economy avoids (GOALS §1e / §10). A tag
     // with an explicit range is always inlined (the slice is bounded).
     if range.is_none() {
-        if matches!(mode, ExpansionMode::Assembly) {
-            return lazy_reference("read", path_part, raw, "file reference");
-        }
         let line_count = text.lines().count();
         if line_count > caps.max_lines || bytes.len() > caps.max_bytes {
             let note = format!(
@@ -1034,6 +1041,40 @@ mod tests {
             too_many_bytes.wire
         );
         assert!(!too_many_bytes.expansions[0].ok);
+    }
+
+    #[test]
+    fn composer_inline_rejects_a_file_over_the_snapshot_read_cap() {
+        let root = tmp_root();
+        let path = root.path().join("huge.txt");
+        let file = fs::File::create(&path).unwrap();
+        let over = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1;
+        file.set_len(over).unwrap();
+        drop(file);
+        let res = expand_with("@huge.txt", root.path());
+        assert!(
+            !res.wire.contains("<file"),
+            "over-cap snapshot must not be inlined: {}",
+            res.wire
+        );
+        assert!(res.wire.contains("could not be inlined"), "{}", res.wire);
+        assert_eq!(res.expansions[0].detail, "too large");
+        assert!(!res.expansions[0].ok);
+    }
+
+    #[test]
+    fn assembly_mode_leaves_an_oversized_file_as_a_reference_without_loading() {
+        let root = tmp_root();
+        let path = root.path().join("huge.txt");
+        let file = fs::File::create(&path).unwrap();
+        let over = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1;
+        file.set_len(over).unwrap();
+        drop(file);
+        let policy = policy_for(root.path());
+        let res = expand_assembly_tags_with_policy("@huge.txt", &policy);
+        assert_eq!(res.wire, "@huge.txt");
+        assert_eq!(res.expansions[0].detail, "file reference");
+        assert!(!res.expansions[0].ok);
     }
 
     #[test]

@@ -6946,6 +6946,7 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
         b"raw archive with s3cr3t",
         proto::bulk_transfer::BulkMimeClass::Export,
         raw_id,
+        &crate::resource_limits::ClientQuotaKey::for_test(1),
     )
     .expect("stage raw export");
 
@@ -7005,6 +7006,7 @@ async fn redacted_export_reader_rejects_non_export_transfer() {
         b"PK\x03\x04 import archive",
         proto::bulk_transfer::BulkMimeClass::Archive,
         archive_id,
+        &crate::resource_limits::ClientQuotaKey::for_test(1),
     )
     .expect("stage archive");
 

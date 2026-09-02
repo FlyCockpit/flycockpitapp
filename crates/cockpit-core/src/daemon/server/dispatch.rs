@@ -10457,6 +10457,7 @@ async fn handle_serialized_request_impl(
                 include_generated_artifacts,
                 include_sensitive,
                 local_owner_action,
+                &bulk_staging_quota(&state.principal),
             )
             .await
         }
@@ -19485,6 +19486,7 @@ async fn handle_concurrent_request_impl(
                 include_generated_artifacts,
                 include_sensitive,
                 local_owner_action,
+                &bulk_staging_quota(&shared.principal),
             )
             .await
         }
@@ -30829,6 +30831,7 @@ pub(super) async fn import_session_archive(
 fn stage_export_bytes(
     bytes: &[u8],
     mime_class: cockpit_proto::bulk_transfer::BulkMimeClass,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<cockpit_proto::bulk_transfer::BulkTransferRef, ErrorPayload> {
     use rand::RngExt as _;
     let mut transfer_id = [0u8; 16];
@@ -30837,7 +30840,7 @@ fn stage_export_bytes(
     if transfer_id.iter().all(|b| *b == 0) {
         transfer_id[0] = 1;
     }
-    crate::daemon::bulk_staging::stage(bytes, mime_class, transfer_id).map_err(staging_error)
+    crate::daemon::bulk_staging::stage(bytes, mime_class, transfer_id, quota).map_err(staging_error)
 }
 
 /// Serve one chunk of a REDACTED export transfer to an owner-remoted caller.
@@ -30872,6 +30875,7 @@ pub(super) async fn export_session_data(
     include_generated_artifacts: bool,
     include_sensitive: bool,
     local_owner_action: bool,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<Response, ErrorPayload> {
     use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
     // AC1: the raw, unredacted export is owner-LOCAL only. A remoted caller (a
@@ -30957,7 +30961,7 @@ pub(super) async fn export_session_data(
                 .await
                 .map_err(internal)?
             };
-            let transfer = stage_export_bytes(&bytes, mime_class)?;
+            let transfer = stage_export_bytes(&bytes, mime_class, quota)?;
             proto::ExportSessionData {
                 session_id,
                 kind,
@@ -31007,7 +31011,7 @@ pub(super) async fn export_session_data(
                 .await
                 .map_err(internal)?
             };
-            let transfer = stage_export_bytes(&bundle.bytes, mime_class)?;
+            let transfer = stage_export_bytes(&bundle.bytes, mime_class, quota)?;
             proto::ExportSessionData {
                 session_id,
                 kind,

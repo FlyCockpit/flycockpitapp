@@ -154,17 +154,13 @@ fn update_imported_tool_projection_blob_path(
 
 pub fn read_archive(path: &Path) -> Result<ImportArchive> {
     let limits = ResourceLimits::defaults();
-    let len = std::fs::metadata(path)
-        .with_context(|| format!("reading import archive {}", path.display()))?
-        .len();
-    if len > limits.archive_compressed_bytes {
-        bail!(
-            "import archive exceeds the {} byte compressed limit ({len} bytes)",
-            limits.archive_compressed_bytes
-        );
-    }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading import archive {}", path.display()))?;
+    let bytes = cockpit_host::bounded::read_at_most(path, limits.archive_compressed_bytes)
+        .map_err(|error| match error {
+            cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. } => {
+                anyhow!("import archive exceeds the {limit} byte compressed limit ({actual} bytes)")
+            }
+            other => anyhow!(other).context(format!("reading import archive {}", path.display())),
+        })?;
     read_archive_bytes(&bytes)
 }
 
@@ -2053,6 +2049,21 @@ mod tests {
             .expect_err("tiny compressed cap must fail closed")
             .to_string();
         assert!(error.contains("compressed limit"), "{error}");
+    }
+
+    #[test]
+    fn read_archive_rejects_a_file_over_the_compressed_cap_during_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let over = ResourceLimits::defaults().archive_compressed_bytes + 1;
+        file.set_len(over).unwrap();
+        drop(file);
+        let error = read_archive(&path)
+            .expect_err("over-cap archive must not load")
+            .to_string();
+        assert!(error.contains("compressed limit"), "{error}");
+        assert!(error.contains(&over.to_string()), "{error}");
     }
 
     #[test]

@@ -179,7 +179,7 @@ impl OpenAiCompatEmbedder {
         let guard = OutboundGuard::new(effective_redact);
         let command_request = request.clone();
         Ok(
-            Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)
+            Self::from_resolved_request(request, model.to_string(), expected_dimensions, guard)?
                 .with_command_refresh(
                     store
                         .zip(config)
@@ -203,16 +203,17 @@ impl OpenAiCompatEmbedder {
         model: String,
         expected_dimensions: Option<u32>,
         guard: OutboundGuard,
-    ) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    ) -> Result<Self> {
+        Ok(Self {
+            client: crate::providers::provider_http::build()
+                .context("building embedding HTTP client")?,
             base_url: request.base_url,
             headers: request.headers,
             model,
             expected_dimensions,
             guard: Arc::new(Mutex::new(guard)),
             command_refresh: None,
-        }
+        })
     }
 
     fn with_command_refresh(mut self, command_refresh: Option<Arc<CommandRefresh>>) -> Self {
@@ -552,6 +553,7 @@ mod tests {
             Some(3),
             guard,
         )
+        .unwrap()
     }
 
     /// AC4, embeddings send boundary. The embedding path is a potentially
@@ -752,7 +754,8 @@ mod tests {
             "text-embedding-3-small".into(),
             Some(3),
             guard(false),
-        );
+        )
+        .unwrap();
 
         let _ = embedder.embed(&["alpha"]).await.unwrap();
         let captured = capture_rx.await.unwrap();
@@ -790,7 +793,8 @@ mod tests {
             "text-embedding-3-small".into(),
             Some(3),
             guard(false),
-        );
+        )
+        .unwrap();
 
         let _ = embedder.embed(&["alpha"]).await.unwrap();
         let captured = capture_rx.await.unwrap();
@@ -810,7 +814,8 @@ mod tests {
             "text-embedding-3-small".into(),
             Some(3),
             guard,
-        );
+        )
+        .unwrap();
 
         let guard = embedder
             .guard
@@ -895,12 +900,32 @@ mod tests {
             "text-embedding-3-small".into(),
             Some(3),
             guard(false),
-        );
+        )
+        .unwrap();
 
         let guard = embedder
             .guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _: &OutboundGuard = &guard;
+    }
+
+    #[tokio::test]
+    async fn embedding_client_rejects_redirect_without_replaying_credentials() {
+        let (base_url, capture_rx) =
+            capture_embedding_server_with_response_status(r#"{"error":"moved"}"#, "302 Found")
+                .await;
+        let embedder = embedder(base_url, guard(false));
+        let err = embedder.embed(&["alpha"]).await.unwrap_err();
+        assert!(err.to_string().contains("302"), "{err}");
+        let captured = capture_rx.await.unwrap();
+        assert!(
+            captured
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization: bearer"),
+            "{}",
+            captured.head
+        );
     }
 }

@@ -222,7 +222,7 @@ impl DeclarativeUsageProbe {
             provider_id,
             entry.allow_insecure_http,
         )?;
-        let client = reqwest::Client::builder()
+        let client = crate::providers::provider_http::client_builder()
             .timeout(DEFAULT_TIMEOUT)
             // Usage specs reuse arbitrary inference headers, including custom
             // credential headers that reqwest cannot prove safe to retain on a
@@ -230,8 +230,8 @@ impl DeclarativeUsageProbe {
             // validated against the provider's HTTPS/local/opt-in policy, so
             // reject redirects rather than allowing a credential-bearing
             // request to leave that boundary.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .build()
+            .with_context(|| format!("building usage probe HTTP client for {provider_id}"))?;
         let mut request = (match self.spec.method {
             UsageProbeMethod::Get => client.get(&url),
         })
@@ -392,9 +392,10 @@ async fn fetch_codex_usage_with_store(
         None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
     };
     let url = resolve_codex_usage_url(&resolved.base_url);
-    let client = reqwest::Client::builder()
+    let client = crate::providers::provider_http::client_builder()
         .timeout(DEFAULT_TIMEOUT)
-        .build()?;
+        .build()
+        .context("building Codex usage probe HTTP client")?;
     let resp = send_codex_usage_request_with_retries(&client, &url, &resolved.headers).await?;
     let status = resp.status();
     if !status.is_success() {

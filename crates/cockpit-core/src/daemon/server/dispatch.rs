@@ -4262,6 +4262,13 @@ fn bulk_user_message_transfer_owner_impl(
     )
 }
 
+fn bulk_staging_quota(principal: &ClientPrincipal) -> crate::resource_limits::ClientQuotaKey {
+    crate::resource_limits::ClientQuotaKey::hash_material(
+        b"flycockpit-bulk-staging-quota-v1",
+        principal.steer_origin().as_bytes(),
+    )
+}
+
 pub(super) fn bulk_user_message_transfer_owner_local(
     principal: &ClientPrincipal,
     session_id: Uuid,
@@ -10532,7 +10539,14 @@ async fn handle_serialized_request_impl(
                 } else {
                     None
                 };
-            write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
+            write_bulk_transfer_chunk(
+                &transfer,
+                chunk_index,
+                &data_base64,
+                owner.as_ref(),
+                &bulk_staging_quota(&state.principal),
+            )
+            .await
         }
         Request::ReadBulkTransferChunk {
             transfer_id,
@@ -19509,7 +19523,14 @@ async fn handle_concurrent_request_impl(
                 } else {
                     None
                 };
-            write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
+            write_bulk_transfer_chunk(
+                &transfer,
+                chunk_index,
+                &data_base64,
+                owner.as_ref(),
+                &bulk_staging_quota(&shared.principal),
+            )
+            .await
         }
         Request::ReadBulkTransferChunk {
             transfer_id,
@@ -30707,6 +30728,7 @@ pub(super) async fn write_bulk_transfer_chunk(
     chunk_index: u32,
     data_base64: &str,
     owner: Option<&crate::daemon::bulk_staging::BulkTransferOwner>,
+    quota: &crate::resource_limits::ClientQuotaKey,
 ) -> std::result::Result<Response, ErrorPayload> {
     if data_base64.len() > cockpit_proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
         return Err(ErrorPayload {
@@ -30731,7 +30753,7 @@ pub(super) async fn write_bulk_transfer_chunk(
                     other => staging_error(other),
                 })?
         }
-        _ => crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk)
+        _ => crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk, quota)
             .map_err(staging_error)?,
     };
     Ok(Response::BulkTransferChunkAccepted {
@@ -30740,8 +30762,9 @@ pub(super) async fn write_bulk_transfer_chunk(
             accepted.received_bytes,
         ),
         complete: accepted.complete,
-        // Advertise the deadline so the peer is never surprised by expiry.
-        idle_timeout_ms: crate::daemon::bulk_staging::STAGED_TRANSFER_TTL_MS as u32,
+        // Advertise remaining non-renewable lease so the peer is never
+        // surprised by expiry.
+        idle_timeout_ms: u32::try_from(accepted.lease_remaining_ms).unwrap_or(u32::MAX),
     })
 }
 

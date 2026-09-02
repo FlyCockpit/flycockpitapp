@@ -22,8 +22,10 @@ use cockpit_proto::bulk_transfer::{
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use crate::resource_limits::{ClientQuotaKey, ResourceLimits};
+
 /// Total bytes the staging area may hold across all transfers.
-pub const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_STAGED_BYTES: u64 = ResourceLimits::defaults().bulk_staged_bytes_global;
 
 /// Most transfers the staging area may hold at once.
 ///
@@ -31,7 +33,16 @@ pub const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
 /// charges zero bytes, so a peer could otherwise insert unbounded completed
 /// entries by replaying distinct valid empty transfers. Entry count is the
 /// bound that closes that, and it is checked before any insertion.
-pub const MAX_STAGED_TRANSFERS: usize = 256;
+pub const MAX_STAGED_TRANSFERS: usize = ResourceLimits::defaults().bulk_staged_transfers_global;
+
+/// Bytes one client may reserve. Strictly less than [`MAX_STAGED_BYTES`] so a
+/// single peer cannot squat the whole store.
+pub const MAX_STAGED_BYTES_PER_CLIENT: u64 =
+    ResourceLimits::defaults().bulk_staged_bytes_per_client;
+
+/// Transfers one client may hold at once, including zero-length entries.
+pub const MAX_STAGED_TRANSFERS_PER_CLIENT: usize =
+    ResourceLimits::defaults().bulk_staged_transfers_per_client;
 
 /// Bytes of raw payload carried per staged chunk. Chosen so the base64 body
 /// stays within [`cockpit_proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES`] and the
@@ -41,23 +52,24 @@ pub const STAGED_CHUNK_BYTES: usize = 3 * (cockpit_proto::MAX_ATTACHMENT_CHUNK_B
 const _: () =
     assert!(STAGED_CHUNK_BYTES <= cockpit_proto::bulk_transfer::MAX_BULK_CHUNK_PAYLOAD_BYTES);
 
-/// How long a staged transfer may sit untouched before it is reclaimed.
+/// Non-renewable lease, milliseconds from first reservation.
 ///
 /// Staging holds a *reservation*, so an import that declares a large length and
 /// then goes away — a disconnect, a crash, or a deliberate squat — would
-/// otherwise hold that reservation until the daemon restarts.
+/// otherwise hold that reservation until the daemon restarts. Writes do **not**
+/// extend this lease: a peer cannot keep a 512 MiB squat alive by dripping
+/// chunks.
 ///
 /// Expiry runs from two places, and it needs both: opportunistically on every
 /// staging operation (free, covers a busy daemon), and from [`spawn_reaper`]
 /// (covers an *idle* daemon, where no second operation is ever coming). The
-/// opportunistic sweep alone would leave an abandoned 512 MiB reservation held
-/// forever on a quiet daemon.
+/// opportunistic sweep alone would leave an abandoned reservation held forever
+/// on a quiet daemon.
 ///
-/// This value is **advertised to the peer** on every accepted chunk
+/// Remaining time is **advertised to the peer** on every accepted chunk
 /// (`BulkTransferChunkAccepted.idle_timeout_ms`). That is what makes expiry a
-/// contract rather than a surprise: a backpressured or stalled peer knows the
-/// deadline it is held to, and every write renews it.
-pub const STAGED_TRANSFER_TTL_MS: u64 = 5 * 60 * 1000;
+/// contract rather than a surprise.
+pub const STAGED_TRANSFER_TTL_MS: u64 = ResourceLimits::defaults().bulk_lease_ms;
 
 /// How often the daemon's reaper sweeps staging.
 pub const STAGED_TRANSFER_REAP_INTERVAL_MS: u64 = 30 * 1000;
@@ -123,6 +135,11 @@ impl BulkTransferOwner {
             binding: hasher.finalize().into(),
         }
     }
+
+    /// Per-client staging quota identity for this owner.
+    pub fn quota_key(&self) -> ClientQuotaKey {
+        ClientQuotaKey::from_bytes(self.binding)
+    }
 }
 
 #[derive(Debug)]
@@ -137,12 +154,15 @@ struct StagedTransfer {
     chunk_ends: Vec<usize>,
     next_chunk_index: u32,
     complete: bool,
-    /// Monotonic milliseconds at the last operation that touched this transfer.
-    touched_ms: u64,
+    /// Monotonic milliseconds at first reservation. The lease is not renewed.
+    created_ms: u64,
     /// `Some` only for opaque user-message transfers. Generic archive/export
     /// staging intentionally has no attached-session owner because those
     /// transfer classes have separate authorization/consumption boundaries.
     owner: Option<BulkTransferOwner>,
+    /// Client charged for this reservation. Daemon-produced exports are
+    /// `None` and count only against the global budget.
+    quota: Option<ClientQuotaKey>,
 }
 
 /// Storage identity for a staged transfer. Opaque ingress deliberately carries
@@ -171,7 +191,7 @@ struct Store {
 }
 
 impl Store {
-    /// Reclaim every transfer untouched for longer than the TTL.
+    /// Reclaim every transfer whose non-renewable lease has elapsed.
     ///
     /// Both the reservation and the buffered bytes go back, so an abandoned
     /// transfer cannot wedge the store shut.
@@ -179,7 +199,7 @@ impl Store {
         let before = self.transfers.len();
         let mut freed = 0u64;
         self.transfers.retain(|_, transfer| {
-            let stale = now_ms.saturating_sub(transfer.touched_ms) >= STAGED_TRANSFER_TTL_MS;
+            let stale = now_ms.saturating_sub(transfer.created_ms) >= STAGED_TRANSFER_TTL_MS;
             if stale {
                 freed += transfer.total_length;
             }
@@ -195,6 +215,46 @@ impl Store {
         self.staged_bytes = self.staged_bytes.saturating_sub(removed.total_length);
         Some(removed)
     }
+
+    fn client_reserved(&self, quota: &ClientQuotaKey) -> (u64, usize) {
+        let mut bytes = 0u64;
+        let mut count = 0usize;
+        for transfer in self.transfers.values() {
+            if transfer.quota.as_ref() == Some(quota) {
+                bytes = bytes.saturating_add(transfer.total_length);
+                count += 1;
+            }
+        }
+        (bytes, count)
+    }
+
+    fn can_reserve(
+        &self,
+        total_length: u64,
+        quota: Option<&ClientQuotaKey>,
+    ) -> Result<(), BulkStagingError> {
+        if self.transfers.len() >= MAX_STAGED_TRANSFERS {
+            return Err(BulkStagingError::CapacityExceeded);
+        }
+        if self.staged_bytes + total_length > MAX_STAGED_BYTES {
+            return Err(BulkStagingError::CapacityExceeded);
+        }
+        let Some(quota) = quota else {
+            return Ok(());
+        };
+        let (bytes, count) = self.client_reserved(quota);
+        if count >= MAX_STAGED_TRANSFERS_PER_CLIENT {
+            return Err(BulkStagingError::CapacityExceeded);
+        }
+        if bytes + total_length > MAX_STAGED_BYTES_PER_CLIENT {
+            return Err(BulkStagingError::CapacityExceeded);
+        }
+        Ok(())
+    }
+}
+
+fn lease_remaining_ms(created_ms: u64, now_ms: u64) -> u64 {
+    STAGED_TRANSFER_TTL_MS.saturating_sub(now_ms.saturating_sub(created_ms))
 }
 
 fn store() -> &'static Mutex<Store> {
@@ -334,12 +394,7 @@ fn stage_with_owner(
     if guard.transfers.contains_key(&key) {
         return Err(BulkStagingError::DuplicateTransfer);
     }
-    if guard.transfers.len() >= MAX_STAGED_TRANSFERS {
-        return Err(BulkStagingError::CapacityExceeded);
-    }
-    if guard.staged_bytes + total_length > MAX_STAGED_BYTES {
-        return Err(BulkStagingError::CapacityExceeded);
-    }
+    guard.can_reserve(total_length, None)?;
     guard.staged_bytes += total_length;
     guard.transfers.insert(
         key,
@@ -353,8 +408,9 @@ fn stage_with_owner(
                 .collect(),
             next_chunk_index: chunk_count(total_length),
             complete: true,
-            touched_ms: now,
+            created_ms: now,
             owner: owner.cloned(),
+            quota: None,
         },
     );
     drop(guard);
@@ -371,6 +427,7 @@ pub struct ChunkAccepted {
     pub next_chunk_index: u32,
     pub received_bytes: u64,
     pub complete: bool,
+    pub lease_remaining_ms: u64,
 }
 
 /// Accept one chunk pushed by the peer (import).
@@ -378,8 +435,9 @@ pub fn write_chunk(
     reference: &RemoteBulkTransferRef,
     chunk_index: u32,
     chunk: &[u8],
+    quota: &ClientQuotaKey,
 ) -> Result<ChunkAccepted, BulkStagingError> {
-    write_chunk_with_owner(reference, None, chunk_index, chunk)
+    write_chunk_with_owner(reference, None, Some(quota), chunk_index, chunk)
 }
 
 /// Accept an opaque user-message chunk under its attached-session/actor owner.
@@ -389,12 +447,14 @@ pub fn write_chunk_owned(
     chunk_index: u32,
     chunk: &[u8],
 ) -> Result<ChunkAccepted, BulkStagingError> {
-    write_chunk_with_owner(reference, Some(owner), chunk_index, chunk)
+    let quota = owner.quota_key();
+    write_chunk_with_owner(reference, Some(owner), Some(&quota), chunk_index, chunk)
 }
 
 fn write_chunk_with_owner(
     reference: &RemoteBulkTransferRef,
     owner: Option<&BulkTransferOwner>,
+    quota: Option<&ClientQuotaKey>,
     chunk_index: u32,
     chunk: &[u8],
 ) -> Result<ChunkAccepted, BulkStagingError> {
@@ -419,12 +479,7 @@ fn write_chunk_with_owner(
         if chunk_index != 0 {
             return Err(BulkStagingError::ChunkIndexGap);
         }
-        if guard.transfers.len() >= MAX_STAGED_TRANSFERS {
-            return Err(BulkStagingError::CapacityExceeded);
-        }
-        if guard.staged_bytes + total_length > MAX_STAGED_BYTES {
-            return Err(BulkStagingError::CapacityExceeded);
-        }
+        guard.can_reserve(total_length, quota)?;
         guard.staged_bytes += total_length;
         guard.transfers.insert(
             key.clone(),
@@ -440,8 +495,9 @@ fn write_chunk_with_owner(
                 chunk_ends: Vec::new(),
                 next_chunk_index: 0,
                 complete: false,
-                touched_ms: now,
+                created_ms: now,
                 owner: owner.cloned(),
+                quota: quota.copied(),
             },
         );
     }
@@ -477,11 +533,12 @@ fn write_chunk_with_owner(
         if entry.bytes.get(start..end) != Some(chunk) {
             return Err(BulkStagingError::ChunkReplayMismatch);
         }
-        entry.touched_ms = now;
+        let remaining = lease_remaining_ms(entry.created_ms, now);
         return Ok(ChunkAccepted {
             next_chunk_index: entry.next_chunk_index,
             received_bytes: entry.bytes.len() as u64,
             complete: entry.complete,
+            lease_remaining_ms: remaining,
         });
     }
     if entry.complete {
@@ -495,7 +552,6 @@ fn write_chunk_with_owner(
     if entry.bytes.len() as u64 + chunk.len() as u64 > entry.total_length {
         return Err(BulkStagingError::LengthOverrun);
     }
-    entry.touched_ms = now;
     entry.bytes.extend_from_slice(chunk);
     entry.chunk_ends.push(entry.bytes.len());
     entry.next_chunk_index += 1;
@@ -507,10 +563,12 @@ fn write_chunk_with_owner(
         }
         entry.complete = true;
     }
+    let remaining = lease_remaining_ms(entry.created_ms, now);
     Ok(ChunkAccepted {
         next_chunk_index: entry.next_chunk_index,
         received_bytes: entry.bytes.len() as u64,
         complete: entry.complete,
+        lease_remaining_ms: remaining,
     })
 }
 
@@ -546,7 +604,6 @@ pub fn read_chunk(
     if chunk_index >= total_chunks {
         return Err(BulkStagingError::ChunkIndexGap);
     }
-    entry.touched_ms = now;
     let start = chunk_index as usize * STAGED_CHUNK_BYTES;
     let end = (start + STAGED_CHUNK_BYTES).min(entry.bytes.len());
     let chunk = entry.bytes[start..end].to_vec();
@@ -601,7 +658,6 @@ pub fn read_chunk_of_kind(
     if chunk_index >= total_chunks {
         return Err(BulkStagingError::ChunkIndexGap);
     }
-    entry.touched_ms = now;
     let start = chunk_index as usize * STAGED_CHUNK_BYTES;
     let end = (start + STAGED_CHUNK_BYTES).min(entry.bytes.len());
     let chunk = entry.bytes[start..end].to_vec();
@@ -722,6 +778,10 @@ mod tests {
         bytes
     }
 
+    fn quota() -> ClientQuotaKey {
+        ClientQuotaKey::for_test(1)
+    }
+
     fn opaque_reference(payload: &[u8], seed: u8) -> RemoteBulkTransferRef {
         let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(seed))
             .expect("nonzero transfer id");
@@ -801,7 +861,7 @@ mod tests {
             Err(BulkStagingError::OwnerMismatch)
         ));
         assert!(matches!(
-            write_chunk(&reference, 0, payload),
+            write_chunk(&reference, 0, payload, &quota()),
             Err(BulkStagingError::OwnerMismatch)
         ));
 
@@ -961,7 +1021,7 @@ mod tests {
     /// must never drive an allocation of that size.
     #[test]
     fn bulk_staging_does_not_allocate_from_a_declared_length() {
-        let declared = 256 * 1024 * 1024u64;
+        let declared = 32 * 1024 * 1024u64;
         let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(60)).unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -972,7 +1032,7 @@ mod tests {
         .unwrap();
 
         // One empty chunk against a 256 MiB claim.
-        write_chunk(&reference, 0, &[]).unwrap();
+        write_chunk(&reference, 0, &[], &quota()).unwrap();
         let guard = store().lock().expect("bulk staging poisoned");
         let entry = guard
             .transfers
@@ -1004,7 +1064,7 @@ mod tests {
         .unwrap();
         let baseline = staged_bytes();
         // Push one chunk, then walk away.
-        write_chunk(&reference, 0, &payload).unwrap();
+        write_chunk(&reference, 0, &payload, &quota()).unwrap();
         assert!(staged_bytes() > baseline);
 
         let started = now_ms();
@@ -1048,7 +1108,7 @@ mod tests {
         let baseline = staged_bytes();
 
         // The one and only staging operation in this test.
-        write_chunk(&reference, 0, &payload).unwrap();
+        write_chunk(&reference, 0, &payload, &quota()).unwrap();
         assert!(staged_bytes() > baseline, "the reservation is charged");
 
         let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
@@ -1072,7 +1132,8 @@ mod tests {
         ));
     }
 
-    /// A live transfer that is still being fed must never be swept.
+    /// A live transfer that finishes inside the non-renewable lease must not
+    /// be swept.
     #[tokio::test(start_paused = true)]
     async fn bulk_staging_reaper_does_not_drop_a_live_transfer() {
         let chunk = vec![5u8; 1024];
@@ -1093,18 +1154,89 @@ mod tests {
         let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
         spawn_reaper(shutdown.clone());
 
-        // Feed a chunk, wait most of the TTL, feed again: each write renews
-        // `touched_ms`, so the transfer stays alive across more than one TTL.
         for index in 0..3u32 {
-            write_chunk(&reference, index, &chunk).unwrap();
-            tokio::time::advance(Duration::from_millis(STAGED_TRANSFER_TTL_MS - 1_000)).await;
-            tokio::task::yield_now().await;
+            write_chunk(&reference, index, &chunk, &quota()).unwrap();
         }
         assert_eq!(
             take(&reference).unwrap(),
             whole,
-            "a transfer being actively fed must survive the reaper"
+            "a transfer completed inside the lease must survive the reaper"
         );
+    }
+
+    /// Writes do not extend the lease: dripping chunks cannot squat the store.
+    #[tokio::test(start_paused = true)]
+    async fn bulk_staging_lease_is_not_renewed_by_writes() {
+        let chunk = vec![3u8; 256];
+        let mut whole = Vec::new();
+        for _ in 0..2 {
+            whole.extend_from_slice(&chunk);
+        }
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(96)).unwrap();
+        let reference = RemoteBulkTransferRef::new(
+            transfer_id,
+            whole.len() as u64,
+            digest_of(&whole),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+
+        write_chunk(&reference, 0, &chunk, &quota()).unwrap();
+        tokio::time::advance(Duration::from_millis(STAGED_TRANSFER_TTL_MS + 1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                write_chunk(&reference, 1, &chunk, &quota()),
+                Err(BulkStagingError::UnknownTransfer | BulkStagingError::ChunkIndexGap)
+            ),
+            "a write after the non-renewable lease must not keep the reservation"
+        );
+    }
+
+    #[test]
+    fn bulk_staging_enforces_per_client_byte_quota() {
+        let client = ClientQuotaKey::for_test(7);
+        let other = ClientQuotaKey::for_test(8);
+        let payload = vec![1u8; 4096];
+        let over = MAX_STAGED_BYTES_PER_CLIENT + 1;
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(97)).unwrap();
+        let reference = RemoteBulkTransferRef::new(
+            transfer_id,
+            over,
+            digest_of(&payload),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+        assert!(matches!(
+            write_chunk(&reference, 0, &[], &client),
+            Err(BulkStagingError::CapacityExceeded)
+        ));
+
+        let allowed = MAX_STAGED_BYTES_PER_CLIENT;
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(98)).unwrap();
+        let first = RemoteBulkTransferRef::new(
+            transfer_id,
+            allowed,
+            digest_of(&[]),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+        write_chunk(&first, 0, &[], &client).unwrap();
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(99)).unwrap();
+        let second = RemoteBulkTransferRef::new(
+            transfer_id,
+            1,
+            digest_of(&[]),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+        assert!(matches!(
+            write_chunk(&second, 0, &[], &client),
+            Err(BulkStagingError::CapacityExceeded)
+        ));
+        write_chunk(&second, 0, &[], &other).unwrap();
+        discard(id(98));
+        discard(id(99));
     }
 
     /// A transfer that goes quiet for a long — but sub-deadline — interval must
@@ -1133,13 +1265,13 @@ mod tests {
         let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
         spawn_reaper(shutdown.clone());
 
-        write_chunk(&reference, 0, &chunk).unwrap();
+        write_chunk(&reference, 0, &chunk, &quota()).unwrap();
         // Stall for almost the whole advertised deadline, with no traffic at
         // all — exactly the backpressure case.
         tokio::time::advance(Duration::from_millis(STAGED_TRANSFER_TTL_MS - 1)).await;
         tokio::task::yield_now().await;
 
-        let resumed = write_chunk(&reference, 1, &chunk)
+        let resumed = write_chunk(&reference, 1, &chunk, &quota())
             .expect("a stall shorter than the advertised deadline must not lose the transfer");
         assert!(resumed.complete);
         assert_eq!(take(&reference).unwrap(), whole);
@@ -1230,19 +1362,20 @@ mod tests {
 
         // Out-of-order first chunk is refused.
         assert!(matches!(
-            write_chunk(&reference, 1, &payload[..10]),
+            write_chunk(&reference, 1, &payload[..10], &quota()),
             Err(BulkStagingError::ChunkIndexGap)
         ));
 
-        let accepted = write_chunk(&reference, 0, &payload[..STAGED_CHUNK_BYTES]).unwrap();
+        let accepted =
+            write_chunk(&reference, 0, &payload[..STAGED_CHUNK_BYTES], &quota()).unwrap();
         assert_eq!(accepted.next_chunk_index, 1);
         assert!(!accepted.complete);
         // A gap is refused.
         assert!(matches!(
-            write_chunk(&reference, 5, &payload[STAGED_CHUNK_BYTES..]),
+            write_chunk(&reference, 5, &payload[STAGED_CHUNK_BYTES..], &quota()),
             Err(BulkStagingError::ChunkIndexGap)
         ));
-        let done = write_chunk(&reference, 1, &payload[STAGED_CHUNK_BYTES..]).unwrap();
+        let done = write_chunk(&reference, 1, &payload[STAGED_CHUNK_BYTES..], &quota()).unwrap();
         assert!(done.complete);
         assert_eq!(done.received_bytes, payload.len() as u64);
         assert_eq!(take(&reference).unwrap(), payload);

@@ -24769,12 +24769,23 @@ fn stage_archive_transfer(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef
     let reference = archive_transfer_ref(bytes);
     let chunk_size = crate::daemon::bulk_staging::STAGED_CHUNK_BYTES;
     if bytes.is_empty() {
-        crate::daemon::bulk_staging::write_chunk(&reference, 0, &[]).expect("stage empty archive");
+        crate::daemon::bulk_staging::write_chunk(
+            &reference,
+            0,
+            &[],
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+        )
+        .expect("stage empty archive");
         return reference;
     }
     for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-        crate::daemon::bulk_staging::write_chunk(&reference, index as u32, chunk)
-            .expect("stage chunk");
+        crate::daemon::bulk_staging::write_chunk(
+            &reference,
+            index as u32,
+            chunk,
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+        )
+        .expect("stage chunk");
     }
     reference
 }

@@ -6,24 +6,22 @@ use anyhow::Result;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::agents::{GeneratorSpec, VerificationRecipe};
+use crate::agents::VerificationRecipe;
 use crate::db::verification_ledger::{
     CandidateTransitionOutcome, NewVerificationCandidate, RedactedVerificationJson,
     VerificationArtifactKind, VerificationCandidateState, VerificationDigest,
 };
-use crate::engine::agent::Agent;
-use crate::engine::message::{Message, ToolDefinition};
 use crate::engine::model::Model;
-use crate::engine::model::UtilityCallSite;
-use crate::engine::tool::{Tool, ToolCtx, ToolEffect};
+use crate::engine::tool::{Tool, ToolCtx};
 use crate::session::Session;
 
-use super::inference::{
-    VerificationInferenceInput, effective_verification_route, journaled_verification_inference,
+use super::inference::{VerificationInferenceRuntime, effective_verification_route};
+use super::intercept::generator_context::{
+    EffectiveGeneratorContext, EffectiveGeneratorRequest, candidate_tool_definition,
 };
-use super::recipe::{RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot};
+use super::recipe::{RecipeAssemblyInput, assemble_recipe};
 
-const GENERATOR_SYSTEM: &str = "Independently verify the proposed file change. You may use only \
+pub(super) const GENERATOR_SYSTEM: &str = "Independently verify the proposed file change. You may use only \
     the advertised read-only investigation tools. Return exactly one structured candidate through \
     verification_candidate; no other tool can produce a final answer.";
 
@@ -142,12 +140,13 @@ fn take_override_answer() -> Option<GeneratorAnswer> {
 
 pub struct CollectionInput<'a> {
     pub session: &'a Session,
-    pub agent: &'a Agent,
+    pub author_model: &'a std::sync::Arc<Model>,
+    pub generator_audit_name: &'a str,
+    pub candidate_schema: &'a Value,
     pub ctx: &'a ToolCtx,
-    pub history: &'a [Message],
     pub resolved_name: &'a str,
     pub args: &'a Value,
-    pub generators: &'a [GeneratorSpec],
+    pub(super) generators: &'a [EffectiveGeneratorContext],
     pub max_candidates: u16,
     pub operation_id: Uuid,
     pub expected_revision: i64,
@@ -155,17 +154,6 @@ pub struct CollectionInput<'a> {
     pub profile_snapshot_id: Uuid,
     pub collection_deadline_unix_ms: i64,
     pub original_digest: VerificationDigest,
-    /// Authoring model slot of the agent that emitted the write/edit.
-    /// Inherit cache identity is same-slot as this name (Decision 3).
-    pub author_slot: String,
-}
-
-fn is_author_slot(slot: &str, author_slot: &str) -> bool {
-    slot == author_slot
-}
-
-fn inherit_uses_author_context(spec: &GeneratorSpec, same_as_author: bool) -> bool {
-    matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author
 }
 
 fn candidate_is_adjudicable(
@@ -212,7 +200,7 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         .len()
         .min(usize::from(input.max_candidates))
         .min(usize::from(crate::agents::MAX_VERIFICATION_CANDIDATES));
-    for spec in input.generators.iter().take(effective_candidate_count) {
+    for effective in input.generators.iter().take(effective_candidate_count) {
         if chrono::Utc::now().timestamp_millis() >= input.collection_deadline_unix_ms {
             break;
         }
@@ -220,13 +208,13 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             // Compiled definition grant path: no profile snapshot is bound
             // (local CLI/TUI dispatch). Run the generator on the author's
             // live model, matching intercept's grant-path estimate.
-            input.agent.model.clone()
+            input.author_model.clone()
         } else {
             let Ok(model) = super::models::resolve_profile_utility_model(
                 input.session,
                 input.ctx,
                 input.profile_snapshot_id,
-                &spec.slot,
+                effective.slot(),
             )
             .await
             else {
@@ -237,12 +225,7 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
         let mut generator_model = generator_model.as_ref().clone();
         generator_model
             .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
-        // Slot identity, not provider/model equality, decides cache-prefix
-        // inheritance. Two distinct slots may intentionally bind the same
-        // provider model but have different custody and prompt identities.
-        let same_as_author = is_author_slot(&spec.slot, &input.author_slot);
-        let recipe = generator_recipe_for_slot(&spec.recipe, same_as_author);
-        let (include_linked, last_n) = match recipe.as_ref() {
+        let (include_linked, last_n) = match effective.recipe() {
             VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
             VerificationRecipe::CleanRoom {
                 include_linked_files,
@@ -251,7 +234,7 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             } => (*include_linked_files, *last_n_reads),
         };
         let assembled = assemble_recipe(RecipeAssemblyInput {
-            recipe: recipe.as_ref(),
+            recipe: effective.recipe(),
             session: input.session,
             workspace_root: input.workspace_root,
             cwd: &input.ctx.cwd,
@@ -265,15 +248,8 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
                  Answer through the candidate tool only.",
         })
         .await?;
-        let tools = generator_tools(input, spec, same_as_author);
-        let initial_history = if inherit_uses_author_context(spec, same_as_author) {
-            input.history
-        } else {
-            &[]
-        };
-        let Ok(reservation_body) =
-            generator_budget_text(&generator_model, &assembled.prompt, initial_history, &tools)
-        else {
+        let request = effective.request(&assembled.prompt);
+        let Ok(reservation_body) = generator_budget_text(&generator_model, &request) else {
             continue;
         };
         let reservation_digest = VerificationDigest::of(reservation_body.as_bytes());
@@ -284,7 +260,7 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
             super::estimate::encoding_for_model_id(generator_model.model_id_ref()),
             price.map(|price| price.0),
             price.map(|price| price.1),
-            spec.max_turns,
+            effective.max_turns(),
         );
         let reservation_tokens = reservation.tokens;
         let reserved_cost = reservation.cost_microusd.unwrap_or(0);
@@ -339,9 +315,8 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
                 generate_with_turns(
                     input,
                     &generator_model,
-                    spec,
+                    effective,
                     &assembled.prompt,
-                    same_as_author,
                     reservation_tokens,
                     reserved_cost,
                 )
@@ -453,104 +428,17 @@ pub async fn collect_candidates(input: &CollectionInput<'_>) -> Result<Vec<Colle
     Ok(collected)
 }
 
-/// Read-only investigation tools: `ToolEffect::ReadOnly` names minus session
-/// and image tools. Dynamic tools (`code`/`search`/`context_pack`) stay
-/// excluded — do not reclassify; `tool_requires_permission` reads the same
-/// field.
-fn is_private_investigation_tool(tool: &dyn Tool) -> bool {
-    let name = tool.name();
-    tool.is_registered_ordinary_operation()
-        && tool.effect() == ToolEffect::ReadOnly
-        && !name.starts_with("session_")
-        && !name.contains("image")
-        && !name.contains("audio")
-        && !name.contains("video")
-        && !name.contains("generation")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdvertisedGeneratorToolMode {
-    AuthorSchemas,
-    Investigation,
-    None,
-}
-
-fn advertised_generator_tool_mode(
-    spec: &GeneratorSpec,
-    same_as_author: bool,
-) -> AdvertisedGeneratorToolMode {
-    let turns = spec
-        .max_turns
-        .max(1)
-        .min(crate::agents::MAX_GENERATOR_TURNS);
-    if turns > 1 {
-        AdvertisedGeneratorToolMode::Investigation
-    } else if matches!(spec.recipe, VerificationRecipe::Inherit) && same_as_author {
-        AdvertisedGeneratorToolMode::AuthorSchemas
-    } else {
-        AdvertisedGeneratorToolMode::None
-    }
-}
-
-fn generator_tools(
-    input: &CollectionInput<'_>,
-    spec: &GeneratorSpec,
-    same_as_author: bool,
-) -> Vec<ToolDefinition> {
-    // Stage 7's investigation loop advertises the curated read-only set
-    // even on inherit/author-slot. Decision 3's full author schemas apply
-    // only to Stage 4's single-shot cache prefix (`maxTurns == 1`).
-    let mut tools = match advertised_generator_tool_mode(spec, same_as_author) {
-        AdvertisedGeneratorToolMode::Investigation => input
-            .agent
-            .tools
-            .definitions(input.agent.tool_steering)
-            .into_iter()
-            .filter(|definition| {
-                input
-                    .agent
-                    .tools
-                    .get(&definition.name)
-                    .is_some_and(|tool| is_private_investigation_tool(tool.as_ref()))
-            })
-            .collect(),
-        AdvertisedGeneratorToolMode::AuthorSchemas => {
-            input.agent.tools.definitions(input.agent.tool_steering)
-        }
-        AdvertisedGeneratorToolMode::None => Vec::new(),
-    };
-    // Keep the author's definitions byte-for-byte and in their original order;
-    // the private terminal tool is additive.
-    tools.push(candidate_tool_definition());
-    tools
-}
-
-fn generator_budget_text(
+pub(super) fn generator_budget_text(
     model: &Model,
-    prompt: &str,
-    history: &[Message],
-    tools: &[ToolDefinition],
+    request: &EffectiveGeneratorRequest<'_>,
 ) -> Result<String> {
-    let (system, tools, _) = effective_verification_route(GENERATOR_SYSTEM, model, tools);
+    let (system, tools, _) = effective_verification_route(GENERATOR_SYSTEM, model, request.tools());
     Ok(serde_json::to_string(&serde_json::json!({
         "system": system,
-        "history": history,
-        "prompt": prompt,
+        "history": request.history(),
+        "prompt": request.prompt(),
         "tools": tools,
     }))?)
-}
-
-/// Pre-collection callers do not yet have the runtime's curated tool subset.
-/// Charging the complete author tool definitions is a safe superset and keeps
-/// the operation estimate conservative for every recipe/slot combination.
-pub(super) fn conservative_generator_budget_text(
-    agent: &Agent,
-    prompt: &str,
-    history: &[Message],
-) -> Result<String> {
-    let mut tools = agent.tools.definitions(agent.tool_steering);
-    tools.push(candidate_tool_definition());
-    generator_budget_text(&agent.model, prompt, history, &tools)
 }
 
 fn take_bounded_private_output(output: String, remaining: &mut usize) -> String {
@@ -569,27 +457,13 @@ fn take_bounded_private_output(output: String, remaining: &mut usize) -> String 
 async fn generate_with_turns(
     input: &CollectionInput<'_>,
     model: &Model,
-    spec: &GeneratorSpec,
+    effective: &EffectiveGeneratorContext,
     prompt: &str,
-    same_as_author: bool,
     reserved_tokens: u64,
     reserved_cost_microusd: u64,
 ) -> GenerationOutcome {
-    let turns = spec
-        .max_turns
-        .max(1)
-        .min(crate::agents::MAX_GENERATOR_TURNS);
-    let mut private_history = if inherit_uses_author_context(spec, same_as_author) {
-        input.history.to_vec()
-    } else {
-        Vec::new()
-    };
-    let tools = generator_tools(input, spec, same_as_author);
-    let params = if inherit_uses_author_context(spec, same_as_author) {
-        input.agent.params.clone()
-    } else {
-        crate::engine::model::ModelParams::default()
-    };
+    let turns = effective.max_turns();
+    let mut conversation = effective.start_conversation();
     let prices = crate::db::stats::PriceTable::load_default();
     let price = super::estimate::model_prices(&prices, model.model_id_ref());
     let encoding = super::estimate::encoding_for_model_id(model.model_id_ref());
@@ -601,7 +475,8 @@ async fn generate_with_turns(
         if let Some(answer) = take_override_answer() {
             return GenerationOutcome::Answer(answer);
         }
-        let Ok(turn_body) = generator_budget_text(model, prompt, &private_history, &tools) else {
+        let request = conversation.request(prompt);
+        let Ok(turn_body) = generator_budget_text(model, &request) else {
             return GenerationOutcome::Failed;
         };
         let turn_estimate =
@@ -616,49 +491,29 @@ async fn generate_with_turns(
         if !budget.debit(turn_estimate) {
             return GenerationOutcome::BudgetExhausted;
         }
-        match generate_one_shot(
-            input,
-            model,
-            prompt,
-            &private_history,
-            &tools,
-            params.clone(),
-        )
-        .await
-        {
+        match generate_one_shot(input, model, request).await {
             Ok(GeneratorTurn::Answer(answer)) => return GenerationOutcome::Answer(answer),
             Ok(GeneratorTurn::Investigate(choice, calls)) if turn + 1 < turns => {
-                private_history.push(Message::Assistant {
-                    id: None,
-                    content: choice,
-                });
+                conversation.append_assistant(choice);
                 let mut remaining_read_output = super::estimate::PRIVATE_READ_OUTPUT_BYTES_PER_TURN;
                 for call in calls {
-                    let raw_text = match input.agent.tools.get(&call.function.name) {
-                        Some(tool) if is_private_investigation_tool(tool.as_ref()) => {
+                    let raw_text = match effective.investigation_tool(&call.function.name) {
+                        Some(tool) => {
                             let remaining = input
                                 .collection_deadline_unix_ms
                                 .saturating_sub(chrono::Utc::now().timestamp_millis());
                             execute_private_investigation_call(
-                                tool.as_ref(),
+                                tool,
                                 call.function.arguments.clone(),
                                 input.ctx,
                                 remaining,
                             )
                             .await
                         }
-                        Some(_) => {
-                            "Error: this tool is disabled in private verification investigation"
-                                .to_string()
-                        }
                         None => "Error: unknown investigation tool".to_string(),
                     };
                     let text = take_bounded_private_output(raw_text, &mut remaining_read_output);
-                    private_history.push(crate::engine::message::tool_result_message_for(
-                        &call,
-                        &call.function.name,
-                        text,
-                    ));
+                    conversation.append_tool_result(&call, text);
                 }
             }
             Ok(GeneratorTurn::Investigate(_, _)) => {
@@ -726,48 +581,24 @@ enum GeneratorTurn {
     ),
 }
 
-fn candidate_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "verification_candidate".to_string(),
-        description: "Return one verification candidate for the proposed write or edit."
-            .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "kind": { "type": "string", "enum": ["revision", "approve_original", "flag"] },
-                "args": { "type": ["object", "null"] },
-                "critique": { "type": "string" }
-            },
-            "required": ["kind", "args", "critique"],
-            "additionalProperties": false
-        }),
-    }
-}
-
 async fn generate_one_shot(
     input: &CollectionInput<'_>,
     model: &Model,
-    prompt: &str,
-    history: &[Message],
-    tools: &[ToolDefinition],
-    params: crate::engine::model::ModelParams,
+    request: EffectiveGeneratorRequest<'_>,
 ) -> Result<GeneratorTurn> {
     let tool = candidate_tool_definition();
-    let choice = journaled_verification_inference(VerificationInferenceInput {
-        session: input.ctx.session.clone(),
-        model,
-        config: &input.ctx.config,
-        interrupts: input.ctx.interrupts.as_ref(),
-        system: GENERATOR_SYSTEM,
-        history,
-        prompt,
-        tools,
-        params,
-        agent_name: &format!("{}:verification-generator", input.agent.name),
-        site: UtilityCallSite::VerificationVariant,
-        cancel: &input.ctx.cancel,
-        deadline_unix_ms: Some(input.collection_deadline_unix_ms),
-    })
+    let choice = super::inference::journaled_generator_inference(
+        VerificationInferenceRuntime {
+            session: input.ctx.session.clone(),
+            model,
+            config: &input.ctx.config,
+            interrupts: input.ctx.interrupts.as_ref(),
+            agent_name: input.generator_audit_name,
+            cancel: &input.ctx.cancel,
+            deadline_unix_ms: Some(input.collection_deadline_unix_ms),
+        },
+        request,
+    )
     .await?;
     let calls = crate::engine::message::collect_tool_calls(&choice);
     let call = calls
@@ -815,14 +646,9 @@ fn candidate_descriptor(
 }
 
 fn canonical_candidate_args(input: &CollectionInput<'_>, args: Value) -> Result<Value> {
-    let schema = input
-        .agent
-        .tools
-        .get(input.resolved_name)
-        .map(|tool| tool.parameters())
-        .unwrap_or(Value::Null);
-    let mut canonical = crate::engine::model::wire_schema::strip_wire_nulls(&schema, args);
-    let repaired = crate::engine::repair::repair(&mut canonical, &schema, input.resolved_name);
+    let schema = input.candidate_schema;
+    let mut canonical = crate::engine::model::wire_schema::strip_wire_nulls(schema, args);
+    let repaired = crate::engine::repair::repair(&mut canonical, schema, input.resolved_name);
     if !repaired.valid {
         anyhow::bail!(
             "verification candidate arguments failed schema validation: {}",
@@ -830,7 +656,7 @@ fn canonical_candidate_args(input: &CollectionInput<'_>, args: Value) -> Result<
         );
     }
     let normalized =
-        crate::engine::repair::normalize_paths(&mut canonical, &schema, input.ctx.cwd.as_path());
+        crate::engine::repair::normalize_paths(&mut canonical, schema, input.ctx.cwd.as_path());
     if let Some(error) = normalized.error {
         anyhow::bail!("verification candidate path normalization failed: {error}");
     }
@@ -858,6 +684,9 @@ pub fn parse_candidate_payload(value: &Value) -> Result<GeneratorAnswer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::message::ToolDefinition;
+    use crate::engine::tool::ToolEffect;
+    use crate::engine::verification::intercept::generator_context::is_private_investigation_tool;
 
     #[test]
     fn investigation_loop_budget_is_positive_and_hard_bounded() {
@@ -899,59 +728,6 @@ mod tests {
         assert!(first.is_char_boundary(first.len()));
         assert!(first.len() + second.len() <= 7);
         assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn inherit_cache_identity_is_the_author_slot_not_a_model_alias() {
-        assert!(is_author_slot("author", "author"));
-        assert!(is_author_slot("primary", "primary"));
-        assert!(!is_author_slot("reviewer", "author"));
-        assert!(!is_author_slot("primary", "author"));
-        assert!(!is_author_slot("same-model-different-slot", "author"));
-    }
-
-    #[test]
-    fn inherit_author_context_is_reserved_for_the_author_slot() {
-        let spec = GeneratorSpec {
-            slot: "author".into(),
-            recipe: VerificationRecipe::Inherit,
-            max_turns: 1,
-        };
-        assert!(inherit_uses_author_context(&spec, true));
-        assert!(!inherit_uses_author_context(&spec, false));
-
-        let clean_room = GeneratorSpec {
-            slot: "reviewer".into(),
-            recipe: VerificationRecipe::clean_room_default(),
-            max_turns: 1,
-        };
-        assert!(!inherit_uses_author_context(&clean_room, true));
-    }
-
-    #[test]
-    fn multi_turn_inherit_advertises_investigation_tools_not_author_mutating_set() {
-        let spec = GeneratorSpec {
-            slot: "author".into(),
-            recipe: VerificationRecipe::Inherit,
-            max_turns: 3,
-        };
-        assert_eq!(
-            advertised_generator_tool_mode(&spec, true),
-            AdvertisedGeneratorToolMode::Investigation
-        );
-        let single = GeneratorSpec {
-            slot: "author".into(),
-            recipe: VerificationRecipe::Inherit,
-            max_turns: 1,
-        };
-        assert_eq!(
-            advertised_generator_tool_mode(&single, true),
-            AdvertisedGeneratorToolMode::AuthorSchemas
-        );
-        assert_eq!(
-            advertised_generator_tool_mode(&single, false),
-            AdvertisedGeneratorToolMode::None
-        );
     }
 
     #[test]

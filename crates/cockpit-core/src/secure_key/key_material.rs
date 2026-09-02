@@ -19,6 +19,10 @@ impl SecureKeyBytes {
         Self(Zeroizing::new(bytes))
     }
 
+    pub(crate) fn from_zeroizing_array(bytes: Zeroizing<[u8; KEY_BYTE_LEN]>) -> Self {
+        Self(bytes)
+    }
+
     pub fn as_array(&self) -> &[u8; KEY_BYTE_LEN] {
         &self.0
     }

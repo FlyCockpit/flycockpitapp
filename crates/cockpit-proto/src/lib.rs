@@ -1303,7 +1303,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v21 includes first-class assistant-thread
+/// Current wire schema version. v22 includes first-class assistant-thread
 /// creation and durable lineage projections, alongside the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
@@ -1311,12 +1311,22 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs. Older fixtures remain frozen
 /// migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v21 is current-only: all pre-launch wire changes are
+/// compacted v1 ships. v22 is current-only: all pre-launch wire changes are
 /// edited in place, with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 21;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
+
+/// Oldest protocol version whose daemon fixtures are frozen in the append-only
+/// archive ledger at `tests/fixtures/daemon_proto/archive.sha256`. Every
+/// version in `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION` must be
+/// recorded there, and recorded digests are append-only: they are never
+/// legitimately rewritten or removed. Freezing is not a remembered step —
+/// `tests/wire_schema_version.rs` derives the frozen range from this constant
+/// and `PROTOCOL_VERSION`, so minting a new version structurally fails until
+/// the retiring version is appended to the ledger.
+pub const FIRST_ARCHIVED_PROTOCOL_VERSION: u32 = 12;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3246,6 +3256,8 @@ pub struct SealedAcquisitionAuditItem {
     pub source_tool_call_id: Option<String>,
     pub consent_mode: String,
     pub outcome: String,
+    pub requires_user_reason: Option<String>,
+    pub requires_user_prompt: Option<String>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }
@@ -4283,9 +4295,13 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 
 #[cfg(all(test, feature = "remote"))]
 mod proto_fixture_tests {
-    //! Protocol fixtures cover every version accepted by this build. When the
-    //! supported range changes, add or remove the corresponding `vN/`
-    //! directories together with `SUPPORTED_PROTOCOL_VERSIONS`.
+    //! Protocol fixtures cover every version accepted by this build. The
+    //! supported range derives from `MIN_SUPPORTED_PROTOCOL_VERSION..=
+    //! PROTOCOL_VERSION` and the archived range from
+    //! `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION`, so a version mint
+    //! cannot leave a stale hand-maintained list behind. Byte-level
+    //! immutability of archived fixtures is owned by the append-only archive
+    //! ledger checked in `tests/wire_schema_version.rs`.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -4297,9 +4313,16 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[21];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
+    const WIRE_SCHEMA_DIGEST_FILE: &str = "wire-schema.sha256";
+
+    fn supported_protocol_versions() -> std::ops::RangeInclusive<u32> {
+        MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION
+    }
+
+    fn archived_protocol_versions() -> std::ops::Range<u32> {
+        FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION
+    }
 
     #[test]
     fn proto_fixture_request_full_shapes_round_trip() {
@@ -4368,8 +4391,7 @@ mod proto_fixture_tests {
 
     #[test]
     fn frozen_fixture_every_supported_version_still_deserializes() {
-        for version in SUPPORTED_PROTOCOL_VERSIONS.iter().copied() {
-            assert!(version >= MIN_SUPPORTED_PROTOCOL_VERSION);
+        for version in supported_protocol_versions() {
             assert_frozen_fixture_deserializes::<Request>(version, "request.json");
             assert_frozen_fixture_deserializes::<Response>(version, "response.json");
             assert_frozen_fixture_deserializes::<Event>(version, "event.json");
@@ -4378,10 +4400,8 @@ mod proto_fixture_tests {
 
     #[test]
     fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
-        let listed = SUPPORTED_PROTOCOL_VERSIONS
-            .iter()
-            .chain(ARCHIVED_PROTOCOL_VERSIONS)
-            .copied()
+        let listed = supported_protocol_versions()
+            .chain(archived_protocol_versions())
             .collect::<BTreeSet<_>>();
         assert!(
             !listed.is_empty(),
@@ -4406,10 +4426,6 @@ mod proto_fixture_tests {
 
     #[test]
     fn frozen_fixture_current_version_directory_exists() {
-        assert!(
-            SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION),
-            "current protocol v{PROTOCOL_VERSION} must be listed as supported"
-        );
         let root = fixture_root_for(PROTOCOL_VERSION);
         assert!(
             root.is_dir(),
@@ -4570,6 +4586,10 @@ mod proto_fixture_tests {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            if name == "archive.sha256" {
+                assert!(path.is_file(), "archive checksum manifest must be a file");
+                continue;
+            }
             assert!(
                 path.is_dir(),
                 "unexpected file directly under daemon_proto fixtures: {}",
@@ -4608,13 +4628,28 @@ mod proto_fixture_tests {
             );
             actual.insert(entry.file_name().to_string_lossy().to_string());
         }
-        let expected = DAEMON_PROTO_FIXTURE_FILES
+        let mut allowed = DAEMON_PROTO_FIXTURE_FILES
             .iter()
             .map(|name| (*name).to_string())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            actual, expected,
-            "frozen daemon_proto v{version} must contain exactly the known fixture files"
+        assert!(
+            actual.is_superset(&allowed),
+            "daemon_proto v{version} must contain {allowed:?}"
+        );
+        if version == PROTOCOL_VERSION {
+            assert!(
+                actual.contains(WIRE_SCHEMA_DIGEST_FILE),
+                "the current daemon_proto v{version} must contain {WIRE_SCHEMA_DIGEST_FILE}"
+            );
+        }
+        // Versions retired after the canonical digest file landed keep their
+        // frozen `wire-schema.sha256`; the archive ledger owns its bytes.
+        allowed.insert(WIRE_SCHEMA_DIGEST_FILE.to_string());
+        assert!(
+            actual.is_subset(&allowed),
+            "unexpected files under daemon_proto v{version}: only event.json, \
+             request.json, response.json, and a retired version's frozen \
+             wire-schema.sha256 belong there"
         );
     }
 
@@ -5838,10 +5873,12 @@ mod errorcode_forward_tests {
 // ---- Tests -----------------------------------------------------------------
 
 /// Retained daemon-wire fixtures from versions this binary deliberately does
-/// not support. Keep this separate from the remote-gated supported-version
-/// table: fixture retention must never widen the live compatibility window.
+/// not support, derived from the mint constants instead of hand-maintained.
+/// Keep this separate from the remote-gated supported-version table: fixture
+/// retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18, 19, 20];
+const ARCHIVED_PROTOCOL_VERSIONS: std::ops::Range<u32> =
+    FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION;
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -8356,7 +8393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v21_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v22_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -8423,14 +8460,24 @@ mod tests {
     }
 
     #[test]
+    fn protocol_history_range_derives_from_the_mint_constants() {
+        assert!(FIRST_ARCHIVED_PROTOCOL_VERSION >= 1);
+        assert!(
+            FIRST_ARCHIVED_PROTOCOL_VERSION <= PROTOCOL_VERSION,
+            "the frozen history range {FIRST_ARCHIVED_PROTOCOL_VERSION}..{PROTOCOL_VERSION} \
+             must stay anchored at or below the current version"
+        );
+    }
+
+    #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v21 config_refreshed fixture")
+                .expect("current v22 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -8445,20 +8492,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 21);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v21 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v22 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v21 {response_name} must freeze the inclusive verification cap"
+                "current v22 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v21 {response_name} must deserialize: {error}")
+                panic!("current v22 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -8471,13 +8518,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v21 {response_name} assistant identity is invalid: {error}")
+                panic!("current v22 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v21 assistant inventory must carry bounded opaque revisions");
+            .expect("current v22 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -8563,7 +8610,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v21 MCP CAS fixture must carry {field}"
+                "current v22 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -8613,7 +8660,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v21 fixture must carry an operation id for {tag}"
+                "current v22 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");
@@ -8657,7 +8704,7 @@ mod tests {
 
     #[test]
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
-        for version in ARCHIVED_PROTOCOL_VERSIONS.iter().copied() {
+        for version in ARCHIVED_PROTOCOL_VERSIONS {
             assert!(
                 version < MIN_SUPPORTED_PROTOCOL_VERSION,
                 "archived fixture v{version} must remain older than the live support window"

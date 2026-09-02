@@ -56,6 +56,11 @@ impl Tool for ListSealedValueDescriptionsTool {
             .await?;
         let output: Vec<_> = records
             .into_iter()
+            .filter(|record| {
+                crate::tools::trusted_child_acquisition::acquisition_allows_sealed_reference(
+                    &record.record_id,
+                )
+            })
             .map(|record| {
                 serde_json::json!({
                     "record_id": record.record_id,

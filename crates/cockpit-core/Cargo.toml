@@ -210,6 +210,9 @@ hkdf = { workspace = true }
 # new lockfile entries appear. `alloc` only: enables the one-shot Aead trait for
 # encrypt while AeadInPlace covers zeroizing in-place decrypt.
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+# Advanced file-vault passphrase KDF. We use caller-owned, zeroized working
+# memory rather than the crate's convenience allocator.
+argon2 = { version = "=0.5.3", default-features = false, features = ["zeroize"] }
 # WebRTC sans-I/O endpoint: exact str0m 0.21.0 with defaults off and
 # rust-crypto only (remote-webrtc-daemon-endpoint). No AWS-LC, OpenSSL,
 # platform TLS, or alternate WebRTC stack. The RustCrypto provider is

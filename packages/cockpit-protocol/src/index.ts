@@ -2238,7 +2238,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         next_chunk_index: u32Schema,
         received_bytes: canonicalU64DecimalStringSchema,
         complete: z.boolean(),
-        /** Advertised deadline: how long the daemon holds an idle transfer. */
+        /** Remaining non-renewable lease, milliseconds from first reservation. Writes do not extend it. */
         idle_timeout_ms: u32Schema,
       })
       .passthrough(),

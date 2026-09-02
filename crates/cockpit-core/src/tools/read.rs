@@ -224,7 +224,7 @@ pub(crate) async fn read_impl_with_path(
     _was_locked: bool,
     path: PathBuf,
 ) -> Result<ToolOutput> {
-    match read_impl_outcome_with_path(args, ctx, false, path, |path| std::fs::read(path)).await? {
+    match read_impl_outcome_with_path(args, ctx, false, path, read_tool_file).await? {
         ReadOutcome::Content(out) | ReadOutcome::NoContent(out) => Ok(out),
     }
 }
@@ -234,7 +234,7 @@ pub(crate) async fn read_impl_outcome(
     ctx: &ToolCtx,
     was_locked: bool,
 ) -> Result<ReadOutcome> {
-    read_impl_outcome_with(args, ctx, was_locked, |path| std::fs::read(path)).await
+    read_impl_outcome_with(args, ctx, was_locked, read_tool_file).await
 }
 
 pub(crate) async fn read_impl_outcome_with(
@@ -249,6 +249,10 @@ pub(crate) async fn read_impl_outcome_with(
         .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
     let path = resolve(path_arg, &ctx.cwd);
     read_impl_outcome_with_path(args, ctx, was_locked, path, read_file).await
+}
+
+fn read_tool_file(path: &Path) -> io::Result<Vec<u8>> {
+    crate::resource_limits::read_for_tool(path).map_err(io::Error::from)
 }
 
 pub(crate) async fn read_impl_outcome_with_path(

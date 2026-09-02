@@ -37,7 +37,7 @@ pub struct ResourceLimits {
     pub fs_read_text_bytes: usize,
     /// Bytes of binary/base64 content `fs_read` returns.
     pub fs_read_binary_bytes: usize,
-    /// Maximum existing-file body `write` / `delete` will load for the
+    /// Maximum existing-file body `write` / `delete` / `edit` will load for the
     /// prior-content / change-detection path. Larger files fail closed.
     pub fs_mutation_read_bytes: u64,
     /// Maximum LSP `Content-Length` the daemon will allocate. The subprocess
@@ -59,11 +59,12 @@ pub struct ResourceLimits {
     pub terminal_ingress_client_prepared_bytes: u64,
     /// Concurrent prepared terminal-ingress operations one client may hold.
     pub terminal_ingress_client_prepared_ops: usize,
-    /// Global bulk-staging reservation. Must equal
-    /// [`cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES`].
+    /// Global bulk-staging reservation. Strictly greater than one max-sized
+    /// transfer so a single peer at the per-client cap cannot occupy the store.
     pub bulk_staged_bytes_global: u64,
-    /// Bulk-staging reservation one client may hold. Strictly less than the
-    /// global budget so one peer cannot squat the store.
+    /// Bulk-staging reservation one client may hold. Equal to the per-transfer
+    /// wire cap so one legal archive/export/opaque transfer can be staged, and
+    /// strictly less than the global budget so one peer cannot squat the store.
     pub bulk_staged_bytes_per_client: u64,
     /// Global bulk-staging entry cap (including zero-length transfers).
     pub bulk_staged_transfers_global: usize,
@@ -112,8 +113,8 @@ impl ResourceLimits {
             terminal_ingress_chunk_bytes: 48 * 1024,
             terminal_ingress_client_prepared_bytes: 16 * MIB,
             terminal_ingress_client_prepared_ops: 2,
-            bulk_staged_bytes_global: 512 * MIB,
-            bulk_staged_bytes_per_client: 64 * MIB,
+            bulk_staged_bytes_global: GIB,
+            bulk_staged_bytes_per_client: 512 * MIB,
             bulk_staged_transfers_global: 256,
             bulk_staged_transfers_per_client: 32,
             bulk_lease_ms: 5 * 60 * 1000,
@@ -143,6 +144,10 @@ const _: () = {
     assert!(limits.fs_read_binary_bytes >= limits.fs_read_text_bytes);
     assert!(limits.fs_read_max_file_bytes >= limits.fs_read_binary_bytes as u64);
     assert!(limits.bulk_staged_bytes_per_client < limits.bulk_staged_bytes_global);
+    assert!(limits.bulk_staged_bytes_per_client >= limits.archive_compressed_bytes);
+    assert!(
+        limits.bulk_staged_bytes_per_client == cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES
+    );
     assert!(limits.bulk_staged_transfers_per_client < limits.bulk_staged_transfers_global);
     assert!(
         limits.terminal_ingress_client_prepared_bytes >= limits.terminal_ingress_operation_bytes
@@ -156,7 +161,7 @@ const _: () = {
         limits.terminal_ingress_chunk_bytes
             == cockpit_proto::terminal::TERMINAL_INGRESS_MAX_CHUNK_BYTES
     );
-    assert!(limits.bulk_staged_bytes_global == cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES);
+    assert!(limits.bulk_staged_bytes_global > cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES);
 };
 
 /// Stable per-client quota identity. Opaque 32-byte key so this module does
@@ -165,19 +170,11 @@ const _: () = {
 pub struct ClientQuotaKey([u8; 32]);
 
 impl ClientQuotaKey {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     pub fn hash_material(label: &[u8], material: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(label);
         hasher.update(material);
         Self(hasher.finalize().into())
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
     }
 
     #[cfg(test)]
@@ -211,20 +208,45 @@ impl ResourceLimitError {
     }
 }
 
-/// Load an existing file for `write` / `delete` prior-content checks.
-pub fn read_existing_for_mutation(path: &Path) -> Result<Vec<u8>, ResourceLimitError> {
-    let cap = ResourceLimits::defaults().fs_mutation_read_bytes;
+fn read_capped(path: &Path, cap: u64, what: &'static str) -> Result<Vec<u8>, ResourceLimitError> {
     bounded::read_at_most(path, cap).map_err(|error| match error {
-        BoundedIoError::Limit { actual, .. } => {
-            ResourceLimitError::byte_limit("existing file", cap, actual)
-        }
+        BoundedIoError::Limit { actual, .. } => ResourceLimitError::byte_limit(what, cap, actual),
         other => ResourceLimitError::Io(other),
     })
 }
 
+/// Load an existing file for `write` / `delete` / `edit` prior-content checks.
+pub fn read_existing_for_mutation(path: &Path) -> Result<Vec<u8>, ResourceLimitError> {
+    read_capped(
+        path,
+        ResourceLimits::defaults().fs_mutation_read_bytes,
+        "existing file",
+    )
+}
+
+/// Load a file for the `read` tool (and sibling snapshot reads). The cap is
+/// the same hard maximum as `fs_read`: larger files fail closed before the
+/// whole body is retained.
+pub fn read_for_tool(path: &Path) -> Result<Vec<u8>, ResourceLimitError> {
+    read_capped(
+        path,
+        ResourceLimits::defaults().fs_read_max_file_bytes,
+        "file",
+    )
+}
+
 /// Streamed equality check so mutation tools never hold the file twice.
 pub fn existing_file_unchanged(path: &Path, previous: &[u8]) -> Result<bool, ResourceLimitError> {
-    Ok(bounded::contents_equal(path, previous).map_err(BoundedIoError::from)?)
+    bounded::contents_equal(path, previous).map_err(Into::into)
+}
+
+impl From<ResourceLimitError> for std::io::Error {
+    fn from(error: ResourceLimitError) -> Self {
+        match error {
+            ResourceLimitError::Io(BoundedIoError::Io(io)) => io,
+            other => std::io::Error::new(std::io::ErrorKind::InvalidData, other),
+        }
+    }
 }
 
 /// `fs_read` streaming seam: prefix for the response plus a full-file digest.
@@ -284,16 +306,18 @@ mod tests {
     fn defaults_are_strictly_layered() {
         let limits = ResourceLimits::defaults();
         assert!(limits.bulk_staged_bytes_per_client < limits.bulk_staged_bytes_global);
+        assert!(limits.bulk_staged_bytes_per_client >= limits.archive_compressed_bytes);
+        assert_eq!(
+            limits.bulk_staged_bytes_per_client,
+            cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES
+        );
         assert!(limits.bulk_staged_transfers_per_client < limits.bulk_staged_transfers_global);
         assert!(limits.terminal_ingress_client_prepared_ops >= 1);
         assert_eq!(
             limits.terminal_ingress_operation_bytes,
             cockpit_proto::terminal::TERMINAL_INGRESS_MAX_BYTES
         );
-        assert_eq!(
-            limits.bulk_staged_bytes_global,
-            cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES
-        );
+        assert!(limits.bulk_staged_bytes_global > cockpit_proto::bulk_transfer::MAX_TRANSFER_BYTES);
         assert_eq!(
             limits.fs_read_text_bytes,
             crate::tools::common::OUTPUT_BYTE_CAP

@@ -15438,8 +15438,14 @@ fn stage_opaque_user_transfer(
         .chunks(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES)
         .enumerate()
     {
-        crate::daemon::bulk_staging::write_chunk_owned(&reference, owner, index as u32, chunk)
-            .expect("stage opaque user chunk");
+        crate::daemon::bulk_staging::write_chunk_owned(
+            &reference,
+            owner,
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+            index as u32,
+            chunk,
+        )
+        .expect("stage opaque user chunk");
     }
     reference
 }

@@ -53,6 +53,8 @@ struct PreparedIngressQuota {
     bytes: u64,
     ops: usize,
 }
+
+type PreparedIngressQuotaMap = Arc<Mutex<HashMap<String, PreparedIngressQuota>>>;
 #[cfg(test)]
 static NEXT_LOCAL_TERMINAL_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -132,7 +134,7 @@ struct TerminalContainmentBinding {
 #[derive(Clone)]
 pub struct TerminalHost {
     inner: Arc<Mutex<TerminalHostInner>>,
-    prepared_ingress: Mutex<HashMap<String, PreparedIngressQuota>>,
+    prepared_ingress: PreparedIngressQuotaMap,
     event_tx: EventSender,
     redaction: SharedRedactionTable,
     temp_root: PathBuf,
@@ -646,7 +648,7 @@ impl TerminalHost {
         prepare_temp_root(&temp_root);
         Self {
             inner: Arc::new(Mutex::new(TerminalHostInner::default())),
-            prepared_ingress: Mutex::new(HashMap::new()),
+            prepared_ingress: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             redaction,
             temp_root,
@@ -698,6 +700,7 @@ impl TerminalHost {
             &self.temp_root,
             self.event_tx.clone(),
             self.redaction.clone(),
+            self.prepared_ingress.clone(),
         )
         .map_err(internal)?;
         crate::sync::lock_or_recover(&self.inner)
@@ -883,23 +886,12 @@ impl TerminalHost {
         };
         {
             let mut state = crate::sync::lock_or_recover(&terminal);
-            let released = state
-                .ingress
-                .values()
-                .filter(|operation| operation.state == TerminalIngressState::Prepared)
-                .map(|operation| {
-                    (
-                        operation.owner.principal_id.clone(),
-                        operation.metadata.size,
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.release_prepared_ingress(released);
             let _ = close_generation_locked(
                 &mut state,
                 CloseTrigger::ClientClose,
                 &self.event_tx,
                 &self.redaction,
+                &self.prepared_ingress,
             );
         }
         crate::sync::lock_or_recover(&self.inner)
@@ -1198,37 +1190,11 @@ impl TerminalHost {
         principal_id: &str,
         size: u64,
     ) -> std::result::Result<(), ErrorPayload> {
-        let limits = cockpit_core::resource_limits::ResourceLimits::defaults();
-        let mut quotas = crate::sync::lock_or_recover(&self.prepared_ingress);
-        let entry = quotas.entry(principal_id.to_string()).or_default();
-        if entry.ops >= limits.terminal_ingress_client_prepared_ops
-            || entry.bytes.saturating_add(size) > limits.terminal_ingress_client_prepared_bytes
-        {
-            return Err(ErrorPayload {
-                code: ErrorCode::InvalidIngress,
-                message: "terminal ingress client quota exceeded".to_string(),
-            });
-        }
-        entry.ops = entry.ops.saturating_add(1);
-        entry.bytes = entry.bytes.saturating_add(size);
-        Ok(())
+        charge_prepared_ingress_map(&self.prepared_ingress, principal_id, size)
     }
 
     fn release_prepared_ingress(&self, released: Vec<(String, u64)>) {
-        if released.is_empty() {
-            return;
-        }
-        let mut quotas = crate::sync::lock_or_recover(&self.prepared_ingress);
-        for (principal_id, size) in released {
-            let Some(entry) = quotas.get_mut(&principal_id) else {
-                continue;
-            };
-            entry.ops = entry.ops.saturating_sub(1);
-            entry.bytes = entry.bytes.saturating_sub(size);
-            if entry.ops == 0 && entry.bytes == 0 {
-                quotas.remove(&principal_id);
-            }
-        }
+        release_prepared_ingress_map(&self.prepared_ingress, released);
     }
 
     fn get_terminal(
@@ -1262,6 +1228,7 @@ impl TerminalHost {
         event_tx: &EventSender,
         redaction: &SharedRedactionTable,
         bytes: &[u8],
+        prepared_ingress: &PreparedIngressQuotaMap,
     ) {
         let (filtered, terminal_id) = {
             let mut state = crate::sync::lock_or_recover(terminal);
@@ -1306,6 +1273,7 @@ impl TerminalHost {
                     CloseTrigger::Osc52Overflow,
                     event_tx,
                     redaction,
+                    prepared_ingress,
                 );
                 return;
             }
@@ -1352,6 +1320,7 @@ fn close_generation_locked(
     trigger: CloseTrigger,
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
+    prepared_ingress: &PreparedIngressQuotaMap,
 ) -> TerminalCloseOutcome {
     if state.closed {
         return state
@@ -1434,7 +1403,13 @@ fn close_generation_locked(
 
     // Drop held verified handles first so each exact committed object is
     // scrubbed without a racy pathname unlink before directory teardown.
+    // Prepared reservations must be released here: every generation-close
+    // path (client close, process exit, OSC52 overflow) goes through this
+    // oracle, and a `clear()` without a matching release leaks the per-client
+    // quota until daemon restart.
+    let released = prepared_ingress_charges(state);
     state.ingress.clear();
+    release_prepared_ingress_map(prepared_ingress, released);
     let _ = std::fs::remove_dir_all(&state.temp_dir);
     outcome
 }
@@ -1685,6 +1660,7 @@ fn spawn_terminal(
     temp_root: &Path,
     event_tx: EventSender,
     redaction: SharedRedactionTable,
+    prepared_ingress: PreparedIngressQuotaMap,
 ) -> Result<Arc<Mutex<TerminalState>>> {
     let rows = rows.max(1);
     let cols = cols.max(1);
@@ -1766,6 +1742,7 @@ fn spawn_terminal(
     let reader_state = Arc::clone(&state);
     let reader_redaction = redaction.clone();
     let reader_events = event_tx.clone();
+    let reader_quota = prepared_ingress;
     std::thread::Builder::new()
         .name(format!("cockpit-remote-terminal-{id}"))
         .spawn(move || {
@@ -1779,6 +1756,7 @@ fn spawn_terminal(
                             &reader_events,
                             &reader_redaction,
                             &buf[..n],
+                            &reader_quota,
                         );
                     }
                     Err(_) => break,
@@ -1791,6 +1769,7 @@ fn spawn_terminal(
                     CloseTrigger::ProcessExited,
                     &reader_events,
                     &reader_redaction,
+                    &reader_quota,
                 );
             }
         })
@@ -1953,6 +1932,58 @@ fn ingress_response(operation: &IngressOperation) -> Response {
             input_sequence: operation.input_sequence,
             expires_at_unix_ms,
         },
+    }
+}
+
+fn prepared_ingress_charges(state: &TerminalState) -> Vec<(String, u64)> {
+    state
+        .ingress
+        .values()
+        .filter(|operation| operation.state == TerminalIngressState::Prepared)
+        .map(|operation| {
+            (
+                operation.owner.principal_id.clone(),
+                operation.metadata.size,
+            )
+        })
+        .collect()
+}
+
+fn charge_prepared_ingress_map(
+    quotas: &PreparedIngressQuotaMap,
+    principal_id: &str,
+    size: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    let limits = cockpit_core::resource_limits::ResourceLimits::defaults();
+    let mut quotas = crate::sync::lock_or_recover(quotas);
+    let entry = quotas.entry(principal_id.to_string()).or_default();
+    if entry.ops >= limits.terminal_ingress_client_prepared_ops
+        || entry.bytes.saturating_add(size) > limits.terminal_ingress_client_prepared_bytes
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::InvalidIngress,
+            message: "terminal ingress client quota exceeded".to_string(),
+        });
+    }
+    entry.ops = entry.ops.saturating_add(1);
+    entry.bytes = entry.bytes.saturating_add(size);
+    Ok(())
+}
+
+fn release_prepared_ingress_map(quotas: &PreparedIngressQuotaMap, released: Vec<(String, u64)>) {
+    if released.is_empty() {
+        return;
+    }
+    let mut quotas = crate::sync::lock_or_recover(quotas);
+    for (principal_id, size) in released {
+        let Some(entry) = quotas.get_mut(&principal_id) else {
+            continue;
+        };
+        entry.ops = entry.ops.saturating_sub(1);
+        entry.bytes = entry.bytes.saturating_sub(size);
+        if entry.ops == 0 && entry.bytes == 0 {
+            quotas.remove(&principal_id);
+        }
     }
 }
 
@@ -2729,10 +2760,28 @@ mod tests {
         ));
         assert_eq!(head.len(), OSC52_MAX_SEQUENCE_BYTES);
         let terminal = host.get_terminal(id).unwrap();
-        TerminalHost::handle_pty_bytes(&terminal, &host.event_tx, &host.redaction, &head);
-        TerminalHost::handle_pty_bytes(&terminal, &host.event_tx, &host.redaction, b"X");
+        TerminalHost::handle_pty_bytes(
+            &terminal,
+            &host.event_tx,
+            &host.redaction,
+            &head,
+            &host.prepared_ingress,
+        );
+        TerminalHost::handle_pty_bytes(
+            &terminal,
+            &host.event_tx,
+            &host.redaction,
+            b"X",
+            &host.prepared_ingress,
+        );
         // Suffix after overflow must not forward.
-        TerminalHost::handle_pty_bytes(&terminal, &host.event_tx, &host.redaction, b"\x07SECRET");
+        TerminalHost::handle_pty_bytes(
+            &terminal,
+            &host.event_tx,
+            &host.redaction,
+            b"\x07SECRET",
+            &host.prepared_ingress,
+        );
 
         {
             let state = crate::sync::lock_or_recover(&terminal);
@@ -2836,6 +2885,7 @@ mod tests {
                     CloseTrigger::Osc52Overflow,
                     &host.event_tx,
                     &host.redaction,
+                    &host.prepared_ingress,
                 );
                 assert_eq!(outcome, TerminalCloseOutcome::CloseBlocked, "{label}");
                 assert_eq!(
@@ -2896,12 +2946,14 @@ mod tests {
                             &host.event_tx,
                             &host.redaction,
                             &head,
+                            &host.prepared_ingress,
                         );
                         TerminalHost::handle_pty_bytes(
                             &terminal,
                             &host.event_tx,
                             &host.redaction,
                             b"X",
+                            &host.prepared_ingress,
                         );
                     }
                     other => {
@@ -2910,6 +2962,7 @@ mod tests {
                             *other,
                             &host.event_tx,
                             &host.redaction,
+                            &host.prepared_ingress,
                         );
                     }
                 }
@@ -3439,6 +3492,96 @@ mod tests {
         assert!(err.message.contains("quota"), "{}", err.message);
         let _ = host.close(term_a);
         let _ = host.close(term_b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ingress_quota_releases_on_process_exit_and_osc52_overflow() {
+        fn prepare(
+            host: &TerminalHost,
+            terminal_id: Uuid,
+            binding: TerminalBinding,
+            tag: u8,
+        ) -> std::result::Result<Response, ErrorPayload> {
+            host.ingress_begin(
+                terminal_id,
+                binding,
+                TerminalIngressMetadata {
+                    operation_id: Uuid::new_v4(),
+                    size: TERMINAL_INGRESS_MAX_BYTES,
+                    media_type: TerminalImageType::Png,
+                    sha256: (tag as char).to_string().repeat(64),
+                },
+            )
+        }
+
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+        let cwd = Some(tmp.path().to_string_lossy().into_owned());
+        let Response::TerminalOpened {
+            terminal_id: term_a,
+            binding: binding_a,
+            ..
+        } = host.open(cwd.clone(), 80, 24).unwrap()
+        else {
+            panic!()
+        };
+        prepare(&host, term_a, binding_a, b'a').unwrap();
+        {
+            let terminal = host.get_terminal(term_a).unwrap();
+            let mut state = crate::sync::lock_or_recover(&terminal);
+            let _ = close_generation_locked(
+                &mut state,
+                CloseTrigger::ProcessExited,
+                &host.event_tx,
+                &host.redaction,
+                &host.prepared_ingress,
+            );
+        }
+        let Response::TerminalOpened {
+            terminal_id: term_b,
+            binding: binding_b,
+            ..
+        } = host.open(cwd.clone(), 80, 24).unwrap()
+        else {
+            panic!()
+        };
+        prepare(&host, term_b, binding_b, b'b')
+            .expect("process-exit must release the prepared-ingress quota");
+
+        let mut head = b"\x1b]52;c;".to_vec();
+        let head_len = head.len();
+        head.extend(std::iter::repeat_n(
+            b'A',
+            OSC52_MAX_SEQUENCE_BYTES.saturating_sub(head_len),
+        ));
+        let terminal = host.get_terminal(term_b).unwrap();
+        TerminalHost::handle_pty_bytes(
+            &terminal,
+            &host.event_tx,
+            &host.redaction,
+            &head,
+            &host.prepared_ingress,
+        );
+        TerminalHost::handle_pty_bytes(
+            &terminal,
+            &host.event_tx,
+            &host.redaction,
+            b"X",
+            &host.prepared_ingress,
+        );
+        let Response::TerminalOpened {
+            terminal_id: term_c,
+            binding: binding_c,
+            ..
+        } = host.open(cwd, 80, 24).unwrap()
+        else {
+            panic!()
+        };
+        prepare(&host, term_c, binding_c, b'c')
+            .expect("OSC52 overflow must release the prepared-ingress quota");
+        let _ = host.close(term_c);
     }
 
     #[test]

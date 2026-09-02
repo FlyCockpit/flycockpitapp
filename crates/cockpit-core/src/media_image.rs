@@ -419,6 +419,16 @@ fn skip_gif_sub_blocks(input: &[u8], offset: &mut usize) -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn encode_solid_rgb_png(width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb([0x20, 0x40, 0x60]));
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(img.as_raw(), width, height, ExtendedColorType::Rgb8)
+        .expect("encode test png");
+    bytes
+}
+
 fn check_output(bytes: Vec<u8>, profile: &ImageProfile) -> Result<Vec<u8>> {
     if bytes.len() > profile.max_output_bytes {
         bail!(
@@ -437,9 +447,7 @@ fn decode_bounded(bytes: &[u8], profile: &ImageProfile) -> Result<DynamicImage> 
     limits.max_image_height = profile.max_height;
     limits.max_alloc = profile.max_alloc;
     reader.limits(limits);
-    let decoder = reader
-        .into_decoder()
-        .map_err(|e| anyhow!("failed to decode image: {e}"))?;
+    let decoder = reader.into_decoder().map_err(map_decode_error)?;
     let (width, height) = decoder.dimensions();
     if let Some(max_w) = profile.max_width {
         ensure!(width > 0 && width <= max_w, "resource_limit");
@@ -455,7 +463,14 @@ fn decode_bounded(bytes: &[u8], profile: &ImageProfile) -> Result<DynamicImage> 
             "resource_limit"
         );
     }
-    DynamicImage::from_decoder(decoder).map_err(|e| anyhow!("failed to decode image: {e}"))
+    DynamicImage::from_decoder(decoder).map_err(map_decode_error)
+}
+
+fn map_decode_error(error: image::ImageError) -> anyhow::Error {
+    match error {
+        image::ImageError::Limits(_) => anyhow!("resource_limit"),
+        other => anyhow!("failed to decode image: {other}"),
+    }
 }
 
 /// Locate a raw EXIF TIFF payload without decoding pixels.
@@ -1208,52 +1223,34 @@ mod tests {
         &from[..end]
     }
 
-    fn png_with_ihdr_dimensions(width: u32, height: u32) -> Vec<u8> {
-        fn crc32(data: &[u8]) -> u32 {
-            let mut crc = 0xFFFF_FFFFu32;
-            for &byte in data {
-                crc ^= u32::from(byte);
-                for _ in 0..8 {
-                    crc = if crc & 1 != 0 {
-                        (crc >> 1) ^ 0xEDB8_8320
-                    } else {
-                        crc >> 1
-                    };
-                }
-            }
-            !crc
-        }
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(b"IHDR");
-        ihdr.extend_from_slice(&width.to_be_bytes());
-        ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        let crc = crc32(&ihdr);
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes());
-        png.extend_from_slice(&ihdr);
-        png.extend_from_slice(&crc.to_be_bytes());
-        png.extend_from_slice(&0u32.to_be_bytes());
-        png.extend_from_slice(b"IEND");
-        png.extend_from_slice(&crc32(b"IEND").to_be_bytes());
-        png
+    fn unbounded_decode_profile() -> ImageProfile {
+        let mut profile = ImageProfile::read_image();
+        profile.max_width = None;
+        profile.max_height = None;
+        profile.max_pixels = None;
+        profile.max_alloc = None;
+        profile
     }
 
     #[test]
     fn decode_rejects_width_and_height_over_the_central_limit() {
         let limits = crate::resource_limits::ResourceLimits::defaults();
-        let over_width = png_with_ihdr_dimensions(limits.image_max_width + 1, 1);
+        let over_width = encode_solid_rgb_png(limits.image_max_width + 1, 1);
+        decode_and_orient(&over_width, &unbounded_decode_profile())
+            .expect("fixture must decode when dimension bounds are absent");
         let err = decode_and_orient(&over_width, &ImageProfile::read_image()).unwrap_err();
         let text = err.to_string();
         assert!(
-            text.contains("resource_limit") || text.contains("decode"),
+            text.contains("resource_limit"),
             "width over the cap must fail closed, got {text}"
         );
-        let over_height = png_with_ihdr_dimensions(1, limits.image_max_height + 1);
+        let over_height = encode_solid_rgb_png(1, limits.image_max_height + 1);
+        decode_and_orient(&over_height, &unbounded_decode_profile())
+            .expect("fixture must decode when dimension bounds are absent");
         let err = decode_and_orient(&over_height, &ImageProfile::read_image()).unwrap_err();
         let text = err.to_string();
         assert!(
-            text.contains("resource_limit") || text.contains("decode"),
+            text.contains("resource_limit"),
             "height over the cap must fail closed, got {text}"
         );
     }

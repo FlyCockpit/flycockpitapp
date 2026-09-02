@@ -22,7 +22,6 @@ use lsp_types::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 #[cfg(test)]
@@ -1190,15 +1189,15 @@ where
             );
         }
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = cockpit_host::bounded::read_line_capped(
+            reader,
+            &mut line,
+            limits.lsp_header_line_bytes,
+            "LSP header line",
+        )
+        .await?;
         if n == 0 {
             return Err(anyhow!("LSP stdout closed"));
-        }
-        if line.len() > limits.lsp_header_line_bytes {
-            bail!(
-                "LSP header line exceeds the {} byte limit",
-                limits.lsp_header_line_bytes
-            );
         }
         header_lines += 1;
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -1826,6 +1825,21 @@ mod tests {
             err.to_string().contains("header line"),
             "{}",
             err.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lsp_message_rejects_a_newline_free_header_line() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let frame = vec![b'x'; limits.lsp_header_line_bytes + 1];
+        let mut reader = BufReader::new(std::io::Cursor::new(frame));
+        let err = read_lsp_message(&mut reader)
+            .await
+            .expect_err("a newline-free header must fail before the accumulator grows unbounded");
+        let text = err.to_string();
+        assert!(
+            text.contains("header line") || text.contains("hostile"),
+            "{text}"
         );
     }
 

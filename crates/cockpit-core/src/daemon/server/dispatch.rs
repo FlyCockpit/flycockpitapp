@@ -30745,13 +30745,19 @@ pub(super) async fn write_bulk_transfer_chunk(
     let accepted = match transfer.mime_class {
         cockpit_proto::bulk_transfer::BulkMimeClass::Opaque => {
             let owner = owner.ok_or_else(unavailable_bulk_user_message_transfer)?;
-            crate::daemon::bulk_staging::write_chunk_owned(transfer, owner, chunk_index, &chunk)
-                .map_err(|error| match error {
-                    crate::daemon::bulk_staging::BulkStagingError::OwnerMismatch => {
-                        unavailable_bulk_user_message_transfer()
-                    }
-                    other => staging_error(other),
-                })?
+            crate::daemon::bulk_staging::write_chunk_owned(
+                transfer,
+                owner,
+                quota,
+                chunk_index,
+                &chunk,
+            )
+            .map_err(|error| match error {
+                crate::daemon::bulk_staging::BulkStagingError::OwnerMismatch => {
+                    unavailable_bulk_user_message_transfer()
+                }
+                other => staging_error(other),
+            })?
         }
         _ => crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk, quota)
             .map_err(staging_error)?,

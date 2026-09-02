@@ -35,8 +35,8 @@ pub const MAX_STAGED_BYTES: u64 = ResourceLimits::defaults().bulk_staged_bytes_g
 /// bound that closes that, and it is checked before any insertion.
 pub const MAX_STAGED_TRANSFERS: usize = ResourceLimits::defaults().bulk_staged_transfers_global;
 
-/// Bytes one client may reserve. Strictly less than [`MAX_STAGED_BYTES`] so a
-/// single peer cannot squat the whole store.
+/// Bytes one client may reserve. Equal to one max-sized transfer and strictly
+/// less than [`MAX_STAGED_BYTES`] so a single peer cannot squat the whole store.
 pub const MAX_STAGED_BYTES_PER_CLIENT: u64 =
     ResourceLimits::defaults().bulk_staged_bytes_per_client;
 
@@ -134,11 +134,6 @@ impl BulkTransferOwner {
         Self {
             binding: hasher.finalize().into(),
         }
-    }
-
-    /// Per-client staging quota identity for this owner.
-    pub fn quota_key(&self) -> ClientQuotaKey {
-        ClientQuotaKey::from_bytes(self.binding)
     }
 }
 
@@ -441,14 +436,17 @@ pub fn write_chunk(
 }
 
 /// Accept an opaque user-message chunk under its attached-session/actor owner.
+///
+/// `quota` is the per-peer staging identity, not the owner binding: one
+/// principal attached to many sessions still shares one budget.
 pub fn write_chunk_owned(
     reference: &RemoteBulkTransferRef,
     owner: &BulkTransferOwner,
+    quota: &ClientQuotaKey,
     chunk_index: u32,
     chunk: &[u8],
 ) -> Result<ChunkAccepted, BulkStagingError> {
-    let quota = owner.quota_key();
-    write_chunk_with_owner(reference, Some(owner), Some(&quota), chunk_index, chunk)
+    write_chunk_with_owner(reference, Some(owner), Some(quota), chunk_index, chunk)
 }
 
 fn write_chunk_with_owner(
@@ -782,6 +780,15 @@ mod tests {
         ClientQuotaKey::for_test(1)
     }
 
+    fn write_owned(
+        reference: &RemoteBulkTransferRef,
+        owner: &BulkTransferOwner,
+        chunk_index: u32,
+        chunk: &[u8],
+    ) -> Result<ChunkAccepted, BulkStagingError> {
+        write_chunk_owned(reference, owner, &quota(), chunk_index, chunk)
+    }
+
     fn opaque_reference(payload: &[u8], seed: u8) -> RemoteBulkTransferRef {
         let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(seed))
             .expect("nonzero transfer id");
@@ -804,7 +811,7 @@ mod tests {
         let other_principal =
             BulkTransferOwner::for_attached_identity(Uuid::from_u128(1), b"owner-b");
 
-        write_chunk_owned(&reference, &owner, 0, payload).expect("owner stages source");
+        write_owned(&reference, &owner, 0, payload).expect("owner stages source");
         assert!(matches!(
             take_owned(&reference, &other_session),
             Err(BulkStagingError::UnknownTransfer)
@@ -827,14 +834,12 @@ mod tests {
         let owner_a = BulkTransferOwner::for_attached_identity(Uuid::from_u128(3), b"actor-a");
         let owner_b = BulkTransferOwner::for_attached_identity(Uuid::from_u128(3), b"actor-b");
 
-        let source_first =
-            write_chunk_owned(&source, &owner_a, 0, b"source").expect("source is staged");
+        let source_first = write_owned(&source, &owner_a, 0, b"source").expect("source is staged");
         assert_eq!(
-            write_chunk_owned(&source, &owner_a, 0, b"source")
-                .expect("exact owner replay is idempotent"),
+            write_owned(&source, &owner_a, 0, b"source").expect("exact owner replay is idempotent"),
             source_first
         );
-        write_chunk_owned(&display, &owner_b, 0, b"display").expect("display is staged");
+        write_owned(&display, &owner_b, 0, b"display").expect("display is staged");
 
         assert!(matches!(
             take_all_owned(&[&source, &display], &owner_a),
@@ -865,7 +870,7 @@ mod tests {
             Err(BulkStagingError::OwnerMismatch)
         ));
 
-        write_chunk_owned(&reference, &owner, 0, payload).expect("owner stages opaque body");
+        write_owned(&reference, &owner, 0, payload).expect("owner stages opaque body");
         assert!(matches!(
             take(&reference),
             Err(BulkStagingError::OwnerMismatch)
@@ -887,8 +892,8 @@ mod tests {
         let owner_a = BulkTransferOwner::for_attached_identity(Uuid::from_u128(5), b"actor-a");
         let owner_b = BulkTransferOwner::for_attached_identity(Uuid::from_u128(6), b"actor-b");
 
-        write_chunk_owned(&reference, &owner_a, 0, payload).expect("first owner stages body");
-        write_chunk_owned(&reference, &owner_b, 0, payload)
+        write_owned(&reference, &owner_a, 0, payload).expect("first owner stages body");
+        write_owned(&reference, &owner_b, 0, payload)
             .expect("same locator cannot globally squat another owner");
         assert_eq!(take_owned(&reference, &owner_a).unwrap(), payload);
         assert_eq!(take_owned(&reference, &owner_b).unwrap(), payload);
@@ -1197,21 +1202,6 @@ mod tests {
     fn bulk_staging_enforces_per_client_byte_quota() {
         let client = ClientQuotaKey::for_test(7);
         let other = ClientQuotaKey::for_test(8);
-        let payload = vec![1u8; 4096];
-        let over = MAX_STAGED_BYTES_PER_CLIENT + 1;
-        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(97)).unwrap();
-        let reference = RemoteBulkTransferRef::new(
-            transfer_id,
-            over,
-            digest_of(&payload),
-            RemoteBulkMimeClass::Archive,
-        )
-        .unwrap();
-        assert!(matches!(
-            write_chunk(&reference, 0, &[], &client),
-            Err(BulkStagingError::CapacityExceeded)
-        ));
-
         let allowed = MAX_STAGED_BYTES_PER_CLIENT;
         let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(98)).unwrap();
         let first = RemoteBulkTransferRef::new(
@@ -1237,6 +1227,40 @@ mod tests {
         write_chunk(&second, 0, &[], &other).unwrap();
         discard(id(98));
         discard(id(99));
+    }
+
+    #[test]
+    fn opaque_and_archive_staging_share_one_principal_quota() {
+        let quota = ClientQuotaKey::for_test(11);
+        let owner_a = BulkTransferOwner::for_attached_identity(Uuid::from_u128(21), b"same-actor");
+        let owner_b = BulkTransferOwner::for_attached_identity(Uuid::from_u128(22), b"same-actor");
+        let archive_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(91)).unwrap();
+        let archive = RemoteBulkTransferRef::new(
+            archive_id,
+            MAX_STAGED_BYTES_PER_CLIENT,
+            digest_of(&[]),
+            RemoteBulkMimeClass::Archive,
+        )
+        .unwrap();
+        write_chunk(&archive, 0, &[], &quota).unwrap();
+
+        let payload = b"x";
+        let opaque = opaque_reference(payload, 92);
+        assert!(
+            matches!(
+                write_chunk_owned(&opaque, &owner_a, &quota, 0, payload),
+                Err(BulkStagingError::CapacityExceeded)
+            ),
+            "a second session of the same principal must share the archive reservation"
+        );
+        assert!(
+            matches!(
+                write_chunk_owned(&opaque, &owner_b, &quota, 0, payload),
+                Err(BulkStagingError::CapacityExceeded)
+            ),
+            "owner binding is authorization, not a second quota identity"
+        );
+        discard(id(91));
     }
 
     /// A transfer that goes quiet for a long — but sub-deadline — interval must
@@ -1319,7 +1343,7 @@ mod tests {
                 RemoteBulkMimeClass::Opaque,
             )
             .unwrap();
-            match write_chunk_owned(&reference, &owner, 0, &[]) {
+            match write_owned(&reference, &owner, 0, &[]) {
                 Ok(_) => staged.ids.push(raw),
                 Err(error) => {
                     refused = Some(error);
@@ -1397,7 +1421,7 @@ mod tests {
         .unwrap();
         let owner = BulkTransferOwner::for_attached_identity(Uuid::from_u128(7), b"actor-a");
 
-        let accepted = write_chunk_owned(&reference, &owner, 0, &first).unwrap();
+        let accepted = write_owned(&reference, &owner, 0, &first).unwrap();
         assert_eq!(accepted.next_chunk_index, 1);
         assert_eq!(accepted.received_bytes, first.len() as u64);
         assert!(!accepted.complete);
@@ -1405,20 +1429,20 @@ mod tests {
         // A lost acknowledgement is retried with the same reference and body.
         // It reports the same durable staging frontier and does not duplicate
         // bytes, which makes 64KiB..8MiB remote submission replay safe.
-        let replay = write_chunk_owned(&reference, &owner, 0, &first).unwrap();
+        let replay = write_owned(&reference, &owner, 0, &first).unwrap();
         assert_eq!(replay, accepted);
         assert!(matches!(
-            write_chunk_owned(&reference, &owner, 0, &first[..1]),
+            write_owned(&reference, &owner, 0, &first[..1]),
             Err(BulkStagingError::ChunkReplayMismatch)
         ));
         assert!(matches!(
-            write_chunk_owned(&reference, &owner, 0, b"different"),
+            write_owned(&reference, &owner, 0, b"different"),
             Err(BulkStagingError::ChunkReplayMismatch)
         ));
 
-        let complete = write_chunk_owned(&reference, &owner, 1, &second).unwrap();
+        let complete = write_owned(&reference, &owner, 1, &second).unwrap();
         assert!(complete.complete);
-        let completed_replay = write_chunk_owned(&reference, &owner, 1, &second).unwrap();
+        let completed_replay = write_owned(&reference, &owner, 1, &second).unwrap();
         assert_eq!(completed_replay, complete);
         assert_eq!(take_owned(&reference, &owner).unwrap(), payload);
     }
@@ -1442,7 +1466,7 @@ mod tests {
             "the exact boundary must use bulk chunking"
         );
         for (index, chunk) in payload.chunks(STAGED_CHUNK_BYTES).enumerate() {
-            let accepted = write_chunk_owned(&reference, &owner, index as u32, chunk).unwrap();
+            let accepted = write_owned(&reference, &owner, index as u32, chunk).unwrap();
             assert_eq!(accepted.next_chunk_index, index as u32 + 1);
             assert_eq!(accepted.complete, index as u32 + 1 == expected_chunks);
         }
@@ -1463,7 +1487,7 @@ mod tests {
         .unwrap();
         let owner = BulkTransferOwner::for_attached_identity(Uuid::from_u128(9), b"actor-a");
         assert!(matches!(
-            write_chunk_owned(&reference, &owner, 0, &payload),
+            write_owned(&reference, &owner, 0, &payload),
             Err(BulkStagingError::DigestMismatch)
         ));
         // The failed transfer left nothing behind.

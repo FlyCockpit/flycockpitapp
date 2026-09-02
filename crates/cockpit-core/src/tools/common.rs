@@ -192,9 +192,14 @@ pub(crate) fn boundary_safe_capture(
 
 /// Result of [`read_slice`]: the line-numbered body, whether it was
 /// capped, and the 1-indexed line the model/composer should pass as the
-/// next `offset` to continue reading. It also carries the total line
-/// count discovered during the same pass and whether the requested
-/// offset was past EOF.
+/// next `offset` to continue reading. `next_offset` is the source line
+/// immediately after the last shown line, in the SAME post-elision
+/// coordinates the rendered numbering is anchored to: when front-margin
+/// redaction consumes complete leading lines, both the `${n}|` numbering
+/// and the resume cursor advance past them — the cursor must never point
+/// back into already-elided or already-emitted content. It also carries
+/// the total line count discovered during the same pass and whether the
+/// requested offset was past EOF.
 pub struct ReadSlice {
     pub numbered: String,
     pub truncated: bool,
@@ -319,7 +324,8 @@ pub fn read_slice_with_byte_cap(
         // Fail-closed: when the elision empties the segment (nothing was
         // kept, or the whole kept span lay inside the unsafe margin), show
         // NO lines — never a fabricated empty `${n}|` row — so `next_offset`
-        // stays at the window start and paging re-offers rather than skips.
+        // stays at the first RETAINED line and paging re-offers rather than
+        // skips.
         if safe.is_empty() {
             Vec::new()
         } else {
@@ -357,7 +363,13 @@ pub fn read_slice_with_byte_cap(
         next_offset: if offset_exceeded {
             total_lines + 1
         } else {
-            offset + shown.len()
+            // Resume at the source line immediately after the last shown
+            // line. `shown` is numbered from `first_line_no` — the POST-elision
+            // first retained line — so the cursor must anchor there too, not
+            // at the pre-elision window start `offset`: when the front margin
+            // consumed complete leading lines, `offset + shown.len()` would
+            // point back into already-elided or already-emitted content.
+            first_line_no + shown.len()
         },
         total_lines,
         offset_exceeded,
@@ -876,6 +888,43 @@ mod tests {
         // The margin consumed leading lines; the first RETAINED line must
         // still carry its true source number (4), not the window start (3).
         assert!(slice.numbered.starts_with("4|"), "{}", slice.numbered);
+        // The resume cursor shares that post-elision anchor: it is the first
+        // source line AFTER the shown one (5, past EOF for this 4-line body)
+        // — never the already-shown line 4 that a pre-elision
+        // `offset + shown.len()` anchor would produce.
+        assert_eq!(slice.next_offset, 5);
+    }
+
+    // The pagination-cursor regression (issue #294): when the front margin
+    // consumes a complete leading line AND an omission edge makes the read
+    // truncated (the line limit leaves line 5 unshown), the continuation
+    // marker's cursor must be anchored in POST-elision coordinates — the
+    // first UNSHOWN source line (5) — not at the pre-elision window start,
+    // whose `offset + shown.len()` yields 4: the line just emitted.
+    #[tokio::test]
+    async fn read_slice_front_edge_elision_cursor_resumes_after_shown_lines() {
+        const SECRET: &str = "SECRET-HEAD-99\nSECRET-TAIL-99"; // 31-byte literal
+        let table = leak_table(SECRET);
+        let partial_tail = "SECRET-TAIL-99";
+        let line4 = format!("filler four {}", "z".repeat(40));
+        let body = format!("filler one\nfiller two\n{partial_tail}\n{line4}\nfiller five\n");
+        let slice = read_slice(&table, &body, 3, 2);
+        let scrubbed = table.scrub(&slice.numbered);
+        assert!(
+            !scrubbed.contains(partial_tail),
+            "front-edge multi-line partial leaked: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("SECRET-HEAD-99"));
+        // Front margin (30 bytes) consumed line 3 wholly and 14 bytes of
+        // line 4; the back margin (line 5 unshown) trimmed line 4's tail —
+        // exactly one retained row, numbered by its TRUE source line.
+        assert!(slice.truncated);
+        assert!(slice.numbered.starts_with("4|"), "{}", slice.numbered);
+        assert_eq!(slice.numbered.lines().count(), 1);
+        // The cursor a `read` continuation should use: the first line after
+        // the one shown. The pre-elision anchor regressed to 4 (already
+        // emitted); 5 is the first unseen content.
+        assert_eq!(slice.next_offset, 5);
     }
 
     // A multi-line registered literal straddling the read-slice BACK edge (the

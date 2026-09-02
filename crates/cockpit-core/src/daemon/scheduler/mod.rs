@@ -964,11 +964,19 @@ impl ProductionJobExecutor {
         let root = PathBuf::from(project_root);
         let project_id = crate::session::project_id_for(&root)?;
         let root_str = root.to_string_lossy().into_owned();
-        let session = self
-            .db
-            .create_assistant_session(&project_id, &root_str, &assistant, &assistant)
-            .await
-            .context("creating scheduled assistant session")?;
+        let vault = crate::secure_key::vault_for_db(&self.db).map_err(|error| {
+            anyhow::anyhow!("opening vault for scheduled assistant session: {error}")
+        })?;
+        let session = crate::session::lifecycle::persist_assistant_session_with_redaction_custody(
+            &self.db,
+            vault,
+            &project_id,
+            &root_str,
+            &assistant,
+            &assistant,
+        )
+        .await
+        .context("creating scheduled assistant session")?;
         let result = self
             .prompt_runner
             .run_prompt_turn(
@@ -2050,10 +2058,17 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let registry = production_registry(db.clone());
         let project_root = tmp.path().to_string_lossy().into_owned();
-        let row = db
-            .create_assistant_session("project", &project_root, "helper-bot", "helper-bot")
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let row = crate::session::lifecycle::persist_assistant_session_with_redaction_custody(
+            &db,
+            vault,
+            "project",
+            &project_root,
+            "helper-bot",
+            "helper-bot",
+        )
+        .await
+        .unwrap();
         let session = Arc::new(
             Session::resume(
                 db.clone(),
@@ -3242,6 +3257,13 @@ mod tests {
         assert_eq!(session.assistant_name.as_deref(), Some("helper-bot"));
         assert_eq!(session.active_agent, "helper-bot");
         assert_eq!(session.project_root, project_root.to_string_lossy());
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        crate::session::lifecycle::require_redaction_table_json_from_vault(
+            &vault,
+            session.session_id,
+            "scheduled assistant session redaction custody",
+        )
+        .expect("scheduled session must own redaction custody");
         assert!(result.ok);
         assert_eq!(runner.runs.load(Ordering::SeqCst), 1);
         assert!(

@@ -14,7 +14,9 @@ that fall below the hard floor.
 from matching names such as `PATH` or a user-specified variable name from being
 registered automatically. It is not a value allowlist.
 
-File-derived dotenv values and private SSH key material are re-derived when a session resumes and are never stored in `cockpit.db`'s redaction snapshot. If a legacy file-derived entry cannot be re-derived, Cockpit emits a warning without logging its value. Stored named secrets plus provider and MCP credential values are redacted and may remain in the private session snapshot.
+File-derived dotenv values and private SSH key material are re-derived when a session resumes and are never stored as plaintext in `cockpit.db`. Accumulated session tables live in the encrypted vault. If a legacy file-derived entry cannot be re-derived, Cockpit emits a warning without logging its value. Stored named secrets plus provider and MCP credential values are redacted and may remain in the private session snapshot.
+
+A failed redaction-table load (SQLite busy, vault read error, or credential-store open failure) refuses to send or fork rather than proceeding with an empty table.
 
 Filesystem paths are protected structurally. Cockpit never automatically
 registers the session cwd/project root, git worktree root, `HOME`, `TMPDIR`, or

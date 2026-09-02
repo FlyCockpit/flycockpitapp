@@ -263,6 +263,7 @@ mod tests {
         SandboxPolicy {
             allow_read_roots: vec![root.to_path_buf()],
             allow_write_roots: vec![root.to_path_buf()],
+            deny_paths: Vec::new(),
             network_allowed: true,
         }
     }

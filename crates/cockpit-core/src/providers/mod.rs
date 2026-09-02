@@ -16,6 +16,7 @@ pub mod deepfetch;
 pub(crate) mod http_retry;
 pub mod models_fetch;
 pub mod openrouter_attribution;
+pub(crate) mod provider_http;
 pub mod registry;
 pub mod usage;
 

@@ -232,31 +232,31 @@ pub(super) async fn fork_session(
     let created_by = principal.tag();
     // `/side` forks land ephemeral (excluded from lists, never auto-titled,
     // discarded on end/exit); fresh threads persist with only an anchor.
-    let row = if fresh_thread {
+    if fresh_thread {
         if ephemeral {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: "a fresh thread cannot be ephemeral".to_string(),
             });
         }
-        let Some(anchor_turn_id) = fork_point_turn_id.clone() else {
+        if fork_point_turn_id.is_none() {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: "a fresh thread requires a message anchor".to_string(),
             });
-        };
-        ctx.db
-            .create_thread(parent_session_id, anchor_turn_id)
-            .await
-    } else if ephemeral {
-        ctx.db
-            .create_ephemeral_fork(parent_session_id, fork_point_turn_id.clone())
-            .await
-    } else {
-        ctx.db
-            .create_fork(parent_session_id, fork_point_turn_id.clone())
-            .await
+        }
     }
+    // Vault custody is copied before the child row is visible, matching
+    // `Session::create_fork`: a failed copy must not leave a resumable fork
+    // without its redaction boundary.
+    let row = crate::session::lifecycle::persist_fork_with_redaction_custody(
+        &ctx.db,
+        &ctx.secret_vault,
+        parent_session_id,
+        fork_point_turn_id.clone(),
+        ephemeral,
+        fresh_thread,
+    )
     .map_err(internal)?;
     if let Some(tag) = created_by {
         ctx.db
@@ -300,11 +300,14 @@ pub(super) async fn create_btw_fork(
         Err(e) => return Err(internal(e)),
     }
     let created_by = principal.tag();
-    let result = ctx
-        .db
-        .create_btw_fork(parent_session_id, tangent)
-        .await
-        .map_err(internal)?;
+    let result = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        parent_session_id,
+        tangent,
+    )
+    .await
+    .map_err(internal)?;
     if result.created
         && let Some(tag) = created_by
     {

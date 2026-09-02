@@ -38,6 +38,60 @@ impl std::fmt::Display for SessionForkRefusedSealed {
 
 impl std::error::Error for SessionForkRefusedSealed {}
 
+/// A visible `sessions` row was refused because it has no `redaction_table`
+/// vault item.
+///
+/// Typed so callers can distinguish a missing-custody insert from a generic
+/// constraint failure. The database insert primitives require
+/// [`SessionRedactionCustody`] rather than documenting a call-site convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRedactionCustodyRequired {
+    pub session_id: Uuid,
+}
+
+impl std::fmt::Display for SessionRedactionCustodyRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session {} insert requires redaction-table vault custody",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for SessionRedactionCustodyRequired {}
+
+/// Witness that `session_id` owns a `redaction_table` vault item on this
+/// connection.
+///
+/// The only constructor checks the vault row. Typed session inserts require
+/// this witness, so a durable `sessions` row cannot be created without
+/// redaction custody at the database layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRedactionCustody {
+    session_id: Uuid,
+}
+
+impl SessionRedactionCustody {
+    /// Prove that `session_id` already has a `redaction_table` vault item on
+    /// `conn`. Callers write that item in the same transaction, then pass the
+    /// witness to [`Db::insert_session_row_conn`].
+    pub fn require_on_conn(conn: &Connection, session_id: Uuid) -> Result<Self> {
+        let exists = crate::db::secret_vault::session_redaction_table_vault_item_exists_conn(
+            conn,
+            &session_id.to_string(),
+        )?;
+        if !exists {
+            return Err(SessionRedactionCustodyRequired { session_id }.into());
+        }
+        Ok(Self { session_id })
+    }
+
+    pub fn session_id(self) -> Uuid {
+        self.session_id
+    }
+}
+
 /// Count the scoped sealed value records a session owns.
 ///
 /// Session scope keys its records by the session id. Project- and
@@ -238,7 +292,6 @@ pub struct SessionRow {
     /// diffs continue from the same system-instruction baseline.
     pub guidance_baseline_path: Option<String>,
     pub guidance_baseline_hash: Option<String>,
-    pub redaction_table_json: Option<String>,
     pub model_system_prompt_snapshot_json: String,
     /// Frozen KB names/descriptions/last-dreamed facts for the cached system
     /// prefix. Later dream completion is delivered as injected history.
@@ -337,7 +390,6 @@ impl SessionRow {
             )?,
             guidance_baseline_path: row.get("guidance_baseline_path")?,
             guidance_baseline_hash: row.get("guidance_baseline_hash")?,
-            redaction_table_json: row.get("redaction_table_json")?,
             model_system_prompt_snapshot_json: row
                 .get("model_system_prompt_snapshot_json")
                 .unwrap_or_else(|_| "{}".to_string()),
@@ -517,12 +569,12 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           short_id, provider, model, model_selection_json, active_model_revision,
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
-          guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
+          guidance_baseline_hash, model_system_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
           is_assistant_thread)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -541,7 +593,6 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.goal_settings_override_json,
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
-            row.redaction_table_json,
             row.model_system_prompt_snapshot_json,
             row.knowledge_base_prompt_snapshot_json,
             row.knowledge_base_prompt_snapshot_captured as i64,
@@ -588,12 +639,12 @@ fn execute_fork_insert(
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           title_recovery_nudge_state,
-          guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
+          guidance_baseline_path, guidance_baseline_hash, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, active_model_revision, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -617,7 +668,6 @@ fn execute_fork_insert(
             row.title_recovery_nudge_state.as_i64(),
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
-            row.redaction_table_json,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
             row.btw_parent_session_id.map(|id| id.to_string()),
@@ -759,7 +809,6 @@ fn build_session_row(
         title_recovery_nudge_state: TitleRecoveryNudgeState::None,
         guidance_baseline_path: None,
         guidance_baseline_hash: None,
-        redaction_table_json: None,
         model_system_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_captured: false,
@@ -939,7 +988,7 @@ fn copy_fork_tool_calls(
     Ok(())
 }
 
-fn live_btw_fork_info_conn(
+pub fn live_btw_fork_info_conn(
     conn: &Connection,
     parent_session_id: Uuid,
 ) -> Result<Option<BtwForkInfo>> {
@@ -1556,6 +1605,13 @@ impl Db {
             .transpose()
     }
 
+    /// Insert a `sessions` row **without** redaction-table vault custody.
+    ///
+    /// Test/fixture constructor. Production inserts go through
+    /// [`Self::insert_session_row_conn`], which requires
+    /// [`SessionRedactionCustody`]. Unavailable to a normal dependency graph:
+    /// only `cfg(test)` and the `test-support` feature expose it.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_session(
         &self,
         project_id: &str,
@@ -1568,7 +1624,7 @@ impl Db {
         self.write(move |conn| {
             let row =
                 Self::build_new_session_row_conn(conn, &project_id, &project_root, &active_agent)?;
-            Self::insert_session_row_conn(conn, &row)
+            Self::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
     }
@@ -1620,6 +1676,11 @@ impl Db {
         build_session_row(project_id, project_root, active_agent, Some(short_id), None)
     }
 
+    /// Insert an assistant `sessions` row **without** redaction-table vault
+    /// custody.
+    ///
+    /// Same fixture-only contract as [`Self::create_session`].
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_assistant_session(
         &self,
         project_id: &str,
@@ -1639,7 +1700,7 @@ impl Db {
                 &active_agent,
                 &assistant_name,
             )?;
-            Self::insert_session_row_conn(conn, &row)
+            Self::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
     }
@@ -1707,17 +1768,57 @@ impl Db {
     }
 
     /// Insert a pre-built root session row. Pairs with
-    /// [`Self::new_session_row`] for the deferred-persistence path; also the
-    /// second half of [`Self::create_session`]. Idempotent at the
-    /// application layer is **not** assumed — callers persist exactly once.
+    /// [`Self::new_session_row`] for the deferred-persistence path. Idempotent
+    /// at the application layer is **not** assumed — callers persist exactly
+    /// once.
+    ///
+    /// Refuses unless a `redaction_table` vault item for `row.session_id`
+    /// already exists on the write connection. Write that item in the same
+    /// transaction, then insert.
     pub async fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
         let row = row.clone();
-        self.write(move |conn| Self::insert_session_row_conn(conn, &row))
-            .await
+        self.write(move |conn| {
+            let custody = SessionRedactionCustody::require_on_conn(conn, row.session_id)?;
+            Self::insert_session_row_conn(conn, &row, custody)
+        })
+        .await
     }
 
-    pub fn insert_session_row_conn(conn: &Connection, row: &SessionRow) -> Result<SessionRow> {
+    /// Insert a visible `sessions` row. `custody` must have been proven on
+    /// this same connection for `row.session_id`.
+    pub fn insert_session_row_conn(
+        conn: &Connection,
+        row: &SessionRow,
+        custody: SessionRedactionCustody,
+    ) -> Result<SessionRow> {
+        ensure!(
+            custody.session_id() == row.session_id,
+            "redaction custody is for session {} but the insert is session {}",
+            custody.session_id(),
+            row.session_id
+        );
         insert_session_row_with_short_id_retry(conn, row.clone()).context("inserting session")
+    }
+
+    /// Fixture insert that does not require redaction-table vault custody.
+    /// Production code cannot name this method.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_session_row_without_redaction_custody_conn(
+        conn: &Connection,
+        row: &SessionRow,
+    ) -> Result<SessionRow> {
+        insert_session_row_with_short_id_retry(conn, row.clone()).context("inserting session")
+    }
+
+    /// Async fixture insert without redaction-table vault custody.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn insert_session_row_without_redaction_custody(
+        &self,
+        row: &SessionRow,
+    ) -> Result<SessionRow> {
+        let row = row.clone();
+        self.write(move |conn| Self::insert_session_row_without_redaction_custody_conn(conn, &row))
+            .await
     }
 
     pub async fn set_session_created_by_principal(
@@ -1774,6 +1875,10 @@ impl Db {
     /// `fork_point_turn_id` (None = tail). Inherits the parent's
     /// project_id, project_root, active_agent, provider, model.
     /// Returns the new session row (with a fresh UUID + short_id).
+    ///
+    /// Fixture constructor: does not require redaction-table vault custody.
+    /// Production forks go through [`Self::create_fork_row_conn`].
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_fork(
         &self,
         parent_session_id: Uuid,
@@ -1787,6 +1892,7 @@ impl Db {
     /// to [`Self::create_fork`] but marks the row `ephemeral = 1`, so it is
     /// excluded from every list query, never auto-titled, never resumable,
     /// and discarded when the side conversation ends / its process exits.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_ephemeral_fork(
         &self,
         parent_session_id: Uuid,
@@ -1799,6 +1905,7 @@ impl Db {
     /// Create a persistent child thread anchored to one message in its parent.
     /// The thread starts with a fresh transcript; only its durable anchor
     /// reference links it back to the source message.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_thread(
         &self,
         parent_session_id: Uuid,
@@ -1812,6 +1919,11 @@ impl Db {
     /// `parent_session_id`. The fork is hidden from session lists like an
     /// ephemeral `/side` fork, but it is not swept on boot because it carries
     /// typed BTW linkage.
+    ///
+    /// Fixture constructor: a newly created `/btw` row does not require
+    /// redaction-table vault custody. Production `/btw` inserts go through
+    /// [`Self::create_btw_fork_conn`].
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_btw_fork(
         &self,
         parent_session_id: Uuid,
@@ -1823,7 +1935,7 @@ impl Db {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin create_btw_fork tx")?;
-            let result = Self::create_btw_fork_conn(
+            let result = Self::create_btw_fork_body_conn(
                 &tx,
                 parent_session_id,
                 tangent,
@@ -1841,7 +1953,27 @@ impl Db {
     /// remote-operation ledger writer). Statements run directly on `conn`;
     /// the caller commits. Idempotent: returns the existing live `/btw` fork
     /// (`created: false`) when one is already present for the parent.
+    ///
+    /// A newly created child must already own a `redaction_table` vault item
+    /// on `conn`.
     pub fn create_btw_fork_conn(
+        conn: &Connection,
+        parent_session_id: Uuid,
+        tangent: bool,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<BtwForkCreateResult> {
+        if let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? {
+            return Ok(BtwForkCreateResult {
+                info,
+                created: false,
+            });
+        }
+        SessionRedactionCustody::require_on_conn(conn, session_id)?;
+        Self::create_btw_fork_body_conn(conn, parent_session_id, tangent, session_id, now_unix_ms)
+    }
+
+    fn create_btw_fork_body_conn(
         conn: &Connection,
         parent_session_id: Uuid,
         tangent: bool,
@@ -1909,7 +2041,6 @@ impl Db {
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
-            redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
@@ -1962,6 +2093,7 @@ impl Db {
         Ok(true)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn create_fork_inner(
         &self,
         parent_session_id: Uuid,
@@ -1972,7 +2104,7 @@ impl Db {
         let session_id = Uuid::new_v4();
         let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
-            Self::create_fork_conn(
+            Self::create_fork_row_body_conn(
                 conn,
                 parent_session_id,
                 fork_point_turn_id,
@@ -2014,7 +2146,32 @@ impl Db {
     /// connection ALREADY inside a transaction (e.g. the transactional
     /// remote-operation ledger writer, which cannot nest a second
     /// `BEGIN`). Statements run directly on `conn`; the caller commits.
+    ///
+    /// Refuses unless `session_id` already owns a `redaction_table` vault
+    /// item on `conn`. Copy or persist that item first in the same
+    /// transaction.
     pub fn create_fork_row_conn(
+        conn: &Connection,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        ephemeral: bool,
+        fresh_thread: bool,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<SessionRow> {
+        SessionRedactionCustody::require_on_conn(conn, session_id)?;
+        Self::create_fork_row_body_conn(
+            conn,
+            parent_session_id,
+            fork_point_turn_id,
+            ephemeral,
+            fresh_thread,
+            session_id,
+            now_unix_ms,
+        )
+    }
+
+    fn create_fork_row_body_conn(
         conn: &Connection,
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
@@ -2091,7 +2248,6 @@ impl Db {
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
-            redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
@@ -3294,22 +3450,6 @@ impl Db {
                 params![now_unix_ms, session_id.to_string()],
             )
             .context("touching session")?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn set_session_redaction_table_json(
-        &self,
-        session_id: Uuid,
-        redaction_table_json: Option<String>,
-    ) -> Result<()> {
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
-                params![redaction_table_json, session_id.to_string()],
-            )
-            .context("setting session redaction table")?;
             Ok(())
         })
         .await
@@ -4536,7 +4676,9 @@ mod tests {
         assert!(row.short_id.is_some());
         assert!(db.get_session(row.session_id).await.unwrap().is_none());
         assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
-        db.insert_session_row(&row).await.unwrap();
+        db.insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.project_id, "p");
         assert_eq!(got.short_id, row.short_id);
@@ -4549,7 +4691,9 @@ mod tests {
         let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         assert_eq!(row.session_entry_mode, "code");
         row.session_entry_mode = "computer".to_string();
-        db.insert_session_row(&row).await.unwrap();
+        db.insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
         assert_eq!(
             db.get_session(row.session_id)
                 .await
@@ -4568,7 +4712,9 @@ mod tests {
         let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         row.provider = Some("anthropic".into());
         row.model = Some("opus".into());
-        db.insert_session_row(&row).await.unwrap();
+        db.insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.provider.as_deref(), Some("anthropic"));
         assert_eq!(got.model.as_deref(), Some("opus"));
@@ -4585,7 +4731,9 @@ mod tests {
         row.provider = Some("anthropic".into());
         row.model = Some("opus".into());
         row.active_model_revision = 3;
-        db.insert_session_row(&row).await.unwrap();
+        db.insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
 
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.active_model_revision, 3);
@@ -4639,7 +4787,9 @@ mod tests {
         row.knowledge_base_prompt_snapshot_json = r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#.to_string();
         row.knowledge_base_prompt_snapshot_captured = true;
 
-        db.insert_session_row(&row).await.unwrap();
+        db.insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
 
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(
@@ -4654,17 +4804,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_session_row_round_trips_redaction_table_json() {
+    async fn sessions_table_has_no_plaintext_redaction_column() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
-        row.redaction_table_json =
-            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#.to_string());
-        db.insert_session_row(&row).await.unwrap();
-
-        let got = db.get_session(row.session_id).await.unwrap().unwrap();
-        assert_eq!(
-            got.redaction_table_json.as_deref(),
-            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#)
+        let names: Vec<String> = db
+            .blocking_write_for_sync_maintenance(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
+            })
+            .unwrap();
+        assert!(
+            !names.iter().any(|name| name == "redaction_table_json"),
+            "sessions.redaction_table_json was folded; redaction tables live in the vault"
         );
     }
 
@@ -4763,7 +4916,10 @@ mod tests {
         assert_eq!(competing.short_id.as_deref(), Some("aaaaaa"));
 
         set_test_short_ids(&db, &["bbbbbb"]).await;
-        let inserted = db.insert_session_row(&row).await.unwrap();
+        let inserted = db
+            .insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
         assert_eq!(inserted.short_id.as_deref(), Some("bbbbbb"));
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.short_id.as_deref(), Some("bbbbbb"));
@@ -4850,15 +5006,14 @@ mod tests {
             "prompt_cache_retention": "extended"
         });
         parent.model_selection_json = Some(model_selection.to_string());
-        parent.redaction_table_json = Some(
-            r#"{"entries":[{"value":"fork-secret","class":"ordinary","origin":"$TEST"}],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
-                .to_string(),
-        );
         parent.model_system_prompt_snapshot_json =
             r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
         parent.knowledge_base_prompt_snapshot_json = r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#.to_string();
         parent.knowledge_base_prompt_snapshot_captured = true;
-        let parent = db.insert_session_row(&parent).await.unwrap();
+        let parent = db
+            .insert_session_row_without_redaction_custody(&parent)
+            .await
+            .unwrap();
         let fork_point = record_message(&db, parent.session_id, "fork here", false)
             .await
             .to_string();
@@ -4892,12 +5047,6 @@ mod tests {
             .unwrap(),
             model_selection
         );
-        assert!(
-            fork.redaction_table_json
-                .as_deref()
-                .is_none_or(|json| !json.contains("fork-secret")),
-            "fork must not copy plaintext redaction literals"
-        );
     }
 
     #[tokio::test]
@@ -4910,12 +5059,6 @@ mod tests {
             "long-high-entropy-token",
             "reason",
             "user",
-        )
-        .await
-        .unwrap();
-        db.set_session_redaction_table_json(
-            parent.session_id,
-            Some(r#"{"entries":[{"value":"fork-secret"}]}"#.to_string()),
         )
         .await
         .unwrap();
@@ -4936,11 +5079,6 @@ mod tests {
             child_value
                 .as_deref()
                 .is_none_or(|raw| raw != "long-high-entropy-token")
-        );
-        assert!(
-            fork.redaction_table_json
-                .as_deref()
-                .is_none_or(|json| !json.contains("fork-secret"))
         );
     }
 
@@ -6630,5 +6768,208 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    fn plant_redaction_table_vault_item(conn: &Connection, session_id: Uuid) -> Result<()> {
+        let key_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM secret_vault_keys WHERE key_version = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if key_exists == 0 {
+            crate::db::secret_vault::insert_key_conn(
+                conn,
+                1,
+                1,
+                &[1u8; 12],
+                &[2u8; crate::db::secret_vault::VAULT_WRAPPED_DEK_LEN],
+                true,
+            )?;
+        }
+        crate::db::secret_vault::upsert_item_conn(
+            conn,
+            crate::db::secret_vault::SecretVaultKind::RedactionTable,
+            &session_id.to_string(),
+            1,
+            &[3u8; 12],
+            &[4u8; 16],
+        )
+    }
+
+    #[tokio::test]
+    async fn insert_session_row_conn_refuses_without_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let row = db
+            .write(|conn| Db::build_new_session_row_conn(conn, "p", "/repo", "Build"))
+            .await
+            .unwrap();
+        let err = db
+            .write({
+                let session_id = row.session_id;
+                move |conn| SessionRedactionCustody::require_on_conn(conn, session_id)
+            })
+            .await
+            .expect_err("witness must not exist before a vault item");
+        let required = err
+            .downcast_ref::<SessionRedactionCustodyRequired>()
+            .expect("missing vault item must be the typed custody error");
+        assert_eq!(required.session_id, row.session_id);
+        let err = db
+            .insert_session_row(&row)
+            .await
+            .expect_err("production insert_session_row must refuse without custody");
+        assert!(
+            err.downcast_ref::<SessionRedactionCustodyRequired>()
+                .is_some(),
+            "insert must fail closed on the custody probe: {err:#}"
+        );
+        assert!(
+            db.get_session(row.session_id).await.unwrap().is_none(),
+            "a refused insert must not leave a visible sessions row"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_session_row_conn_accepts_proven_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = db
+            .write(|conn| {
+                let row = Db::build_new_session_row_conn(conn, "p", "/repo", "Build")?;
+                plant_redaction_table_vault_item(conn, row.session_id)?;
+                let custody = SessionRedactionCustody::require_on_conn(conn, row.session_id)?;
+                let inserted = Db::insert_session_row_conn(conn, &row, custody)?;
+                assert!(
+                    crate::db::secret_vault::session_redaction_table_vault_item_exists_conn(
+                        conn,
+                        &inserted.session_id.to_string(),
+                    )?
+                );
+                Ok(inserted.session_id)
+            })
+            .await
+            .unwrap();
+        assert!(db.get_session(session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn insert_session_row_refuses_without_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let row = db.new_session_row("p", "/repo", "Build").await.unwrap();
+        let err = db
+            .insert_session_row(&row)
+            .await
+            .expect_err("async insert must refuse a row with no vault item");
+        assert!(
+            err.downcast_ref::<SessionRedactionCustodyRequired>()
+                .is_some(),
+            "async insert must fail closed on the production probe: {err:#}"
+        );
+        assert!(db.get_session(row.session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_session_row_conn_rejects_mismatched_custody_witness() {
+        let db = Db::open_in_memory().unwrap();
+        db.write(|conn| {
+            let owned = Db::build_new_session_row_conn(conn, "p", "/repo", "Build")?;
+            let other = Db::build_new_session_row_conn(conn, "p", "/repo", "Build")?;
+            plant_redaction_table_vault_item(conn, owned.session_id)?;
+            let custody = SessionRedactionCustody::require_on_conn(conn, owned.session_id)?;
+            let err = Db::insert_session_row_conn(conn, &other, custody)
+                .expect_err("a witness must not insert a different session");
+            assert!(
+                err.to_string().contains("redaction custody is for session"),
+                "mismatched witness must be rejected: {err:#}"
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
+                    [other.session_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )? == 0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_fork_row_conn_refuses_without_child_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/repo", "Build").await.unwrap();
+        let child_id = Uuid::new_v4();
+        let err = db
+            .write(move |conn| {
+                Db::create_fork_row_conn(
+                    conn,
+                    parent.session_id,
+                    None,
+                    false,
+                    false,
+                    child_id,
+                    Utc::now().timestamp_millis(),
+                )
+            })
+            .await
+            .expect_err("production fork insert must require child custody");
+        assert!(
+            err.downcast_ref::<SessionRedactionCustodyRequired>()
+                .is_some(),
+            "fork insert must fail closed on the custody probe: {err:#}"
+        );
+        assert!(db.get_session(child_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn create_fork_row_conn_accepts_proven_child_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/repo", "Build").await.unwrap();
+        let child_id = Uuid::new_v4();
+        let inserted = db
+            .write({
+                let parent_id = parent.session_id;
+                move |conn| {
+                    plant_redaction_table_vault_item(conn, child_id)?;
+                    Db::create_fork_row_conn(
+                        conn,
+                        parent_id,
+                        None,
+                        false,
+                        false,
+                        child_id,
+                        Utc::now().timestamp_millis(),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(inserted.session_id, child_id);
+        assert_eq!(inserted.parent_session_id, Some(parent.session_id));
+    }
+
+    #[tokio::test]
+    async fn create_btw_fork_conn_refuses_without_child_redaction_custody() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/repo", "Build").await.unwrap();
+        let child_id = Uuid::new_v4();
+        let err = db
+            .write(move |conn| {
+                Db::create_btw_fork_conn(
+                    conn,
+                    parent.session_id,
+                    false,
+                    child_id,
+                    Utc::now().timestamp_millis(),
+                )
+            })
+            .await
+            .expect_err("production /btw insert must require child custody");
+        assert!(
+            err.downcast_ref::<SessionRedactionCustodyRequired>()
+                .is_some(),
+            "/btw insert must fail closed on the custody probe: {err:#}"
+        );
+        assert!(db.get_session(child_id).await.unwrap().is_none());
     }
 }

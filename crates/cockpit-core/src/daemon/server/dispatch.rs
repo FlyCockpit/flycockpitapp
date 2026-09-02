@@ -2628,6 +2628,9 @@ fn oauth_owner(state: &MutableClientState) -> String {
 ///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
 ///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
 ///   verified constructors). A caller cannot present itself as `Owner`.
+///   Issue #296: socket Owner is still blanket; secret RPCs additionally
+///   require the daemon-private capability. Follow-up #337 replaces this with
+///   authenticated per-peer identity.
 /// - `remote_operation` is produced only by `admit_remote_operation` from a
 ///   daemon-verified device actor binding; a genuine local owner always yields
 ///   `None` (admission short-circuits on `is_owner()`), and it cannot be forged.
@@ -9483,6 +9486,7 @@ async fn handle_serialized_request_impl(
             }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
+            let vault = ctx.secret_vault.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
@@ -9510,7 +9514,16 @@ async fn handle_serialized_request_impl(
                                     &assistant_for_db,
                                     &assistant_for_db,
                                 )?;
-                                (crate::db::Db::insert_session_row_conn(conn, &row)?, true)
+                                let tx = conn
+                                    .unchecked_transaction()
+                                    .context("begin assistant session insert tx")?;
+                                let row = crate::session::lifecycle::persist_session_row_with_redaction_custody_on_conn(
+                                    &tx,
+                                    &vault,
+                                    &row,
+                                )?;
+                                tx.commit().context("commit assistant session insert tx")?;
+                                (row, true)
                             }
                         };
                     let summary = crate::db::Db::list_session_summaries_conn(
@@ -31043,8 +31056,17 @@ pub(super) async fn auto_title_request(
     } else {
         let table = match session.persisted_redaction_table().map_err(internal)? {
             Some(table) => table,
-            None => crate::redact::RedactionTable::build(&extended.redact, &session.project_root)
-                .map_err(internal)?,
+            None => {
+                let store = session.credential_store().map_err(internal)?;
+                let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+                crate::redact::RedactionTable::build_with_env_and_credential_store(
+                    &extended.redact,
+                    &session.project_root,
+                    &env,
+                    &store,
+                )
+                .map_err(internal)?
+            }
         };
         std::sync::Arc::new(table)
     };

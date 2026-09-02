@@ -13,7 +13,14 @@ use crate::computer::host_identity::domain_hash;
 /// Snapshot an authority record before its durable pre-post pending mark.
 /// Generic so the rollback state machine is testable on non-macOS builders;
 /// the macOS backend supplies its private journal record type.
-pub(super) fn begin_known_pre_post<T: Clone>(
+///
+/// This stays in the cross-platform `platform::macos` module (not the
+/// macOS-only `macos_backend`) so the pure state machine keeps compiling and
+/// testing on non-macOS builders. No other platform backend owns a durable
+/// host-input authority journal, so there is no sibling to unify with; the
+/// `pub(in crate::computer)` scope is exactly the sibling backend module
+/// plus this module's own tests.
+pub(in crate::computer) fn begin_known_pre_post<T: Clone>(
     state: &mut T,
     mark_pending: impl FnOnce(&mut T),
 ) -> T {
@@ -23,7 +30,7 @@ pub(super) fn begin_known_pre_post<T: Clone>(
 }
 
 /// Restore the byte-for-byte logical authority state captured before prepare.
-pub(super) fn rollback_known_pre_post<T>(state: &mut T, previous: T) {
+pub(in crate::computer) fn rollback_known_pre_post<T>(state: &mut T, previous: T) {
     *state = previous;
 }
 
@@ -903,6 +910,60 @@ impl MacFocusedWindowLifetimeEpoch {
 
 // --- Production adapter ---------------------------------------------------
 
+/// Retained AX lifetime witness for the focused window.
+///
+/// The one piece of adapter state that is not plain data: a retained
+/// accessibility object held between snapshots so `CFEqual` can prove live
+/// window identity. AX window numbers, CoreGraphics window numbers, and PIDs
+/// are all recyclable, so this object — unlike every other AX/AppKit/
+/// CoreGraphics handle, which `capture_snapshot` acquires fresh on the
+/// calling thread — must persist across calls and cannot be re-acquired.
+///
+/// The witness API is deliberately restricted to thread-safe CF operations:
+/// object-identity comparison and the atomic `CFRetain`/`CFRelease` of the
+/// retained pointer. Accessibility messaging is never routed through it.
+#[cfg(target_os = "macos")]
+struct MacFocusedWindowWitness(
+    objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+);
+
+#[cfg(target_os = "macos")]
+impl MacFocusedWindowWitness {
+    fn new(
+        element: objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+    ) -> Self {
+        Self(element)
+    }
+
+    /// `CFEqual` object-identity comparison against a freshly acquired AX
+    /// element. This is AX's object identity, not a comparison of window
+    /// bounds or recyclable window numbers.
+    fn same_element(&self, element: &objc2_application_services::AXUIElement) -> bool {
+        objc2_core_foundation::CFEqual(Some(self.0.as_ref()), Some(element))
+    }
+}
+
+// SAFETY: `AXUIElementRef` is an immutable CoreFoundation object, and this
+// witness only performs thread-safe CF operations on it: `CFEqual` identity
+// comparison plus the atomic `CFRetain`/`CFRelease` of the retained pointer
+// (the same basis on which objc2-core-foundation itself implements
+// `Send`/`Sync` for `CFRetained<T>` once `T` is `Send + Sync`). Accessibility
+// messaging (`AXUIElementCopyAttributeValue` and friends) is never sent
+// through the witness — every AX query inside `capture_snapshot` acquires a
+// fresh element on the calling thread — so no AX run-loop or main-thread
+// affinity crosses these impls.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacFocusedWindowWitness {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MacFocusedWindowWitness {}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for MacFocusedWindowWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MacFocusedWindowWitness(<retained AXUIElement>)")
+    }
+}
+
 /// Synchronous macOS AX/AppKit/CoreGraphics evidence adapter.
 ///
 /// Native references are created and consumed inside `capture_snapshot`; no
@@ -916,9 +977,10 @@ pub struct MacOsTargetEvidenceAdapter {
     /// Retained AX element for the currently observed focused window. AX
     /// window and CoreGraphics numbers are recyclable; this retained live AX
     /// object is the lifetime witness that distinguishes a replacement from
-    /// the prior object even when those numeric IDs are identical.
-    focused_window_lifetime:
-        Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>>,
+    /// the prior object even when those numeric IDs are identical. Held as
+    /// [`MacFocusedWindowWitness`], the sole sanctioned cross-thread shape
+    /// for a retained AX element (thread-safe CF operations only).
+    focused_window_lifetime: Option<MacFocusedWindowWitness>,
     focused_window_lifetime_epoch: MacFocusedWindowLifetimeEpoch,
 }
 
@@ -996,15 +1058,13 @@ impl MacOsTargetEvidenceAdapter {
         let same_live_window = self
             .focused_window_lifetime
             .as_ref()
-            .is_some_and(|previous| {
-                objc2_core_foundation::CFEqual(Some(previous.as_ref()), Some(window.as_ref()))
-            });
+            .is_some_and(|witness| witness.same_element(&window));
         let focused_window_lifetime_epoch = self
             .focused_window_lifetime_epoch
             .observe(same_live_window)
             .map_err(|_| TargetUnavailableReason::EpochOverflow)?;
         if !same_live_window {
-            self.focused_window_lifetime = Some(window.clone());
+            self.focused_window_lifetime = Some(MacFocusedWindowWitness::new(window.clone()));
         }
 
         let (position, size) = ax_window_rect(&window)?;
@@ -1111,12 +1171,7 @@ impl MacOsTargetEvidenceAdapter {
         let recheck_same_lifetime = self
             .focused_window_lifetime
             .as_ref()
-            .is_some_and(|retained| {
-                objc2_core_foundation::CFEqual(
-                    Some(retained.as_ref()),
-                    Some(recheck_window.as_ref()),
-                )
-            });
+            .is_some_and(|witness| witness.same_element(&recheck_window));
         if !recheck_same_lifetime {
             return Err(TargetUnavailableReason::StaleTarget);
         }
@@ -1340,11 +1395,14 @@ fn cg_window_number_for_ax_window(
     let bounds_key = unsafe { kCGWindowBounds };
     let mut matches = Vec::new();
     for dictionary in info.iter() {
-        let owner_pid = cg_number_value(dictionary, owner_pid_key)?;
+        // `CFArray::iter` yields owned `CFRetained<CFDictionary>` values;
+        // the lookup helpers borrow the dictionary through `CFRetained`'s
+        // `Deref` for the duration of each call.
+        let owner_pid = cg_number_value(&dictionary, owner_pid_key)?;
         if owner_pid != i64::from(expected_pid) {
             continue;
         }
-        let bounds_value = cg_dictionary_value(dictionary, bounds_key)
+        let bounds_value = cg_dictionary_value(&dictionary, bounds_key)
             .ok_or(TargetUnavailableReason::QueryMismatch)?;
         let bounds_dictionary = bounds_value
             .downcast_ref::<CFDictionary>()
@@ -1367,7 +1425,7 @@ fn cg_window_number_for_ax_window(
         {
             continue;
         }
-        let window_number = cg_number_value(dictionary, window_number_key)?;
+        let window_number = cg_number_value(&dictionary, window_number_key)?;
         let window_number = u32::try_from(window_number)
             .ok()
             .filter(|number| *number != 0)

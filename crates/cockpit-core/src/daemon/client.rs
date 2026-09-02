@@ -104,6 +104,9 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
         if !matches!(&connected.endpoint, cockpit_client::ClientEndpoint::Wire(_)) {
             anyhow::bail!("ACP requires a discoverable socket ledger owner");
         }
+        if !connected.client.has_owner_capability() {
+            anyhow::bail!("ACP stdio ingress requires the daemon-private owner capability");
+        }
         return Ok(connected.client);
     }
     #[cfg(not(unix))]

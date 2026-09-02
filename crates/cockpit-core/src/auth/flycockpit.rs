@@ -180,7 +180,8 @@ impl FlycockpitClient {
     pub fn new(server_url: impl AsRef<str>) -> Result<Self> {
         let server_url = normalize_server_url(server_url.as_ref())?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::providers::provider_http::build()
+                .context("building Flycockpit HTTP client")?,
             server_url,
         })
     }

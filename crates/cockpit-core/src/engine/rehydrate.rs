@@ -7100,11 +7100,14 @@ mod tests {
     async fn btw_events_absent_from_parent_history() {
         let parent = root_session();
         record_user(&parent, "parent before btw").await;
-        let btw = parent
-            .db
-            .create_btw_fork(parent.id, true)
-            .await
-            .expect("btw fork");
+        let btw = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+            &parent.db,
+            crate::secure_key::vault_for_db(&parent.db).expect("test vault"),
+            parent.id,
+            true,
+        )
+        .await
+        .expect("btw fork");
         let btw_session = Session::resume_for_test(
             parent.db.clone(),
             btw.info.session_id,

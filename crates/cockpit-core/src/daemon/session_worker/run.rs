@@ -11628,16 +11628,25 @@ pub(super) async fn run_worker(
                     // interval therefore inherits a cancelled token; the fence
                     // then either owns its registry entry or invalidates its
                     // enqueue generation. Both happen before durable cleanup.
-                    if matches!(
+                    let session_work_stop_generation = if matches!(
                         work,
                         SessionWork::Cancel {
                             origin: CancelOrigin::InteractiveTurn
                         }
                     ) {
                         cancel_handle.cancel_turn();
+                        None
+                    } else if matches!(work, SessionWork::CancelAll) {
+                        // Stop-all: cancel the live turn slot, then the
+                        // session-work root (loops, swarm children, background
+                        // shells, background delegates), and rotate. Capture
+                        // the cancelled generation so the later registry sweep
+                        // cannot kill work admitted after this rotate.
+                        Some(cancel_handle.cancel_all_session_work())
                     } else {
                         cancel_handle.cancel_noninteractive();
-                    }
+                        None
+                    };
                     adopted_processes.cancel_all(&driver_input_queue).await;
                     if let Some(staged) = driver_input_queue.stage_discard_pending().await {
                         let disposition =
@@ -11668,9 +11677,11 @@ pub(super) async fn run_worker(
                             ),
                         }
                     }
-                    if matches!(work, SessionWork::CancelAll) {
+                    if let Some(through_generation) = session_work_stop_generation {
                         if job_cmd_tx
-                            .send(crate::engine::schedule::ScheduleCommand::CancelAll)
+                            .send(crate::engine::schedule::ScheduleCommand::CancelAll {
+                                through_generation,
+                            })
                             .await
                             .is_err()
                         {

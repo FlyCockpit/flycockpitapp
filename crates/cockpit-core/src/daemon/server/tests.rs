@@ -7045,13 +7045,12 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         [("PLANTED_API_KEY".to_string(), SECRET.to_string())],
     )
     .unwrap();
-    ctx.db
-        .set_session_redaction_table_json(
-            session.session_id,
-            Some(table.to_persisted_json().unwrap()),
-        )
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        session.session_id,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
     ctx.db
         .insert_session_event(
             session.session_id,
@@ -8052,6 +8051,7 @@ fn remote_state_with_grants(
             actor_binding: None,
             authorization: crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants),
         }),
+        has_owner_capability: false,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8095,6 +8095,7 @@ fn owner_state_with_instance(client_instance_id: Uuid) -> MutableClientState {
 fn owner_state() -> MutableClientState {
     MutableClientState {
         principal: ClientPrincipal::owner(),
+        has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8111,6 +8112,125 @@ fn owner_state() -> MutableClientState {
         pending_acp_catalog_composition: None,
         exit_guard_reservation: None,
     }
+}
+
+#[tokio::test]
+async fn owner_without_capability_is_denied_secret_rpcs() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    state.has_owner_capability = false;
+    let error = authorize_request(
+        &Request::PutNamedSecret {
+            name: "k".into(),
+            value: "v".into(),
+        },
+        &state,
+        &ctx,
+    )
+    .await
+    .expect_err("secret RPC must fail closed without the owner capability");
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(
+        error.message.contains("daemon-private owner capability"),
+        "{}",
+        error.message
+    );
+
+    authorize_request(&Request::DaemonStatus, &state, &ctx)
+        .await
+        .expect("public_read RPCs do not require the owner capability");
+}
+
+#[tokio::test]
+async fn owner_with_capability_is_allowed_secret_rpcs() {
+    let ctx = test_ctx();
+    let state = owner_state();
+    authorize_request(
+        &Request::PutNamedSecret {
+            name: "k".into(),
+            value: "v".into(),
+        },
+        &state,
+        &ctx,
+    )
+    .await
+    .expect("capability-bearing owner may call secret RPCs");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let mut client = ProtoStream::new(client_stream);
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, Uuid::nil());
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon hello, got {other:?}"),
+    }
+
+    let denied_id = Uuid::now_v7();
+    client
+        .send(&Envelope::request(
+            denied_id,
+            Request::PutNamedSecret {
+                name: "k".into(),
+                value: "v".into(),
+            },
+        ))
+        .await
+        .expect("send secret RPC without capability");
+    match recv_body(&mut client).await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(denied_id));
+            assert_eq!(error.code, ErrorCode::Authorization);
+            assert!(
+                error.message.contains("daemon-private owner capability"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected authorization error, got {other:?}"),
+    }
+
+    let allowed_id = Uuid::now_v7();
+    client
+        .send(&Envelope::request_with_owner_capability(
+            allowed_id,
+            Request::PutNamedSecret {
+                name: "k".into(),
+                value: "v".into(),
+            },
+            Some(proto::OwnerCapabilityToken::new(
+                ctx.owner_capability.token().to_string(),
+            )),
+        ))
+        .await
+        .expect("send secret RPC with capability");
+    match recv_body(&mut client).await {
+        Body::Error { id, error } if id == Some(allowed_id) => {
+            assert_ne!(
+                error.code,
+                ErrorCode::Authorization,
+                "capability-bearing socket peer must pass the owner-capability gate: {error:?}"
+            );
+        }
+        Body::Response { id, .. } => assert_eq!(id, allowed_id),
+        Body::Error { id, .. } => assert_eq!(id, Some(allowed_id)),
+        other => panic!("expected a correlated response, got {other:?}"),
+    }
+
+    drop(client);
+    let _ = server.await;
 }
 
 async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
@@ -10955,6 +11075,14 @@ async fn remote_archive_stops_worker_before_committing_archive() {
 async fn fork_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
@@ -11097,6 +11225,14 @@ async fn discard_session_reused_operation_conflict_rejects_before_detach() {
 async fn create_btw_fork_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;
@@ -15041,12 +15177,14 @@ async fn boot_ephemeral_sweep_continues_after_delete_failure() {
             let mut blocked =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/blocked", "Build")?;
             blocked.ephemeral = true;
-            let blocked = crate::db::Db::insert_session_row_conn(conn, &blocked)?;
+            let blocked =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &blocked)?;
 
             let mut removed =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/removed", "Build")?;
             removed.ephemeral = true;
-            let removed = crate::db::Db::insert_session_row_conn(conn, &removed)?;
+            let removed =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &removed)?;
             conn.execute(
                 "UPDATE sessions SET ephemeral = 1 WHERE session_id IN (?1, ?2)",
                 [
@@ -15376,6 +15514,7 @@ async fn attached_state_with_worker_receiver(
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
+            has_owner_capability: true,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
                 client_instance_id: Uuid::new_v4(),
@@ -18300,11 +18439,16 @@ async fn dispatch_authz_request_after(
 ) -> std::result::Result<Response, ErrorPayload> {
     let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
     let mut client = ProtoStream::new(client_stream);
+    // Owner matrix cells keep the capability so they exercise the 284-row
+    // table rather than the pre-launch capability fence. Remote principals
+    // never receive the daemon-private token.
+    let has_owner_capability = principal.is_owner();
     let mut server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
         principal,
         Uuid::new_v4(),
+        has_owner_capability,
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -18946,7 +19090,7 @@ async fn authz_cross_session_paused_work_scenario(
                 &target_root_str,
                 "Build",
             )?;
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
         .unwrap();
@@ -24036,6 +24180,7 @@ async fn assert_terminal_mutating_happy(kind: &str) {
                 ctx.clone(),
                 ClientPrincipal::owner(),
                 Uuid::new_v4(),
+                true,
             ));
             match recv_body(&mut client).await {
                 Body::Response { id, response } => {
@@ -24115,6 +24260,7 @@ async fn assert_terminal_ingress_mutating_happy(kind: &str) {
         ctx.clone(),
         ClientPrincipal::owner(),
         Uuid::new_v4(),
+        true,
     ));
     // Consume hello.
     match recv_body(&mut client).await {
@@ -28644,6 +28790,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
     );
+    state.has_owner_capability = true;
     let attached = handle_request(
         Request::Attach {
             session_id: None,
@@ -29296,6 +29443,7 @@ async fn image_submission_exact_retry_case() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
     );
+    state.has_owner_capability = true;
     let attached = handle_request(
         Request::Attach {
             session_id: None,
@@ -29434,6 +29582,7 @@ async fn image_submission_exact_retry_case() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
     );
+    state.has_owner_capability = true;
     handle_request(
         Request::Attach {
             session_id: Some(session_id),
@@ -33171,6 +33320,7 @@ async fn serialized_requests_apply_in_receipt_order() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
+        true,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -33350,6 +33500,7 @@ async fn concurrent_requests_may_complete_out_of_order() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
+        true,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -33420,6 +33571,7 @@ async fn slow_request_does_not_block_event_forwarding() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
+        true,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -33472,6 +33624,7 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
+        true,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -33529,6 +33682,7 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
+        true,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -33675,6 +33829,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         ctx,
         ClientPrincipal::owner(),
         Uuid::new_v4(),
+        true,
     ));
     drop(client);
     tokio::time::timeout(std::time::Duration::from_secs(2), task)
@@ -33694,6 +33849,7 @@ async fn hello_only_probe_does_not_claim_client_lifetime() {
         ctx,
         ClientPrincipal::owner(),
         Uuid::new_v4(),
+        true,
     ));
     let mut client = ProtoStream::new(client);
 
@@ -34137,6 +34293,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         registry: base.registry.clone(),
         redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
+        owner_capability: base.owner_capability.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
@@ -34355,6 +34512,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         registry: base.registry.clone(),
         redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
+        owner_capability: base.owner_capability.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
@@ -34654,6 +34812,14 @@ async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
 
     let first = handle_request(
         Request::CreateBtwFork {
@@ -34722,6 +34888,7 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
     let mut parent_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -34784,11 +34951,14 @@ async fn btw_concurrent_with_parent_turn() {
     };
     assert_eq!(parent_submission.text, "parent work");
 
-    let created = ctx
-        .db
-        .create_btw_fork(parent_row.session_id, true)
-        .await
-        .unwrap();
+    let created = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        parent_row.session_id,
+        true,
+    )
+    .await
+    .unwrap();
     let btw_session = Arc::new(
         Session::resume_for_test(
             ctx.db.clone(),
@@ -34802,6 +34972,7 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
     let mut btw_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),

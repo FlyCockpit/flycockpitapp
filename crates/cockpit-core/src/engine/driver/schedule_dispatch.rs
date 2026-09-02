@@ -356,12 +356,7 @@ impl Driver {
                 // normal tools so an approved command cannot be consumed by
                 // the helper and then escape without a terminal handoff
                 // receipt.
-                let cancel = self
-                    .cancel_current
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                    .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+                let cancel = self.live_or_session_cancel();
                 let effect_cancel = cancel.clone();
                 crate::engine::interrupt::with_host_approval_effect_scope(
                     "schedule_background_start",

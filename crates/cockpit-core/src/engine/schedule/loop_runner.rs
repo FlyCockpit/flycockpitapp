@@ -61,6 +61,9 @@ pub struct LoopRunCtx {
     /// The authority owns this handoff while a wake runs. It can promote an
     /// already-recorded action if external cancellation aborts the runner.
     pub active_idle_wake: Option<ActiveIdleWake>,
+    /// Session-work child token. Stop / `loop.cancel` fires this so in-flight
+    /// provider calls abort instead of billing after the task is aborted.
+    pub cancel: tokio_util::sync::CancellationToken,
     /// Test-only notification emitted after an iteration's non-independent
     /// transcript has been retained for the next wake.
     #[cfg(test)]
@@ -87,6 +90,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         mut idle_activity_rx,
         idle_activity_gate,
         active_idle_wake,
+        cancel,
         #[cfg(test)]
         iteration_completed_tx,
     } = run;
@@ -136,6 +140,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             args.interval_secs,
             idle_activity_rx.as_mut(),
             idle_activity_gate.as_ref(),
+            &cancel,
         )
         .await
         {
@@ -156,9 +161,15 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 errored = true;
                 break;
             }
+            WakeWait::Cancelled => {
+                last_result = format!("{} cancelled", args.kind().as_str());
+                cancelled = true;
+                break;
+            }
         }
 
-        if cancelled {
+        if cancelled || cancel.is_cancelled() {
+            cancelled = true;
             break;
         }
 
@@ -260,11 +271,17 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 .clone(),
             &live_ctx,
             &turn_tx,
+            cancel.clone(),
         )
         .await;
 
         match iteration_result {
             Ok(text) => last_result = text,
+            Err(e) if crate::engine::model::is_cancelled(&e) || cancel.is_cancelled() => {
+                last_result = format!("{} cancelled", args.kind().as_str());
+                cancelled = true;
+                break;
+            }
             Err(e) => {
                 last_result = format!("loop iteration error: {e:#}");
                 errored = true;
@@ -440,6 +457,9 @@ enum WakeWait {
     /// for an idle job; returning it prevents a closed watch channel from
     /// making the outer loop spin.
     ActivityChannelClosed,
+    /// Stop / `loop.cancel` fired while the runner was waiting for its next
+    /// wake. The loop must not start a provider call.
+    Cancelled,
 }
 
 async fn wait_for_next_wake(
@@ -447,12 +467,20 @@ async fn wait_for_next_wake(
     reset_delay_secs: u64,
     activity_rx: Option<&mut watch::Receiver<Instant>>,
     activity_gate: Option<&Arc<tokio::sync::Mutex<()>>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> WakeWait {
+    if cancel.is_cancelled() {
+        return WakeWait::Cancelled;
+    }
     let Some(activity_rx) = activity_rx else {
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        return WakeWait::Elapsed {
-            activity_seen: false,
-        };
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {
+                return WakeWait::Elapsed {
+                    activity_seen: false,
+                };
+            }
+            _ = cancel.cancelled() => return WakeWait::Cancelled,
+        }
     };
     let mut activity_seen = false;
     let mut deadline = Instant::now() + std::time::Duration::from_secs(delay_secs);
@@ -470,6 +498,7 @@ async fn wait_for_next_wake(
         tokio::pin!(sleep);
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => return WakeWait::Cancelled,
             changed = activity_rx.changed() => {
                 if changed.is_err() {
                     return WakeWait::ActivityChannelClosed;
@@ -491,6 +520,9 @@ async fn wait_for_next_wake(
                 let _admission = match activity_gate {
                     Some(gate) => Some(gate.lock().await),
                     None => None,
+                };
+                if cancel.is_cancelled() {
+                    return WakeWait::Cancelled;
                 };
                 match activity_rx.has_changed() {
                     Ok(true) => {
@@ -579,16 +611,16 @@ async fn run_iteration(
     session: Arc<crate::session::Session>,
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let mut next_prompt = Message::user(prompt.to_string());
     // A loop fork is a leaf with no human on the other end. Its toolbox
     // removes `question`, so it cannot raise an answerable interrupt (single
     // async-job authority, GOALS §22); a detached hub satisfies the shared
-    // `turn` signature. Same for cancellation: a fork isn't tied to the
-    // foreground run's ctrl+c slot (it's cancelled via `jobs(loop.cancel)`),
-    // so a fresh never-cancelled token keeps the signature uniform.
+    // `turn` signature. Cancellation is the session-work child the authority
+    // minted: TUI Ctrl+C (`CancelTurn`) does not fire it, but Stop /
+    // `loop.cancel` does, aborting in-flight provider calls.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-    let cancel = tokio_util::sync::CancellationToken::new();
     let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
         session.clone(),
         ctx.locks.clone(),
@@ -1055,7 +1087,14 @@ mod tests {
         let (activity_tx, activity_rx) = watch::channel(Instant::now());
         let wait = tokio::spawn(async move {
             let mut activity_rx = activity_rx;
-            wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await
+            wait_for_next_wake(
+                300,
+                60,
+                Some(&mut activity_rx),
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
         });
 
         tokio::task::yield_now().await;
@@ -1089,7 +1128,14 @@ mod tests {
         let wait_gate = gate.clone();
         let wait = tokio::spawn(async move {
             let mut activity_rx = activity_rx;
-            wait_for_next_wake(1, 60, Some(&mut activity_rx), Some(&wait_gate)).await
+            wait_for_next_wake(
+                1,
+                60,
+                Some(&mut activity_rx),
+                Some(&wait_gate),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
         });
 
         tokio::task::yield_now().await;
@@ -1125,7 +1171,14 @@ mod tests {
         drop(activity_tx);
 
         assert!(matches!(
-            wait_for_next_wake(60, 60, Some(&mut activity_rx), None).await,
+            wait_for_next_wake(
+                60,
+                60,
+                Some(&mut activity_rx),
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
             WakeWait::ActivityChannelClosed
         ));
     }
@@ -1140,10 +1193,16 @@ mod tests {
         activity_tx.send(Instant::now()).unwrap();
         tokio::time::advance(std::time::Duration::from_secs(45)).await;
 
-        let wait =
-            tokio::spawn(
-                async move { wait_for_next_wake(300, 60, Some(&mut activity_rx), None).await },
-            );
+        let wait = tokio::spawn(async move {
+            wait_for_next_wake(
+                300,
+                60,
+                Some(&mut activity_rx),
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        });
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(14)).await;
         tokio::task::yield_now().await;
@@ -1156,6 +1215,81 @@ mod tests {
                 activity_seen: true
             }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_cancels_a_pending_loop_wait() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let wait = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { wait_for_next_wake(300, 60, None, None, &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "uncancelled wait must still be sleeping"
+        );
+        cancel.cancel();
+        assert!(
+            matches!(wait.await.unwrap(), WakeWait::Cancelled),
+            "Stop must end a scheduled loop wait without starting inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_forked_loop_skips_provider() {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Hang)
+            .start()
+            .await;
+        let (ctx, _predecessor, _tmp) = loop_test_context(provider.base_url());
+        let (turn_tx, _turn_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_forked_loop(LoopRunCtx {
+                job_id: "job-stop".into(),
+                label: "stop".into(),
+                args: LoopStartArgs {
+                    interval_secs: 1,
+                    prompt: "must not reach the provider".into(),
+                    limit: Some(1),
+                    limit_defaulted: false,
+                    backoff: false,
+                    watch_paths: Vec::new(),
+                    idle: false,
+                    keep_in_context: false,
+                    independent: false,
+                },
+                ctx,
+                turn_tx,
+                event_tx,
+                idle_activity_rx: None,
+                idle_activity_gate: None,
+                active_idle_wake: None,
+                cancel,
+                iteration_completed_tx: None,
+            }),
+        )
+        .await
+        .expect("a cancelled loop must not wait on a hung provider");
+
+        match event_rx.recv().await.unwrap() {
+            ScheduleEvent::Completed { failed, result, .. } => {
+                assert!(!failed, "cancellation is not a job failure: {result}");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(
+            provider.request_count(),
+            0,
+            "Stop must abort before a provider request is sent"
+        );
     }
 
     #[test]
@@ -1211,6 +1345,7 @@ mod tests {
             idle_activity_rx: None,
             idle_activity_gate: None,
             active_idle_wake: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
             iteration_completed_tx: Some(iteration_completed_tx),
         }));
 

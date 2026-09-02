@@ -23,6 +23,13 @@ host-approval-composition = []
 # dev-dependency graph. Normal and release consumers cannot construct the
 # nil-interrupt fixture authority.
 host-approval-test-support = []
+# Fixture constructors that insert `sessions` rows without redaction-table
+# vault custody (`create_session`, `create_assistant_session`, and the
+# custody-free insert/fork helpers). Production inserts require
+# `SessionRedactionCustody`. Other crates' tests enable this from
+# `[dev-dependencies]` so FK fixtures keep compiling; a normal or release
+# consumer cannot construct a visible session without proving custody.
+test-support = []
 # Host-capability refresh decision creation is likewise an internal daemon
 # composition capability.  A generic Db caller must not be able to persist an
 # automatically resolvable `low_risk` request merely by choosing that string.

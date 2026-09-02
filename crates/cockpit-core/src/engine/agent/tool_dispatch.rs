@@ -4430,11 +4430,15 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let fork = db
-            .create_btw_fork(parent.id, false)
-            .await
-            .expect("btw fork")
-            .info;
+        let fork = crate::session::lifecycle::persist_btw_fork_with_redaction_custody(
+            &db,
+            crate::secure_key::vault_for_db(&db).expect("test vault"),
+            parent.id,
+            false,
+        )
+        .await
+        .expect("btw fork")
+        .info;
         Arc::new(
             Session::resume_for_test(
                 db,

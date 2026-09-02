@@ -146,37 +146,27 @@ impl BackgroundHandle {
     /// Budget-capped tail of the last `lines` output lines, scrubbed for
     /// secrets. Returns an empty string when no output has been produced.
     pub fn tail(&self, lines: usize, redact: &RedactionTable) -> String {
-        let snapshot: Vec<String> = {
+        let snap: RingSnapshot = {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
         };
         let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
-        // Tail: keep the most recent lines, so write from the end forward
-        // and reverse — but BudgetedWriter is forward-only, so we just
-        // write oldest→newest of the requested window and accept that an
-        // over-cap window drops its *oldest* lines (the head of the
-        // window), keeping the freshest output.
-        let start = snapshot
-            .len()
-            .saturating_sub(window_that_fits(&snapshot, TAIL_TOKEN_CAP));
-        for line in &snapshot[start..] {
-            if !writer.writeln(line) {
-                break;
-            }
-        }
+        // Tail: keep the most recent lines. The window is a SUFFIX of the
+        // stream — requested-tail slicing, ring eviction, and the token cap
+        // all omit OLDER content — so `write_budget_window` also elides the
+        // unsafe FRONT margin of the first retained line under the table
+        // the CALLER (the driver, at `background.tail` time) holds — the
+        // current session table.
+        let source = write_budget_window(&mut writer, redact, &snap, TAIL_TOKEN_CAP, false);
         // The tail budget can cut the last retained line mid-line; elide the
-        // cut's back margin under the table the CALLER (the driver, at
-        // `background.tail` time) holds — the current session table.
+        // cut's back margin under that same current session table.
         let body = writer.into_string_redacted(redact);
         if body.is_empty() {
             format!("`{}` has produced no output yet", self.label)
+        } else if self.attached_knowledge_read {
+            crate::knowledge::fence_knowledge_model_text_if_needed(&body, &source)
         } else {
-            let source = snapshot[start..].join("\n");
-            if self.attached_knowledge_read {
-                crate::knowledge::fence_knowledge_model_text_if_needed(&body, &source)
-            } else {
-                body
-            }
+            body
         }
     }
 
@@ -188,11 +178,11 @@ impl BackgroundHandle {
 
 /// Compute how many trailing lines of `lines` fit under `cap` tokens, so
 /// `tail` keeps the freshest output rather than the oldest.
-fn window_that_fits(lines: &[String], cap: usize) -> usize {
+fn window_that_fits(lines: &[&str], cap: usize) -> usize {
     let mut probe = BudgetedWriter::new(cap);
     let mut count = 0;
     for line in lines.iter().rev() {
-        if probe.writeln(line) {
+        if probe.writeln(*line) {
             count += 1;
         } else {
             break;
@@ -201,13 +191,136 @@ fn window_that_fits(lines: &[String], cap: usize) -> usize {
     count
 }
 
+/// Write the freshest `cap`-token window of `snap` (whole lines, freshest
+/// kept, per [`window_that_fits`]) into `writer`, redaction-aware at the
+/// window's FRONT edge (issue #294).
+///
+/// The budget drops whole OLDEST lines first, so the retained window is a
+/// SUFFIX of the stream, and every omission ahead of it — ring-evicted
+/// lines, requested-tail-skipped lines, budget-elided lines, or a previous
+/// physical line's discarded over-cap tail (the [`RingLine`] flags) — puts
+/// the first retained line's front at an omission boundary. A registered
+/// multi-line secret beginning in that omitted content and ending in the
+/// first retained line would leave only its SUFFIX there, which the
+/// downstream whole-value §7 scrub cannot match; the unsafe front margin of
+/// the first written STREAM line (and of every flagged line, wherever it
+/// falls in the window) is therefore elided under `redact` — the table
+/// CURRENT at render time, never a stale launch snapshot. The synthetic
+/// overflow marker is a fixed constant and never elided; the budget
+/// omitting the marker alone removes no stream content and creates no
+/// secret-bearing boundary.
+///
+/// When `elided_note` is set and the budget omitted anything, a fixed
+/// `[earlier output elided…]` note line is written first (it counts against
+/// the cap, matching the completion path's historical inline note).
+///
+/// Returns the RAW (pre-elision) join of exactly the lines written, for
+/// downstream knowledge-fence scanning of the delivered window.
+fn write_budget_window(
+    writer: &mut BudgetedWriter,
+    redact: &RedactionTable,
+    snap: &RingSnapshot,
+    cap: usize,
+    elided_note: bool,
+) -> String {
+    let probe: Vec<&str> = snap
+        .overflow
+        .as_deref()
+        .into_iter()
+        .chain(snap.lines.iter().map(|line| line.text.as_str()))
+        .collect();
+    let fit = window_that_fits(&probe, cap);
+    let start = probe.len().saturating_sub(fit);
+    let overflow_count = usize::from(snap.overflow.is_some());
+    // Stream-line index where the written window begins (a present overflow
+    // marker occupies `start == 0`).
+    let line_start = start.saturating_sub(overflow_count);
+    // Only omitted STREAM lines create a secret-bearing front boundary;
+    // omitting just the synthetic marker does not.
+    let front_cut = line_start > 0;
+    if elided_note && fit < probe.len() {
+        let _ = writer.writeln(&format!(
+            "[earlier output elided — {fit} of {} line(s) shown]",
+            probe.len()
+        ));
+    }
+    let mut raw_written: Vec<&str> = Vec::new();
+    if start == 0 {
+        if let Some(marker) = &snap.overflow {
+            if writer.writeln(marker) {
+                raw_written.push(marker);
+            }
+        }
+    }
+    for (i, line) in snap.lines[line_start..].iter().enumerate() {
+        let elide = line.front_abuts_omission || (i == 0 && front_cut);
+        let text = if elide {
+            crate::tools::common::drop_front_margin(redact, &line.text)
+        } else {
+            line.text.as_str()
+        };
+        if !writer.writeln(text) {
+            break;
+        }
+        raw_written.push(line.text.as_str());
+    }
+    raw_written.join("\n")
+}
+
+/// One retained output line with its omission-boundary metadata.
+#[derive(Debug, Clone)]
+struct RingLine {
+    text: String,
+    /// True when this line's FRONT abuts omitted stream content: earlier
+    /// ring lines were evicted ahead of it, the preceding physical line's
+    /// over-cap tail was discarded at the line/read cap, or the preceding
+    /// stream line was dropped whole. A registered multi-line secret
+    /// beginning in that omitted content and ending in this line would
+    /// leave only its SUFFIX here — a partial the downstream whole-value §7
+    /// scrub cannot match (issue #294). The unsafe front margin is elided
+    /// once, at RENDER time ([`write_budget_window`]), so the table CURRENT
+    /// at the cut applies — never a stale launch snapshot.
+    front_abuts_omission: bool,
+}
+
+/// A ring window ready for rendering: the synthetic overflow marker (earlier
+/// output evicted from the ring) and the retained raw lines with their
+/// front-omission flags. Lines stay RAW here; the redaction-aware front
+/// elision happens exactly once, in [`write_budget_window`], under the
+/// render-time table.
+#[derive(Debug)]
+struct RingSnapshot {
+    overflow: Option<String>,
+    lines: Vec<RingLine>,
+}
+
+impl RingSnapshot {
+    /// RAW (pre-elision) join of the whole snapshot — the marker and every
+    /// retained line — for downstream knowledge-fence scanning, which must
+    /// see the full retained window, not just the budget-visible slice.
+    fn raw_joined(&self) -> String {
+        let mut parts: Vec<&str> = Vec::with_capacity(self.lines.len() + 1);
+        if let Some(marker) = &self.overflow {
+            parts.push(marker);
+        }
+        parts.extend(self.lines.iter().map(|line| line.text.as_str()));
+        parts.join("\n")
+    }
+}
+
 #[derive(Debug)]
 struct BoundedOutputRing {
-    lines: VecDeque<String>,
+    lines: VecDeque<RingLine>,
     bytes: usize,
     dropped_lines: usize,
     dropped_bytes: usize,
     max_bytes: usize,
+    /// True when the NEXT pushed stream line's front abuts omitted content:
+    /// the previous physical line was truncated at the line cap (its tail
+    /// discarded by the ring or the capped reader), or the previous stream
+    /// line was dropped whole (larger than the entire ring). The synthetic
+    /// truncation-note line between the two never consumes this flag.
+    next_stream_front_abuts_omission: bool,
 }
 
 impl BoundedOutputRing {
@@ -218,10 +331,12 @@ impl BoundedOutputRing {
             dropped_lines: 0,
             dropped_bytes: 0,
             max_bytes: max_bytes.max(1),
+            next_stream_front_abuts_omission: false,
         }
     }
 
     fn push(&mut self, line: String, redact: &RedactionTable) {
+        let front_abuts_omission = self.next_stream_front_abuts_omission;
         let (line, truncated) = truncate_line(line, BACKGROUND_LINE_BYTE_CAP);
         // The retained head's END abuts the discarded tail of the physical
         // line: a registered secret straddling the cap would leave only its
@@ -232,55 +347,108 @@ impl BoundedOutputRing {
         } else {
             line
         };
-        self.push_one(line);
+        // The discarded tail also puts the NEXT physical line's front at an
+        // omission boundary: a secret spanning the discarded tail into that
+        // line would surface as an unmatchable SUFFIX there. Record it as a
+        // flag (not a push-time mutation) so the elision uses the table
+        // CURRENT at render time.
+        self.next_stream_front_abuts_omission = truncated;
+        let head_dropped = self.push_one(
+            RingLine {
+                text: line,
+                front_abuts_omission,
+            },
+            true,
+        );
         if truncated {
-            self.push_one(format!(
-                "[background output line truncated at {BACKGROUND_LINE_BYTE_CAP} bytes]"
-            ));
+            self.push_one(
+                RingLine {
+                    text: format!(
+                        "[background output line truncated at {BACKGROUND_LINE_BYTE_CAP} bytes]"
+                    ),
+                    // Synthetic constant: no registered secret can
+                    // straddle into it, and evicting everything ahead of it
+                    // never makes its front secret-bearing.
+                    front_abuts_omission: false,
+                },
+                false,
+            );
+        }
+        if head_dropped {
+            // The head itself was dropped whole (larger than the entire
+            // ring): the next stream line's front abuts its omitted bytes.
+            self.next_stream_front_abuts_omission = true;
         }
     }
 
-    fn push_one(&mut self, line: String) {
-        let line_bytes = line.len();
+    /// Push one line, evicting oldest lines to fit. Returns `true` when the
+    /// line was dropped whole (larger than the entire ring).
+    ///
+    /// `flag_front_if_evicted_to_front` marks the incoming line's front as
+    /// abutting omission when eviction empties the ring and the incoming
+    /// line becomes the front — true for stream lines, false for the
+    /// synthetic truncation note (a fixed constant).
+    fn push_one(&mut self, mut line: RingLine, flag_front_if_evicted_to_front: bool) -> bool {
+        let line_bytes = line.text.len();
         while self.bytes.saturating_add(line_bytes) > self.max_bytes {
             let Some(old) = self.lines.pop_front() else {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(old.len());
+            self.bytes = self.bytes.saturating_sub(old.text.len());
             self.dropped_lines = self.dropped_lines.saturating_add(1);
-            self.dropped_bytes = self.dropped_bytes.saturating_add(old.len());
+            self.dropped_bytes = self.dropped_bytes.saturating_add(old.text.len());
+            // Eviction is a front-omission boundary for whatever now leads
+            // the ring: a secret beginning in the evicted lines and ending
+            // in the new front line leaves an unmatchable SUFFIX there.
+            if let Some(front) = self.lines.front_mut() {
+                front.front_abuts_omission = true;
+            } else if flag_front_if_evicted_to_front {
+                line.front_abuts_omission = true;
+            }
         }
         if line_bytes <= self.max_bytes {
             self.bytes = self.bytes.saturating_add(line_bytes);
             self.lines.push_back(line);
+            false
         } else {
             self.dropped_lines = self.dropped_lines.saturating_add(1);
             self.dropped_bytes = self.dropped_bytes.saturating_add(line_bytes);
+            true
         }
     }
 
-    fn snapshot_all(&self) -> Vec<String> {
-        let mut out = self.overflow_prefix();
-        out.extend(self.lines.iter().cloned());
-        out
+    fn snapshot_all(&self) -> RingSnapshot {
+        RingSnapshot {
+            overflow: self.overflow_marker(),
+            lines: self.lines.iter().cloned().collect(),
+        }
     }
 
-    fn snapshot_tail(&self, lines: usize) -> Vec<String> {
+    fn snapshot_tail(&self, lines: usize) -> RingSnapshot {
         let n = lines.min(self.lines.len());
-        let mut out = self.overflow_prefix();
-        out.extend(self.lines.iter().skip(self.lines.len() - n).cloned());
-        out
+        let skip = self.lines.len() - n;
+        let mut lines: Vec<RingLine> = self.lines.iter().skip(skip).cloned().collect();
+        // The requested-tail slice omitted `skip` retained lines, putting
+        // the window's first line at an omission boundary exactly like
+        // eviction does.
+        if skip > 0 {
+            if let Some(first) = lines.first_mut() {
+                first.front_abuts_omission = true;
+            }
+        }
+        RingSnapshot {
+            overflow: self.overflow_marker(),
+            lines,
+        }
     }
 
-    fn overflow_prefix(&self) -> Vec<String> {
-        if self.dropped_lines == 0 {
-            Vec::new()
-        } else {
-            vec![format!(
+    fn overflow_marker(&self) -> Option<String> {
+        (self.dropped_lines > 0).then(|| {
+            format!(
                 "[earlier background output discarded: {} bytes across {} line(s)]",
                 self.dropped_bytes, self.dropped_lines
-            )]
-        }
+            )
+        })
     }
 }
 
@@ -644,28 +812,28 @@ async fn run_background(
     let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
 
     // Build the budget-capped result from the ring's freshest output.
-    let snapshot: Vec<String> = {
+    let snap: RingSnapshot = {
         let r = ring.lock().unwrap();
         r.snapshot_all()
     };
-    let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
-    let fit = window_that_fits(&snapshot, ASYNC_RESULT_TOKEN_CAP);
-    let start = snapshot.len().saturating_sub(fit);
-    if fit < snapshot.len() {
-        let _ = writer.writeln(&format!(
-            "[earlier output elided — {} of {} line(s) shown]",
-            fit,
-            snapshot.len()
-        ));
-    }
-    for line in &snapshot[start..] {
-        if !writer.writeln(line) {
-            break;
-        }
-    }
-    // The result budget can cut the LAST retained line mid-line; the back
-    // margin of that cut must elide under the table current at completion.
+    // The knowledge fence below scans the FULL retained window (raw,
+    // pre-elision) so a finding beyond the budget-visible slice cannot
+    // arrive as a seemingly clean event.
+    let raw_all = snap.raw_joined();
+    // The completion window is a SUFFIX of the stream (ring eviction and
+    // the token cap omit older content), so `write_budget_window` elides
+    // the unsafe FRONT margin of the first retained line under the table
+    // current at completion; the budget's back-edge cut is elided by
+    // `into_string_redacted` below.
     let redact_now = redact_probe();
+    let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
+    write_budget_window(
+        &mut writer,
+        &redact_now,
+        &snap,
+        ASYNC_RESULT_TOKEN_CAP,
+        true,
+    );
     let body = writer.into_string_redacted(&redact_now);
 
     let (result, failed) = if killed {
@@ -679,10 +847,10 @@ async fn run_background(
         (format!("{header}{body}"), !success)
     };
     let result = if !killed && !launch.attached_knowledge_paths.is_empty() {
-        // `body` is budget-capped, but `snapshot` retains every line that can
+        // `body` is budget-capped, but `raw_all` retains every line that can
         // still cross this job's output boundary. Scan the latter so a finding
         // beyond the visible window cannot arrive as a seemingly clean event.
-        crate::knowledge::fence_knowledge_model_text_if_needed(&result, &snapshot.join("\n"))
+        crate::knowledge::fence_knowledge_model_text_if_needed(&result, &raw_all)
     } else {
         result
     };
@@ -873,8 +1041,9 @@ mod tests {
     #[test]
     fn window_that_fits_keeps_freshest() {
         let lines: Vec<String> = (0..50).map(|i| format!("line number {i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
         // A tiny cap fits only a couple of trailing lines.
-        let fit = window_that_fits(&lines, 6);
+        let fit = window_that_fits(&refs, 6);
         assert!(fit >= 1 && fit < lines.len());
     }
 
@@ -905,9 +1074,9 @@ mod tests {
             "x".repeat(BACKGROUND_LINE_BYTE_CAP + 100),
             &RedactionTable::empty(),
         );
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
-        assert!(snapshot[1].contains("line truncated"));
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(snap.lines[1].text.contains("line truncated"));
     }
 
     // A registered secret straddling the per-line head cut leaves only its
@@ -928,9 +1097,9 @@ mod tests {
         );
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line, &table);
-        let snapshot = ring.snapshot_all();
-        assert!(snapshot[1].contains("line truncated"));
-        let head = &snapshot[0];
+        let snap = ring.snapshot_all();
+        assert!(snap.lines[1].text.contains("line truncated"));
+        let head = &snap.lines[0].text;
         assert!(head.len() < BACKGROUND_LINE_BYTE_CAP);
         let scrubbed = table.scrub(head);
         assert!(
@@ -938,6 +1107,129 @@ mod tests {
             "straddling prefix leaked: {scrubbed}"
         );
         assert!(!scrubbed.contains(SECRET));
+    }
+
+    // The ring's front edges (issue #294): eviction, requested-tail slicing,
+    // and the token-budget window all make the retained output a SUFFIX of
+    // the stream. A registered multi-line secret beginning in the omitted
+    // content and ending in the first retained line leaves only its SUFFIX —
+    // a partial the downstream whole-value scrub cannot match. The first
+    // retained line's unsafe front margin must elide at render time, under
+    // the table current then (never a stale launch snapshot).
+
+    /// Render the ring's whole retained window through `write_budget_window`
+    /// with a generous cap (no budget cut of its own).
+    fn rendered_window(ring: &BoundedOutputRing, table: &RedactionTable) -> String {
+        let snap = ring.snapshot_all();
+        let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
+        write_budget_window(&mut writer, table, &snap, ASYNC_RESULT_TOKEN_CAP, false);
+        writer.into_string_redacted(table)
+    }
+
+    #[test]
+    fn ring_eviction_front_edge_elides_secret_straddling_evicted_line() {
+        // The multi-line secret spans two adjacent lines; the ring is sized
+        // so the second push evicts the first (both lines fit alone).
+        const HALF_A: &str = "front-half-A";
+        const HALF_B: &str = "back-half-B";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-evict-straddle-test".to_string())
+            .unwrap();
+        let line_one = format!("lead {HALF_A}");
+        let line_two = format!("{HALF_B} close out the ledger now");
+        let mut ring = BoundedOutputRing::new(line_one.len() + line_two.len() - 1);
+        ring.push(line_one, &table);
+        ring.push(line_two, &table);
+        assert!(ring.dropped_lines > 0, "fixture must evict the first line");
+        let out = rendered_window(&ring, &table);
+        assert!(out.contains("ledger"), "rendered window: {out}");
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "eviction front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn tail_slice_front_edge_elides_secret_straddling_skipped_line() {
+        // No eviction here: the requested-tail slice itself omits the
+        // retained line holding the secret's first half.
+        const HALF_A: &str = "front-half-A";
+        const HALF_B: &str = "back-half-B";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-tail-straddle-test".to_string())
+            .unwrap();
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(format!("lead {HALF_A}"), &table);
+        ring.push(format!("{HALF_B} close out the ledger now"), &table);
+        let snap = ring.snapshot_tail(1);
+        let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
+        write_budget_window(&mut writer, &table, &snap, TAIL_TOKEN_CAP, false);
+        let body = writer.into_string_redacted(&table);
+        assert!(body.contains("ledger"), "tail body: {body}");
+        let scrubbed = table.scrub(&body);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "requested-tail front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn budget_window_front_edge_elides_secret_straddling_budget_elided_line() {
+        // The budget keeps only the freshest line, so the line before it —
+        // holding the secret's first half — is omitted by the cap itself.
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-budget-straddle-test".to_string())
+            .unwrap();
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push("old output".to_string(), &table);
+        ring.push(format!("prefix {HALF_A} {}", "x".repeat(600)), &table);
+        ring.push(format!("{HALF_B} fresh tail keeps running"), &table);
+        // A cap that fits the last line but never the 600-x line before it.
+        let cap = crate::tokens::count("BBBBBBBBBB fresh tail keeps running") + 4;
+        let snap = ring.snapshot_all();
+        let mut writer = BudgetedWriter::new(cap);
+        write_budget_window(&mut writer, &table, &snap, cap, false);
+        let body = writer.into_string_redacted(&table);
+        assert!(!body.is_empty(), "budget window must render the last line");
+        let scrubbed = table.scrub(&body);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "budget window front edge leaked a secret suffix: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn truncated_line_follower_front_edge_elides_secret_straddling_discarded_tail() {
+        // The secret's first half sits just past the line cap (discarded with
+        // the over-cap tail); its second half leads the NEXT physical line.
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret, "bg-follower-straddle-test".to_string())
+            .unwrap();
+        // Line one: cap bytes of filler then the secret's first half exactly
+        // at the end — truncated at the cap, so HALF_A is discarded.
+        let overlong = format!("{}{HALF_A}", "x".repeat(BACKGROUND_LINE_BYTE_CAP));
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(overlong, &table);
+        ring.push(format!("{HALF_B} after the cut"), &table);
+        let out = rendered_window(&ring, &table);
+        assert!(
+            out.contains("line truncated"),
+            "fixture must show the truncation note: {out}"
+        );
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "discarded-tail follower edge leaked a secret suffix: {scrubbed}"
+        );
     }
 
     #[tokio::test]
@@ -985,9 +1277,9 @@ mod tests {
         assert!(line.len() > BACKGROUND_LINE_BYTE_CAP);
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line, &RedactionTable::empty());
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
-        assert!(snapshot[1].contains("line truncated"));
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
+        assert!(snap.lines[1].text.contains("line truncated"));
     }
 
     #[tokio::test]
@@ -1010,10 +1302,10 @@ mod tests {
         assert!(line.ends_with('\r'));
         let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
         ring.push(line, &RedactionTable::empty());
-        let snapshot = ring.snapshot_all();
-        assert_eq!(snapshot[0].len(), BACKGROUND_LINE_BYTE_CAP);
+        let snap = ring.snapshot_all();
+        assert_eq!(snap.lines[0].text.len(), BACKGROUND_LINE_BYTE_CAP);
         assert!(
-            snapshot[1].contains("line truncated"),
+            snap.lines[1].text.contains("line truncated"),
             "truncation note must survive a \\r at the cap boundary"
         );
     }
@@ -1060,10 +1352,14 @@ mod tests {
         ring.push("first".to_string(), &empty);
         ring.push("second".to_string(), &empty);
         ring.push("third".to_string(), &empty);
-        let snapshot = ring.snapshot_all();
-        assert!(snapshot[0].contains("earlier background output discarded"));
-        assert!(!snapshot.iter().any(|line| line == "first"));
-        assert!(snapshot.iter().any(|line| line == "third"));
+        let snap = ring.snapshot_all();
+        assert!(
+            snap.overflow
+                .as_deref()
+                .is_some_and(|marker| marker.contains("earlier background output discarded"))
+        );
+        assert!(!snap.lines.iter().any(|line| line.text == "first"));
+        assert!(snap.lines.iter().any(|line| line.text == "third"));
     }
 
     #[test]

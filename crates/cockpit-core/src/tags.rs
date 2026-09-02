@@ -968,7 +968,17 @@ mod tests {
     }
 
     fn policy_for(cwd: &Path) -> TagPolicy {
-        TagPolicy::new_for_caps(cwd, Vec::new(), TagInlineCaps::STANDARD)
+        policy_for_with_redact(
+            cwd,
+            std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+        )
+    }
+
+    fn policy_for_with_redact(
+        cwd: &Path,
+        redact: std::sync::Arc<crate::redact::RedactionTable>,
+    ) -> TagPolicy {
+        TagPolicy::new_for_caps(cwd, Vec::new(), TagInlineCaps::STANDARD, redact)
     }
 
     fn expand_with(buffer: &str, cwd: &Path) -> ExpandResult {
@@ -1077,6 +1087,44 @@ mod tests {
             shown < lines && shown > 0,
             "byte-capped range should inline a proper prefix, not the full request: {}",
             res.expansions[0].detail
+        );
+    }
+
+    // Issue #294: the inline expansion truncates at the line/byte caps and
+    // at offset-read fronts; a registered secret straddling such a cut
+    // leaves a PARTIAL the downstream whole-value §7 scrub cannot match.
+    // The policy's table must drive the boundary elision (the TUI submit
+    // path builds this table fail-closed for exactly this reason).
+    #[test]
+    fn range_tag_offset_front_edge_elides_secret_straddling_omitted_line() {
+        const HALF_A: &str = "AAAAAAAAAA";
+        const HALF_B: &str = "BBBBBBBBBB";
+        let secret = format!("{HALF_A}\n{HALF_B}");
+        let table = std::sync::Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(secret, "tag-offset-straddle-test".to_string())
+                .unwrap(),
+        );
+        let root = tmp_root();
+        fs::write(
+            root.path().join("notes.txt"),
+            format!("prelude {HALF_A}\n{HALF_B} epilogue\n"),
+        )
+        .unwrap();
+        // The range starts at line 2: line 1 (holding the secret's first
+        // half) is omitted, so a boundary-unsafe slice would open the block
+        // with the secret's unmatchable SUFFIX.
+        let policy = policy_for_with_redact(root.path(), table.clone());
+        let res = expand_tags_with_policy("@notes.txt:2", &policy);
+        assert!(
+            res.wire.contains("<file path=\"notes.txt\">"),
+            "tag must still inline the file block: {}",
+            res.wire
+        );
+        let scrubbed = table.scrub(&res.wire);
+        assert!(
+            !scrubbed.contains(HALF_B),
+            "range-tag offset front edge leaked a secret suffix: {scrubbed}"
         );
     }
 

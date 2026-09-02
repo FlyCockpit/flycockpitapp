@@ -289,7 +289,14 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         return Ok(None);
     }
 
-    apply_text_artifact_user_projections(conn, session_id, &events, &mut history, redaction)?;
+    apply_text_artifact_user_projections(
+        conn,
+        session_id,
+        &events,
+        &mut history,
+        root_agent,
+        redaction,
+    )?;
 
     // Heal pass (implementation note): stub honest
     // results for orphan tool_uses and drop orphan tool_results so the
@@ -822,6 +829,33 @@ fn render_rehydrated_tool_artifact_frame<'a>(
     }
 }
 
+/// Last in-place `/compact` boundary in `events`, if any.
+///
+/// `rebuild_history` clears model history at a root `session_compacted` event
+/// and replaces it with the handoff plus retained tail. `/compact` is in-place
+/// (`successor_session_id` is this session), so pre-compaction `user_message`
+/// rows remain in the log. Text-artifact projection must not replay those
+/// rows against the post-compact history.
+///
+/// Returns `(seq, history_prefix)`: `seq` is the last root compaction event;
+/// `history_prefix` is the handoff (always one user message) plus
+/// `tail_messages.len()`, matching the prefix `rebuild_history` materializes
+/// so post-compaction turns still line up.
+fn last_root_compaction_cursor(
+    events: &[SessionEventRow],
+    root_agent: &str,
+) -> Option<(i64, usize)> {
+    let event = events.iter().rev().find(|event| {
+        event.kind == "session_compacted" && event.agent.as_deref() == Some(root_agent)
+    })?;
+    let tail_len = event
+        .data
+        .get("tail_messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    Some((event.seq, 1 + tail_len))
+}
+
 /// Replace only the authored text part of materialized oversized-user events.
 /// The canonical event is still rebuilt first for transcript fidelity; this
 /// second relational pass turns its model-only representation into the exact
@@ -831,6 +865,7 @@ fn apply_text_artifact_user_projections(
     session_id: Uuid,
     events: &[SessionEventRow],
     history: &mut Vec<Message>,
+    root_agent: &str,
     redaction: &crate::redact::RedactionTable,
 ) -> Result<()> {
     use crate::db::text_artifacts::{
@@ -850,9 +885,20 @@ fn apply_text_artifact_user_projections(
         }
     }
 
+    let (compact_seq, mut next_history) = last_root_compaction_cursor(events, root_agent)
+        .map(|(seq, prefix)| (Some(seq), prefix))
+        .unwrap_or((None, 0));
+    let precedes_compaction = |seq: i64| compact_seq.is_some_and(|cursor| seq <= cursor);
+    if let Some(seq) = compact_seq {
+        by_event.retain(|event_seq, _| *event_seq > seq);
+    }
+
     let mut frames = std::collections::BTreeMap::<i64, String>::new();
     for event in events {
         if event.kind != "user_message" {
+            continue;
+        }
+        if precedes_compaction(event.seq) {
             continue;
         }
         let authored = event
@@ -994,8 +1040,10 @@ fn apply_text_artifact_user_projections(
         ));
     }
 
-    let mut next_history = 0usize;
     for event in events.iter().filter(|event| event.kind == "user_message") {
+        if precedes_compaction(event.seq) {
+            continue;
+        }
         let authored = event
             .data
             .get("text")
@@ -7530,6 +7578,106 @@ mod tests {
         assert_eq!(
             serde_json::to_value(restored).unwrap(),
             serde_json::to_value([vec![Message::user("exact handoff")], tail].concat()).unwrap()
+        );
+    }
+
+    /// REGRESSION (#276): `/compact` resets in-place history but leaves
+    /// pre-compaction `user_message` rows in the log. Rehydrate must skip
+    /// those rows when applying text-artifact projections; otherwise the
+    /// first historical user message hard-fails against the compacted handoff.
+    #[tokio::test]
+    async fn compacted_model_history_with_prior_turns_rehydrates() {
+        let s = root_session();
+        record_user(&s, "first question").await;
+        record_assistant(&s, "a1", "first answer").await;
+        record_user(&s, "second question").await;
+        record_assistant(&s, "a2", "second answer").await;
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id(),
+                seed_tool_count: 0,
+                brief_text: "brief",
+                handoff_text: "exact handoff",
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 500,
+                tokens_after: 100,
+                turns_summarized: 3,
+                tail_kept: 1,
+                tail_trimmed: 0,
+                tail_messages: &tail,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value([vec![Message::user("exact handoff")], tail].concat()).unwrap()
+        );
+    }
+
+    /// Compact, continue the session, then resume: post-compaction user
+    /// turns must still validate against history after the handoff/tail
+    /// prefix, not against the compacted handoff itself.
+    #[tokio::test]
+    async fn compacted_model_history_with_prior_turns_then_followup_rehydrates() {
+        let s = root_session();
+        record_user(&s, "first question").await;
+        record_assistant(&s, "a1", "first answer").await;
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        s.record_session_compacted_with_source(
+            "Build",
+            crate::session::SessionCompactionRecord {
+                successor_session_id: s.id,
+                successor_short_id: &s.short_id(),
+                seed_tool_count: 0,
+                brief_text: "brief",
+                handoff_text: "exact handoff",
+                source: "manual",
+                trigger_ctx_pct: None,
+                tokens_before: 500,
+                tokens_after: 100,
+                turns_summarized: 3,
+                tail_kept: 1,
+                tail_trimmed: 0,
+                tail_messages: &tail,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        record_user(&s, "after compact").await;
+        let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(
+                [
+                    vec![Message::user("exact handoff")],
+                    tail,
+                    vec![Message::user("after compact")]
+                ]
+                .concat()
+            )
+            .unwrap()
         );
     }
 

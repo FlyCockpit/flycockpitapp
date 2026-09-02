@@ -65,17 +65,18 @@ pub(crate) use vnext::DefinitionScope;
 pub(crate) use vnext::author_slot;
 pub use vnext::{
     AgentRole, AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
-    DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
-    EffectiveVnextGrant, ExecutionKind, GeneratorSpec, LocalInstallationIdentity,
-    LocalInstallationResolver, MAX_GENERATOR_TURNS, MAX_VERIFICATION_CANDIDATES, ModelCapability,
-    ModelLocality, ModelRecommendation, ModelSlot, ModelTrustSuggestion, OnAdjudicationFailure,
-    OnBudgetExceeded, PROFILE_CLEAN_ROOM, PROFILE_PANEL, PROFILE_SELF_CHECK,
-    PreparedPrimarySlotRoute, ProhibitedQuestionClass, ProviderAlias, QuestionOverride,
-    QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef,
-    ToolClass, VerificationAction, VerificationBudget, VerificationDispatch, VerificationEstimate,
-    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
-    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
-    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+    DEFAULT_CLEAN_ROOM_LAST_N_READS, DelegationPolicy, DelegationTarget, EffectiveDelegationGrant,
+    EffectiveQuestionPolicy, EffectiveVnextGrant, ExecutionKind, GeneratorSpec,
+    LocalInstallationIdentity, LocalInstallationResolver, MAX_GENERATOR_TURNS,
+    MAX_VERIFICATION_CANDIDATES, ModelCapability, ModelLocality, ModelRecommendation, ModelSlot,
+    ModelTrustSuggestion, OnAdjudicationFailure, OnBudgetExceeded, PROFILE_CLEAN_ROOM,
+    PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute, ProhibitedQuestionClass,
+    ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
+    SelectorPredicate, SlotModelRef, ToolClass, VerificationAction, VerificationBudget,
+    VerificationDispatch, VerificationEstimate, VerificationMode, VerificationPolicy,
+    VerificationRecipe, VerificationRule, VerificationSelector, VerificationSessionReduction,
+    VerificationSubject, VerificationToolCategory, VnextAgentDef, VnextHostPolicy,
+    delegation_kind_permitted, resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;

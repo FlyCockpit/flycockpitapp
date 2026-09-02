@@ -21,6 +21,8 @@ use crate::engine::message::{AssistantContent, Message, ToolDefinition, collect_
 use crate::engine::model::{Model, ModelParams, UtilityCallSite};
 use crate::session::{Session, SessionEventModelFrame};
 
+use super::intercept::generator_context::EffectiveGeneratorRequest;
+
 fn verification_audit_projection(
     provider_payload: &serde_json::Value,
     site: UtilityCallSite,
@@ -42,23 +44,117 @@ fn verification_audit_projection(
     }))
 }
 
-pub(crate) struct VerificationInferenceInput<'a> {
+struct VerificationInferenceInput<'a> {
+    session: Arc<Session>,
+    model: &'a Model,
+    config: &'a crate::daemon::session_worker::SessionConfigHandle,
+    interrupts: &'a crate::engine::interrupt::InterruptHub,
+    system: &'a str,
+    history: &'a [Message],
+    prompt: &'a str,
+    tools: &'a [ToolDefinition],
+    params: ModelParams,
+    agent_name: &'a str,
+    site: UtilityCallSite,
+    cancel: &'a tokio_util::sync::CancellationToken,
+    /// Optional caller-owned absolute deadline. The inference barrier owns
+    /// the timeout so a deadline cannot drop a provider future while leaving
+    /// either audit journal pending.
+    deadline_unix_ms: Option<i64>,
+    assembled_provider_payload: Option<serde_json::Value>,
+}
+
+pub(super) struct VerificationInferenceRuntime<'a> {
     pub session: Arc<Session>,
     pub model: &'a Model,
     pub config: &'a crate::daemon::session_worker::SessionConfigHandle,
     pub interrupts: &'a crate::engine::interrupt::InterruptHub,
-    pub system: &'a str,
-    pub history: &'a [Message],
-    pub prompt: &'a str,
-    pub tools: &'a [ToolDefinition],
-    pub params: ModelParams,
     pub agent_name: &'a str,
-    pub site: UtilityCallSite,
     pub cancel: &'a tokio_util::sync::CancellationToken,
-    /// Optional caller-owned absolute deadline. The inference barrier owns
-    /// the timeout so a deadline cannot drop a provider future while leaving
-    /// either audit journal pending.
     pub deadline_unix_ms: Option<i64>,
+}
+
+pub(super) async fn journaled_generator_inference(
+    runtime: VerificationInferenceRuntime<'_>,
+    request: EffectiveGeneratorRequest<'_>,
+) -> Result<Vec<AssistantContent>> {
+    let assembled_provider_payload = assemble_generator_provider_request(runtime.model, &request)?;
+    journaled_verification_inference(VerificationInferenceInput {
+        session: runtime.session,
+        model: runtime.model,
+        config: runtime.config,
+        interrupts: runtime.interrupts,
+        system: super::generate::GENERATOR_SYSTEM,
+        history: request.history(),
+        prompt: request.prompt(),
+        tools: request.tools(),
+        params: request.params().clone(),
+        agent_name: runtime.agent_name,
+        site: UtilityCallSite::VerificationVariant,
+        cancel: runtime.cancel,
+        deadline_unix_ms: runtime.deadline_unix_ms,
+        assembled_provider_payload: Some(assembled_provider_payload),
+    })
+    .await
+}
+
+pub(super) async fn journaled_adjudication_inference(
+    runtime: VerificationInferenceRuntime<'_>,
+    request: super::adjudicate::TrustedAdjudicationRequest<'_>,
+) -> Result<Vec<AssistantContent>> {
+    journaled_verification_inference(VerificationInferenceInput {
+        session: runtime.session,
+        model: runtime.model,
+        config: runtime.config,
+        interrupts: runtime.interrupts,
+        system: super::adjudicate::ADJUDICATOR_SYSTEM,
+        history: request.history(),
+        prompt: request.prompt(),
+        tools: request.tools(),
+        params: ModelParams::default(),
+        agent_name: runtime.agent_name,
+        site: UtilityCallSite::VerificationAdjudication,
+        cancel: runtime.cancel,
+        deadline_unix_ms: runtime.deadline_unix_ms,
+        assembled_provider_payload: None,
+    })
+    .await
+}
+
+/// Assemble the exact initial provider request from the context-owned generator projection.
+/// Production dispatch uses this value for its durable audit digest; tests use the same seam to
+/// prove foreign-slot custody reaches the provider boundary.
+pub(super) fn assemble_generator_provider_request(
+    model: &Model,
+    request: &EffectiveGeneratorRequest<'_>,
+) -> Result<serde_json::Value> {
+    let (system, tools, _) =
+        effective_verification_route(super::generate::GENERATOR_SYSTEM, model, request.tools());
+    let params = effective_verification_params(
+        request.params().clone(),
+        UtilityCallSite::VerificationVariant,
+    );
+    model.assemble_dispatch_request(
+        &system,
+        request.history(),
+        &Message::user(request.prompt()),
+        &tools,
+        &params,
+    )
+}
+
+fn effective_verification_params(mut params: ModelParams, site: UtilityCallSite) -> ModelParams {
+    params.max_tokens = Some(
+        params
+            .max_tokens
+            .unwrap_or(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
+            .min(crate::engine::model::UTILITY_MAX_TOKENS_CAP),
+    );
+    params.tools_required = true;
+    if site.pins_temperature_zero() {
+        params.temperature = Some(0.0);
+    }
+    params
 }
 
 /// Build the exact untrusted safety surface used by verification requests.
@@ -91,29 +187,25 @@ fn effective_verification_route_for_trust(
     (system, tools, report_leak_eligible)
 }
 
-pub(crate) async fn journaled_verification_inference(
+async fn journaled_verification_inference(
     input: VerificationInferenceInput<'_>,
 ) -> Result<Vec<AssistantContent>> {
     let call_id = Uuid::now_v7();
     let ordinal = 0;
-    let mut params = input.params;
-    params.max_tokens = Some(
-        params
-            .max_tokens
-            .unwrap_or(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
-            .min(crate::engine::model::UTILITY_MAX_TOKENS_CAP),
-    );
-    params.tools_required = true;
-    if input.site.pins_temperature_zero() {
-        params.temperature = Some(0.0);
-    }
+    let params = effective_verification_params(input.params, input.site);
     let (system, tools, report_leak_eligible) =
         effective_verification_route(input.system, input.model, input.tools);
     let prompt = Message::user(input.prompt);
-    let payload =
-        input
-            .model
-            .assemble_dispatch_request(&system, input.history, &prompt, &tools, &params)?;
+    let payload = match input.assembled_provider_payload {
+        Some(payload) => payload,
+        None => input.model.assemble_dispatch_request(
+            &system,
+            input.history,
+            &prompt,
+            &tools,
+            &params,
+        )?,
+    };
     // Verification prompts intentionally contain raw candidate args and
     // critiques. They are provider-visible but must never become an ordinary
     // inference payload row or a protected-redaction-history literal. The

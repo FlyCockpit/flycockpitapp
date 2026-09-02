@@ -2348,7 +2348,24 @@ pub enum VerificationRecipe {
         include_linked_files: bool,
         #[serde(default = "default_last_n_reads", rename = "lastNReads")]
         last_n_reads: u8,
+        #[serde(
+            default = "default_clean_room_tool_categories",
+            rename = "toolCategories"
+        )]
+        tool_categories: Vec<VerificationToolCategory>,
+        #[serde(default, rename = "toolAllowlist")]
+        tool_allowlist: Vec<String>,
     },
+}
+
+/// Curated evidence categories eligible for a clean-room verification
+/// projection. A recipe can additionally name individual tools through its
+/// `toolAllowlist`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationToolCategory {
+    Reads,
+    Exploration,
 }
 
 impl<'de> Deserialize<'de> for VerificationRecipe {
@@ -2361,6 +2378,13 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
             include_linked_files: bool,
             #[serde(default = "default_last_n_reads", rename = "lastNReads")]
             last_n_reads: u8,
+            #[serde(
+                default = "default_clean_room_tool_categories",
+                rename = "toolCategories"
+            )]
+            tool_categories: Vec<VerificationToolCategory>,
+            #[serde(default, rename = "toolAllowlist")]
+            tool_allowlist: Vec<String>,
         }
 
         fn from_clean_room_value<E: serde::de::Error>(
@@ -2370,6 +2394,8 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
             Ok(VerificationRecipe::CleanRoom {
                 include_linked_files: fields.include_linked_files,
                 last_n_reads: fields.last_n_reads,
+                tool_categories: fields.tool_categories,
+                tool_allowlist: fields.tool_allowlist,
             })
         }
 
@@ -2402,8 +2428,17 @@ impl<'de> Deserialize<'de> for VerificationRecipe {
     }
 }
 
+pub const DEFAULT_CLEAN_ROOM_LAST_N_READS: u8 = 5;
+
 fn default_last_n_reads() -> u8 {
-    3
+    DEFAULT_CLEAN_ROOM_LAST_N_READS
+}
+
+fn default_clean_room_tool_categories() -> Vec<VerificationToolCategory> {
+    vec![
+        VerificationToolCategory::Reads,
+        VerificationToolCategory::Exploration,
+    ]
 }
 
 impl Default for VerificationRecipe {
@@ -2421,6 +2456,8 @@ impl VerificationRecipe {
         Self::CleanRoom {
             include_linked_files: false,
             last_n_reads: default_last_n_reads(),
+            tool_categories: default_clean_room_tool_categories(),
+            tool_allowlist: Vec::new(),
         }
     }
 }
@@ -2534,8 +2571,8 @@ impl VerificationRule {
             .unwrap_or(OnAdjudicationFailure::DispatchOriginal)
     }
 
-    /// Custody note: inherit generators on untrusted slots see a redacted
-    /// transcript and produce placeholder-bearing (invalid) candidates.
+    /// Custody note: foreign inherit generators receive the curated clean-room
+    /// projection. Candidates remain invalid when redaction inserts placeholders.
     pub fn inherit_untrusted_slot_warnings(
         &self,
         untrusted_slots: &BTreeSet<String>,
@@ -2548,7 +2585,7 @@ impl VerificationRule {
             })
             .map(|generator| {
                 format!(
-                    "verification inherit generator on untrusted slot `{}` will receive a redacted transcript; placeholder-bearing candidates are invalid and never selectable",
+                    "verification inherit generator on untrusted slot `{}` will receive the curated clean-room projection; placeholder-bearing candidates are invalid and never selectable",
                     generator.slot
                 )
             })
@@ -2618,6 +2655,13 @@ impl VerificationRule {
                         && last_n_reads == 0
                     {
                         bail!("verification cleanRoom.lastNReads must be positive");
+                    }
+                    if let VerificationRecipe::CleanRoom { tool_allowlist, .. } = &generator.recipe
+                        && tool_allowlist.iter().any(|tool| tool.trim().is_empty())
+                    {
+                        bail!(
+                            "verification cleanRoom.toolAllowlist must not contain empty tool names"
+                        );
                     }
                 }
             }
@@ -4065,13 +4109,18 @@ mod tests {
         clean.validate().unwrap();
         let compiled = clean.verification.unwrap().compile();
         assert_eq!(compiled.regions[0].rule.generators.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             compiled.regions[0].rule.generators[0].recipe,
             VerificationRecipe::CleanRoom {
                 include_linked_files: false,
-                last_n_reads: 3
+                last_n_reads: 5,
+                tool_categories: vec![
+                    VerificationToolCategory::Reads,
+                    VerificationToolCategory::Exploration,
+                ],
+                tool_allowlist: vec![],
             }
-        ));
+        );
     }
 
     #[test]
@@ -4227,6 +4276,8 @@ generators:
       cleanRoom:
         includeLinkedFiles: true
         lastNReads: 4
+        toolCategories: [exploration]
+        toolAllowlist: [context_pack]
 "#;
         let rule: VerificationRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.mode, Some(VerificationMode::Revise));
@@ -4240,7 +4291,9 @@ generators:
             rule.generators[1].recipe,
             VerificationRecipe::CleanRoom {
                 include_linked_files: true,
-                last_n_reads: 4
+                last_n_reads: 4,
+                tool_categories: vec![VerificationToolCategory::Exploration],
+                tool_allowlist: vec!["context_pack".into()],
             }
         );
         let encoded = serde_yaml::to_string(&rule).unwrap();

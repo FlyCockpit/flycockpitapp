@@ -274,6 +274,8 @@ impl Session {
                 Ok(())
             })
             .await?;
+        // Persist-before-swap: advertise the union as persisted only after the
+        // vault write commits, matching [`Session::persist_redaction_table`].
         *self.redaction_table_json.lock().unwrap() = Some(cache_json);
         Ok(())
     }
@@ -533,8 +535,9 @@ impl Session {
                 Ok(metadata)
             })
             .await?;
-        // Mirror the durable write into the in-memory cache only after the
-        // transaction commits, so a rollback never leaves a stale table.
+        // Persist-before-swap: advertise the union as persisted only after the
+        // transaction commits, so a rollback never leaves a cache ahead of the
+        // durable table.
         *self.redaction_table_json.lock().unwrap() = Some(json);
         Ok(metadata)
     }

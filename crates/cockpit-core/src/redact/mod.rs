@@ -46,9 +46,10 @@ use crate::config::extended::RedactConfig;
 
 /// A redaction table could not be loaded on a security-relevant path.
 ///
-/// Callers must fail closed (refuse to send, fork, or export) rather than
-/// substitute an empty table, which would let plaintext secrets flow into
-/// model context, provider requests, or exports.
+/// Callers must fail closed (refuse to send, fork, export, or acknowledge
+/// first-party org-sync/audit records as processed) rather than substitute
+/// an empty table or skip the record. An empty table would let plaintext
+/// secrets flow into model context, provider requests, or exports.
 #[derive(Debug)]
 pub struct RedactionTableUnavailable {
     context: &'static str,
@@ -61,6 +62,13 @@ impl RedactionTableUnavailable {
             context,
             source: source.to_string(),
         }
+    }
+
+    /// True when this typed fail-closed error is anywhere in an [`anyhow::Error`]
+    /// chain. First-party egress uses it to distinguish custody failures from
+    /// skippable malformed rows.
+    pub fn in_chain(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
     }
 }
 

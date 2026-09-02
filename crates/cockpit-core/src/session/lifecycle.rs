@@ -119,11 +119,28 @@ pub(crate) fn persist_fork_with_redaction_custody(
     .context("creating fork session row")
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_REDACTION_VAULT_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm the next session redaction vault write in this thread to fail before
+/// committing, so tests can assert cache identity after a failed persist.
+#[cfg(test)]
+pub(crate) fn fail_next_redaction_vault_write_for_test() {
+    FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.set(true));
+}
+
 fn persist_redaction_table_to_vault(
     vault: &crate::secure_key::SecretVault,
     session_id: uuid::Uuid,
     json: &[u8],
 ) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+        return Err(anyhow::anyhow!("injected redaction vault write failure"));
+    }
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
     vault
         .put_item(
@@ -1178,12 +1195,20 @@ impl Session {
 
     /// Persist the accumulated egress redaction table with the session so raw
     /// history remains covered after resume even if env/dotenv sources change.
+    ///
+    /// The in-memory cache advertised by [`Self::persisted_redaction_table`] is
+    /// updated only after the vault write commits. A failed persist leaves both
+    /// the durable vault and every cache advertised as persisted at the last
+    /// committed table (persist-before-swap).
     pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
         let json = table.to_persisted_json()?;
-        *self.redaction_table_json.lock().unwrap() = Some(json.clone());
-        persist_redaction_table_to_vault(&self.secret_vault, self.id, json.as_bytes())
+        persist_redaction_table_to_vault(&self.secret_vault, self.id, json.as_bytes())?;
+        *self.redaction_table_json.lock().unwrap() = Some(json);
+        Ok(())
     }
 
+    /// Load the last committed redaction table. The in-memory cache is a
+    /// committed-table mirror, never a speculative write.
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
         if let Some(json) = self.redaction_table_json.lock().unwrap().clone() {
             return crate::redact::RedactionTable::from_persisted_json(&json)
@@ -1449,6 +1474,53 @@ mod vault_unification_tests {
         assert!(
             child_ids.is_empty(),
             "failed fork must not leave a persisted child: {child_ids:?}"
+        );
+    }
+
+    #[test]
+    fn failed_vault_write_keeps_committed_persisted_cache_and_vault() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        const COMMITTED: &str = "committed-redaction-secret-abcdef123";
+        const UNCOMMITTED: &str = "uncommitted-redaction-secret-xyz789";
+        let committed = crate::redact::RedactionTable::empty()
+            .with_forced_literal(COMMITTED.to_string(), "test".to_string())
+            .unwrap();
+        session.persist_redaction_table(&committed).unwrap();
+
+        let newer = committed
+            .with_forced_literal(UNCOMMITTED.to_string(), "test".to_string())
+            .unwrap();
+        fail_next_redaction_vault_write_for_test();
+        session
+            .persist_redaction_table(&newer)
+            .expect_err("injected vault write failure must surface");
+
+        let cached = session.persisted_redaction_table().unwrap().unwrap();
+        assert_ne!(
+            cached.scrub(COMMITTED),
+            COMMITTED,
+            "committed coverage must remain after a failed persist"
+        );
+        assert_eq!(
+            cached.scrub(UNCOMMITTED),
+            UNCOMMITTED,
+            "uncommitted table must not be advertised as persisted"
+        );
+
+        session.clear_cached_redaction_table_for_test();
+        let from_vault = session.persisted_redaction_table().unwrap().unwrap();
+        assert_ne!(from_vault.scrub(COMMITTED), COMMITTED);
+        assert_eq!(
+            from_vault.scrub(UNCOMMITTED),
+            UNCOMMITTED,
+            "vault must remain at the last committed table after a failed persist"
         );
     }
 }

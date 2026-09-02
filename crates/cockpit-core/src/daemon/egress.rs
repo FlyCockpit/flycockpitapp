@@ -73,24 +73,46 @@ impl FirstPartyEgressClient {
     }
 }
 
+/// Load the durable redaction table required to emit a first-party
+/// session-owned record.
+///
+/// An existing session is expected to have an initial vault table. Missing
+/// session rows, missing vault items, and unreadable/malformed tables are
+/// typed fail-closed errors — never `Ok` with an empty table and never a
+/// skippable filter. Callers without a vault handle must not call this;
+/// they defer without acknowledging the record as processed.
 pub(crate) async fn redaction_for_session(
     db: &Db,
-    vault: Option<&crate::secure_key::SecretVault>,
+    vault: &crate::secure_key::SecretVault,
     session_id: Uuid,
-) -> Result<Option<crate::redact::RedactionTable>> {
+) -> Result<crate::redact::RedactionTable> {
     if db.get_session(session_id).await?.is_none() {
-        return Ok(None);
+        return Err(crate::redact::RedactionTableUnavailable::new(
+            "loading session redaction table for first-party egress",
+            format!("session {session_id} is missing"),
+        )
+        .into());
     }
-    let Some(vault) = vault else {
-        return Ok(None);
-    };
-    let Some(json) = crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)?
-    else {
-        return Ok(None);
-    };
-    crate::redact::RedactionTable::from_persisted_json(&json)
-        .map(Some)
-        .context("loading session redaction table for first-party egress")
+    let json = crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)
+        .map_err(|error| {
+            crate::redact::RedactionTableUnavailable::new(
+                "loading session redaction table for first-party egress",
+                error,
+            )
+        })?
+        .ok_or_else(|| {
+            crate::redact::RedactionTableUnavailable::new(
+                "loading session redaction table for first-party egress",
+                format!("session {session_id} has no vault redaction table"),
+            )
+        })?;
+    crate::redact::RedactionTable::from_persisted_json(&json).map_err(|error| {
+        crate::redact::RedactionTableUnavailable::new(
+            "loading session redaction table for first-party egress",
+            error,
+        )
+        .into()
+    })
 }
 
 pub(crate) async fn connector_enabled(
@@ -152,9 +174,8 @@ mod tests {
         )
         .unwrap();
         let vault = crate::secure_key::vault_for_db(&db).unwrap();
-        let loaded = redaction_for_session(&db, Some(&vault), session.session_id)
+        let loaded = redaction_for_session(&db, &vault, session.session_id)
             .await
-            .unwrap()
             .unwrap();
         assert_ne!(loaded.scrub("custom-upload-secret"), "custom-upload-secret");
     }
@@ -173,10 +194,47 @@ mod tests {
         )
         .unwrap();
         let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error = redaction_for_session(&db, &vault, session.session_id)
+            .await
+            .expect_err("malformed vault table must fail closed");
         assert!(
-            redaction_for_session(&db, Some(&vault), session.session_id)
-                .await
-                .is_err()
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "malformed table must be a typed redaction failure: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_vault_item_blocks_upload() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/project", "builder")
+            .await
+            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error = redaction_for_session(&db, &vault, session.session_id)
+            .await
+            .expect_err("missing vault table must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "missing table must be a typed redaction failure: {message}"
+        );
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_blocks_upload() {
+        let db = Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error = redaction_for_session(&db, &vault, Uuid::new_v4())
+            .await
+            .expect_err("missing session must fail closed");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "missing session must be a typed redaction failure: {error:#}"
         );
     }
 

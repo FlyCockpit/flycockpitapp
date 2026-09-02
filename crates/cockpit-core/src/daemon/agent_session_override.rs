@@ -23,7 +23,7 @@
 //! route key back to the credential-owning provider handle.
 
 use cockpit_config::config::providers::ProvidersConfig;
-use cockpit_config::config::sandbox_mode::SandboxMode;
+use cockpit_config::config::sandbox_mode::{SandboxIntent, SandboxMode};
 use cockpit_proto::{
     AGENT_EFFECTIVE_SETTINGS_DTO_VERSION, AgentControlLockedReasonV1, AgentEffectiveSettingsV1,
     AgentQuestionControlV1, AgentQuestionEffectiveV1, AgentQuestionOverrideV1,
@@ -58,8 +58,9 @@ pub struct NodeOverrideContext {
     pub override_revision: i64,
     pub pending: Option<StoredSessionOverride>,
     pub effective: Option<StoredSessionOverride>,
-    /// Session config sandbox default (the baseline when no consumed override).
-    pub session_sandbox_default: SandboxMode,
+    /// Session config sandbox default (the persistable baseline when no
+    /// consumed override). Runtime [`SandboxMode::Refuse`] is never a baseline.
+    pub session_sandbox_default: SandboxIntent,
     /// The node's resolved profile snapshot, when one is bound. Absent for a
     /// node with no persisted profile (e.g. a bare utility node).
     pub profile: Option<RedactedAgentProfileSnapshot>,
@@ -74,48 +75,27 @@ pub struct NodeOverrideContext {
 // --- restrictiveness / permissiveness orderings ---------------------------
 
 /// Sandbox restrictiveness rank: higher = stricter = *less* authority. A
-/// non-escalating override may only keep or raise the rank.
-fn sandbox_rank(mode: SandboxMode) -> u8 {
+/// non-escalating override may only keep or raise the rank. Refuse is not
+/// a persistable intent and has no rank.
+fn sandbox_rank(mode: SandboxIntent) -> u8 {
     match mode {
-        SandboxMode::Off => 0,
-        SandboxMode::Sandbox => 1,
-        SandboxMode::Container => 2,
-        SandboxMode::ContainerReadonly => 3,
-    }
-}
-
-const SANDBOX_ORDER: [SandboxMode; 4] = [
-    SandboxMode::Off,
-    SandboxMode::Sandbox,
-    SandboxMode::Container,
-    SandboxMode::ContainerReadonly,
-];
-
-fn sandbox_label(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::Off => "off",
-        SandboxMode::Sandbox => "sandbox",
-        SandboxMode::Container => "container",
-        SandboxMode::ContainerReadonly => "container_readonly",
+        SandboxIntent::Off => 0,
+        SandboxIntent::Sandbox => 1,
+        SandboxIntent::Container => 2,
+        SandboxIntent::ContainerReadonly => 3,
     }
 }
 
 pub(crate) fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
-    match label {
-        "off" => Some(SandboxMode::Off),
-        "sandbox" => Some(SandboxMode::Sandbox),
-        "container" => Some(SandboxMode::Container),
-        "container_readonly" => Some(SandboxMode::ContainerReadonly),
-        _ => None,
-    }
+    SandboxIntent::from_label(label).map(SandboxMode::from)
 }
 
 impl NodeOverrideContext {
-    fn effective_sandbox(&self) -> SandboxMode {
+    fn effective_sandbox_intent(&self) -> SandboxIntent {
         self.effective
             .as_ref()
             .and_then(|o| o.sandbox.as_deref())
-            .and_then(sandbox_from_label)
+            .and_then(SandboxIntent::from_label)
             .unwrap_or(self.session_sandbox_default)
     }
 
@@ -158,14 +138,18 @@ pub fn build_effective_settings(ctx: &NodeOverrideContext) -> AgentEffectiveSett
     let terminal_lock = terminal.then_some(AgentControlLockedReasonV1::Terminal);
 
     // Sandbox: allowed = keep or raise restrictiveness (never loosen). `off`
-    // appears only when the effective value is already `off`.
-    let eff_sandbox = ctx.effective_sandbox();
+    // appears only when the effective value is already `off`. Refuse is not
+    // selectable; a stored refuse label is ignored and the session intent
+    // is used instead.
+    let eff_sandbox_intent = ctx.effective_sandbox_intent();
+    let eff_sandbox = SandboxMode::from(eff_sandbox_intent);
     let sandbox_allowed: Vec<SandboxMode> = if terminal {
         Vec::new()
     } else {
-        SANDBOX_ORDER
+        SandboxIntent::ALL
             .into_iter()
-            .filter(|candidate| sandbox_rank(*candidate) >= sandbox_rank(eff_sandbox))
+            .filter(|candidate| sandbox_rank(*candidate) >= sandbox_rank(eff_sandbox_intent))
+            .map(SandboxMode::from)
             .collect()
     };
     let sandbox = AgentSandboxControlV1 {
@@ -563,10 +547,11 @@ pub fn authorize_non_model_field(
             Err(AgentSessionOverrideStatusV1::RejectedIncompatible)
         }
         AgentSessionOverrideFieldV1::Sandbox { mode } => {
-            if sandbox_rank(*mode) >= sandbox_rank(ctx.effective_sandbox()) {
-                Ok(StoredOverrideField::Sandbox(
-                    sandbox_label(*mode).to_string(),
-                ))
+            let Ok(requested) = SandboxIntent::try_from(*mode) else {
+                return Err(AgentSessionOverrideStatusV1::RejectedIncompatible);
+            };
+            if sandbox_rank(requested) >= sandbox_rank(ctx.effective_sandbox_intent()) {
+                Ok(StoredOverrideField::Sandbox(requested.label().to_string()))
             } else {
                 Err(AgentSessionOverrideStatusV1::RejectedEscalation)
             }
@@ -721,7 +706,7 @@ mod tests {
             override_revision: 0,
             pending: None,
             effective: None,
-            session_sandbox_default: SandboxMode::Sandbox,
+            session_sandbox_default: SandboxIntent::Sandbox,
             profile: None,
             model_bindings: Vec::new(),
             child_model_bindings: Vec::new(),
@@ -768,7 +753,7 @@ mod tests {
     fn modes_session_setup_sandbox_allowed_never_loosens_and_off_gated() {
         let mut ctx = base_ctx();
         // Effective sandbox = Sandbox: allowed is Sandbox and stricter; never Off.
-        ctx.session_sandbox_default = SandboxMode::Sandbox;
+        ctx.session_sandbox_default = SandboxIntent::Sandbox;
         let dto = build_effective_settings(&ctx);
         assert_eq!(
             dto.sandbox.allowed,
@@ -800,6 +785,18 @@ mod tests {
             )
             .is_ok()
         );
+        assert_eq!(
+            authorize_non_model_field(
+                &AgentSessionOverrideFieldV1::Sandbox {
+                    mode: SandboxMode::Refuse
+                },
+                &ctx
+            ),
+            Err(AgentSessionOverrideStatusV1::RejectedIncompatible),
+            "Refuse is not a selectable or persistable override intent"
+        );
+        assert!(sandbox_from_label("refuse").is_none());
+        assert_eq!(sandbox_from_label("sandbox"), Some(SandboxMode::Sandbox));
     }
 
     #[test]
@@ -943,12 +940,12 @@ mod tests {
         // From the strictest posture nothing is loosenable: allowed is a
         // singleton; from `off` every posture is allowed (off included).
         let mut ctx = base_ctx();
-        ctx.session_sandbox_default = SandboxMode::ContainerReadonly;
+        ctx.session_sandbox_default = SandboxIntent::ContainerReadonly;
         assert_eq!(
             build_effective_settings(&ctx).sandbox.allowed,
             vec![SandboxMode::ContainerReadonly]
         );
-        ctx.session_sandbox_default = SandboxMode::Off;
+        ctx.session_sandbox_default = SandboxIntent::Off;
         assert_eq!(
             build_effective_settings(&ctx).sandbox.allowed,
             vec![

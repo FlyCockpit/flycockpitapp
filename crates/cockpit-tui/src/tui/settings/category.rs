@@ -2248,7 +2248,7 @@ impl SettingsCx {
                 }
             }
             S::SandboxDefaultMode => {
-                sandbox_mode_setting_value(e.sandbox.default_mode, &self.host_capabilities)
+                sandbox_mode_setting_value(e.sandbox.default_mode.into(), &self.host_capabilities)
             }
             S::SecretStore => {
                 crate::tui::capability_gate::secret_store_row_value(&self.host_capabilities)
@@ -3083,7 +3083,7 @@ impl SettingsCx {
         use crate::tui::capability_gate::{
             RecheckApply, apply_sandbox_choice, next_settings_sandbox_mode,
         };
-        let current = self.extended.sandbox.default_mode;
+        let current = cockpit_proto::SandboxMode::from(self.extended.sandbox.default_mode);
         let requested = next_settings_sandbox_mode(current, &self.host_capabilities);
         if requested == current {
             p.status = Some("no other sandbox mode is available".into());
@@ -3094,7 +3094,16 @@ impl SettingsCx {
             apply_sandbox_choice(requested, &snapshot, || self.refresh_host_capabilities());
         match outcome {
             RecheckApply::Applied(mode) => {
-                self.extended.sandbox.default_mode = mode;
+                let Ok(intent) =
+                    cockpit_config::config::sandbox_mode::SandboxIntent::try_from(mode)
+                else {
+                    p.status = Some(
+                        "refuse is a runtime fail-closed state, not a persistable sandbox intent"
+                            .into(),
+                    );
+                    return false;
+                };
+                self.extended.sandbox.default_mode = intent;
                 true
             }
             RecheckApply::Instruct(instruct) => {

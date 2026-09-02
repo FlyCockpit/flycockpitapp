@@ -47,6 +47,7 @@
     "sandbox_mode.sandbox": 2,
     "sandbox_mode.container": 3,
     "sandbox_mode.container_readonly": 4,
+    "sandbox_mode.refuse": 5,
     "goal_disposition.running": 1,
     "goal_disposition.user_paused": 2,
     "goal_disposition.infra_paused": 3,

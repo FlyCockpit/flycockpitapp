@@ -354,6 +354,7 @@ canonical_unit_enum16!(cockpit_config::config::sandbox_mode::SandboxMode, {
     Sandbox = 2,
     Container = 3,
     ContainerReadonly = 4,
+    Refuse = 5,
 });
 canonical_unit_enum16!(cockpit_db::db::session_goals::GoalDisposition, {
     Running = 1,
@@ -1661,6 +1662,10 @@ mod tests {
         check!(
             "sandbox_mode.container_readonly",
             cockpit_config::config::sandbox_mode::SandboxMode::ContainerReadonly
+        );
+        check!(
+            "sandbox_mode.refuse",
+            cockpit_config::config::sandbox_mode::SandboxMode::Refuse
         );
         check!(
             "goal_disposition.running",

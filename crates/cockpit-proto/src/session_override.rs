@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use cockpit_config::config::sandbox_mode::SandboxMode;
+use cockpit_config::config::sandbox_mode::{SandboxIntent, SandboxMode};
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
 
@@ -200,7 +200,15 @@ pub enum AgentSessionOverrideFieldV1 {
     /// client never sends a provider/profile handle.
     Model { slot_id: String, choice_id: String },
     /// Reduce sandbox posture to an envelope-permitted, non-escalating value.
-    Sandbox { mode: SandboxMode },
+    /// `mode` is a persistable [`SandboxIntent`]; runtime [`SandboxMode::Refuse`]
+    /// is not a selectable override.
+    Sandbox {
+        #[serde(
+            serialize_with = "serialize_persistable_sandbox_mode",
+            deserialize_with = "deserialize_persistable_sandbox_mode"
+        )]
+        mode: SandboxMode,
+    },
     /// Reduce or disable verification for a daemon-resolved effective region.
     Verification {
         reduction: AgentVerificationReductionV1,
@@ -275,6 +283,25 @@ impl AgentSessionOverrideStatusV1 {
     }
 }
 
+fn deserialize_persistable_sandbox_mode<'de, D>(deserializer: D) -> Result<SandboxMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    SandboxIntent::deserialize(deserializer).map(Into::into)
+}
+
+fn serialize_persistable_sandbox_mode<S>(
+    mode: &SandboxMode,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    SandboxIntent::try_from(*mode)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +324,22 @@ mod tests {
         assert_eq!(json["axis"], "sandbox");
         assert_eq!(json["mode"], "container");
         assert_eq!(roundtrip(&sandbox), sandbox);
+
+        let refuse = serde_json::json!({"axis": "sandbox", "mode": "refuse"});
+        let err = serde_json::from_value::<AgentSessionOverrideFieldV1>(refuse)
+            .expect_err("refuse is not a persistable override intent");
+        let message = err.to_string();
+        assert!(
+            message.contains("refuse") || message.contains("unknown variant"),
+            "unexpected serde error: {message}"
+        );
+        let constructed = AgentSessionOverrideFieldV1::Sandbox {
+            mode: SandboxMode::Refuse,
+        };
+        assert!(
+            serde_json::to_value(&constructed).is_err(),
+            "Refuse cannot be serialized as an override intent"
+        );
 
         let question = AgentSessionOverrideFieldV1::Question {
             policy: AgentQuestionOverrideV1::Reduce {

@@ -284,6 +284,29 @@ fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
 }
 
 #[test]
+fn sandbox_refuse_state_does_not_clear_unavailable_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::SandboxUnavailable {
+        remedy: "sandbox.host probe failed".to_string(),
+        fix_command: None,
+    });
+    assert!(app.sandbox_down_notice.is_some());
+
+    app.apply_event(TurnEvent::SandboxState {
+        mode: cockpit_proto::SandboxMode::Refuse,
+        container_network_enabled: false,
+        container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Sandbox),
+    });
+    assert!(
+        app.sandbox_down_notice.is_some(),
+        "Refuse is fail-closed, not Off, so the warning must stay visible"
+    );
+    assert_eq!(app.sandbox_mode, cockpit_proto::SandboxMode::Refuse);
+}
+
+#[test]
 fn sandbox_escalation_state_toasts_only_on_change() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);

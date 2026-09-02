@@ -1,1 +1,1 @@
-pub use crate::config::sandbox_mode::SandboxMode;
+pub use crate::config::sandbox_mode::{SandboxIntent, SandboxMode};

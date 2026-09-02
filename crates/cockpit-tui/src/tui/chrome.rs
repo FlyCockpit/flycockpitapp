@@ -194,6 +194,7 @@ pub fn left_status(
         SandboxMode::Sandbox => ("sandbox", muted),
         SandboxMode::Container => ("container", muted),
         SandboxMode::ContainerReadonly => ("container readonly", muted),
+        SandboxMode::Refuse => ("sandbox refused", Style::default().fg(WARNING_TEXT)),
     };
     push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
     push_span(
@@ -638,6 +639,12 @@ mod tests {
         let text = sandbox_status_text(SandboxMode::ContainerReadonly, true);
         assert!(text.contains("container readonly"), "{text}");
         assert!(!text.contains("esc "), "{text}");
+    }
+
+    #[test]
+    fn left_status_sandbox_refuse_is_visible_warning() {
+        let text = sandbox_status_text(SandboxMode::Refuse, true);
+        assert!(text.contains("sandbox refused"), "{text}");
     }
 }
 

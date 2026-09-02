@@ -13,13 +13,17 @@
 //! not a fabricated heuristic oracle.
 //!
 //! A pgid is a bare integer identity. Signal authority requires a
-//! parent-owned leader pin (`waitid` WNOWAIT). `terminate` is one-shot after
-//! Ok/ESRCH; a failed signal may retry only while that pin holds. Losing the
-//! pin without a successful SIGKILL forgets the pgid (Unattributable).
-//! `ProvenEmpty` reclaims the live guard, and `Uncertain` after SIGKILL, a
-//! failed bind, or pin-loss forgets the pgid so a later retry cannot SIGKILL
-//! a recycled process group. Adapter memory is the live map of in-flight
-//! leases only.
+//! parent-owned leader pin (`waitid` WNOWAIT plus the start identity
+//! captured at assign). `terminate` is one-shot after Ok/ESRCH; a failed
+//! signal may retry only while that pin holds. Losing the pin without a
+//! successful SIGKILL forgets the pgid (Unattributable). `ProvenEmpty`
+//! reclaims the live guard. `Uncertain` after a failed bind or pin-loss
+//! forgets the pgid so a later retry cannot SIGKILL a recycled process
+//! group. `Uncertain` after a delivered SIGKILL while the group is still
+//! populated keeps the live guard: signal authority is already consumed
+//! (one-shot), and the empty oracle is one-sided safe (a recycled pgid
+//! can only yield false-Populated, never false-Empty). Adapter memory is
+//! the live map of in-flight leases only.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -378,21 +382,20 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
             EmptyOutcome::Uncertain { .. } => {
                 #[cfg(unix)]
                 {
-                    // Probe Uncertain (still populated, never SIGKILL'd, leader
-                    // pin held) keeps the live guard so a later terminate can
-                    // still kill. Settlement Uncertain after SIGKILL, a failed
-                    // bind, or pin-loss without a successful signal drops pgid
-                    // authority so retries cannot target a recycle.
-                    let drop_authority = {
+                    // Unattributable membership (failed bind, pin-loss without
+                    // SIGKILL) cannot prove empty and must not remain a signal
+                    // target: drop it. A delivered SIGKILL that has not yet
+                    // drained keeps the live guard. Signal authority is already
+                    // one-shot (`group_terminate_signaled`); the empty oracle
+                    // is one-sided safe and is the only object that can later
+                    // observe Empty once the group actually drains.
+                    let drop_unattributable = {
                         let live = self.live.lock().unwrap();
                         live.get(&handle.key)
-                            .map(|job| {
-                                job.guard.group_is_unattributable()
-                                    || job.guard.group_terminate_signaled()
-                            })
+                            .map(|job| job.guard.group_is_unattributable())
                             .unwrap_or(false)
                     };
-                    if drop_authority {
+                    if drop_unattributable {
                         self.drop_signal_authority_and_reclaim(&handle.key);
                     }
                 }
@@ -470,8 +473,9 @@ async fn unix_wait_group_empty(
     handle: &AdapterHandle,
     generation: u64,
 ) -> EmptyOutcome {
-    // Brief poll so SIGKILL'd zombies reaped by init are not reported as a
-    // still-populated group. Live descendants stay Uncertain.
+    // Brief poll so a just-SIGKILL'd group that has already drained is
+    // observed Empty on this call. Still-populated groups stay Uncertain;
+    // after SIGKILL the live oracle is kept so a later probe can settle.
     for _ in 0..20 {
         let population = {
             let live = adapter.live.lock().unwrap();
@@ -708,6 +712,63 @@ mod unix_settlement_invariants {
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
             o => panic!("successful SIGKILL must still settle empty after reap: {o:?}"),
+        }
+        assert_eq!(adapter.live_group_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_signal_slow_drain_keeps_empty_oracle() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated guard");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        tree.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn into the lease group");
+        tree.assign(&child).expect("bind");
+        adapter
+            .terminate(&allocated.handle, 1)
+            .await
+            .expect("SIGKILL");
+        // Do not reap: the zombie leader keeps the group resolvable, so the
+        // ~100ms probe cannot prove Empty. Signal authority is spent; the
+        // empty oracle must survive so a later drain can settle.
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { generation, reason } => {
+                assert_eq!(generation, 1);
+                assert_eq!(reason, "process_group_still_populated");
+            }
+            o => panic!("unreaped SIGKILL'd leader must not fabricate Empty: {o:?}"),
+        }
+        assert_eq!(
+            adapter.live_group_count(),
+            1,
+            "SIGKILL Uncertain must keep the empty oracle"
+        );
+        match adapter
+            .recover(&allocated.locator, 1)
+            .await
+            .expect("recover")
+        {
+            EmptyOutcome::Uncertain { reason, .. } => {
+                assert_ne!(
+                    reason, "process_group_locator_not_reusable",
+                    "kept oracle must remain recoverable"
+                );
+            }
+            EmptyOutcome::ProvenEmpty { .. } => {}
+            o => panic!("recover must still see the live group: {o:?}"),
+        }
+        let _ = child.wait().await;
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
+            o => panic!("kept oracle must prove Empty once the group drains: {o:?}"),
         }
         assert_eq!(adapter.live_group_count(), 0);
     }

@@ -24,9 +24,17 @@ const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 ///
 /// A numeric pgid is a recycled-identity hazard the moment the original
 /// group can empty. Signal authority requires a parent-owned attribution
-/// proof: the unreaped leader pin (`waitid` `WNOWAIT`). An unattributable
+/// proof: the unreaped leader pin (`waitid` `WNOWAIT`) *and* the kernel
+/// process-start identity captured at [`ProcessTreeGuard::assign`]. `waitid`
+/// alone is pid-parenthood (any unreaped child of this process at that
+/// number); the start identity is guard-child sameness. An unattributable
 /// membership (spawned child, never bound, or pin lost without a successful
 /// SIGKILL) must never be treated as empty and must never be a signal target.
+///
+/// The pin is proven at check time, immediately before `kill(-pgid)`, under
+/// this guard's mutex. Reaping is outside that mutex: callers must not reap
+/// the assigned leader concurrently with [`ProcessTreeGuard::terminate`]
+/// (see that method's contract).
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnixGroup {
@@ -37,7 +45,11 @@ enum UnixGroup {
     /// re-signal. A failed signal leaves `signaled` false so a later
     /// attempt may retry only while the unreaped leader pin holds. Losing
     /// that pin without a successful signal forgets this identity.
-    Bound { pgid: libc::pid_t, signaled: bool },
+    Bound {
+        pgid: libc::pid_t,
+        start: crate::daemon_lifecycle::ProcessStartIdentity,
+        signaled: bool,
+    },
     /// A child ran (or assign failed after spawn) but this guard does not
     /// hold an attributable pgid. Never empty; never a signal target.
     Unattributable,
@@ -168,6 +180,15 @@ impl ProcessTreeGuard {
     }
 
     /// Assign `child` to this containment object. Does not resume user code.
+    ///
+    /// On Unix this records the child's pgid together with its kernel
+    /// process-start identity. That pair is the only attribution proof a
+    /// later [`terminate`](Self::terminate) may signal. The child must still
+    /// be this process's unreaped leader: callers must not reap `child`
+    /// concurrently with `terminate` / `Drop`, and must not spawn a
+    /// replacement own-group child at the same pid until `terminate` has
+    /// returned. [`wait_for_exit_without_reaping`] is the observe-then-
+    /// terminate-then-reap protocol that keeps the pin held.
     pub fn assign(&self, child: &tokio::process::Child) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
@@ -178,7 +199,7 @@ impl ProcessTreeGuard {
             if matches!(*group, UnixGroup::Bound { .. }) {
                 return Err(anyhow::anyhow!("process group already bound"));
             }
-            let result = (|| -> anyhow::Result<libc::pid_t> {
+            let result = (|| -> anyhow::Result<(libc::pid_t, crate::daemon_lifecycle::ProcessStartIdentity)> {
                 let pid = child
                     .id()
                     .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
@@ -195,12 +216,15 @@ impl ProcessTreeGuard {
                         "child is not the leader of its process group"
                     ));
                 }
-                Ok(pgid)
+                let start = crate::daemon_lifecycle::process_start_identity(pid as u32)
+                    .map_err(|e| anyhow::anyhow!("child start identity missing: {e}"))?;
+                Ok((pgid, start))
             })();
             match result {
-                Ok(pgid) => {
+                Ok((pgid, start)) => {
                     *group = UnixGroup::Bound {
                         pgid,
+                        start,
                         signaled: false,
                     };
                     Ok(())
@@ -320,18 +344,26 @@ impl ProcessTreeGuard {
         self.resume(child)
     }
 
+    /// Kill every process in this containment.
+    ///
+    /// Unix: `kill(-pgid, SIGKILL)` only while the unreaped-leader pin holds
+    /// for the *assigned* child (waitid parenthood plus the start identity
+    /// recorded by [`assign`](Self::assign)). The pin is checked and the
+    /// signal is sent under this guard's mutex; the caller's reaper is not.
+    /// Callers must not reap the assigned leader concurrently with this
+    /// method (or `Drop`), and must not spawn a replacement own-group child
+    /// at the same pid until it returns. The sanctioned order is
+    /// [`wait_for_exit_without_reaping`] → `terminate` → `child.wait()`.
+    ///
+    /// Ok/ESRCH consume the one-shot so a later retry cannot target a
+    /// recycle; the bound identity is kept so the empty oracle can still
+    /// observe ESRCH after the leader is reaped. A failed signal (EPERM)
+    /// leaves the one-shot open so a later attempt may retry while that pin
+    /// holds. Losing the pin without a successful signal forgets the pgid:
+    /// Drop/retry must not send `kill(-pgid)`.
     pub fn terminate(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            // A pgid is a bare integer identity. Signal it only while this
-            // process still holds the unreaped leader (`waitid` WNOWAIT pin).
-            // Ok/ESRCH consume the one-shot so a later retry cannot target a
-            // recycle; the bound identity is kept so the empty oracle can
-            // still observe ESRCH after the leader is reaped. A failed
-            // signal (EPERM: one un-signable member, the hostile-hook case)
-            // leaves the one-shot open so a later attempt may retry while
-            // that pin holds. Losing the pin without a successful signal
-            // forgets the pgid: Drop/retry must not send `kill(-pgid)`.
             let mut group = self
                 .group
                 .lock()
@@ -340,15 +372,17 @@ impl ProcessTreeGuard {
             match *group {
                 UnixGroup::Bound {
                     pgid,
+                    start,
                     signaled: false,
                 } => {
-                    match signal_group(pgid, libc::SIGKILL) {
+                    match signal_pinned_group(pgid, start, libc::SIGKILL) {
                         Ok(()) => {}
                         Err(error) if is_esrch(&error) => {}
                         Err(error) => return Err(error.into()),
                     }
                     *group = UnixGroup::Bound {
                         pgid,
+                        start,
                         signaled: true,
                     };
                 }
@@ -541,7 +575,12 @@ impl ProcessTreeGuard {
 ///
 /// `WNOWAIT` deliberately leaves the group leader as a zombie, pinning its PID
 /// and therefore the process-group identity until descendant containment has
-/// been applied. The caller must subsequently reap the child.
+/// been applied. This is observation only: it does not authorize `kill(-pgid)`
+/// by itself. Pair it with [`ProcessTreeGuard::terminate`] (or a pinned
+/// `terminate_group_*` helper) *before* reaping. Callers must not reap the
+/// leader concurrently with that terminate, and must not spawn a replacement
+/// own-group child at the same pid until terminate has returned. Reap only
+/// afterward.
 #[cfg(unix)]
 pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
     let pid = libc::pid_t::try_from(pid)
@@ -740,12 +779,14 @@ fn unix_group_signal_target(pgid: i32) -> i32 {
 #[cfg(all(test, unix))]
 thread_local! {
     static TEST_GROUP_SIGNAL_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    static TEST_GROUP_SIGNAL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(unix)]
 fn signal_group(pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
     #[cfg(test)]
     {
+        TEST_GROUP_SIGNAL_COUNT.with(|cell| cell.set(cell.get().saturating_add(1)));
         let errno = TEST_GROUP_SIGNAL_ERRNO.with(|cell| cell.replace(0));
         if errno != 0 {
             return Err(std::io::Error::from_raw_os_error(errno));
@@ -802,13 +843,54 @@ fn observe_child_exit_without_reaping(pid: libc::pid_t) -> std::io::Result<bool>
     }
 }
 
-/// Whether the bound leader PID is still this process's unreaped child.
-/// That parent relationship is the only attribution proof a numeric pgid
-/// can hold: `kill(-pgid, 0)` after a gap cannot distinguish our group
-/// from a recycled one.
+/// Whether `pgid` still names the assigned unreaped leader.
+///
+/// `waitid(P_PID, ..., WNOWAIT)` is pid-parenthood: it succeeds for *any*
+/// unreaped child of this process at that number. The start identity is
+/// guard-child sameness: a reaped leader whose pid is immediately recycled
+/// by a new own-group child fails this check. Both must hold. Fail closed
+/// if the start identity cannot be re-read.
 #[cfg(unix)]
-fn leader_pin_holds(pgid: libc::pid_t) -> bool {
-    observe_child_exit_without_reaping(pgid).is_ok()
+fn leader_pin_holds(
+    pgid: libc::pid_t,
+    start: crate::daemon_lifecycle::ProcessStartIdentity,
+) -> bool {
+    if observe_child_exit_without_reaping(pgid).is_err() {
+        return false;
+    }
+    match crate::daemon_lifecycle::process_start_identity(pgid as u32) {
+        Ok(observed) => observed == start,
+        Err(_) => false,
+    }
+}
+
+/// Capture a leader pin from a live child pid. `None` if this process does
+/// not currently hold that unreaped child or its start identity is missing.
+#[cfg(unix)]
+fn capture_leader_pin(
+    pgid: libc::pid_t,
+) -> Option<(libc::pid_t, crate::daemon_lifecycle::ProcessStartIdentity)> {
+    if pgid <= 0 {
+        return None;
+    }
+    if observe_child_exit_without_reaping(pgid).is_err() {
+        return None;
+    }
+    let start = crate::daemon_lifecycle::process_start_identity(pgid as u32).ok()?;
+    Some((pgid, start))
+}
+
+/// Signal a process group only while the unreaped assigned-leader pin holds.
+#[cfg(unix)]
+fn signal_pinned_group(
+    pgid: libc::pid_t,
+    start: crate::daemon_lifecycle::ProcessStartIdentity,
+    sig: libc::c_int,
+) -> std::io::Result<()> {
+    if !leader_pin_holds(pgid, start) {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    signal_group(pgid, sig)
 }
 
 /// Forget a bound pgid that can no longer be attributed. A successful
@@ -820,8 +902,9 @@ fn forget_unpinned_signal_target(group: &mut UnixGroup) {
     match *group {
         UnixGroup::Bound {
             pgid,
+            start,
             signaled: false,
-        } if !leader_pin_holds(pgid) => {
+        } if !leader_pin_holds(pgid, start) => {
             *group = UnixGroup::Unattributable;
         }
         _ => {}
@@ -861,11 +944,14 @@ pub async fn terminate_group_and_reap_status_async(
     {
         // Tokio clears `Child::id()` after a reap. Never use a separately
         // cached numeric PID once the child no longer proves that identity.
+        // `id()` being Some is necessary but not sufficient: also require
+        // the unreaped-leader pin (waitid + start identity) before any
+        // `kill(-pgid)`.
         let live_pid = pid
             .filter(|pid| child.id() == Some(*pid))
             .and_then(|pid| i32::try_from(pid).ok());
-        if let Some(pid) = live_pid {
-            match signal_group(pid, libc::SIGTERM) {
+        if let Some((pgid, start)) = live_pid.and_then(capture_leader_pin) {
+            match signal_pinned_group(pgid, start, libc::SIGTERM) {
                 Ok(()) => {}
                 Err(error) if is_esrch(&error) => {
                     return child.wait().await;
@@ -881,8 +967,8 @@ pub async fn terminate_group_and_reap_status_async(
                     _ = tokio::time::sleep(grace) => {}
                 }
             }
-            if group_exists(pid) {
-                let _ = signal_group(pid, libc::SIGKILL);
+            if leader_pin_holds(pgid, start) && group_exists(pgid) {
+                let _ = signal_pinned_group(pgid, start, libc::SIGKILL);
             }
         } else {
             let _ = child.kill().await;
@@ -908,8 +994,12 @@ pub async fn terminate_group_and_reap_status_async(
 pub fn terminate_group_start(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-            match signal_group(pid, libc::SIGTERM) {
+        if let Some((pgid, start)) = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(capture_leader_pin)
+        {
+            match signal_pinned_group(pgid, start, libc::SIGTERM) {
                 Ok(()) => return,
                 Err(error) if is_esrch(&error) => return,
                 Err(_) => {}
@@ -935,8 +1025,12 @@ pub fn terminate_group_kill_wait(child: &mut tokio::process::Child, timeout: Dur
     let deadline = Instant::now() + timeout;
     #[cfg(unix)]
     {
-        if let Some(pgid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-            match signal_group(pgid, libc::SIGKILL) {
+        if let Some((pgid, start)) = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(capture_leader_pin)
+        {
+            match signal_pinned_group(pgid, start, libc::SIGKILL) {
                 Err(error) if is_esrch(&error) => {
                     let _ = child.try_wait();
                     return;
@@ -945,6 +1039,8 @@ pub fn terminate_group_kill_wait(child: &mut tokio::process::Child, timeout: Dur
             }
             while Instant::now() < deadline {
                 let _ = child.try_wait();
+                // Existence probe only: a recycled pgid can delay return
+                // (false populated) but cannot become a SIGKILL target.
                 match signal_group(pgid, 0) {
                     Err(error) if is_esrch(&error) => return,
                     _ => std::thread::sleep(Duration::from_millis(1)),
@@ -962,12 +1058,22 @@ pub fn terminate_group_kill_wait(child: &mut tokio::process::Child, timeout: Dur
     }
 }
 
+/// Terminate a caller-created Unix process group and reap its leader.
+///
+/// `std::process::Child::id()` is the spawn-cached pid and is never
+/// cleared after `wait`, so it is not an attribution proof. Destructive
+/// group signals (`SIGTERM` / `SIGKILL`) require the unreaped-leader pin
+/// (`waitid` plus process-start identity) at signal time. After the
+/// leader has been reaped, this falls back to a direct-child kill/wait
+/// and must not `kill(-pgid)`. Callers hold exclusive `&mut Child`, so a
+/// concurrent reaper cannot currently race the pin; the pin is still
+/// required because the cached integer outlives the child.
 pub fn terminate_group_sync(child: &mut std::process::Child, grace: Duration) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
-        if pgid > 0 {
-            match signal_group(pgid, libc::SIGTERM) {
+        if let Some((_, start)) = capture_leader_pin(pgid) {
+            match signal_pinned_group(pgid, start, libc::SIGTERM) {
                 Ok(()) => {}
                 Err(error) if is_esrch(&error) => {
                     let _ = child.wait();
@@ -984,10 +1090,17 @@ pub fn terminate_group_sync(child: &mut std::process::Child, grace: Duration) {
                 match child.try_wait() {
                     Ok(Some(_)) => return,
                     Ok(None) => std::thread::sleep(Duration::from_millis(10).min(grace)),
-                    Err(_) => break,
+                    Err(_) => {
+                        // Wait identity is unknown; do not SIGKILL a cached pgid.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
                 }
             }
-            let _ = signal_group(pgid, libc::SIGKILL);
+            if leader_pin_holds(pgid, start) {
+                let _ = signal_pinned_group(pgid, start, libc::SIGKILL);
+            }
             let _ = child.wait();
             return;
         }
@@ -1490,6 +1603,66 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(child.id(), None, "termination must finish by reaping once");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leader_pin_requires_start_identity_sameness() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn");
+        let pid = libc::pid_t::try_from(child.id().expect("pid")).expect("pid_t");
+        let start = crate::daemon_lifecycle::process_start_identity(pid as u32).expect("start");
+        assert!(
+            leader_pin_holds(pid, start),
+            "assigned unreaped leader must pin"
+        );
+        let mismatch = crate::daemon_lifecycle::ProcessStartIdentity {
+            primary: start.primary.wrapping_add(1),
+            secondary: start.secondary,
+        };
+        assert!(
+            !leader_pin_holds(pid, mismatch),
+            "waitid parenthood is not guard-child sameness"
+        );
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert!(
+            !leader_pin_holds(pid, start),
+            "reaped leader must not remain a signal target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_sync_does_not_signal_a_reaped_std_child_pgid() {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn");
+        let _ = child.kill();
+        let _ = child.wait();
+        TEST_GROUP_SIGNAL_COUNT.with(|cell| cell.set(0));
+        terminate_group_sync(&mut child, Duration::from_millis(50));
+        assert_eq!(
+            TEST_GROUP_SIGNAL_COUNT.with(|cell| cell.get()),
+            0,
+            "std Child::id() survives wait; a reaped leader must not be a group-signal target"
+        );
     }
 
     #[cfg(unix)]

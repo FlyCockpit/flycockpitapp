@@ -22517,12 +22517,9 @@ fn redacted_mcp_config_snapshot(
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
     let path = canonical_mcp_target_path(&path)?;
-    let prior = match std::fs::read_to_string(&path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
-        }
-        Err(error) => return Err(internal(error)),
+    let prior = match mcp_layer_text(&path)? {
+        Some(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        None => crate::mcp::config::McpConfig::default(),
     };
     crate::mcp::config::redact_config_for_owner_view(&mut config);
     let catalog = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
@@ -22599,13 +22596,12 @@ fn canonical_mcp_target_path(
 }
 
 fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<String, ErrorPayload> {
-    let value: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(raw) => {
+    let value: serde_json::Value = match mcp_layer_text(path)? {
+        Some(raw) => {
             crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
             serde_json::from_str(&raw).map_err(internal)?
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(internal(error)),
+        None => serde_json::json!({}),
     };
     let json = serde_json::to_string(&value).map_err(internal)?;
     use sha2::Digest as _;
@@ -25307,17 +25303,14 @@ async fn save_mcp_config(
     // from a caller-supplied list of arbitrary vault names. A malformed prior
     // layer is a hard failure: treating it as empty could delete credentials
     // still needed by that layer.
-    let prior_config = match std::fs::read_to_string(&path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
-        }
-        Err(error) => return Err(internal(error)),
+    let prior_raw = mcp_layer_text(&path)?;
+    let prior_config = match &prior_raw {
+        Some(raw) => crate::mcp::config::McpConfig::parse(raw).map_err(internal)?,
+        None => crate::mcp::config::McpConfig::default(),
     };
-    let mut raw_document: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(internal(error)),
+    let mut raw_document: serde_json::Value = match &prior_raw {
+        Some(raw) => serde_json::from_str(raw).map_err(internal)?,
+        None => serde_json::json!({}),
     };
     let root = raw_document
         .as_object_mut()
@@ -26036,10 +26029,8 @@ fn mcp_live_secret_references(
     for path in
         cockpit_config::config::dirs::mcp_file_paths_for_load(std::path::Path::new(project_root))
     {
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(internal(error)),
+        let Some(raw) = mcp_layer_text(&path)? else {
+            continue;
         };
         let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
         for (name, server) in layer.servers {
@@ -26075,10 +26066,8 @@ fn mcp_config_from_paths(
 ) -> std::result::Result<crate::mcp::config::McpConfig, ErrorPayload> {
     let mut merged = crate::mcp::config::McpConfig::default();
     for path in paths {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(internal(error)),
+        let Some(raw) = mcp_layer_text(path)? else {
+            continue;
         };
         let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
         for (name, server) in layer.servers {
@@ -26086,6 +26075,22 @@ fn mcp_config_from_paths(
         }
     }
     Ok(merged)
+}
+
+fn mcp_layer_text(path: &std::path::Path) -> std::result::Result<Option<String>, ErrorPayload> {
+    match crate::mcp::config::McpConfig::read_layer_text(path) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            if matches!(
+                error,
+                crate::resource_limits::ResourceLimitError::ByteLimit { .. }
+            ) {
+                Err(bad_request(error.to_string()))
+            } else {
+                Err(internal(error))
+            }
+        }
+    }
 }
 
 fn mcp_and_provider_live_secret_references(

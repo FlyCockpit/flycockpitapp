@@ -1934,7 +1934,7 @@ fn now_secs() -> i64 {
 /// Read the `module` line out of `go.mod` at the project root, if any.
 fn go_module_prefix(root: &Path) -> String {
     let gomod = root.join("go.mod");
-    let Ok(text) = std::fs::read_to_string(&gomod) else {
+    let Ok(Some(text)) = crate::resource_limits::read_project_text(&gomod) else {
         return String::new();
     };
     for line in text.lines() {
@@ -2020,6 +2020,19 @@ mod tests {
         assert!(parsed.lines.is_none());
         assert!(parsed.content_hash.is_empty());
         assert!(parsed.extraction.symbols.is_empty());
+    }
+
+    #[test]
+    fn go_module_prefix_does_not_load_an_oversized_go_mod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gomod = tmp.path().join("go.mod");
+        std::fs::File::create(&gomod)
+            .unwrap()
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        assert!(go_module_prefix(tmp.path()).is_empty());
+        std::fs::write(&gomod, "module example.com/mod\n").unwrap();
+        assert_eq!(go_module_prefix(tmp.path()), "example.com/mod");
     }
 
     #[test]

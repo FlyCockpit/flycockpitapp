@@ -141,6 +141,25 @@ fn dotenv_stray_line_does_not_void_file() {
 }
 
 #[test]
+fn dotenv_over_cap_fails_the_table_build() {
+    let dir = TempDir::new().unwrap();
+    let env_path = dir.path().join(".env");
+    let handle = std::fs::File::create(&env_path).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let err = RedactionTable::build(&cfg, dir.path()).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("exceeds the daemon file size limit"),
+        "{text}"
+    );
+}
+
+#[test]
 fn dotenv_no_equals_line_skipped_others_kept() {
     let dir = TempDir::new().unwrap();
     let env_path = dir.path().join(".env");

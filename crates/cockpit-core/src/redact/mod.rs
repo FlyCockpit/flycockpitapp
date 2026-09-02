@@ -1163,6 +1163,12 @@ impl RedactionTable {
                     }
                     EnvFileScan::Unsupported => unsupported_files.push(path),
                     EnvFileScan::Unreadable => {}
+                    EnvFileScan::OverLimit => {
+                        anyhow::bail!(
+                            "env file `{}` exceeds the daemon file size limit; refusing to build a redaction table that would miss its secrets",
+                            path.display()
+                        );
+                    }
                 }
             }
         }
@@ -1530,15 +1536,23 @@ impl RedactionTable {
     /// This does not decide whether a path is secret and never reads any other
     /// path; callers pair it with `SecretPathMatcher` after their read gate.
     pub fn with_approved_secret_file(&self, cfg: &RedactConfig, path: &Path) -> Result<Self> {
-        let EnvFileScan::Candidates(candidates) = collect_env_file_candidates(path, &cfg.allowlist)
-        else {
-            return self.union(&Self::from_entries(
-                Vec::new(),
-                self.placeholder.clone(),
-                self.disabled,
-                Vec::new(),
-                self.protected.clone(),
-            )?);
+        let candidates = match collect_env_file_candidates(path, &cfg.allowlist) {
+            EnvFileScan::Candidates(candidates) => candidates,
+            EnvFileScan::OverLimit => {
+                anyhow::bail!(
+                    "env file `{}` exceeds the daemon file size limit; refusing to ingest secrets from an uncapped read",
+                    path.display()
+                );
+            }
+            EnvFileScan::Unsupported | EnvFileScan::Unreadable => {
+                return self.union(&Self::from_entries(
+                    Vec::new(),
+                    self.placeholder.clone(),
+                    self.disabled,
+                    Vec::new(),
+                    self.protected.clone(),
+                )?);
+            }
         };
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
@@ -2213,6 +2227,9 @@ enum EnvFileScan {
     Unsupported,
     /// Couldn't even read the file (missing / permission). Silent skip.
     Unreadable,
+    /// File exceeded the daemon project-file cap. Must fail the table build:
+    /// skipping it would miss secrets (fail open).
+    OverLimit,
 }
 
 #[cfg(test)]

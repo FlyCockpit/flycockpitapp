@@ -5,11 +5,17 @@
 //! their own byte, pixel, or lease constants. Defaults are conservative and
 //! documented next to each field.
 //!
+//! Daemon-side reads of project-controlled files must go through the helpers
+//! in this module (or `cockpit_host::bounded` with an explicit domain cap):
+//! they refuse non-regular files and apply the cap *during* IO so a growing
+//! regular file cannot outrun a stale `metadata.len()`.
+//!
 //! Wire-visible protocol ceilings (per-operation terminal ingress, per-transfer
 //! bulk length) stay in `cockpit-proto` so the CLI and TUI can share them
 //! without depending on this crate's policy. Compile-time asserts below keep
 //! those copies equal to this module.
 
+use std::io;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -206,6 +212,16 @@ impl ResourceLimitError {
             actual,
         }
     }
+
+    /// Absence is the only error that mutation/config loaders may coerce to
+    /// empty. Over-cap, non-regular files, and other IO must fail closed —
+    /// treating them as empty would wipe on-disk state on the subsequent write.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(BoundedIoError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        )
+    }
 }
 
 fn read_capped(path: &Path, cap: u64, what: &'static str) -> Result<Vec<u8>, ResourceLimitError> {
@@ -224,15 +240,68 @@ pub fn read_existing_for_mutation(path: &Path) -> Result<Vec<u8>, ResourceLimitE
     )
 }
 
-/// Load a file for the `read` tool (and sibling snapshot reads). The cap is
-/// the same hard maximum as `fs_read`: larger files fail closed before the
-/// whole body is retained.
+/// Like [`read_existing_for_mutation`], treating a missing file as empty.
+/// Over-cap and non-regular files still fail closed: they must never look
+/// like "no prior content" to a merge or compare.
+pub fn read_existing_or_empty(path: &Path) -> Result<Vec<u8>, ResourceLimitError> {
+    match read_existing_for_mutation(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.is_not_found() => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Streamed SHA-256 of an existing file. The daemon never retains the body;
+/// files over the mutation cap fail closed instead of hashing unbounded time.
+pub fn hash_existing_file(path: &Path) -> Result<String, ResourceLimitError> {
+    let cap = ResourceLimits::defaults().fs_mutation_read_bytes;
+    bounded::read_prefix_and_hash(path, 0, cap)
+        .map(|prefixed| sha256_hex_array(&prefixed.digest))
+        .map_err(|error| match error {
+            BoundedIoError::Limit { actual, .. } => {
+                ResourceLimitError::byte_limit("existing file", cap, actual)
+            }
+            other => ResourceLimitError::Io(other),
+        })
+}
+
+/// Like [`hash_existing_file`], treating a missing file as the digest of empty.
+pub fn hash_existing_or_empty(path: &Path) -> Result<String, ResourceLimitError> {
+    match hash_existing_file(path) {
+        Ok(hash) => Ok(hash),
+        Err(error) if error.is_not_found() => Ok(sha256_hex(&[])),
+        Err(error) => Err(error),
+    }
+}
+
+/// Load a project-controlled file for the `read` tool and every sibling
+/// daemon-side whole-file snapshot. Cap is applied *during* IO; non-regular
+/// files are refused. This is the default helper for any daemon-side read of
+/// a workspace-controlled path that needs the body.
 pub fn read_for_tool(path: &Path) -> Result<Vec<u8>, ResourceLimitError> {
     read_capped(
         path,
         ResourceLimits::defaults().fs_read_max_file_bytes,
         "file",
     )
+}
+
+/// UTF-8 body of a project-controlled file. Absence is `Ok(None)`. Over-cap,
+/// non-regular files, and invalid UTF-8 fail closed.
+pub fn read_project_text(path: &Path) -> Result<Option<String>, ResourceLimitError> {
+    match read_for_tool(path) {
+        Ok(bytes) => {
+            let text = String::from_utf8(bytes).map_err(|error| {
+                ResourceLimitError::Io(BoundedIoError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error,
+                )))
+            })?;
+            Ok(Some(text))
+        }
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Streamed equality check so mutation tools never hold the file twice.
@@ -359,6 +428,59 @@ mod tests {
         assert_eq!(read_existing_for_mutation(&path).unwrap(), b"hello");
         assert!(existing_file_unchanged(&path, b"hello").unwrap());
         assert!(!existing_file_unchanged(&path, b"hellp").unwrap());
+        assert_eq!(read_existing_or_empty(&path).unwrap(), b"hello");
+        assert_eq!(hash_existing_or_empty(&path).unwrap(), sha256_hex(b"hello"));
+    }
+
+    #[test]
+    fn existing_or_empty_treats_absence_as_empty_and_refuses_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(read_existing_or_empty(&missing).unwrap().is_empty());
+        assert_eq!(hash_existing_or_empty(&missing).unwrap(), sha256_hex(&[]));
+
+        let over = dir.path().join("over");
+        let file = File::create(&over).unwrap();
+        let cap = ResourceLimits::defaults().fs_mutation_read_bytes;
+        file.set_len(cap + 1).unwrap();
+        drop(file);
+        let read_err = read_existing_or_empty(&over).unwrap_err();
+        assert!(
+            matches!(read_err, ResourceLimitError::ByteLimit { limit, actual, .. } if limit == cap && actual == cap + 1),
+            "{read_err}"
+        );
+        let hash_err = hash_existing_or_empty(&over).unwrap_err();
+        assert!(
+            matches!(hash_err, ResourceLimitError::ByteLimit { limit, actual, .. } if limit == cap && actual == cap + 1),
+            "{hash_err}"
+        );
+        assert!(!read_err.is_not_found());
+        assert!(
+            read_existing_for_mutation(&missing)
+                .unwrap_err()
+                .is_not_found()
+        );
+    }
+
+    #[test]
+    fn project_text_is_none_when_absent_and_fails_closed_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.txt");
+        assert_eq!(read_project_text(&missing).unwrap(), None);
+
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, "hello").unwrap();
+        assert_eq!(read_project_text(&small).unwrap().as_deref(), Some("hello"));
+
+        let over = dir.path().join("over.txt");
+        let file = File::create(&over).unwrap();
+        file.set_len(ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(file);
+        assert!(matches!(
+            read_project_text(&over).unwrap_err(),
+            ResourceLimitError::ByteLimit { .. }
+        ));
     }
 
     #[test]

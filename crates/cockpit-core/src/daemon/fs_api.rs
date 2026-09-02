@@ -169,13 +169,7 @@ pub(crate) fn fs_read_sync(
     apply_fs_read_block_for_test(&resolved);
 
     let limits = crate::resource_limits::ResourceLimits::defaults();
-    let prefixed =
-        crate::resource_limits::read_for_fs_read(&resolved).map_err(|error| match error {
-            crate::resource_limits::ResourceLimitError::ByteLimit { .. } => {
-                bad_request(error.to_string())
-            }
-            other => internal(other),
-        })?;
+    let prefixed = crate::resource_limits::read_for_fs_read(&resolved).map_err(resource_limit)?;
     let hash = crate::resource_limits::sha256_hex_array(&prefixed.digest);
     let binary = crate::tools::common::looks_binary(&prefixed.prefix);
     let kind = read_kind_for_path(&resolved, binary);
@@ -1470,15 +1464,14 @@ fn save_extended_config_sync(
     }
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
     // Only a genuinely-absent file is an empty config. A non-NotFound read error
-    // (EACCES/EIO/EMFILE/…) must NOT be coerced to empty: the merge would then
-    // find no on-disk `image_generation` to preserve and the atomic write would
-    // WIPE the registry — the exact data loss this path exists to prevent. Fail
-    // closed instead, writing nothing.
-    let current = match std::fs::read(&target) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(internal(error)),
-    };
+    // (EACCES/EIO/EMFILE/…, over-cap, non-regular) must NOT be coerced to empty:
+    // the merge would then find no on-disk `image_generation` to preserve and
+    // the atomic write would WIPE the registry — the exact data loss this path
+    // exists to prevent. Fail closed instead, writing nothing. The body is
+    // required for the registry-preserving merge, so this lane cannot swap in
+    // a streamed digest.
+    let current =
+        crate::resource_limits::read_existing_or_empty(&target).map_err(resource_limit)?;
     let current_hash = content_hash(&current);
     if let Some(expected) = base_hash.as_deref()
         && expected != current_hash
@@ -1575,12 +1568,8 @@ pub(crate) fn fs_write_staged_sync(
         .acquire_transient(&target, REMOTE_FILE_AGENT)
         .map_err(lock_conflict)?;
     let desired_hash = content_hash(content.as_bytes());
-    let current = match std::fs::read(&target) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(internal(err)),
-    };
-    let current_hash = content_hash(&current);
+    let current_hash =
+        crate::resource_limits::hash_existing_or_empty(&target).map_err(resource_limit)?;
     if current_hash == desired_hash {
         return Ok(Response::FsWrite { hash: desired_hash });
     }
@@ -1627,12 +1616,8 @@ pub(crate) fn fs_write_sync(
         .acquire_transient(&target, REMOTE_FILE_AGENT)
         .map_err(lock_conflict)?;
 
-    let current = match std::fs::read(&target) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(internal(err)),
-    };
-    let current_hash = content_hash(&current);
+    let current_hash =
+        crate::resource_limits::hash_existing_or_empty(&target).map_err(resource_limit)?;
     if let Some(expected) = base_hash.as_deref()
         && expected != current_hash
     {
@@ -2268,6 +2253,15 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
+fn resource_limit(error: crate::resource_limits::ResourceLimitError) -> ErrorPayload {
+    match error {
+        crate::resource_limits::ResourceLimitError::ByteLimit { .. } => {
+            bad_request(error.to_string())
+        }
+        other => internal(other),
+    }
+}
+
 fn conflict(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Conflict,
@@ -2694,6 +2688,71 @@ mod tests {
         .expect_err("oversized file must fail closed");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("filesystem read"), "{}", err.message);
+    }
+
+    #[test]
+    fn fs_write_refuses_an_oversized_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("huge.txt");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let ctx = test_ctx(root);
+        let err = fs_write_sync(&ctx, root.to_str().unwrap(), "huge.txt", "new", None)
+            .expect_err("oversized prior content must fail closed");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("existing file"), "{}", err.message);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len(),
+            crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1
+        );
+    }
+
+    #[test]
+    fn fs_write_staged_refuses_an_oversized_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("huge.txt");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let ctx = test_ctx(root);
+        let err = fs_write_staged_sync(
+            &ctx,
+            root.to_str().unwrap(),
+            "huge.txt",
+            "new",
+            None,
+            "op-1",
+        )
+        .expect_err("oversized prior content must fail closed");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("existing file"), "{}", err.message);
+    }
+
+    #[test]
+    fn save_extended_config_refuses_an_oversized_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("config.json");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let err = save_extended_config_sync(root.to_str().unwrap(), "config.json", "{}", None)
+            .expect_err("oversized config.json must fail closed rather than merge from empty");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("existing file"), "{}", err.message);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len(),
+            crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1
+        );
     }
 
     #[test]

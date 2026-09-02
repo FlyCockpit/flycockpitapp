@@ -569,10 +569,12 @@ impl PathOverlaySnapshot {
         for rel in paths {
             validate_overlay_path(root, &rel)?;
             let abs = root.join(&rel);
-            let bytes = if abs.exists() {
-                Some(std::fs::read(&abs).with_context(|| format!("snapshot `{}`", abs.display()))?)
-            } else {
-                None
+            let bytes = match crate::resource_limits::read_for_tool(&abs) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.is_not_found() => None,
+                Err(error) => {
+                    return Err(error).context(format!("snapshot `{}`", abs.display()));
+                }
             };
             files.insert(rel, bytes);
         }
@@ -995,6 +997,24 @@ mod tests {
             std::fs::read_to_string(dir.path().join(&rel)).unwrap(),
             "before\n",
             "Drop of an overlay snapshot must restore captured bytes"
+        );
+    }
+
+    #[test]
+    fn overlay_snapshot_refuses_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("huge.bin");
+        let handle = std::fs::File::create(dir.path().join(&rel)).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let err = PathOverlaySnapshot::capture(dir.path(), [rel])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("byte limit") || err.contains("snapshot"),
+            "{err}"
         );
     }
 

@@ -3049,7 +3049,13 @@ impl Driver {
         self.config.extended().max_primary_rounds
     }
 
-    async fn refresh_redaction_table_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+    /// Rebuild the live redaction table from disk for this turn.
+    ///
+    /// Returns `false` when the build refused because scanning would miss
+    /// secrets (env file over the daemon cap). The caller must not run
+    /// inference: the previous table stays live only as a parked copy, not
+    /// as permission to proceed.
+    async fn refresh_redaction_table_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
         let cwd = self.cwd.clone();
         let scan_environment_override = self.redaction_scan_environment_override;
         let scan_dotenv_override = self.redaction_scan_dotenv_override;
@@ -3155,11 +3161,22 @@ impl Driver {
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "refreshing redaction table failed");
+                if crate::redact::build_would_miss_secrets(&e) {
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!(
+                                "Redaction refresh failed: {e:#}. Refusing this turn rather than running with an incomplete redaction table."
+                            ),
+                        })
+                        .await;
+                    return false;
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "refreshing redaction table task join failed");
             }
         }
+        true
     }
 
     /// Install the recursive-`Swarm` knobs (GOALS §24) before the main
@@ -4877,7 +4894,10 @@ impl Driver {
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
-        self.refresh_redaction_table_for_turn(tx).await;
+        if !self.refresh_redaction_table_for_turn(tx).await {
+            self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
+            return Ok(ParkedReplayOutcome::Completed);
+        }
         self.refresh_active_frame_for_turn(tx).await;
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
@@ -12034,7 +12054,10 @@ impl Driver {
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
-        self.refresh_redaction_table_for_turn(tx).await;
+        if !self.refresh_redaction_table_for_turn(tx).await {
+            self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
+            return Ok(());
+        }
         self.refresh_active_frame_for_turn(tx).await;
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,

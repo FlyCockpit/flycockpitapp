@@ -157,6 +157,10 @@ fn dotenv_over_cap_fails_the_table_build() {
         text.contains("exceeds the daemon file size limit"),
         "{text}"
     );
+    assert!(
+        super::build_would_miss_secrets(&err),
+        "over-cap must be detectable by automatic refresh consumers"
+    );
 }
 
 #[test]

@@ -10,6 +10,13 @@
 //! they refuse non-regular files and apply the cap *during* IO so a growing
 //! regular file cannot outrun a stale `metadata.len()`.
 //!
+//! What this mechanism fully closes: any single daemon-side read of a
+//! project-controlled file. Remaining class: an operation that holds N
+//! capped reads simultaneously can still occupy up to N × cap bytes
+//! (overlay-validation rollback, export layer-tree). That aggregate
+//! residency is documented remaining risk of the per-read ratchet, not a
+//! per-read bypass.
+//!
 //! Wire-visible protocol ceilings (per-operation terminal ingress, per-transfer
 //! bulk length) stay in `cockpit-proto` so the CLI and TUI can share them
 //! without depending on this crate's policy. Compile-time asserts below keep

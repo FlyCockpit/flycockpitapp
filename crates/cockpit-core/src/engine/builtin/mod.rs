@@ -1611,7 +1611,7 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
         for name in names {
             let candidate = d.join(name);
             if candidate.is_file()
-                && let Ok(body) = std::fs::read_to_string(&candidate)
+                && let Some(body) = read_guidance_text(&candidate)
             {
                 return Some((candidate, body));
             }
@@ -1624,6 +1624,22 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
         dir = d.parent();
     }
     None
+}
+
+/// Project guidance is agent-growable markdown. Cap during IO so a planted
+/// AGENTS.md cannot OOM the daemon; skip unreadable/over-cap candidates.
+fn read_guidance_text(path: &Path) -> Option<String> {
+    match crate::resource_limits::read_project_text(path) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "skipping unreadable project guidance file"
+            );
+            None
+        }
+    }
 }
 
 /// Load user-defined custom-bash tools from the effective layered config and
@@ -8908,6 +8924,22 @@ pub(crate) mod tests {
         let (path, body) = find_agent_guidance(&sub, &names).expect("expected a hit");
         assert!(path.ends_with("sub/AGENTS.md"), "got {path:?}");
         assert_eq!(body, "FROM-SUB");
+    }
+
+    #[test]
+    fn find_agent_guidance_skips_an_over_cap_file_and_keeps_searching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let over = tmp.path().join("AGENTS.md");
+        let handle = std::fs::File::create(&over).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(handle);
+        std::fs::write(tmp.path().join("CLAUDE.md"), "SAFE").unwrap();
+        let names = vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()];
+        let (path, body) = find_agent_guidance(tmp.path(), &names).expect("fallback guidance");
+        assert!(path.ends_with("CLAUDE.md"), "got {path:?}");
+        assert_eq!(body, "SAFE");
     }
 
     fn media_args(

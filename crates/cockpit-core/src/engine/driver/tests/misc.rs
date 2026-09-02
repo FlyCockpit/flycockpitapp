@@ -25,7 +25,7 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
     std::fs::write(tmp.path().join(".env"), "NEW_SECRET=turn-boundary-secret\n").unwrap();
     let (tx, _rx) = mpsc::channel(8);
 
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    assert!(driver.refresh_redaction_table_for_turn(&tx).await);
 
     for scrubbed in [
         driver.redact.scrub("turn-boundary-secret"),
@@ -42,6 +42,41 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
         assert!(!scrubbed.contains("turn-boundary-secret"));
         assert!(scrubbed.contains("REDACTED"));
     }
+}
+
+#[tokio::test]
+async fn turn_boundary_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
+    let (mut driver, tmp) = test_driver(1);
+    std::fs::write(tmp.path().join(".env"), "KEEP=turn-boundary-keep-secret\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    assert!(driver.refresh_redaction_table_for_turn(&tx).await);
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret")
+    );
+    while rx.try_recv().is_ok() {}
+
+    let handle = std::fs::File::create(tmp.path().join(".env")).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+
+    assert!(!driver.refresh_redaction_table_for_turn(&tx).await);
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret"),
+        "over-cap must not wipe the previously committed table"
+    );
+    let notice = rx.try_recv().ok();
+    assert!(
+        matches!(notice, Some(TurnEvent::Notice { text }) if text.contains("incomplete redaction table")),
+        "got {notice:?}"
+    );
 }
 
 // J2 regression: a driver's per-turn redaction refresh must never overwrite the
@@ -119,7 +154,7 @@ async fn driver_refresh_does_not_drop_a_committed_sealed_adoption() {
     .unwrap();
 
     let (tx, _turn_rx) = mpsc::channel(8);
-    driver.refresh_redaction_table_for_turn(&tx).await;
+    assert!(driver.refresh_redaction_table_for_turn(&tx).await);
 
     // Core J2 property: the refresh unioned onto the LATEST shared table under
     // the write lock, so the DURABLE table still scrubs the committed sealed

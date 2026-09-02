@@ -1164,10 +1164,7 @@ impl RedactionTable {
                     EnvFileScan::Unsupported => unsupported_files.push(path),
                     EnvFileScan::Unreadable => {}
                     EnvFileScan::OverLimit => {
-                        anyhow::bail!(
-                            "env file `{}` exceeds the daemon file size limit; refusing to build a redaction table that would miss its secrets",
-                            path.display()
-                        );
+                        return Err(EnvFileOverLimitError { path }.into());
                     }
                 }
             }
@@ -2216,6 +2213,25 @@ pub(crate) fn match_sensitive_literals(
         });
     }
     matched
+}
+
+/// Table build refused because scanning an over-cap env file would miss
+/// secrets. Automatic per-turn refresh channels must fail the turn rather
+/// than continue with a stale table; fail-closed callers already propagate.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "env file `{path}` exceeds the daemon file size limit; refusing to build a redaction table that would miss its secrets"
+)]
+pub(crate) struct EnvFileOverLimitError {
+    path: PathBuf,
+}
+
+/// True when [`RedactionTable::build`] (and siblings) refused so a later
+/// consumer cannot proceed with a table that would miss secrets.
+pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EnvFileOverLimitError>().is_some())
 }
 
 /// Outcome of scanning one matched env file (§4).

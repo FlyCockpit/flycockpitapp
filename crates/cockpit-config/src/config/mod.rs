@@ -44,10 +44,11 @@ pub mod resolve;
 pub mod sandbox_mode;
 pub mod trust;
 
-/// Maximum bytes accepted from one capability-bound workspace configuration
-/// leaf.  Every daemon-owned workspace reader, including hook configuration,
-/// uses this one policy limit so an attacker cannot turn a configuration
-/// refresh into an unbounded allocation.
+/// Maximum bytes accepted from one workspace configuration leaf, whether
+/// read through a retained directory handle or an ambient path loader
+/// (`ExtendedConfigDoc::load`, `ConfigDoc`, hook sources, provider files).
+/// Every daemon-owned workspace config reader uses this one policy limit so
+/// an attacker cannot turn a configuration refresh into an unbounded allocation.
 pub const MAX_WORKSPACE_CONFIG_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Immutable bytes captured from one attach-time configuration layer through

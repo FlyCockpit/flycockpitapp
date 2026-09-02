@@ -6,6 +6,77 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
 
+/// Read a project- or user-layer config file with
+/// [`MAX_WORKSPACE_CONFIG_FILE_BYTES`] applied *during* IO. Absence is
+/// `Ok(None)`. Over-cap, non-regular files, and other IO fail closed so a
+/// giant `.cockpit/config.json` cannot OOM the daemon.
+pub(crate) fn read_workspace_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match cockpit_host::bounded::read_at_most(path, MAX_WORKSPACE_CONFIG_FILE_BYTES as u64) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(cockpit_host::bounded::BoundedIoError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
+            anyhow::bail!(
+                "{} exceeds the {limit} byte limit ({actual} bytes)",
+                path.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// UTF-8 body of a workspace config file. Absence is `Ok(None)`. Over-cap,
+/// non-regular files, and invalid UTF-8 fail closed.
+pub(crate) fn read_workspace_config_text(path: &Path) -> Result<Option<String>> {
+    match read_workspace_config_bytes(path)? {
+        None => Ok(None),
+        Some(bytes) => {
+            let text =
+                String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))?;
+            Ok(Some(text))
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_config_read_tests {
+    #[test]
+    fn over_cap_fails_closed_and_absence_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.json");
+        assert!(
+            super::read_workspace_config_text(&missing)
+                .unwrap()
+                .is_none()
+        );
+
+        let small = temp.path().join("ok.json");
+        std::fs::write(&small, "{}").unwrap();
+        assert_eq!(
+            super::read_workspace_config_text(&small)
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+
+        let over = temp.path().join("over.json");
+        let handle = std::fs::File::create(&over).unwrap();
+        handle
+            .set_len(super::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+            .unwrap();
+        drop(handle);
+        let err = super::read_workspace_config_text(&over).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exceeds the") && text.contains("byte limit"),
+            "{text}"
+        );
+    }
+}
+
 #[cfg(unix)]
 fn ensure_dir_exists_private_if_created(path: &Path) -> Result<()> {
     open_directory_nofollow(path, true, false).map(drop)

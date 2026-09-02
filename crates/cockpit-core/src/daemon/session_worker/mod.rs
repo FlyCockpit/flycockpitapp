@@ -393,6 +393,14 @@ impl RedactionSourceOverrides {
     }
 }
 
+#[derive(Debug)]
+enum RedactionRefreshOutcome {
+    Applied,
+    DriverGone,
+    /// Table build refused because scanning would miss secrets (env file over cap).
+    Refused(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn refresh_redaction_for_turn(
     session: &Session,
@@ -406,7 +414,7 @@ async fn refresh_redaction_for_turn(
     event_tx: &EventSender,
     driver_control_tx: &mpsc::Sender<crate::engine::driver::DriverControl>,
     env: &HashMap<String, String>,
-) -> bool {
+) -> RedactionRefreshOutcome {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
     let new_table = session.credential_store().and_then(|store| {
@@ -489,14 +497,17 @@ async fn refresh_redaction_for_turn(
                 .is_err()
             {
                 tracing::warn!(session_id = %session_id, "driver control channel closed");
-                return false;
+                return RedactionRefreshOutcome::DriverGone;
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "refreshing redaction table failed");
+            if crate::redact::build_would_miss_secrets(&e) {
+                return RedactionRefreshOutcome::Refused(e.to_string());
+            }
         }
     }
-    true
+    RedactionRefreshOutcome::Applied
 }
 
 /// Live in-daemon status of a session, maintained by the event

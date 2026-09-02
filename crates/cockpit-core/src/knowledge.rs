@@ -1034,9 +1034,9 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
             );
         }
     }
-    let existing = match fs::read_to_string(&exclude_path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let existing = match crate::resource_limits::read_project_text(&exclude_path) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => String::new(),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()));
@@ -6302,8 +6302,8 @@ fn read_human_knowledge_concept_nofollow(
         file.metadata()?.is_file(),
         "human knowledge concept is not a regular file"
     );
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+    let bytes = cockpit_host::bounded::read_reader_at_most(file, cap, "human knowledge concept")
         .context("reading human knowledge concept through held parent")?;
     Ok(Some(bytes))
 }
@@ -7272,9 +7272,9 @@ impl KnowledgeDreamWriteRollback {
         for write in writes {
             let path = PathBuf::from(&write.path);
             let target = root.join(&path);
-            let contents = match fs::read(&target) {
+            let contents = match crate::resource_limits::read_for_tool(&target) {
                 Ok(contents) => Some(contents),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) if error.is_not_found() => None,
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("capturing pre-dream output {}", write.path));

@@ -618,10 +618,14 @@ mod redirect_policy_tests {
             .uri(url)
             .body(bytes::Bytes::new())
             .expect("build request");
-        let err = client
-            .send::<bytes::Bytes, bytes::Bytes>(req)
-            .await
-            .expect_err("redirect must fail closed before replaying credentials");
+        let result = client.send::<bytes::Bytes, bytes::Bytes>(req).await;
+        let err = match result {
+            Ok(response) => panic!(
+                "redirect must fail closed before replaying credentials; got status {}",
+                response.status()
+            ),
+            Err(err) => err,
+        };
         let message = err.to_string();
         assert!(message.contains("302"), "{message}");
 

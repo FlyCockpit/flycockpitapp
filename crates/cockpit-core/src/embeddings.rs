@@ -648,6 +648,7 @@ mod tests {
         let (base_url, request_rx) = capture_embedding_server_with_response_status(
             r#"{"error":"expired"}"#,
             "401 Unauthorized",
+            None,
         )
         .await;
         let entry = ProviderEntry {

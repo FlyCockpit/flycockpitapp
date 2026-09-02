@@ -954,11 +954,21 @@ impl CaffeinateMode {
 pub enum IdleReason {
     Completed,
     GoalComplete,
-    NeedsIntervention { code: String },
+    NeedsIntervention {
+        code: String,
+    },
     BudgetLimited,
     UsageLimited,
-    Error { class: InferenceErrorClass },
+    Error {
+        class: InferenceErrorClass,
+    },
     Interrupted,
+    /// The submission was retracted or refused before its turn ever ran
+    /// (preflight or prompt-injection guard rejection, oversized-admission
+    /// rejection, or a durable run-invocation gate refusing dispatch). No
+    /// provider request was made, so a watcher settling on an idle carrying
+    /// this reason must not treat the submission as successfully completed.
+    PreflightRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

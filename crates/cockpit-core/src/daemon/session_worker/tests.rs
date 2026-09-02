@@ -1581,6 +1581,280 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
     });
 }
 
+/// Regression (#275): daemon-origin submissions (scheduled jobs and Dream
+/// runs) legitimately carry no client receipt, but the worker used to
+/// unconditionally `.expect()` a wire receipt and panicked the session
+/// worker on every scheduled job and Dream run. Both origins must drive the
+/// REAL `run_worker` (no mocked worker boundary) through a full model turn
+/// to completion without panicking. The acked `QueueItem.id` (the
+/// daemon-minted receipt) must also be the `turn_id` the turn settles under:
+/// the daemon schedulers `watch_turn` exactly that id, so a mismatched
+/// `AgentIdle` would strand every scheduled job and Dream run behind a
+/// one-hour timeout even after the panic is fixed.
+#[test]
+fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        // Production workers boot with a daemon-owned journal installed; the
+        // barrier is non-optional, so mirror that for this live-worker test.
+        session.install_test_external_journal();
+        session
+            .set_active_model("lmstudio", "session-model")
+            .unwrap();
+
+        // A controlled chat-completions stream for every request the session
+        // makes: a single visible text delta, the stop finish, then the stream
+        // terminator. The loop serves any request count because a user turn
+        // is followed by detached same-model metadata-fork calls, which must
+        // not consume another turn's stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let delta = serde_json::json!({
+                "id": "daemon-origin", "model": "session-model",
+                "choices": [{
+                    "delta": { "content": "daemon turn answer" },
+                    "finish_reason": null
+                }]
+            });
+            let finish = serde_json::json!({
+                "id": "daemon-origin", "model": "session-model",
+                "choices": [{ "delta": {}, "finish_reason": "stop" }]
+            });
+            let body = format!("data: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut read = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let n = match socket.read(&mut chunk).await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    read.extend_from_slice(&chunk[..n]);
+                    let Some(header_end) = read.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers =
+                        std::str::from_utf8(&read[..header_end]).expect("ASCII HTTP headers");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length").then(|| {
+                                    value
+                                        .trim()
+                                        .parse::<usize>()
+                                        .expect("numeric content length")
+                                })
+                            })
+                        })
+                        .expect("model request has a content length");
+                    if read.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        let mut providers = lmstudio_test_providers();
+        providers.providers.get_mut("lmstudio").unwrap().url = format!("http://{address}/v1");
+        let redact = Arc::new(RedactionTable::empty());
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+        let (handle, join, start_permit) = spawn(
+            session.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                    db.clone(),
+                )),
+            )),
+            Arc::new(LockManager::in_memory(db.clone())),
+            redact,
+            model,
+            None,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            test_workspace_root_authority(tmp.path(), &trusted_test_policy(tmp.path())),
+            false,
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            None,
+            Arc::new(StdMutex::new(None)),
+            Arc::new(StdMutex::new(None)),
+            None,
+            trusted_test_policy(tmp.path()),
+            0,
+            None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            Uuid::now_v7(),
+            std::time::Instant::now(),
+            None,
+            crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+            SessionConfigSnapshot::new(0, providers, extended.clone()),
+        )
+        .unwrap();
+        start_permit.release();
+        let mut events = handle.subscribe();
+
+        async fn send_daemon_submission(
+            handle: &SessionWorkerHandle,
+            origin: crate::engine::message::SubmissionOrigin,
+            origin_principal: Option<String>,
+            job_id: Option<String>,
+            text: &str,
+        ) -> proto::QueueItem {
+            let submission = crate::engine::message::UserSubmission {
+                origin,
+                kind: crate::engine::message::UserSubmissionKind::User,
+                text: text.to_owned(),
+                origin_principal,
+                job_id,
+                // The regression condition from the issue: daemon-origin
+                // submissions arrive with NO client receipt.
+                client_submissions: Vec::new(),
+                ..Default::default()
+            };
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::UserMessage {
+                    submission: Box::new(submission),
+                    #[cfg(feature = "remote")]
+                    remote_operation: None,
+                    artifact_admission: None,
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            let (item, _queue) = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("worker acknowledges the daemon-origin message without panicking")
+                .expect("worker response channel remains open")
+                .expect("daemon-origin message is accepted");
+            item
+        }
+
+        // Completion is observed through the worker's own event stream — the
+        // same `AgentIdle` boundary the daemon schedulers settle on. The
+        // scheduler contract is that the `QueueItem.id` returned by the
+        // `UserMessage` ack IS the `turn_id` published by `AgentIdle` (the
+        // id `watch_turn` matches), so this binds the acked id to the
+        // published idle id on the REAL `run_worker` — for daemon-origin
+        // submissions, the id the worker minted at arm entry.
+        async fn await_turn_idle(
+            events: &mut crate::daemon::EventReceiver,
+            expected_turn_id: Uuid,
+            label: &str,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match events
+                        .recv()
+                        .await
+                        .unwrap_or_else(|error| panic!("{label} event stream failed: {error}"))
+                        .event
+                    {
+                        // Settling the acked id is only a success when the
+                        // turn idled with a success reason: a preflight
+                        // rejection or parked interrupt publishes
+                        // `AgentIdle` under the same id, and the daemon
+                        // schedulers must never read those as completion.
+                        proto::Event::AgentIdle {
+                            session_id: _,
+                            turn_id: Some(turn_id),
+                            reason:
+                                crate::engine::IdleReason::Completed
+                                | crate::engine::IdleReason::GoalComplete,
+                        } if turn_id == expected_turn_id.to_string() => return,
+                        proto::Event::SessionDriverFailed { error, .. } => {
+                            panic!("{label} session driver failed: {error}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} turn timed out"));
+        }
+
+        // Scheduled jobs arrive from `daemon::scheduler` with a
+        // `ScheduledJob` origin, a daemon principal, a job id, and no
+        // client receipt.
+        let scheduled = send_daemon_submission(
+            &handle,
+            crate::engine::message::SubmissionOrigin::ScheduledJob,
+            Some("daemon_scheduler".to_owned()),
+            Some("regression-scheduled-job".to_owned()),
+            "scheduled regression prompt",
+        )
+        .await;
+        await_turn_idle(&mut events, scheduled.id, "scheduled job").await;
+
+        // A manual Dream run arrives from `daemon::dream_scheduler` with an
+        // `ExternalRoot` origin, no principal, no job id, and no client
+        // receipt.
+        let dream = send_daemon_submission(
+            &handle,
+            crate::engine::message::SubmissionOrigin::ExternalRoot,
+            None,
+            None,
+            "manual Dream regression prompt",
+        )
+        .await;
+        await_turn_idle(&mut events, dream.id, "Dream run").await;
+        assert_ne!(
+            scheduled.id, dream.id,
+            "each daemon-origin submission gets its own minted receipt identity"
+        );
+
+        handle
+            .send_work(SessionWork::Shutdown {
+                pause_for_resume: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("daemon-origin worker shuts down")
+            .expect("worker completes the daemon-origin turns without panicking");
+        provider_server.abort();
+    });
+}
+
 /// A `send_user_message` admitted as an authenticated remote operation commits
 /// the transactional remote-operation ledger on the REAL worker ACCEPT path
 /// (`SessionWork::UserMessage`), not a dispatch-arm shim. A replayed operation
@@ -2383,6 +2657,46 @@ async fn turn_completion_resolves_when_the_turn_finished_before_the_watcher_regi
         completion.await.unwrap(),
         TurnOutcome::Completed {
             reason: crate::engine::IdleReason::GoalComplete
+        }
+    ));
+}
+
+/// #275 fail-open regression: an `AgentIdle` carrying the watched queue id
+/// is only a success when its reason is a success reason. A turn that parks
+/// on an interrupt (headless scheduled run with no interactive client) and
+/// a preflight-retracted submission both idle under the acked id; the
+/// settlement layer must resolve their watchers as `DidNotComplete`, never
+/// `Completed`, so daemon schedulers cannot record a run that never
+/// completed as a success.
+#[tokio::test]
+async fn non_success_idle_reasons_resolve_watchers_as_did_not_complete() {
+    let handle = test_session_handle();
+
+    let parked = handle.watch_turn("turn-parked");
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-parked".to_string()),
+        reason: crate::engine::IdleReason::NeedsIntervention {
+            code: "parked_interrupt".to_string(),
+        },
+    });
+    assert!(matches!(
+        parked.await.unwrap(),
+        TurnOutcome::DidNotComplete {
+            reason: crate::engine::IdleReason::NeedsIntervention { .. }
+        }
+    ));
+
+    let retracted = handle.watch_turn("turn-retracted");
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-retracted".to_string()),
+        reason: crate::engine::IdleReason::PreflightRejected,
+    });
+    assert!(matches!(
+        retracted.await.unwrap(),
+        TurnOutcome::DidNotComplete {
+            reason: crate::engine::IdleReason::PreflightRejected
         }
     ));
 }

@@ -1886,6 +1886,138 @@ async fn emit_turn_idle_if_settled_emits_only_after_a_turn() {
     assert!(driver.current_lifecycle_turn_id.is_none());
 }
 
+/// #275: an idle published under a bound queue id may only carry a success
+/// reason when the bound turn actually reached its terminal outcome. A
+/// post-bind exit that never completed (durable-record retry, admission
+/// refusal, run-invocation gate) must fail closed with a non-success reason
+/// — the settlement layer maps `Completed`/`GoalComplete` to a successful
+/// run, so a fabricated success would record a job that never ran.
+#[tokio::test]
+async fn post_bind_exit_never_idles_as_success() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+    // A bound turn that never reached a terminal outcome idles fail-closed.
+    driver.current_lifecycle_turn_id = Some("turn-1".into());
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle { reason, .. }) => assert!(
+            !matches!(
+                reason,
+                crate::engine::IdleReason::Completed | crate::engine::IdleReason::GoalComplete
+            ),
+            "an uncompleted turn must not idle with a success reason, got {reason:?}"
+        ),
+        other => panic!("expected fail-closed AgentIdle, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
+
+    // Only a turn marked as having reached its terminal outcome may take
+    // the goal-aware success default.
+    driver.current_lifecycle_turn_id = Some("turn-2".into());
+    driver.current_lifecycle_turn_completed = true;
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle {
+            turn_id: Some(turn_id),
+            reason,
+        }) => {
+            assert_eq!(turn_id, "turn-2");
+            assert_eq!(reason, crate::engine::IdleReason::Completed);
+        }
+        other => panic!("expected completed AgentIdle, got {other:?}"),
+    }
+    assert!(driver.current_lifecycle_turn_id.is_none());
+}
+
+/// #275: a preflight rejection settles the rejected submission under its
+/// OWN acked queue id and never steals the driving turn's bound identity.
+/// Sibling callers run `prepare_queued_user_submission` mid-turn (steering
+/// at a `Continue` boundary, the post-completion `Done` drain,
+/// child-completion drains) while the driving turn still holds
+/// `current_lifecycle_turn_id` — including the post-completion drain, where
+/// the driving turn already earned `current_lifecycle_turn_completed`. A
+/// rejection there must not settle a watcher on the driving submission as
+/// `PreflightRejected` (which the settlement layer resolves as
+/// `DidNotComplete`, failing a scheduled/Dream run that never saw the
+/// rejected prompt), and must leave the driving turn's own truthful idle
+/// intact.
+#[tokio::test]
+async fn preflight_rejection_settles_own_id_and_preserves_the_driving_turn_idle() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(32);
+
+    let id = uuid::Uuid::new_v4();
+    let mut submission = crate::engine::message::UserSubmission::text("blocked mid-turn");
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: "steer-wire".into(),
+        origin_principal: None,
+    };
+    submission.client_submissions.push(receipt.clone());
+    let (_, _, outcome) = queue
+        .push_idempotent(receipt, submission.clone(), driver.active_queue_target())
+        .await;
+    assert_eq!(
+        outcome,
+        crate::engine::message::IdempotentPush::Inserted,
+        "the steering submission must enter the queue under its receipt id"
+    );
+
+    // A driving turn is mid-flight: bound to its own acked id and (the
+    // post-completion steering-drain case) already completed.
+    driver.current_lifecycle_turn_id = Some("driving-turn-id".into());
+    driver.current_lifecycle_turn_completed = true;
+
+    driver
+        .settle_preflight_rejection(submission, &queue, &tx)
+        .await;
+
+    // The rejection settles only the rejected submission, under its own
+    // acked id, with the truthful non-success reason.
+    let mut retraction_idles = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let TurnEvent::AgentIdle { turn_id, reason } = event {
+            retraction_idles.push((turn_id, reason));
+        }
+    }
+    assert_eq!(
+        retraction_idles,
+        vec![(
+            Some(id.to_string()),
+            crate::engine::IdleReason::PreflightRejected
+        )],
+        "the retraction must idle under the rejected submission's own id"
+    );
+
+    // The driving turn keeps its bound identity and its earned completion
+    // mark, so its own idle boundary still settles truthfully.
+    assert_eq!(
+        driver.current_lifecycle_turn_id.as_deref(),
+        Some("driving-turn-id")
+    );
+    assert!(
+        driver.current_lifecycle_turn_completed,
+        "the driving turn's earned completion mark must survive the sibling rejection"
+    );
+
+    driver.emit_turn_idle_if_settled(&tx).await;
+    match rx.try_recv() {
+        Ok(TurnEvent::AgentIdle { turn_id, reason }) => {
+            assert_eq!(turn_id.as_deref(), Some("driving-turn-id"));
+            assert_eq!(
+                reason,
+                crate::engine::IdleReason::Completed,
+                "the driving turn must still idle with its own truthful success reason"
+            );
+        }
+        other => panic!("expected the driving turn's completed AgentIdle, got {other:?}"),
+    }
+}
+
 /// Install a test providers override with the given context thresholds,
 /// cache mode, and the active model's `context_length` so the
 /// auto-prune/auto-compact triggers resolve deterministically.

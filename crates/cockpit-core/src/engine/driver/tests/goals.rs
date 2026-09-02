@@ -66,7 +66,7 @@ async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
         "mutating-action observation must not independently pause or complete the goal"
     );
     assert_ne!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::NeedsIntervention {
             code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
@@ -191,7 +191,7 @@ async fn goal_prose_without_tools_counts_as_no_progress_subset() {
         crate::db::session_goals::GoalDisposition::NoProgressPaused
     );
     assert_ne!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::NeedsIntervention {
             code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
@@ -263,7 +263,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         .unwrap();
 
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::BudgetLimited
     );
 }
@@ -385,7 +385,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
         "legacy no-progress budget intervention must not latch"
     );
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::BudgetLimited
     );
     let events = driver
@@ -445,7 +445,7 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         crate::db::session_goals::GoalDisposition::InfraPaused
     );
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::UsageLimited
     );
     let mut watchdog = None;
@@ -547,7 +547,7 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         crate::db::session_goals::GoalDisposition::InfraPaused
     );
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::NeedsIntervention {
             code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string()
         }
@@ -571,7 +571,7 @@ async fn ordinary_non_goal_idle_reason_is_completed() {
     let (mut driver, _tmp) = test_driver(1);
 
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::Completed
     );
 }
@@ -646,7 +646,7 @@ async fn goal_idle_intervention_idle_reason_carries_code() {
         .unwrap();
 
     assert_eq!(
-        driver.take_idle_reason().await,
+        driver.take_idle_reason(true).await,
         crate::engine::IdleReason::BudgetLimited
     );
 }

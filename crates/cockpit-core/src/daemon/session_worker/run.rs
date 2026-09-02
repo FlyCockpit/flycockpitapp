@@ -10067,15 +10067,36 @@ pub(super) async fn run_worker(
                     // by the driver's phase-two materialization path.
                     let reset_idle_timer =
                         artifact_admission.is_none() && submission.origin.advances_activity_epoch();
+                    // Wire submissions always carry a client-minted receipt.
+                    // Daemon-origin submissions (scheduled jobs, Dream runs)
+                    // legitimately arrive with no client receipt: their
+                    // producer is inside the daemon, so there is no client
+                    // retry identity to preserve. Mint the internal receipt
+                    // identity here so every downstream receipt consumer
+                    // (dedupe probes, queue identity, turn correlation,
+                    // media invocations) sees the same shape a wire
+                    // submission has.
+                    if submission.client_submissions.is_empty() {
+                        let id = uuid::Uuid::new_v4();
+                        let fingerprint = submission.client_fingerprint();
+                        submission.client_submissions.push(
+                            crate::engine::message::ClientSubmissionReceipt {
+                                id,
+                                fingerprint: fingerprint.clone(),
+                                wire_fingerprint: format!("daemon:{fingerprint}"),
+                                origin_principal: submission.origin_principal.clone(),
+                            },
+                        );
+                    }
                     let client_submission_id = submission
                         .client_submissions
                         .first()
                         .map(|receipt| receipt.id)
-                        .expect("wire user submissions carry a client receipt");
+                        .expect("user submissions carry a client or daemon-minted receipt");
                     let receipt = submission
                         .client_submissions
                         .first()
-                        .expect("wire user submissions carry a client receipt");
+                        .expect("user submissions carry a client or daemon-minted receipt");
                     let mut artifact_admission = artifact_admission;
                     // An FCM2 retry is governed by its original durable receipt,
                     // including the canonical queue decision. Consult that
@@ -10874,11 +10895,10 @@ pub(super) async fn run_worker(
                         let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
                     }
-                    let receipt = submission
-                        .client_submissions
-                        .first()
-                        .cloned()
-                        .expect("wire user submissions carry a client receipt");
+                    // End the immutable borrow of `submission` here so the
+                    // move into the queue below is legal; the receipt itself
+                    // was minted or carried at arm entry above.
+                    let receipt = receipt.clone();
                     if artifact_admission.is_none() {
                         let durable_receipt = match session
                             .db

@@ -3019,6 +3019,10 @@ fn idle_reason_status(reason: cockpit_proto::IdleReason) -> Option<IdleReasonSta
             text: "turn interrupted".to_string(),
             kind: ToastKind::Info,
         }),
+        cockpit_proto::IdleReason::PreflightRejected => Some(IdleReasonStatus {
+            text: "submitted message was blocked before running".to_string(),
+            kind: ToastKind::Warning,
+        }),
     }
 }
 

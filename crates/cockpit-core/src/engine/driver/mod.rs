@@ -1338,6 +1338,17 @@ pub struct Driver {
     pending_monty_tool_nudge: Option<String>,
     active_model_state_generation: u64,
     current_lifecycle_turn_id: Option<String>,
+    /// Whether the turn bound to `current_lifecycle_turn_id` reached its
+    /// natural terminal outcome — the root `Done` tail (including its
+    /// post-completion steering drain), or a child `Return` whose parent
+    /// held no outstanding call. Only then may the idle boundary default
+    /// the reason to the goal-aware success computation in
+    /// [`Self::take_idle_reason`]. Every other post-bind exit must either
+    /// leave a truthful `pending_idle_reason` or take the bound id to
+    /// defer to a pending retry; `take_idle_reason` fails closed on
+    /// anything else so no `AgentIdle` can hand the settlement layer a
+    /// success reason for a turn that never completed (#275).
+    current_lifecycle_turn_completed: bool,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
     /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
     /// [`CancellationToken`] here at the start of each run and clears it on
@@ -2342,6 +2353,9 @@ impl Driver {
             pending_monty_tool_nudge: self.pending_monty_tool_nudge.clone(),
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
+            // The fork inherits the bound id but its own run of that turn
+            // has not reached any outcome; fail closed on its first idle.
+            current_lifecycle_turn_completed: false,
             cancel_current: self.cancel_current.clone(),
             user_cancel_requested: self.user_cancel_requested.clone(),
             adopted_processes: self.adopted_processes.clone(),
@@ -2714,6 +2728,7 @@ impl Driver {
             pending_monty_tool_nudge: None,
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
+            current_lifecycle_turn_completed: false,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             user_cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             adopted_processes: crate::engine::agent::AdoptedProcessRegistry::default(),
@@ -3624,7 +3639,7 @@ impl Driver {
     }
 
     async fn primary_round_ceiling_allows_more(
-        &self,
+        &mut self,
         rounds: u32,
         limit: u32,
         tx: &mpsc::Sender<TurnEvent>,
@@ -3644,6 +3659,14 @@ impl Driver {
                     ),
                 })
                 .await;
+            // The turn stops at a configured limit without completing, so
+            // the idle boundary must carry a non-success reason: daemon
+            // schedulers settle on it and must record a failed run (#275).
+            self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                class: crate::engine::model::InferenceErrorClass::Other(
+                    "max_primary_rounds_exceeded".to_string(),
+                ),
+            });
             return Ok(false);
         }
 
@@ -3691,6 +3714,11 @@ impl Driver {
                         .to_string(),
                 })
                 .await;
+            // The user explicitly ended the turn at the limit. That is a
+            // user-initiated termination, not a completed run, so the idle
+            // carries `Interrupted` and settlement resolves it as
+            // `DidNotComplete` (#275).
+            self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
             Ok(false)
         }
     }
@@ -3873,13 +3901,35 @@ impl Driver {
     /// Falling-edge chrome for a settled user-facing turn. Not a stack
     /// transition: recovered attach and other control arms can leave a
     /// child on the stack, and those arms must not emit `AgentIdle`.
+    ///
+    /// The success default is earned, never assumed: only a turn marked
+    /// as having reached its terminal outcome may idle with
+    /// `Completed`/`GoalComplete`. A bound turn that exited without
+    /// completing (and without a declared `pending_idle_reason`) fails
+    /// closed with a non-success reason, so daemon schedulers settling on
+    /// the acked queue id can never mistake an admission refusal, a
+    /// durable-record gate, or an aborted round for a successful run
+    /// (#275).
     async fn emit_turn_idle_if_settled(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         let turn_id = self.current_lifecycle_turn_id.take();
+        let turn_completed = self.current_lifecycle_turn_completed;
+        self.current_lifecycle_turn_completed = false;
         if turn_id.is_none() && self.pending_idle_reason.is_none() {
             return;
         }
-        let reason = self.take_idle_reason().await;
+        let reason = self.take_idle_reason(turn_completed).await;
         let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+    }
+
+    /// Declare the truthful idle reason for a bound turn that settles
+    /// without ever running — the submission was refused before any
+    /// provider request (oversized-admission rejection, run-invocation
+    /// gate, stale durable receipt). The idle boundary publishes
+    /// `reason` under the bound queue id so watchers settle as
+    /// `DidNotComplete` instead of reading the fabricated `Completed`
+    /// default a scheduler would record as a successful run (#275).
+    fn mark_bound_turn_refused(&mut self, reason: crate::engine::IdleReason) {
+        self.pending_idle_reason = Some(reason);
     }
 
     /// A sender into the async-job command channel (GOALS §22). The
@@ -4805,8 +4855,16 @@ impl Driver {
                 .cloned()
                 .context("parked interrupt replay produced no tool result")?
         };
+        // The replay is a NEW working span, not a resumption of the parked
+        // one: the parked turn already settled its watchers when it idled
+        // under the original queue id with `NeedsIntervention` (daemon
+        // schedulers resolve that as `DidNotComplete`, fail closed — #275),
+        // and interactive clients track the continuation as a fresh span.
+        // Reusing the parked id would let a post-resolution idle overwrite
+        // the truthful non-success settlement watchers already observed.
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        self.current_lifecycle_turn_completed = false;
         // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
         // (below): `consume_active_node_override_for_turn` runs the AC5 "second
         // transaction" for the active node (mode applied per-frame, sandbox to the
@@ -4835,6 +4893,9 @@ impl Driver {
         let mut primary_rounds_in_chunk: u32 = 0;
 
         loop {
+            // Only this round's terminal arm may earn the success default;
+            // see the matching reset in the user-input turn loop (#275).
+            self.current_lifecycle_turn_completed = false;
             // Mirror the user-input persist enter path: a pending plan owns
             // pairing until take_after CAS-commits. Auto-prune elides snapshot
             // bodies in place and must not run ahead of that persist.
@@ -4865,6 +4926,12 @@ impl Driver {
                         %error,
                         "persist-on-re-entry did not commit; pair retained in live history"
                     );
+                    // The keep-park state persists: the interrupt stays
+                    // parked pending the worker's replay retry, so the idle
+                    // boundary must not claim the continuation completed.
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "parked_interrupt".to_string(),
+                    });
                     return Ok(ParkedReplayOutcome::Uncommitted);
                 }
                 Ok(PendingScheduledReentry::None) => {
@@ -5051,6 +5118,9 @@ impl Driver {
                     return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::is_gated(&e) => {
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                        code: "daemon_draining".to_string(),
+                    });
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::Gated,
                         input_rx,
@@ -5238,6 +5308,9 @@ impl Driver {
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
+                    // The replay continuation reached its natural terminal
+                    // outcome; the goal-aware success default is honest.
+                    self.current_lifecycle_turn_completed = true;
                     return Ok(ParkedReplayOutcome::Completed);
                 }
                 TurnOutcome::Return { fields } => {
@@ -5273,6 +5346,9 @@ impl Driver {
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
+                    // Structural end of the replay continuation (child
+                    // returned with no parent call outstanding).
+                    self.current_lifecycle_turn_completed = true;
                     return Ok(ParkedReplayOutcome::Completed);
                 }
                 _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
@@ -5724,7 +5800,17 @@ impl Driver {
         Ok(())
     }
 
-    async fn take_idle_reason(&mut self) -> crate::engine::IdleReason {
+    /// Compute the idle reason for one settled turn boundary.
+    ///
+    /// `turn_completed` is true only when the bound turn reached its
+    /// natural terminal outcome. Only then do the goal-aware defaults
+    /// below resolve to the success reasons (`Completed`,
+    /// `GoalComplete`); an uncompleted turn fails closed with a
+    /// non-success `Error` reason so the settlement layer — which maps
+    /// success reasons to `TurnOutcome::Completed` and every other
+    /// reason to `DidNotComplete` — can never record a successful run for
+    /// a turn that never ran to completion (#275).
+    async fn take_idle_reason(&mut self, turn_completed: bool) -> crate::engine::IdleReason {
         if let Some(reason) = self.pending_idle_reason.take() {
             self.goal_was_active_recently = false;
             return reason;
@@ -5737,6 +5823,11 @@ impl Driver {
                 code: code.to_string(),
             };
         }
+        let uncompleted_turn = || crate::engine::IdleReason::Error {
+            class: crate::engine::model::InferenceErrorClass::Other(
+                "turn_exited_without_completing".to_string(),
+            ),
+        };
         match self
             .session
             .db
@@ -5754,14 +5845,34 @@ impl Driver {
             }
             Some(crate::db::session_goals::GoalDisposition::Running) => {
                 self.goal_was_active_recently = true;
-                crate::engine::IdleReason::Completed
+                if turn_completed {
+                    crate::engine::IdleReason::Completed
+                } else {
+                    uncompleted_turn()
+                }
             }
-            Some(_) => crate::engine::IdleReason::Completed,
+            Some(_) => {
+                if turn_completed {
+                    crate::engine::IdleReason::Completed
+                } else {
+                    uncompleted_turn()
+                }
+            }
             None if self.goal_was_active_recently => {
                 self.goal_was_active_recently = false;
-                crate::engine::IdleReason::GoalComplete
+                if turn_completed {
+                    crate::engine::IdleReason::GoalComplete
+                } else {
+                    uncompleted_turn()
+                }
             }
-            None => crate::engine::IdleReason::Completed,
+            None => {
+                if turn_completed {
+                    crate::engine::IdleReason::Completed
+                } else {
+                    uncompleted_turn()
+                }
+            }
         }
     }
 
@@ -9041,11 +9152,6 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        let client_submission_ids = submission
-            .client_submissions
-            .iter()
-            .map(|receipt| receipt.id)
-            .collect();
         if !self
             .record_terminal_client_submissions(
                 &submission.client_submissions,
@@ -9066,15 +9172,48 @@ impl Driver {
                 .await;
             return;
         }
+        // A retraction settles the submission without ever starting a turn,
+        // so it settles under its OWN acked identity (its receipt id == queue
+        // item id): a `watch_turn` watcher holding that id resolves on this
+        // `AgentIdle` instead of being stranded behind a timeout, and the
+        // published reason is the truthful non-success one —
+        // `take_idle_reason` would default to `Completed` here (no pending
+        // reason is set), which the settlement layer would hand to daemon
+        // schedulers as a successful run even though no provider request was
+        // ever made (#275).
+        //
+        // The in-flight lifecycle id is never this submission's: preflight
+        // runs before the turn bind, and sibling callers of
+        // `prepare_queued_user_submission` (steering at a `Continue`
+        // boundary, the post-completion `Done` drain, child-completion
+        // drains) run it while the driving turn still holds
+        // `current_lifecycle_turn_id`. Taking that id here would settle a
+        // watcher on the driving submission with this rejection — failing a
+        // scheduled/Dream run mid-flight, or even after it already earned
+        // `current_lifecycle_turn_completed` — and would silence the driving
+        // turn's own truthful idle at the boundary. Only the idle boundary
+        // publishes the driving turn's settlement (#275).
+        let retraction_turn_id = submission
+            .client_submissions
+            .first()
+            .map(|receipt| receipt.id);
         let _ = tx
             .send(TurnEvent::UserMessageRetracted {
-                client_submission_ids,
+                client_submission_ids: submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id)
+                    .collect(),
             })
             .await;
         self.emit_context_projection(tx).await;
-        let turn_id = self.current_lifecycle_turn_id.take();
-        let reason = self.take_idle_reason().await;
-        let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+        let turn_id = retraction_turn_id.map(|id| id.to_string());
+        let _ = tx
+            .send(TurnEvent::AgentIdle {
+                turn_id,
+                reason: crate::engine::IdleReason::PreflightRejected,
+            })
+            .await;
     }
 
     async fn run_prepared_queued_user_batch(
@@ -11799,6 +11938,18 @@ impl Driver {
                         ?outcome,
                         "discarding an in-memory V2 delivery whose durable receipt is no longer accepted"
                     );
+                    // The durable receipt already settled this delivery
+                    // without a turn (rejected, materialized, or removed), so
+                    // no provider request may run and the idle boundary must
+                    // carry a truthful non-success reason: a client-removed
+                    // message was interrupted by its owner, every other
+                    // terminal state was a pre-turn refusal (#275).
+                    self.pending_idle_reason = Some(match outcome {
+                        Some(crate::db::message_attachments::MessageSafeOutcome::Removed) => {
+                            crate::engine::IdleReason::Interrupted
+                        }
+                        _ => crate::engine::IdleReason::PreflightRejected,
+                    });
                     return Ok(());
                 }
             }
@@ -11846,8 +11997,31 @@ impl Driver {
         // before assembling or dispatching the user's inference.
         self.preempt_shadow_brief_for_foreground().await;
         self.preempt_self_improvement_review_for_foreground();
-        let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
+        // The lifecycle turn id IS the queue identity the dispatcher acked:
+        // a `SessionWork::UserMessage` ack hands back the queue item id
+        // (the client or daemon-minted receipt id; `commit_idempotent_push`
+        // keys the item by `receipt.id`, and the queue pop records the same
+        // id in `queue_item_ids`), and daemon consumers (`scheduler`,
+        // `dream_scheduler`) settle the submission by watching exactly that
+        // id through `watch_turn` / `Event::AgentIdle`. A fresh v4 here would
+        // publish an `AgentIdle` no watcher can ever match, stranding the
+        // submission behind a one-hour timeout. Injects with no queue
+        // identity (loop ticks, job completions, goal roots, AsyncUser)
+        // have no watcher and keep a fresh v4. For a folded batch only the
+        // driving submission's item survives as the turn id; leading ids
+        // are finished into history and carry no turn of their own.
+        let lifecycle_turn_id = submission
+            .queue_item_ids
+            .first()
+            .map(|queue_item_id| queue_item_id.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        // The bound turn has not reached any outcome yet: only the
+        // terminal arms below (`Done` tail, child `Return` end) may mark
+        // it completed. Every post-bind exit that settles without
+        // completing must declare a truthful `pending_idle_reason`, or
+        // take the bound id to defer to a pending retry (#275).
+        self.current_lifecycle_turn_completed = false;
         // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
         // (below): `consume_active_node_override_for_turn` runs the AC5 "second
         // transaction" for the active node (mode applied per-frame, sandbox to the
@@ -11894,6 +12068,7 @@ impl Driver {
                             text: durable_notice,
                         })
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 Err(error) => {
@@ -11904,6 +12079,7 @@ impl Driver {
                                 .to_owned(),
                         })
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
             }
@@ -12120,6 +12296,7 @@ impl Driver {
                             text: durable_notice,
                         })
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 Err(error) => {
@@ -12130,6 +12307,7 @@ impl Driver {
                                 .to_owned(),
                         })
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
             }
@@ -12156,6 +12334,7 @@ impl Driver {
                             tx,
                         )
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 match crate::text_artifact_blob::write_at(&path, &oversized.source_text) {
@@ -12167,6 +12346,7 @@ impl Driver {
                             crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
                             tx,
                         ).await;
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                         return Ok(());
                     }
                 }
@@ -12193,6 +12373,7 @@ impl Driver {
                             tx,
                         )
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 match crate::text_artifact_blob::write_at(&path, projection) {
@@ -12206,6 +12387,7 @@ impl Driver {
                                 tx,
                             )
                             .await;
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                         return Ok(());
                     }
                 }
@@ -12229,6 +12411,9 @@ impl Driver {
                                         tx,
                                     )
                                     .await;
+                                self.mark_bound_turn_refused(
+                                    crate::engine::IdleReason::PreflightRejected,
+                                );
                                 return Ok(());
                             }
                         },
@@ -12354,6 +12539,9 @@ impl Driver {
                                             .to_owned(),
                                     })
                                     .await;
+                                self.mark_bound_turn_refused(
+                                    crate::engine::IdleReason::PreflightRejected,
+                                );
                                 return Ok(());
                             }
                         };
@@ -12381,6 +12569,9 @@ impl Driver {
                                         .to_owned(),
                                 })
                                 .await;
+                            self.mark_bound_turn_refused(
+                                crate::engine::IdleReason::PreflightRejected,
+                            );
                             return Ok(());
                         }
                     }
@@ -12401,6 +12592,7 @@ impl Driver {
                         })
                         .await;
                     self.emit_context_projection(tx).await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 Ok(
@@ -12420,6 +12612,7 @@ impl Driver {
                             text: durable_notice,
                         })
                         .await;
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::PreflightRejected);
                     return Ok(());
                 }
                 Err(error) => {
@@ -12435,6 +12628,14 @@ impl Driver {
                                 .to_owned(),
                         })
                         .await;
+                    // A fault, not a rejection: the lease stays accepted for
+                    // the durable reaper, but this turn never ran, so fail
+                    // closed with an error-class reason (#275).
+                    self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                        class: crate::engine::model::InferenceErrorClass::Other(
+                            "oversized_materialization_failed".to_string(),
+                        ),
+                    });
                     return Ok(());
                 }
             }
@@ -12560,6 +12761,14 @@ impl Driver {
                             DURABLE_SUBMISSION_RETRY_BACKOFF,
                         )
                         .await;
+                    // The requeued submission re-binds the same queue id when
+                    // the backoff expires and publishes the truthful idle
+                    // then, so this attempt must not settle any idle: success
+                    // would be a lie and failure would sink a submission that
+                    // is still pending. Take the bound id so the idle boundary
+                    // stays silent and watchers resolve on the retry's real
+                    // outcome (#275).
+                    self.current_lifecycle_turn_id = None;
                     return Ok(());
                 }
             }
@@ -12598,6 +12807,11 @@ impl Driver {
                                 // A materialized bound FCM2 row must have armed its
                                 // clock. Do not dispatch if the durable composition
                                 // is inconsistent.
+                                self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                                    class: crate::engine::model::InferenceErrorClass::Other(
+                                        "run_invocation_clock_not_started".to_string(),
+                                    ),
+                                });
                                 return Ok(());
                             }
                             crate::daemon::server::RunInvocationRemaining::Remaining(remaining) => {
@@ -12613,9 +12827,21 @@ impl Driver {
                                     .ok()
                                     .flatten()
                                 else {
+                                    self.mark_bound_turn_refused(
+                                        crate::engine::IdleReason::Error {
+                                            class: crate::engine::model::InferenceErrorClass::Other(
+                                                "run_invocation_checkpoint_failed".to_string(),
+                                            ),
+                                        },
+                                    );
                                     return Ok(());
                                 };
                                 if checkpointed.terminal_at_wall_ms.is_some() {
+                                    self
+                                        .mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                                        class:
+                                            crate::engine::model::InferenceErrorClass::TimeoutIdle,
+                                    });
                                     return Ok(());
                                 }
                                 remaining
@@ -12634,6 +12860,14 @@ impl Driver {
                                 return Ok(());
                             }
                             crate::daemon::server::RunInvocationRemaining::Unbounded => {
+                                // Unreachable under a bound `timeout_ms` row;
+                                // treat the inconsistent durable composition as
+                                // a fail-closed refusal rather than dispatching.
+                                self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                                    class: crate::engine::model::InferenceErrorClass::Other(
+                                        "run_invocation_deadline_unbounded".to_string(),
+                                    ),
+                                });
                                 return Ok(());
                             }
                         };
@@ -12943,6 +13177,11 @@ impl Driver {
 
         let response_window_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
+            // A fresh round runs under the same bound id, so a completion
+            // mark from an earlier round must not survive into this one:
+            // only this round's own terminal arm may re-earn the success
+            // default (#275).
+            self.current_lifecycle_turn_completed = false;
             // Cache-aware auto-prune (GOALS §10): before talking to the
             // model, if the cache is cold and the foreground history has
             // grown something prunable, collapse it for free.
@@ -13061,6 +13300,11 @@ impl Driver {
                                         // A phase-one FCM2 reservation must be
                                         // materialized before any provider turn
                                         // can spend its configured timeout.
+                                        self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                                            class: crate::engine::model::InferenceErrorClass::Other(
+                                                "run_invocation_clock_not_started".to_string(),
+                                            ),
+                                        });
                                         return Ok(());
                                     }
                                     crate::daemon::server::RunInvocationRemaining::Remaining(ms) => {
@@ -13102,16 +13346,39 @@ impl Driver {
                         });
                         return Ok(());
                     }
-                    Ok(
-                        crate::db::run_invocations::ReserveTurnOutcome::AlreadyTerminal(_)
-                        | crate::db::run_invocations::ReserveTurnOutcome::CancelRequested(_)
-                        | crate::db::run_invocations::ReserveTurnOutcome::ClockNotStarted(_),
-                    ) => {
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::AlreadyTerminal(_)) => {
+                        // The run already settled; this turn may not dispatch.
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                "run_invocation_already_terminal".to_string(),
+                            ),
+                        });
+                        cancel.cancel();
+                        return Ok(());
+                    }
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::CancelRequested(_)) => {
+                        // A requested cancel is a user-initiated termination of
+                        // this run, not a completed turn.
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::Interrupted);
+                        cancel.cancel();
+                        return Ok(());
+                    }
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::ClockNotStarted(_)) => {
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                "run_invocation_clock_not_started".to_string(),
+                            ),
+                        });
                         cancel.cancel();
                         return Ok(());
                     }
                     Ok(crate::db::run_invocations::ReserveTurnOutcome::NotFound) | Err(_) => {
                         // Fail closed: do not dispatch without a reservation.
+                        self.mark_bound_turn_refused(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                "run_invocation_reservation_failed".to_string(),
+                            ),
+                        });
                         return Ok(());
                     }
                 }
@@ -13635,6 +13902,10 @@ impl Driver {
                         next_prompt = np;
                         continue;
                     }
+                    // Structural end of the driving turn: the child returned
+                    // and its parent held no outstanding call, so the turn
+                    // reached its natural terminal outcome.
+                    self.current_lifecycle_turn_completed = true;
                     return Ok(());
                 }
                 TurnOutcome::Done => {
@@ -13693,6 +13964,13 @@ impl Driver {
                             continue;
                         }
                     }
+                    // The driving turn reached its natural terminal outcome,
+                    // so the goal-aware success default is now honest. The
+                    // post-completion steering drain below exits through this
+                    // same tail (`Aborted` included) after the turn already
+                    // completed; later `continue`s re-run under the same bound
+                    // id and re-mark on their own terminal arm (#275).
+                    self.current_lifecycle_turn_completed = true;
                     // Root agent is done with this user message. Before
                     // we wait for the next user input, check if more
                     // landed in the queue while we were busy — fold

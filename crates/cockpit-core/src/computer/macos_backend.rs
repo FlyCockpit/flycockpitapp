@@ -233,10 +233,14 @@ impl MacOsComputerBackend {
         for chunk in utf16_chunks(text) {
             let down = CGEvent::new_keyboard_event(Some(&self.source), 0, true)
                 .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
-            // SAFETY: `chunk` is alive for the call and supplies exactly len
-            // initialized UniChar values.
+            // `UniCharCount` is the C `unsigned long` (u64 on LP64 macOS);
+            // a bounded UTF-16 chunk length always fits it.
+            let string_length =
+                u64::try_from(chunk.len()).expect("bounded UTF-16 chunk length fits UniCharCount");
+            // SAFETY: `chunk` is alive for the call and supplies exactly
+            // `string_length` initialized UniChar values.
             unsafe {
-                CGEvent::keyboard_set_unicode_string(Some(&down), chunk.len(), chunk.as_ptr());
+                CGEvent::keyboard_set_unicode_string(Some(&down), string_length, chunk.as_ptr());
             }
             self.post_event(&down, Some(InputTransition::KeyDown(0)))?;
             let up = CGEvent::new_keyboard_event(Some(&self.source), 0, false)

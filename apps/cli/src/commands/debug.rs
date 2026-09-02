@@ -134,8 +134,14 @@ async fn context() -> Result<()> {
     let env = crate::env_snapshot::EnvSnapshot::from_process(
         crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
     );
-    let redact =
-        crate::redact::RedactionTable::build_with_env_and_store(&config.redact, &cwd, env.vars())?;
+    let redact = crate::redact::RedactionTable::build_with_env_and_store(
+        &config.redact,
+        &cwd,
+        env.vars(),
+        Err(anyhow::anyhow!(
+            "debug context has no credential store; refusing to print unredacted assembled context"
+        )),
+    )?;
     let mut rendered = format!(
         "System prompt:\n{}",
         crate::engine::builtin::default_chat_system_prompt(&cwd, "")

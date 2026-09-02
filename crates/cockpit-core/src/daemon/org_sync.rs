@@ -630,9 +630,11 @@ mod tests {
                 sleep_log.lock().await.push(duration);
             })
         };
-        let outcome = sync_once_with_client(db, &credential, &client, &mut sleeper)
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(db).unwrap();
+        let outcome =
+            sync_once_with_client_and_vault(db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .unwrap();
         let requests = requests.lock().await.clone();
         let sleeps = sleeps.lock().await.clone();
         (outcome, requests, sleeps)
@@ -652,11 +654,11 @@ mod tests {
                 )
             })
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         db.insert_session_event(
             session.session_id,
@@ -893,11 +895,11 @@ mod tests {
             .create_session("p", "/tmp/project", "builder")
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         let removed_seq = db
             .insert_session_event(
@@ -923,12 +925,13 @@ mod tests {
             include_local_model_transcripts: true,
             raw: json!({}),
         };
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         let built = build_batch(
             &db,
             &credential("https://app.example.test".to_string()),
             &policy,
             0,
-            None,
+            Some(&vault),
         )
         .await
         .unwrap();
@@ -1094,7 +1097,8 @@ mod tests {
             raw: json!({}),
         };
         let credential = credential("http://localhost:1".to_string());
-        let built = build_batch(&db, &credential, &policy, 0, None)
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, &policy, 0, Some(&vault))
             .await
             .unwrap();
         match built {
@@ -1149,11 +1153,11 @@ mod tests {
             .create_session("p", "/tmp/project", "builder")
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         let local = db
             .insert_session_event_with_context(
@@ -1229,11 +1233,11 @@ mod tests {
         let redaction = with_redaction_token_override("fci_instance_secret", || {
             RedactionTable::build(&RedactConfig::default(), tmp.path()).unwrap()
         });
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
             session.session_id,
-            Some(redaction.to_persisted_json().unwrap()),
+            &redaction.to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         db.set_connector_enabled(&server, &credential.instance_id, true)
             .await
@@ -1246,7 +1250,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        sync_once_with_client(&db, &credential, &client, &mut sleeper)
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
             .await
             .unwrap();
         let seen = requests.lock().await;

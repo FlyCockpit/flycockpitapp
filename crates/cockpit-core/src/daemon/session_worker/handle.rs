@@ -2581,6 +2581,30 @@ pub enum CancelOrigin {
     Noninteractive,
 }
 
+/// Union a persisted redaction table onto the live scan. Load and union
+/// failures are fail-closed: returning the live table alone would drop
+/// previously accumulated sealed/named secrets and leak them on send.
+pub(crate) fn adopt_persisted_redaction_table(
+    persisted: anyhow::Result<Option<RedactionTable>>,
+    live: Arc<RedactionTable>,
+) -> anyhow::Result<Arc<RedactionTable>> {
+    match persisted {
+        Ok(Some(persisted)) => persisted.union(&live).map(Arc::new).map_err(|error| {
+            crate::redact::RedactionTableUnavailable::new(
+                "unioning persisted redaction table",
+                error,
+            )
+            .into()
+        }),
+        Ok(None) => Ok(live),
+        Err(error) => Err(crate::redact::RedactionTableUnavailable::new(
+            "loading persisted redaction table",
+            error,
+        )
+        .into()),
+    }
+}
+
 /// One-shot constructor: persist its initial redaction boundary, then spawn the
 /// worker and return its handle.
 ///
@@ -2694,20 +2718,8 @@ pub(crate) fn spawn(
             Vec::new()
         }
     };
-    let redact = match session.persisted_redaction_table() {
-        Ok(Some(persisted)) => match persisted.union(&redact) {
-            Ok(unioned) => Arc::new(unioned),
-            Err(error) => {
-                tracing::warn!(error = %error, %session_id, "unioning persisted redaction table failed");
-                redact
-            }
-        },
-        Ok(None) => redact,
-        Err(error) => {
-            tracing::warn!(error = %error, %session_id, "loading persisted redaction table failed");
-            redact
-        }
-    };
+    let redact = adopt_persisted_redaction_table(session.persisted_redaction_table(), redact)
+        .context("loading persisted redaction table; refusing to start session unredacted")?;
     // H1: this initial persist needs no redaction-table write lock. It runs
     // during session-worker construction, strictly BEFORE the shared live table
     // (`redaction`, below) and the per-session `InterruptHub` that owns the write

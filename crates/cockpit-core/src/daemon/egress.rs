@@ -78,21 +78,15 @@ pub(crate) async fn redaction_for_session(
     vault: Option<&crate::secure_key::SecretVault>,
     session_id: Uuid,
 ) -> Result<Option<crate::redact::RedactionTable>> {
-    let Some(session) = db.get_session(session_id).await? else {
+    if db.get_session(session_id).await?.is_none() {
+        return Ok(None);
+    }
+    let Some(vault) = vault else {
         return Ok(None);
     };
-    let json = match session.redaction_table_json.filter(|s| !s.is_empty()) {
-        Some(json) => json,
-        None => match vault {
-            Some(vault) => {
-                match crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)?
-                {
-                    Some(json) => json,
-                    None => return Ok(None),
-                }
-            }
-            None => return Ok(None),
-        },
+    let Some(json) = crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)?
+    else {
+        return Ok(None);
     };
     crate::redact::RedactionTable::from_persisted_json(&json)
         .map(Some)
@@ -151,13 +145,14 @@ mod tests {
         let table = crate::redact::RedactionTable::empty()
             .with_forced_literal("custom-upload-secret".to_string(), "test".to_string())
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
             session.session_id,
-            Some(table.to_persisted_json().unwrap()),
+            &table.to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
-        let loaded = redaction_for_session(&db, None, session.session_id)
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let loaded = redaction_for_session(&db, Some(&vault), session.session_id)
             .await
             .unwrap()
             .unwrap();
@@ -171,11 +166,15 @@ mod tests {
             .create_session("p", "/tmp/project", "builder")
             .await
             .unwrap();
-        db.set_session_redaction_table_json(session.session_id, Some("not json".to_string()))
-            .await
-            .unwrap();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
+            session.session_id,
+            "not json",
+        )
+        .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         assert!(
-            redaction_for_session(&db, None, session.session_id)
+            redaction_for_session(&db, Some(&vault), session.session_id)
                 .await
                 .is_err()
         );

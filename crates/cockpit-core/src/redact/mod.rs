@@ -44,6 +44,38 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+/// A redaction table could not be loaded on a security-relevant path.
+///
+/// Callers must fail closed (refuse to send, fork, or export) rather than
+/// substitute an empty table, which would let plaintext secrets flow into
+/// model context, provider requests, or exports.
+#[derive(Debug)]
+pub struct RedactionTableUnavailable {
+    context: &'static str,
+    source: String,
+}
+
+impl RedactionTableUnavailable {
+    pub fn new(context: &'static str, source: impl std::fmt::Display) -> Self {
+        Self {
+            context,
+            source: source.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RedactionTableUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "redaction table unavailable ({}); refusing to proceed unredacted: {}",
+            self.context, self.source
+        )
+    }
+}
+
+impl std::error::Error for RedactionTableUnavailable {}
+
 mod command_output;
 mod dotenv;
 mod protected;
@@ -1054,7 +1086,14 @@ impl RedactionTable {
         }
         #[cfg(not(test))]
         {
-            Self::build_with_env_and_store(cfg, cwd, &env)
+            Self::build_with_env_and_store(
+                cfg,
+                cwd,
+                &env,
+                Err(anyhow::anyhow!(
+                    "RedactionTable::build has no credential store; pass an opened store via build_with_env_and_credential_store"
+                )),
+            )
         }
     }
 
@@ -1069,14 +1108,22 @@ impl RedactionTable {
         Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
     }
 
-    /// Production session-env builder. Named secrets are loaded here so the
-    /// injected [`Self::build_with_env`] seam remains hermetic for tests.
+    /// Production session-env builder that requires an opened credential store.
+    ///
+    /// A store-open failure is fail-closed: this never substitutes an empty
+    /// secret iterator, which would leak named secrets into model context.
+    /// Callers that already hold a store should use
+    /// [`Self::build_with_env_and_credential_store`].
     pub fn build_with_env_and_store(
         cfg: &RedactConfig,
         cwd: &Path,
         env: &HashMap<String, String>,
+        store: Result<crate::credentials::CredentialStore>,
     ) -> Result<Self> {
-        Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
+        let store = store.map_err(|error| {
+            RedactionTableUnavailable::new("opening credential store for redaction", error)
+        })?;
+        Self::build_with_env_and_credential_store(cfg, cwd, env, &store)
     }
 
     pub fn build_with_env_and_credential_store(

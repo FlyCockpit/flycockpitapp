@@ -31043,8 +31043,17 @@ pub(super) async fn auto_title_request(
     } else {
         let table = match session.persisted_redaction_table().map_err(internal)? {
             Some(table) => table,
-            None => crate::redact::RedactionTable::build(&extended.redact, &session.project_root)
-                .map_err(internal)?,
+            None => {
+                let store = session.credential_store().map_err(internal)?;
+                let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+                crate::redact::RedactionTable::build_with_env_and_credential_store(
+                    &extended.redact,
+                    &session.project_root,
+                    &env,
+                    &store,
+                )
+                .map_err(internal)?
+            }
         };
         std::sync::Arc::new(table)
     };

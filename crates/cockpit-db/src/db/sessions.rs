@@ -238,7 +238,6 @@ pub struct SessionRow {
     /// diffs continue from the same system-instruction baseline.
     pub guidance_baseline_path: Option<String>,
     pub guidance_baseline_hash: Option<String>,
-    pub redaction_table_json: Option<String>,
     pub model_system_prompt_snapshot_json: String,
     /// Frozen KB names/descriptions/last-dreamed facts for the cached system
     /// prefix. Later dream completion is delivered as injected history.
@@ -337,7 +336,6 @@ impl SessionRow {
             )?,
             guidance_baseline_path: row.get("guidance_baseline_path")?,
             guidance_baseline_hash: row.get("guidance_baseline_hash")?,
-            redaction_table_json: row.get("redaction_table_json")?,
             model_system_prompt_snapshot_json: row
                 .get("model_system_prompt_snapshot_json")
                 .unwrap_or_else(|_| "{}".to_string()),
@@ -517,12 +515,12 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           short_id, provider, model, model_selection_json, active_model_revision,
           session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
-          guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
+          guidance_baseline_hash, model_system_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
           is_assistant_thread)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -541,7 +539,6 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.goal_settings_override_json,
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
-            row.redaction_table_json,
             row.model_system_prompt_snapshot_json,
             row.knowledge_base_prompt_snapshot_json,
             row.knowledge_base_prompt_snapshot_captured as i64,
@@ -588,12 +585,12 @@ fn execute_fork_insert(
           provider, model, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           title_recovery_nudge_state,
-          guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
+          guidance_baseline_path, guidance_baseline_hash, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, active_model_revision, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -617,7 +614,6 @@ fn execute_fork_insert(
             row.title_recovery_nudge_state.as_i64(),
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
-            row.redaction_table_json,
             row.created_by_principal,
             row.shared_with_collaborators as i64,
             row.btw_parent_session_id.map(|id| id.to_string()),
@@ -759,7 +755,6 @@ fn build_session_row(
         title_recovery_nudge_state: TitleRecoveryNudgeState::None,
         guidance_baseline_path: None,
         guidance_baseline_hash: None,
-        redaction_table_json: None,
         model_system_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_captured: false,
@@ -1909,7 +1904,6 @@ impl Db {
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
-            redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
@@ -2091,7 +2085,6 @@ impl Db {
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
-            redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
@@ -3294,22 +3287,6 @@ impl Db {
                 params![now_unix_ms, session_id.to_string()],
             )
             .context("touching session")?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn set_session_redaction_table_json(
-        &self,
-        session_id: Uuid,
-        redaction_table_json: Option<String>,
-    ) -> Result<()> {
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
-                params![redaction_table_json, session_id.to_string()],
-            )
-            .context("setting session redaction table")?;
             Ok(())
         })
         .await
@@ -4654,17 +4631,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_session_row_round_trips_redaction_table_json() {
+    async fn sessions_table_has_no_plaintext_redaction_column() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
-        row.redaction_table_json =
-            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#.to_string());
-        db.insert_session_row(&row).await.unwrap();
-
-        let got = db.get_session(row.session_id).await.unwrap().unwrap();
-        assert_eq!(
-            got.redaction_table_json.as_deref(),
-            Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#)
+        let names: Vec<String> = db
+            .blocking_write_for_sync_maintenance(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
+            })
+            .unwrap();
+        assert!(
+            !names.iter().any(|name| name == "redaction_table_json"),
+            "sessions.redaction_table_json was folded; redaction tables live in the vault"
         );
     }
 
@@ -4850,10 +4830,6 @@ mod tests {
             "prompt_cache_retention": "extended"
         });
         parent.model_selection_json = Some(model_selection.to_string());
-        parent.redaction_table_json = Some(
-            r#"{"entries":[{"value":"fork-secret","class":"ordinary","origin":"$TEST"}],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
-                .to_string(),
-        );
         parent.model_system_prompt_snapshot_json =
             r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
         parent.knowledge_base_prompt_snapshot_json = r#"{"entries":[{"id":"kb","name":"Team notes","description":"Shared decisions","last_dreamed_at_unix_ms":42}]}"#.to_string();
@@ -4892,12 +4868,6 @@ mod tests {
             .unwrap(),
             model_selection
         );
-        assert!(
-            fork.redaction_table_json
-                .as_deref()
-                .is_none_or(|json| !json.contains("fork-secret")),
-            "fork must not copy plaintext redaction literals"
-        );
     }
 
     #[tokio::test]
@@ -4910,12 +4880,6 @@ mod tests {
             "long-high-entropy-token",
             "reason",
             "user",
-        )
-        .await
-        .unwrap();
-        db.set_session_redaction_table_json(
-            parent.session_id,
-            Some(r#"{"entries":[{"value":"fork-secret"}]}"#.to_string()),
         )
         .await
         .unwrap();
@@ -4936,11 +4900,6 @@ mod tests {
             child_value
                 .as_deref()
                 .is_none_or(|raw| raw != "long-high-entropy-token")
-        );
-        assert!(
-            fork.redaction_table_json
-                .as_deref()
-                .is_none_or(|json| !json.contains("fork-secret"))
         );
     }
 

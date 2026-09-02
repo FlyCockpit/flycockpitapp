@@ -497,15 +497,13 @@ mod tests {
             })
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(
-                crate::redact::RedactionTable::empty()
-                    .to_persisted_json()
-                    .unwrap(),
-            ),
+            &crate::redact::RedactionTable::empty()
+                .to_persisted_json()
+                .unwrap(),
         )
-        .await
         .unwrap();
         db.insert_remote_audit_with_path(
             "flycockpit:user-1",
@@ -614,7 +612,10 @@ mod tests {
         }
         let credential = credential("http://127.0.0.1:1".to_string());
         let rows = db.list_remote_audit_after(0, 101).await.unwrap();
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready {
                 payload,
@@ -646,13 +647,16 @@ mod tests {
         let session_id = db.list_remote_audit_after(0, 1).await.unwrap()[0]
             .session_id
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
             session_id,
-            Some(redaction.to_persisted_json().unwrap()),
+            &redaction.to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready { payload, .. } => {
                 let body = payload.to_string();
@@ -668,7 +672,10 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let audit_id = insert_remote(&db, "", None).await;
         let credential = credential("http://127.0.0.1:1".to_string());
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Skipped { cursor_audit_id } => assert_eq!(cursor_audit_id, audit_id),
             BatchBuild::Idle | BatchBuild::Ready { .. } => panic!("expected skipped row"),

@@ -494,6 +494,17 @@ async fn refresh_redaction_for_turn(
         }
         Err(e) => {
             tracing::warn!(error = %e, "refreshing redaction table failed");
+            send_current_session_event(
+                session,
+                event_tx,
+                accumulated_redact,
+                proto::Event::Notice {
+                    session_id,
+                    text: format!("Redaction refresh failed; refusing to send unredacted: {e:#}"),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            return false;
         }
     }
     true

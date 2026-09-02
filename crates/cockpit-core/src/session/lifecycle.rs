@@ -12,6 +12,26 @@ use super::*;
 pub(crate) type RedactionKeyResolverArc =
     Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>;
 
+fn copy_vault_item(
+    vault: &crate::secure_key::SecretVault,
+    kind: cockpit_db::secret_vault::SecretVaultKind,
+    from_id: &str,
+    to_id: &str,
+    what: &'static str,
+) -> Result<()> {
+    match vault.get_item(kind, from_id) {
+        Ok(secret) => vault
+            .put_item(kind, to_id, secret.as_slice())
+            .map_err(|error| anyhow::anyhow!("copying {what}: {error}")),
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(()),
+        Err(error) => Err(crate::redact::RedactionTableUnavailable::new(
+            "reading parent vault item for session fork",
+            format!("{what}: {error}"),
+        )
+        .into()),
+    }
+}
+
 fn copy_vault_session_secrets(
     db: &crate::db::Db,
     vault: &crate::secure_key::SecretVault,
@@ -20,18 +40,13 @@ fn copy_vault_session_secrets(
 ) -> Result<()> {
     let parent_key = parent.to_string();
     let child_key = child.to_string();
-    if let Ok(secret) = vault.get_item(
+    copy_vault_item(
+        vault,
         cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
         &crate::secure_key::redaction_table_item_id(&parent_key),
-    ) {
-        vault
-            .put_item(
-                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-                &crate::secure_key::redaction_table_item_id(&child_key),
-                secret.as_slice(),
-            )
-            .map_err(|e| anyhow::anyhow!("copying redaction table vault item: {e}"))?;
-    }
+        &crate::secure_key::redaction_table_item_id(&child_key),
+        "redaction table vault item",
+    )?;
     let sealed_ids: Vec<(String, i64)> = db
         .blocking_write_for_sync_maintenance({
             let parent_key = parent_key.clone();
@@ -62,26 +77,17 @@ fn copy_vault_session_secrets(
     for (value_id, version) in sealed_ids {
         let from = crate::secure_key::session_sealed_item_id(&parent_key, &value_id, version);
         let to = crate::secure_key::session_sealed_item_id(&child_key, &value_id, version);
-        if let Ok(secret) = vault.get_item(
+        copy_vault_item(
+            vault,
             cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
             &from,
-        ) {
-            vault
-                .put_item(
-                    cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
-                    &to,
-                    secret.as_slice(),
-                )
-                .map_err(|e| anyhow::anyhow!("copying session sealed vault item: {e}"))?;
-        }
+            &to,
+            "session sealed vault item",
+        )?;
     }
     db.blocking_write_for_sync_maintenance({
         let child_key = child_key.clone();
         move |conn| {
-            conn.execute(
-                "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
-                rusqlite::params![child_key],
-            )?;
             conn.execute(
                 "UPDATE sealed_values SET value = NULL WHERE session_id = ?1",
                 rusqlite::params![child_key],
@@ -89,37 +95,33 @@ fn copy_vault_session_secrets(
             Ok(())
         }
     })
-    .context("clearing plaintext columns on forked session")?;
+    .context("clearing plaintext sealed-value columns on forked session")?;
     Ok(())
 }
 
 fn persist_redaction_table_to_vault(
-    db: &crate::db::Db,
-    vault: &Arc<crate::secure_key::SecretVault>,
+    vault: &crate::secure_key::SecretVault,
     session_id: uuid::Uuid,
     json: &[u8],
 ) -> Result<()> {
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
-    let json = json.to_vec();
-    let session_key = session_id.to_string();
-    let vault = vault.clone();
-    db.blocking_write_for_sync_maintenance(move |conn| {
-        conn.execute(
-            "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
-            rusqlite::params![session_key],
+    vault
+        .put_item(
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &item_id,
+            json,
         )
-        .context("clearing plaintext session redaction column")?;
-        vault
-            .put_item_on_conn(
-                conn,
-                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
-                &item_id,
-                &json,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(())
-    })
-    .context("persisting session redaction table")
+        .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
+}
+
+pub(crate) fn write_redaction_table_json_to_vault(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    json: &str,
+) -> Result<()> {
+    let vault = crate::secure_key::vault_for_db(db)
+        .map_err(|error| anyhow::anyhow!("opening vault for redaction table: {error}"))?;
+    persist_redaction_table_to_vault(&vault, session_id, json.as_bytes())
 }
 
 pub(crate) fn load_redaction_table_from_vault(
@@ -723,7 +725,6 @@ impl Session {
                     row.model_selection_json = model_selection_json;
                     row.tool_surface_override_json = self.tool_surface_override_json();
                     row.goal_settings_override_json = self.goal_settings_override_json();
-                    row.redaction_table_json = self.redaction_table_json.lock().unwrap().clone();
                     row
                 }
                 None => return Ok(false),
@@ -959,11 +960,8 @@ impl Session {
                 None
             }
         };
-        let redaction_table_json = match row.redaction_table_json.filter(|s| !s.is_empty()) {
-            Some(json) => Some(json),
-            None => load_redaction_table_from_vault(&vault, row.session_id)
-                .context("loading vault redaction table while resuming session")?,
-        };
+        let redaction_table_json = load_redaction_table_from_vault(&vault, row.session_id)
+            .context("loading vault redaction table while resuming session")?;
         // Durable workspace scratch is a required production session
         // capability. Test-support sessions with synthetic roots receive the
         // same per-session path but must not publish a reverse-map marker for
@@ -1176,17 +1174,7 @@ impl Session {
     pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
         let json = table.to_persisted_json()?;
         *self.redaction_table_json.lock().unwrap() = Some(json.clone());
-        if self.stage_pending_row(|row| {
-            row.redaction_table_json = None;
-        }) {
-            return persist_redaction_table_to_vault(
-                &self.db,
-                &self.secret_vault,
-                self.id,
-                json.as_bytes(),
-            );
-        }
-        persist_redaction_table_to_vault(&self.db, &self.secret_vault, self.id, json.as_bytes())
+        persist_redaction_table_to_vault(&self.secret_vault, self.id, json.as_bytes())
     }
 
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
@@ -1203,13 +1191,19 @@ impl Session {
         }
     }
 
+    /// Drop the in-memory redaction cache so the next load hits the vault.
+    /// Used to inject vault-read failures on security-relevant paths.
+    #[cfg(test)]
+    pub(crate) fn clear_cached_redaction_table_for_test(&self) {
+        *self.redaction_table_json.lock().unwrap() = None;
+    }
+
     /// Load a session's durable redaction table through this daemon-owned
     /// session's vault handle. Cross-session readers must fold this table into
     /// their own redactor before returning any target-owned history.
     ///
-    /// The database column remains a legacy import projection; production
-    /// persistence keeps the table in the vault. A malformed persisted table
-    /// is an error rather than a reason to return target content unredacted.
+    /// A malformed or unloadable vault table is an error rather than a reason
+    /// to return target content unredacted.
     pub(crate) async fn persisted_redaction_table_for_session(
         &self,
         reader_project: &str,
@@ -1218,22 +1212,19 @@ impl Session {
         if session_id == self.id {
             return self.persisted_redaction_table();
         }
-        let Some(redaction_table_json) = self
+        if !self
             .db
-            .session_redaction_table_json_for_reader_project(reader_project, session_id)
+            .session_visible_to_reader_project(reader_project, session_id)
             .await?
-        else {
+        {
             return Ok(None);
-        };
-        let json = match redaction_table_json.filter(|json| !json.is_empty()) {
-            Some(json) => Some(json),
-            None => load_redaction_table_from_vault(&self.secret_vault, session_id)?,
-        };
-        json.map(|json| {
-            crate::redact::RedactionTable::from_persisted_json(&json)
-                .context("loading persisted target-session redaction table")
-        })
-        .transpose()
+        }
+        match load_redaction_table_from_vault(&self.secret_vault, session_id)? {
+            Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
+                .map(Some)
+                .context("loading persisted target-session redaction table"),
+            None => Ok(None),
+        }
     }
 
     /// Legacy file-origin markers are used only to warn when a resumed
@@ -1378,28 +1369,62 @@ mod vault_unification_tests {
             )
             .unwrap();
         session.persist_redaction_table(&table).unwrap();
-        let column: Option<String> = db
-            .blocking_write_for_sync_maintenance({
-                let sid = session.id.to_string();
-                move |conn| {
-                    Ok(conn.query_row(
-                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
-                        rusqlite::params![sid],
-                        |row| row.get(0),
-                    )?)
-                }
+        let column_names: Vec<String> = db
+            .blocking_write_for_sync_maintenance(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
             })
             .unwrap();
         assert!(
-            column
-                .as_deref()
-                .is_none_or(|json| !json.contains("first-high-entropy-token"))
+            !column_names
+                .iter()
+                .any(|name| name == "redaction_table_json"),
+            "sessions.redaction_table_json must not hold plaintext literals"
         );
         let loaded = session.persisted_redaction_table().unwrap().unwrap();
         assert!(
             !loaded
                 .scrub("first-high-entropy-token")
                 .contains("first-high-entropy-token")
+        );
+    }
+
+    #[test]
+    fn session_fork_fails_closed_when_redaction_vault_read_errors() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        const SECRET: &str = "fork-vault-read-secret-abcdef123";
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "test".to_string())
+            .unwrap();
+        parent.persist_redaction_table(&table).unwrap();
+        crate::secure_key::tamper_item_ciphertext(
+            &db,
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &crate::secure_key::redaction_table_item_id(&parent.id.to_string()),
+            |ciphertext| ciphertext[0] ^= 0xff,
+        )
+        .unwrap();
+        let err = Session::create_fork_for_test(
+            db,
+            parent.id,
+            None,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect_err("fork must refuse to proceed without the parent redaction table");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
         );
     }
 }

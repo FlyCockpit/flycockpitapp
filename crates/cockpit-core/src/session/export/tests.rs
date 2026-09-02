@@ -5203,9 +5203,12 @@ async fn redacted_export_scrubs_secret_from_every_member_including_manifest_and_
         [("PLANTED".to_string(), SECRET.to_string())],
     )
     .unwrap();
-    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &db,
+        sid,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
 
     let target = get_test_session(&db, sid).await;
     let vault = crate::secure_key::vault_for_db(&db).unwrap();
@@ -5402,9 +5405,12 @@ async fn single_scrub_redacts_placeholder_substring_literal_without_corrupting_o
         ],
     )
     .unwrap();
-    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &db,
+        sid,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
 
     let target = get_test_session(&db, sid).await;
     let vault = crate::secure_key::vault_for_db(&db).unwrap();

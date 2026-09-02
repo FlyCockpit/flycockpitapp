@@ -85,6 +85,44 @@ fn mcp_oauth_json_registers_each_token_leaf() {
 }
 
 #[test]
+fn store_open_failure_does_not_emit_an_empty_redaction_table() {
+    let dir = TempDir::new().unwrap();
+    const SECRET: &str = "named-store-secret-value-xyz123";
+    let err = RedactionTable::build_with_env_and_store(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        Err(anyhow::anyhow!("database is locked")),
+    )
+    .expect_err("store-open failure must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("refusing to proceed unredacted"),
+        "visible fail-closed signal missing: {message}"
+    );
+    let leaked = RedactionTable::build_with_env_and_secrets(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .unwrap();
+    assert_eq!(
+        leaked.scrub(SECRET),
+        SECRET,
+        "the previous empty-store fallback would have leaked the named secret"
+    );
+    let covered = RedactionTable::build_with_env_and_secrets(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        [("PLANTED".to_string(), SECRET.to_string())],
+    )
+    .unwrap();
+    assert!(!covered.scrub(SECRET).contains(SECRET));
+}
+
+#[test]
 fn disabled_passes_through() {
     let mut cfg = enabled_cfg();
     cfg.enabled = false;

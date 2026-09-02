@@ -209,17 +209,6 @@ CREATE TABLE sessions (
         guidance_baseline_path IS NULL OR length(CAST(guidance_baseline_path AS BLOB)) BETWEEN 1 AND 32768
     ),
 
-    -- Accumulated session egress redaction table. Stores literal redaction
-    -- candidates so resumed raw transcripts remain covered even if the
-    -- original env/dotenv source has changed or disappeared.
-    redaction_table_json TEXT CHECK (
-        redaction_table_json IS NULL OR (
-            json_valid(redaction_table_json)
-            AND json_type(redaction_table_json) IN ('array', 'object')
-            AND length(CAST(redaction_table_json AS BLOB)) <= 8388608
-        )
-    ),
-
     -- Frozen model-specific system-prompt snapshot for this conversation
     -- lineage. JSON object keyed provider id -> model id -> prompt body.
     model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (

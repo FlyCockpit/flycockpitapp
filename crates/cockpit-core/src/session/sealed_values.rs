@@ -226,12 +226,13 @@ impl Session {
         let source_tool_call_id = source_tool_call_id.to_owned();
         self.db
             .transaction(move |conn| {
-                let updated = conn.execute(
-                    "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+                let exists: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
                     rusqlite::params![session_id.to_string()],
+                    |row| row.get(0),
                 )?;
                 anyhow::ensure!(
-                    updated == 1,
+                    exists == 1,
                     "agent-acquired sealed value requires a live persisted session"
                 );
                 let table_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
@@ -479,11 +480,12 @@ impl Session {
         let metadata = self
             .db
             .transaction(move |conn| {
-                let updated = conn.execute(
-                    "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+                let exists: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
                     rusqlite::params![session_id.to_string()],
+                    |row| row.get(0),
                 )?;
-                if updated == 0 {
+                if exists == 0 {
                     // A sealed adoption requires a persisted session row: the
                     // history row's FK targets `sessions(session_id)`. Fail
                     // closed rather than journal an orphan.
@@ -885,22 +887,19 @@ mod tests {
             )
             .await
             .unwrap();
-        let column: Option<String> = db
-            .blocking_write_for_sync_maintenance({
-                let sid = session.id.to_string();
-                move |conn| {
-                    Ok(conn.query_row(
-                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
-                        rusqlite::params![sid],
-                        |row| row.get(0),
-                    )?)
-                }
+        let column_names: Vec<String> = db
+            .blocking_write_for_sync_maintenance(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
             })
             .unwrap();
         assert!(
-            column
-                .as_deref()
-                .is_none_or(|json| !json.contains("first-high-entropy-token")),
+            !column_names
+                .iter()
+                .any(|name| name == "redaction_table_json"),
             "sessions.redaction_table_json must not hold plaintext literals"
         );
         let table = session.persisted_redaction_table().unwrap().unwrap();
@@ -955,23 +954,6 @@ mod tests {
             child_value
                 .as_deref()
                 .is_none_or(|value| value != "before-high-entropy-token")
-        );
-        let child_table: Option<String> = db
-            .blocking_write_for_sync_maintenance({
-                let sid = child.id.to_string();
-                move |conn| {
-                    Ok(conn.query_row(
-                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
-                        rusqlite::params![sid],
-                        |row| row.get(0),
-                    )?)
-                }
-            })
-            .unwrap();
-        assert!(
-            child_table
-                .as_deref()
-                .is_none_or(|json| !json.contains("before-high-entropy-token"))
         );
         assert!(
             child

@@ -803,14 +803,12 @@ mod tests {
         let target_redaction = crate::redact::RedactionTable::empty()
             .with_forced_literal(secret.to_string(), "test".to_string())
             .unwrap();
-        ctx.session
-            .db
-            .set_session_redaction_table_json(
-                other.session_id,
-                Some(target_redaction.to_persisted_json().unwrap()),
-            )
-            .await
-            .unwrap();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &ctx.session.db,
+            other.session_id,
+            &target_redaction.to_persisted_json().unwrap(),
+        )
+        .unwrap();
 
         let found = HistorySearchTool
             .call(json!({ "query": secret }), &ctx)

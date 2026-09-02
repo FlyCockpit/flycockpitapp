@@ -1948,13 +1948,6 @@ fn session_persisted_or_vault_redaction_json(
     conn: Option<&Connection>,
     session: &SessionRow,
 ) -> Result<Option<String>> {
-    if let Some(json) = session
-        .redaction_table_json
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(Some(json.to_string()));
-    }
     let Some(vault) = vault else {
         return Ok(None);
     };
@@ -2016,13 +2009,15 @@ fn export_redaction_table_for_sessions(
 ) -> Result<RedactionTable> {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    let mut table = match store {
-        Some(store) => {
-            RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
-        }
-        None => RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env),
-    }
-    .context("building export redaction table")?;
+    let store = store.ok_or_else(|| {
+        crate::redact::RedactionTableUnavailable::new(
+            "building export redaction table",
+            "redacted export requires an opened credential store",
+        )
+    })?;
+    let mut table =
+        RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
+            .context("building export redaction table")?;
     for session in sessions {
         let Some(json) = session_persisted_or_vault_redaction_json(vault, conn, session)? else {
             continue;

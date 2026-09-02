@@ -44,6 +44,57 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
     }
 }
 
+#[tokio::test]
+async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secrets() {
+    let (mut driver, _tmp) = test_driver(1);
+    const SECRET: &str = "driver-store-secret-value-xyz987";
+    {
+        let mut store = driver.session.credential_store().unwrap();
+        store.set_named_secret("PLANTED", SECRET);
+        store.save().unwrap();
+    }
+    let (tx, mut rx) = mpsc::channel(8);
+    driver.refresh_redaction_table_for_turn(&tx).await;
+    assert!(
+        !driver.redact.scrub(SECRET).contains(SECRET),
+        "named secret must enter the live table on a successful store open"
+    );
+    while rx.try_recv().is_ok() {}
+
+    driver
+        .session
+        .secret_vault()
+        .put_item(
+            cockpit_db::secret_vault::SecretVaultKind::Command,
+            "corrupt",
+            b"not-json-\xff-garbage",
+        )
+        .unwrap();
+    assert!(
+        driver.session.credential_store().is_err(),
+        "injected vault corruption must fail store open"
+    );
+
+    driver.refresh_redaction_table_for_turn(&tx).await;
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("store-open failure must surface a notice")
+        .expect("notice channel closed");
+    match notice {
+        TurnEvent::Notice { text } => {
+            assert!(
+                text.contains("refusing to send unredacted"),
+                "visible fail-closed signal missing: {text}"
+            );
+        }
+        other => panic!("expected Notice, got {other:?}"),
+    }
+    assert!(
+        !driver.redact.scrub(SECRET).contains(SECRET),
+        "a failed store open must not replace the live table with an empty secret set"
+    );
+}
+
 // J2 regression: a driver's per-turn redaction refresh must never overwrite the
 // durable table with its own stale `self.redact` copy and thereby drop a sealed
 // literal that was adopted mid-session into the HUB's shared table (decision

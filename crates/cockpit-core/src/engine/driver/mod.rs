@@ -3073,12 +3073,22 @@ impl Driver {
         if let Some(v) = scan_ssh_keys_override {
             cfg.scan_ssh_keys = v;
         }
-        let store = self.session.credential_store().ok();
-        match tokio::task::spawn_blocking(move || match store.as_ref() {
-            Some(store) => {
-                RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, store)
+        let store = match self.session.credential_store() {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(error = %error, "opening credential store for redaction failed");
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Redaction refresh failed; refusing to send unredacted: {error:#}"
+                        ),
+                    })
+                    .await;
+                return;
             }
-            None => RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env),
+        };
+        match tokio::task::spawn_blocking(move || {
+            RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, &store)
         })
         .await
         {
@@ -3155,9 +3165,23 @@ impl Driver {
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "refreshing redaction table failed");
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Redaction refresh failed; refusing to send unredacted: {e:#}"
+                        ),
+                    })
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "refreshing redaction table task join failed");
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Redaction refresh failed; refusing to send unredacted: {e:#}"
+                        ),
+                    })
+                    .await;
             }
         }
     }

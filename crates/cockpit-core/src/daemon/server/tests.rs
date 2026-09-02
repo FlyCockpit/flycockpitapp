@@ -7045,13 +7045,12 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         [("PLANTED_API_KEY".to_string(), SECRET.to_string())],
     )
     .unwrap();
-    ctx.db
-        .set_session_redaction_table_json(
-            session.session_id,
-            Some(table.to_persisted_json().unwrap()),
-        )
-        .await
-        .unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        session.session_id,
+        &table.to_persisted_json().unwrap(),
+    )
+    .unwrap();
     ctx.db
         .insert_session_event(
             session.session_id,

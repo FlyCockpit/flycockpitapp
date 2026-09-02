@@ -1710,6 +1710,84 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
 }
 
 #[tokio::test]
+async fn stop_aborts_noninteractive_jobs_of_the_cancelled_generation() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.noninteractive_jobs.insert(
+        "task-old".to_string(),
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(std::future::pending::<()>()),
+            Vec::new(),
+        )
+        .with_generation(0),
+    );
+    let through = driver.cancel_handle().cancel_all_session_work();
+    driver.noninteractive_jobs.insert(
+        "task-new".to_string(),
+        BackgroundNoninteractiveJob::with_workspace_leases(
+            tokio::spawn(std::future::pending::<()>()),
+            Vec::new(),
+        )
+        .with_generation(driver.session_work_cancel.generation()),
+    );
+    driver.apply_session_work_stop(through);
+    assert!(
+        !driver.noninteractive_jobs.contains_key("task-old"),
+        "Stop must abort background delegates admitted before rotate"
+    );
+    assert!(
+        driver.noninteractive_jobs.contains_key("task-new"),
+        "a delayed Stop sweep must not abort delegates admitted after rotate"
+    );
+}
+
+#[tokio::test]
+async fn stop_cancels_in_flight_background_delegate_inference() {
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Hang)
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url_vnext(8, provider.base_url());
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    seed_task_delegation(&driver, "task-stop-inflight", "default").await;
+    seed_task_payload(&driver, "task-stop-inflight", "default", "builder").await;
+    let task = single_task(&driver, "builder", "task-stop-inflight", None, None);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            driver
+                .execute_single_noninteractive_task(task, &tx, cancel)
+                .await
+        }
+    });
+    let _captured = provider.next_request().await;
+    cancel.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("Stop must abort in-flight delegate inference")
+        .expect("join");
+    let completion = result.expect("execute_single returns a completion on cancel");
+    assert!(
+        completion.failed,
+        "cancelled in-flight inference is a failed child outcome: {}",
+        completion.report
+    );
+    assert!(
+        completion.report.to_lowercase().contains("cancel"),
+        "got report {}",
+        completion.report
+    );
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "Stop must not start another billed delegate request"
+    );
+}
+
+#[tokio::test]
 async fn whole_job_cancel_releases_aborted_child_locks() {
     let (mut driver, tmp) = test_driver(8);
     let path = tmp.path().join("held.rs");

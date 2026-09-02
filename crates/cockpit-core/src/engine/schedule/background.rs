@@ -44,6 +44,10 @@ pub struct BackgroundHandle {
     attached_knowledge_read: bool,
     /// Set when the job is asked to die; the spawned task observes it.
     kill_tx: tokio::sync::watch::Sender<bool>,
+    /// Leader pid of the shell's process group, published once the child
+    /// is spawned. `kill()` SIGTERMs this group even if the runner has
+    /// already been aborted and cannot poll `cancel` / `kill_rx`.
+    pgid: Arc<Mutex<Option<u32>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,8 +181,26 @@ impl BackgroundHandle {
         }
     }
 
-    /// Signal the spawned task to kill the child. Idempotent.
+    /// Group-kill the shell, then signal the runner. Idempotent.
+    ///
+    /// The process-group SIGTERM (and a delayed SIGKILL) is issued from this
+    /// handle so Stop / `background.cancel` still contains descendants when
+    /// the authority aborts the runner immediately afterward. The watch send
+    /// remains so a still-running runner can `terminate_group_async` itself.
     pub fn kill(&self) {
+        let pgid = self
+            .pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pgid) = pgid {
+            cockpit_host::process::terminate_process_group(pgid);
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cockpit_host::process::kill_process_group(pgid);
+            });
+        }
         let _ = self.kill_tx.send(true);
     }
 }
@@ -297,18 +319,21 @@ pub fn spawn(
         redact,
         turn_tx,
         event_tx,
+        cancel,
     }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
     let ring: Arc<Mutex<BoundedOutputRing>> =
         Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP)));
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
     let attached_knowledge_read = !launch.attached_knowledge_paths.is_empty();
+    let pgid = Arc::new(Mutex::new(None));
 
     let handle = BackgroundHandle {
         label: label.clone(),
         ring: ring.clone(),
         attached_knowledge_read,
         kill_tx,
+        pgid: pgid.clone(),
     };
 
     let task = spawn_guarded_background(
@@ -323,6 +348,8 @@ pub fn spawn(
             turn_tx,
             event_tx.clone(),
             kill_rx,
+            cancel,
+            pgid,
         ),
         event_tx,
         job_id,
@@ -340,6 +367,10 @@ pub struct BackgroundSpawn {
     pub redact: Arc<RedactionTable>,
     pub turn_tx: mpsc::Sender<TurnEvent>,
     pub event_tx: mpsc::Sender<ScheduleEvent>,
+    /// Session-work child token. Stop fires this so a still-running runner
+    /// kills the subprocess; [`BackgroundHandle::kill`] group-kills even if
+    /// the runner is aborted first.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 fn spawn_guarded_background<F>(
@@ -504,7 +535,22 @@ async fn run_background(
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: tokio_util::sync::CancellationToken,
+    pgid: Arc<Mutex<Option<u32>>>,
 ) {
+    if cancel.is_cancelled() {
+        let _ = event_tx
+            .send(ScheduleEvent::Completed {
+                job_id,
+                label: label.clone(),
+                kind: ScheduleKind::Background,
+                result: format!("background `{label}` was cancelled"),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await;
+        return;
+    }
     let mut cmd = match build_background_command(&command, &cwd, &launch).await {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -538,6 +584,11 @@ async fn run_background(
             return;
         }
     };
+    if let Some(id) = child.id() {
+        *pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -565,6 +616,17 @@ async fn run_background(
 
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => {
+                killed = true;
+                let pid = child.id();
+                cockpit_host::process::terminate_group_async(
+                    &mut child,
+                    pid,
+                    Duration::from_millis(200),
+                )
+                .await;
+                break;
+            }
             // Kill request from the authority / `background.cancel`.
             changed = kill_rx.changed(), if !kill_watch_closed => {
                 match changed {
@@ -831,6 +893,28 @@ mod tests {
         turn_tx: mpsc::Sender<TurnEvent>,
         event_tx: mpsc::Sender<ScheduleEvent>,
     ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        spawn_test_job_with_cancel(
+            label,
+            command,
+            cwd,
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    fn spawn_test_job_with_cancel(
+        label: &str,
+        command: &str,
+        cwd: std::path::PathBuf,
+        launch: BackgroundLaunch,
+        redact: Arc<RedactionTable>,
+        turn_tx: mpsc::Sender<TurnEvent>,
+        event_tx: mpsc::Sender<ScheduleEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
         spawn(BackgroundSpawn {
             job_id: "job-1".to_string(),
             label: label.to_string(),
@@ -840,6 +924,7 @@ mod tests {
             redact,
             turn_tx,
             event_tx,
+            cancel,
         })
     }
 
@@ -1017,6 +1102,7 @@ mod tests {
             ring,
             attached_knowledge_read: true,
             kill_tx,
+            pgid: Arc::new(Mutex::new(None)),
         };
 
         let tail = handle.tail(10, &RedactionTable::empty());
@@ -1387,6 +1473,109 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn session_cancel_token_kills_running_shell() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, _task) = spawn_test_job_with_cancel(
+            "slow",
+            "printf 'progress one\\nprogress two\\n'; sleep 30",
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact.clone(),
+            turn_tx,
+            event_tx,
+            cancel.clone(),
+        );
+
+        let mut waited = 0;
+        loop {
+            let t = handle.tail(40, &redact);
+            if t.contains("progress two") {
+                break;
+            }
+            assert!(waited < 100, "lines never appeared in tail: {t}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+
+        cancel.cancel();
+        let completed = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("session Stop must complete the background shell")
+            .unwrap();
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(!failed, "a cancelled scheduled task isn't a failure");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_kill_group_terminates_descendants_after_runner_abort() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let heartbeat = tmp.path().join("heartbeat");
+        let ready = tmp.path().join("ready");
+        let script = format!(
+            "( while true; do touch '{}'; sleep 0.1; done ) & touch '{}'; sleep 30",
+            heartbeat.display(),
+            ready.display()
+        );
+        let (handle, task) = spawn_test_job(
+            "group-kill",
+            &script,
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact,
+            turn_tx,
+            event_tx,
+        );
+
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "shell never created the ready file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        while !heartbeat.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "descendant never created the heartbeat file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+        let _ = task.await;
+        handle.kill();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let mtime_after_kill = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let mtime_later = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        assert_eq!(
+            mtime_after_kill, mtime_later,
+            "descendant heartbeat kept updating after handle.kill() with the runner already aborted"
+        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};

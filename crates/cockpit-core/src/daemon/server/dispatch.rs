@@ -2628,6 +2628,9 @@ fn oauth_owner(state: &MutableClientState) -> String {
 ///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
 ///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
 ///   verified constructors). A caller cannot present itself as `Owner`.
+///   Issue #296: socket Owner is still blanket; secret RPCs additionally
+///   require the daemon-private capability. Follow-up #337 replaces this with
+///   authenticated per-peer identity.
 /// - `remote_operation` is produced only by `admit_remote_operation` from a
 ///   daemon-verified device actor binding; a genuine local owner always yields
 ///   `None` (admission short-circuits on `is_owner()`), and it cannot be forged.

@@ -595,6 +595,10 @@ pub struct DaemonClient {
     /// `Clone` — clones of `DaemonClient` share access to the
     /// receiver they were spawned with.
     events: Arc<tokio::sync::Mutex<mpsc::Receiver<proto::Event>>>,
+    /// Daemon-private owner capability loaded from the 0600 file next to
+    /// the control socket. In-process clients do not need it: possession of
+    /// the endpoint is the capability. Issue #296 / follow-up #337.
+    owner_capability: Option<proto::OwnerCapabilityToken>,
 }
 
 #[cfg(unix)]
@@ -641,6 +645,7 @@ impl DaemonClient {
                 proto,
                 negotiated,
                 initial_events,
+                load_owner_capability(socket),
             ))
         }
         #[cfg(not(unix))]
@@ -665,13 +670,30 @@ impl DaemonClient {
             backend: ClientBackend::InProcess(connection.requests),
             negotiated: proto::NegotiatedProtocol::current(),
             events: Arc::new(tokio::sync::Mutex::new(connection.events)),
+            owner_capability: None,
+        }
+    }
+
+    /// True when this client can present the daemon-private owner capability
+    /// (in-process endpoint, or a loaded socket token). ACP stdio ingress
+    /// requires this (issue #296).
+    pub fn has_owner_capability(&self) -> bool {
+        match &self.backend {
+            ClientBackend::InProcess(_) => true,
+            #[cfg(unix)]
+            ClientBackend::Wire(_) => self.owner_capability.is_some(),
         }
     }
 
     #[cfg(unix)]
     #[cfg(test)]
     fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
-        Self::from_proto_negotiated(proto, proto::NegotiatedProtocol::current(), Vec::new())
+        Self::from_proto_negotiated(
+            proto,
+            proto::NegotiatedProtocol::current(),
+            Vec::new(),
+            None,
+        )
     }
 
     #[cfg(unix)]
@@ -679,6 +701,7 @@ impl DaemonClient {
         proto: ProtoStream<UnixStream>,
         negotiated: proto::NegotiatedProtocol,
         initial_events: Vec<proto::Event>,
+        owner_capability: Option<proto::OwnerCapabilityToken>,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
@@ -690,11 +713,17 @@ impl DaemonClient {
                 .try_send(event)
                 .expect("bounded confirmation events fit the client queue");
         }
-        tokio::spawn(run_io(proto, request_rx, event_tx));
+        tokio::spawn(run_io(
+            proto,
+            request_rx,
+            event_tx,
+            owner_capability.clone(),
+        ));
         Self {
             backend: ClientBackend::Wire(request_tx),
             negotiated,
             events: Arc::new(tokio::sync::Mutex::new(event_rx)),
+            owner_capability,
         }
     }
 
@@ -971,6 +1000,7 @@ async fn run_io(
     mut proto: ProtoStream<UnixStream>,
     mut request_rx: mpsc::Receiver<IoCommand>,
     event_tx: mpsc::Sender<proto::Event>,
+    owner_capability: Option<proto::OwnerCapabilityToken>,
 ) {
     let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
         HashMap::new();
@@ -983,7 +1013,9 @@ async fn run_io(
             match request_rx.try_recv() {
                 Ok(cmd) => {
                     inbound_burst.reset();
-                    if !handle_io_command(cmd, &mut proto, &mut pending).await {
+                    if !handle_io_command(cmd, &mut proto, &mut pending, owner_capability.as_ref())
+                        .await
+                    {
                         break;
                     }
                     continue;
@@ -1131,7 +1163,9 @@ async fn run_io(
                 let Some(cmd) = cmd else {
                     break;
                 };
-                if !handle_io_command(cmd, &mut proto, &mut pending).await {
+                if !handle_io_command(cmd, &mut proto, &mut pending, owner_capability.as_ref())
+                    .await
+                {
                     break;
                 }
             }
@@ -1208,6 +1242,7 @@ async fn handle_io_command(
     cmd: IoCommand,
     proto: &mut ProtoStream<UnixStream>,
     pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
+    owner_capability: Option<&proto::OwnerCapabilityToken>,
 ) -> bool {
     match cmd {
         IoCommand::Cancel { id } => {
@@ -1219,7 +1254,8 @@ async fn handle_io_command(
         IoCommand::Request(p) => {
             let id = p.id;
             pending.insert(id, p.reply);
-            let envelope = Envelope::request(id, p.request);
+            let envelope =
+                Envelope::request_with_owner_capability(id, p.request, owner_capability.cloned());
             if let Err(e) = proto.send(&envelope).await {
                 tracing::warn!(error = ?e, "daemon write failed");
                 if let Some(tx) = pending.remove(&id) {
@@ -1248,6 +1284,33 @@ fn remove_pending_request(
 fn is_nil_daemon_status_hello(id: Uuid, response: &Response) -> bool {
     id.is_nil() && matches!(response, Response::DaemonStatus { .. })
 }
+
+/// Same derivation the daemon uses: `{stem}.owner-capability` next to the
+/// control socket. Confined children are denied this path.
+pub fn owner_capability_path(control_socket: &Path) -> PathBuf {
+    let stem = control_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cockpit");
+    let file_name = format!("{stem}.owner-capability");
+    match control_socket.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
+#[cfg(unix)]
+fn load_owner_capability(socket: &Path) -> Option<proto::OwnerCapabilityToken> {
+    let path = owner_capability_path(socket);
+    let bytes = std::fs::read(&path).ok()?;
+    let token = String::from_utf8(bytes).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(proto::OwnerCapabilityToken::new(token.to_string()))
+    }
+}
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -1256,6 +1319,20 @@ mod tests {
 
     fn lsp_event(text: impl Into<String>) -> proto::Event {
         proto::Event::LspNotice { text: text.into() }
+    }
+
+    #[test]
+    fn owner_capability_path_is_a_pure_function_of_the_control_socket() {
+        assert_eq!(
+            owner_capability_path(Path::new("/run/user/1000/cockpit/cockpit.sock")),
+            PathBuf::from("/run/user/1000/cockpit/cockpit.owner-capability")
+        );
+        assert_eq!(
+            owner_capability_path(Path::new("/home/u/.local/state/cockpit/daemon.sock")),
+            PathBuf::from("/home/u/.local/state/cockpit/daemon.owner-capability")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_owner_capability(&dir.path().join("cockpit.sock")).is_none());
     }
 
     fn daemon_status_response() -> Response {

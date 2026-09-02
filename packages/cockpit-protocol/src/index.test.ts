@@ -274,6 +274,19 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("accepts a capability-bearing request envelope and still rejects unknown keys", () => {
+    const frame = {
+      ...requestsFixture.list_sessions,
+      owner_capability: "0123456789abcdef".repeat(4),
+    };
+    const parsed = clientEnvelopeSchema.safeParse(frame);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.owner_capability).toBe(frame.owner_capability);
+    }
+    expect(clientEnvelopeSchema.safeParse({ ...frame, extra: true }).success).toBe(false);
+  });
+
   it("rejects client-claimed internal user-message provenance", () => {
     for (const request of ["send_user_message", "send_user_message_bulk"] as const) {
       const frame = requestsFixture[request];

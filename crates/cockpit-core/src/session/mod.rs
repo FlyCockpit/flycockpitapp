@@ -2193,6 +2193,7 @@ fn sandbox_mode_to_u8(mode: crate::tools::sandbox_mode::SandboxMode) -> u8 {
         crate::tools::sandbox_mode::SandboxMode::Sandbox => 1,
         crate::tools::sandbox_mode::SandboxMode::Container => 2,
         crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => 3,
+        crate::tools::sandbox_mode::SandboxMode::Refuse => 4,
     }
 }
 
@@ -2201,6 +2202,7 @@ fn sandbox_mode_from_u8(value: u8) -> crate::tools::sandbox_mode::SandboxMode {
         0 => crate::tools::sandbox_mode::SandboxMode::Off,
         2 => crate::tools::sandbox_mode::SandboxMode::Container,
         3 => crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+        4 => crate::tools::sandbox_mode::SandboxMode::Refuse,
         _ => crate::tools::sandbox_mode::SandboxMode::Sandbox,
     }
 }

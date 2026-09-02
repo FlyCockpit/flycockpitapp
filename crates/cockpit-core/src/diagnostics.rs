@@ -1313,7 +1313,7 @@ fn doctor_integration_input(
         lsp_servers: Vec::new(),
         stdio_mcp: Vec::new(),
         sandbox_enabled: Some(sandbox_enabled),
-        sandbox_mode: extended.sandbox.default_mode,
+        sandbox_mode: extended.sandbox.default_mode.into(),
         computer_use_mode,
         selected_features: harnesses
             .iter()

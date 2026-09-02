@@ -220,6 +220,7 @@ async fn jq_shim_is_skipped_only_for_actual_container_runs() {
     assert!(should_prepare_jq_shim(true, SandboxMode::ContainerReadonly));
     assert!(should_prepare_jq_shim(false, SandboxMode::Sandbox));
     assert!(should_prepare_jq_shim(false, SandboxMode::Off));
+    assert!(should_prepare_jq_shim(false, SandboxMode::Refuse));
 }
 
 #[tokio::test]
@@ -3828,4 +3829,98 @@ fn retirement_structural_inventory() {
         include_str!("../../redact/mod.rs").contains("SEALED_"),
         "env scrub must treat SEALED_* as sensitive"
     );
+}
+
+#[tokio::test]
+async fn capability_refuse_never_runs_unconfined_even_if_live_probe_is_available() {
+    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_mode(SandboxMode::Refuse);
+    ctx.config.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            1,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        )
+        .with_host_capabilities(
+            crate::daemon::session_worker::sandbox_capability_snapshot(
+                FeatureCapabilityState::Failed,
+                FeatureCapabilityState::Available,
+            ),
+        ),
+    );
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(false, shell_out("UNCONFINED_RAN", "", 0))],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(
+        out.content.contains("will not run unconfined"),
+        "capability fail-closed must refuse bash: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("/sandbox off"),
+        "refusal must name the explicit acknowledgement: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("UNCONFINED_RAN"),
+        "bash must not spawn unconfined when effective mode is Refuse"
+    );
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.enabled);
+    assert!(!meta.confined);
+    assert!(meta.unavailable_reason.is_some());
+}
+
+#[tokio::test]
+async fn capability_refuse_covers_missing_and_unpublished_snapshots() {
+    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    for caps in [
+        crate::daemon::session_worker::sandbox_capability_snapshot(
+            FeatureCapabilityState::Missing,
+            FeatureCapabilityState::Available,
+        ),
+        crate::daemon::session_worker::unpublished_host_capability_snapshot(),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(tmp.path());
+        ctx.session.set_sandbox_mode(SandboxMode::Refuse);
+        ctx.config.set_full_config_snapshot_for_tests(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            )
+            .with_host_capabilities(caps),
+        );
+        let _guard = set_bash_test_overrides(
+            Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+            None,
+            [(false, shell_out("UNCONFINED_RAN", "", 0))],
+        );
+
+        let out = BashTool::new()
+            .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+            .await
+            .expect("bash call returns");
+        assert!(
+            out.content.contains("will not run unconfined"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("UNCONFINED_RAN"));
+    }
 }

@@ -661,6 +661,7 @@ fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
         SandboxMode::Sandbox => "on",
         SandboxMode::Container => "container",
         SandboxMode::ContainerReadonly => "container readonly",
+        SandboxMode::Refuse => "refused",
     }
 }
 
@@ -676,6 +677,10 @@ fn sandbox_mode_description(
         }
         SandboxMode::Container => "run bash in a writable project container".to_string(),
         SandboxMode::ContainerReadonly => "run bash in a read-only project container".to_string(),
+        SandboxMode::Refuse => {
+            "configured sandbox cannot run; bash will not run unconfined until /sandbox off"
+                .to_string()
+        }
     }
 }
 

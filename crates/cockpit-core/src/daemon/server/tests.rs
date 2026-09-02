@@ -35739,7 +35739,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
             serde_json::json!({"reasoning_effort":"high"}),
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));

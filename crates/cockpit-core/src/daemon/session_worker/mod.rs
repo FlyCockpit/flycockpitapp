@@ -585,8 +585,10 @@ mod tests;
 use self::helpers::queue_target_to_proto;
 
 pub use effective_sandbox::{
-    SandboxCapabilityMissing, SetSandboxApplied, SetSandboxError, effective_sandbox_mode,
-    evaluate_set_sandbox, sandbox_capability_snapshot, sandbox_capability_snapshot_with_reasons,
+    SandboxCapabilityMissing, SetSandboxApplied, SetSandboxError, apply_sandbox_intent,
+    apply_stored_sandbox_override_label, effective_sandbox_mode, evaluate_set_sandbox,
+    fail_closed_capability_reason, sandbox_capability_snapshot,
+    sandbox_capability_snapshot_with_reasons, sandbox_capability_unavailable_notice,
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
 pub(crate) use handle::spawn;

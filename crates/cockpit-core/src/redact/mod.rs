@@ -421,8 +421,10 @@ const ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "LANG", "XDG_"];
 /// equal to one of these is dropped by the prune step — they're config
 /// keywords, not secrets, and redacting them would corrupt every prompt
 /// that mentions the word. Empty/whitespace-only values are already
-/// covered by the `min_secret_length` floor.
-const NEVER_SCRUB_LITERALS: &[&str] = &[
+/// covered by the `min_secret_length` floor. The substitution-site
+/// novel-secret scrub (issue #279) mirrors the same exemption, so a
+/// boolean echo like `DB_PASSWORD=null` is visible at both boundaries.
+pub(crate) const NEVER_SCRUB_LITERALS: &[&str] = &[
     "true", "false", "null", "nil", "none", "yes", "no", "on", "off",
 ];
 

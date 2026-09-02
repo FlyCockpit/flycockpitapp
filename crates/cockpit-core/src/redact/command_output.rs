@@ -56,13 +56,24 @@
 //! word used to be, while under-redaction leaks a credential, and the
 //! module consistently chooses the former. Absolute paths (which share
 //! base64's `/`) are exempted.
-//! Values under the [`NOVEL_SECRET_VALUE_MIN_LEN`] floor stay visible
-//! (ports, counts, `yes`/`no` flags), mirroring the `min_secret_length`
-//! prune in table building — except under [`credential_shaped_key`] keys,
-//! which share the table builder's length exemption down to
-//! [`MIN_REDACTION_ENTRY_LENGTH`], so a short `*_PASSWORD`/`*_PIN` value
-//! first surfaced by a command is scrubbed exactly like one collected from
-//! an env file. Multi-line XML element values and multi-line quoted shell
+//! Keyed values are redacted down to the hard [`MIN_REDACTION_ENTRY_LENGTH`]
+//! floor for *every* secret-shaped key, not just the `*_PASSWORD`/`*_PIN`
+//! family: the key's own shape is the secrecy evidence, so length above the
+//! hard floor is token-ness, never a secrecy gate (`GITHUB_TOKEN=abc123`
+//! and a bare `password: hunter2` used to cross this boundary under the
+//! eight-character collection floor). The two exemptions mirror the table
+//! builder's candidate prune exactly, so the boundaries keep one
+//! plausibility definition: values below the hard floor (never safe to
+//! replace — short strings match unrelated output) and never-scrub
+//! literals (`true`/`false`/`null`/`none`/`yes`/`no`/`on`/`off`,
+//! case-insensitive) stay visible, so a boolean echo like
+//! `DB_PASSWORD=null` is not corrupted into a placeholder. The keyless
+//! floor stays 20: without a key there is no secrecy signal except the
+//! run's own shape, and below 20 an opaque run shares its shape with
+//! ordinary words (`information`, `well-known-compound`) — position and
+//! charset composition are non-gates because they carry no signal either
+//! way, while sub-20 length carries positive counter-signal.
+//! Multi-line XML element values and multi-line quoted shell
 //! strings are passed through untouched rather than guessed at (the value
 //! cannot be delimited by shape); PEM and YAML block scalars are the two
 //! multi-line shapes with unambiguous fences and are fully covered.
@@ -79,15 +90,8 @@ use std::collections::HashMap;
 
 use super::structured::strip_quotes;
 use super::{
-    MIN_REDACTION_ENTRY_LENGTH, RedactionTable, credential_shaped_key, is_secret_shaped_key,
+    MIN_REDACTION_ENTRY_LENGTH, NEVER_SCRUB_LITERALS, RedactionTable, is_secret_shaped_key,
 };
-
-/// The value-length floor for novel substitution-site redaction. Mirrors
-/// the `min_secret_length` default (`RedactConfig::default()`); values at
-/// or above it under a secret-shaped key are replaced with the placeholder.
-/// Credential-shaped keys are exempt down to
-/// [`MIN_REDACTION_ENTRY_LENGTH`] instead (see [`novel_value_min_len`]).
-const NOVEL_SECRET_VALUE_MIN_LEN: usize = 8;
 
 /// Minimum total length for the opaque keyless-credential token rule (the
 /// `gh auth token` / `aws configure get …` / digitless `pass show`
@@ -97,16 +101,25 @@ const KEYLESS_TOKEN_MIN_LEN: usize = 20;
 /// Minimum total length for a JWT (`eyJ…` with at least two dots).
 const JWT_MIN_LEN: usize = 30;
 
-/// The effective value floor for one key or tag: credential-shaped keys
-/// share the table builder's `length_exempt` semantics (floor of the hard
-/// [`MIN_REDACTION_ENTRY_LENGTH`]), every other secret-shaped key keeps the
-/// eight-byte floor.
-fn novel_value_min_len(key: &str) -> usize {
-    if credential_shaped_key(key) {
-        MIN_REDACTION_ENTRY_LENGTH
-    } else {
-        NOVEL_SECRET_VALUE_MIN_LEN
-    }
+/// A keyed novel value stays visible (not redacted) when it is below the
+/// hard [`MIN_REDACTION_ENTRY_LENGTH`] floor or case-insensitively equals
+/// a never-scrub literal. Both exemptions mirror the table builder's
+/// candidate prune exactly, so the two boundaries keep one plausibility
+/// definition — and above that floor the value's length never gates
+/// secrecy (issue #279 cycle 4): the secret-shaped key itself is the
+/// secrecy evidence, so `GITHUB_TOKEN=abc123` and a bare
+/// `password: hunter2` are scrubbed like any long value. The value-side
+/// floor that used to sit here (eight characters for keys outside the
+/// `*_PASSWORD`/`*_PIN` family) was the table builder's *collection*
+/// cost model — an anti-false-positive bound for installing a persistent
+/// pattern that scrubs all traffic — carried into a boundary whose own
+/// cost model is the opposite (a placeholder here costs one tool result;
+/// a miss leaks a credential).
+fn keyed_novel_value_is_visible(value: &str) -> bool {
+    value.len() < MIN_REDACTION_ENTRY_LENGTH
+        || NEVER_SCRUB_LITERALS
+            .iter()
+            .any(|lit| value.eq_ignore_ascii_case(lit))
 }
 
 impl RedactionTable {
@@ -130,10 +143,10 @@ impl RedactionTable {
         }
         let mut out = String::with_capacity(body.len());
         let mut in_private_key_block = false;
-        // YAML block scalar opened by a secret-shaped key: `(key-line
-        // indent, value floor)`. The value is the run of following lines
-        // indented deeper than the key line.
-        let mut block_scalar: Option<(usize, usize)> = None;
+        // YAML block scalar opened by a secret-shaped key: the key line's
+        // indent. The value is the run of following lines indented deeper
+        // than the key line.
+        let mut block_scalar: Option<usize> = None;
         for line in body.split_inclusive('\n') {
             let (content, newline) = match line.strip_suffix('\n') {
                 Some(content) => (content, "\n"),
@@ -154,7 +167,7 @@ impl RedactionTable {
                 in_private_key_block = true;
                 continue;
             }
-            if let Some((key_indent, floor)) = block_scalar {
+            if let Some(key_indent) = block_scalar {
                 let indent = content.len() - content.trim_start().len();
                 let trimmed = content.trim();
                 if trimmed.is_empty() {
@@ -164,7 +177,7 @@ impl RedactionTable {
                     continue;
                 }
                 if indent > key_indent {
-                    if trimmed.len() >= floor && trimmed != self.placeholder {
+                    if trimmed != self.placeholder && !keyed_novel_value_is_visible(trimmed) {
                         out.push_str(&content[..indent]);
                         out.push_str(&self.placeholder);
                     } else {
@@ -257,7 +270,7 @@ fn scrub_secret_shaped_xml(line: &str, placeholder: &str) -> String {
                 // `</` + tag + `>`
                 let close_end = close_start + tag.len() + 3;
                 let value = &line[value_start..close_start];
-                if value.len() >= novel_value_min_len(tag) && value != placeholder {
+                if value != placeholder && !keyed_novel_value_is_visible(value) {
                     out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
                     copied = close_end;
@@ -351,7 +364,7 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
                 assignment_value_span(content, eq + 1, opening_quote, query_context, &quotes)
         {
             let value = &content[value_start..value_end];
-            if value.len() >= novel_value_min_len(key) && value != placeholder {
+            if value != placeholder && !keyed_novel_value_is_visible(value) {
                 redacted = Some((value_start, value_end));
             }
         }
@@ -446,7 +459,7 @@ fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) ->
             let mut parts = separator.split_whitespace();
             if parts.next() == Some(":") && parts.next().is_none() {
                 let value = &content[val_open + 1..val_close];
-                if value.len() >= novel_value_min_len(key) && value != placeholder {
+                if value != placeholder && !keyed_novel_value_is_visible(value) {
                     out.push_str(&content[copied..val_open + 1]);
                     out.push_str(placeholder);
                     copied = val_close;
@@ -540,7 +553,7 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
         }
         _ => value_and_close,
     };
-    if value.len() < novel_value_min_len(key) || value == placeholder {
+    if keyed_novel_value_is_visible(value) || value == placeholder {
         return content.to_string();
     }
     let mut out = String::with_capacity(content.len());
@@ -559,8 +572,8 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
     out
 }
 
-/// `(key-line indent, value floor)` when `content` opens a YAML block
-/// scalar under a secret-shaped key — `password: |`, `db_secret: >-`,
+/// The key-line indent when `content` opens a YAML block scalar under a
+/// secret-shaped key — `password: |`, `db_secret: >-`,
 /// `token: |2` — whose value lives on the following, more-indented lines
 /// and must be scrubbed there. Chomping/indent indicators (`+`, `-`,
 /// digits) may follow the `|`/`>`; anything else is an inline value, not a
@@ -568,7 +581,7 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
 /// (`- key: |`) is skipped first, so a list-item block classifies exactly
 /// like a line-anchored one (the returned floor indentation stays the key
 /// line's own indent, which list-item value lines exceed).
-fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
+fn secret_shaped_block_scalar_intro(content: &str) -> Option<usize> {
     let indent = content.len() - content.trim_start().len();
     let mut trimmed = content.trim_start();
     if let Some(rest) = trimmed.strip_prefix('-') {
@@ -592,7 +605,7 @@ fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
     if !chars.all(|c| matches!(c, '+' | '-' | '0'..='9')) {
         return None;
     }
-    Some((indent, novel_value_min_len(key)))
+    Some(indent)
 }
 
 /// Charset of an opaque credential token: base64 / base64url / hex /
@@ -1372,13 +1385,30 @@ mod tests {
     }
 
     #[test]
-    fn short_values_and_plain_keys_pass_through() {
+    fn short_keyed_values_are_redacted_plain_keys_pass_through() {
+        // Issue #279 cycle 4: the key's shape is the secrecy evidence, so a
+        // keyed value is redacted down to the hard MIN_REDACTION_ENTRY_LENGTH
+        // floor for every secret-shaped key. `GITHUB_TOKEN=abc123` (6 chars,
+        // broad family) and a bare `password: hunter2` (7 chars) used to cross
+        // this boundary unchanged under the old eight-character floor.
         let table = table_with_placeholder(PH);
-        // Below the length floor for non-credential-shaped keys: ports,
-        // counts, flags stay visible.
         assert_eq!(
             table.scrub_novel_command_output_secrets("GITHUB_TOKEN=abc123"),
-            "GITHUB_TOKEN=abc123"
+            "GITHUB_TOKEN=[ph]"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("API_TOKEN=abc123"),
+            "API_TOKEN=[ph]"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("password: hunter2"),
+            "password: [ph]"
+        );
+        // Below the hard floor a value is never safe to replace (the table
+        // builder's own absolute bound), so it stays visible.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("GITHUB_TOKEN=abc"),
+            "GITHUB_TOKEN=abc"
         );
         // Non-secret keys are never touched.
         assert_eq!(
@@ -1388,6 +1418,43 @@ mod tests {
         assert_eq!(
             table.scrub_novel_command_output_secrets("PORT: 8080"),
             "PORT: 8080"
+        );
+    }
+
+    #[test]
+    fn never_scrub_literals_stay_visible_under_secret_shaped_keys() {
+        // The table builder's never-scrub prune is mirrored at this
+        // boundary: a boolean/keyword echo under a secret-shaped key is
+        // config text, not a secret, and must not be corrupted into a
+        // placeholder — including under credential-shaped keys, where the
+        // old hard-floor-only check redacted `DB_PASSWORD=null`.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("DB_PASSWORD=null"),
+            "DB_PASSWORD=null"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("api_key: true"),
+            "api_key: true"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("{\"SECRET_TOKEN\": \"false\",}"),
+            "{\"SECRET_TOKEN\": \"false\",}"
+        );
+        // Case-insensitive, like the prune.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("db_password: NULL"),
+            "db_password: NULL"
+        );
+        // Block-scalar values share the same exemption.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("db_password: |\n  true\n"),
+            "db_password: |\n  true\n"
+        );
+        // A real short secret under the same key is still scrubbed.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("db_password: hunter2"),
+            "db_password: [ph]"
         );
     }
 

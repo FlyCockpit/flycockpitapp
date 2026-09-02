@@ -630,6 +630,7 @@ fn sandbox_label(mode: SandboxMode) -> &'static str {
         SandboxMode::Sandbox => "sandbox",
         SandboxMode::Container => "container",
         SandboxMode::ContainerReadonly => "container_readonly",
+        SandboxMode::Refuse => "refuse",
     }
 }
 

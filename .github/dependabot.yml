@@ -36,6 +36,23 @@ updates:
     cooldown:
       default-days: 3
 
+  # Cargo — covers the root Cargo.toml workspace (issue #306). Exact-pinned
+  # dependencies (`=x.y.z`, e.g. quick-xml, firecrawl, image, and the audited
+  # platform pins) are deliberately NOT auto-bumped: their semver requirement
+  # excludes newer versions, so each moves only through an audited change that
+  # re-checks deny.toml and the release feature policy. Everything else
+  # (minor/patch) rides the grouped weekly PR.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
   # npm — covers package.json files across the pnpm workspace.
   #
   # NOTE: Versions in pnpm-workspace.yaml#catalog are NOT updated automatically.

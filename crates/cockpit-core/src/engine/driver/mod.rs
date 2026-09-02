@@ -2868,8 +2868,12 @@ impl Driver {
     ///    to the active frame, so an ancestor or sibling frame is never
     ///    affected. The daemon already re-validated the model choice as
     ///    hard-compatible before it was stored.
-    ///  - `sandbox`: applied to the session posture below. This is session-scoped
-    ///    in the current architecture; true per-node sandbox isolation across
+    ///  - `sandbox`: applied to the session posture below as a persistable
+    ///    intent run through [`crate::daemon::session_worker::apply_sandbox_intent`].
+    ///    Capability-unavailable Sandbox/container labels stay
+    ///    [`crate::tools::sandbox_mode::SandboxMode::Refuse`]; `"refuse"` is
+    ///    not a stored intent and is ignored. This is session-scoped in the
+    ///    current architecture; true per-node sandbox isolation across
     ///    concurrent delegated turns needs a node-aware read seam at
     ///    `turn_toolbox` (documented follow-on). Only applied when the node
     ///    actually carries a sandbox override, so the no-override path leaves
@@ -2908,12 +2912,14 @@ impl Driver {
                 return ConsumedNodeOverride::default();
             }
         };
-        if let Some(sandbox) = effective
-            .sandbox
-            .as_deref()
-            .and_then(crate::daemon::agent_session_override::sandbox_from_label)
-        {
-            self.session.set_sandbox_mode(sandbox);
+        if let Some(label) = effective.sandbox.as_deref() {
+            let snapshot = self.config.snapshot();
+            if let Some(mode) = crate::daemon::session_worker::apply_stored_sandbox_override_label(
+                label,
+                &snapshot.host_capabilities,
+            ) {
+                self.session.set_sandbox_mode(mode);
+            }
         }
         ConsumedNodeOverride {
             model: effective

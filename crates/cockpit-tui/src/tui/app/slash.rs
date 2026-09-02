@@ -3278,6 +3278,7 @@ pub(super) fn sandbox_mode_label(mode: cockpit_proto::SandboxMode) -> &'static s
         cockpit_proto::SandboxMode::Sandbox => "on",
         cockpit_proto::SandboxMode::Container => "container",
         cockpit_proto::SandboxMode::ContainerReadonly => "container-readonly",
+        cockpit_proto::SandboxMode::Refuse => "refused",
     }
 }
 

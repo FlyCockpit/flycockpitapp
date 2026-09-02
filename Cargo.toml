@@ -45,6 +45,15 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+# `image` is the largest untrusted-input decoder in the binary (screenshots,
+# clipboard images, model-generated media), so its version stays exact-pinned
+# and the feature set is held to the minimum codecs Cockpit actually decodes
+# (png/jpeg/gif/webp, no default features — no ravif/tiff/avif C decoders, no
+# rayon/threads). Rationale (issue #306): the exact pin keeps the audited
+# decoder surface byte-stable between release audits; every bump re-opens the
+# audit. Relaxing the pin requires a fresh untrusted-input audit in the same
+# change that touches this line. `cargo audit`/`cargo deny` (cli-ci.yml) flag
+# advisories against the locked version in the meantime.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 jiff = "=0.2.35"
 jsonc-parser = { version = "0.33.0", default-features = false }

@@ -5464,7 +5464,6 @@ fn behavior_jobs_max_concurrent_rejects_zero() {
 fn privacy_sandbox_rows_cycle_edit_and_persist() {
     use cockpit_config::extended::ExtendedConfigDoc;
     use cockpit_proto::FeatureCapabilityState;
-    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -5472,12 +5471,15 @@ fn privacy_sandbox_rows_cycle_edit_and_persist() {
         FeatureCapabilityState::Available,
         FeatureCapabilityState::Missing,
     );
-    d.extended.sandbox.default_mode = SandboxMode::Off;
+    d.extended.sandbox.default_mode = cockpit_config::config::sandbox_mode::SandboxIntent::Off;
     d.save_extended().unwrap();
 
     open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Sandbox);
+    assert_eq!(
+        d.extended.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Sandbox
+    );
 
     let dockerfile = tmp.path().join("Dockerfile");
     std::fs::write(&dockerfile, "FROM scratch").unwrap();
@@ -5507,7 +5509,10 @@ fn privacy_sandbox_rows_cycle_edit_and_persist() {
     );
 
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Sandbox);
+    assert_eq!(
+        reloaded.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Sandbox
+    );
     assert_eq!(
         reloaded.sandbox.dockerfile,
         Some(std::path::PathBuf::from("Dockerfile"))
@@ -5554,17 +5559,19 @@ fn inject_secret_store(
 #[test]
 fn privacy_sandbox_on_blocked_when_host_cap_missing() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     inject_missing_host_sandbox(&mut d, "sudo apt-get install bubblewrap");
-    d.extended.sandbox.default_mode = SandboxMode::Off;
+    d.extended.sandbox.default_mode = cockpit_config::config::sandbox_mode::SandboxIntent::Off;
     d.save_extended().unwrap();
 
     open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Off);
+    assert_eq!(
+        d.extended.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Off
+    );
     match d.test_page() {
         TestPageRef::Category(p) => {
             let status = p.status.as_deref().unwrap_or("");
@@ -5576,24 +5583,29 @@ fn privacy_sandbox_on_blocked_when_host_cap_missing() {
         _ => panic!("not on category page"),
     }
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Off);
+    assert_eq!(
+        reloaded.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Off
+    );
 }
 
 #[test]
 fn sandbox_on_recheck_then_instruct() {
     use cockpit_config::extended::ExtendedConfigDoc;
-    use cockpit_proto::SandboxMode;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     inject_missing_host_sandbox(&mut d, "sudo apt-get install bubblewrap");
-    d.extended.sandbox.default_mode = SandboxMode::Off;
+    d.extended.sandbox.default_mode = cockpit_config::config::sandbox_mode::SandboxIntent::Off;
     d.save_extended().unwrap();
 
     open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.capability_refresh_calls, 1);
-    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Off);
+    assert_eq!(
+        d.extended.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Off
+    );
     match d.test_page() {
         TestPageRef::Category(p) => {
             let status = p.status.as_deref().unwrap_or("");
@@ -5611,9 +5623,15 @@ fn sandbox_on_recheck_then_instruct() {
             cockpit_proto::FeatureCapabilityState::Missing,
         ));
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Sandbox);
+    assert_eq!(
+        d.extended.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Sandbox
+    );
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Sandbox);
+    assert_eq!(
+        reloaded.sandbox.default_mode,
+        cockpit_config::config::sandbox_mode::SandboxIntent::Sandbox
+    );
 }
 
 #[test]

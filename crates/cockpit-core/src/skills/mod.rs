@@ -28,9 +28,12 @@
 //! [`render_body`] resolves them according to the auto-`!` toggle:
 //!   - **Claude mode (enabled):** run each command, replace the inline
 //!     directive with the command's stdout. Output is routed through
-//!     [`crate::redact::RedactionTable::scrub`] (non-bypassable, GOALS
-//!     §7) before it enters context. A nonzero exit / spawn failure
-//!     injects a clear inline error marker rather than crashing the turn.
+//!     [`crate::redact::RedactionTable::scrub`] plus the novel-secret pass
+//!     (`RedactionTable::scrub_novel_command_output_secrets`, covering
+//!     secret-shaped values first surfaced by the command itself —
+//!     non-bypassable, GOALS §7) before it enters context. A nonzero
+//!     exit / spawn failure injects a clear inline error marker rather
+//!     than crashing the turn.
 //!   - **Codex mode (disabled, the default):** the `` !`command` ``
 //!     directive is left verbatim — the model sees the literal text and
 //!     the command never runs.
@@ -1000,8 +1003,10 @@ fn resolve_dir_entry(entry: &str, cwd: &Path, ancestor_walk: bool, out: &mut Vec
 
 /// Render a skill body for injection into context, applying the
 /// auto-`!`-command toggle. `redact` scrubs Claude-mode command output
-/// before it enters context (GOALS §7). In Codex mode (`auto_bang_commands
-/// == false`) directives are returned verbatim and no command runs.
+/// before it enters context (GOALS §7) — table-known literals and novel
+/// secret-shaped values the command itself surfaces. In Codex mode
+/// (`auto_bang_commands == false`) directives are returned verbatim and
+/// no command runs.
 pub fn render_body(
     body: &str,
     cwd: &Path,
@@ -1055,9 +1060,14 @@ fn substitute_bang_commands(body: &str, cwd: &Path, redact: &RedactionTable) -> 
     out
 }
 
-/// Run one inline `!`-command and return the (redacted) stdout, or a
+/// Run one inline `!`-command and return the redacted stdout, or a
 /// bracketed error marker on failure / nonzero exit. Never panics.
-fn run_bang_command(cmd: &str, cwd: &Path, _redact: &RedactionTable) -> String {
+///
+/// Every captured channel — stdout, stderr, and the echoed command inside
+/// an error marker — runs through [`scrub_bang_output`] (the non-bypassable
+/// GOALS §7 substitution-site scrub) before it can enter context, the
+/// provider request, or any export.
+fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return "[skill command error: empty command]".to_string();
@@ -1072,9 +1082,9 @@ fn run_bang_command(cmd: &str, cwd: &Path, _redact: &RedactionTable) -> String {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             // Trim the trailing newline command stdout usually carries so
-            // the substitution reads inline-naturally; redact before it
-            // enters context.
-            stdout.trim_end_matches('\n').to_string()
+            // the substitution reads inline-naturally; scrub before the
+            // output enters context.
+            scrub_bang_output(redact, stdout.trim_end_matches('\n'))
         }
         Ok(out) => {
             let code = out
@@ -1083,15 +1093,34 @@ fn run_bang_command(cmd: &str, cwd: &Path, _redact: &RedactionTable) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signaled".to_string());
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let stderr = stderr.trim().to_string();
+            let stderr = scrub_bang_output(redact, stderr.trim());
             if stderr.is_empty() {
-                format!("[skill command `{trimmed}` failed: exit {code}]")
+                redact.scrub(&format!(
+                    "[skill command `{}` failed: exit {code}]",
+                    scrub_bang_output(redact, trimmed)
+                ))
             } else {
-                format!("[skill command `{trimmed}` failed: exit {code}: {stderr}]")
+                redact.scrub(&format!(
+                    "[skill command `{}` failed: exit {code}: {stderr}]",
+                    scrub_bang_output(redact, trimmed)
+                ))
             }
         }
-        Err(e) => format!("[skill command `{trimmed}` failed to run: {e}]"),
+        Err(e) => redact.scrub(&format!(
+            "[skill command `{}` failed to run: {e}]",
+            scrub_bang_output(redact, trimmed)
+        )),
     }
+}
+
+/// The substitution-site scrub for captured `!`-command text: table-known
+/// literals first via [`RedactionTable::scrub`], then novel secret-shaped
+/// values the table has no entry for
+/// ([`RedactionTable::scrub_novel_command_output_secrets`] — secrets first
+/// surfaced by the command itself, which dispatch-time table scrubbing can
+/// never catch). Both run before the text can enter context.
+fn scrub_bang_output(redact: &RedactionTable, text: &str) -> String {
+    redact.scrub_novel_command_output_secrets(&redact.scrub(text))
 }
 
 #[cfg(windows)]
@@ -1813,9 +1842,10 @@ mod tests {
     }
 
     #[test]
-    fn render_body_claude_mode_keeps_command_output_raw_until_dispatch() {
-        // Command output remains raw locally; model dispatch applies the
-        // dispatching model's effective redaction table.
+    fn render_body_claude_mode_scrubs_command_output_at_substitution_site() {
+        // Table-known secrets are redacted where the directive is replaced
+        // — the documented non-bypassable GOALS §7 scrub — not deferred to
+        // dispatch time (issue #279 regression).
         let cfg = RedactConfig {
             denylist: vec!["SUPERSECRETTOKEN".to_string()],
             scan_ssh_keys: false,
@@ -1824,7 +1854,81 @@ mod tests {
         let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
         let body = "leak: !`echo SUPERSECRETTOKEN`";
         let out = render_body(body, Path::new("."), true, false, &redact);
-        assert!(out.contains("SUPERSECRETTOKEN"), "got {out:?}");
+        assert!(!out.contains("SUPERSECRETTOKEN"), "got {out:?}");
+        assert!(out.contains("REDACTED"), "got {out:?}");
+    }
+
+    #[test]
+    fn render_body_claude_mode_redacts_novel_command_secrets_absent_from_table() {
+        // The dispatch-time scrub only replaces values already registered
+        // in the session table, so a secret first surfaced BY the command
+        // itself (`!`cat .env``) must be redacted at the substitution site
+        // (issue #279 regression).
+        let body = "cfg !`echo \"API_TOKEN=novel-skill-secret-9f1a2b\"`";
+        let out = trusted_render_body(body, Path::new("."), true, &no_redact());
+        assert!(!out.contains("novel-skill-secret-9f1a2b"), "got {out:?}");
+        assert!(
+            out.contains("API_TOKEN=") && out.contains("REDACTED"),
+            "key is preserved and the value redacted, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn render_body_claude_mode_redacts_novel_secret_read_from_file() {
+        // The issue's headline repro: a `!`-command that reads a secret the
+        // table does not know yet (the secret lives in a file, so the
+        // command text itself carries none).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("leak.env"),
+            "AWS_SESSION_TOKEN=freshly-minted-novel-token-8842\n",
+        )
+        .unwrap();
+        let body = "env dump: !`cat leak.env`";
+        let out = trusted_render_body(body, tmp.path(), true, &no_redact());
+        assert!(
+            !out.contains("freshly-minted-novel-token-8842"),
+            "got {out:?}"
+        );
+        assert!(
+            out.contains("AWS_SESSION_TOKEN=") && out.contains("REDACTED"),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn render_body_claude_mode_scrubs_table_known_secret_in_error_marker() {
+        let cfg = RedactConfig {
+            denylist: vec!["TABLESTDERRSECRET7".to_string()],
+            scan_ssh_keys: false,
+            ..Default::default()
+        };
+        let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
+        let body = "x !`echo TABLESTDERRSECRET7 >&2; exit 1` y";
+        let out = render_body(body, Path::new("."), true, false, &redact);
+        assert!(!out.contains("TABLESTDERRSECRET7"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn render_body_claude_mode_redacts_novel_secret_in_error_marker_stderr() {
+        // Stderr embedded in the failure marker is scrubbed for novel
+        // secret-shaped values too, not just table-known literals. The
+        // secret lives in a file so the command text itself carries none.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("err.env"),
+            "DB_PASSWORD=novel-stderr-secret-77aa\n",
+        )
+        .unwrap();
+        let body = "x !`cat err.env >&2; exit 1` y";
+        let out = trusted_render_body(body, tmp.path(), true, &no_redact());
+        assert!(!out.contains("novel-stderr-secret-77aa"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+        assert!(out.contains("DB_PASSWORD="), "got {out:?}");
     }
 
     #[test]

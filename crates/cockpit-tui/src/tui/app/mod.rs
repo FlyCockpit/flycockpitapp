@@ -1572,12 +1572,18 @@ pub(super) fn sandbox_down_notice_text_with_intent(
     intent: Option<cockpit_proto::SandboxMode>,
 ) -> String {
     let selected = match intent {
-        Some(cockpit_proto::SandboxMode::Sandbox) => "Sandbox is selected but effective Off",
-        Some(cockpit_proto::SandboxMode::Container) => "Container is selected but effective Off",
-        Some(cockpit_proto::SandboxMode::ContainerReadonly) => {
-            "Container-readonly is selected but effective Off"
+        Some(cockpit_proto::SandboxMode::Sandbox) => {
+            "Sandbox is selected but cannot run; bash will not run unconfined"
         }
-        _ => "shell sandbox can't start",
+        Some(cockpit_proto::SandboxMode::Container) => {
+            "Container is selected but cannot run; bash will not run unconfined"
+        }
+        Some(cockpit_proto::SandboxMode::ContainerReadonly) => {
+            "Container-readonly is selected but cannot run; bash will not run unconfined"
+        }
+        Some(cockpit_proto::SandboxMode::Off) | Some(cockpit_proto::SandboxMode::Refuse) | None => {
+            "shell sandbox can't start"
+        }
     };
     let mut text = if copy_chip && fix_command.is_some() {
         format!("[copy] ⚠ {selected}: {remedy}.")

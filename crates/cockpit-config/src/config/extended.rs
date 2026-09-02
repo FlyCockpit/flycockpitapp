@@ -1011,7 +1011,7 @@ impl CommandResourceProfilesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxConfig {
     #[serde(rename = "defaultMode", default)]
-    pub default_mode: crate::config::sandbox_mode::SandboxMode,
+    pub default_mode: crate::config::sandbox_mode::SandboxIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<PathBuf>,
 }
@@ -1019,7 +1019,7 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            default_mode: crate::config::sandbox_mode::SandboxMode::Sandbox,
+            default_mode: crate::config::sandbox_mode::SandboxIntent::Sandbox,
             dockerfile: None,
         }
     }

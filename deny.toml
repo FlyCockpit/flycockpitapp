@@ -1,0 +1,183 @@
+# cargo-deny configuration for the Flycockpit Cargo workspace (issue #306).
+# Enforced by the `supply-chain` job in .github/workflows/cli-ci.yml with
+# cargo-deny 0.20.2 (taiki-e/install-action, GitHub Releases + checksums).
+# Schema follows cargo-deny 0.20.2's deny.template.toml:
+# https://embarkstudios.github.io/cargo-deny/checks/
+#
+# Policy (owner decision 2026-09-01, issue #306):
+# - New RUSTSEC advisories fail CI. The only accepted advisories are the
+#   time-bounded, audited exceptions in [advisories].ignore; every entry
+#   carries a review-by date and the full dependency chain that drags it in.
+#   Expire an entry by bumping the affected crate, or re-audit and re-date the
+#   reason if the deadline needs to slip.
+# - Yanked crates are denied; the single pinned yanked exception lives in the
+#   same [advisories].ignore array as the advisory IDs. cargo-deny 0.20.2 has no
+#   separate ignore_yanked key: `ignore` entries carrying `id` ignore RUSTSEC
+#   advisories, entries carrying `crate` ignore yanked crate versions
+#   (src/advisories/cfg.rs splits the single `ignore` array on that key).
+#   scripts/check-advisory-exceptions.sh mechanically enforces the review-by
+#   dates on every entry and derives the cargo-audit --ignore flags from the
+#   `id` entries, so audit and deny cannot drift.
+# - firecrawl stays (pinned =2.12.1 in crates/cockpit-core). Its second
+#   reqwest 0.12 + OpenSSL/native-TLS stack is the ONLY tolerated OpenSSL in
+#   the graph, contained via [bans] deny + wrapper entries. Any other crate
+#   that introduces OpenSSL/native-TLS fails CI.
+# - Licenses are limited to the audited allowlist in [licenses]; anything new
+#   requires a deliberate policy decision.
+
+[graph]
+# Targets intentionally unset: cargo-deny then checks the dependency graph for
+# every supported target union (matching the cargo-dist release matrix in
+# dist-workspace.toml), so target-gated windows/macos/linux dependencies are
+# all covered.
+all-features = true
+# all-features closes the feature-gated subgraphs too (grok-subscription,
+# remote, daemon-custody-pkcs11/cryptoki, turn-coturn-conformance): every
+# optional dependency of every workspace member is already in the committed
+# Cargo.lock (verified, including cryptoki), so metadata collection with
+# --all-features never mutates the lockfile, and an advisory or off-policy
+# crate hidden behind a non-default feature fails this gate instead of only
+# failing the CI leg that happens to compile that feature.
+
+[advisories]
+# Yanked crate versions fail the check; exceptions are crate-spec entries in
+# the ignore array below (there is no separate ignore_yanked key in
+# cargo-deny 0.20.2).
+yanked = "deny"
+# unmaintained/unsound advisories are enforced for every crate in the graph,
+# not just workspace members.
+unmaintained = "all"
+unsound = "all"
+# One array for both exception kinds: entries with `id` suppress RUSTSEC
+# advisories, entries with `crate` suppress yanked crate versions. Every entry
+# carries a time-bounded reason (review-by dates are mechanically enforced by
+# scripts/check-advisory-exceptions.sh in the cli-ci supply-chain job).
+ignore = [
+    # RUSTSEC-2023-0089: atomic-polyfill is unmaintained (informational).
+    # Chain: cockpit-core -> monty -> postcard -> heapless 0.7 -> atomic-polyfill.
+    # No fixed release exists (superseded by critical-section). Audited
+    # 2026-09-01: not reachable from untrusted input. Time-bounded: review by
+    # 2026-12-01 (issue #306).
+    { id = "RUSTSEC-2023-0089", reason = "time-bounded (review by 2026-12-01): unmaintained transitive via monty->postcard->heapless 0.7; no fixed release, unreachable from untrusted input; audited 2026-09-01 (issue #306)" },
+    # RUSTSEC-2026-0118: hickory-proto NSEC3 closest-encloser proof validation
+    # enters an unbounded loop on cross-zone responses.
+    # Chain: cockpit-core/cockpit-cli -> zerobox -> zerobox-network-proxy ->
+    # rama-http-backend -> rama-dns -> hickory-resolver 0.25.2 -> hickory-proto
+    # 0.25.2. Fix (hickory 0.26) is incompatible with the pinned rama 0.3 alpha.
+    # The resolver runs only for the Linux sandbox egress proxy, never for
+    # arbitrary attacker-chosen DNS. Audited 2026-09-01. Time-bounded: review
+    # by 2026-12-01 (issue #306).
+    { id = "RUSTSEC-2026-0118", reason = "time-bounded (review by 2026-12-01): hickory-proto 0.25.2 via pinned rama-dns (zerobox sandbox proxy); fix needs hickory 0.26; audited 2026-09-01 (issue #306)" },
+    # RUSTSEC-2026-0119: hickory-proto CPU exhaustion during message encoding
+    # due to O(n^2) name compression. Same chain as RUSTSEC-2026-0118. Audited
+    # 2026-09-01. Time-bounded: review by 2026-12-01 (issue #306).
+    { id = "RUSTSEC-2026-0119", reason = "time-bounded (review by 2026-12-01): hickory-proto 0.25.2 via pinned rama-dns (zerobox sandbox proxy); fix needs hickory 0.26; audited 2026-09-01 (issue #306)" },
+    # RUSTSEC-2026-0176: pyo3 out-of-bounds read in `nth`/`nth_back` for
+    # `PyList`/`PyTuple` iterators.
+    # Chain: cockpit-core/cockpit-cli -> monty 0.0.18 (embedded Python sandbox
+    # VM) -> jiter 0.15 -> pyo3 0.28.3. Fix is pyo3 0.29, not yet reachable
+    # through jiter 0.15. Cockpit never executes host CPython: monty runs
+    # model-generated bytecode inside its own sandbox. Audited 2026-09-01.
+    # Time-bounded: review by 2026-12-01 (issue #306).
+    { id = "RUSTSEC-2026-0176", reason = "time-bounded (review by 2026-12-01): pyo3 0.28.3 via monty Python sandbox (jiter 0.15); fix needs pyo3 0.29 through jiter; audited 2026-09-01 (issue #306)" },
+    # RUSTSEC-2026-0177: pyo3 missing `Sync` bound on
+    # `PyCFunction::new_closure` closures. Same chain as RUSTSEC-2026-0176.
+    # Audited 2026-09-01. Time-bounded: review by 2026-12-01 (issue #306).
+    { id = "RUSTSEC-2026-0177", reason = "time-bounded (review by 2026-12-01): pyo3 0.28.3 via monty Python sandbox (jiter 0.15); fix needs pyo3 0.29 through jiter; audited 2026-09-01 (issue #306)" },
+    # Yanked-crate exception (cargo-deny 0.20.2: crate-spec entries in the
+    # same ignore array cover yanked crates; advisory IDs and crate specs are
+    # split by key, not by section). chacha20 0.10.1 is yanked upstream but is
+    # the version the locked rand 0.10.x stack resolves through rand_chacha.
+    # Audited 2026-09-01: pure-Rust ChaCha20 with no advisory open against it
+    # (an advisory against chacha20 would still fail — this entry only lifts
+    # the yank check). Time-bounded: review by 2026-12-01, replace when
+    # rand_chacha moves to a live chacha20 release (issue #306).
+    { crate = "chacha20@0.10.1", reason = "time-bounded (review by 2026-12-01): yanked upstream; only version satisfying the locked rand 0.10.x rand_chacha requirement; no advisory open; audited 2026-09-01 (issue #306)" },
+]
+
+[licenses]
+# Audited allowlist (issue #306). GPL-2.0-only (self_cell) and
+# LGPL-2.1-or-later (r-efi) appear only inside OR-expressions satisfied by
+# MIT/Apache-2.0 alternatives; adding a crate whose license requires GPL/LGPL
+# terms is a deliberate policy decision, not an accident.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate crate versions currently warn (the lock still carries several:
+# rand, syn, windows-sys, hashbrown, ...). Tighten to "deny" post-launch once
+# the known duplicates are triaged into skip entries or consolidated.
+multiple-versions = "warn"
+# The binary is rustls-only; OpenSSL/native-TLS is forbidden everywhere except
+# the pinned firecrawl stack. Each banned crate is tolerated only while every
+# one of its direct dependents matches an allowed wrapper spec, and every
+# wrapper spec is an EXACT version (`name@x.y.z` is an exact comparator in
+# cargo-deny 0.20.2, src/cfg/package_spec.rs): the tolerated shape is precisely
+#   firecrawl =2.12.1 -> reqwest 0.12.28
+#     -> hyper-tls 0.6.0 / tokio-native-tls 0.3.1 (reqwest and hyper-tls both
+#        pull tokio-native-tls)
+#       -> native-tls 0.2.18 -> openssl 0.10.81 -> openssl-sys 0.9.117
+# (openssl-probe is a pure-Rust probe utility dragged by native-tls and links
+# no OpenSSL; it needs no entry.) The exact versions mean:
+#   - the workspace reqwest (0.13, rustls) can never become a permitted
+#     wrapper, even if someone enables its native-tls feature;
+#   - any bump anywhere on the firecrawl TLS chain (Dependabot patch bump
+#     included) fails CI until this table is updated in the same change,
+#     forcing the re-audit crates/cockpit-core's `firecrawl = "=2.12.1"` pin
+#     already demands;
+#   - a new direct dependent of any banned crate — or of the wrapper crates
+#     hyper-tls/tokio-native-tls themselves — fails CI.
+deny = [
+    { crate = "hyper-tls", wrappers = ["reqwest@0.12.28"], reason = "rustls-only TLS stance; hyper-tls tolerated only under the pinned firecrawl (=2.12.1) reqwest 0.12.28 (owner decision 2026-09-01, issue #306)" },
+    { crate = "tokio-native-tls", wrappers = ["reqwest@0.12.28", "hyper-tls@0.6.0"], reason = "rustls-only TLS stance; tokio-native-tls tolerated only under the pinned firecrawl (=2.12.1) reqwest 0.12.28 stack (owner decision 2026-09-01, issue #306)" },
+    { crate = "native-tls", wrappers = ["reqwest@0.12.28", "hyper-tls@0.6.0", "tokio-native-tls@0.3.1"], reason = "rustls-only TLS stance; native-tls tolerated only on the pinned firecrawl (=2.12.1) reqwest 0.12.28 stack (owner decision 2026-09-01, issue #306)" },
+    { crate = "openssl", wrappers = ["native-tls@0.2.18"], reason = "rustls-only TLS stance; OpenSSL tolerated only under native-tls on the pinned firecrawl (=2.12.1) stack (owner decision 2026-09-01, issue #306)" },
+    { crate = "openssl-sys", wrappers = ["native-tls@0.2.18", "openssl@0.10.81"], reason = "rustls-only TLS stance; OpenSSL tolerated only under native-tls/openssl on the pinned firecrawl (=2.12.1) stack (owner decision 2026-09-01, issue #306)" },
+]
+# firecrawl's second reqwest stack is allowed to stay a duplicate version; the
+# exception is pinned in crates/cockpit-core and audited above.
+skip = [
+    { crate = "reqwest@0.12.28", reason = "pinned firecrawl =2.12.1 drags reqwest 0.12 (owner decision 2026-09-01, issue #306); the workspace stack is reqwest 0.13 with rustls" },
+]
+
+[sources]
+# Crates must come from crates.io or one of the two pinned git sources — the
+# exact URLs present in the committed Cargo.lock — and any other registry or
+# git source fails CI.
+unknown-registry = "deny"
+unknown-git = "deny"
+# An allowlisted git URL may not be retargeted off its lockfile commit: only
+# `rev = "<sha>"` specs are accepted (cargo-deny values, least to most
+# specific: any, branch, tag, rev). A branch/tag/default-track spec on an
+# allowed URL would turn the lockfile's exact commit into a wildcard that
+# `cargo update` silently moves, so it fails the gate too.
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Both git sources actually in the locked graph:
+# - pydantic/monty: the embedded Python sandbox VM, pinned by `rev` in the
+#   workspace root Cargo.toml.
+# - samuelcolvin/ruff: the ruff_python_* parser/stdlib crates monty depends
+#   on inside its pinned checkout; their rev is locked transitively with
+#   monty's.
+allow-git = [
+    "https://github.com/pydantic/monty.git",
+    "https://github.com/samuelcolvin/ruff.git",
+]

@@ -511,6 +511,8 @@ async fn call_bash_inner(
     //
     //   - Windows: never (no zerobox backend) — run unconfined and
     //     show the one-time per-session notice.
+    //   - Capability fail-closed (`SandboxMode::Refuse`): never run
+    //     unconfined; require explicit `/sandbox off` or `--no-sandbox`.
     //   - Sandboxing disabled for this session (`/sandbox off` /
     //     `--no-sandbox`): run unconfined.
     //   - Otherwise consult the once-per-process environment probe: if the
@@ -522,6 +524,9 @@ async fn call_bash_inner(
     //     authorizes a later unconfined rerun only if the confined attempt
     //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled = ctx.session.sandbox_enabled();
+    if ctx.session.sandbox_mode().refuses() {
+        return Ok(capability_fail_closed_bash_output(ctx, options.escalated));
+    }
     if (ctx.write_scope.is_some() || ctx.workspace_lease.is_some()) && options.force_unconfined {
         return Ok(ToolOutput::text(
             "Error: scoped or workspace-leased task children cannot run `bash` unconfined; keep shell work inside the assigned confinement or report it to the parent",
@@ -1627,6 +1632,31 @@ fn sandbox_denial_evidence_summary(
     } else {
         parts.join("; ")
     }
+}
+
+fn capability_fail_closed_reason(ctx: &ToolCtx) -> String {
+    let snapshot = ctx.config.snapshot();
+    crate::daemon::session_worker::fail_closed_capability_reason(
+        snapshot.extended.sandbox.default_mode.into(),
+        &snapshot.host_capabilities,
+    )
+}
+
+fn capability_fail_closed_bash_output(ctx: &ToolCtx, escalated: bool) -> ToolOutput {
+    let reason = capability_fail_closed_reason(ctx);
+    let meta = crate::engine::tool::SandboxMeta {
+        enabled: true,
+        confined: false,
+        escalated,
+        escalation_preauthorized: false,
+        approval_scope_recorded: None,
+        unavailable_reason: Some(reason.clone()),
+        resource_profiles: Vec::new(),
+    };
+    let message = format!(
+        "Error: configured sandbox cannot start because the host capability is unavailable ({reason}); `bash` will not run unconfined. Ask the user to type `/sandbox off` in the cockpit composer (a UI command, not a shell command) — do not retry or run `/sandbox off` yourself."
+    );
+    ToolOutput::text(message).with_sandbox(meta)
 }
 
 fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool) -> String {

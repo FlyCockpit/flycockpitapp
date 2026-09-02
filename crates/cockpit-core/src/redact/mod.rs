@@ -44,6 +44,7 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+mod command_output;
 mod dotenv;
 mod protected;
 pub(crate) mod protected_redaction_history;
@@ -420,8 +421,10 @@ const ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "LANG", "XDG_"];
 /// equal to one of these is dropped by the prune step — they're config
 /// keywords, not secrets, and redacting them would corrupt every prompt
 /// that mentions the word. Empty/whitespace-only values are already
-/// covered by the `min_secret_length` floor.
-const NEVER_SCRUB_LITERALS: &[&str] = &[
+/// covered by the `min_secret_length` floor. The substitution-site
+/// novel-secret scrub (issue #279) mirrors the same exemption, so a
+/// boolean echo like `DB_PASSWORD=null` is visible at both boundaries.
+pub(crate) const NEVER_SCRUB_LITERALS: &[&str] = &[
     "true", "false", "null", "nil", "none", "yes", "no", "on", "off",
 ];
 
@@ -496,7 +499,11 @@ pub(crate) fn env_scrub_patterns(name: &str) -> bool {
 /// This is intentionally wider than [`credential_shaped_key`]: structured
 /// config registration uses this to decide whether a value enters the table at
 /// all, while `credential_shaped_key` only grants the min-length exemption to a
-/// smaller, high-confidence subset.
+/// smaller, high-confidence subset. The `authorization` segment covers the
+/// credential-bearing header family (`Authorization`,
+/// `Proxy-Authorization`, and the `:` / `=` spellings command output
+/// echoes): the whole value — auth scheme included (`Bearer …`,
+/// `Basic …`) — is treated as the secret.
 pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.ends_with("_KEY")
@@ -527,6 +534,7 @@ pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
                 | "credentials"
                 | "passphrase"
                 | "passphrases"
+                | "authorization"
         )
     }) {
         return true;
@@ -574,7 +582,12 @@ fn key_name_segments(name: &str) -> Vec<String> {
     segments
 }
 
-fn credential_shaped_key(name: &str) -> bool {
+/// Narrow credential-shape predicate: the `_PIN` / `_PASSWORD` / `_PASSWD` /
+/// `_SECRET` key family that bypasses the `min_secret_length` prune in table
+/// building. `pub(crate)` so the substitution-site novel-secret scrub
+/// (issue #279) applies the same exemption to freshly captured command
+/// output, keeping the two length floors one invariant instead of two.
+pub(crate) fn credential_shaped_key(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.ends_with("_PIN")
         || upper.ends_with("_PASSWORD")
@@ -2459,6 +2472,9 @@ mod scrub_fast_path_tests {
             "SERVICE_PAT",
             "SERVICE_CREDENTIALS",
             "SERVICE_PASSPHRASE",
+            "authorization",
+            "Authorization",
+            "PROXY_AUTHORIZATION",
         ] {
             assert!(is_secret_shaped_key(key), "expected `{key}` to match");
         }

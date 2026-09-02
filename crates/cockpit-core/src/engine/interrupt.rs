@@ -4483,16 +4483,48 @@ mod tests {
             crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
             outcome => panic!("unexpected running transition: {outcome:?}"),
         };
+        let installation_id = Uuid::now_v7();
+        assert!(matches!(
+            db.install_agent(crate::db::agent_installations::AgentInstallationInput {
+                installation_id,
+                scope: crate::db::agent_installations::AgentInstallationScope::Global,
+                canonical_workspace_id: None,
+                source_agent_id: format!("network-test-{installation_id}"),
+                source_identity: format!("network-test:{installation_id}"),
+                source_revision: Some("test".into()),
+                source_digest: "a".repeat(64),
+                fetched_at_unix_ms: 1,
+            })
+            .await
+            .unwrap(),
+            crate::db::agent_installations::InstallAgentOutcome::Installed(_)
+        ));
+        let session_id = tool_ctx.session.id;
+        let agent_instance_id = agent.agent_instance_id;
+        db.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE agent_instances SET resolved_installation_id=?1 WHERE session_id=?2 AND agent_instance_id=?3",
+                rusqlite::params![
+                    installation_id.to_string(),
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                ],
+            )?;
+            anyhow::ensure!(changed == 1, "network test agent disappeared");
+            Ok(())
+        })
+        .await
+        .unwrap();
         tool_ctx.agent_instance_id = Some(agent.agent_instance_id);
-        db.mutate_monty_network_agent_policy(
-            agent.agent_instance_id,
+        db.mutate_monty_network_installation_policy(
+            installation_id,
             crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
             3,
         )
         .await
         .unwrap();
-        db.mutate_monty_network_agent_policy(
-            agent.agent_instance_id,
+        db.mutate_monty_network_installation_policy(
+            installation_id,
             crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
                 crate::db::monty_network::CanonicalNetworkHost::parse("127.0.0.1").unwrap(),
             ),

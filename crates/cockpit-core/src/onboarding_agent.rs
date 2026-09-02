@@ -191,6 +191,12 @@ pub fn build_onboarding_agent_plan(
             "selected third-party default model is not configured"
         );
         let sidecar = resolve_sidecar_selection(&answers.sidecar, providers)?;
+        // Third-party definitions are fetched only by the pinned installer,
+        // so their author defaults cannot be inspected at picker time. Keep
+        // an explicit advanced selection as host-owned runtime defaults; the
+        // launch boundary applies it only to tools in the fetched definition's
+        // resolved grant. Author defaults remain an empty override.
+        let tool_surface = onboarding_tool_surface(answers.tools, None)?;
         return Ok(OnboardingAgentPlan {
             source_locator: source_locator.to_string(),
             agent_name: source.agent_name()?.to_string(),
@@ -202,10 +208,7 @@ pub fn build_onboarding_agent_plan(
                 prompt_cache_retention: None,
             },
             model_trust: answers.model_trust.into(),
-            // The fetched third-party definition remains the authority for
-            // author tiers. It is not safe to invent an advanced surface
-            // before parsing that pinned definition.
-            tool_surface: ToolSurfaceSelection::default(),
+            tool_surface,
             sidecar,
             make_default: answers.make_default,
             third_party_trust_confirmed: true,
@@ -232,32 +235,8 @@ pub fn build_onboarding_agent_plan(
         "selected default model is not compatible with the agent's primary slot"
     );
 
-    let tool_tiers = match answers.tools {
-        OnboardingToolConfiguration::AuthorDefaults => {
-            entry.definition.tool_tier_preferences.clone()
-        }
-        OnboardingToolConfiguration::Advanced(overrides) => {
-            let mut tiers = entry.definition.tool_tier_preferences.clone();
-            for (tool, mode) in overrides {
-                ensure!(
-                    crate::agents::known_tool_names().contains(&tool.as_str()),
-                    "advanced tool configuration names unknown tool `{tool}`"
-                );
-                let tier: ToolTier = mode.into();
-                ensure!(
-                    crate::agents::legal_tool_tiers(&tool).contains(&tier),
-                    "tool `{tool}` does not support requested onboarding tier"
-                );
-                tiers.insert(tool, tier);
-            }
-            tiers
-        }
-    };
-    let tools = tool_tiers
-        .iter()
-        .filter(|(_, tier)| **tier != ToolTier::Disabled)
-        .map(|(tool, _)| tool.clone())
-        .collect();
+    let tool_surface =
+        onboarding_tool_surface(answers.tools, Some(&entry.definition.tool_tier_preferences))?;
 
     let sidecar = resolve_sidecar_selection(&answers.sidecar, providers)?;
     let agent_name = entry.catalog.slug.clone();
@@ -272,11 +251,42 @@ pub fn build_onboarding_agent_plan(
             prompt_cache_retention: None,
         },
         model_trust: answers.model_trust.into(),
-        tool_surface: ToolSurfaceSelection { tools, tool_tiers },
+        tool_surface,
         sidecar,
         make_default: answers.make_default,
         third_party_trust_confirmed: false,
     })
+}
+
+/// Convert the common onboarding answer into a concrete host-owned surface.
+/// For a third-party definition the installer has not fetched the pinned
+/// Markdown yet, so only an explicit advanced override is retained. Runtime
+/// application remains bounded by that definition's resolved tool grant.
+fn onboarding_tool_surface(
+    configuration: OnboardingToolConfiguration,
+    author_tiers: Option<&BTreeMap<String, ToolTier>>,
+) -> Result<ToolSurfaceSelection> {
+    let mut tool_tiers = author_tiers.cloned().unwrap_or_default();
+    if let OnboardingToolConfiguration::Advanced(overrides) = configuration {
+        for (tool, mode) in overrides {
+            ensure!(
+                crate::agents::known_tool_names().contains(&tool.as_str()),
+                "advanced tool configuration names unknown tool `{tool}`"
+            );
+            let tier: ToolTier = mode.into();
+            ensure!(
+                crate::agents::legal_tool_tiers(&tool).contains(&tier),
+                "tool `{tool}` does not support requested onboarding tier"
+            );
+            tool_tiers.insert(tool, tier);
+        }
+    }
+    let tools = tool_tiers
+        .iter()
+        .filter(|(_, tier)| **tier != ToolTier::Disabled)
+        .map(|(tool, _)| tool.clone())
+        .collect();
+    Ok(ToolSurfaceSelection { tools, tool_tiers })
 }
 
 /// Default sidecar choice. Only local/private self-hosted vision models are

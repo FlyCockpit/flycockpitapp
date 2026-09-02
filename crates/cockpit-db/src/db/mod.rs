@@ -801,7 +801,7 @@ impl Db {
 
     /// Acquire the shared durable Monty-network egress fence. The permit must
     /// be held from the final policy check through `RequestBuilder::send`.
-    /// `mutate_monty_network_agent_policy` takes the exclusive side before
+    /// `mutate_monty_network_installation_policy` takes the exclusive side before
     /// committing any durable policy change.
     pub async fn monty_network_egress_permit(&self) -> MontyNetworkEgressPermit {
         MontyNetworkEgressPermit {

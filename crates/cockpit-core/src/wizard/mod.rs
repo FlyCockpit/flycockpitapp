@@ -1000,10 +1000,8 @@ fn onboarding_tool_configuration_branch(
     }
 }
 
-fn onboarding_post_model_trust_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
-    matches!(run.answer("agent"), Some(WizardAnswer::Select(agent)) if agent == "third-party")
-        .then_some("monty-packages")
-        .or(Some("tool-configuration"))
+fn onboarding_post_model_trust_branch(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    Some("tool-configuration")
 }
 
 fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
@@ -1061,51 +1059,45 @@ pub fn onboarding_agent_answers(
             .context("default model selection omitted provider or model")?,
         _ => return Err(anyhow!("default model selection is required")),
     };
-    let tools = if agent == "third-party" {
-        OnboardingToolConfiguration::AuthorDefaults
-    } else {
-        match run.answer("tool-configuration") {
-            Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
-                OnboardingToolConfiguration::AuthorDefaults
-            }
-            Some(WizardAnswer::Select(value)) if value == "advanced" => {
-                let selection = match run.answer("advanced-tools") {
-                    Some(WizardAnswer::ToolSurface(selection)) => selection,
-                    _ => return Err(anyhow!("advanced tool configuration is required")),
-                };
-                let mut modes = BTreeMap::new();
-                for tool in crate::agents::known_tool_names() {
-                    let selected = selection.tools.iter().any(|selected| selected == tool);
-                    let tier = if selected {
-                        Some(
-                            selection
-                                .tool_tiers
-                                .get(*tool)
-                                .copied()
-                                .unwrap_or(crate::agents::ToolTier::Enabled),
-                        )
-                    } else {
-                        crate::agents::legal_tool_tiers(tool)
-                            .contains(&crate::agents::ToolTier::Disabled)
-                            .then_some(crate::agents::ToolTier::Disabled)
-                    };
-                    if let Some(tier) = tier {
-                        modes.insert(
-                            (*tool).to_string(),
-                            match tier {
-                                crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
-                                crate::agents::ToolTier::Discoverable => {
-                                    OnboardingToolMode::MontyOnly
-                                }
-                                crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
-                            },
-                        );
-                    }
-                }
-                OnboardingToolConfiguration::Advanced(modes)
-            }
-            _ => return Err(anyhow!("tool configuration selection is required")),
+    let tools = match run.answer("tool-configuration") {
+        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
+            OnboardingToolConfiguration::AuthorDefaults
         }
+        Some(WizardAnswer::Select(value)) if value == "advanced" => {
+            let selection = match run.answer("advanced-tools") {
+                Some(WizardAnswer::ToolSurface(selection)) => selection,
+                _ => return Err(anyhow!("advanced tool configuration is required")),
+            };
+            let mut modes = BTreeMap::new();
+            for tool in crate::agents::known_tool_names() {
+                let selected = selection.tools.iter().any(|selected| selected == tool);
+                let tier = if selected {
+                    Some(
+                        selection
+                            .tool_tiers
+                            .get(*tool)
+                            .copied()
+                            .unwrap_or(crate::agents::ToolTier::Enabled),
+                    )
+                } else {
+                    crate::agents::legal_tool_tiers(tool)
+                        .contains(&crate::agents::ToolTier::Disabled)
+                        .then_some(crate::agents::ToolTier::Disabled)
+                };
+                if let Some(tier) = tier {
+                    modes.insert(
+                        (*tool).to_string(),
+                        match tier {
+                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
+                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
+                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
+                        },
+                    );
+                }
+            }
+            OnboardingToolConfiguration::Advanced(modes)
+        }
+        _ => return Err(anyhow!("tool configuration selection is required")),
     };
     let sidecar = match run.answer("sidecar") {
         Some(WizardAnswer::Select(value)) if value == "disabled" => {

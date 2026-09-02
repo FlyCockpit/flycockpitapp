@@ -156,9 +156,9 @@ pub enum ContainmentError {
     Internal(String),
 }
 
-/// Non-serializable lease token. Callers must not spawn user code outside the
-/// actor that issued this lease. Dropping does not terminate the group;
-/// cancellation drives Stopping + reconciliation.
+/// Non-serializable lease token. Callers spawn user code only into this
+/// lease's process-tree guard when the adapter provides one. Dropping does
+/// not terminate the group; cancellation drives Stopping + reconciliation.
 #[derive(Clone)]
 pub struct ContainmentLease {
     pub(crate) containment_id: Uuid,
@@ -280,13 +280,14 @@ pub enum ContainmentEvent {
         now_wall_ms: i64,
     },
     /// Platform allocation succeeded; membership not yet proven.
-    #[allow(dead_code)]
+    /// Durable state stays `Creating` with `pending_command = await_membership`.
     PlatformAllocated {
         generation: u64,
         locator: SafeLocator,
         now_wall_ms: i64,
     },
-    /// Spawn membership proven → Active.
+    /// Kernel membership proven → Active. Illegal unless `PlatformAllocated`
+    /// has already set `pending_command = await_membership`.
     MembershipProven {
         generation: u64,
         locator: SafeLocator,

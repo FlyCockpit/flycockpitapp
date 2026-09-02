@@ -129,6 +129,9 @@ fn apply_to_existing(rec: &mut ContainmentRecord, event: ContainmentEvent) -> Re
             if rec.state != ContainmentState::Creating {
                 return illegal(rec, "membership_proven");
             }
+            if rec.pending_command.as_deref() != Some("await_membership") {
+                return illegal(rec, "membership_proven_before_platform_allocated");
+            }
             rec.state = ContainmentState::Active;
             rec.locator = locator;
             rec.updated_at_wall_ms = now_wall_ms;
@@ -324,6 +327,23 @@ mod containment_state_machine {
         }
     }
 
+    fn allocated() -> ContainmentRecord {
+        match reduce(
+            Some(begin()),
+            ContainmentEvent::PlatformAllocated {
+                generation: 1,
+                locator: SafeLocator {
+                    locator_key: Some("k".into()),
+                    ..Default::default()
+                },
+                now_wall_ms: 2,
+            },
+        ) {
+            ReduceResult::Applied(rec) => *rec,
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
     #[test]
     fn covers_every_state_and_generation_transition() {
         let mut rec = begin();
@@ -331,7 +351,7 @@ mod containment_state_machine {
 
         rec = match reduce(
             Some(rec.clone()),
-            ContainmentEvent::MembershipProven {
+            ContainmentEvent::PlatformAllocated {
                 generation: 1,
                 locator: SafeLocator {
                     locator_key: Some("k".into()),
@@ -343,13 +363,30 @@ mod containment_state_machine {
             ReduceResult::Applied(r) => *r,
             o => panic!("{o:?}"),
         };
+        assert_eq!(rec.state, ContainmentState::Creating);
+        assert_eq!(rec.pending_command.as_deref(), Some("await_membership"));
+
+        rec = match reduce(
+            Some(rec.clone()),
+            ContainmentEvent::MembershipProven {
+                generation: 1,
+                locator: SafeLocator {
+                    locator_key: Some("k".into()),
+                    ..Default::default()
+                },
+                now_wall_ms: 3,
+            },
+        ) {
+            ReduceResult::Applied(r) => *r,
+            o => panic!("{o:?}"),
+        };
         assert_eq!(rec.state, ContainmentState::Active);
 
         rec = match reduce(
             Some(rec.clone()),
             ContainmentEvent::RequestStop {
                 generation: 1,
-                now_wall_ms: 3,
+                now_wall_ms: 4,
             },
         ) {
             ReduceResult::Applied(r) => *r,
@@ -362,7 +399,7 @@ mod containment_state_machine {
             Some(rec.clone()),
             ContainmentEvent::RequestStop {
                 generation: 1,
-                now_wall_ms: 4,
+                now_wall_ms: 5,
             },
         ) {
             ReduceResult::DuplicateCommand { command } => assert_eq!(command, "terminate"),
@@ -373,14 +410,14 @@ mod containment_state_machine {
             Some(rec.clone()),
             ContainmentEvent::OracleEmpty {
                 generation: 1,
-                now_wall_ms: 5,
+                now_wall_ms: 6,
             },
         ) {
             ReduceResult::Applied(r) => *r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rec.state, ContainmentState::Empty);
-        assert_eq!(rec.emptied_at_wall_ms, Some(5));
+        assert_eq!(rec.emptied_at_wall_ms, Some(6));
 
         // Replacement generation
         rec = match reduce(
@@ -442,13 +479,13 @@ mod containment_state_machine {
 
     #[test]
     fn caller_cancellation_drives_stopping_not_forget() {
-        let mut rec = begin();
+        let mut rec = allocated();
         rec = match reduce(
             Some(rec),
             ContainmentEvent::MembershipProven {
                 generation: 1,
                 locator: SafeLocator::default(),
-                now_wall_ms: 2,
+                now_wall_ms: 3,
             },
         ) {
             ReduceResult::Applied(r) => *r,
@@ -518,13 +555,13 @@ mod containment_state_machine {
 
     #[test]
     fn process_exit_is_never_empty_oracle() {
-        let mut rec = begin();
+        let mut rec = allocated();
         rec = match reduce(
             Some(rec),
             ContainmentEvent::MembershipProven {
                 generation: 1,
                 locator: SafeLocator::default(),
-                now_wall_ms: 2,
+                now_wall_ms: 3,
             },
         ) {
             ReduceResult::Applied(r) => *r,
@@ -564,5 +601,32 @@ mod containment_state_machine {
             rec.unsupported_reason.as_deref(),
             Some("management_boundary_unavailable")
         );
+    }
+
+    #[test]
+    fn membership_proven_before_platform_allocated_is_illegal() {
+        let rec = begin();
+        match reduce(
+            Some(rec),
+            ContainmentEvent::MembershipProven {
+                generation: 1,
+                locator: SafeLocator::default(),
+                now_wall_ms: 2,
+            },
+        ) {
+            ReduceResult::Illegal { from, event } => {
+                assert_eq!(from, ContainmentState::Creating);
+                assert_eq!(event, "membership_proven_before_platform_allocated");
+            }
+            o => panic!("expected illegal, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_allocated_does_not_activate() {
+        let rec = allocated();
+        assert_eq!(rec.state, ContainmentState::Creating);
+        assert_eq!(rec.pending_command.as_deref(), Some("await_membership"));
+        assert_eq!(rec.locator.locator_key.as_deref(), Some("k"));
     }
 }

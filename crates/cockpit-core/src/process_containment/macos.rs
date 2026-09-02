@@ -63,6 +63,16 @@ impl ContainmentAdapter for MacosNativeAdapter {
         })
     }
 
+    async fn prove_membership(
+        &self,
+        _handle: &AdapterHandle,
+        _generation: u64,
+    ) -> Result<(), ContainmentError> {
+        Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: MACOS_UNSUPPORTED_REASON.into(),
+        })
+    }
+
     async fn create_container_and_exec(
         &self,
         _req: ContainerExecRequest,

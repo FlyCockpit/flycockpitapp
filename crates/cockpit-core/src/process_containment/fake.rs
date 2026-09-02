@@ -211,6 +211,24 @@ impl ContainmentAdapter for FakeProvenAdapter {
         })
     }
 
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError> {
+        let g = self.inner.lock().unwrap();
+        match g.groups.get(&handle.key) {
+            Some((entry_gen, _)) if *entry_gen == generation => Ok(()),
+            Some((entry_gen, _)) => Err(ContainmentError::GenerationMismatch {
+                expected: *entry_gen,
+                got: generation,
+            }),
+            None => Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: "fake_group_missing_membership_unproven".into(),
+            }),
+        }
+    }
+
     async fn terminate(
         &self,
         handle: &AdapterHandle,
@@ -362,6 +380,16 @@ impl ContainmentAdapter for FakeUnsupportedAdapter {
         req: NativeSpawnRequest,
     ) -> Result<AllocatedContainment, ContainmentError> {
         let _ = req;
+        Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: self.reason.clone(),
+        })
+    }
+
+    async fn prove_membership(
+        &self,
+        _handle: &AdapterHandle,
+        _generation: u64,
+    ) -> Result<(), ContainmentError> {
         Err(ContainmentError::DescendantContainmentUnavailable {
             reason: self.reason.clone(),
         })

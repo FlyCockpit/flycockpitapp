@@ -268,7 +268,7 @@ zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = fal
 # fetch / cargo build) before running with `--locked`.
 cryptoki = { version = "=0.12.0", default-features = false, optional = true }
 # Computer target identity (X11 RandR + optional AT-SPI). Exact audited pins.
-x11rb = { version = "=0.13.2", default-features = false, features = ["randr"] }
+x11rb = { version = "=0.14.0", default-features = false, features = ["randr"] }
 atspi = { version = "=0.30.0", default-features = false, features = ["connection", "proxies", "tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

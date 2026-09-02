@@ -57,7 +57,13 @@ fn builder_report_is_structured_envelope_with_host_derived_files() {
         "accomplished": "added the flag",
         "decisions_made": "used a u32",
     });
-    let report = assemble_subagent_report(&builder, &history, &deferred, Some(&fields));
+    let report = assemble_subagent_report(
+        &builder,
+        &history,
+        &deferred,
+        Some(&fields),
+        &crate::redact::RedactionTable::empty(),
+    );
     assert!(report.contains("## Accomplished"));
     assert!(report.contains("added the flag"));
     assert!(report.contains("## Decisions made"));
@@ -77,7 +83,13 @@ fn explore_report_envelope_has_empty_files_and_fallback_wraps_final_text() {
     let deferred = crate::engine::deferred::DeferredLog::new();
     // No `return` call (fallback): final text becomes `accomplished`; no
     // files section because nothing was written.
-    let report = assemble_subagent_report(&explore, &history, &deferred, None);
+    let report = assemble_subagent_report(
+        &explore,
+        &history,
+        &deferred,
+        None,
+        &crate::redact::RedactionTable::empty(),
+    );
     assert!(report.contains("## Accomplished"));
     assert!(report.contains("the bug is in foo.rs line 10"));
     assert!(
@@ -95,7 +107,13 @@ fn explore_deferred_items_appear_in_subagent_report() {
     let deferred = crate::engine::deferred::DeferredLog::new();
     deferred.push("follow up on the unrelated config mismatch");
 
-    let report = assemble_subagent_report(&explore, &history, &deferred, None);
+    let report = assemble_subagent_report(
+        &explore,
+        &history,
+        &deferred,
+        None,
+        &crate::redact::RedactionTable::empty(),
+    );
 
     assert!(report.contains("the assigned search is complete"));
     assert!(report.contains("[deferred to orchestrator"));
@@ -113,6 +131,7 @@ fn empty_deferred_log_leaves_subagent_report_unchanged() {
         &history,
         &crate::engine::deferred::DeferredLog::new(),
         None,
+        &crate::redact::RedactionTable::empty(),
     );
 
     let report = assemble_subagent_report(
@@ -120,6 +139,7 @@ fn empty_deferred_log_leaves_subagent_report_unchanged() {
         &history,
         &crate::engine::deferred::DeferredLog::new(),
         None,
+        &crate::redact::RedactionTable::empty(),
     );
 
     assert_eq!(report, baseline);
@@ -158,7 +178,13 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
     };
     let history = vec![Message::assistant("The answer is to call foo() with bar.")];
     let deferred = crate::engine::deferred::DeferredLog::new();
-    let report = assemble_subagent_report(&plain, &history, &deferred, None);
+    let report = assemble_subagent_report(
+        &plain,
+        &history,
+        &deferred,
+        None,
+        &crate::redact::RedactionTable::empty(),
+    );
     assert_eq!(report, "The answer is to call foo() with bar.");
     assert!(!report.contains("## Accomplished"));
 }

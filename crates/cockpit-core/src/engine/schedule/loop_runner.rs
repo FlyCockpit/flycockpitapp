@@ -330,6 +330,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
                 let requests = state.take_requests();
                 let actions = state.take_actions();
                 let result = bundle_terminal(
+                    &live_ctx.redact,
                     &label,
                     args.kind(),
                     iteration,
@@ -399,7 +400,12 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             state.take_actions(),
         )
     };
+    // Terminal promotion happens after the loop: take a FRESH live snapshot
+    // (the session may have registered a new secret since the last wake) so
+    // the budget cut elides under the current table, not a stale one.
+    let (_, fresh_ctx) = ctx.snapshot_at_wake();
     let result = bundle_terminal(
+        &fresh_ctx.redact,
         &label,
         args.kind(),
         iteration,
@@ -798,6 +804,7 @@ fn build_fork_agent(
 /// Bundle the terminal result + notes into the budget-capped text injected
 /// into main context.
 fn bundle_terminal(
+    redact: &crate::redact::RedactionTable,
     label: &str,
     kind: ScheduleKind,
     iterations: u64,
@@ -827,7 +834,10 @@ fn bundle_terminal(
         let _ = writer.writeln("Final iteration:");
         let _ = writer.writeln(trimmed);
     }
-    writer.into_string()
+    // The result budget can cut the last retained line mid-line; elide the
+    // cut's back margin so a boundary-straddling secret never survives as a
+    // partial past the downstream whole-value scrub (issue #294).
+    writer.into_string_redacted(redact)
 }
 
 fn collect_final_text(history: &[Message]) -> String {

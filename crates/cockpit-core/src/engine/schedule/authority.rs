@@ -964,13 +964,18 @@ impl ScheduleAuthority {
         self.emit_started(&job_id, &label, ScheduleKind::Background);
         let (cancel, generation) = self.session_work_cancel.child_with_generation();
 
+        // Probe the LIVE schedule context's redaction slot per truncation
+        // instead of snapshotting the table at launch: a secret the session
+        // registers mid-stream must elide this job's line-cap boundaries too
+        // (issue #294: stale-snapshot redaction identity).
+        let live_ctx = self.ctx.clone();
         let (handle, task) = background::spawn(background::BackgroundSpawn {
             job_id: job_id.clone(),
             label: label.clone(),
             command: args.command.clone(),
             cwd,
             launch,
-            redact: self.ctx.snapshot().redact,
+            redact_probe: Arc::new(move || live_ctx.snapshot().redact),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cancel: cancel.clone(),

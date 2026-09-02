@@ -20,8 +20,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, invalid_input};
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use crate::tools::common::{OUTPUT_BYTE_CAP, boundary_safe_capture, truncate_head_tail_redacted};
 
 pub struct McpTool {
     requests_enabled: bool,
@@ -265,7 +264,10 @@ fn rendered_result_output(
         .collect::<Vec<_>>();
     let model_over_cap = model.len() > OUTPUT_BYTE_CAP;
     let model_inline = if model_over_cap {
-        truncate_head_tail(&model, OUTPUT_BYTE_CAP)
+        // Redacting truncator: a registered secret straddling a truncation
+        // boundary must not leave a PARTIAL in the model lane that the §7
+        // whole-value scrub cannot match.
+        truncate_head_tail_redacted(&ctx.redact, &model, OUTPUT_BYTE_CAP)
     } else {
         model.clone()
     };
@@ -281,21 +283,21 @@ fn rendered_result_output(
     if model_over_cap {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Model,
-            capture_text_artifact_body(&model),
+            boundary_safe_capture(&ctx.redact, &model),
             model_over_cap,
         );
     }
     if !display_lane.is_empty() {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Display,
-            capture_text_artifact_body(&display_lane),
+            boundary_safe_capture(&ctx.redact, &display_lane),
             display_lane.len() > OUTPUT_BYTE_CAP,
         );
     }
     for attached in attachments {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Attachment,
-            capture_text_artifact_body(&attached),
+            boundary_safe_capture(&ctx.redact, &attached),
             true,
         );
     }
@@ -306,7 +308,11 @@ fn rendered_result_output(
         } else {
             format!("{model}\n{display_lane}")
         };
-        output = output.with_model_ephemeral_display(truncate_head_tail(&display, OUTPUT_BYTE_CAP));
+        output = output.with_model_ephemeral_display(truncate_head_tail_redacted(
+            &ctx.redact,
+            &display,
+            OUTPUT_BYTE_CAP,
+        ));
     }
     output.with_notices(envelope.notifications)
 }

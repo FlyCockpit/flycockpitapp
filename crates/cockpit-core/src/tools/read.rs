@@ -15,7 +15,8 @@ use crate::engine::tool::{
     Tool, ToolCtx, ToolEffect, ToolOutput, ToolPresentation, path_or_readable_args,
 };
 use crate::tools::common::{
-    OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker,
+    OUTPUT_BYTE_CAP, READ_LINE_CAP, drop_back_margin, drop_front_margin, looks_binary, read_slice,
+    resolve, truncation_marker,
 };
 
 pub struct ReadTool;
@@ -346,7 +347,7 @@ async fn render_read_bytes(
         _ => (READ_LINE_CAP, true),
     };
 
-    let slice = read_slice(&text, offset, limit);
+    let slice = read_slice(&ctx.redact, &text, offset, limit);
     if slice.offset_exceeded {
         let mut out = String::new();
         if default_offset && default_limit {
@@ -485,7 +486,7 @@ async fn read_range(
     let limit = requested_end
         .map(|end| end.max(start) - start + 1)
         .unwrap_or(usize::MAX);
-    let slice = read_slice(text, start, limit);
+    let slice = read_slice(&ctx.redact, text, start, limit);
     let total = slice.total_lines;
     let end = requested_end
         .unwrap_or_else(|| if start_byte.is_some() { start } else { total })
@@ -517,49 +518,52 @@ async fn read_range(
         }
         let end = end.min(total);
         let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
+        // The oversized-line pager now shares the redacting-truncator
+        // geometry (issue #294): the byte cursor and the `end` bound are
+        // omission edges exactly like the line/byte caps, and both are
+        // elided under the session table before the `${n}|` numbering
+        // attaches. `start_byte` stays a cursor, never a bypass around the
+        // normal model-output ceiling: the 256 reserve keeps the
+        // continuation marker inside the cap.
+        let body_cap = OUTPUT_BYTE_CAP
+            .saturating_sub(header.len())
+            .saturating_sub(256);
+        let paged = cursor_page(&ctx.redact, &lines, start, end, start_byte, body_cap);
         let mut out = header.clone();
-        let mut continuation = None;
-        for number in start..=end {
-            let line = lines[number - 1];
-            let byte = if number == start { start_byte } else { 0 };
-            let prefix = format!("{number}|");
-            // Reserve enough room for the continuation before selecting any
-            // text from the line.  `start_byte` is a cursor, never a bypass
-            // around the normal model-output ceiling.
-            let remaining = OUTPUT_BYTE_CAP
-                .saturating_sub(out.len())
-                .saturating_sub(256);
-            if remaining <= prefix.len() + 1 {
-                continuation = Some((number, byte));
-                break;
-            }
-            let text_budget = remaining - prefix.len() - 1;
-            let remainder = &line[byte..];
-            let clipped = utf8_prefix(remainder, text_budget);
-            out.push_str(&prefix);
-            out.push_str(clipped);
-            out.push('\n');
-            if clipped.len() != remainder.len() {
-                continuation = Some((number, byte + clipped.len()));
-                break;
-            }
-        }
-        let Some((next_line, next_byte)) = continuation else {
+        out.push_str(&paged.body);
+        if !paged.truncated {
             return Ok(ToolOutput::text(out));
-        };
+        }
         let marker = if args.get("start_line").is_some() || args.get("end_line").is_some() {
             format!(
-                "... [truncated; read `{}` with start_line={next_line}, end_line={end}, start_byte={next_byte}]\n",
-                path.display()
+                "... [truncated; read `{}` with start_line={}, end_line={end}, start_byte={}]\n",
+                path.display(),
+                paged.next_line,
+                paged.next_byte
             )
         } else {
             format!(
-                "... [truncated; read `{}` with offset={next_line}, limit=1, start_byte={next_byte}]\n",
-                path.display()
+                "... [truncated; read `{}` with offset={}, limit=1, start_byte={}]\n",
+                path.display(),
+                paged.next_line,
+                paged.next_byte
             )
         };
+        let mut popped = false;
         while out.len() + marker.len() > OUTPUT_BYTE_CAP && out.len() > header.len() {
             out.pop();
+            popped = true;
+        }
+        if popped {
+            // The pop cut the retained tail mid-content (an over-long path
+            // grew the marker past its reserve), so the same back-margin
+            // elision applies to what remains — the numbered-tail form of
+            // the `read_slice` defensive backstop: any surviving partial
+            // sits at the very END of the emitted text, where the `${n}|`
+            // prefixes cannot interleave it.
+            let safe_tail = drop_back_margin(&ctx.redact, &out[header.len()..]);
+            let cut = header.len() + safe_tail.len();
+            out.truncate(cut);
         }
         out.push_str(&marker);
         return Ok(ToolOutput::truncated_text(out));
@@ -579,6 +583,174 @@ async fn read_range(
         "{header}{prelude}{}",
         slice.numbered
     )))
+}
+
+/// A byte-cursor page of the `[start..=end]` slice (1-indexed; `end` is
+/// pre-clamped to the line count): the `${n}|`-numbered rows that fit
+/// `body_cap` bytes, and the `(line, byte)` cursor a continuation should
+/// resume from.
+///
+/// This is the oversized-line pager behind `read`'s `start_byte`, and it
+/// shares `read_slice_with_byte_cap`'s redaction-aware geometry (issue
+/// #294): the raw rows are assembled FIRST, both omission edges — the
+/// content before (line `start`, byte `start_byte`), and whatever the cap
+/// or the `end` bound cuts — are elided in RAW pre-numbering coordinates
+/// (so the `${n}|` prefixes can never interleave a partial), and only then
+/// is the numbering attached. `truncated` is true exactly when the cap
+/// stopped the page mid-span; when it did not, `next_line`/`next_byte`
+/// point past `end` for callers that page on an end bound.
+struct CursorPage {
+    body: String,
+    truncated: bool,
+    next_line: usize,
+    next_byte: usize,
+}
+
+fn cursor_page(
+    redact: &crate::redact::RedactionTable,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    start_byte: usize,
+    body_cap: usize,
+) -> CursorPage {
+    // Raw rows of the page: row 0 is line `start` from `start_byte`; the
+    // rest are the whole lines after it.
+    let mut rows: Vec<&str> = Vec::with_capacity(end.saturating_sub(start) + 1);
+    for number in start..=end {
+        let line = lines[number - 1];
+        rows.push(if number == start {
+            &line[start_byte..]
+        } else {
+            line
+        });
+    }
+    let joined = rows.join("\n");
+
+    // Front edge: everything before (line `start`, byte `start_byte`) was
+    // omitted — earlier lines, the cursor's own line prefix, or both. A
+    // registered secret straddling that cut would leave only its SUFFIX at
+    // the head of the page, which the §7 whole-value scrub cannot match.
+    let safe = if start > 1 || start_byte > 0 {
+        drop_front_margin(redact, &joined)
+    } else {
+        joined.as_str()
+    };
+    let head_skip = joined.len() - safe.len();
+    if safe.is_empty() {
+        // Fail-closed: the whole page sat inside the unsafe front margin.
+        // Emit nothing rather than a fragment; the resume cursor restarts
+        // the page so nothing is skipped.
+        return CursorPage {
+            body: String::new(),
+            truncated: false,
+            next_line: start,
+            next_byte: start_byte,
+        };
+    }
+
+    // Map each retained piece back to its source line: the elided head
+    // prefix spans `skipped_rows` whole rows (their '\n' separators counted)
+    // plus a byte remainder within the next row — which is that line's byte
+    // offset, plus the in-line cursor when row 0 itself is the straddler.
+    let pieces: Vec<&str> = safe.split('\n').collect();
+    let skipped_rows = joined[..head_skip].matches('\n').count();
+    let mut row_start = 0usize;
+    for row in &rows[..skipped_rows] {
+        row_start += row.len() + 1;
+    }
+    let first_byte = head_skip - row_start + if skipped_rows == 0 { start_byte } else { 0 };
+
+    // Dry-run the byte cap over the NUMBERED rendering (a numbered row costs
+    // its digits + 1 + row bytes + 1, exactly like the incremental renderer
+    // this replaces). A row that does not fit whole is clipped mid-content —
+    // the byte cursor exists for exactly this — and the clip point is a back
+    // edge. Rows are materialized owned so the back-margin stage can freely
+    // re-split them.
+    let mut kept: Vec<(usize, usize, String)> = Vec::new(); // (line, byte, row)
+    let mut len_acc = 0usize;
+    let mut stopped = false;
+    for (j, piece) in pieces.iter().enumerate() {
+        let number = start + skipped_rows + j;
+        let byte = if j == 0 { first_byte } else { 0 };
+        let added = number.to_string().len() + 1 + piece.len() + 1;
+        if len_acc + added > body_cap {
+            stopped = true;
+            let room = body_cap
+                .saturating_sub(len_acc)
+                .saturating_sub(number.to_string().len() + 2);
+            if room > 0 {
+                let clipped = utf8_prefix(piece, room);
+                if !clipped.is_empty() {
+                    kept.push((number, byte, clipped.to_string()));
+                }
+            }
+            break;
+        }
+        len_acc += added;
+        kept.push((number, byte, piece.to_string()));
+    }
+
+    // Back edge: the retained rows' END abuts omitted content when the cap
+    // stopped mid-span OR the `end` bound left lines unshown — a registered
+    // secret straddling that boundary (a multi-line literal spanning
+    // several trailing rows included, via the joined coordinates) would
+    // leave an unmatchable PREFIX at the tail.
+    if (stopped || end < lines.len()) && !kept.is_empty() {
+        let kept_joined = kept
+            .iter()
+            .map(|(_, _, piece)| piece.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let safe = drop_back_margin(redact, &kept_joined);
+        if safe.len() < kept_joined.len() {
+            if safe.is_empty() {
+                // Fail-closed: the whole retained span lay inside the
+                // unsafe margin; show nothing rather than a fragment.
+                kept.clear();
+            } else {
+                // Re-split the elided tail: interior rows are unchanged;
+                // only the last (possibly partial) row shrank.
+                let tail: Vec<&str> = safe.split('\n').collect();
+                kept.truncate(tail.len());
+                if let Some((_, _, piece)) = kept.last_mut() {
+                    *piece = tail.last().copied().unwrap_or("").to_string();
+                }
+            }
+        }
+    }
+
+    let mut body = String::new();
+    for (number, _, piece) in &kept {
+        body.push_str(&number.to_string());
+        body.push('|');
+        body.push_str(piece);
+        body.push('\n');
+    }
+    let (next_line, next_byte) = if stopped {
+        match kept.last() {
+            // Resume just past the last EMITTED byte: a partially-shown
+            // line continues at its byte cursor; a fully-shown line at the
+            // next line's start. Margin-elided bytes are never re-offered.
+            Some((number, byte, piece)) => {
+                let line_len = lines[number - 1].len();
+                if byte + piece.len() < line_len {
+                    (*number, byte + piece.len())
+                } else {
+                    (number + 1, 0)
+                }
+            }
+            None => (start, start_byte),
+        }
+    } else {
+        (end + 1, 0)
+    };
+    CursorPage {
+        body,
+        truncated: stopped,
+        next_line,
+        next_byte,
+    }
 }
 
 fn utf8_prefix(value: &str, budget: usize) -> &str {
@@ -772,6 +944,154 @@ mod tests {
             .unwrap();
         assert!(second.content.model_text().contains("1|"));
         assert_ne!(first.content.model_text(), second.content.model_text());
+    }
+
+    // Issue #294: the `start_byte` cursor is an omission EDGE. A registered
+    // secret straddling the cursor leaves only its SUFFIX at the head of the
+    // page — unmatchable by the §7 whole-value scrub — so the pager must
+    // elide the front margin in raw (pre-numbering) coordinates first.
+    #[tokio::test]
+    async fn start_byte_front_edge_elides_secret_straddling_the_cursor() {
+        const SECRET: &str = "sk-live-CURSOR-0123456789abcdef"; // 31 bytes
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cursor.txt");
+        // The secret spans bytes [88, 119); the cursor at 100 lands inside
+        // it, so a boundary-blind page would open with SECRET[12..].
+        std::fs::write(
+            &file,
+            format!("{}{SECRET}{}", "a".repeat(88), "b".repeat(2000)),
+        )
+        .unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.redact = std::sync::Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:cursor".to_string())
+                .unwrap(),
+        );
+
+        let out = ReadTool
+            .call(
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": 100,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let content = out.content.model_text();
+        assert!(content.contains("returned=1-1"), "got: {content}");
+        assert!(
+            !content.contains(&SECRET[12..]),
+            "cursor front edge leaked a straddling suffix: {content}"
+        );
+        assert!(!content.contains("sk-live-CURSOR"), "got: {content}");
+        assert!(content.contains("1|"), "got: {content}");
+    }
+
+    // Issue #294: an `end_line` that leaves later lines unshown is a back
+    // omission edge exactly like the read-slice line-limit edge. A
+    // multi-line registered secret whose first line ends the last retained
+    // line and whose second line is omitted must be elided, never handed to
+    // §7 as an unmatchable PREFIX.
+    #[tokio::test]
+    async fn start_byte_end_bound_elides_secret_straddling_the_last_line() {
+        const SECRET: &str = "SECRET-EOFHEAD-99\nSECRET-EOFTAIL-99"; // 37 bytes
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("eof.txt");
+        let line1 = format!("{}SECRET-EOFHEAD-99", "x".repeat(400));
+        std::fs::write(&file, format!("{line1}\nSECRET-EOFTAIL-99 tail\n")).unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.redact = std::sync::Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:eof".to_string())
+                .unwrap(),
+        );
+
+        let out = ReadTool
+            .call(
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": 0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let content = out.content.model_text();
+        assert!(content.contains("total_lines=2"), "got: {content}");
+        assert!(content.contains("returned=1-1"), "got: {content}");
+        assert!(
+            !content.contains("SECRET-EOFHEAD-99"),
+            "end-bound back edge leaked a straddling prefix: {content}"
+        );
+        assert!(!content.contains("SECRET-EOFTAIL-99"), "got: {content}");
+        assert!(content.contains("1|"), "got: {content}");
+    }
+
+    // Issue #294: the byte-cap clip inside an oversized line is a back edge
+    // too — a secret straddling the clip point would leave an unmatchable
+    // PREFIX at the end of the emitted row — and the continuation cursor
+    // must track the post-elision end so the elided tail is never re-offered
+    // as a fresh partial on the next page.
+    #[tokio::test]
+    async fn start_byte_clip_edge_elides_secret_and_tracks_cursor() {
+        const SECRET: &str = "sk-live-CLIPEDGE-0123456789abcdef"; // 33 bytes
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("clip.txt");
+        // The secret spans [7860, 7893); the byte-cap clip lands inside it.
+        std::fs::write(
+            &file,
+            format!("{}{SECRET}{}", "a".repeat(7860), "b".repeat(60)),
+        )
+        .unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.redact = std::sync::Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:clip".to_string())
+                .unwrap(),
+        );
+
+        let out = ReadTool
+            .call(
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "start_byte": 0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.truncated);
+        let content = out.content.model_text();
+        assert!(content.len() <= OUTPUT_BYTE_CAP, "got: {content}");
+        assert!(
+            !content.contains(&SECRET[..26]),
+            "clip back edge leaked a straddling prefix: {content}"
+        );
+        assert!(!content.contains("sk-live-CLIPEDGE"), "got: {content}");
+        // The cursor sits at the post-elision emitted end: the blind clip
+        // point would be 7886 (body_cap 7889 minus the `1|` row overhead);
+        // the back margin retreats it past the straddler.
+        let cursor = content
+            .split("start_byte=")
+            .nth(1)
+            .expect("continuation has byte cursor")
+            .split(']')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(cursor, 7854, "got: {content}");
     }
 
     /// A directory is reported as a directory via the portable check, never

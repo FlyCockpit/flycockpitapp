@@ -16,8 +16,7 @@ use crate::engine::tool::{
     ToolPresentation, bounded_preview, invalid_input, readable_args, single_line_preview,
     string_field,
 };
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use crate::tools::common::{OUTPUT_BYTE_CAP, boundary_safe_capture, truncate_head_tail_redacted};
 use crate::tools::custom::{CustomBashTool, ToolTemplateProvenance, WEBFETCH, WEBSEARCH};
 
 const FIRECRAWL_API_KEY_ENV: &str = "FIRECRAWL_API_KEY";
@@ -344,7 +343,7 @@ impl Tool for WebSearchTool {
             }
         };
         Ok(match out {
-            Ok(results) => capped_text(render_search_results(&results)),
+            Ok(results) => capped_text(&ctx.redact, render_search_results(&results)),
             Err(err) => {
                 if maybe_capture_web_key(ctx, &err, WEBSEARCH).await? {
                     let cfg = ctx.config.extended();
@@ -359,7 +358,7 @@ impl Tool for WebSearchTool {
                         SelectedBackendKind::Custom => Err(err.clone()),
                     };
                     match retry {
-                        Ok(results) => capped_text(render_search_results(&results)),
+                        Ok(results) => capped_text(&ctx.redact, render_search_results(&results)),
                         Err(retry_err) => ToolOutput::text(retry_err.to_tool_text(WEBSEARCH)),
                     }
                 } else {
@@ -433,7 +432,7 @@ impl Tool for WebFetchTool {
             SelectedBackendKind::Tinyfish => fetch_tinyfish_or_fallback(&selected, url, ctx).await,
         };
         Ok(match out {
-            Ok(page) => capped_text(page.markdown),
+            Ok(page) => capped_text(&ctx.redact, page.markdown),
             Err(err) => {
                 if maybe_capture_web_key(ctx, &err, WEBFETCH).await? {
                     let cfg = ctx.config.extended();
@@ -448,7 +447,7 @@ impl Tool for WebFetchTool {
                         SelectedBackendKind::Custom => Err(err.clone()),
                     };
                     match retry {
-                        Ok(page) => capped_text(page.markdown),
+                        Ok(page) => capped_text(&ctx.redact, page.markdown),
                         Err(retry_err) => ToolOutput::text(retry_err.to_tool_text(WEBFETCH)),
                     }
                 } else {
@@ -545,10 +544,13 @@ pub(crate) fn render_search_results(results: &[SearchResult]) -> String {
     out
 }
 
-fn capped_text(text: String) -> ToolOutput {
+fn capped_text(table: &crate::redact::RedactionTable, text: String) -> ToolOutput {
     if text.len() > OUTPUT_BYTE_CAP {
-        ToolOutput::truncated_text(truncate_head_tail(&text, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&text))
+        // Redacting truncator: a registered secret straddling a truncation
+        // boundary must not leave a PARTIAL in the model-facing text that the
+        // §7 whole-value scrub cannot match.
+        ToolOutput::truncated_text(truncate_head_tail_redacted(&table, &text, OUTPUT_BYTE_CAP))
+            .with_text_artifact_capture(boundary_safe_capture(table, &text))
     } else {
         ToolOutput::text(text)
     }

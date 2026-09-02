@@ -21,15 +21,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::config::extended::ToolCommandTemplate;
-use crate::engine::tool::{TextArtifactCapture, Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
-use crate::intel::budget::capture_text_artifact_body;
+use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
 use crate::redact::RedactionTable;
 use crate::tools::common::{
-    OUTPUT_BYTE_CAP, drop_back_margin, drop_front_margin, truncate_head_tail_redacted,
+    OUTPUT_BYTE_CAP, boundary_safe_capture, boundary_safe_join, truncate_head_tail_redacted,
 };
-use cockpit_host::process::{
-    BoundedPipeCapture, CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES,
-};
+use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
 pub(crate) const WEBFETCH: &str = "webfetch";
@@ -467,50 +464,6 @@ impl CustomBashTool {
             }),
         }
     }
-}
-
-/// Fixed marker inserted at a bounded-drain head/tail junction whose middle was
-/// omitted. A constant (never secret-bearing); the §7 scrub matches it whole.
-const OMITTED_MIDDLE_MARKER: &str = "\n... [output truncated: middle bytes elided] ...\n";
-
-/// Join a bounded-drain capture (retained HEAD + omitted MIDDLE + retained TAIL)
-/// into one string, eliding the unsafe margin at the head/tail junction so no
-/// boundary-straddling secret PARTIAL reaches the downstream §7 whole-value scrub.
-///
-/// When nothing was dropped (`dropped_bytes == 0`) the head and tail are
-/// contiguous in the original stream — there is no omission boundary — so this is
-/// exactly the prior `join_lossy` (`head ++ tail`). It is likewise a no-op join
-/// when the table has no multi-byte literal (`max_match_len <= 1`), so an empty
-/// table never perturbs output. Otherwise it drops the back margin of the head
-/// (which may hold a straddling secret's PREFIX) and the front margin of the tail
-/// (which may hold a straddling secret's SUFFIX) and joins them around the fixed
-/// marker. The head and tail are UTF-8-lossy-decoded SEPARATELY at the
-/// stream-char-boundary split (`head_len`), so an invalid byte in one never
-/// shifts the junction offset.
-fn boundary_safe_join(table: &RedactionTable, cap: BoundedPipeCapture) -> String {
-    let split = cap.head_len.min(cap.bytes.len());
-    let head = String::from_utf8_lossy(&cap.bytes[..split]);
-    let tail = String::from_utf8_lossy(&cap.bytes[split..]);
-    if cap.dropped_bytes == 0 || table.max_match_len() <= 1 {
-        return format!("{head}{tail}");
-    }
-    let safe_head = drop_back_margin(table, &head);
-    let safe_tail = drop_front_margin(table, &tail);
-    format!("{safe_head}{OMITTED_MIDDLE_MARKER}{safe_tail}")
-}
-
-/// Boundary-safe capture for the immutable artifact.  The host capture has a
-/// fixed 8 MiB boundary; safety removal is represented by a smaller stored
-/// source count rather than being misreported as host loss.
-fn boundary_safe_capture(table: &RedactionTable, combined: &str) -> TextArtifactCapture {
-    let mut base = capture_text_artifact_body(combined);
-    if base.host_dropped_bytes == 0 {
-        return base;
-    }
-    let safe = drop_back_margin(table, &base.content);
-    base.content = safe.to_string();
-    base.stored_source_bytes = base.content.len();
-    base
 }
 
 fn render_failure_diagnostic(
@@ -1204,7 +1157,7 @@ mod tests {
             "raw join must leak the tail suffix"
         );
 
-        let cap = BoundedPipeCapture {
+        let cap = cockpit_host::process::BoundedPipeCapture {
             bytes,
             dropped_bytes: 500, // middle omitted → junction is a real boundary
             head_len,
@@ -1224,7 +1177,7 @@ mod tests {
     #[test]
     fn boundary_safe_join_is_passthrough_when_nothing_dropped() {
         let table = leak_table("sk-live-UNUSED-0123456789abcdefghijkl");
-        let cap = BoundedPipeCapture {
+        let cap = cockpit_host::process::BoundedPipeCapture {
             bytes: b"hello world".to_vec(),
             dropped_bytes: 0,
             head_len: 5,

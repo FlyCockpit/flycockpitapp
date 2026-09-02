@@ -232,7 +232,8 @@ impl Tool for SearchTool {
             body
         };
 
-        let (render_body, thinned) = thin_line_output(&ranked_body, pattern, ThinLimits::default());
+        let (render_body, thinned) =
+            thin_line_output(&ctx.redact, &ranked_body, pattern, ThinLimits::default());
         let mut writer = BudgetedWriter::new(SEARCH_TOKEN_CAP);
         for line in render_body.lines() {
             if !write_retained_line(&mut writer, line) {
@@ -241,16 +242,18 @@ impl Tool for SearchTool {
         }
         let mut out = if thinned {
             let truncated = writer.is_truncated();
-            let mut content = writer.into_string();
+            let mut content = writer.into_string_redacted(&ctx.redact);
             if truncated {
                 content.push_str(
                     "\n... [truncated; narrow the query or add a `path`/`glob` filter]\n",
                 );
             }
-            ToolOutput::truncated_text(content)
-                .with_text_artifact_capture(capture_text_artifact_body(&ranked_body))
+            ToolOutput::truncated_text(content).with_text_artifact_capture(
+                crate::tools::common::boundary_safe_capture(&ctx.redact, &ranked_body),
+            )
         } else {
             finish(
+                &ctx.redact,
                 writer,
                 "\n... [truncated; narrow the query or add a `path`/`glob` filter]\n",
             )

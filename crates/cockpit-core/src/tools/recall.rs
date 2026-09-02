@@ -176,8 +176,8 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         ToolOutput::text("No matching cockpit pseudofiles.".to_string())
     } else {
         let truncated = writer.is_truncated();
-        let capture = writer.text_artifact_capture();
-        let mut body = writer.into_string();
+        let capture = writer.text_artifact_capture_redacted(&ctx.redact);
+        let mut body = writer.into_string_redacted(&ctx.redact);
         if truncated {
             body.push_str("... [truncated; narrow the pattern]\n");
             let output = ToolOutput::truncated_text(body);

@@ -3540,6 +3540,7 @@ impl Driver {
             &root.history,
             &root.agent.role_prompt,
             instructions.as_ref().map(|(_, body)| body.as_str()),
+            &self.redact,
         );
         crate::engine::preflight::run(
             enabled,
@@ -10740,7 +10741,7 @@ impl Driver {
         let mut allow = crate::config::extended::resolve_gitignore_allow(cwd);
         allow.extend(self.session.gitignore_session_allow());
         let caps = crate::tags::TagInlineCaps::for_context_policy(context_policy);
-        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps);
+        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps, self.redact.clone());
         crate::tags::expand_assembly_tags_with_policy(&text, &policy).wire
     }
 
@@ -11093,12 +11094,15 @@ impl Driver {
         // `files_changed`) and fold in the child's deferred-log section
         // (`plan.md §3d`). The `docs` pipeline never reaches this path (it runs
         // through the noninteractive flow, holds no `return` tool, and is
-        // exempt from the envelope).
+        // exempt from the envelope). The child's session table is the same
+        // table the report is later journaled under (F4).
+        let child_session_table = child.agent.model.session_redact_table();
         let report = assemble_subagent_report(
             &child.agent,
             &child.history,
             &child.deferred_log,
             return_fields,
+            child_session_table.as_ref(),
         );
         // Persist a re-query handle for a finished INTERACTIVE subagent
         // (`builder` + custom — `interactive-subagent-
@@ -11174,7 +11178,6 @@ impl Driver {
         // child's report would never journal. When the child model is untrusted
         // the frame path journals nothing (its report is already post-redaction),
         // preserving today's semantics.
-        let child_session_table = child.agent.model.session_redact_table();
         if let Err(e) = self
             .session
             .record_event_with_model_frame(

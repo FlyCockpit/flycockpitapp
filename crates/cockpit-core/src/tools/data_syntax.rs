@@ -33,19 +33,24 @@ impl DataFormat {
     }
 }
 
-pub fn data_syntax_note(path: &Path, content: &str, config: &DataSyntaxConfig) -> Option<String> {
+pub fn data_syntax_note(
+    redact: &crate::redact::RedactionTable,
+    path: &Path,
+    content: &str,
+    config: &DataSyntaxConfig,
+) -> Option<String> {
     if !config.enabled || content.len() > config.max_bytes {
         return None;
     }
     let format = detect_format(path)?;
     match format {
-        DataFormat::Json => Some(validate_json(content)),
-        DataFormat::Jsonc => Some(validate_jsonc(content)),
-        DataFormat::Ndjson => Some(validate_ndjson(content)),
-        DataFormat::Yaml => Some(validate_yaml(content)),
-        DataFormat::Toml => Some(validate_toml(content)),
-        DataFormat::Csv => validate_delimited(content, b',', DataFormat::Csv),
-        DataFormat::Tsv => validate_delimited(content, b'\t', DataFormat::Tsv),
+        DataFormat::Json => Some(validate_json(redact, content)),
+        DataFormat::Jsonc => Some(validate_jsonc(redact, content)),
+        DataFormat::Ndjson => Some(validate_ndjson(redact, content)),
+        DataFormat::Yaml => Some(validate_yaml(redact, content)),
+        DataFormat::Toml => Some(validate_toml(redact, content)),
+        DataFormat::Csv => validate_delimited(redact, content, b',', DataFormat::Csv),
+        DataFormat::Tsv => validate_delimited(redact, content, b'\t', DataFormat::Tsv),
     }
 }
 
@@ -82,21 +87,21 @@ fn is_vscode_json(path: &Path) -> bool {
         })
 }
 
-fn validate_json(content: &str) -> String {
+fn validate_json(redact: &crate::redact::RedactionTable, content: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(content) {
         Ok(_) => "\nsyntax OK (JSON)".to_string(),
-        Err(error) => invalid_note(DataFormat::Json, error.to_string()),
+        Err(error) => invalid_note(redact, DataFormat::Json, error.to_string()),
     }
 }
 
-fn validate_jsonc(content: &str) -> String {
+fn validate_jsonc(redact: &crate::redact::RedactionTable, content: &str) -> String {
     match jsonc_parser::parse_to_value(content, &jsonc_parser::ParseOptions::default()) {
         Ok(_) => "\nsyntax OK (JSONC)".to_string(),
-        Err(error) => invalid_note(DataFormat::Jsonc, error.to_string()),
+        Err(error) => invalid_note(redact, DataFormat::Jsonc, error.to_string()),
     }
 }
 
-fn validate_ndjson(content: &str) -> String {
+fn validate_ndjson(redact: &crate::redact::RedactionTable, content: &str) -> String {
     let mut valid_lines = 0usize;
     let mut errors = Vec::new();
     for (idx, line) in content.lines().enumerate() {
@@ -114,16 +119,16 @@ fn validate_ndjson(content: &str) -> String {
     if errors.is_empty() {
         format!("\nsyntax OK (NDJSON, {valid_lines} lines)")
     } else {
-        invalid_note(DataFormat::Ndjson, errors.join("; "))
+        invalid_note(redact, DataFormat::Ndjson, errors.join("; "))
     }
 }
 
-fn validate_yaml(content: &str) -> String {
+fn validate_yaml(redact: &crate::redact::RedactionTable, content: &str) -> String {
     let mut documents = 0usize;
     for document in serde_yaml::Deserializer::from_str(content) {
         match serde_yaml::Value::deserialize(document) {
             Ok(_) => documents += 1,
-            Err(error) => return invalid_note(DataFormat::Yaml, error.to_string()),
+            Err(error) => return invalid_note(redact, DataFormat::Yaml, error.to_string()),
         }
     }
     if documents == 0 {
@@ -137,14 +142,19 @@ fn validate_yaml(content: &str) -> String {
     format!("\nparses as YAML ({documents} {noun})")
 }
 
-fn validate_toml(content: &str) -> String {
+fn validate_toml(redact: &crate::redact::RedactionTable, content: &str) -> String {
     match toml::from_str::<toml::Value>(content) {
         Ok(_) => "\nsyntax OK (TOML)".to_string(),
-        Err(error) => invalid_note(DataFormat::Toml, error.to_string()),
+        Err(error) => invalid_note(redact, DataFormat::Toml, error.to_string()),
     }
 }
 
-fn validate_delimited(content: &str, delimiter: u8, format: DataFormat) -> Option<String> {
+fn validate_delimited(
+    redact: &crate::redact::RedactionTable,
+    content: &str,
+    delimiter: u8,
+    format: DataFormat,
+) -> Option<String> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(false)
@@ -152,7 +162,7 @@ fn validate_delimited(content: &str, delimiter: u8, format: DataFormat) -> Optio
         .from_reader(content.as_bytes());
     for result in reader.records() {
         if let Err(error) = result {
-            return Some(invalid_note(format, csv_error_message(&error)));
+            return Some(invalid_note(redact, format, csv_error_message(&error)));
         }
     }
     None
@@ -172,8 +182,12 @@ fn csv_error_message(error: &csv::Error) -> String {
     }
 }
 
-fn invalid_note(format: DataFormat, detail: String) -> String {
-    let detail = truncate_detail(detail);
+fn invalid_note(
+    redact: &crate::redact::RedactionTable,
+    format: DataFormat,
+    detail: String,
+) -> String {
+    let detail = truncate_detail(redact, detail);
     format!(
         "\nwarning: content is not valid {} — {}. {}",
         format.label(),
@@ -182,14 +196,19 @@ fn invalid_note(format: DataFormat, detail: String) -> String {
     )
 }
 
-fn truncate_detail(detail: String) -> String {
+fn truncate_detail(redact: &crate::redact::RedactionTable, detail: String) -> String {
     if detail.chars().count() <= MAX_DETAIL_CHARS {
         return detail;
     }
 
-    let mut truncated = detail.chars().take(MAX_DETAIL_CHARS).collect::<String>();
-    truncated.push('…');
-    truncated
+    let kept: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
+    // The cut keeps a head and drops the tail: a parser detail quoting file
+    // content could straddle a registered secret here, leaving only its
+    // PREFIX — past what the downstream whole-value scrub can match. Elide
+    // the retained head's back margin before appending the ellipsis
+    // (no-op for an empty table). Issue #294.
+    let safe = crate::tools::common::drop_back_margin(redact, &kept);
+    format!("{safe}…")
 }
 
 #[cfg(test)]
@@ -216,23 +235,51 @@ mod tests {
     #[test]
     fn json_success_and_failure() {
         assert_eq!(
-            data_syntax_note(Path::new("a.JSON"), "{}", &cfg()).unwrap(),
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.JSON"),
+                "{}",
+                &cfg()
+            )
+            .unwrap(),
             "\nsyntax OK (JSON)"
         );
-        let note = data_syntax_note(Path::new("a.json"), "{", &cfg()).unwrap();
+        let note = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.json"),
+            "{",
+            &cfg(),
+        )
+        .unwrap();
         assert!(note.contains("warning: content is not valid JSON"));
         assert!(note.contains("line 1 column"));
     }
 
     #[test]
     fn jsonc_comments_and_errors() {
-        let ok =
-            data_syntax_note(Path::new("tsconfig.json"), "{ // c\n \"x\": 1,\n}", &cfg()).unwrap();
+        let ok = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("tsconfig.json"),
+            "{ // c\n \"x\": 1,\n}",
+            &cfg(),
+        )
+        .unwrap();
         assert_eq!(ok, "\nsyntax OK (JSONC)");
-        let plain =
-            data_syntax_note(Path::new("foo.json"), "{ // c\n \"x\": 1\n}", &cfg()).unwrap();
+        let plain = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("foo.json"),
+            "{ // c\n \"x\": 1\n}",
+            &cfg(),
+        )
+        .unwrap();
         assert!(plain.contains("warning: content is not valid JSON"));
-        let bad = data_syntax_note(Path::new("foo.jsonc"), "{ \"x\": ", &cfg()).unwrap();
+        let bad = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("foo.jsonc"),
+            "{ \"x\": ",
+            &cfg(),
+        )
+        .unwrap();
         assert!(bad.contains("warning: content is not valid JSONC"));
         assert!(bad.contains("line"));
         assert!(bad.contains("column"));
@@ -240,34 +287,74 @@ mod tests {
 
     #[test]
     fn ndjson_counts_and_reports_lines() {
-        let ok = data_syntax_note(Path::new("a.ndjson"), "{}\n\n{\"a\":1}\n[]\n", &cfg()).unwrap();
+        let ok = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.ndjson"),
+            "{}\n\n{\"a\":1}\n[]\n",
+            &cfg(),
+        )
+        .unwrap();
         assert_eq!(ok, "\nsyntax OK (NDJSON, 3 lines)");
-        let bad = data_syntax_note(Path::new("a.jsonl"), "{}\n{\n[]\n", &cfg()).unwrap();
+        let bad = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.jsonl"),
+            "{}\n{\n[]\n",
+            &cfg(),
+        )
+        .unwrap();
         assert!(bad.contains("line 2:"));
     }
 
     #[test]
     fn yaml_documents_and_failure() {
-        let ok = data_syntax_note(Path::new("a.yaml"), "---\na: 1\n---\nb: 2\n", &cfg()).unwrap();
+        let ok = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.yaml"),
+            "---\na: 1\n---\nb: 2\n",
+            &cfg(),
+        )
+        .unwrap();
         assert_eq!(ok, "\nparses as YAML (2 documents)");
-        let bad = data_syntax_note(Path::new("a.yml"), "a: [1\n", &cfg()).unwrap();
+        let bad = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.yml"),
+            "a: [1\n",
+            &cfg(),
+        )
+        .unwrap();
         assert!(bad.contains("warning: content is not valid YAML"));
     }
 
     #[test]
     fn toml_success_and_failure() {
         assert_eq!(
-            data_syntax_note(Path::new("a.toml"), "a = 1", &cfg()).unwrap(),
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.toml"),
+                "a = 1",
+                &cfg()
+            )
+            .unwrap(),
             "\nsyntax OK (TOML)"
         );
-        let bad = data_syntax_note(Path::new("a.toml"), "a = ", &cfg()).unwrap();
+        let bad = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.toml"),
+            "a = ",
+            &cfg(),
+        )
+        .unwrap();
         assert!(bad.contains("warning: content is not valid TOML"));
     }
 
     #[test]
     fn invalid_note_truncates_long_parser_details() {
         let detail = "x".repeat(MAX_DETAIL_CHARS + 10);
-        let note = invalid_note(DataFormat::Toml, detail);
+        let note = invalid_note(
+            &crate::redact::RedactionTable::empty(),
+            DataFormat::Toml,
+            detail,
+        );
         let capped = format!("{}…", "x".repeat(MAX_DETAIL_CHARS));
 
         assert!(note.contains(&capped));
@@ -283,7 +370,11 @@ mod tests {
 
     #[test]
     fn invalid_note_does_not_truncate_short_parser_details() {
-        let note = invalid_note(DataFormat::Json, "short parser detail".to_string());
+        let note = invalid_note(
+            &crate::redact::RedactionTable::empty(),
+            DataFormat::Json,
+            "short parser detail".to_string(),
+        );
 
         assert!(note.contains("short parser detail"));
         assert!(!note.contains('…'));
@@ -292,7 +383,11 @@ mod tests {
     #[test]
     fn invalid_note_truncates_on_char_boundaries() {
         let detail = "世".repeat(MAX_DETAIL_CHARS + 1);
-        let note = invalid_note(DataFormat::Yaml, detail);
+        let note = invalid_note(
+            &crate::redact::RedactionTable::empty(),
+            DataFormat::Yaml,
+            detail,
+        );
         let capped = format!("{}…", "世".repeat(MAX_DETAIL_CHARS));
 
         assert!(note.contains(&capped));
@@ -301,20 +396,86 @@ mod tests {
 
     #[test]
     fn csv_warns_only_on_errors() {
-        assert!(data_syntax_note(Path::new("a.csv"), "a,b\nc,d\n", &cfg()).is_none());
-        let bad = data_syntax_note(Path::new("a.csv"), "a,b\nc\n", &cfg()).unwrap();
+        assert!(
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.csv"),
+                "a,b\nc,d\n",
+                &cfg()
+            )
+            .is_none()
+        );
+        let bad = data_syntax_note(
+            &crate::redact::RedactionTable::empty(),
+            Path::new("a.csv"),
+            "a,b\nc\n",
+            &cfg(),
+        )
+        .unwrap();
         assert!(bad.contains("row 2 has 1 fields; earlier rows have 2"));
     }
 
     #[test]
     fn unknown_disabled_and_oversize_are_silent() {
-        assert!(data_syntax_note(Path::new("a.rs"), "{", &cfg()).is_none());
-        assert!(data_syntax_note(Path::new("Makefile"), "{", &cfg()).is_none());
+        assert!(
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.rs"),
+                "{",
+                &cfg()
+            )
+            .is_none()
+        );
+        assert!(
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("Makefile"),
+                "{",
+                &cfg()
+            )
+            .is_none()
+        );
         let mut disabled = cfg();
         disabled.enabled = false;
-        assert!(data_syntax_note(Path::new("a.json"), "{}", &disabled).is_none());
+        assert!(
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.json"),
+                "{}",
+                &disabled
+            )
+            .is_none()
+        );
         let mut tiny = cfg();
         tiny.max_bytes = 1;
-        assert!(data_syntax_note(Path::new("a.json"), "{}", &tiny).is_none());
+        assert!(
+            data_syntax_note(
+                &crate::redact::RedactionTable::empty(),
+                Path::new("a.json"),
+                "{}",
+                &tiny
+            )
+            .is_none()
+        );
+    }
+    // A parser detail quoting file content can straddle a registered secret
+    // at the detail cap; the cut must elide the retained head's back margin
+    // so no partial survives into the tool note (issue #294).
+    #[test]
+    fn truncate_detail_elides_back_margin_of_straddling_secret() {
+        const SECRET: &str = "sk-live-DATASYNTAX-0123456789abcd"; // 33 bytes
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$leak:datasyntax".to_string())
+            .unwrap();
+        // Cut at MAX_DETAIL_CHARS (500) with the secret starting at 490: a
+        // boundary-blind cut keeps 10 of its 33 bytes.
+        let detail = format!("{}{SECRET}{}", "d".repeat(490), "e".repeat(300));
+        let truncated = truncate_detail(&table, detail);
+        let scrubbed = table.scrub(&truncated);
+        assert!(
+            !scrubbed.contains("sk-live-DATASYNTAX"),
+            "straddling prefix leaked into the data-syntax note: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("0123456789abcd"));
     }
 }

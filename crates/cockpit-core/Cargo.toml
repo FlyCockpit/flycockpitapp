@@ -190,7 +190,7 @@ rayon = { workspace = true }
 # stack into the otherwise rustls-only binary; the exception is documented and
 # contained in deny.toml ([advisories]/[bans]). Do not widen this pin without
 # re-auditing that stack and updating deny.toml in the same change.
-firecrawl = "=2.12.1"
+firecrawl = "=2.17.0"
 jsonc-parser = { workspace = true }
 # Generated SVG trust boundary. Exact direct pins; both run without optional
 # default features so parser/sanitizer behavior cannot drift through features.
@@ -198,7 +198,7 @@ jsonc-parser = { workspace = true }
 # duplicate-attribute check) and RUSTSEC-2026-0195 (unbounded namespace
 # allocation); both advisories affect 0.39.x, which parsed model-generated SVG.
 quick-xml = { version = "=0.41.0", default-features = false }
-svg-hush = { version = "=0.9.6", default-features = false }
+svg-hush = { version = "=0.9.7", default-features = false }
 
 # Native secure key store: keyring-core on every target; exactly one native
 # store per supported OS; Unsupported adapter elsewhere. Never the all-in-one
@@ -245,8 +245,8 @@ str0m-rust-crypto = { version = "=0.5.0", default-features = false, optional = t
 # `turn-client-rustls` selects no crypto provider; the process installs
 # `aws_lc_rs` (only — never `ring`) once via `crate::tls_crypto_provider`
 # before any TLS client config is built.
-turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"], optional = true }
-turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"], optional = true }
+turn-client-proto = { version = "=0.7.2", default-features = false, features = ["std"], optional = true }
+turn-client-rustls = { version = "=0.1.1", default-features = false, features = ["std"], optional = true }
 # System roots for TLS-to-TURN-server verification (rustls-native-certs). Exact
 # pin (no caret) matching the audited lock version.
 rustls-native-certs = { version = "=0.8.4", default-features = false, optional = true }
@@ -259,7 +259,7 @@ rustls = "=0.23.43"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
-zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
+zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
 # Linux/WSL daemon custody: PKCS#11 loading only an explicitly configured
 # absolute module path (no dlopen search path). Exact pin + crates.io checksum
 # per `identity-custody-dedup-and-hardening`; provenance recorded. Optional +
@@ -272,7 +272,7 @@ x11rb = { version = "=0.13.2", default-features = false, features = ["randr"] }
 atspi = { version = "=0.30.0", default-features = false, features = ["connection", "proxies", "tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "=1.0.1", default-features = false, features = ["keychain"] }
+apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }
 # macOS daemon custody: Secure Enclave / Keychain nonexportable P-256 via the
 # pinned security-framework wrapper. Exact pins per prompt; provenance recorded.
 # Both already present in Cargo.lock (3.7.0 / 2.17.0).
@@ -352,7 +352,7 @@ syn = { version = "2", features = ["full", "visit"] }
 # Source-range support for the forwarded-MCP production-only source ratchet.
 # The lockfile-compatible line is already used by sibling source-scan tests.
 proc-macro2 = { version = "1", features = ["span-locations"] }
-rcgen = "=0.14.8"
+rcgen = "=0.14.10"
 # `rustls` is now a normal dependency (process-global aws_lc_rs provider install);
 # see `[dependencies]`. `tokio-rustls` stays dev-only for media_https test servers.
 tokio-rustls = "=0.26.4"

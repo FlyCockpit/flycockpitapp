@@ -15056,12 +15056,14 @@ async fn boot_ephemeral_sweep_continues_after_delete_failure() {
             let mut blocked =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/blocked", "Build")?;
             blocked.ephemeral = true;
-            let blocked = crate::db::Db::insert_session_row_conn(conn, &blocked)?;
+            let blocked =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &blocked)?;
 
             let mut removed =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/removed", "Build")?;
             removed.ephemeral = true;
-            let removed = crate::db::Db::insert_session_row_conn(conn, &removed)?;
+            let removed =
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &removed)?;
             conn.execute(
                 "UPDATE sessions SET ephemeral = 1 WHERE session_id IN (?1, ?2)",
                 [
@@ -18961,7 +18963,7 @@ async fn authz_cross_session_paused_work_scenario(
                 &target_root_str,
                 "Build",
             )?;
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
         .unwrap();

@@ -4119,7 +4119,10 @@ mod tests {
         let claimed = s.short_id();
         let mut competitor = db.new_session_row(&s.project_id, "/x", "a").await.unwrap();
         competitor.short_id = Some(claimed.clone());
-        let inserted = db.insert_session_row(&competitor).await.unwrap();
+        let inserted = db
+            .insert_session_row_without_redaction_custody(&competitor)
+            .await
+            .unwrap();
         assert_eq!(inserted.short_id.as_deref(), Some(claimed.as_str()));
 
         assert!(s.persist_if_needed().unwrap());
@@ -4262,7 +4265,10 @@ mod tests {
             )
             .await
             .unwrap();
-        row = db.insert_session_row(&row).await.unwrap();
+        row = db
+            .insert_session_row_without_redaction_custody(&row)
+            .await
+            .unwrap();
 
         let error = Session::resume_strict_for_test(
             db,

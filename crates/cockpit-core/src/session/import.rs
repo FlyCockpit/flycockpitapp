@@ -49,13 +49,11 @@ pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportRes
         anyhow!("opening vault for imported session redaction custody: {error}")
     })?;
     db.transaction(move |conn| {
-        let result = Db::import_session_archive_graph_conn(conn, archive)?;
-        crate::session::lifecycle::persist_empty_redaction_tables_for_imported_sessions_on_conn(
-            &vault,
-            conn,
-            &result.imported,
-        )?;
-        Ok(result)
+        Db::import_session_archive_graph_conn(conn, archive, |conn, session_id| {
+            crate::session::lifecycle::persist_empty_redaction_table_on_conn(
+                &vault, conn, session_id,
+            )
+        })
     })
     .await
 }
@@ -1644,7 +1642,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
-            Db::insert_session_row_conn(conn, &row)?;
+            Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
         .await
@@ -1675,7 +1673,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
-            Db::insert_session_row_conn(conn, &row)?;
+            Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
         .await
@@ -2063,7 +2061,7 @@ mod tests {
                     "/tmp/approval-import",
                     "Build",
                 )?;
-                Db::insert_session_row_conn(conn, &row)
+                Db::insert_session_row_without_redaction_custody_conn(conn, &row)
             })
             .await
             .unwrap();
@@ -2124,7 +2122,7 @@ mod tests {
                 row.provider = Some(row_active_model.provider.clone());
                 row.model = Some(row_active_model.model.clone());
                 row.model_selection_json = Some(serde_json::to_string(&row_active_model)?);
-                Db::insert_session_row_conn(conn, &row)
+                Db::insert_session_row_without_redaction_custody_conn(conn, &row)
             })
             .await
             .unwrap();

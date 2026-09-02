@@ -1000,7 +1000,7 @@ mod tests {
         let project_id = project_id.to_string();
         db.write(move |conn| {
             let row = Db::build_new_session_row_conn(conn, &project_id, "/project", "test")?;
-            Db::insert_session_row_conn(conn, &row)?;
+            Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Db::authoritative_project_uuid_conn(conn, &project_id)?.context("project UUID")
         })
         .await

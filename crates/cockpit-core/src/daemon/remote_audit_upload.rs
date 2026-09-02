@@ -507,7 +507,7 @@ mod tests {
     async fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
         let session = db
             .write(|conn| {
-                crate::db::Db::insert_session_row_conn(
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
                         conn,

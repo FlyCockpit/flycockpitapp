@@ -658,7 +658,7 @@ mod tests {
     async fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
         let session = db
             .blocking_write_for_sync_maintenance(|conn| {
-                crate::db::Db::insert_session_row_conn(
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
                         conn,

@@ -94,7 +94,7 @@ async fn create_test_session(
                 &project_root,
                 &active_agent,
             )?;
-            crate::db::Db::insert_session_row_conn(conn, &row)
+            crate::db::Db::insert_session_row_without_redaction_custody_conn(conn, &row)
         })
         .await
         .unwrap();
@@ -111,20 +111,7 @@ async fn stage_text_artifact_blob(db: &crate::db::Db, session_id: Uuid, text: &s
 }
 
 async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
-    let row = db
-        .write(move |conn| {
-            crate::db::Db::create_fork_conn(
-                conn,
-                parent_session_id,
-                None,
-                false,
-                false,
-                Uuid::new_v4(),
-                chrono::Utc::now().timestamp_millis(),
-            )
-        })
-        .await
-        .unwrap();
+    let row = db.create_fork(parent_session_id, None).await.unwrap();
     persist_test_redaction_custody(db, row.session_id);
     row
 }

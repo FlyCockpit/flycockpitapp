@@ -183,23 +183,23 @@ pub(crate) fn persist_btw_fork_with_redaction_custody_on_conn(
     session_id: uuid::Uuid,
     now_unix_ms: i64,
 ) -> Result<crate::db::sessions::BtwForkCreateResult> {
-    let result = crate::db::Db::create_btw_fork_conn(
-        conn,
-        parent_session_id,
-        tangent,
-        session_id,
-        now_unix_ms,
-    )?;
-    if result.created {
-        copy_vault_redaction_table_on_conn(
-            vault,
+    if crate::db::sessions::live_btw_fork_info_conn(conn, parent_session_id)?.is_some() {
+        return crate::db::Db::create_btw_fork_conn(
             conn,
             parent_session_id,
-            result.info.session_id,
-            "copying parent redaction table for /btw fork",
-        )?;
+            tangent,
+            session_id,
+            now_unix_ms,
+        );
     }
-    Ok(result)
+    copy_vault_redaction_table_on_conn(
+        vault,
+        conn,
+        parent_session_id,
+        session_id,
+        "copying parent redaction table for /btw fork",
+    )?;
+    crate::db::Db::create_btw_fork_conn(conn, parent_session_id, tangent, session_id, now_unix_ms)
 }
 
 #[cfg(test)]
@@ -215,7 +215,7 @@ pub(crate) fn fail_next_redaction_vault_write_for_test() {
     FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.set(true));
 }
 
-fn persist_empty_redaction_table_on_conn(
+pub(crate) fn persist_empty_redaction_table_on_conn(
     vault: &crate::secure_key::SecretVault,
     conn: &rusqlite::Connection,
     session_id: uuid::Uuid,
@@ -254,24 +254,19 @@ fn ensure_redaction_table_custody_on_conn(
 /// on the same connection.
 ///
 /// `conn` must already be inside a transaction so a failed vault write cannot
-/// leave a resumable row. Existing vault items (a spawn-time live scan) are
-/// left untouched. The insert is refused if custody is still missing after
-/// `ensure`.
+/// leave a resumable row. Custody is written first: the database insert
+/// primitive requires [`cockpit_db::db::sessions::SessionRedactionCustody`]
+/// and will not create a visible row without it. Existing vault items (a
+/// spawn-time live scan) are left untouched.
 pub(crate) fn persist_session_row_with_redaction_custody_on_conn(
     conn: &rusqlite::Connection,
     vault: &crate::secure_key::SecretVault,
     row: &crate::db::sessions::SessionRow,
 ) -> Result<crate::db::sessions::SessionRow> {
-    let inserted = crate::db::Db::insert_session_row_conn(conn, row)?;
-    ensure_redaction_table_custody_on_conn(vault, conn, inserted.session_id)?;
-    anyhow::ensure!(
-        cockpit_db::secret_vault::session_redaction_table_vault_item_exists_conn(
-            conn,
-            &crate::secure_key::redaction_table_item_id(&inserted.session_id.to_string()),
-        )?,
-        "session insert did not establish redaction-table vault custody"
-    );
-    Ok(inserted)
+    ensure_redaction_table_custody_on_conn(vault, conn, row.session_id)?;
+    let custody =
+        crate::db::sessions::SessionRedactionCustody::require_on_conn(conn, row.session_id)?;
+    crate::db::Db::insert_session_row_conn(conn, row, custody)
 }
 
 fn persist_built_session_row_with_redaction_custody(
@@ -391,21 +386,6 @@ pub(crate) fn write_redaction_table_json_to_vault(
     let vault = crate::secure_key::vault_for_db(db)
         .map_err(|error| anyhow::anyhow!("opening vault for redaction table: {error}"))?;
     persist_redaction_table_to_vault(&vault, session_id, json.as_bytes())
-}
-
-/// Establish empty vault custody for each newly inserted durable session in
-/// the same SQLite transaction as the rows. Archives never carry secret
-/// literals, so imported history is covered by an empty committed table
-/// rather than a missing item that resume would treat as "no secrets."
-pub(crate) fn persist_empty_redaction_tables_for_imported_sessions_on_conn(
-    vault: &crate::secure_key::SecretVault,
-    conn: &rusqlite::Connection,
-    session_ids: &[uuid::Uuid],
-) -> Result<()> {
-    for session_id in session_ids {
-        persist_empty_redaction_table_on_conn(vault, conn, *session_id)?;
-    }
-    Ok(())
 }
 
 fn redaction_table_json_from_required_vault_bytes(
@@ -2144,74 +2124,18 @@ mod vault_unification_tests {
         );
     }
 
-    #[test]
-    fn production_session_inserts_do_not_use_raw_db_constructors() {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        collect_rs_files(&src_dir, &mut files);
-        let banned = [
-            ".create_session(",
-            "db.create_assistant_session(",
-            "Db::create_assistant_session(",
-        ];
-        let offenders: Vec<String> = files
-            .into_iter()
-            .filter(|path| {
-                !path.components().any(|c| {
-                    let name = c.as_os_str();
-                    name == "tests" || name == "tests.rs"
-                })
-            })
-            .flat_map(|path| {
-                let text = std::fs::read_to_string(&path).unwrap();
-                let mut depth: i32 = 0;
-                let mut cfg_test_pending = false;
-                let mut cfg_test_depth: Option<i32> = None;
-                let mut hits = Vec::new();
-                for (idx, line) in text.lines().enumerate() {
-                    let trimmed = line.trim_start();
-                    let in_cfg_test = cfg_test_depth.is_some();
-                    if !in_cfg_test
-                        && !trimmed.starts_with("//")
-                        && banned.iter().any(|needle| line.contains(needle))
-                    {
-                        hits.push(format!("{}:{}:{}", path.display(), idx + 1, line.trim()));
-                    }
-                    if trimmed.contains("#[cfg(test)]") {
-                        cfg_test_pending = true;
-                    }
-                    let opens = line.matches('{').count() as i32;
-                    let closes = line.matches('}').count() as i32;
-                    if cfg_test_pending && opens > 0 {
-                        cfg_test_depth = Some(depth);
-                        cfg_test_pending = false;
-                    }
-                    depth += opens - closes;
-                    if let Some(start) = cfg_test_depth
-                        && depth <= start
-                    {
-                        cfg_test_depth = None;
-                    }
-                }
-                hits
-            })
-            .collect();
+    #[tokio::test]
+    async fn persist_session_row_writes_vault_before_the_visible_insert() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        fail_next_redaction_vault_write_for_test();
+        let err = persist_session_with_redaction_custody(&db, vault, "p", "/repo", "Build")
+            .await
+            .expect_err("vault write is the first step of a durable insert");
         assert!(
-            offenders.is_empty(),
-            "production code must create durable sessions through custody-aware helpers, \
-             not Db::create_session / Db::create_assistant_session:\n{offenders:#?}"
+            format!("{err:#}").contains("injected redaction vault write failure"),
+            "failure must come from the vault write, before insert_session_row_conn: {err:#}"
         );
-    }
-
-    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs_files(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
+        assert!(db.list_sessions(true, 10).await.unwrap().is_empty());
     }
 }

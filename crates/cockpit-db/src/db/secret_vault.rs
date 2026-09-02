@@ -595,9 +595,9 @@ fn upsert_item_locked(
 
 /// Whether `session_id` owns a `redaction_table` vault item.
 ///
-/// The item id is the session UUID string. Cockpit-core's session constructors
-/// must persist that item in the same transaction as the visible `sessions`
-/// row; this probe is the database-side half of that invariant.
+/// The item id is the session UUID string. [`crate::db::sessions::SessionRedactionCustody`]
+/// is the only constructor that turns this probe into a typed insert witness;
+/// `Db::insert_session_row_conn` will not create a visible row without it.
 pub fn session_redaction_table_vault_item_exists_conn(
     conn: &rusqlite::Connection,
     session_id: &str,

@@ -1211,6 +1211,9 @@ impl RedactionTable {
                     }
                     EnvFileScan::Unsupported => unsupported_files.push(path),
                     EnvFileScan::Unreadable => {}
+                    EnvFileScan::OverLimit => {
+                        return Err(EnvFileOverLimitError { path }.into());
+                    }
                 }
             }
         }
@@ -1578,15 +1581,23 @@ impl RedactionTable {
     /// This does not decide whether a path is secret and never reads any other
     /// path; callers pair it with `SecretPathMatcher` after their read gate.
     pub fn with_approved_secret_file(&self, cfg: &RedactConfig, path: &Path) -> Result<Self> {
-        let EnvFileScan::Candidates(candidates) = collect_env_file_candidates(path, &cfg.allowlist)
-        else {
-            return self.union(&Self::from_entries(
-                Vec::new(),
-                self.placeholder.clone(),
-                self.disabled,
-                Vec::new(),
-                self.protected.clone(),
-            )?);
+        let candidates = match collect_env_file_candidates(path, &cfg.allowlist) {
+            EnvFileScan::Candidates(candidates) => candidates,
+            EnvFileScan::OverLimit => {
+                anyhow::bail!(
+                    "env file `{}` exceeds the daemon file size limit; refusing to ingest secrets from an uncapped read",
+                    path.display()
+                );
+            }
+            EnvFileScan::Unsupported | EnvFileScan::Unreadable => {
+                return self.union(&Self::from_entries(
+                    Vec::new(),
+                    self.placeholder.clone(),
+                    self.disabled,
+                    Vec::new(),
+                    self.protected.clone(),
+                )?);
+            }
         };
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
@@ -2252,6 +2263,25 @@ pub(crate) fn match_sensitive_literals(
     matched
 }
 
+/// Table build refused because scanning an over-cap env file would miss
+/// secrets. Automatic per-turn refresh channels must fail the turn rather
+/// than continue with a stale table; fail-closed callers already propagate.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "env file `{path}` exceeds the daemon file size limit; refusing to build a redaction table that would miss its secrets"
+)]
+pub(crate) struct EnvFileOverLimitError {
+    path: PathBuf,
+}
+
+/// True when [`RedactionTable::build`] (and siblings) refused so a later
+/// consumer cannot proceed with a table that would miss secrets.
+pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EnvFileOverLimitError>().is_some())
+}
+
 /// Outcome of scanning one matched env file (§4).
 enum EnvFileScan {
     /// Parsed in a supported format; the carried candidates
@@ -2261,6 +2291,9 @@ enum EnvFileScan {
     Unsupported,
     /// Couldn't even read the file (missing / permission). Silent skip.
     Unreadable,
+    /// File exceeded the daemon project-file cap. Must fail the table build:
+    /// skipping it would miss secrets (fail open).
+    OverLimit,
 }
 
 #[cfg(test)]

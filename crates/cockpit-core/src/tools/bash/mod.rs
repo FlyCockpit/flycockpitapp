@@ -2641,7 +2641,7 @@ async fn run_container_shell(
         Ok(resolved) => resolved,
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };
-    let dockerfile_bytes = match std::fs::read(&resolved.path) {
+    let dockerfile_bytes = match crate::resource_limits::read_for_tool(&resolved.path) {
         Ok(bytes) => bytes,
         Err(e) => {
             return RunOutcome::SpawnError(std::io::Error::other(format!(

@@ -2531,7 +2531,7 @@ fn config_entries_from_layers(
     let mut any_mcp = false;
     for dir in &ordered_layers {
         let path = dir.path.join("mcp.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Some(raw) = crate::mcp::config::read_layer_text_lossy(&path) else {
             continue;
         };
         let Ok(layer) = crate::mcp::config::McpConfig::parse(&raw) else {
@@ -2609,7 +2609,9 @@ fn merge_order(layers: &[ConfigDir]) -> Vec<&ConfigDir> {
 
 /// Read a file as a JSON `Value`, or `None` if missing / unparseable.
 fn read_json_value(path: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::resource_limits::read_project_text(path)
+        .ok()
+        .flatten()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -2647,8 +2649,8 @@ fn collect_layer_tree(
                 };
                 // zip paths use forward slashes on every platform.
                 let rel_str = rel_str.replace('\\', "/");
-                match std::fs::read_to_string(&path) {
-                    Ok(contents) => {
+                match crate::resource_limits::read_project_text(&path) {
+                    Ok(Some(contents)) => {
                         let contents = if rel_str == "mcp.json" {
                             sanitize_mcp_json_text(&contents)
                         } else if rel_str == "config.json"
@@ -2663,9 +2665,10 @@ fn collect_layer_tree(
                             redactor.scrub(&contents),
                         ));
                     }
-                    Err(_) => {
-                        // Unreadable or non-UTF-8 (binary) — not cockpit
-                        // config; skip rather than embed undecodable bytes.
+                    Ok(None) | Err(_) => {
+                        // Missing, over-cap, unreadable, or non-UTF-8
+                        // (binary) — not cockpit config; skip rather than
+                        // embed undecodable bytes or load the file whole.
                     }
                 }
             }

@@ -165,7 +165,7 @@ pub fn proposed_diff(tool_name: &str, args: &Value, cwd: &Path) -> String {
                 .unwrap_or_default();
             let old = path
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| crate::resource_limits::read_project_text(p).ok().flatten())
                 .unwrap_or_default();
             unified_diff(&old, new)
         }
@@ -238,7 +238,7 @@ fn walk_guidance(
         for name in names {
             let candidate = d.join(name);
             if candidate.is_file()
-                && let Ok(body) = std::fs::read_to_string(&candidate)
+                && let Ok(Some(body)) = crate::resource_limits::read_project_text(&candidate)
                 && let Some(canonical) = contained_regular_file(&candidate, &workspace)
             {
                 return Some((canonical, body));
@@ -333,14 +333,19 @@ pub fn resolve_linked_files(
         if !seen.insert(resolved.clone()) {
             continue;
         }
-        match std::fs::read_to_string(&resolved) {
-            Ok(body) => {
+        if total_bytes >= MAX_LINKED_BYTES {
+            break;
+        }
+        let remaining = (MAX_LINKED_BYTES - total_bytes) as u64;
+        match cockpit_host::bounded::read_at_most(&resolved, remaining) {
+            Ok(bytes) => {
+                let Ok(body) = String::from_utf8(bytes) else {
+                    continue;
+                };
                 total_bytes = total_bytes.saturating_add(body.len());
-                if total_bytes > MAX_LINKED_BYTES {
-                    break;
-                }
                 out.push((resolved, body));
             }
+            Err(cockpit_host::bounded::BoundedIoError::Limit { .. }) => break,
             Err(_) => continue,
         }
     }
@@ -867,6 +872,25 @@ mod tests {
         );
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].1.contains("from repo root"));
+    }
+
+    #[test]
+    fn linked_files_cap_during_io_instead_of_load_then_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let huge = tmp.path().join("huge.md");
+        let handle = std::fs::File::create(&huge).unwrap();
+        handle.set_len((MAX_LINKED_BYTES as u64) + 1).unwrap();
+        drop(handle);
+        std::fs::write(tmp.path().join("ok.md"), "small\n").unwrap();
+        let resolved = resolve_linked_files(
+            &tmp.path().join("instructions.md"),
+            "See [huge](huge.md) then [ok](ok.md)\n",
+            tmp.path(),
+        );
+        assert!(
+            resolved.is_empty(),
+            "an over-budget first link must stop the walk without loading later files, got {resolved:?}"
+        );
     }
 
     #[test]

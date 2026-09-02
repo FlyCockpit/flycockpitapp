@@ -45,6 +45,56 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
 }
 
 #[tokio::test]
+async fn turn_boundary_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
+    let (mut driver, tmp) = test_driver(1);
+    std::fs::write(tmp.path().join(".env"), "KEEP=turn-boundary-keep-secret\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    driver.refresh_redaction_table_for_turn(&tx).await.unwrap();
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret")
+    );
+    while rx.try_recv().is_ok() {}
+
+    let handle = std::fs::File::create(tmp.path().join(".env")).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+
+    driver
+        .refresh_redaction_table_for_turn(&tx)
+        .await
+        .expect_err("over-cap dotenv must abort the refresh so the turn cannot send");
+    assert!(
+        !driver
+            .redact
+            .scrub("turn-boundary-keep-secret")
+            .contains("turn-boundary-keep-secret"),
+        "over-cap must not wipe the previously committed table"
+    );
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("over-cap must surface a notice")
+        .expect("notice channel closed");
+    match notice {
+        TurnEvent::Notice { text } => {
+            assert!(
+                text.contains("refusing to send unredacted"),
+                "visible fail-closed signal missing: {text}"
+            );
+            assert!(
+                text.contains("exceeds the daemon file size limit"),
+                "over-cap cause missing: {text}"
+            );
+        }
+        other => panic!("expected Notice, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secrets() {
     let (mut driver, _tmp) = test_driver(1);
     const SECRET: &str = "driver-store-secret-value-xyz987";

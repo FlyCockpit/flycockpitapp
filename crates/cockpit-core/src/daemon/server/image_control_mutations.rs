@@ -579,11 +579,9 @@ fn verify_mutation_capability(
 }
 
 fn read_document(path: &Path) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
-    match std::fs::read(path) {
+    match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) => Ok(zeroize::Zeroizing::new(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(zeroize::Zeroizing::new(b"{}".to_vec()))
-        }
+        Err(error) if error.is_not_found() => Ok(zeroize::Zeroizing::new(b"{}".to_vec())),
         Err(error) => Err(error.into()),
     }
 }

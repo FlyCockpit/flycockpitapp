@@ -10819,7 +10819,7 @@ pub(super) async fn run_worker(
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         snapshot.extended.redact.clone()
                     };
-                    if !refresh_redaction_for_turn(
+                    match refresh_redaction_for_turn(
                         &session,
                         session_id,
                         &project_root,
@@ -10834,30 +10834,51 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
-                        emit_session_driver_failed_once(
-                            &event_tx,
-                            &turn_completions,
-                            &redaction,
-                            session_id,
-                            &mut driver_failed,
-                            "driver control channel closed".to_string(),
-                        );
-                        let rejection = match phase_one_reservation.take() {
-                            Some(reservation) => reject_oversized_text_artifact_admission(
-                                &session,
-                                reservation,
-                                crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
-                            )
-                            .await,
-                            None => proto::ErrorPayload {
-                                code: proto::ErrorCode::UserMessageNotAccepted,
-                                message: format!(
-                                    "session driver became unavailable before accepting message {client_submission_id} while refreshing redaction"
-                                ),
-                            },
-                        };
-                        let _ = respond_to.send(Err(rejection));
-                        break WorkerStop::DriverFailed;
+                        RedactionRefreshOutcome::Applied => {}
+                        RedactionRefreshOutcome::Refused(message) => {
+                            let rejection = match phase_one_reservation.take() {
+                                Some(reservation) => reject_oversized_text_artifact_admission(
+                                    &session,
+                                    reservation,
+                                    crate::db::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
+                                )
+                                .await,
+                                None => proto::ErrorPayload {
+                                    code: proto::ErrorCode::UserMessageNotAccepted,
+                                    message: format!(
+                                        "refusing message {client_submission_id}: {message}"
+                                    ),
+                                },
+                            };
+                            let _ = respond_to.send(Err(rejection));
+                            continue;
+                        }
+                        RedactionRefreshOutcome::DriverGone => {
+                            emit_session_driver_failed_once(
+                                &event_tx,
+                                &turn_completions,
+                                &redaction,
+                                session_id,
+                                &mut driver_failed,
+                                "driver control channel closed".to_string(),
+                            );
+                            let rejection = match phase_one_reservation.take() {
+                                Some(reservation) => reject_oversized_text_artifact_admission(
+                                    &session,
+                                    reservation,
+                                    crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                )
+                                .await,
+                                None => proto::ErrorPayload {
+                                    code: proto::ErrorCode::UserMessageNotAccepted,
+                                    message: format!(
+                                        "session driver became unavailable before accepting message {client_submission_id} while refreshing redaction"
+                                    ),
+                                },
+                            };
+                            let _ = respond_to.send(Err(rejection));
+                            break WorkerStop::DriverFailed;
+                        }
                     }
                     let max_primary_rounds = {
                         let snapshot = config_snapshot

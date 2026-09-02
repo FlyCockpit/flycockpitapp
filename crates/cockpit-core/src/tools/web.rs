@@ -359,9 +359,7 @@ impl Tool for WebSearchTool {
                         SelectedBackendKind::Custom => Err(err.clone()),
                     };
                     match retry {
-                        Ok(results) => {
-                            capped_text(&ctx.redact, render_search_results(&results))
-                        }
+                        Ok(results) => capped_text(&ctx.redact, render_search_results(&results)),
                         Err(retry_err) => ToolOutput::text(retry_err.to_tool_text(WEBSEARCH)),
                     }
                 } else {

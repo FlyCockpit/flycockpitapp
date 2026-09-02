@@ -198,7 +198,9 @@ pub async fn run_envelope_with_host(
                     recorder.finish_suppressed().await;
                 }
                 if envelope.model.is_empty() {
-                    envelope.model.push(render_complete_value(&value, &stdout, &redact)?);
+                    envelope
+                        .model
+                        .push(render_complete_value(&value, &stdout, &redact)?);
                 }
                 return Ok(envelope);
             }

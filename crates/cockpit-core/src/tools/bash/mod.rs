@@ -1119,10 +1119,13 @@ async fn call_bash_inner(
         // truncator additionally elides the unsafe margin at the head→middle
         // and middle→tail boundaries so a boundary-straddling secret PARTIAL
         // never survives into the §7 whole-value scrub.
-        let mut out =
-            ToolOutput::truncated_text(truncate_head_tail_redacted(&ctx.redact, &body, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&body))
-            .with_bash_meta(meta, &resource_meta);
+        let mut out = ToolOutput::truncated_text(truncate_head_tail_redacted(
+            &ctx.redact,
+            &body,
+            OUTPUT_BYTE_CAP,
+        ))
+        .with_text_artifact_capture(capture_text_artifact_body(&body))
+        .with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
         }

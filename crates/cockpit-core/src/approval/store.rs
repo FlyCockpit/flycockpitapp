@@ -38,14 +38,19 @@
 //! owner-only posture on the store it consumed: a store whose
 //! permissions cannot be inspected or tightened to owner-only is
 //! refused, never consumed. Every pathname effect on store state is
-//! identity-guarded through a held handle: the staged temp is renamed
-//! into place only while its name still refers to the object this
-//! process wrote and synced, the lock is acquired (and the publish
-//! re-fenced) only while its name still refers to the object this
-//! process locked, and a failed write's partial copy is removed only
-//! while its name still refers to the object this process created — so
+//! identity-guarded through a held handle and proof-bound at the moment
+//! it takes effect: the staged temp is renamed into place only while
+//! its name still refers to the object this process wrote and synced —
+//! and the publish is reported successful only when the installed live
+//! entry is then proven, through the held handle, to be that exact
+//! object, so a staged-name substitution installs nothing silently; the
+//! lock is acquired and proven at the publication boundary (both sides
+//! of the rename) only while its name still refers to the object this
+//! process locked; and a failed write's partial copy is removed only
+//! while its name still refers to the object this process created, with
+//! the removal itself proven after the act through the held handle — so
 //! a replacement object at a known pathname is never consumed,
-//! installed, or destroyed.
+//! installed, or silently destroyed.
 //!
 //! ## Wrappers are never persisted (priority #1)
 //!
@@ -2289,42 +2294,167 @@ fn same_object_at_path(_file: &std::fs::File, _path: &Path) -> std::io::Result<b
     Ok(true)
 }
 
+/// The held handle's current link count — the pre/post-act proof input
+/// for [`discard_partial_private_candidate`]'s identity-guarded removal.
+#[cfg(unix)]
+fn held_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(file.metadata()?.nlink())
+}
+
 /// Remove a failed private-file attempt's partial copy, identity-guarded
-/// (issue #297): the removal happens only while the candidate pathname
-/// still refers to the object this process created and opened, proven
-/// through the held handle — never the pathname alone. Between the
-/// exclusive `create_new` and this cleanup, a non-cooperating writer can
-/// unlink the partial candidate and install a different object at the
-/// same name; a blind `remove_file(path)` would then destroy that
-/// replacement — including a preserved diagnostic artifact fencing the
-/// store. A mismatch is left exactly as found (the caller still fails
-/// closed), and identity that cannot be proven is never guessed:
-/// nothing is removed on a probe failure. The name is only ever removed
-/// by this failure path — a successful private file is the caller's to
-/// publish or keep.
+/// and proof-bound (issue #297): the removal happens only while the
+/// candidate pathname still refers to the object this process created
+/// and opened, proven through the held handle — never the pathname
+/// alone — and its completion is proven, not assumed, after the act
+/// through the same held handle. The handle stays open across the
+/// removal precisely so that proof is possible; the previous
+/// probe-then-drop-then-remove shape could neither bound the window nor
+/// verify the outcome. Between the exclusive `create_new` and this
+/// cleanup, a non-cooperating writer can unlink the partial candidate
+/// and install a different object at the same name; a blind
+/// `remove_file(path)` would then destroy that replacement — including
+/// a preserved diagnostic artifact fencing the store.
 ///
-/// Residual window: like every lstat→unlink pair, the probe and the
-/// removal are two steps; a swap landing between them is the same
-/// best-effort residual the identity-verified publish in
-/// [`store_approvals`] documents, not a silent unguarded deletion.
+/// Unix proof pair: immediately before the removal, the held object's
+/// link count must be exactly 1 — the candidate entry is the only link
+/// to the object this process created, and any other count (a link
+/// added by another writer; the candidate's link already removed and
+/// the name re-populated) is a substituted state in which nothing is
+/// removed. The removal is then proven by the held object's link count
+/// dropping to 0 exactly at it: the removed directory entry was the
+/// object this process created. A removal whose post-act count still
+/// shows a live link proves the removed entry was a substitution
+/// (this process's object was renamed aside), and the tampering is
+/// reported loudly instead of the cleanup silently completing or
+/// silently destroying evidence. A mismatch on any probe is left
+/// exactly as found (the caller still fails closed), and identity that
+/// cannot be proven is never guessed: nothing is removed on a probe
+/// failure. The name is only ever removed by this failure path — a
+/// successful private file is the caller's to publish or keep.
+///
+/// Irreducible platform boundary: Unix has no delete-by-descriptor
+/// primitive (Windows has `FileDispositionInfo`), so an entry unlinked
+/// and replaced in the instant between the pre-removal proofs and the
+/// `remove_file` below can still be removed by this failure path — the
+/// same boundary
+/// `cockpit_host::private_fs::held_directory`'s unlink accepts (it
+/// proves the identical way, after the act) and the TUI clipboard's
+/// `remove_verified` documents. The pre-removal probe plus link-count
+/// guard make that instant as small as the platform admits and catch
+/// every deterministically checkable substitution; the post-removal
+/// proof converts each detectable one into a reported tamper, so
+/// cleanup completion is only ever claimed for the object this process
+/// created. A non-unix target keeps the documented platform-honesty
+/// exemption of [`same_object_at_path`] (no stable link-count or
+/// object-identity probe there): the pre-removal probe stands alone.
 fn discard_partial_private_candidate(out: std::fs::File, path: &Path) {
-    let still_created_object = same_object_at_path(&out, path);
-    drop(out);
-    match still_created_object {
-        Ok(true) => {
-            let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    {
+        // Pre-act link-count guard, taken first so the identity probe can
+        // sit immediately adjacent to the removal: the held object must
+        // be linked exactly once — by the candidate entry this process
+        // created. Any other count (a link added by another writer; the
+        // candidate's link already removed) is a substituted state in
+        // which nothing is removed.
+        match held_link_count(&out) {
+            Ok(1) => {}
+            Ok(links) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    links,
+                    "a failed private-file candidate's link state is not exactly the \
+                     one entry this process created; leaving its name untouched"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "cannot prove the link state of a failed private-file candidate; \
+                     leaving its name untouched"
+                );
+                return;
+            }
         }
-        Ok(false) => tracing::warn!(
-            path = %path.display(),
-            "a failed private-file candidate's name no longer refers to the object \
-             this process created; leaving whatever occupies it untouched"
-        ),
-        Err(error) => tracing::warn!(
-            path = %path.display(),
-            error = %error,
-            "cannot prove the identity of a failed private-file candidate; leaving \
-             its name untouched"
-        ),
+    }
+    // Pre-act identity probe, immediately adjacent to the removal: the
+    // candidate pathname must still refer to the object this process
+    // created and opened, proven through the held handle — never the
+    // pathname alone.
+    match same_object_at_path(&out, path) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                path = %path.display(),
+                "a failed private-file candidate's name no longer refers to the object \
+                 this process created; leaving whatever occupies it untouched"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "cannot prove the identity of a failed private-file candidate; leaving \
+                 its name untouched"
+            );
+            return;
+        }
+    }
+    let removal = std::fs::remove_file(path);
+    #[cfg(unix)]
+    {
+        // Post-act proof: the held object must have lost its one link
+        // exactly at this removal, proving the removed entry was the
+        // object this process created. A still-live link proves the
+        // removed entry was a substitution — report the tamper; the
+        // caller already fails closed either way.
+        match (&removal, held_link_count(&out)) {
+            (Ok(()), Ok(0)) => {}
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (Err(error), _) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "removing a failed private-file candidate failed; leaving any \
+                     residue for the next cycle"
+                );
+            }
+            (Ok(()), Ok(links)) => {
+                tracing::error!(
+                    path = %path.display(),
+                    links,
+                    "the entry removed from a failed private-file candidate's name \
+                     was not the object this process created (its partial still has a \
+                     live link — it was renamed aside); the substitution is reported, \
+                     never silently cleaned"
+                );
+            }
+            (Ok(()), Err(error)) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %error,
+                    "the removal of a failed private-file candidate completed but its \
+                     outcome could not be proven through the held handle; treating it \
+                     as unproven, never as completed cleanup"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = removal {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "removing a failed private-file candidate failed; leaving any \
+                     residue for the next cycle"
+                );
+            }
+        }
     }
 }
 
@@ -2631,10 +2761,11 @@ fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
 /// residue — fails closed with [`ApprovalsLoadError::refusal_message`]:
 /// never a silent `unwrap_or_default()` that would overwrite the corrupt
 /// bytes and drop every standing entry. The lock is one verified shared
-/// object ([`lock_approvals`]), and the publish re-fences that object
-/// before installing anything ([`store_approvals`]) — a lock file
-/// replaced mid-cycle aborts the write closed instead of racing whatever
-/// else now serializes on the replacement.
+/// object ([`lock_approvals`]), and the publish proves that object at
+/// the publication boundary — both sides of the rename
+/// ([`store_approvals`]) — a lock file replaced mid-cycle aborts the
+/// write closed instead of racing whatever else now serializes on the
+/// replacement.
 fn mutate_approvals<R>(
     dir: &Path,
     mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
@@ -2714,53 +2845,88 @@ fn random_hex() -> String {
     out
 }
 
+/// Deterministic seam for the publish-boundary race tests (issue #297):
+/// fires immediately after the staged temp is written and synced, before
+/// the pre-act proofs, so a test can substitute the staged entry or
+/// replace the lock pathname in the exact window the proofs must catch.
+#[cfg(test)]
+thread_local! {
+    static AFTER_STAGING_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Deterministic seam for the publish-boundary race tests (issue #297):
+/// fires after the pre-act proofs and immediately before the rename, so
+/// a test can land a substitution in the pre-act-proof→rename window
+/// that the post-act proofs must detect.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLISH_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_staging_hook() {
+    if let Some(hook) = AFTER_STAGING_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_staging_hook() {}
+
+#[cfg(test)]
+fn run_before_publish_rename_hook() {
+    if let Some(hook) = BEFORE_PUBLISH_RENAME_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_before_publish_rename_hook() {}
+
 /// Write `file` to `<dir>/approvals.json` atomically (owner-only exclusive
-/// temp file + fsync + identity-verified rename + directory fsync) so a
-/// crash mid-write can't corrupt the store, a crash after the rename
+/// temp file + fsync + identity-proof-bound rename + directory fsync) so
+/// a crash mid-write can't corrupt the store, a crash after the rename
 /// can't lose it, and the file is never world-readable. Called with the
 /// approvals lock held; `lock` is that held lock object.
 ///
-/// Two invariants bind the publish (issue #297):
+/// Two invariants bind the publish (issue #297), each proven at the
+/// publication boundary — the pre-act proofs run immediately before
+/// the rename and the post-act proofs immediately after it, so success
+/// is only ever reported for a rename whose entry effects are proven
+/// through the held handles on both sides of the act:
 ///
 /// - **The installed store is the object that was written.** The staged
 ///   temp is a fresh `create_new` file under an unpredictable name
 ///   ([`create_private_store_temp`]) — never a guessable fixed `.tmp`
 ///   whose entry a pre-planted symlink could steer the writer into
-///   truncating — and the rename is taken only while the temp pathname
-///   still refers to the object this process wrote and synced, proven
-///   through the held handle ([`same_object_at_path`]). A replacement at
-///   the staged name is left untouched and the publish fails closed, so
-///   a write never reports success while installing some other object's
-///   bytes. Residual window: like every probe→rename pair, the check and
-///   the rename are two steps; a swap landing between them is the same
-///   best-effort residual documented on
-///   [`discard_partial_private_candidate`], on an unguessable name —
-///   never a silent unguarded publish.
-/// - **The serialization boundary is still valid at publish time.** The
-///   held lock object must still be the one the lock pathname refers to
-///   (the same probe): a lock file replaced while this cycle ran means
-///   the exclusion this write relies on is gone, so the write aborts
-///   (fail closed with a visible error) instead of silently racing
-///   whatever else now serializes on the replacement.
+///   truncating. Before the rename, the staged entry must still refer
+///   to the object this process wrote and synced, proven through the
+///   held handle ([`same_object_at_path`]); a replacement at the staged
+///   name is left untouched and the publish fails closed. After the
+///   rename, the live entry must be proven — through the same held
+///   handle — to be that exact written-and-synced object: a
+///   substitution landing in the pre-act-proof→rename window (the
+///   name is enumerable after creation) makes the rename install the
+///   replacement's bytes, and the post-act proof detects it and fails
+///   the write closed with a tamper error instead of reporting success —
+///   the same detected-not-silent outcome the TUI clipboard
+///   `file_publish` publish established for its identical race. Every
+///   abort after staging removes this process's own partial through
+///   [`discard_partial_private_candidate`] (identity-guarded itself), so
+///   a failed publish leaves no temp residue.
+/// - **The serialization boundary is valid at publication.** The held
+///   lock object must still be the one the lock pathname refers to —
+///   proven immediately before the rename and proven again
+///   immediately after it: a lock file replaced during this cycle (or
+///   in the rename window) means the exclusion this write relies on
+///   is gone, so the write fails closed with a visible error instead
+///   of silently racing whatever else now serializes on the
+///   replacement.
 fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Result<()> {
     let path = dir.join(APPROVALS_FILE);
     let lock_path = dir.join(APPROVALS_LOCK_FILE);
-    // Serialization-boundary fence: this publish is valid only while the
-    // lock object this cycle holds is still the one the lock pathname
-    // names. A replaced lock file means the boundary is gone — leave the
-    // store untouched and fail closed.
-    match same_object_at_path(lock, &lock_path) {
-        Ok(true) => {}
-        Ok(false) => anyhow::bail!(
-            "the approvals lock at {} no longer refers to the lock object held \
-             for this write; the store was left untouched",
-            lock_path.display()
-        ),
-        Err(error) => {
-            return Err(anyhow::Error::from(error))
-                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
-        }
-    }
     let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
     let (mut out, tmp) = create_private_store_temp(dir)?;
     {
@@ -2772,10 +2938,12 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
             return Err(write_error);
         }
     }
-    // Identity-bind the rename to the object that was written: the staged
-    // entry must still be the one this process created, wrote, and synced.
-    // A replacement at the name is not ours to remove or install — leave
-    // it untouched and abort the publish.
+    run_after_staging_hook();
+    // Publish boundary, pre-act proof 1 — identity-bind the rename to the
+    // object that was written: the staged entry must still be the one
+    // this process created, wrote, and synced. A replacement at the name
+    // is not ours to remove or install — leave it untouched and abort
+    // the publish.
     match same_object_at_path(&out, &tmp) {
         Ok(true) => {}
         Ok(false) => anyhow::bail!(
@@ -2784,10 +2952,35 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
             tmp.display()
         ),
         Err(error) => {
+            discard_partial_private_candidate(out, &tmp);
             return Err(anyhow::Error::from(error))
                 .with_context(|| format!("verifying the staged temp at {}", tmp.display()));
         }
     }
+    // Publish boundary, pre-act proof 2 — serialization fence at
+    // publication: this publish is valid only while the lock object this
+    // cycle holds is still the one the lock pathname names. A replaced
+    // lock file means the boundary is gone — remove this process's own
+    // staged partial (never the replacement) and fail closed with the
+    // store untouched.
+    match same_object_at_path(lock, &lock_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            discard_partial_private_candidate(out, &tmp);
+            anyhow::bail!(
+                "the approvals lock at {} no longer refers to the lock object held \
+                 for this write; the store was left untouched",
+                lock_path.display()
+            );
+        }
+        Err(error) => {
+            discard_partial_private_candidate(out, &tmp);
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
+        }
+    }
+    run_before_publish_rename_hook();
+    // The publish act.
     if let Err(error) = std::fs::rename(&tmp, &path) {
         let rename_error =
             anyhow::Error::from(error).with_context(|| format!("renaming into {}", path.display()));
@@ -2796,6 +2989,45 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
         // untouched, never destroyed).
         discard_partial_private_candidate(out, &tmp);
         return Err(rename_error);
+    }
+    // Publish boundary, post-act proof 1 — the installed entry must be
+    // the exact object this process wrote and synced, proven through the
+    // still-held staged handle. A mismatch means a substitution landed
+    // in the pre-act-proof→rename window and the rename installed its
+    // entry: report the publish as failed (fail closed with a visible
+    // tamper error) — a write never reports success while installing
+    // some other object's bytes.
+    match same_object_at_path(&out, &path) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals store write installed an entry at {} that is not the \
+             staged object this process wrote and synced (the staged temp was \
+             substituted during the rename); reporting the publish as failed",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the published store at {}", path.display()));
+        }
+    }
+    // Publish boundary, post-act proof 2 — the serialization boundary must
+    // have held across the publish: the lock pathname must still refer to
+    // the held lock object. A replacement landing in the rename window
+    // means another writer may have serialized on the replacement and
+    // raced this publish; report the write as failed instead of claiming
+    // a serialized success.
+    match same_object_at_path(lock, &lock_path) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals lock at {} was replaced while the store was being \
+             published; the serialization boundary this write relied on is gone, \
+             so the write is reported as failed",
+            lock_path.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
+        }
     }
     sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
@@ -5002,6 +5234,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn discard_partial_private_candidate_removes_the_partial_it_created() {
+        // The happy failure path (issue #297): a candidate whose entry is
+        // still the object this process created is removed, and the
+        // removal is proven after the act through the still-held handle
+        // (its one link drops to zero at this removal) — leaving no
+        // residue from a failed write.
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("approvals.json.corrupt-1");
+        let out = open_new_private_file(&candidate).unwrap();
+
+        discard_partial_private_candidate(out, &candidate);
+
+        assert!(
+            !candidate.exists(),
+            "the partial this process created must be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_partial_private_candidate_refuses_a_hard_linked_candidate() {
+        // Pre-removal link-count guard (issue #297): a hard link to the
+        // candidate object means it is linked more than once — its state
+        // was tampered with and the entry can no longer be bounded to the
+        // one link this process created, so the guarded removal refuses
+        // and leaves the name exactly as found.
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("approvals.json.corrupt-1");
+        let out = open_new_private_file(&candidate).unwrap();
+        let alias = dir.path().join("hard-linked-alias");
+        std::fs::hard_link(&candidate, &alias).unwrap();
+
+        discard_partial_private_candidate(out, &candidate);
+
+        assert!(
+            candidate.exists(),
+            "a hard-linked candidate must never be removed by cleanup"
+        );
+        assert!(alias.exists(), "the alias must be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn store_publish_aborts_when_the_held_lock_no_longer_occupies_the_lock_path() {
         // The lock must be one stable shared object (issue #297): if the
         // lock pathname is replaced while a cycle holds a lock on the
@@ -5048,6 +5323,215 @@ mod tests {
             file.commands_reject.contains("fresh"),
             "a fresh cycle must serialize on the current lock object"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_aborts_and_cleans_its_temp_when_the_lock_is_replaced_after_staging() {
+        // The serialization fence is proven at the publication boundary,
+        // after the staged temp exists (issue #297): a lock pathname
+        // replaced between staging and the publish aborts the write with
+        // the store untouched — and removes this process's own staged
+        // partial, so the abort never leaves temp residue.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        AFTER_STAGING_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Replace the lock path entry (unlink + install a
+                // different object), as a non-cooperating writer would.
+                std::fs::remove_file(dir_path.join(APPROVALS_LOCK_FILE)).unwrap();
+                std::fs::write(dir_path.join(APPROVALS_LOCK_FILE), b"").unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["stolen-boundary".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no longer refers to the lock object"),
+            "{message}"
+        );
+        // The store is left untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            b"{}".as_slice()
+        );
+        // The staged partial this process created is removed by the
+        // abort — the boundary fence never leaks temp residue.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(&format!("{APPROVALS_FILE}.tmp-")),
+                "a fence abort must clean its own staged temp (found {name})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_aborts_when_the_staged_temp_is_substituted_before_the_boundary_proofs() {
+        // The staged entry is discoverable by enumeration after its
+        // creation (issue #297): a non-cooperating writer can unlink it and
+        // install a replacement before the publish. The pre-act staged
+        // identity proof catches it, the publish aborts with the store
+        // untouched, and the replacement is left exactly as found — never
+        // removed, never installed.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        AFTER_STAGING_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let staged = find_staged_store_temp(&dir_path);
+                std::fs::remove_file(&staged).unwrap();
+                std::fs::write(&staged, b"attacker staged bytes").unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["never-landed".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("substituted before the rename"),
+            "{message}"
+        );
+        // The store is left untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            b"{}".as_slice()
+        );
+        // The replacement at the staged name is left exactly as found —
+        // it is not this process's object to remove or install.
+        let staged = find_staged_store_temp(dir.path());
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"attacker staged bytes".as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_fails_closed_when_the_staged_temp_is_substituted_in_the_rename_window() {
+        // The irreducible name-based instant between the pre-act proofs
+        // and the rename (issue #297): a substitution landing exactly
+        // there makes the rename install the replacement's entry. The
+        // post-act published-entry proof detects it through the held
+        // staged handle and the write reports failure — a substituted
+        // publish never reports success.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let staged = find_staged_store_temp(&dir_path);
+                std::fs::remove_file(&staged).unwrap();
+                std::fs::write(&staged, b"attacker installed bytes").unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["never-reported-success".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("substituted during the rename"),
+            "{message}"
+        );
+        // The transient installed bytes are the attacker's, not this
+        // write's — the failure is reported, never a false success. (The
+        // live path now holds invalid JSON; every later read fails closed
+        // through the corrupt-store path, preserving the standing
+        // rejects rather than silently dropping them.)
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            b"attacker installed bytes".as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_fails_closed_when_the_lock_is_replaced_in_the_rename_window() {
+        // The serialization boundary is proven on both sides of the
+        // rename (issue #297): a lock pathname replaced in the pre-act
+        // proof→rename window is caught by the post-act fence, and the
+        // write reports failure — a publish is never claimed successful
+        // while the exclusion it relied on was replaced mid-act.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(dir_path.join(APPROVALS_LOCK_FILE)).unwrap();
+                std::fs::write(dir_path.join(APPROVALS_LOCK_FILE), b"").unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["boundary-replaced-midact".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("was replaced while the store was being published"),
+            "{message}"
+        );
+        // The rename itself completed with this process's proven-staged
+        // object (the post-act published-entry proof passed), but the
+        // serialization boundary was gone mid-act, so the write is
+        // reported as failed — the honest outcome, never a claimed
+        // serialized success.
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(
+            file.commands_reject.contains("boundary-replaced-midact"),
+            "the completed rename's data is on disk; only the claim of a \
+             serialized success is refused"
+        );
+    }
+
+    /// The staged store temp's path, found by enumeration: the staging
+    /// name is random but its prefix is fixed, exactly how a
+    /// non-cooperating writer discovers it (issue #297). Test-only.
+    #[cfg(unix)]
+    fn find_staged_store_temp(dir: &Path) -> PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&format!("{APPROVALS_FILE}.tmp-")))
+            })
+            .expect("the staged store temp exists while the publish is in flight")
     }
 
     #[cfg(unix)]

@@ -693,6 +693,7 @@ mod unix_settlement_invariants {
         assert!(tree.group_is_unattributable());
         adapter
             .terminate(&allocated.handle, 1)
+            .await
             .expect("unattributable terminate is a no-op");
         let _ = first.start_kill();
         let _ = first.wait().await;

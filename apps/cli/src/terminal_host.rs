@@ -47,6 +47,12 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const INGRESS_JOURNAL_CAP: usize = 64;
 const INGRESS_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PreparedIngressQuota {
+    bytes: u64,
+    ops: usize,
+}
 #[cfg(test)]
 static NEXT_LOCAL_TERMINAL_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -126,6 +132,7 @@ struct TerminalContainmentBinding {
 #[derive(Clone)]
 pub struct TerminalHost {
     inner: Arc<Mutex<TerminalHostInner>>,
+    prepared_ingress: Mutex<HashMap<String, PreparedIngressQuota>>,
     event_tx: EventSender,
     redaction: SharedRedactionTable,
     temp_root: PathBuf,
@@ -639,6 +646,7 @@ impl TerminalHost {
         prepare_temp_root(&temp_root);
         Self {
             inner: Arc::new(Mutex::new(TerminalHostInner::default())),
+            prepared_ingress: Mutex::new(HashMap::new()),
             event_tx,
             redaction,
             temp_root,
@@ -875,6 +883,18 @@ impl TerminalHost {
         };
         {
             let mut state = crate::sync::lock_or_recover(&terminal);
+            let released = state
+                .ingress
+                .values()
+                .filter(|operation| operation.state == TerminalIngressState::Prepared)
+                .map(|operation| {
+                    (
+                        operation.owner.principal_id.clone(),
+                        operation.metadata.size,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.release_prepared_ingress(released);
             let _ = close_generation_locked(
                 &mut state,
                 CloseTrigger::ClientClose,
@@ -897,7 +917,11 @@ impl TerminalHost {
         let terminal = self.get_terminal(terminal_id)?;
         let mut state = crate::sync::lock_or_recover(&terminal);
         authorize_binding(&state, binding)?;
-        sweep_ingress_locked(&mut state);
+        let released = sweep_ingress_locked(&mut state);
+        drop(state);
+        self.release_prepared_ingress(released);
+        let mut state = crate::sync::lock_or_recover(&terminal);
+        authorize_binding(&state, binding)?;
         if metadata.operation_id.get_version_num() != 4
             || !(1..=TERMINAL_INGRESS_MAX_BYTES).contains(&metadata.size)
             || !is_sha256_hex(&metadata.sha256)
@@ -957,12 +981,13 @@ impl TerminalHost {
             .get(&binding.binding_id)
             .cloned()
             .ok_or_else(invalid_ingress)?;
+        self.charge_prepared_ingress(&binding_record.owner.principal_id, metadata.size)?;
         state.ingress.insert(
             metadata.operation_id,
             IngressOperation {
                 metadata: metadata.clone(),
                 binding,
-                bytes: Vec::with_capacity(metadata.size as usize),
+                bytes: Vec::new(),
                 state: TerminalIngressState::Prepared,
                 input_sequence: None,
                 created_at: Instant::now(),
@@ -994,7 +1019,7 @@ impl TerminalHost {
         let terminal = self.get_terminal(terminal_id)?;
         let mut state = crate::sync::lock_or_recover(&terminal);
         authorize_binding(&state, binding)?;
-        sweep_ingress_locked(&mut state);
+        self.sweep_terminal_ingress(&mut state);
         let operation = state
             .ingress
             .get_mut(&operation_id)
@@ -1019,7 +1044,7 @@ impl TerminalHost {
         let terminal = self.get_terminal(terminal_id)?;
         let mut state = crate::sync::lock_or_recover(&terminal);
         authorize_binding(&state, binding)?;
-        sweep_ingress_locked(&mut state);
+        self.sweep_terminal_ingress(&mut state);
         let operation = state
             .ingress
             .get(&operation_id)
@@ -1039,7 +1064,7 @@ impl TerminalHost {
         let terminal = self.get_terminal(terminal_id)?;
         let mut state = crate::sync::lock_or_recover(&terminal);
         authorize_binding(&state, binding)?;
-        sweep_ingress_locked(&mut state);
+        self.sweep_terminal_ingress(&mut state);
         if let Some(operation) = state.ingress.get(&operation_id)
             && operation.binding == binding
             && operation.state == TerminalIngressState::Committed
@@ -1108,6 +1133,8 @@ impl TerminalHost {
             .ingress
             .get_mut(&operation_id)
             .ok_or_else(invalid_ingress)?;
+        let prepared_principal = operation.owner.principal_id.clone();
+        let prepared_size = operation.metadata.size;
         operation.state = TerminalIngressState::Committed;
         operation.input_sequence = Some(sequence);
         operation.committed_at = Some(Instant::now());
@@ -1115,6 +1142,7 @@ impl TerminalHost {
         operation.capability = Some(capability);
         operation.verified_file = Some(verified_file);
         operation.bytes.clear();
+        self.release_prepared_ingress(vec![(prepared_principal, prepared_size)]);
         #[cfg(test)]
         self.hit_ingress_barrier(
             IngressMutationEdge::AfterReserve,
@@ -1145,7 +1173,7 @@ impl TerminalHost {
                 .iter()
                 .filter_map(|(id, terminal)| {
                     let mut state = crate::sync::lock_or_recover(terminal);
-                    sweep_ingress_locked(&mut state);
+                    self.sweep_terminal_ingress(&mut state);
                     (state.viewer_count == 0
                         && state
                             .last_detached
@@ -1158,6 +1186,49 @@ impl TerminalHost {
             let _ = self.close(*id);
         }
         ids
+    }
+
+    fn sweep_terminal_ingress(&self, state: &mut TerminalState) {
+        let released = sweep_ingress_locked(state);
+        self.release_prepared_ingress(released);
+    }
+
+    fn charge_prepared_ingress(
+        &self,
+        principal_id: &str,
+        size: u64,
+    ) -> std::result::Result<(), ErrorPayload> {
+        let limits = cockpit_core::resource_limits::ResourceLimits::defaults();
+        let mut quotas = crate::sync::lock_or_recover(&self.prepared_ingress);
+        let entry = quotas.entry(principal_id.to_string()).or_default();
+        if entry.ops >= limits.terminal_ingress_client_prepared_ops
+            || entry.bytes.saturating_add(size) > limits.terminal_ingress_client_prepared_bytes
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::InvalidIngress,
+                message: "terminal ingress client quota exceeded".to_string(),
+            });
+        }
+        entry.ops = entry.ops.saturating_add(1);
+        entry.bytes = entry.bytes.saturating_add(size);
+        Ok(())
+    }
+
+    fn release_prepared_ingress(&self, released: Vec<(String, u64)>) {
+        if released.is_empty() {
+            return;
+        }
+        let mut quotas = crate::sync::lock_or_recover(&self.prepared_ingress);
+        for (principal_id, size) in released {
+            let Some(entry) = quotas.get_mut(&principal_id) else {
+                continue;
+            };
+            entry.ops = entry.ops.saturating_sub(1);
+            entry.bytes = entry.bytes.saturating_sub(size);
+            if entry.ops == 0 && entry.bytes == 0 {
+                quotas.remove(&principal_id);
+            }
+        }
     }
 
     fn get_terminal(
@@ -1546,7 +1617,7 @@ impl crate::daemon::terminal::TerminalHost for TerminalHost {
             .collect::<Vec<_>>();
         for terminal in terminals {
             let mut state = crate::sync::lock_or_recover(&terminal);
-            sweep_ingress_locked(&mut state);
+            self.sweep_terminal_ingress(&mut state);
             let Some(operation_id) = state.ingress.iter().find_map(|(id, operation)| {
                 (operation.capability.as_deref() == Some(capability)).then_some(*id)
             }) else {
@@ -1885,13 +1956,21 @@ fn ingress_response(operation: &IngressOperation) -> Response {
     }
 }
 
-fn sweep_ingress_locked(state: &mut TerminalState) {
+fn sweep_ingress_locked(state: &mut TerminalState) -> Vec<(String, u64)> {
     let now = Instant::now();
+    let mut released = Vec::new();
     state.ingress.retain(|_, operation| {
         let horizon = operation.committed_at.unwrap_or(operation.created_at);
         let expired = now.duration_since(horizon) >= INGRESS_TTL;
+        if expired && operation.state == TerminalIngressState::Prepared {
+            released.push((
+                operation.owner.principal_id.clone(),
+                operation.metadata.size,
+            ));
+        }
         !expired
     });
+    released
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -3258,8 +3337,108 @@ mod tests {
         assert!(is_sha256_hex(&"0".repeat(64)));
         assert_eq!(TERMINAL_INGRESS_MAX_CHUNK_BYTES, 48 * 1024);
         assert_eq!(TERMINAL_INGRESS_MAX_BYTES, 10 * 1024 * 1024);
+        let limits = cockpit_core::resource_limits::ResourceLimits::defaults();
+        assert_eq!(
+            limits.terminal_ingress_operation_bytes,
+            TERMINAL_INGRESS_MAX_BYTES
+        );
+        assert!(
+            limits.terminal_ingress_client_prepared_bytes < TERMINAL_INGRESS_MAX_BYTES * 3,
+            "one client must not be able to pre-declare several 10 MiB operations"
+        );
         assert_eq!(INGRESS_JOURNAL_CAP, 64);
         assert_eq!(INGRESS_TTL, Duration::from_secs(10 * 60));
+    }
+
+    #[cfg(test)]
+    fn prepared_buffer_capacity(
+        host: &TerminalHost,
+        terminal_id: Uuid,
+        operation_id: Uuid,
+    ) -> usize {
+        let terminal = host.get_terminal(terminal_id).unwrap();
+        let state = crate::sync::lock_or_recover(&terminal);
+        state.ingress[&operation_id].bytes.capacity()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ingress_does_not_preallocate_the_declared_size() {
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+        let Response::TerminalOpened {
+            terminal_id,
+            binding,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let metadata = TerminalIngressMetadata {
+            operation_id: Uuid::new_v4(),
+            size: TERMINAL_INGRESS_MAX_BYTES,
+            media_type: TerminalImageType::Png,
+            sha256: "0".repeat(64),
+        };
+        host.ingress_begin(terminal_id, binding, metadata.clone())
+            .unwrap();
+        assert_eq!(
+            prepared_buffer_capacity(&host, terminal_id, metadata.operation_id),
+            0,
+            "declared size must not drive an allocation"
+        );
+        let _ = host.close(terminal_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ingress_enforces_per_client_prepared_quota() {
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+        let Response::TerminalOpened {
+            terminal_id: term_a,
+            binding: binding_a,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Response::TerminalOpened {
+            terminal_id: term_b,
+            binding: binding_b,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let first = TerminalIngressMetadata {
+            operation_id: Uuid::new_v4(),
+            size: TERMINAL_INGRESS_MAX_BYTES,
+            media_type: TerminalImageType::Png,
+            sha256: "a".repeat(64),
+        };
+        host.ingress_begin(term_a, binding_a, first).unwrap();
+        let second = TerminalIngressMetadata {
+            operation_id: Uuid::new_v4(),
+            size: TERMINAL_INGRESS_MAX_BYTES,
+            media_type: TerminalImageType::Png,
+            sha256: "b".repeat(64),
+        };
+        let err = host
+            .ingress_begin(term_b, binding_b, second)
+            .expect_err("second 10 MiB prepare must hit the per-client quota");
+        assert_eq!(err.code, ErrorCode::InvalidIngress);
+        assert!(err.message.contains("quota"), "{}", err.message);
+        let _ = host.close(term_a);
+        let _ = host.close(term_b);
     }
 
     #[test]

@@ -7418,6 +7418,15 @@ CREATE TABLE agent_installations (
     UNIQUE (scope, scope_workspace_key, source_agent_id)
 );
 
+-- Machine-wide onboarding default. The referenced global installation still
+-- has to pass the normal observation/binding checks when a session snapshots
+-- it; this row is selection intent, not launch authority.
+CREATE TABLE agent_default_installation (
+    singleton                     INTEGER PRIMARY KEY CHECK (singleton = 1),
+    installation_id               TEXT NOT NULL UNIQUE REFERENCES agent_installations(installation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    updated_at_unix_ms             INTEGER NOT NULL
+);
+
 CREATE TABLE installation_observations (
     installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     observed_digest              TEXT NOT NULL,

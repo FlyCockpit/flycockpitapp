@@ -5960,6 +5960,7 @@ impl Dialog {
             | cockpit_core::wizard::MODEL_WIZARD_ID
             | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
             | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
             | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
@@ -6006,6 +6007,16 @@ impl Dialog {
     pub fn open_onboarding_lifetime_setup(status: Option<String>) -> Result<Self, String> {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         let descriptor = cockpit_core::wizard::onboarding_lifetime_descriptor();
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
+    pub fn open_onboarding_agent_setup(status: Option<String>) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = cockpit_core::wizard::descriptor_for_cwd(
+            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+            &global_root,
+        )
+        .ok_or_else(|| "could not build onboarding agent catalog".to_string())?;
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
@@ -9722,6 +9733,7 @@ fn apply_setup_wizard_daemon_completion(
                 wizard.run.descriptor().id,
                 cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
             ) && let Err(error) =
                 cockpit_core::welcome::persist_onboarding_wizard_progress(&wizard.run)
@@ -9752,6 +9764,11 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
+            } else if wizard.run.descriptor().id
+                == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
+            {
+                "Installed the pinned agent and saved its model, trust, tool tiers, default, and sidecar settings."
+                    .to_string()
             } else if wizard.run.descriptor().id
                 == cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
             {
@@ -9796,6 +9813,7 @@ fn submit_setup_wizard_answer(
                 run.descriptor().id,
                 cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
                     | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
             ) && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(run)
             {

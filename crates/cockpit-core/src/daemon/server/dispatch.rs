@@ -17272,6 +17272,115 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let mutation = async {
+                if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
+                    let prepared = crate::wizard::prepare_onboarding_agent_answers(&answers_json)
+                        .await
+                        .map_err(internal)?;
+                    let operation_key = uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_URL,
+                        format!(
+                            "flycockpit:onboarding-agent:v1:{}:{}",
+                            prepared.plan.source_locator, answers_json
+                        )
+                        .as_bytes(),
+                    )
+                    .to_string();
+                    let service = ctx.agent_installation_service().map_err(internal)?;
+                    let install = service
+                        .begin(
+                            cockpit_proto::AgentInstallationBeginV1 {
+                                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                                idempotency_key: operation_key,
+                                operation: cockpit_proto::AgentInstallationOperationKind::Install,
+                                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                                workspace_path: None,
+                                source_locator: prepared.plan.source_locator.clone(),
+                                target_installation_id: None,
+                                replace_acknowledged: false,
+                                third_party_trust_confirmed: false,
+                                requested_slot: Some("primary".into()),
+                                roles: Vec::new(),
+                                computer_use: false,
+                                primary_slot_id: None,
+                                auto_select_first_exact: false,
+                            },
+                            crate::workspace_lease::now_unix_ms(),
+                        )
+                        .await;
+                    let terminal = match install {
+                        cockpit_proto::AgentInstallationResultV1::NeedsChoice {
+                            continuation_token,
+                            choices,
+                            ..
+                        } => {
+                            let choice = choices
+                                .iter()
+                                .find(|choice| {
+                                    choice.model_id == prepared.plan.default_model.model
+                                        && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
+                                            &prepared.providers,
+                                            choice,
+                                        )
+                                        .as_deref()
+                                            == Some(prepared.plan.default_model.provider.as_str())
+                                })
+                                .ok_or_else(|| {
+                                    internal(anyhow::anyhow!(
+                                        "selected onboarding model is absent from daemon binding choices"
+                                    ))
+                                })?;
+                            service
+                                .submit_choice(
+                                    cockpit_proto::AgentInstallationSubmitChoiceV1 {
+                                        dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                                        continuation_token,
+                                        choice_id: Some(choice.choice_id.clone()),
+                                        defer: false,
+                                    },
+                                    crate::workspace_lease::now_unix_ms(),
+                                )
+                                .await
+                        }
+                        result => result,
+                    };
+                    let installed_id = match terminal {
+                        cockpit_proto::AgentInstallationResultV1::Receipt {
+                            status:
+                                cockpit_proto::AgentInstallationReceiptStatusV1::Installed
+                                | cockpit_proto::AgentInstallationReceiptStatusV1::Bound,
+                            installation_id: Some(installation_id),
+                            ..
+                        } => uuid::Uuid::parse_str(&installation_id)
+                            .map_err(|error| internal(anyhow::Error::from(error)))?,
+                        cockpit_proto::AgentInstallationResultV1::Error { error } => {
+                            return Err(internal(anyhow::anyhow!(
+                                "agent onboarding install failed: {}",
+                                error.message
+                            )));
+                        }
+                        _ => {
+                            return Err(internal(anyhow::anyhow!(
+                                "agent onboarding did not produce a usable primary binding"
+                            )));
+                        }
+                    };
+                    if prepared.plan.make_default {
+                        ctx.db
+                            .set_default_agent_installation(
+                                installed_id,
+                                crate::workspace_lease::now_unix_ms(),
+                            )
+                            .await
+                            .map_err(internal)?;
+                    }
+                    crate::wizard::persist_onboarding_agent_plan(&prepared.plan)
+                        .map_err(internal)?;
+                    return Ok(Response::SetupWizardApplied {
+                        changed: true,
+                        model_file_written: true,
+                        default_scope: Some("global".into()),
+                    });
+                }
                 let result = crate::wizard::apply_setup_wizard_answers_authoritative(
                     std::path::Path::new(&project_root),
                     &wizard_id,

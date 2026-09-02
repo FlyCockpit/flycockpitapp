@@ -34,6 +34,82 @@ use crate::wizard::{
     model_subagent_answers, model_system_prompt_answer, model_trust_answer, sandbox_mode_answer,
 };
 
+pub struct PreparedOnboardingAgent {
+    pub plan: crate::onboarding_agent::OnboardingAgentPlan,
+    pub providers: crate::config::providers::ProvidersConfig,
+}
+
+pub async fn prepare_onboarding_agent_answers(
+    answers_json: &str,
+) -> Result<PreparedOnboardingAgent> {
+    let global_config = global_config_file().context("resolving global agent onboarding config")?;
+    let providers = ConfigDoc::load(&global_config)?.providers();
+    let descriptor = crate::wizard::onboarding_agent_descriptor(&providers);
+    let run = WizardRun::from_answers_json(descriptor, answers_json)?;
+    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
+    let (slug, answers) =
+        crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
+    let entry = catalog
+        .index
+        .entry(&slug)
+        .with_context(|| format!("selected agent `{slug}` is absent from the pinned catalog"))?;
+    let plan = crate::onboarding_agent::build_onboarding_agent_plan(entry, answers, &providers)?;
+    Ok(PreparedOnboardingAgent { plan, providers })
+}
+
+pub fn persist_onboarding_agent_plan(plan: &crate::onboarding_agent::OnboardingAgentPlan) -> Result<()> {
+    let global_config = global_config_file().context("resolving global agent onboarding config")?;
+    let model_target = crate::config::providers::provider_file_path_for_config(
+        &global_config,
+        &plan.default_model.provider,
+    )
+    .context("resolving onboarding model config")?;
+    let mut model_doc = ConfigDoc::load(&model_target)?;
+    let mut model_layer = model_doc.providers();
+    let provider = model_layer
+        .providers
+        .entry(plan.default_model.provider.clone())
+        .or_default();
+    let model_index = provider
+        .models
+        .iter()
+        .position(|model| model.id == plan.default_model.model)
+        .unwrap_or_else(|| {
+            provider.models.push(crate::config::providers::ModelEntry {
+                id: plan.default_model.model.clone(),
+                ..Default::default()
+            });
+            provider.models.len() - 1
+        });
+    let model = provider
+        .models
+        .get_mut(model_index)
+        .context("onboarding model insertion failed")?;
+    model.trust = Some(plan.model_trust);
+    model_doc.write_model_wizard_fields(&plan.default_model.provider, model)?;
+
+    if plan.make_default {
+        crate::config::providers::mutate_effective_default(
+            global_config
+                .parent()
+                .context("global config file has no parent directory")?,
+            Some(&plan.default_model),
+            crate::config::providers::ActiveModelWriteMode::Replace,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| anyhow!("{}", error.user_message))?;
+    }
+
+    let mut extended_doc = ExtendedConfigDoc::load(&global_config)?;
+    let mut extended = extended_doc.config();
+    let mut providers = ConfigDoc::load(&global_config)?.providers();
+    plan.apply_to_configs(&mut providers, &mut extended)?;
+    extended_doc.write(&extended)?;
+    Ok(())
+}
+
 /// Compose a daemon-less host-capability snapshot for the setup wizard.
 /// Callers inject this; the wizard never consults a process-global cache.
 pub async fn compose_wizard_host_capabilities(cwd: &Path) -> cockpit_proto::HostCapabilitySnapshot {
@@ -95,6 +171,13 @@ pub fn descriptor_for_cwd_with_caps(
     if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
+    if id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
+        let current = ConfigDoc::load(&global_config)
+            .ok()
+            .map(|doc| doc.providers())
+            .unwrap_or_default();
+        return Some(crate::wizard::onboarding_agent_descriptor(&current));
+    }
     if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
         return Some(crate::wizard::onboarding_lifetime_descriptor());
     }
@@ -153,6 +236,7 @@ pub fn apply_setup_wizard_answers(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | crate::wizard::ONBOARDING_AGENT_WIZARD_ID
             | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
@@ -194,6 +278,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | crate::wizard::ONBOARDING_AGENT_WIZARD_ID
             | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));

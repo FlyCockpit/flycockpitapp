@@ -27,6 +27,7 @@ pub enum OnboardingStage {
     Profile,
     Provider,
     Model,
+    Agent,
     Lifetime,
     Complete,
 }
@@ -128,6 +129,7 @@ pub fn persist_onboarding_wizard_progress(run: &crate::wizard::WizardRun) -> Res
             crate::wizard::PROVIDER_WIZARD_ID
                 | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
                 | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+                | crate::wizard::ONBOARDING_AGENT_WIZARD_ID
                 | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
         ),
         "wizard `{}` is not resumable onboarding",
@@ -325,7 +327,7 @@ fn build_launch_info(
         .filter(|name| !name.is_empty())
         .map(ToString::to_string);
     let banner_enabled = extended.tui.banner.enabled;
-    let agent_name = extended.default_primary_agent.agent_name().to_string();
+    let agent_name = extended.default_agent_name().to_string();
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),

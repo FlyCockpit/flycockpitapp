@@ -2726,6 +2726,34 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             )?;
         }
         crate::agents::apply_author_tool_tier_preferences(&mut effective_def)?;
+        if let Some(defaults) = args
+            .config
+            .extended()
+            .agent_runtime_defaults
+            .get(&effective_def.name)
+        {
+            let mut selection = crate::agents::ToolSurfaceSelection {
+                tools: effective_def.tools.clone().unwrap_or_default(),
+                tool_tiers: effective_def.tool_tiers.clone(),
+            };
+            for (tool, tier) in &defaults.tool_tiers {
+                selection.tool_tiers.insert(
+                    tool.clone(),
+                    match tier {
+                        crate::config::extended::AgentRuntimeToolTier::Enabled => {
+                            crate::agents::ToolTier::Enabled
+                        }
+                        crate::config::extended::AgentRuntimeToolTier::Disabled => {
+                            crate::agents::ToolTier::Disabled
+                        }
+                        crate::config::extended::AgentRuntimeToolTier::MontyOnly => {
+                            crate::agents::ToolTier::Discoverable
+                        }
+                    },
+                );
+            }
+            crate::agents::apply_tool_surface_override(&mut effective_def, &selection)?;
+        }
     }
     let def = &effective_def;
     let effective_vnext_grant = effective_vnext_grant_for(def, args)?;

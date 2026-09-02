@@ -582,6 +582,19 @@ pub struct ExtendedConfig {
     #[serde(rename = "defaultPrimaryAgent", default)]
     pub default_primary_agent: DefaultPrimaryAgent,
 
+    /// Installed launch-v1 agent selected during onboarding. When present it
+    /// supersedes the legacy built-in-only `defaultPrimaryAgent` switch for
+    /// new code sessions. The stored value is the agent's final ID segment,
+    /// never a source path or repository locator.
+    #[serde(rename = "defaultAgent", default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+
+    /// Host-owned per-agent onboarding overrides. These are separate from the
+    /// portable definition's author preferences and therefore cannot be
+    /// supplied by an agent repository.
+    #[serde(rename = "agentRuntimeDefaults", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_runtime_defaults: BTreeMap<String, AgentRuntimeDefaults>,
+
     /// Raw removed/unknown `defaultPrimaryAgent` value that degraded to
     /// [`DefaultPrimaryAgent::Build`]. This is runtime-only notice state:
     /// it is derived from config input, cloned through daemon snapshots, and
@@ -1167,6 +1180,23 @@ pub enum DefaultPrimaryAgent {
     Plan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntimeToolTier {
+    Enabled,
+    Disabled,
+    MontyOnly,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuntimeDefaults {
+    #[serde(rename = "toolTiers", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_tiers: BTreeMap<String, AgentRuntimeToolTier>,
+    #[serde(rename = "montyPackages", default, skip_serializing_if = "Vec::is_empty")]
+    pub monty_packages: Vec<String>,
+}
+
 impl<'de> Deserialize<'de> for DefaultPrimaryAgent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1750,6 +1780,14 @@ impl ExtendedConfig {
         self.removed_default_primary_agent.as_deref()
     }
 
+    pub fn default_agent_name(&self) -> &str {
+        self.default_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.default_primary_agent.agent_name())
+    }
+
     pub fn removed_llm_mode(&self) -> Option<&str> {
         self.removed_llm_mode.as_deref()
     }
@@ -1814,6 +1852,8 @@ impl Default for ExtendedConfig {
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
+            default_agent: None,
+            agent_runtime_defaults: BTreeMap::new(),
             removed_default_primary_agent: None,
             removed_llm_mode: None,
             translation: TranslationConfig::default(),
@@ -2620,6 +2660,15 @@ pub(crate) fn strip_remote_image_sidecar(raw: &mut Value) {
     }
 }
 
+/// Per-agent runtime defaults are host authority: a remote layer may not
+/// change native/Monty tool placement, packages, or the machine default agent.
+pub(crate) fn strip_remote_agent_runtime_defaults(raw: &mut Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("defaultAgent");
+        obj.remove("agentRuntimeDefaults");
+    }
+}
+
 /// Parse config.json bytes into an object root, mirroring
 /// [`ExtendedConfigDoc::load`]: empty/whitespace bytes are an empty object, and
 /// a non-object root is rejected (fail closed). Shared by the layered loader's
@@ -2765,6 +2814,7 @@ impl ExtendedConfigDoc {
     pub fn from_remote_layer(mut raw: Value) -> Self {
         strip_remote_image_generation(&mut raw);
         strip_remote_image_sidecar(&mut raw);
+        strip_remote_agent_runtime_defaults(&mut raw);
         strip_secret_store_key(&mut raw);
         Self {
             path: PathBuf::from("<remote .well-known/cockpit>"),
@@ -2950,6 +3000,8 @@ impl ExtendedConfigDoc {
                 },
             }
         }
+        parse_field!("defaultAgent", default_agent);
+        parse_field!("agentRuntimeDefaults", agent_runtime_defaults);
         parse_field!("translation", translation);
         parse_field!("sandboxEscalationEnabled", sandbox_escalation_enabled);
         parse_field!("sandbox_escalation_enabled", sandbox_escalation_enabled);
@@ -2985,6 +3037,7 @@ impl ExtendedConfigDoc {
             // layer.
             strip_remote_image_generation(&mut raw);
             strip_remote_image_sidecar(&mut raw);
+            strip_remote_agent_runtime_defaults(&mut raw);
         }
         strip_secret_store_key(&mut raw);
         let Some(obj) = raw.as_object_mut() else {

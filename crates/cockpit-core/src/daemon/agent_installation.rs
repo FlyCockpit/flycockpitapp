@@ -200,6 +200,24 @@ impl CanonicalAgentSource {
     pub fn identity(&self) -> String {
         format!("{}/{}:{}", self.owner, self.repository, self.markdown_path)
     }
+
+    /// Resolve the installed name for both the legacy flat `agents/name.md`
+    /// layout and package-style `agents/name/agent.md` definitions.
+    pub fn agent_name(&self) -> Result<&str> {
+        let mut segments = self.markdown_path.rsplit('/');
+        let filename = segments
+            .next()
+            .context("source Markdown path has no agent filename")?;
+        if filename == "agent.md"
+            && let Some(package_name) = segments.next().filter(|value| !value.is_empty())
+        {
+            return Ok(package_name);
+        }
+        filename
+            .strip_suffix(".md")
+            .filter(|value| !value.is_empty())
+            .context("source Markdown path has no agent filename")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3668,13 +3686,7 @@ impl AgentInstallationService {
         expected_agent_id: Option<&str>,
     ) -> Result<FetchedAgentSource> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
+        let name = source.agent_name()?;
         let fetched = if source.owner == "FlyCockpit"
             && source.repository == "agents"
             && source.requested_revision.as_deref()
@@ -3767,13 +3779,7 @@ impl AgentInstallationService {
         fetched: &FetchedAgentSource,
     ) -> Result<()> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
+        let name = source.agent_name()?;
         let target = owned_path(
             &self.daemon_agents_dir,
             workspace_root,
@@ -3839,13 +3845,7 @@ impl AgentInstallationService {
         prefetched: Option<FetchedAgentSource>,
     ) -> Result<AgentInstallationResultV1> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
+        let name = source.agent_name()?;
         ensure!(
             !crate::agents::is_builtin_agent(name),
             "daemon installation may not overwrite a protected builtin agent"
@@ -5853,13 +5853,7 @@ fn staged_source_journal_metadata(
     fetched: &FetchedAgentSource,
 ) -> Result<(String, String)> {
     let source = CanonicalAgentSource::parse(source_locator)?;
-    let target_name = source
-        .markdown_path
-        .rsplit('/')
-        .next()
-        .and_then(|value| value.strip_suffix(".md"))
-        .filter(|value| !value.is_empty())
-        .context("source Markdown path has no agent filename")?;
+    let target_name = source.agent_name()?;
     let digest = sha256_hex(&fetched.markdown);
     let metadata = serde_json::to_string(&JournalStagedSource {
         target_name: target_name.to_owned(),
@@ -8327,7 +8321,11 @@ mod tests {
     }
     #[test]
     fn agent_installation_daemon_source_parser_refuses_urls_traversal_and_non_markdown() {
-        assert!(CanonicalAgentSource::parse("owner/repo@main:agents/helper.md").is_ok());
+        let flat = CanonicalAgentSource::parse("owner/repo@main:agents/helper.md").unwrap();
+        assert_eq!(flat.agent_name().unwrap(), "helper");
+        let package =
+            CanonicalAgentSource::parse("owner/repo@main:agents/frontier-coding/agent.md").unwrap();
+        assert_eq!(package.agent_name().unwrap(), "frontier-coding");
         for source in [
             "https://github.com/owner/repo:a.md",
             "owner/repo:../a.md",

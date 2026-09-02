@@ -203,6 +203,6 @@ pub(super) fn update_live_foreground(
 /// this when it constructs a fresh session row; the worker uses it for the
 /// approver's prompt-attribution agent. Lives here so the constants and
 /// event-translation helpers stay in one module.
-pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &'static str {
-    cfg.default_primary_agent.agent_name()
+pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &str {
+    cfg.default_agent_name()
 }

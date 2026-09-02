@@ -15,7 +15,8 @@ pub use apply::{
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
-    security_config_path,
+    persist_onboarding_agent_plan, prepare_onboarding_agent_answers, security_config_path,
+    PreparedOnboardingAgent,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -23,6 +24,7 @@ pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
 pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
 pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
+pub const ONBOARDING_AGENT_WIZARD_ID: &str = "onboarding-agent";
 pub const ONBOARDING_LIFETIME_WIZARD_ID: &str = "onboarding-lifetime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -601,6 +603,388 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
             ),
         ],
     }
+}
+
+/// Agent installation and default-selection step. Discovery is filtered by
+/// the configured model catalog before the user sees it. The apply boundary
+/// resolves the live first-party revision again and pins that SHA.
+pub fn onboarding_agent_descriptor(
+    providers: &crate::config::providers::ProvidersConfig,
+) -> WizardDescriptor {
+    let catalog = crate::daemon::agent_catalog::cached_catalog().ok();
+    let agent_options = catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .suggestions_for_models(providers)
+                .into_iter()
+                .map(|entry| SelectOption {
+                    id: entry.catalog.slug.clone().into(),
+                    label: entry.catalog.display_name.clone().into(),
+                    description: entry.definition.description.clone().into(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let offerings = crate::daemon::agent_installation::setup_offerings(providers);
+    let mut compatible_models = BTreeMap::new();
+    if let Some(catalog) = &catalog {
+        for entry in catalog.suggestions_for_models(providers) {
+            let Some(primary) = entry.definition.model_slots.get("primary") else {
+                continue;
+            };
+            for offering in
+                crate::agents::ranked_compatible_offerings(primary, &offerings, providers)
+            {
+                compatible_models
+                    .entry((
+                        offering.provider_profile_handle.clone(),
+                        offering.model_id.clone(),
+                    ))
+                    .or_insert_with(|| SelectOption {
+                        id: format!(
+                            "{}/{}",
+                            offering.provider_profile_handle, offering.model_id
+                        )
+                        .into(),
+                        label: format!(
+                            "{}/{}",
+                            offering.provider_profile_handle, offering.model_id
+                        )
+                        .into(),
+                        description: "Compatible with at least one suggested agent".into(),
+                    });
+            }
+        }
+    }
+    let active_model_default = providers.active_model.as_ref().and_then(|active| {
+        compatible_models
+            .contains_key(&(active.provider.clone(), active.model.clone()))
+            .then(|| WizardAnswer::Select(format!("{}/{}", active.provider, active.model)))
+    });
+    let mut sidecar_options = vec![SelectOption {
+        id: "disabled".into(),
+        label: "Disable image sidecar".into(),
+        description: "Screenshots will not be sent to a separate vision model".into(),
+    }];
+    for (provider_id, provider) in &providers.providers {
+        for model in &provider.models {
+            if !providers
+                .resolve_effective_model_capabilities(
+                    provider_id,
+                    &model.id,
+                    providers.resolution_generation,
+                )
+                .supports_image_input()
+            {
+                continue;
+            }
+            let self_hosted = matches!(
+                providers.resolve_location(provider_id, &model.id),
+                Some(crate::config::providers::ModelLocation::Local)
+                    | Some(crate::config::providers::ModelLocation::PrivateRemote)
+            );
+            let locality = if self_hosted { "local" } else { "remote" };
+            sidecar_options.push(SelectOption {
+                id: format!("{locality}:{provider_id}/{}", model.id).into(),
+                label: format!("{provider_id}/{}", model.id).into(),
+                description: if self_hosted {
+                    "Local/self-hosted vision model (preferred)".into()
+                } else {
+                    "Remote vision model; screenshots and image content leave this machine".into()
+                },
+            });
+        }
+    }
+    let sidecar_default = crate::onboarding_agent::preferred_self_hosted_sidecar(providers)
+        .map(|sidecar| WizardAnswer::Select(format!("local:{}/{}", sidecar.provider, sidecar.model)))
+        .unwrap_or_else(|| WizardAnswer::Select("disabled".into()));
+    WizardDescriptor {
+        id: ONBOARDING_AGENT_WIZARD_ID,
+        title: "Install your coding agent",
+        description: "Choose an agent, confirm model trust, configure tools, and select an image sidecar",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        steps: vec![
+            StepDescriptor {
+                id: "agent",
+                prompt: "Choose an agent compatible with your configured models",
+                help: "Cockpit prefers the live FlyCockpit/agents catalog and uses this bundled snapshot when offline.",
+                help_hook: None,
+                kind: StepKind::Select { options: agent_options },
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "model-trust",
+                prompt: "How should Cockpit classify the default model?",
+                help: "Trusted models may receive unredacted content. Untrusted models keep outbound redaction enabled. Cockpit never chooses this for you.",
+                help_hook: None,
+                kind: StepKind::Select { options: vec![
+                    SelectOption { id: "untrusted".into(), label: "Untrusted".into(), description: "Keep outbound secret redaction enabled".into() },
+                    SelectOption { id: "trusted".into(), label: "Trusted".into(), description: "Allow content without untrusted-model redaction".into() },
+                ] },
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "default-model",
+                prompt: "Choose this agent's default model",
+                help: "Only configured models compatible with the selected agent can be installed. If you make the agent the default, this also becomes Cockpit's default model.",
+                help_hook: None,
+                kind: StepKind::Select { options: compatible_models.into_values().collect() },
+                default_answer: active_model_default,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "model-trust-confirm",
+                prompt: "I confirm this model trust classification.",
+                help: "This confirmation is required even for the bundled agent and even when the provider already has a trust value.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "tool-configuration",
+                prompt: "Tool configuration",
+                help: "Author defaults preserve the agent's native/Monty tiers. Advanced lets you enable, disable, or make tools Monty-only.",
+                help_hook: None,
+                kind: StepKind::Select { options: vec![
+                    SelectOption { id: "author-defaults".into(), label: "Use author tiers".into(), description: "Recommended default".into() },
+                    SelectOption { id: "advanced".into(), label: "Advanced".into(), description: "Review each tool tier".into() },
+                ] },
+                default_answer: Some(WizardAnswer::Select("author-defaults".into())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(onboarding_tool_configuration_branch),
+            },
+            StepDescriptor {
+                id: "advanced-tools",
+                prompt: "Set per-tool tiers",
+                help: "Monty-only removes a tool from the provider-visible schema while retaining governed discovery.",
+                help_hook: None,
+                kind: StepKind::ToolSurface,
+                default_answer: Some(WizardAnswer::ToolSurface(crate::agents::ToolSurfaceSelection::default())),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "requests-package",
+                prompt: "Enable the governed Monty `requests` package for this agent?",
+                help: "Off by default. Network policy and the standard-library restrictions still apply independently.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(false)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "sidecar",
+                prompt: "Choose an image sidecar",
+                help: "Local/self-hosted vision models are preferred. Selecting a remote model requires a separate egress confirmation.",
+                help_hook: None,
+                kind: StepKind::Select { options: sidecar_options },
+                default_answer: Some(sidecar_default),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(onboarding_sidecar_branch),
+            },
+            StepDescriptor {
+                id: "sidecar-egress-confirm",
+                prompt: "I understand screenshots and image content will leave this machine.",
+                help: "This is separate from model trust and is required for a cloud/unknown-location sidecar.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "make-default",
+                prompt: "Make this the default agent and its selected model the default model?",
+                help: "You can change either default later in Settings.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(true)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            action_step("agent-install", "Install agent", "Installing pinned agent…"),
+        ],
+    }
+}
+
+fn validate_required_confirmation(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Confirm(true) => Ok(()),
+        _ => Err("explicit confirmation is required".into()),
+    }
+}
+
+fn onboarding_tool_configuration_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    match answer {
+        WizardAnswer::Select(value) if value == "advanced" => Some("advanced-tools"),
+        WizardAnswer::Select(_) => Some("requests-package"),
+        _ => None,
+    }
+}
+
+fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    let WizardAnswer::Select(value) = answer else { return None };
+    if value == "disabled" {
+        return Some("make-default");
+    }
+    if value.starts_with("local:") {
+        Some("make-default")
+    } else {
+        Some("sidecar-egress-confirm")
+    }
+}
+
+pub fn onboarding_agent_answers(
+    run: &WizardRun,
+    catalog_revision: String,
+) -> Result<(String, crate::onboarding_agent::OnboardingAgentAnswers)> {
+    use crate::onboarding_agent::{
+        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingMontyPackages,
+        OnboardingSidecarSelection, OnboardingToolConfiguration, OnboardingToolMode,
+    };
+    let agent = match run.answer("agent") {
+        Some(WizardAnswer::Select(value)) => value.clone(),
+        _ => return Err(anyhow!("agent selection is required")),
+    };
+    let model_trust = match run.answer("model-trust") {
+        Some(WizardAnswer::Select(value)) if value == "trusted" => OnboardingModelTrust::Trusted,
+        Some(WizardAnswer::Select(value)) if value == "untrusted" => {
+            OnboardingModelTrust::Untrusted
+        }
+        _ => return Err(anyhow!("model trust selection is required")),
+    };
+    let model_trust_confirmed = matches!(
+        run.answer("model-trust-confirm"),
+        Some(WizardAnswer::Confirm(true))
+    );
+    let (default_model_provider, default_model) = match run.answer("default-model") {
+        Some(WizardAnswer::Select(value)) => value
+            .split_once('/')
+            .map(|(provider, model)| (provider.to_string(), model.to_string()))
+            .context("default model selection omitted provider or model")?,
+        _ => return Err(anyhow!("default model selection is required")),
+    };
+    let tools = match run.answer("tool-configuration") {
+        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
+            OnboardingToolConfiguration::AuthorDefaults
+        }
+        Some(WizardAnswer::Select(value)) if value == "advanced" => {
+            let selection = match run.answer("advanced-tools") {
+                Some(WizardAnswer::ToolSurface(selection)) => selection,
+                _ => return Err(anyhow!("advanced tool configuration is required")),
+            };
+            let mut modes = BTreeMap::new();
+            for tool in crate::agents::known_tool_names() {
+                let selected = selection.tools.iter().any(|selected| selected == tool);
+                let tier = if selected {
+                    Some(
+                        selection
+                            .tool_tiers
+                            .get(*tool)
+                            .copied()
+                            .unwrap_or(crate::agents::ToolTier::Enabled),
+                    )
+                } else {
+                    crate::agents::legal_tool_tiers(tool)
+                        .contains(&crate::agents::ToolTier::Disabled)
+                        .then_some(crate::agents::ToolTier::Disabled)
+                };
+                if let Some(tier) = tier {
+                    modes.insert(
+                        (*tool).to_string(),
+                        match tier {
+                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
+                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
+                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
+                        },
+                    );
+                }
+            }
+            OnboardingToolConfiguration::Advanced(modes)
+        }
+        _ => return Err(anyhow!("tool configuration selection is required")),
+    };
+    let requests = matches!(
+        run.answer("requests-package"),
+        Some(WizardAnswer::Confirm(true))
+    );
+    let sidecar = match run.answer("sidecar") {
+        Some(WizardAnswer::Select(value)) if value == "disabled" => {
+            OnboardingSidecarSelection::Disabled
+        }
+        Some(WizardAnswer::Select(value)) => {
+            let (remote, selector) = if let Some(selector) = value.strip_prefix("local:") {
+                (false, selector)
+            } else if let Some(selector) = value.strip_prefix("remote:") {
+                (true, selector)
+            } else {
+                return Err(anyhow!("invalid sidecar selection"));
+            };
+            let (provider, model) = selector
+                .split_once('/')
+                .context("sidecar selection omitted provider or model")?;
+            OnboardingSidecarSelection::Model {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                remote_image_egress_confirmed: !remote
+                    || matches!(
+                        run.answer("sidecar-egress-confirm"),
+                        Some(WizardAnswer::Confirm(true))
+                    ),
+            }
+        }
+        _ => return Err(anyhow!("sidecar selection is required")),
+    };
+    Ok((
+        agent,
+        OnboardingAgentAnswers {
+            catalog_revision,
+            default_model_provider,
+            default_model,
+            model_trust,
+            model_trust_confirmed,
+            tools,
+            monty_packages: OnboardingMontyPackages { requests },
+            sidecar,
+            make_default: matches!(
+                run.answer("make-default"),
+                Some(WizardAnswer::Confirm(true))
+            ),
+        },
+    ))
 }
 
 pub fn onboarding_background_agents_answer(run: &WizardRun) -> Option<bool> {

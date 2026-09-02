@@ -2737,6 +2737,12 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
                 tool_tiers: effective_def.tool_tiers.clone(),
             };
             for (tool, tier) in &defaults.tool_tiers {
+                // Onboarding can describe the full host tool catalog, but it
+                // may only rearrange tools already present in this agent's
+                // resolved grant. It can never acquire a tool by naming it.
+                if !selection.tools.iter().any(|granted| granted == tool) {
+                    continue;
+                }
                 selection.tool_tiers.insert(
                     tool.clone(),
                     match tier {

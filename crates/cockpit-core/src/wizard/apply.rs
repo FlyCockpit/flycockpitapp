@@ -39,14 +39,74 @@ pub struct PreparedOnboardingAgent {
     pub providers: crate::config::providers::ProvidersConfig,
 }
 
+/// Exact pre-onboarding bytes for the configuration files this flow owns.
+/// The daemon holds the config-publication boundary while this token is live;
+/// it is therefore safe to compensate a later database/install failure without
+/// overwriting an interleaved daemon publisher.
+pub struct OnboardingConfigRollback {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+impl OnboardingConfigRollback {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(anyhow!(error))
+                            .with_context(|| format!("capturing {}", path.display()));
+                    }
+                };
+                Ok((path, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { files })
+    }
+
+    pub fn restore(self) -> Result<()> {
+        for (path, bytes) in self.files {
+            match bytes {
+                Some(bytes) => crate::config::config::files::atomic_write(&path, &bytes)
+                    .with_context(|| format!("restoring {}", path.display()))?,
+                None => match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(anyhow!(error)).with_context(|| {
+                            format!("removing {} during rollback", path.display())
+                        });
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
 pub async fn prepare_onboarding_agent_answers(
     answers_json: &str,
 ) -> Result<PreparedOnboardingAgent> {
+    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
+    prepare_onboarding_agent_answers_for_catalog(answers_json, catalog)
+}
+
+/// Bind onboarding answers to one already-resolved catalog.  The daemon uses
+/// this form to perform network discovery before taking the publication lock;
+/// all config reads and writes then share that one serialized boundary.
+pub fn prepare_onboarding_agent_answers_for_catalog(
+    answers_json: &str,
+    catalog: crate::daemon::agent_catalog::ResolvedAgentCatalog,
+) -> Result<PreparedOnboardingAgent> {
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let providers = ConfigDoc::load(&global_config)?.providers();
-    let descriptor = crate::wizard::onboarding_agent_descriptor(&providers);
+    // Discovery is part of the selection authority, not an install-time
+    // afterthought.  Reuse this exact resolved catalog for descriptor replay
+    // and the eventual pinned lookup so live-only agents remain selectable.
+    let descriptor = crate::wizard::onboarding_agent_descriptor(&providers, &catalog.index);
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
-    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
     let (slug, answers) = crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
     let entry = catalog
         .index
@@ -58,57 +118,70 @@ pub async fn prepare_onboarding_agent_answers(
 
 pub fn persist_onboarding_agent_plan(
     plan: &crate::onboarding_agent::OnboardingAgentPlan,
-) -> Result<()> {
+) -> Result<OnboardingConfigRollback> {
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let model_target = crate::config::providers::provider_file_path_for_config(
         &global_config,
         &plan.default_model.provider,
     )
     .context("resolving onboarding model config")?;
-    let mut model_doc = ConfigDoc::load(&model_target)?;
-    let mut model_layer = model_doc.providers();
-    let provider = model_layer
-        .providers
-        .entry(plan.default_model.provider.clone())
-        .or_default();
-    let model_index = provider
-        .models
-        .iter()
-        .position(|model| model.id == plan.default_model.model)
-        .unwrap_or_else(|| {
-            provider.models.push(crate::config::providers::ModelEntry {
-                id: plan.default_model.model.clone(),
-                ..Default::default()
+    let rollback =
+        OnboardingConfigRollback::capture([global_config.clone(), model_target.clone()])?;
+    let result = (|| {
+        let mut model_doc = ConfigDoc::load(&model_target)?;
+        let mut model_layer = model_doc.providers();
+        let provider = model_layer
+            .providers
+            .entry(plan.default_model.provider.clone())
+            .or_default();
+        let model_index = provider
+            .models
+            .iter()
+            .position(|model| model.id == plan.default_model.model)
+            .unwrap_or_else(|| {
+                provider.models.push(crate::config::providers::ModelEntry {
+                    id: plan.default_model.model.clone(),
+                    ..Default::default()
+                });
+                provider.models.len() - 1
             });
-            provider.models.len() - 1
-        });
-    let model = provider
-        .models
-        .get_mut(model_index)
-        .context("onboarding model insertion failed")?;
-    model.trust = Some(plan.model_trust);
-    model_doc.write_model_wizard_fields(&plan.default_model.provider, model)?;
+        let model = provider
+            .models
+            .get_mut(model_index)
+            .context("onboarding model insertion failed")?;
+        model.trust = Some(plan.model_trust);
+        model_doc.write_model_wizard_fields(&plan.default_model.provider, model)?;
 
-    if plan.make_default {
-        crate::config::providers::mutate_effective_default(
-            global_config
-                .parent()
-                .context("global config file has no parent directory")?,
-            Some(&plan.default_model),
-            crate::config::providers::ActiveModelWriteMode::Replace,
-            None,
-            None,
-            None,
-        )
-        .map_err(|error| anyhow!("{}", error.user_message))?;
+        if plan.make_default {
+            crate::config::providers::mutate_effective_default(
+                global_config
+                    .parent()
+                    .context("global config file has no parent directory")?,
+                Some(&plan.default_model),
+                crate::config::providers::ActiveModelWriteMode::Replace,
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| anyhow!("{}", error.user_message))?;
+        }
+
+        let mut extended_doc = ExtendedConfigDoc::load(&global_config)?;
+        let mut extended = extended_doc.config();
+        let mut providers = ConfigDoc::load(&global_config)?.providers();
+        plan.apply_to_configs(&mut providers, &mut extended)?;
+        extended_doc.write(&extended)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(rollback),
+        Err(error) => {
+            rollback
+                .restore()
+                .context("rolling back failed onboarding config publication")?;
+            Err(error)
+        }
     }
-
-    let mut extended_doc = ExtendedConfigDoc::load(&global_config)?;
-    let mut extended = extended_doc.config();
-    let mut providers = ConfigDoc::load(&global_config)?.providers();
-    plan.apply_to_configs(&mut providers, &mut extended)?;
-    extended_doc.write(&extended)?;
-    Ok(())
 }
 
 /// Compose a daemon-less host-capability snapshot for the setup wizard.
@@ -177,7 +250,11 @@ pub fn descriptor_for_cwd_with_caps(
             .ok()
             .map(|doc| doc.providers())
             .unwrap_or_default();
-        return Some(crate::wizard::onboarding_agent_descriptor(&current));
+        let catalog = crate::daemon::agent_catalog::preferred_catalog_for_discovery().ok()?;
+        return Some(crate::wizard::onboarding_agent_descriptor(
+            &current,
+            &catalog.index,
+        ));
     }
     if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
         return Some(crate::wizard::onboarding_lifetime_descriptor());

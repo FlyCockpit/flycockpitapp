@@ -28,7 +28,9 @@ macro_rules! default_const {
 pub mod dirs;
 pub mod effective_default;
 pub mod extended;
-mod files;
+/// Shared atomic writer used by higher-level coordinated configuration
+/// transactions. Callers remain responsible for their authority boundary.
+pub mod files;
 pub mod image_generation;
 pub mod image_sidecar;
 pub mod image_spend;

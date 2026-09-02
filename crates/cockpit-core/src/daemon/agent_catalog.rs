@@ -265,6 +265,25 @@ pub async fn preferred_catalog() -> Result<ResolvedAgentCatalog> {
     }
 }
 
+/// Resolve discovery before a synchronous renderer constructs its wizard.
+///
+/// The TUI owns its dialogs synchronously, while catalog discovery is an
+/// authenticated/bounded async HTTP operation.  Run that operation on an
+/// isolated runtime rather than silently substituting the bundled snapshot:
+/// online discovery must describe the live repository, and only a real fetch
+/// failure is allowed to select the offline snapshot.
+pub fn preferred_catalog_for_discovery() -> Result<ResolvedAgentCatalog> {
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("creating catalog discovery runtime")?
+            .block_on(preferred_catalog())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("agent catalog discovery thread panicked"))?
+}
+
 pub async fn fetch_live_catalog() -> Result<ResolvedAgentCatalog> {
     let client = catalog_http_client()?;
     let commit_bytes = fetch_bounded(

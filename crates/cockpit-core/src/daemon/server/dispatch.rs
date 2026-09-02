@@ -17273,9 +17273,19 @@ async fn handle_serialized_request_impl(
             }
             let mutation = async {
                 if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-                    let prepared = crate::wizard::prepare_onboarding_agent_answers(&answers_json)
+                    // Catalog I/O is deliberately outside the publication
+                    // boundary. Once it is resolved, the config snapshot used
+                    // to validate the plan and every config publication share
+                    // the daemon-wide serialization gate.
+                    let catalog = crate::daemon::agent_catalog::preferred_catalog()
                         .await
                         .map_err(internal)?;
+                    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+                    let prepared = crate::wizard::prepare_onboarding_agent_answers_for_catalog(
+                        &answers_json,
+                        catalog,
+                    )
+                    .map_err(internal)?;
                     let operation_key = uuid::Uuid::new_v5(
                         &uuid::Uuid::NAMESPACE_URL,
                         format!(
@@ -17364,17 +17374,60 @@ async fn handle_serialized_request_impl(
                             )));
                         }
                     };
-                    if prepared.plan.make_default {
-                        ctx.db
+                    // Publish config before selecting the DB default. If any
+                    // later participant fails, compensate both authorities
+                    // while the publication gate still excludes other daemon
+                    // writers; onboarding must not leave a visible half-plan.
+                    let rollback = match crate::wizard::persist_onboarding_agent_plan(
+                        &prepared.plan,
+                    ) {
+                        Ok(rollback) => rollback,
+                        Err(error) => {
+                            let cleanup = ctx
+                                .db
+                                .delete_agent_installation(
+                                    installed_id,
+                                    crate::workspace_lease::now_unix_ms(),
+                                )
+                                .await;
+                            return match cleanup {
+                                Ok(_) => Err(internal(error)),
+                                Err(cleanup_error) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding config publication failed ({error:#}); installation compensation also failed ({cleanup_error:#})"
+                                ))),
+                            };
+                        }
+                    };
+                    if prepared.plan.make_default
+                        && let Err(error) = ctx
+                            .db
                             .set_default_agent_installation(
                                 installed_id,
                                 crate::workspace_lease::now_unix_ms(),
                             )
                             .await
-                            .map_err(internal)?;
+                    {
+                        let config_rollback = rollback.restore();
+                        let install_rollback = ctx
+                            .db
+                            .delete_agent_installation(
+                                installed_id,
+                                crate::workspace_lease::now_unix_ms(),
+                            )
+                            .await;
+                        return match (config_rollback, install_rollback) {
+                            (Ok(()), Ok(_)) => Err(internal(error)),
+                            (config_rollback, install_rollback) => Err(internal(anyhow::anyhow!(
+                                "agent onboarding default selection failed ({error:#}); config compensation: {}; installation compensation: {}",
+                                config_rollback
+                                    .err()
+                                    .map_or_else(|| "ok".to_string(), |value| format!("{value:#}")),
+                                install_rollback
+                                    .err()
+                                    .map_or_else(|| "ok".to_string(), |value| format!("{value:#}")),
+                            ))),
+                        };
                     }
-                    crate::wizard::persist_onboarding_agent_plan(&prepared.plan)
-                        .map_err(internal)?;
                     return Ok(Response::SetupWizardApplied {
                         changed: true,
                         model_file_written: true,

@@ -20,7 +20,7 @@
 
 #![allow(deprecated)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,14 @@ use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::knowledge::KnowledgeBasePromptSnapshot;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
+
+/// Shared side of the process-local Monty-network revocation fence.
+///
+/// It is opaque so callers can retain it only as an egress permit rather than
+/// mixing it with the session-grant mutex.
+pub(crate) struct MontyNetworkEgressPermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
 
 pub mod export;
 mod gitignore;
@@ -498,6 +506,14 @@ pub struct Session {
     /// Per-session container-network toggle. Only honored by container modes;
     /// default off so container sandboxes start with `--network none`.
     container_network_enabled: AtomicBool,
+    /// Process-local session-scope Monty egress grants. They deliberately do
+    /// not survive daemon restart; agent-scope grants are the durable layer.
+    pub(crate) monty_network_grants: Mutex<crate::mcp::network::SessionNetworkGrants>,
+    /// Revocation fence for the process-local half of governed Monty egress.
+    /// A request holds the shared side through `RequestBuilder::send`; every
+    /// session-grant mutation takes the exclusive side before changing the
+    /// generation or host set.
+    monty_network_egress_gate: Arc<tokio::sync::RwLock<()>>,
     /// Whether the session may offer explicit sandbox escalation retries.
     /// Seeded from config at spawn/resume and flipped live by
     /// `/sandbox-escalate` or the settings dialog. Approval mode still gates
@@ -642,11 +658,11 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// The configured endpoint that reported the last real prompt-cache hit.
-    /// This is deliberately separate from `last_usage`: context chrome may use
-    /// a session-wide estimate, but keep-warm is authorized only by a hit from
+    /// Configured endpoints that reported a real prompt-cache hit. This is
+    /// deliberately separate from `last_usage`: context chrome may use a
+    /// session-wide estimate, but cache work is authorized only by a hit from
     /// the endpoint it is about to refresh.
-    last_cache_hit_endpoint: Mutex<Option<(String, String)>>,
+    observed_cache_hit_endpoints: Mutex<BTreeSet<crate::engine::model::CacheEndpointIdentity>>,
     /// Monotonic instant and durable identity of the most recent inference
     /// send. The cache-cold predicate uses the monotonic instant, while the
     /// daemon-scheduled keep-warm callback carries the unique identity across

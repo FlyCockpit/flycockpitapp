@@ -1657,6 +1657,10 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
+/// Shared action-step constructor. Provider-wizard actions pass an explicit
+/// branch (`saving` or `done`). Terminal save actions (`profile-save`,
+/// `security-save`, `model-save`, `lifetime-save`) must pass `None` so they
+/// finish the wizard instead of branching into the provider `saving` step.
 fn action_step(
     id: &'static str,
     prompt: &'static str,
@@ -2326,6 +2330,28 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_profile_save_completes_without_a_saving_branch() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action, not a branch to `saving`");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), Some("Ada".into()));
+    }
+
+    #[test]
+    fn onboarding_profile_blank_name_is_a_skip_that_still_completes() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text(String::new())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("skipping the name still completes profile-save");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), None);
+    }
+
+    #[test]
     fn onboarding_model_wizard_accepts_manual_model_id_and_context() {
         let mut providers = crate::config::providers::ProvidersConfig::default();
         providers.providers.insert(
@@ -2384,39 +2410,64 @@ mod tests {
         assert_eq!(onboarding_background_agents_answer(&run), Some(false));
     }
 
+    /// Terminal profile-save must finish the wizard. Branching to a
+    /// provider-wizard `saving` step is a hard submit error and stalls
+    /// first-run at AwaitProfile.
     #[test]
-    fn onboarding_profile_save_completes_without_a_saving_step() {
-        let descriptor = onboarding_profile_descriptor();
-        let mut run = WizardRun::new(descriptor.clone()).unwrap();
-        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
-        assert_eq!(run.current_step_id(), Some("profile-save"));
-        let pending = run.answers_json().unwrap();
+    fn onboarding_profile_save_completes_without_saving_step() {
+        let mut live = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        live.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(live.current_step_id(), Some("profile-save"));
+        live.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action");
+        assert!(live.is_complete());
+        assert_eq!(onboarding_name_answer(&live).as_deref(), Some("Ada"));
 
-        run.submit(WizardAnswer::Acknowledged).unwrap();
-        assert!(run.is_complete());
+        let mut client = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        client.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        let json = client.answers_json().unwrap();
+        assert!(
+            !json.contains("profile-save"),
+            "the client acknowledges the save only after the daemon reply: {json}"
+        );
 
-        let replayed = WizardRun::from_answers_json(descriptor, &pending).unwrap();
-        assert!(replayed.is_complete());
+        let reconstructed = WizardRun::from_answers_json(onboarding_profile_descriptor(), &json)
+            .expect("daemon reconstruction infers the terminal save acknowledgement");
+        assert!(reconstructed.is_complete());
         assert_eq!(
-            replayed.answer("name"),
-            Some(&WizardAnswer::Text("Ada".into()))
+            onboarding_name_answer(&reconstructed).as_deref(),
+            Some("Ada")
         );
     }
 
+    /// Terminal lifetime-save must finish the wizard the same way profile-save
+    /// does: the client omits the action from answers_json, and daemon replay
+    /// infers the acknowledgement.
     #[test]
     fn onboarding_lifetime_save_completes_without_a_saving_step() {
-        let descriptor = onboarding_lifetime_descriptor();
-        let mut run = WizardRun::new(descriptor.clone()).unwrap();
-        run.submit(WizardAnswer::Confirm(false)).unwrap();
-        assert_eq!(run.current_step_id(), Some("lifetime-save"));
-        let pending = run.answers_json().unwrap();
+        let mut live = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        live.submit(WizardAnswer::Confirm(false)).unwrap();
+        assert_eq!(live.current_step_id(), Some("lifetime-save"));
+        live.submit(WizardAnswer::Acknowledged)
+            .expect("lifetime-save is a terminal action");
+        assert!(live.is_complete());
+        assert_eq!(onboarding_background_agents_answer(&live), Some(false));
 
-        run.submit(WizardAnswer::Acknowledged).unwrap();
-        assert!(run.is_complete());
+        let mut client = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        client.submit(WizardAnswer::Confirm(false)).unwrap();
+        let json = client.answers_json().unwrap();
+        assert!(
+            !json.contains("lifetime-save"),
+            "the client acknowledges the save only after the daemon reply: {json}"
+        );
 
-        let replayed = WizardRun::from_answers_json(descriptor, &pending).unwrap();
-        assert!(replayed.is_complete());
-        assert_eq!(onboarding_background_agents_answer(&replayed), Some(false));
+        let reconstructed = WizardRun::from_answers_json(onboarding_lifetime_descriptor(), &json)
+            .expect("daemon reconstruction infers the terminal save acknowledgement");
+        assert!(reconstructed.is_complete());
+        assert_eq!(
+            onboarding_background_agents_answer(&reconstructed),
+            Some(false)
+        );
     }
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);

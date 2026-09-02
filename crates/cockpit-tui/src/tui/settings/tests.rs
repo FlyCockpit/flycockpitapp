@@ -6980,6 +6980,89 @@ fn first_run_completion_copy_points_to_security_and_help() {
 }
 
 #[test]
+fn onboarding_profile_save_completes_after_daemon_apply() {
+    let tmp = TempDir::new().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut d = Dialog::open_setup_wizard(
+        tmp.path(),
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+    )
+    .expect("profile wizard opens");
+
+    for _ in 0..80 {
+        d.handle_key(press(KeyCode::Backspace));
+    }
+    for ch in "Ada".chars() {
+        d.handle_key(press(KeyCode::Char(ch)));
+    }
+    d.handle_key(press(KeyCode::Enter));
+
+    {
+        let Dialog::SetupWizard(wizard) = &d else {
+            panic!("expected setup wizard");
+        };
+        assert_eq!(wizard.run.current_step_id(), Some("profile-save"));
+    }
+
+    d.handle_key(press(KeyCode::Enter));
+    let effect = d
+        .take_settings_daemon_effect()
+        .expect("profile-save queues ApplySetupWizard");
+    let SettingsDaemonEffectWork::Request(Request::ApplySetupWizard {
+        wizard_id,
+        answers_json,
+        project_root,
+    }) = &effect.work
+    else {
+        panic!("expected ApplySetupWizard, got {:?}", effect.work);
+    };
+    assert_eq!(
+        wizard_id,
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
+    );
+
+    let (changed, model_file_written, default_scope) =
+        cockpit_core::wizard::apply_setup_wizard_answers(
+            std::path::Path::new(project_root),
+            wizard_id,
+            answers_json,
+        )
+        .expect("daemon apply infers profile-save from TUI answers_json");
+    assert!(changed);
+    assert!(!model_file_written);
+    assert!(default_scope.is_none());
+
+    d.apply_settings_daemon_completion(SettingsDaemonEffectCompletion {
+        dialog_id: effect.dialog_id,
+        operation_id: effect.operation_id,
+        target: effect.target,
+        response: Ok(Response::SetupWizardApplied {
+            changed,
+            model_file_written,
+            default_scope,
+        }),
+        authoritative_rejection: false,
+        committed_refresh_needed: None,
+    });
+
+    let Dialog::SetupWizard(wizard) = &d else {
+        panic!("expected setup wizard");
+    };
+    assert!(
+        wizard.run.is_complete(),
+        "profile-save must complete the wizard after daemon apply"
+    );
+    assert!(
+        wizard
+            .status
+            .as_deref()
+            .is_none_or(|status| !status.contains("could not advance wizard")),
+        "unexpected status: {:?}",
+        wizard.status
+    );
+}
+
+#[test]
 fn security_setup_wizard_tui_edits_redaction_number() {
     let tmp = TempDir::new().unwrap();
     let mut d = Dialog::open_setup_wizard(tmp.path(), cockpit_core::wizard::SECURITY_WIZARD_ID)

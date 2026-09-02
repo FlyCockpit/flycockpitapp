@@ -4624,6 +4624,13 @@ fn test_guard(
 ) -> InteractiveClientGuard {
     counter.fetch_add(1, Ordering::SeqCst);
     InteractiveClientGuard {
+        lease: InteractiveAttachmentLease {
+            state: Arc::new(std::sync::Mutex::new(InteractiveAttachmentState {
+                live: true,
+                session_id,
+                attachment_id: Uuid::new_v4(),
+            })),
+        },
         counter,
         session_id,
         locks,
@@ -4664,9 +4671,20 @@ async fn last_detach_while_idle_releases_locks() {
     let counter = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(LiveState::default()); // not processing = idle
     let guard = test_guard(counter.clone(), sid, locks.clone(), live);
+    let attachment_lease = guard.lease();
+    assert!(attachment_lease.is_live());
+    let settlement_permit = attachment_lease
+        .try_acquire()
+        .expect("live attachment mints a settlement permit");
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 
     drop(guard); // last detach, idle → release
+    assert!(!attachment_lease.is_live());
+    assert!(
+        attachment_lease.try_acquire().is_none(),
+        "detach closes the exact attachment against new settlements"
+    );
+    drop(settlement_permit);
     assert_eq!(counter.load(Ordering::SeqCst), 0);
     assert!(
         locks.holder(&p).is_some(),

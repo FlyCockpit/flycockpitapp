@@ -1790,6 +1790,7 @@ local	secret_named_ownership	item_id	primary
 local	secret_named_ownership	owner_kind	primary
 local	secret_named_ownership	project_root	primary
 local	secret_vault_authority	active_placement	non_relationship
+local	secret_vault_authority	file_kek_mode	non_relationship
 local	secret_vault_authority	id	primary
 local	secret_vault_authority	intent	non_relationship
 local	secret_vault_authority	kek_fingerprint	non_relationship
@@ -1817,11 +1818,19 @@ local	secret_vault_keys	key_version	primary
 local	secret_vault_keys	wrap_nonce	local_identity
 local	secret_vault_keys	wrap_version	non_relationship
 local	secret_vault_keys	wrapped_dek	non_relationship
+local	secret_vault_passphrase_kdf	algorithm	non_relationship
+local	secret_vault_passphrase_kdf	id	primary
+local	secret_vault_passphrase_kdf	iterations	non_relationship
+local	secret_vault_passphrase_kdf	memory_kib	non_relationship
+local	secret_vault_passphrase_kdf	parallelism	non_relationship
+local	secret_vault_passphrase_kdf	salt	non_relationship
 local	secret_vault_sagas	created_at	non_relationship
+local	secret_vault_sagas	dest_file_kek_mode	non_relationship
 local	secret_vault_sagas	dest_placement	non_relationship
 local	secret_vault_sagas	kek_fingerprint	non_relationship
 local	secret_vault_sagas	op_id	primary
 local	secret_vault_sagas	phase	non_relationship
+local	secret_vault_sagas	source_file_kek_mode	non_relationship
 local	secret_vault_sagas	source_placement	non_relationship
 local	secret_vault_sagas	updated_at	non_relationship
 local	secure_key_consumer_refs	consumer_id	non_relationship

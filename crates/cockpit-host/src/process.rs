@@ -101,7 +101,7 @@ impl ProcessTreeGuard {
                         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
                         Thread32Next,
                     },
-                    JobObjects::AssignProcessToJobObject,
+                    JobObjects::{AssignProcessToJobObject, IsProcessInJob},
                     Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
                 },
             };
@@ -120,6 +120,15 @@ impl ProcessTreeGuard {
                 .ok_or_else(|| anyhow::anyhow!("process tree job already closed"))?;
             if unsafe { AssignProcessToJobObject(job, process) } == 0 {
                 return Err(std::io::Error::last_os_error().into());
+            }
+            // Membership is proven before ResumeThread so no user instruction
+            // runs outside the job.
+            let mut in_job: windows_sys::core::BOOL = 0;
+            if unsafe { IsProcessInJob(process, job, &mut in_job) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if in_job == 0 {
+                return Err(anyhow::anyhow!("child not a member of the job object"));
             }
             let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
             if snapshot == INVALID_HANDLE_VALUE {
@@ -186,6 +195,48 @@ impl ProcessTreeGuard {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
+    }
+
+    /// Whether the owned Job Object handle is still open.
+    #[cfg(windows)]
+    pub fn job_is_open(&self) -> bool {
+        self.job
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Kernel-observed active process count for the owned Job Object.
+    ///
+    /// This is the empty oracle: it is `QueryInformationJobObject` accounting,
+    /// not a local counter, child-exit wait, or PID poll.
+    #[cfg(windows)]
+    pub fn active_process_count(&self) -> anyhow::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let job = self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process tree job lock poisoned"))?
+            .ok_or_else(|| anyhow::anyhow!("process tree job already closed"))?;
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut returned = 0u32;
+        let queried = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                u32::try_from(std::mem::size_of_val(&info)).unwrap_or(u32::MAX),
+                &mut returned,
+            )
+        };
+        if queried == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(info.ActiveProcesses)
     }
 }
 
@@ -864,5 +915,47 @@ mod tests {
             mtime_after_kill, mtime_later,
             "descendant heartbeat kept updating after terminate_group_kill_wait returned"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_process_tree_guard_job_accounts_for_assigned_process() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("cmd.exe");
+        command
+            .args(["/C", "ping", "-n", "20", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::prepare(&mut command).expect("CreateJobObjectW");
+        let mut child = command.spawn().expect("CreateProcessW CREATE_SUSPENDED");
+        guard.attach(&child).expect("assign then ResumeThread");
+        assert!(
+            guard.job_is_open(),
+            "job handle must stay open after attach"
+        );
+        assert!(
+            guard
+                .active_process_count()
+                .expect("QueryInformationJobObject")
+                >= 1,
+            "job accounting must observe the assigned process"
+        );
+        guard.terminate().expect("TerminateJobObject");
+        let mut empty = false;
+        for _ in 0..50 {
+            if guard
+                .active_process_count()
+                .expect("QueryInformationJobObject")
+                == 0
+            {
+                empty = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(empty, "TerminateJobObject must drain the job");
+        let _ = child.try_wait();
     }
 }

@@ -1191,7 +1191,7 @@ pub fn default_host_adapter() -> SharedAdapter {
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(super::macos::MacosNativeAdapter)
+        Arc::new(super::macos::MacosNativeAdapter::production())
     }
     #[cfg(target_os = "windows")]
     {

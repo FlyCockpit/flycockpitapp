@@ -4181,6 +4181,42 @@ fn externally_documented_hook_failure_reason_constants_are_stable() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_hook_runner_native_process_tree_guard_runs_body() {
+    // Production Linux/macOS adapters are ProcessTreeGuard-backed. A real
+    // `/bin/echo` child must run (the previous stub returned Unsupported
+    // before spawn, so user-configured hooks never executed).
+    let (db, sid) = db_session().await;
+    let actor = ProcessContainmentActor::start(
+        db.clone(),
+        crate::process_containment::default_host_adapter(),
+    );
+    let runner = TokioCommandRunner::with_optional_containment(Some(actor.handle()));
+    let out = runner
+        .run(
+            Path::new("/bin/echo"),
+            &["contained-hook".to_string()],
+            &BTreeMap::new(),
+            Path::new("/tmp"),
+            "",
+            Duration::from_secs(5),
+            sid,
+        )
+        .await;
+    assert_eq!(
+        out.failure_reason, None,
+        "native process-tree containment must run the hook body: {out:?}"
+    );
+    assert!(
+        out.stdout.contains("contained-hook"),
+        "hook stdout missing: {:?}",
+        out.stdout
+    );
+    assert_eq!(out.exit_code, Some(0));
+    assert!(!out.spawn_failed);
+}
+
 #[tokio::test]
 async fn tool_hook_runner_without_handle_is_unsupported() {
     // Drive the REAL production entry point `CommandRunner::run` on a runner with

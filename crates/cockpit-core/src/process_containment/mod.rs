@@ -19,6 +19,7 @@ mod macos;
 mod observability;
 mod state_machine;
 mod types;
+mod unix;
 mod windows;
 
 #[cfg(test)]
@@ -35,9 +36,12 @@ pub use adapter::{
 pub use container::{ContainerRuntimeAdapter, RuntimeKind};
 pub use fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};
 pub use linux::{
-    CgroupNamespaceGuard, LinuxCgroupAdapter, MANAGEMENT_BOUNDARY_UNAVAILABLE, TestBroker,
+    LINUX_PROCESS_TREE_UNAVAILABLE_ON_HOST, LinuxCgroupAdapter, MANAGEMENT_BOUNDARY_UNAVAILABLE,
+    PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN,
 };
-pub use macos::{MACOS_UNSUPPORTED_REASON, MacosNativeAdapter};
+pub use macos::{
+    MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST, MACOS_UNSUPPORTED_REASON, MacosNativeAdapter,
+};
 pub use observability::{doctor_lines, error_audit_fields, sanitize_reason};
 pub use types::{
     ContainmentError, ContainmentGuarantee, ContainmentLease, ContainmentState, EmptyOutcome,

@@ -1078,10 +1078,10 @@ where
 /// `tokio::process::Command` with `env_clear`, piped stdio, an independent
 /// stdout cap, and `kill_on_drop(true)` (in addition to the lease terminate +
 /// empty barrier that owns cancellation). When `tree` is present (Windows Job
-/// Object lease), the child is created suspended, assigned, membership is
-/// proven on the actor, then resumed only after this function is already
-/// running under [`HookLeaseGuard`]. It is invoked from inside
-/// [`run_hook_child_contained`] only after an allocated lease exists.
+/// Object or Unix process-group lease), spawn flags are applied, the child
+/// is assigned, membership is proven on the actor, then resumed only after
+/// this function is already running under [`HookLeaseGuard`]. It is invoked
+/// from inside [`run_hook_child_contained`] only after an allocated lease exists.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_real_hook_child(
     executable: &Path,
@@ -1395,9 +1395,8 @@ async fn spawn_hook_child_for_lease(
         Ok(tree) => tree,
         Err(_) => return spawn_failed_outcome(),
     };
-    #[cfg(windows)]
     if tree.is_none() {
-        // A Proven Windows lease without a Job Object would spawn uncontained.
+        // A Proven native lease without a process-tree guard would spawn uncontained.
         return spawn_failed_outcome();
     }
     spawn_real_hook_child(

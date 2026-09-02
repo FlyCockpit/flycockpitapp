@@ -73,9 +73,12 @@ async fn descendant_containment_tests_corrected_first() {
     handle.begin_session_deletion(session).await.unwrap();
     handle.finish_session_deletion(session).await.unwrap();
 
-    // Portable-pty-drop / process-group assumptions are not Proven:
-    // Unsupported platforms never return ProvenEmpty as authority.
-    let mac = MacosNativeAdapter;
+    // Portable-pty-drop is never the empty oracle. Native macOS is Proven only
+    // on macOS via ProcessTreeGuard; other hosts report Unsupported.
+    let mac = MacosNativeAdapter::production();
+    #[cfg(target_os = "macos")]
+    assert_eq!(mac.guarantee(), ContainmentGuarantee::Proven);
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(mac.guarantee(), ContainmentGuarantee::Unsupported);
 }
 
@@ -240,6 +243,39 @@ async fn daemon_shutdown_not_clean_when_uncertain() {
         .await
         .unwrap_err();
     assert!(matches!(err, ContainmentError::ShutdownNotClean { .. }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_unix_adapter_allocates_process_tree_guard_through_actor() {
+    let db = Db::open_in_memory().unwrap();
+    let session = seed_session(&db).await;
+    let actor = ProcessContainmentActor::start(
+        db.clone(),
+        crate::process_containment::default_host_adapter(),
+    );
+    let handle = actor.handle();
+    let meta = handle.safe_metadata().await.expect("safe metadata");
+    assert_eq!(meta.guarantee, ContainmentGuarantee::Proven);
+    let lease = handle
+        .create_and_spawn(session, "op", "/bin/true", vec![], "/tmp", true)
+        .await
+        .expect("native Unix ProcessTreeGuard must allocate a proven lease");
+    assert_eq!(lease.guarantee(), ContainmentGuarantee::Proven);
+    let tree = handle
+        .process_tree_guard(&lease)
+        .await
+        .expect("actor process-tree guard")
+        .expect("native adapter must return a bindable ProcessTreeGuard");
+    assert!(
+        !tree.group_is_bound(),
+        "allocation must not fabricate membership"
+    );
+    handle.terminate(lease.clone()).await.unwrap();
+    match handle.await_empty(lease).await.unwrap() {
+        EmptyOutcome::ProvenEmpty { .. } => {}
+        o => panic!("{o:?}"),
+    }
 }
 
 #[tokio::test]

@@ -1957,13 +1957,14 @@ pub fn security_descriptor_for_config_with_caps(
 }
 
 fn sandbox_select_options(
-    current: crate::tools::sandbox_mode::SandboxMode,
+    current: crate::tools::sandbox_mode::SandboxIntent,
     caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> (Vec<SelectOption>, String) {
     use crate::daemon::session_worker::sandbox_mode_selectable;
-    use crate::tools::sandbox_mode::SandboxMode;
+    use crate::tools::sandbox_mode::{SandboxIntent, SandboxMode};
 
-    let current_selectable = sandbox_mode_selectable(current, caps);
+    let current_mode = SandboxMode::from(current);
+    let current_selectable = sandbox_mode_selectable(current_mode, caps);
     let host_on = sandbox_mode_selectable(SandboxMode::Sandbox, caps);
     let container_on = sandbox_mode_selectable(SandboxMode::Container, caps);
 
@@ -1972,14 +1973,14 @@ fn sandbox_select_options(
         options.push(SelectOption {
             id: sandbox_mode_id(current).into(),
             label: "Keep current sandbox setting".into(),
-            description: if current == SandboxMode::Sandbox {
+            description: if current == SandboxIntent::Sandbox {
                 "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.".into()
             } else {
                 "Keep the sandbox mode already stored in config.".into()
             },
         });
     }
-    if host_on && current != SandboxMode::Sandbox {
+    if host_on && current != SandboxIntent::Sandbox {
         options.push(SelectOption {
             id: "sandbox".into(),
             label: "sandbox".into(),
@@ -1987,14 +1988,14 @@ fn sandbox_select_options(
         });
     }
     if container_on {
-        if current != SandboxMode::Container {
+        if current != SandboxIntent::Container {
             options.push(SelectOption {
                 id: "container".into(),
                 label: "container".into(),
                 description: "Run commands in a Docker/Podman container.".into(),
             });
         }
-        if current != SandboxMode::ContainerReadonly {
+        if current != SandboxIntent::ContainerReadonly {
             options.push(SelectOption {
                 id: "container-readonly".into(),
                 label: "container-readonly".into(),
@@ -2002,7 +2003,7 @@ fn sandbox_select_options(
             });
         }
     }
-    if current != SandboxMode::Off || !current_selectable {
+    if current != SandboxIntent::Off || !current_selectable {
         options.push(SelectOption {
             id: "off".into(),
             label: "off".into(),
@@ -2020,23 +2021,22 @@ fn sandbox_select_options(
     (options, default_id)
 }
 
-pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxMode) -> &'static str {
+pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxIntent) -> &'static str {
     match mode {
-        crate::tools::sandbox_mode::SandboxMode::Off => "off",
-        crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox",
-        crate::tools::sandbox_mode::SandboxMode::Container => "container",
-        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
-        crate::tools::sandbox_mode::SandboxMode::Refuse => "refuse",
+        crate::tools::sandbox_mode::SandboxIntent::Off => "off",
+        crate::tools::sandbox_mode::SandboxIntent::Sandbox => "sandbox",
+        crate::tools::sandbox_mode::SandboxIntent::Container => "container",
+        crate::tools::sandbox_mode::SandboxIntent::ContainerReadonly => "container-readonly",
     }
 }
 
-pub(crate) fn sandbox_mode_from_id(id: &str) -> Option<crate::tools::sandbox_mode::SandboxMode> {
+pub(crate) fn sandbox_mode_from_id(id: &str) -> Option<crate::tools::sandbox_mode::SandboxIntent> {
     Some(match id {
-        "off" => crate::tools::sandbox_mode::SandboxMode::Off,
-        "sandbox" | "on" => crate::tools::sandbox_mode::SandboxMode::Sandbox,
-        "container" => crate::tools::sandbox_mode::SandboxMode::Container,
+        "off" => crate::tools::sandbox_mode::SandboxIntent::Off,
+        "sandbox" | "on" => crate::tools::sandbox_mode::SandboxIntent::Sandbox,
+        "container" => crate::tools::sandbox_mode::SandboxIntent::Container,
         "container-readonly" | "container_readonly" => {
-            crate::tools::sandbox_mode::SandboxMode::ContainerReadonly
+            crate::tools::sandbox_mode::SandboxIntent::ContainerReadonly
         }
         _ => return None,
     })
@@ -2058,7 +2058,7 @@ pub fn min_secret_length_answer(run: &WizardRun) -> Option<usize> {
     value.trim().parse().ok()
 }
 
-pub fn sandbox_mode_answer(run: &WizardRun) -> Option<crate::tools::sandbox_mode::SandboxMode> {
+pub fn sandbox_mode_answer(run: &WizardRun) -> Option<crate::tools::sandbox_mode::SandboxIntent> {
     let WizardAnswer::Select(value) = run.answer("sandbox")? else {
         return None;
     };
@@ -3571,7 +3571,7 @@ mod tests {
     fn security_wizard_prefills_current_config() {
         let current = crate::config::extended::ExtendedConfig {
             sandbox: crate::config::extended::SandboxConfig {
-                default_mode: crate::tools::sandbox_mode::SandboxMode::ContainerReadonly,
+                default_mode: crate::tools::sandbox_mode::SandboxIntent::ContainerReadonly,
                 ..Default::default()
             },
             default_approval_mode: crate::config::extended::ApprovalMode::Yolo,

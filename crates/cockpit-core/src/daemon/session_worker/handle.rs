@@ -1422,7 +1422,7 @@ impl SessionWorkerHandle {
                 enabled: new.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
-                persisted_intent: Some(applied.persisted_intent),
+                persisted_intent: Some(applied.persisted_intent.into()),
             },
         );
         if new.enabled() {
@@ -2124,7 +2124,7 @@ impl SessionWorkerHandle {
                 enabled: mode.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
-                persisted_intent: Some(snapshot.extended.sandbox.default_mode),
+                persisted_intent: Some(snapshot.extended.sandbox.default_mode.into()),
             },
         );
     }
@@ -2231,7 +2231,7 @@ impl SessionWorkerHandle {
 
     fn emit_capability_fail_closed_notice(&self) {
         let snapshot = self.config_snapshot();
-        let intent = snapshot.extended.sandbox.default_mode;
+        let intent = snapshot.extended.sandbox.default_mode.as_mode();
         let (remedy, fix_command) =
             super::sandbox_capability_unavailable_notice(intent, &snapshot.host_capabilities)
                 .unwrap_or_else(|| {

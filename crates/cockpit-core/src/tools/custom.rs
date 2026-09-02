@@ -209,7 +209,7 @@ impl Tool for CustomBashTool {
         if ctx.session.sandbox_mode().refuses() {
             let snapshot = ctx.config.snapshot();
             let reason = crate::daemon::session_worker::fail_closed_capability_reason(
-                snapshot.extended.sandbox.default_mode,
+                snapshot.extended.sandbox.default_mode.into(),
                 &snapshot.host_capabilities,
             );
             return Ok(ToolOutput::text(format!(

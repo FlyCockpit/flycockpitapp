@@ -515,7 +515,7 @@ impl Driver {
         if self.session.sandbox_mode().refuses() {
             let snapshot = self.config.snapshot();
             let reason = crate::daemon::session_worker::fail_closed_capability_reason(
-                snapshot.extended.sandbox.default_mode,
+                snapshot.extended.sandbox.default_mode.into(),
                 &snapshot.host_capabilities,
             );
             return Err(background_sandbox_unavailable_refusal(&reason));

@@ -1273,7 +1273,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         let model =
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(tokio::sync::Mutex::new(
@@ -1622,7 +1622,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         let model =
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(tokio::sync::Mutex::new(
@@ -1948,7 +1948,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         let model =
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(tokio::sync::Mutex::new(
@@ -2939,7 +2939,7 @@ async fn absent_scheduler_is_not_an_error() {
     let model =
         Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
     let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::TrustRoot {
             opened_path: tmp.path().to_path_buf(),
@@ -3057,7 +3057,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
     let model =
         Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
     let trust_policy = trusted_test_policy(tmp.path());
 
     let (handle, join, start_permit) = spawn(
@@ -3192,7 +3192,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     let model =
         Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
     let (handle, join, start_permit) = spawn(
         session.clone(),
         Arc::new(tokio::sync::Mutex::new(
@@ -3365,7 +3365,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
 
     let providers = lmstudio_test_providers();
     let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
     let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::TrustRoot {
             opened_path: tmp.path().to_path_buf(),
@@ -3895,7 +3895,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
 
 #[tokio::test]
 async fn sandbox_default_precedence_daemon_wins() {
-    use crate::tools::sandbox_mode::SandboxMode;
+    use crate::tools::sandbox_mode::{SandboxIntent, SandboxMode};
     use cockpit_proto::FeatureCapabilityState;
 
     let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
@@ -3905,18 +3905,18 @@ async fn sandbox_default_precedence_daemon_wins() {
 
     // (a) daemon `--no-sandbox` -> OFF regardless of the client flag.
     assert_eq!(
-        resolve_sandbox_default_with(true, false, SandboxMode::Sandbox, &caps),
+        resolve_sandbox_default_with(true, false, SandboxIntent::Sandbox, &caps),
         SandboxMode::Off
     );
     assert_eq!(
-        resolve_sandbox_default_with(true, true, SandboxMode::Container, &caps),
+        resolve_sandbox_default_with(true, true, SandboxIntent::Container, &caps),
         SandboxMode::Off
     );
 }
 
 #[tokio::test]
 async fn sandbox_default_precedence_client_then_on() {
-    use crate::tools::sandbox_mode::SandboxMode;
+    use crate::tools::sandbox_mode::{SandboxIntent, SandboxMode};
     use cockpit_proto::FeatureCapabilityState;
 
     let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
@@ -3926,19 +3926,19 @@ async fn sandbox_default_precedence_client_then_on() {
 
     // (b) no daemon flag, client `--no-sandbox` -> OFF.
     assert_eq!(
-        resolve_sandbox_default_with(false, true, SandboxMode::Container, &caps),
+        resolve_sandbox_default_with(false, true, SandboxIntent::Container, &caps),
         SandboxMode::Off
     );
     // (c) neither flag -> effective intent (host Sandbox when available).
     assert_eq!(
-        resolve_sandbox_default_with(false, false, SandboxMode::Sandbox, &caps),
+        resolve_sandbox_default_with(false, false, SandboxIntent::Sandbox, &caps),
         SandboxMode::Sandbox
     );
 }
 
 #[tokio::test]
 async fn sandbox_default_capability_unavailable_is_refuse_not_off() {
-    use crate::tools::sandbox_mode::SandboxMode;
+    use crate::tools::sandbox_mode::{SandboxIntent, SandboxMode};
     use cockpit_proto::FeatureCapabilityState;
 
     let missing = crate::daemon::session_worker::sandbox_capability_snapshot(
@@ -3957,12 +3957,12 @@ async fn sandbox_default_capability_unavailable_is_refuse_not_off() {
         (empty, "empty-snapshot"),
     ] {
         assert_eq!(
-            resolve_sandbox_default_with(false, false, SandboxMode::Sandbox, &caps),
+            resolve_sandbox_default_with(false, false, SandboxIntent::Sandbox, &caps),
             SandboxMode::Refuse,
             "intent=Sandbox capability {label} must refuse"
         );
         assert_eq!(
-            resolve_sandbox_default_with(true, false, SandboxMode::Sandbox, &caps),
+            resolve_sandbox_default_with(true, false, SandboxIntent::Sandbox, &caps),
             SandboxMode::Off,
             "explicit daemon --no-sandbox stays Off even when caps are down"
         );
@@ -4016,7 +4016,10 @@ fn set_sandbox_rejects_unavailable_intent_does_not_persist() {
     let applied = handle
         .set_sandbox(Some(SandboxMode::Sandbox), None, &available)
         .expect("available Sandbox persists");
-    assert_eq!(applied.persisted_intent, SandboxMode::Sandbox);
+    assert_eq!(
+        applied.persisted_intent,
+        crate::tools::sandbox_mode::SandboxIntent::Sandbox
+    );
     assert_eq!(applied.effective, SandboxMode::Sandbox);
     assert_eq!(handle.session().sandbox_mode(), SandboxMode::Sandbox);
 }
@@ -4516,7 +4519,8 @@ async fn capability_refuse_probe_emits_visible_sandbox_unavailable_notice() {
             .config_snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshot.extended.sandbox.default_mode = SandboxMode::Sandbox;
+        snapshot.extended.sandbox.default_mode =
+            crate::config::sandbox_mode::SandboxIntent::Sandbox;
         snapshot.host_capabilities = crate::daemon::session_worker::sandbox_capability_snapshot(
             FeatureCapabilityState::Failed,
             FeatureCapabilityState::Available,

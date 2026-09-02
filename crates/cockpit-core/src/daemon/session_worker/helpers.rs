@@ -252,7 +252,7 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
 /// project layer; scaffolds a project `.cockpit/` when no layer exists yet.
 pub(super) fn persist_sandbox_intent(
     project_root: &std::path::Path,
-    mode: crate::tools::sandbox_mode::SandboxMode,
+    mode: crate::tools::sandbox_mode::SandboxIntent,
 ) -> anyhow::Result<()> {
     use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
@@ -267,10 +267,6 @@ pub(super) fn persist_sandbox_intent(
     // still overrode it, silently dropping a toggle-to-default. Writing the
     // intent to the nearest layer every time is idempotent and matches
     // the other session-preference persist helpers.
-    anyhow::ensure!(
-        mode != crate::tools::sandbox_mode::SandboxMode::Refuse,
-        "refuse is a runtime fail-closed state, not a persistable sandbox intent"
-    );
     cfg.sandbox.default_mode = mode;
     doc.write(&cfg)?;
     Ok(())
@@ -284,13 +280,13 @@ pub(super) fn persist_sandbox_intent(
 pub(super) fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,
-    configured_default: crate::tools::sandbox_mode::SandboxMode,
+    configured_default: crate::tools::sandbox_mode::SandboxIntent,
     caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> crate::tools::sandbox_mode::SandboxMode {
     if daemon_no_sandbox || client_no_sandbox {
         return crate::tools::sandbox_mode::SandboxMode::Off;
     }
-    super::effective_sandbox_mode(configured_default, caps)
+    super::apply_sandbox_intent(configured_default, caps)
 }
 
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the

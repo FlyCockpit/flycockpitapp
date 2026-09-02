@@ -1637,7 +1637,7 @@ fn sandbox_denial_evidence_summary(
 fn capability_fail_closed_reason(ctx: &ToolCtx) -> String {
     let snapshot = ctx.config.snapshot();
     crate::daemon::session_worker::fail_closed_capability_reason(
-        snapshot.extended.sandbox.default_mode,
+        snapshot.extended.sandbox.default_mode.into(),
         &snapshot.host_capabilities,
     )
 }

@@ -9,7 +9,7 @@ use cockpit_proto::{
 };
 
 use crate::host_capabilities::{FEATURE_SANDBOX_CONTAINER, FEATURE_SANDBOX_HOST};
-use crate::tools::sandbox_mode::SandboxMode;
+use crate::tools::sandbox_mode::{SandboxIntent, SandboxMode};
 
 /// Typed reject when [`SetSandbox`](super::SessionWorkerHandle::set_sandbox)
 /// asks for a mode the snapshot cannot honor. The caller must not persist
@@ -17,7 +17,7 @@ use crate::tools::sandbox_mode::SandboxMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCapabilityMissing {
     pub requested: SandboxMode,
-    pub persisted_intent: SandboxMode,
+    pub persisted_intent: SandboxIntent,
     pub effective: SandboxMode,
     pub reason: String,
     pub fix_command: Option<String>,
@@ -30,7 +30,7 @@ impl std::fmt::Display for SandboxCapabilityMissing {
             "sandbox capability missing for {}: {} (persisted intent {}, effective {})",
             sandbox_mode_label(self.requested),
             self.reason,
-            sandbox_mode_label(self.persisted_intent),
+            self.persisted_intent.label(),
             sandbox_mode_label(self.effective),
         )?;
         if let Some(fix) = &self.fix_command {
@@ -46,7 +46,7 @@ impl std::error::Error for SandboxCapabilityMissing {}
 /// `effective`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetSandboxApplied {
-    pub persisted_intent: SandboxMode,
+    pub persisted_intent: SandboxIntent,
     pub effective: SandboxMode,
 }
 
@@ -185,17 +185,37 @@ pub fn sandbox_mode_selectable(intent: SandboxMode, caps: &HostCapabilitySnapsho
 /// container is [`SandboxMode::Refuse`], never silent Off. Explicit Off
 /// (`--no-sandbox` / `/sandbox off`) remains Off.
 pub fn effective_sandbox_mode(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> SandboxMode {
-    match intent {
-        SandboxMode::Off => SandboxMode::Off,
-        SandboxMode::Refuse => SandboxMode::Refuse,
-        SandboxMode::Sandbox | SandboxMode::Container | SandboxMode::ContainerReadonly => {
-            if sandbox_mode_available(intent, caps) {
-                intent
-            } else {
-                SandboxMode::Refuse
-            }
-        }
+    match SandboxIntent::try_from(intent) {
+        Ok(intent) => apply_sandbox_intent(intent, caps),
+        Err(_) => SandboxMode::Refuse,
     }
+}
+
+/// Map a persistable sandbox intent onto the live session mode.
+///
+/// Every transition from configured/override intent to an executable session
+/// mode goes through this function so [`SandboxMode::Refuse`] is preserved
+/// until capabilities are verified or the user explicitly selects Off.
+pub fn apply_sandbox_intent(intent: SandboxIntent, caps: &HostCapabilitySnapshot) -> SandboxMode {
+    let mode = SandboxMode::from(intent);
+    if sandbox_mode_available(mode, caps) {
+        mode
+    } else {
+        SandboxMode::Refuse
+    }
+}
+
+/// Resolve a stored per-node sandbox override label through capability
+/// checks. Unknown and `"refuse"` labels are not persistable intents and
+/// yield [`None`] so the caller keeps the current session mode.
+pub fn apply_stored_sandbox_override_label(
+    label: &str,
+    caps: &HostCapabilitySnapshot,
+) -> Option<SandboxMode> {
+    Some(apply_sandbox_intent(
+        SandboxIntent::from_label(label)?,
+        caps,
+    ))
 }
 
 /// Reason and optional fix command when `intent` cannot be honored.
@@ -233,22 +253,22 @@ pub fn fail_closed_capability_reason(intent: SandboxMode, caps: &HostCapabilityS
 /// must not be persisted. [`SandboxMode::Refuse`] is not a selectable intent.
 pub fn evaluate_set_sandbox(
     requested: SandboxMode,
-    persisted_intent: SandboxMode,
+    persisted_intent: SandboxIntent,
     caps: &HostCapabilitySnapshot,
 ) -> Result<SetSandboxApplied, SandboxCapabilityMissing> {
-    if requested == SandboxMode::Refuse {
+    let Ok(requested_intent) = SandboxIntent::try_from(requested) else {
         return Err(SandboxCapabilityMissing {
             requested,
             persisted_intent,
-            effective: effective_sandbox_mode(persisted_intent, caps),
+            effective: apply_sandbox_intent(persisted_intent, caps),
             reason: "refuse is a runtime fail-closed state, not a selectable sandbox mode"
                 .to_string(),
             fix_command: None,
         });
-    }
+    };
     if sandbox_mode_available(requested, caps) {
         return Ok(SetSandboxApplied {
-            persisted_intent: requested,
+            persisted_intent: requested_intent,
             effective: requested,
         });
     }
@@ -256,7 +276,7 @@ pub fn evaluate_set_sandbox(
     Err(SandboxCapabilityMissing {
         requested,
         persisted_intent,
-        effective: effective_sandbox_mode(persisted_intent, caps),
+        effective: apply_sandbox_intent(persisted_intent, caps),
         reason: row
             .map(|row| row.reason.clone())
             .unwrap_or_else(|| format!("{} is unavailable", sandbox_mode_label(requested))),
@@ -424,7 +444,7 @@ mod tests {
             effective_sandbox_mode(SandboxMode::Sandbox, &caps),
             SandboxMode::Refuse
         );
-        assert!(evaluate_set_sandbox(SandboxMode::Sandbox, SandboxMode::Off, &caps).is_err());
+        assert!(evaluate_set_sandbox(SandboxMode::Sandbox, SandboxIntent::Off, &caps).is_err());
         let notice = sandbox_capability_unavailable_notice(SandboxMode::Sandbox, &caps)
             .expect("unpublished snapshot must surface a fail-closed notice");
         assert!(
@@ -470,7 +490,7 @@ mod tests {
             Some("sudo apt-get install bubblewrap".to_string()),
             None,
         );
-        let previous = SandboxMode::Off;
+        let previous = SandboxIntent::Off;
         let err = evaluate_set_sandbox(SandboxMode::Sandbox, previous, &host_down)
             .expect_err("SetSandbox(Sandbox) must reject when host cap is missing");
         assert_eq!(err.requested, SandboxMode::Sandbox);
@@ -490,7 +510,7 @@ mod tests {
             None,
             None,
         );
-        let previous = SandboxMode::Sandbox;
+        let previous = SandboxIntent::Sandbox;
         let err = evaluate_set_sandbox(SandboxMode::Container, previous, &container_down)
             .expect_err("SetSandbox(Container) must reject when container cap is down");
         assert_eq!(err.requested, SandboxMode::Container);
@@ -509,17 +529,17 @@ mod tests {
             FeatureCapabilityState::Available,
             FeatureCapabilityState::Available,
         );
-        let applied = evaluate_set_sandbox(SandboxMode::Sandbox, SandboxMode::Off, &both_up)
+        let applied = evaluate_set_sandbox(SandboxMode::Sandbox, SandboxIntent::Off, &both_up)
             .expect("available host Sandbox persists");
-        assert_eq!(applied.persisted_intent, SandboxMode::Sandbox);
+        assert_eq!(applied.persisted_intent, SandboxIntent::Sandbox);
         assert_eq!(applied.effective, SandboxMode::Sandbox);
         let applied = evaluate_set_sandbox(
             SandboxMode::ContainerReadonly,
-            SandboxMode::Sandbox,
+            SandboxIntent::Sandbox,
             &both_up,
         )
         .expect("available container persists");
-        assert_eq!(applied.persisted_intent, SandboxMode::ContainerReadonly);
+        assert_eq!(applied.persisted_intent, SandboxIntent::ContainerReadonly);
         assert_eq!(applied.effective, SandboxMode::ContainerReadonly);
     }
 
@@ -578,10 +598,10 @@ mod tests {
             FeatureCapabilityState::Available,
             FeatureCapabilityState::Available,
         );
-        let err = evaluate_set_sandbox(SandboxMode::Refuse, SandboxMode::Sandbox, &caps)
+        let err = evaluate_set_sandbox(SandboxMode::Refuse, SandboxIntent::Sandbox, &caps)
             .expect_err("Refuse is not a selectable intent");
         assert_eq!(err.requested, SandboxMode::Refuse);
-        assert_eq!(err.persisted_intent, SandboxMode::Sandbox);
+        assert_eq!(err.persisted_intent, SandboxIntent::Sandbox);
         assert_eq!(err.effective, SandboxMode::Sandbox);
     }
 
@@ -596,5 +616,57 @@ mod tests {
             SandboxMode::Off
         );
         assert!(sandbox_capability_unavailable_notice(SandboxMode::Off, &caps).is_none());
+    }
+
+    #[test]
+    fn stored_override_label_rechecks_capabilities_before_replacing_refuse() {
+        let down = sandbox_capability_snapshot(
+            FeatureCapabilityState::Missing,
+            FeatureCapabilityState::Available,
+        );
+        let up = sandbox_capability_snapshot(
+            FeatureCapabilityState::Available,
+            FeatureCapabilityState::Available,
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("sandbox", &down),
+            Some(SandboxMode::Refuse),
+            "Sandbox override must not re-enter Sandbox while the host cap is down"
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("container", &down),
+            Some(SandboxMode::Container),
+            "container cap is up in this snapshot"
+        );
+        let container_down = sandbox_capability_snapshot(
+            FeatureCapabilityState::Available,
+            FeatureCapabilityState::Missing,
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("container", &container_down),
+            Some(SandboxMode::Refuse)
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("sandbox", &up),
+            Some(SandboxMode::Sandbox)
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("off", &down),
+            Some(SandboxMode::Off),
+            "explicit Off is the acknowledgement path out of fail-closed"
+        );
+        assert_eq!(
+            apply_stored_sandbox_override_label("refuse", &up),
+            None,
+            "refuse is not a stored override intent"
+        );
+        assert_eq!(
+            apply_sandbox_intent(SandboxIntent::Sandbox, &down),
+            SandboxMode::Refuse
+        );
+        assert_eq!(
+            apply_sandbox_intent(SandboxIntent::Off, &down),
+            SandboxMode::Off
+        );
     }
 }

@@ -10,6 +10,34 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::computer::host_identity::domain_hash;
 
+/// Snapshot an authority record before its durable pre-post pending mark.
+/// Generic so the rollback state machine is testable on non-macOS builders;
+/// the macOS backend supplies its private journal record type.
+pub(super) fn begin_known_pre_post<T: Clone>(
+    state: &mut T,
+    mark_pending: impl FnOnce(&mut T),
+) -> T {
+    let previous = state.clone();
+    mark_pending(state);
+    previous
+}
+
+/// Restore the byte-for-byte logical authority state captured before prepare.
+pub(super) fn rollback_known_pre_post<T>(state: &mut T, previous: T) {
+    *state = previous;
+}
+
+#[cfg(target_os = "macos")]
+use crate::computer::host_identity::{
+    HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
+};
+#[cfg(target_os = "macos")]
+use crate::computer::target::{
+    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
+    RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
+    TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+};
+
 /// Apple `AU_DEFAUDITSID` — audit session id zero is nondefault-required.
 pub const AU_DEFAUDITSID: u32 = 0;
 
@@ -851,5 +879,773 @@ impl MacObservedEpoch {
                 Err(MacEvidenceError::Stale)
             }
         }
+    }
+}
+
+/// Epoch tied to the AX focused-window object's lifetime, rather than to a
+/// recyclable PID or CoreGraphics window number. The production adapter feeds
+/// this with `CFEqual` on a retained AX element; a replacement advances it
+/// even when every numeric/window-geometry field happens to repeat.
+#[derive(Debug, Default)]
+pub struct MacFocusedWindowLifetimeEpoch {
+    epoch: u64,
+}
+
+impl MacFocusedWindowLifetimeEpoch {
+    pub fn observe(&mut self, same_live_window: bool) -> Result<u64, MacEvidenceError> {
+        if same_live_window {
+            return Ok(self.epoch);
+        }
+        self.epoch = self.epoch.checked_add(1).ok_or(MacEvidenceError::Stale)?;
+        Ok(self.epoch)
+    }
+}
+
+// --- Production adapter ---------------------------------------------------
+
+/// Synchronous macOS AX/AppKit/CoreGraphics evidence adapter.
+///
+/// Native references are created and consumed inside `capture_snapshot`; no
+/// AppKit, AX, or CoreFoundation object crosses the platform-neutral trait.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct MacOsTargetEvidenceAdapter {
+    host: HostInstallationId,
+    reducer: FocusGenerationReducer,
+    observed_epoch: u64,
+    /// Retained AX element for the currently observed focused window. AX
+    /// window and CoreGraphics numbers are recyclable; this retained live AX
+    /// object is the lifetime witness that distinguishes a replacement from
+    /// the prior object even when those numeric IDs are identical.
+    focused_window_lifetime:
+        Option<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>>,
+    focused_window_lifetime_epoch: MacFocusedWindowLifetimeEpoch,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsTargetEvidenceAdapter {
+    pub fn new() -> Result<Self, TargetUnavailableReason> {
+        // SAFETY: This is a read-only TCC preflight and does not request or
+        // mutate system permission state.
+        if !unsafe { objc2_application_services::AXIsProcessTrusted() } {
+            return Err(TargetUnavailableReason::PermissionDenied);
+        }
+        let data_dir = crate::config::resolve::cockpit_data_dir()
+            .map_err(|_| TargetUnavailableReason::HostIdentityUnavailable)?;
+        let host = load_or_create_host_installation_id(
+            &data_dir,
+            &mut SysHostIdentityRng,
+            &mut RealHostIdentityFs,
+        )
+        .map_err(|_| TargetUnavailableReason::HostIdentityUnavailable)?;
+        Ok(Self {
+            host,
+            reducer: FocusGenerationReducer::new(),
+            observed_epoch: 0,
+            focused_window_lifetime: None,
+            focused_window_lifetime_epoch: MacFocusedWindowLifetimeEpoch::default(),
+        })
+    }
+
+    fn capture_macos_snapshot(
+        &mut self,
+    ) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        use objc2_app_kit::NSWorkspace;
+        use objc2_application_services::AXUIElement;
+        use objc2_core_graphics::{
+            CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError,
+            CGGetActiveDisplayList, CGMainDisplayID,
+        };
+
+        let session = current_audit_session_id()?;
+        // CGEvent is host-wide, so the process's non-default audit session is
+        // not sufficient proof that it owns the displayed desktop. Capture a
+        // typed CGSession snapshot before querying focus and require the same
+        // active console session after the complete evidence bracket.
+        let login_session = current_active_login_session()?;
+        let workspace = NSWorkspace::sharedWorkspace();
+        let frontmost = workspace
+            .frontmostApplication()
+            .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+        let frontmost_pid = u32::try_from(frontmost.processIdentifier())
+            .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+
+        // SAFETY: AX returns retained CF objects. `ax_attribute` validates the
+        // status and takes ownership of each +1 result before downcasting.
+        let system = unsafe { AXUIElement::new_system_wide() };
+        let application = ax_attribute(&system, MacAxAttribute::FocusedApplication)?
+            .downcast::<AXUIElement>()
+            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+        let mut ax_pid: libc::pid_t = 0;
+        let pid_status = unsafe { application.pid(std::ptr::NonNull::from(&mut ax_pid)) };
+        if pid_status != objc2_application_services::AXError::Success
+            || u32::try_from(ax_pid).ok() != Some(frontmost_pid)
+        {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+        let window = ax_attribute(&application, MacAxAttribute::FocusedWindow)?
+            .downcast::<AXUIElement>()
+            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+
+        // `CFEqual` is AX's object-identity comparison, not a comparison of
+        // window bounds or the recyclable CGWindowID. Keep the prior object
+        // retained across snapshots: a destroyed AX element and a replacement
+        // that happens to receive the same PID/window number compare unequal.
+        // The resulting epoch is mixed into the opaque ID consumed by both
+        // planning and pre-handoff generation checks.
+        let same_live_window = self
+            .focused_window_lifetime
+            .as_ref()
+            .is_some_and(|previous| {
+                objc2_core_foundation::CFEqual(Some(previous.as_ref()), Some(window.as_ref()))
+            });
+        let focused_window_lifetime_epoch = self
+            .focused_window_lifetime_epoch
+            .observe(same_live_window)
+            .map_err(|_| TargetUnavailableReason::EpochOverflow)?;
+        if !same_live_window {
+            self.focused_window_lifetime = Some(window.clone());
+        }
+
+        let (position, size) = ax_window_rect(&window)?;
+        let window_number = cg_window_number_for_ax_window(frontmost_pid, position, size)?;
+
+        let mut displays = [0_u32; 32];
+        let mut display_count = 0_u32;
+        // SAFETY: `displays` has exactly the advertised capacity and
+        // `display_count` is a valid writable out pointer.
+        let display_status = unsafe {
+            CGGetActiveDisplayList(
+                displays.len() as u32,
+                displays.as_mut_ptr(),
+                &mut display_count,
+            )
+        };
+        if display_status != CGError::Success || display_count == 0 {
+            return Err(TargetUnavailableReason::MissingCapability);
+        }
+        let display_count = usize::try_from(display_count)
+            .ok()
+            .filter(|count| *count <= displays.len())
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        let window_rect = (position.x, position.y, size.width, size.height);
+        let mut selected = None;
+        for display in &displays[..display_count] {
+            let bounds = CGDisplayBounds(*display);
+            let area = intersection_area(
+                window_rect,
+                (
+                    bounds.origin.x,
+                    bounds.origin.y,
+                    bounds.size.width,
+                    bounds.size.height,
+                ),
+            );
+            match selected {
+                None if area > 0.0 => selected = Some((*display, bounds, area)),
+                Some((best_id, _, best_area))
+                    if area > best_area || (area == best_area && *display < best_id) =>
+                {
+                    selected = Some((*display, bounds, area));
+                }
+                _ => {}
+            }
+        }
+        let (display_id, display_bounds, _) =
+            selected.ok_or(TargetUnavailableReason::AmbiguousOutput)?;
+        // The backend currently captures and maps coordinates against the main
+        // display only. Never attach secondary-display evidence to that
+        // surface: fail the physical open closed until a display-bound backend
+        // is composed with the adapter.
+        if display_id != CGMainDisplayID() {
+            return Err(TargetUnavailableReason::AmbiguousOutput);
+        }
+        let mode = CGDisplayCopyDisplayMode(display_id)
+            .ok_or(TargetUnavailableReason::MissingCapability)?;
+        let logical_width = CGDisplayMode::width(Some(&mode));
+        let physical_width = CGDisplayMode::pixel_width(Some(&mode));
+        if logical_width == 0 || physical_width == 0 {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+        let scale = physical_width as f64 / logical_width as f64;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+        // SAFETY: ColorSync documents a non-null retained UUID for a valid
+        // active display ID. objc2 represents that audited contract directly.
+        let display_uuid =
+            unsafe { objc2_color_sync::CGDisplayCreateUUIDFromDisplayID(display_id) };
+        let display_uuid_bytes: [u8; 16] = display_uuid.uuid_bytes().into();
+
+        let role = ax_string(&window, MacAxAttribute::Role)?;
+        let subrole = ax_optional_string(&window, MacAxAttribute::Subrole);
+        let title = ax_optional_string(&window, MacAxAttribute::Title);
+        let bundle_id = frontmost.bundleIdentifier().map(|value| value.to_string());
+        let app_name = frontmost.localizedName().map(|value| value.to_string());
+
+        // Recheck both independently observed focus authorities after all
+        // component queries to close the synchronous evidence bracket.
+        let recheck_frontmost_pid = workspace
+            .frontmostApplication()
+            .and_then(|app| u32::try_from(app.processIdentifier()).ok());
+        let recheck_application = ax_attribute(&system, MacAxAttribute::FocusedApplication)?
+            .downcast::<AXUIElement>()
+            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+        let mut recheck_ax_pid: libc::pid_t = 0;
+        let recheck_status =
+            unsafe { recheck_application.pid(std::ptr::NonNull::from(&mut recheck_ax_pid)) };
+        if recheck_status != objc2_application_services::AXError::Success
+            || recheck_frontmost_pid != Some(frontmost_pid)
+            || u32::try_from(recheck_ax_pid).ok() != Some(frontmost_pid)
+        {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        let recheck_window = ax_attribute(&recheck_application, MacAxAttribute::FocusedWindow)?
+            .downcast::<AXUIElement>()
+            .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+        // The numeric CoreGraphics window number and AX geometry below can be
+        // recycled after the original window is destroyed. Recheck the live
+        // AX object against the retained lifetime witness before accepting
+        // those observable fields, otherwise a same-PID replacement could
+        // inherit the original window's epoch during this synchronous bracket.
+        let recheck_same_lifetime = self
+            .focused_window_lifetime
+            .as_ref()
+            .is_some_and(|retained| {
+                objc2_core_foundation::CFEqual(
+                    Some(retained.as_ref()),
+                    Some(recheck_window.as_ref()),
+                )
+            });
+        if !recheck_same_lifetime {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        let (recheck_position, recheck_size) = ax_window_rect(&recheck_window)?;
+        let recheck_window_number =
+            cg_window_number_for_ax_window(frontmost_pid, recheck_position, recheck_size)?;
+        if recheck_position != position
+            || recheck_size != size
+            || recheck_window_number != window_number
+        {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+
+        let window_hash = domain_hash(
+            b"cockpit.macos.ax-window-lifetime.v1",
+            &[
+                &frontmost_pid.to_le_bytes(),
+                &window_number.to_le_bytes(),
+                &focused_window_lifetime_epoch.to_le_bytes(),
+            ],
+        );
+        let mut window_id = [0_u8; 16];
+        window_id.copy_from_slice(&window_hash[..16]);
+
+        let mut snapshot = empty_unavailable(BackendKind::RealDesktopMacOs);
+        snapshot.host_installation_id =
+            FieldEvidence::available(self.host, EvidenceSource::MachAuditToken);
+        snapshot.platform_session_or_seat_id = FieldEvidence::available(
+            session_id_from_asid(session),
+            EvidenceSource::MachAuditToken,
+        );
+        snapshot.physical_display_id = FieldEvidence::available(
+            display_id_from_uuid_bytes(display_uuid_bytes),
+            EvidenceSource::ColorSyncDisplayUuid,
+        );
+        snapshot.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes(window_id),
+            EvidenceSource::CgWindowList,
+        );
+        snapshot.process_id =
+            FieldEvidence::available(frontmost_pid, EvidenceSource::AppKitWorkspace);
+        snapshot.stable_application_id = bundle_id.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::AppKitWorkspace),
+                )
+            },
+            |value| {
+                FieldEvidence::available(
+                    StableApplicationId {
+                        kind: "macos.bundle_id",
+                        value,
+                    },
+                    EvidenceSource::AppKitWorkspace,
+                )
+            },
+        );
+        // TODO(issue #188 follow-up): semantic accessibility-driven
+        // perception remains deferred; these AX fields are target evidence
+        // only, while screenshots remain the model's perception surface.
+        snapshot.accessibility_role = FieldEvidence::available(role, EvidenceSource::Accessibility);
+        snapshot.accessibility_subrole = optional_ax_field(subrole);
+        snapshot.title_hint = title.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::Accessibility),
+                )
+            },
+            |value| {
+                FieldEvidence::available(
+                    RedactedHint::from_raw(&value),
+                    EvidenceSource::Accessibility,
+                )
+            },
+        );
+        snapshot.class_hint = app_name.map_or_else(
+            || {
+                FieldEvidence::unavailable(
+                    TargetUnavailableReason::PartialEvidence,
+                    Some(EvidenceSource::AppKitWorkspace),
+                )
+            },
+            |value| {
+                FieldEvidence::available(
+                    RedactedHint::from_raw(&value),
+                    EvidenceSource::AppKitWorkspace,
+                )
+            },
+        );
+        snapshot.geometry = FieldEvidence::available(
+            TargetGeometry {
+                x: (position.x * scale).round() as i32,
+                y: (position.y * scale).round() as i32,
+                width: (size.width * scale).round() as u32,
+                height: (size.height * scale).round() as u32,
+                scale,
+            },
+            EvidenceSource::Accessibility,
+        );
+        snapshot.desktop_geometry = FieldEvidence::available(
+            TargetGeometry {
+                x: (display_bounds.origin.x * scale).round() as i32,
+                y: (display_bounds.origin.y * scale).round() as i32,
+                width: (display_bounds.size.width * scale).round() as u32,
+                height: (display_bounds.size.height * scale).round() as u32,
+                scale,
+            },
+            EvidenceSource::ColorSyncDisplayUuid,
+        );
+        validate_current_login_session(&login_session)?;
+        snapshot.synchronous_recheck = true;
+        Ok(snapshot)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TargetEvidenceAdapter for MacOsTargetEvidenceAdapter {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::RealDesktopMacOs
+    }
+
+    fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        let mut snapshot = self.capture_macos_snapshot()?;
+        // This adapter does not publish a native callback stream yet, so a
+        // synchronous snapshot is not itself an observed focus event. The
+        // pre-handoff bracket below compares the complete fingerprint, which
+        // now includes the retained-AX lifetime epoch; advancing this counter
+        // on every read would reject every otherwise stable dispatch.
+        snapshot.adapter_observed_epoch = self.observed_epoch;
+        snapshot.focus_generation = self.reducer.observe(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn observed_focus_epoch(&self) -> u64 {
+        self.observed_epoch
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ax_window_rect(
+    window: &objc2_application_services::AXUIElement,
+) -> Result<
+    (
+        objc2_core_foundation::CGPoint,
+        objc2_core_foundation::CGSize,
+    ),
+    TargetUnavailableReason,
+> {
+    use objc2_application_services::{AXValue, AXValueType};
+    use objc2_core_foundation::{CGPoint, CGSize};
+
+    let position_value = ax_attribute(window, MacAxAttribute::Position)?
+        .downcast::<AXValue>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let size_value = ax_attribute(window, MacAxAttribute::Size)?
+        .downcast::<AXValue>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let mut position = CGPoint::default();
+    let mut size = CGSize::default();
+    // SAFETY: Both destinations are initialized, correctly aligned native
+    // geometry values and remain live for the duration of each AX call.
+    let position_ok = unsafe {
+        position_value.r#type() == AXValueType::CGPoint
+            && position_value.value(
+                AXValueType::CGPoint,
+                std::ptr::NonNull::new_unchecked(
+                    (&mut position as *mut CGPoint).cast::<std::ffi::c_void>(),
+                ),
+            )
+    };
+    let size_ok = unsafe {
+        size_value.r#type() == AXValueType::CGSize
+            && size_value.value(
+                AXValueType::CGSize,
+                std::ptr::NonNull::new_unchecked(
+                    (&mut size as *mut CGSize).cast::<std::ffi::c_void>(),
+                ),
+            )
+    };
+    if !position_ok
+        || !size_ok
+        || !position.x.is_finite()
+        || !position.y.is_finite()
+        || !size.width.is_finite()
+        || !size.height.is_finite()
+        || size.width <= 0.0
+        || size.height <= 0.0
+    {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    Ok((position, size))
+}
+
+/// Resolve AX's focused window to the public CoreGraphics window number.
+/// The window number is a live compositor object identity; unlike AX bounds,
+/// it does not change when the window moves or resizes.
+#[cfg(target_os = "macos")]
+fn cg_window_number_for_ax_window(
+    expected_pid: u32,
+    position: objc2_core_foundation::CGPoint,
+    size: objc2_core_foundation::CGSize,
+) -> Result<u32, TargetUnavailableReason> {
+    use objc2_core_foundation::{CFArray, CFDictionary, CFRetained, CGRect};
+    use objc2_core_graphics::{
+        CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption,
+        kCGNullWindowID, kCGWindowBounds, kCGWindowNumber, kCGWindowOwnerPID,
+    };
+
+    let info = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )
+    .ok_or(TargetUnavailableReason::MissingCapability)?;
+    // CoreGraphics documents this return as an array of CFDictionary entries.
+    // The cast only supplies that documented element type to objc2.
+    let info: CFRetained<CFArray<CFDictionary>> = unsafe { CFRetained::cast_unchecked(info) };
+    let owner_pid_key = unsafe { kCGWindowOwnerPID };
+    let window_number_key = unsafe { kCGWindowNumber };
+    let bounds_key = unsafe { kCGWindowBounds };
+    let mut matches = Vec::new();
+    for dictionary in info.iter() {
+        let owner_pid = cg_number_value(dictionary, owner_pid_key)?;
+        if owner_pid != i64::from(expected_pid) {
+            continue;
+        }
+        let bounds_value = cg_dictionary_value(dictionary, bounds_key)
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        let bounds_dictionary = bounds_value
+            .downcast_ref::<CFDictionary>()
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        let mut bounds = CGRect::default();
+        // SAFETY: `bounds_dictionary` is checked as a CFDictionary and
+        // `bounds` is an initialized writable CGRect. CoreGraphics validates
+        // the dictionary's typed geometry fields before returning true.
+        let bounds_ok =
+            unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds_dictionary), &mut bounds) };
+        if !bounds_ok {
+            return Err(TargetUnavailableReason::QueryMismatch);
+        }
+        if (
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ) != (position.x, position.y, size.width, size.height)
+        {
+            continue;
+        }
+        let window_number = cg_number_value(dictionary, window_number_key)?;
+        let window_number = u32::try_from(window_number)
+            .ok()
+            .filter(|number| *number != 0)
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
+        matches.push(window_number);
+    }
+    match matches.as_slice() {
+        [window_number] => Ok(*window_number),
+        [] => Err(TargetUnavailableReason::FocusIdentityUnavailable),
+        _ => Err(TargetUnavailableReason::AmbiguousOutput),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_dictionary_value<'a>(
+    dictionary: &'a objc2_core_foundation::CFDictionary,
+    key: &objc2_core_foundation::CFString,
+) -> Option<&'a objc2_core_foundation::CFType> {
+    use objc2_core_foundation::{CFDictionary, CFString, CFType};
+
+    // CGWindowList dictionaries are dynamically typed. Reinterpret only the
+    // generic parameters (the CF object layout is identical), then downcast
+    // each value before use.
+    let typed =
+        unsafe { &*(dictionary as *const CFDictionary).cast::<CFDictionary<CFString, CFType>>() };
+    // SAFETY: `typed` supplies the actual key/value CF types documented for a
+    // CGWindowList entry; the returned reference lives no longer than `dictionary`.
+    unsafe { typed.get_unchecked(key) }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_number_value(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: &objc2_core_foundation::CFString,
+) -> Result<i64, TargetUnavailableReason> {
+    use objc2_core_foundation::CFNumber;
+
+    cg_dictionary_value(dictionary, key)
+        .and_then(|value| value.downcast_ref::<CFNumber>())
+        .and_then(CFNumber::as_i64)
+        .ok_or(TargetUnavailableReason::QueryMismatch)
+}
+
+#[cfg(target_os = "macos")]
+fn current_audit_session_id() -> Result<u32, TargetUnavailableReason> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::message::audit_token_t;
+    use mach2::task::task_info;
+    use mach2::task_info::{TASK_AUDIT_TOKEN, TASK_AUDIT_TOKEN_COUNT, task_info_t};
+    use mach2::traps::mach_task_self;
+
+    let mut token = audit_token_t::default();
+    let mut count = TASK_AUDIT_TOKEN_COUNT;
+    // SAFETY: `token` is the exact public TASK_AUDIT_TOKEN layout, and count
+    // advertises its size in natural_t units as required by task_info.
+    let status = unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_AUDIT_TOKEN,
+            (&mut token as *mut audit_token_t).cast::<i32>() as task_info_t,
+            &mut count,
+        )
+    };
+    extract_audit_session_id(status == KERN_SUCCESS, count, &token.val)
+        .map_err(|_| TargetUnavailableReason::SessionInactive)
+}
+
+/// Capture the current login session and prove that it belongs to this
+/// process's effective UID and is the active, fully logged-in console session.
+///
+/// The caller retains the snapshot and passes it to
+/// [`validate_current_login_session`] after its evidence bracket. That second
+/// read rejects fast-user-switch and login transitions that occur while AX and
+/// CoreGraphics focus evidence is being gathered.
+#[cfg(target_os = "macos")]
+fn current_active_login_session() -> Result<CgSessionSnapshot, TargetUnavailableReason> {
+    use objc2_core_foundation::{CFBoolean, CFNumber};
+    use objc2_core_graphics::CGSessionCopyCurrentDictionary;
+
+    let dictionary =
+        CGSessionCopyCurrentDictionary().ok_or(TargetUnavailableReason::SessionInactive)?;
+    let snapshot = CgSessionSnapshot {
+        user_id: cg_session_value(&dictionary, CgSessionKey::UserId, |value| {
+            value
+                .downcast_ref::<CFNumber>()
+                .and_then(CFNumber::as_i64)
+                .and_then(|number| u32::try_from(number).ok())
+                .map(CgSessionValue::Number)
+        }),
+        console_set: cg_session_value(&dictionary, CgSessionKey::ConsoleSet, |value| {
+            value
+                .downcast_ref::<CFNumber>()
+                .and_then(CFNumber::as_i64)
+                .and_then(|number| u32::try_from(number).ok())
+                .map(CgSessionValue::Number)
+        }),
+        on_console: cg_session_value(&dictionary, CgSessionKey::OnConsole, |value| {
+            value
+                .downcast_ref::<CFBoolean>()
+                .map(|boolean| CgSessionValue::Bool(boolean.as_bool()))
+        }),
+        login_done: cg_session_value(&dictionary, CgSessionKey::LoginDone, |value| {
+            value
+                .downcast_ref::<CFBoolean>()
+                .map(|boolean| CgSessionValue::Bool(boolean.as_bool()))
+        }),
+    };
+    // SAFETY: `geteuid` has no preconditions and only reads this process's
+    // effective credentials.
+    let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    validate_cg_session(&snapshot, effective_uid, None)
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    Ok(snapshot)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_current_login_session(
+    previous: &CgSessionSnapshot,
+) -> Result<(), TargetUnavailableReason> {
+    let current = current_active_login_session()?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's
+    // effective credentials.
+    let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+        .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+    validate_cg_session(&current, effective_uid, Some(previous))
+        .map(|_| ())
+        .map_err(|_| TargetUnavailableReason::SessionInactive)
+}
+
+/// Reboundable proof of the active macOS console session used by the
+/// host-wide CGEvent sink. The backend retains one of these for its complete
+/// lifetime and rechecks it at the irreversible post primitive; evidence
+/// captured only at coordinator handoff is insufficient because a multi-event
+/// action may span a fast-user-switch transition.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub(crate) struct MacActiveConsoleSession {
+    login: CgSessionSnapshot,
+    audit_session_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl MacActiveConsoleSession {
+    pub(crate) fn capture() -> Result<Self, TargetUnavailableReason> {
+        Ok(Self {
+            login: current_active_login_session()?,
+            audit_session_id: current_audit_session_id()?,
+        })
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), TargetUnavailableReason> {
+        validate_current_login_session(&self.login)?;
+        if current_audit_session_id()? != self.audit_session_id {
+            return Err(TargetUnavailableReason::SessionInactive);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn identity(&self) -> Result<(u32, u32, u32), TargetUnavailableReason> {
+        let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+            .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+        let (owner_uid, console_set) = validate_cg_session(&self.login, effective_uid, None)
+            .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+        Ok((owner_uid, console_set, self.audit_session_id))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cg_session_value(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: CgSessionKey,
+    decode: impl FnOnce(&objc2_core_foundation::CFType) -> Option<CgSessionValue>,
+) -> CgSessionValue {
+    let key = objc2_core_foundation::CFString::from_static_str(key.as_static_str());
+    cg_dictionary_value(dictionary, &key).map_or(CgSessionValue::Missing, |value| {
+        decode(value).unwrap_or(CgSessionValue::WrongType)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn ax_attribute(
+    element: &objc2_application_services::AXUIElement,
+    attribute: MacAxAttribute,
+) -> Result<objc2_core_foundation::CFRetained<objc2_core_foundation::CFType>, TargetUnavailableReason>
+{
+    use objc2_application_services::AXError;
+    use objc2_core_foundation::{CFRetained, CFString, CFType};
+
+    let name = CFString::from_static_str(attribute.as_static_str());
+    let mut raw: *const CFType = std::ptr::null();
+    // SAFETY: `raw` is a valid writable out pointer. On success AX returns a
+    // non-null +1 CF object, transferred immediately into CFRetained.
+    let status = unsafe { element.copy_attribute_value(&name, std::ptr::NonNull::from(&mut raw)) };
+    if status == AXError::APIDisabled {
+        return Err(TargetUnavailableReason::PermissionDenied);
+    }
+    if status != AXError::Success {
+        return Err(TargetUnavailableReason::FocusIdentityUnavailable);
+    }
+    let raw =
+        std::ptr::NonNull::new(raw.cast_mut()).ok_or(TargetUnavailableReason::QueryMismatch)?;
+    // SAFETY: AXUIElementCopyAttributeValue returned success and ownership of
+    // the non-null +1 value represented by `raw`.
+    Ok(unsafe { CFRetained::from_raw(raw) })
+}
+
+#[cfg(target_os = "macos")]
+fn ax_string(
+    element: &objc2_application_services::AXUIElement,
+    attribute: MacAxAttribute,
+) -> Result<String, TargetUnavailableReason> {
+    ax_attribute(element, attribute)?
+        .downcast::<objc2_core_foundation::CFString>()
+        .map(|value| value.to_string())
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)
+}
+
+#[cfg(target_os = "macos")]
+fn ax_optional_string(
+    element: &objc2_application_services::AXUIElement,
+    attribute: MacAxAttribute,
+) -> Option<String> {
+    ax_string(element, attribute).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn optional_ax_field(value: Option<String>) -> FieldEvidence<String> {
+    value.map_or_else(
+        || {
+            FieldEvidence::unavailable(
+                TargetUnavailableReason::PartialEvidence,
+                Some(EvidenceSource::Accessibility),
+            )
+        },
+        |value| FieldEvidence::available(value, EvidenceSource::Accessibility),
+    )
+}
+
+#[cfg(test)]
+mod authority_transaction_tests {
+    use super::{begin_known_pre_post, rollback_known_pre_post};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AuthorityState {
+        pending: bool,
+        keys: Vec<u16>,
+        generation: u64,
+    }
+
+    #[test]
+    fn known_pre_post_refusal_restores_exact_prior_authority_state() {
+        let expected = AuthorityState {
+            pending: false,
+            keys: vec![12, 44],
+            generation: 9,
+        };
+        let mut state = expected.clone();
+        let previous = begin_known_pre_post(&mut state, |state| state.pending = true);
+        assert!(state.pending);
+        rollback_known_pre_post(&mut state, previous);
+        assert_eq!(state, expected);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_gui_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive macOS login and Accessibility permission"]
+    fn captures_focused_ax_evidence() {
+        let mut adapter = MacOsTargetEvidenceAdapter::new().expect("construct AX adapter");
+        let snapshot = adapter.capture_snapshot().expect("capture AX evidence");
+        assert_eq!(snapshot.backend_kind, BackendKind::RealDesktopMacOs);
+        assert!(snapshot.physical_target_key().is_ok());
+        assert!(snapshot.accessibility_role.is_available());
+        assert!(snapshot.process_id.is_available());
+        assert!(snapshot.synchronous_recheck);
     }
 }

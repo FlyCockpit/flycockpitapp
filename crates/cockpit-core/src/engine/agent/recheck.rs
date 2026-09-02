@@ -87,7 +87,9 @@ pub(crate) async fn result_recheck(
     let (extended, providers) = ctx.config.configs();
     let guard = resolve_injection_guard(&ctx.cwd);
     if guard.threshold == crate::config::extended::InjectionThreshold::Off
-        || ctx.session.approval_mode() == crate::config::extended::ApprovalMode::Yolo
+        || crate::tools::trusted_child_acquisition::effective_approval_mode(
+            ctx.session.approval_mode(),
+        ) == crate::config::extended::ApprovalMode::Yolo
     {
         return Ok(output.to_string());
     }
@@ -144,7 +146,9 @@ pub(crate) async fn result_recheck_for_artifact_capture(
     let (extended, providers) = ctx.config.configs();
     let guard = resolve_injection_guard(&ctx.cwd);
     if guard.threshold == crate::config::extended::InjectionThreshold::Off
-        || ctx.session.approval_mode() == crate::config::extended::ApprovalMode::Yolo
+        || crate::tools::trusted_child_acquisition::effective_approval_mode(
+            ctx.session.approval_mode(),
+        ) == crate::config::extended::ApprovalMode::Yolo
     {
         return Ok(Some(output.to_owned()));
     }

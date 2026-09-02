@@ -1246,9 +1246,10 @@ mod tests {
 
     fn key_action() -> ComputerAction {
         ComputerAction::KeyChord {
-            chord: super::super::KeyChord {
-                keys: vec!["Escape".to_string()],
-            },
+            chord: super::super::CanonicalKeyChord::new(vec![
+                super::super::KeyCode::parse("Escape").unwrap(),
+            ])
+            .unwrap(),
         }
     }
 
@@ -2813,7 +2814,7 @@ mod tests {
             button: super::super::MouseButton::Left,
         }));
         assert!(!action_qualifiable(&ComputerAction::HoldKey {
-            key: "Shift".to_string(),
+            key: super::super::KeyCode::parse("Shift").unwrap(),
             duration: Duration::from_millis(1),
         }));
     }

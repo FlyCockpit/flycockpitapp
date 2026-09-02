@@ -2358,30 +2358,34 @@ impl Session {
     /// than the session's mutable active selection.
     pub fn note_cache_hit_for_endpoint(
         &self,
-        provider: impl Into<String>,
-        model: impl Into<String>,
+        endpoint: crate::engine::model::CacheEndpointIdentity,
         usage: crate::tokens::TokenUsage,
     ) {
         if usage.hit_rate().is_some_and(|rate| rate > 0.0) {
-            *self.last_cache_hit_endpoint.lock().unwrap() = Some((provider.into(), model.into()));
+            self.observed_cache_hit_endpoints
+                .lock()
+                .unwrap()
+                .insert(endpoint);
         }
     }
 
     /// Whether this exact configured endpoint has observed a real cache hit
     /// during the current live session. Estimates and utility bookkeeping do
     /// not establish this gate.
-    pub fn has_observed_cache_hit_for_endpoint(&self, provider: &str, model: &str) -> bool {
-        self.last_cache_hit_endpoint
+    pub fn has_observed_cache_hit_for_endpoint(
+        &self,
+        endpoint: &crate::engine::model::CacheEndpointIdentity,
+    ) -> bool {
+        self.observed_cache_hit_endpoints
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|(hit_provider, hit_model)| hit_provider == provider && hit_model == model)
+            .contains(endpoint)
     }
 
     /// A model switch changes the prompt-cache key. Forget all prior evidence
     /// rather than allowing a switch-away-and-back race to arm an old window.
     pub fn clear_observed_cache_hit(&self) {
-        *self.last_cache_hit_endpoint.lock().unwrap() = None;
+        self.observed_cache_hit_endpoints.lock().unwrap().clear();
     }
 
     /// Seed the in-memory `last_usage` **without** writing an
@@ -2409,9 +2413,12 @@ mod keep_warm_endpoint_tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
+        let endpoint_a =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "model-a", 1);
+        let endpoint_b =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-b", "model-b", 1);
         session.note_cache_hit_for_endpoint(
-            "provider-a",
-            "model-a",
+            endpoint_a.clone(),
             crate::tokens::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 1,
@@ -2419,10 +2426,39 @@ mod keep_warm_endpoint_tests {
                 cache_creation_input_tokens: 0,
             },
         );
-        assert!(session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
-        assert!(!session.has_observed_cache_hit_for_endpoint("provider-b", "model-b"));
+        assert!(session.has_observed_cache_hit_for_endpoint(&endpoint_a));
+        assert!(!session.has_observed_cache_hit_for_endpoint(&endpoint_b));
+        session.note_cache_hit_for_endpoint(
+            endpoint_b.clone(),
+            crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        assert!(session.has_observed_cache_hit_for_endpoint(&endpoint_a));
+        assert!(session.has_observed_cache_hit_for_endpoint(&endpoint_b));
         session.clear_observed_cache_hit();
-        assert!(!session.has_observed_cache_hit_for_endpoint("provider-a", "model-a"));
+        assert!(!session.has_observed_cache_hit_for_endpoint(&endpoint_a));
+        assert!(!session.has_observed_cache_hit_for_endpoint(&endpoint_b));
+
+        let rebuilt_same_names =
+            crate::engine::model::CacheEndpointIdentity::for_test("provider-a", "model-a", 2);
+        session.note_cache_hit_for_endpoint(
+            endpoint_a.clone(),
+            crate::tokens::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                cached_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        assert!(session.has_observed_cache_hit_for_endpoint(&endpoint_a));
+        assert!(
+            !session.has_observed_cache_hit_for_endpoint(&rebuilt_same_names),
+            "a refreshed configuration with recycled provider/model labels must re-observe a hit"
+        );
     }
 }
 

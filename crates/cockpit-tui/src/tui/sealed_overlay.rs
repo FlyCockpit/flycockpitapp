@@ -34,8 +34,8 @@ use zeroize::Zeroizing;
 use cockpit_core::sealed::identity::SealedScopeKind;
 use cockpit_core::sealed::owner_commands::{SealedActionCommand, SealedCommand};
 use cockpit_proto::{
-    MAX_SENSITIVE_FRAME_BYTES, Request, Response, SealedOwnerInventoryItem, SealedOwnerScopeKind,
-    SensitiveWireLiteral,
+    MAX_SENSITIVE_FRAME_BYTES, Request, Response, SealedAcquisitionAuditItem,
+    SealedOwnerInventoryItem, SealedOwnerScopeKind, SensitiveWireLiteral,
 };
 
 /// The ephemeral recover reveal lifetime: 30 seconds (mirrors `/leaks`).
@@ -348,13 +348,15 @@ pub(crate) fn format_sealed_inventory(items: &[SealedOwnerInventoryItem]) -> Str
     if items.is_empty() {
         return "/sealed: no sealed values".to_string();
     }
-    let mut out = String::from("/sealed: record_id | name | scope | key | version | description");
+    let mut out =
+        String::from("/sealed: record_id | name | namespace | scope | key | version | description");
     for item in items {
         out.push('\n');
         out.push_str(&format!(
-            "{} | {} | {} | {} | {} | {}",
+            "{} | {} | {:?} | {} | {} | {} | {}",
             item.record_id,
             item.name,
+            item.namespace,
             scope_kind_label(item.scope_kind),
             item.scope_key,
             item.active_version,
@@ -364,13 +366,52 @@ pub(crate) fn format_sealed_inventory(items: &[SealedOwnerInventoryItem]) -> Str
     out
 }
 
+fn append_acquisition_audit(out: &mut String, acquisitions: &[SealedAcquisitionAuditItem]) {
+    if acquisitions.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\n/sealed acquisitions: acquisition_id | name | outcome | owner question | consent | child | created",
+    );
+    for acquisition in acquisitions {
+        let owner_question = match (
+            acquisition.requires_user_reason.as_deref(),
+            acquisition.requires_user_prompt.as_deref(),
+        ) {
+            (Some(reason), Some(prompt)) => format!("{reason}: {prompt}"),
+            _ if acquisition.outcome == "requires_user" => {
+                "invalid requires-user audit entry".to_owned()
+            }
+            _ => String::new(),
+        };
+        out.push('\n');
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {} | {} | {}",
+            acquisition.acquisition_id,
+            acquisition.name,
+            acquisition.outcome,
+            owner_question,
+            acquisition.consent_mode,
+            acquisition.child_agent,
+            acquisition.created_at_ms,
+        ));
+    }
+}
+
 /// Map a `/sealed` metadata daemon result to transcript text. Follows the
 /// `/leaks` shape: the unexpected-response arm NEVER renders a `Debug` of a
 /// daemon response, so a `SealedOwnerOperationApplied` (the only literal-bearing
 /// response) can never surface a revealed literal through this path.
 pub(crate) fn sealed_response_text(result: Result<Response, String>) -> String {
     match result {
-        Ok(Response::SealedOwnerInventory { items }) => format_sealed_inventory(&items),
+        Ok(Response::SealedOwnerInventory {
+            items,
+            acquisitions,
+        }) => {
+            let mut rendered = format_sealed_inventory(&items);
+            append_acquisition_audit(&mut rendered, &acquisitions);
+            rendered
+        }
         Ok(Response::SealedOwnerDescriptionEdited { record_id }) => {
             format!("/sealed: description updated for {record_id}")
         }
@@ -1127,14 +1168,37 @@ mod tests {
             scope_key: "proj-key".to_string(),
             active_version: 3,
             created_at_ms: 1_000,
+            namespace: cockpit_proto::SealedOwnerNamespace::AgentAcquired,
         }];
-        let rendered = sealed_response_text(Ok(Response::SealedOwnerInventory { items }));
+        let rendered = sealed_response_text(Ok(Response::SealedOwnerInventory {
+            items,
+            acquisitions: vec![cockpit_proto::SealedAcquisitionAuditItem {
+                acquisition_id: "acq-1".to_string(),
+                record_id: "rec-1".to_string(),
+                session_id: "session-1".to_string(),
+                project_key: "project-1".to_string(),
+                name: "deploy_token".to_string(),
+                description: "acquired for deploy".to_string(),
+                child_agent: "sealed-acquisition".to_string(),
+                source_tool_call_id: Some("call-1".to_string()),
+                consent_mode: "audit_only".to_string(),
+                outcome: "requires_user".to_string(),
+                requires_user_reason: Some("interactive_login".to_string()),
+                requires_user_prompt: Some("Please complete the provider login.".to_string()),
+                created_at_ms: 1_000,
+                completed_at_ms: Some(1_001),
+            }],
+        }));
         assert!(
             rendered.contains("rec-1"),
             "renders safe metadata: {rendered}"
         );
         assert!(rendered.contains("deploy_token"));
         assert!(rendered.contains("project"));
+        assert!(rendered.contains("AgentAcquired"));
+        assert!(rendered.contains("/sealed acquisitions"));
+        assert!(rendered.contains("audit_only"));
+        assert!(rendered.contains("interactive_login: Please complete the provider login."));
 
         // Precondition: this response really carries the secret.
         const SENTINEL: &str = "SENTINEL_LITERAL_XYZ";

@@ -8,11 +8,9 @@
 //! way to build a [`RequiresUser`] interactive-prompt payload. It has no
 //! provider, no async, no I/O, and no wiring to any caller.
 //!
-//! The coordinator that actually dispatches a trusted child and classifies its
-//! output into one of these outcomes (sub-increment 2c-3b, the task-delegation
-//! caller), and the lifecycle wiring through the 2c-2
-//! [`crate::session::trusted_child_capture`] registry (sub-increment 2c-3c),
-//! are **separate** follow-ups and are intentionally NOT built here.
+//! The trusted-child acquisition coordinator consumes this closed type and the
+//! [`crate::session::trusted_child_capture`] registry; this module keeps only
+//! the pure outcome and question validation contract.
 //!
 //! ## The closed outcome set (AC6)
 //!

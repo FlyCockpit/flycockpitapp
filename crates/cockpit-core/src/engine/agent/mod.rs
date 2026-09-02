@@ -429,6 +429,23 @@ pub(crate) async fn turn_toolbox(
 ) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, &agent.posture).await;
+    // `mcp` is rendered per executing daemon-owned agent instance.  Do this
+    // at the turn construction seam so delegated frames cannot inherit the
+    // root session's advertised package set.
+    if toolbox.names().contains(&"mcp") {
+        let registry = toolbox.mcp_builtin_registry_for_context(&agent.name);
+        let requests_enabled = match current_agent_instance_id() {
+            Some(agent_instance_id) => registry
+                .effective_network_capability_for(Some(session), Some(agent_instance_id))
+                .await
+                .map(|capability| capability.requests_enabled())
+                .unwrap_or(false),
+            None => false,
+        };
+        toolbox = toolbox.with(std::sync::Arc::new(
+            crate::tools::mcp_tool::McpTool::for_requests_enabled(requests_enabled),
+        ));
+    }
     let env = agent
         .env_overlay
         .read()
@@ -799,7 +816,7 @@ async fn record_usage_blocking(
     usage: crate::tokens::TokenUsage,
     model: &Model,
 ) -> anyhow::Result<()> {
-    session.note_cache_hit_for_endpoint(model.provider_id(), model.model_id_ref(), usage);
+    session.note_cache_hit_for_endpoint(model.cache_endpoint_identity(), usage);
     session.record_usage(call_id, usage).await
 }
 

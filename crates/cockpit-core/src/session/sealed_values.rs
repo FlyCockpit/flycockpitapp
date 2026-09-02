@@ -70,6 +70,66 @@ pub fn validate_sealed_value(value_id: &str, value: &str) -> Result<(), SealedVa
     Ok(())
 }
 
+/// Agent-acquired values originate in a command selected by a model and are
+/// therefore not trusted as redaction-table entries merely because they pass
+/// the owner-authored literal floor. Accept only an opaque, single-token
+/// credential shape: this prevents a command from registering a sentence or
+/// other future transcript fragment as a session-wide forced redaction.
+fn validate_agent_acquired_sealed_value(
+    value_id: &str,
+    value: &str,
+) -> Result<(), SealedValueError> {
+    validate_sealed_value(value_id, value)?;
+    let mut has_alpha = false;
+    let mut has_digit = false;
+    let mut has_separator = false;
+    if value.len() < 20
+        || value.len() > 4096
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(SealedValueError::PoisoningRisk);
+    }
+    for ch in value.chars() {
+        has_alpha |= ch.is_ascii_alphabetic();
+        has_digit |= ch.is_ascii_digit();
+        has_separator |= matches!(ch, '-' | '_' | '.' | '~' | '+' | '/' | '=' | ':');
+        if !ch.is_ascii_alphanumeric()
+            && !matches!(ch, '-' | '_' | '.' | '~' | '+' | '/' | '=' | ':')
+        {
+            return Err(SealedValueError::PoisoningRisk);
+        }
+    }
+    if !(has_alpha && has_digit) || !(has_separator || value.len() >= 32) {
+        return Err(SealedValueError::PoisoningRisk);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod agent_acquisition_tests {
+    use super::*;
+
+    #[test]
+    fn command_output_cannot_register_a_sentence_as_forced_redaction() {
+        assert_eq!(
+            validate_agent_acquired_sealed_value(
+                "acquired_token",
+                "this is a future transcript phrase 123"
+            ),
+            Err(SealedValueError::PoisoningRisk)
+        );
+        assert!(
+            validate_agent_acquired_sealed_value(
+                "acquired_token",
+                "ghp_6qV0t9Pz1Rf4Dx8Lm2Nc7Bw5Kj3Hs6Ya"
+            )
+            .is_ok()
+        );
+    }
+}
+
 impl Session {
     /// Union every live machine-scoped sealed literal into a session redaction
     /// table. Project values are intentionally not narrowed to this session's
@@ -107,6 +167,114 @@ impl Session {
         }
 
         Ok(unioned)
+    }
+
+    /// Create a session-scoped value in the agent-acquired namespace. This is
+    /// deliberately a separate host path from owner create/rotate: it accepts
+    /// an already-minted acquisition id, creates version one only, and cannot
+    /// replace either a scoped or legacy owner-authored slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_agent_acquired_sealed_value(
+        &self,
+        redaction: &crate::redact::RedactionTable,
+        acquisition_id: &str,
+        record_id: &str,
+        name: &str,
+        description: &str,
+        value: &str,
+        source_tool_call_id: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: crate::sealed::identity::SealedScopeKind::Session,
+            record_id: Some(crate::sealed::identity::SealedRecordId::parse(record_id)?),
+            name: crate::sealed::identity::SealedName::canonical(name)?,
+            version: 1,
+        };
+        let unioned = redaction.with_forced_sealed_literal(value.to_owned(), identity)?;
+        let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+            value.to_owned(),
+            crate::redact::protected_redaction_history::RedactionHistorySource::Sealed,
+            Some(record_id.to_owned()),
+            Some(1),
+        )?;
+        let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+            &self.db,
+            self.redaction_key_resolver().as_ref(),
+        );
+        let prepared = history
+            .prepare_append(&self.id.to_string(), protected)
+            .await?;
+        let record = crate::db::sealed_scope::NewSealedValueRecord {
+            record_id: record_id.to_owned(),
+            scope: crate::db::sealed_scope::SealedScopeKind::Session,
+            scope_key: self.id.to_string(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            owner_principal: "agent-acquired".to_string(),
+            created_at_ms: now_ms,
+        };
+        let write_json = unioned.to_persisted_json()?;
+        let cache_json = write_json.clone();
+        let vault = self.secret_vault.clone();
+        let session_id = self.id;
+        let item_id = crate::secure_key::session_sealed_item_id(&session_id.to_string(), name, 1);
+        let literal = value.to_owned();
+        let reason = description.to_owned();
+        let acquisition_id = acquisition_id.to_owned();
+        let source_tool_call_id = source_tool_call_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                let updated = conn.execute(
+                    "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                )?;
+                anyhow::ensure!(
+                    updated == 1,
+                    "agent-acquired sealed value requires a live persisted session"
+                );
+                let table_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+                vault
+                    .put_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                        &table_id,
+                        write_json.as_bytes(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let row = crate::db::sealed_scope::create_agent_acquired_session_sealed_value_conn(
+                    conn,
+                    &record,
+                    &literal,
+                    &reason,
+                    "trusted_child_acquisition",
+                    &acquisition_id,
+                    &source_tool_call_id,
+                    now_ms,
+                )?;
+                vault
+                    .put_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                        &item_id,
+                        literal.as_bytes(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                crate::redact::protected_redaction_history::append_and_attach_conn(
+                    conn,
+                    &prepared,
+                    &[],
+                )?;
+                anyhow::ensure!(
+                    row.active_version == 1,
+                    "agent-acquired create did not publish version one"
+                );
+                Ok(())
+            })
+            .await?;
+        *self.redaction_table_json.lock().unwrap() = Some(cache_json);
+        Ok(())
     }
 
     /// Build the enforced redaction union for text recalled from `target`.

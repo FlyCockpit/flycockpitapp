@@ -4050,7 +4050,7 @@ mod tests {
         for turn in 1..=8 {
             let _ = session.note_user_content(&format!("turn {turn}"));
         }
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(
@@ -4098,7 +4098,7 @@ mod tests {
         for turn in 1..=8 {
             let _ = session.note_user_content(&format!("turn {turn}"));
         }
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(
@@ -4126,7 +4126,7 @@ mod tests {
         for turn in 1..=8 {
             let _ = session.note_user_content(&format!("turn {turn}"));
         }
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         let context_usage = crate::engine::tool::ContextUsageSnapshot {
             ctx_pct: Some(62.0),
             used_tokens: Some(62_000),
@@ -4217,7 +4217,7 @@ mod tests {
             ),
             "{history:?}"
         );
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         inject_turn_start_system_messages(
             &session,
             &toolbox,
@@ -4240,7 +4240,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         let toolbox = ToolBox::new()
-            .with(Arc::new(crate::tools::mcp_tool::McpTool))
+            .with(Arc::new(crate::tools::mcp_tool::McpTool::default()))
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
         let mut history = Vec::new();
 
@@ -4278,7 +4278,7 @@ mod tests {
     async fn no_advert_nudge_when_catalog_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(

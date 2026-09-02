@@ -152,6 +152,51 @@ pub struct NeedsAttentionRow {
 }
 
 impl Db {
+    /// Exact governed-network approval class bound to an interrupt's durable
+    /// host operation. Prompt text and generic wire approval classes are not
+    /// authority for this classification.
+    pub async fn interrupt_governed_network_operation_kind(
+        &self,
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    ) -> Result<Option<String>> {
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT o.operation_kind
+                       FROM needs_attention n
+                       JOIN decision_requests d
+                         ON d.decision_request_id = n.decision_request_id
+                        AND d.session_id = n.session_id
+                       JOIN agent_host_approval_operations o
+                         ON o.operation_id = d.host_approval_operation_id
+                        AND o.session_id = n.session_id
+                      WHERE n.session_id = ?1
+                        AND n.interrupt_id = ?2
+                        AND o.operation_kind IN ('owner_network_configuration','monty_network_egress')",
+                    params![session_id.to_string(), interrupt_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Durable classification for the one interrupt class that can expand
+    /// future Monty network authority. The class comes from the bound private
+    /// host operation, never from prompt text or the generic command grant.
+    pub async fn interrupt_is_owner_network_configuration(
+        &self,
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    ) -> Result<bool> {
+        Ok(self
+            .interrupt_governed_network_operation_kind(session_id, interrupt_id)
+            .await?
+            .as_deref()
+            == Some("owner_network_configuration"))
+    }
+
     pub async fn raise_interrupt(
         &self,
         session_id: Uuid,

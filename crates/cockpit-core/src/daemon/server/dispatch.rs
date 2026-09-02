@@ -8519,8 +8519,16 @@ async fn handle_serialized_request_impl(
                 .into_iter()
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
+            let acquisitions = ctx
+                .db
+                .list_sealed_value_acquisition_audit(None, proto::MAX_SEALED_OWNER_INVENTORY_ROWS)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_acquisition_audit_to_wire)
+                .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, acquisitions))
         }
         Request::EditSealedOwnerDescription {
             record_id,
@@ -11577,10 +11585,36 @@ async fn handle_serialized_request_impl(
             response,
         } => {
             let att = require_attached(state)?;
+            let governed_network_operation = ctx
+                .db
+                .interrupt_governed_network_operation_kind(att.handle.session_id, interrupt_id)
+                .await
+                .map_err(internal)?;
+            let governed_network_attachment = if governed_network_operation.is_some() {
+                let guard = att._interactive_guard.as_ref().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "governed network approval requires the interactive attachment that rendered the prompt".into(),
+                })?;
+                if !crate::sync::lock_or_recover(&att.rendered_interrupts).contains(&interrupt_id) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Authorization,
+                        message:
+                            "governed network approval prompt was not rendered by this attachment"
+                                .into(),
+                    });
+                }
+                Some(guard.lease().try_acquire().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "governed network approval attachment is no longer live".into(),
+                })?)
+            } else {
+                None
+            };
             att.handle
                 .send_work(SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,
+                    governed_network_attachment,
                 })
                 .await
                 .map_err(session_work_error)?;
@@ -18997,8 +19031,16 @@ async fn handle_concurrent_request_impl(
                 .into_iter()
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
+            let acquisitions = ctx
+                .db
+                .list_sealed_value_acquisition_audit(None, proto::MAX_SEALED_OWNER_INVENTORY_ROWS)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_acquisition_audit_to_wire)
+                .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, acquisitions))
         }
         Request::ListSealedActions => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
@@ -28819,6 +28861,7 @@ pub(super) async fn attach(
         code_root_capability: None,
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
+        rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
     });
 
     // Hydrate the queue and gitignore read-allowlist for this client. The
@@ -29958,6 +30001,32 @@ fn sealed_record_row_to_inventory_item(
         scope_key: row.scope_key,
         active_version: u32::try_from(row.active_version).unwrap_or(0),
         created_at_ms: row.created_at_ms,
+        namespace: if row.owner_principal == "agent-acquired" {
+            proto::SealedOwnerNamespace::AgentAcquired
+        } else {
+            proto::SealedOwnerNamespace::OwnerAuthored
+        },
+    }
+}
+
+fn sealed_acquisition_audit_to_wire(
+    row: crate::db::sealed_scope::SealedValueAcquisitionAuditRow,
+) -> proto::SealedAcquisitionAuditItem {
+    proto::SealedAcquisitionAuditItem {
+        acquisition_id: row.acquisition_id,
+        record_id: row.record_id,
+        session_id: row.session_id,
+        project_key: row.project_key,
+        name: row.name,
+        description: row.description,
+        child_agent: row.child_agent,
+        source_tool_call_id: row.source_tool_call_id,
+        consent_mode: row.consent_mode,
+        outcome: row.outcome,
+        requires_user_reason: row.requires_user_reason,
+        requires_user_prompt: row.requires_user_prompt,
+        created_at_ms: row.created_at_ms,
+        completed_at_ms: row.completed_at_ms,
     }
 }
 

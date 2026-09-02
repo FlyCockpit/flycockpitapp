@@ -10,20 +10,32 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::agents::VerificationRecipe;
+use crate::agents::{VerificationRecipe, VerificationToolCategory};
+use crate::db::tool_calls::ToolCallEvent;
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::engine::guidance_diff::unified_diff;
-use crate::engine::message::Message;
 use crate::session::Session;
 
 const MAX_LINKED_FILES: usize = 8;
 const MAX_LINKED_BYTES: usize = 256 * 1024;
 
+/// A clean-room projection cannot safely proceed without its durable goal.
+///
+/// Keep the failure typed so all callers retain the durable-goal context when
+/// propagating recipe-assembly errors.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CleanRoomSessionGoalError {
+    #[error("loading persisted session goal for clean-room verification: {0}")]
+    Load(anyhow::Error),
+    #[error("clean-room verification requires a persisted session goal")]
+    Missing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssembledRecipe {
-    /// Stable-parts-first body (instructions + linked files) then volatile
-    /// tail (recent reads + proposed diff). The stable prefix is intended to
-    /// cache across verifications.
+    /// Stable-parts-first body (session goal + instructions + linked files)
+    /// then volatile tail (curated results + proposed diff). The stable prefix
+    /// is intended to cache across verifications.
     pub prompt: String,
     pub stable_prefix: String,
     pub volatile_tail: String,
@@ -32,7 +44,6 @@ pub struct AssembledRecipe {
 #[derive(Clone)]
 pub struct RecipeAssemblyInput<'a> {
     pub recipe: &'a VerificationRecipe,
-    pub history: &'a [Message],
     pub session: &'a Session,
     pub workspace_root: &'a Path,
     pub cwd: &'a Path,
@@ -64,12 +75,24 @@ fn assemble_inherit(input: RecipeAssemblyInput<'_>) -> Result<AssembledRecipe> {
 }
 
 async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<AssembledRecipe> {
-    let (include_linked, last_n) = match input.recipe {
+    let (include_linked, last_n, tool_categories, tool_allowlist) = match input.recipe {
         VerificationRecipe::CleanRoom {
             include_linked_files,
             last_n_reads,
-        } => (*include_linked_files, *last_n_reads),
-        VerificationRecipe::Inherit => (input.include_linked_files, input.last_n_reads),
+            tool_categories,
+            tool_allowlist,
+        } => (
+            *include_linked_files,
+            *last_n_reads,
+            tool_categories.as_slice(),
+            tool_allowlist.as_slice(),
+        ),
+        VerificationRecipe::Inherit => (
+            input.include_linked_files,
+            input.last_n_reads,
+            &[] as &[VerificationToolCategory],
+            &[] as &[String],
+        ),
     };
     let last_n = if last_n == 0 {
         input.last_n_reads
@@ -77,6 +100,8 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
         last_n
     };
     let mut stable = String::new();
+    let goal = stored_session_goal(input.session).await?;
+    stable.push_str(&format!("## Session goal\n\n{goal}\n"));
     if let Some((path, body)) = select_guidance_for_target(
         input.session,
         input.workspace_root,
@@ -99,11 +124,21 @@ async fn assemble_clean_room(input: RecipeAssemblyInput<'_>) -> Result<Assembled
         }
     }
     let mut volatile = String::new();
-    let reads = last_n_file_reads(input.session, last_n).await;
-    if !reads.is_empty() {
-        volatile.push_str("## Recent reads\n");
-        for (path, excerpt) in reads {
-            volatile.push_str(&format!("\n### {path}\n\n{excerpt}\n"));
+    let results = curated_tool_results(
+        input.session,
+        last_n,
+        tool_categories,
+        tool_allowlist,
+        input.target_path,
+    )
+    .await?;
+    if !results.is_empty() {
+        volatile.push_str("## Curated investigation results\n");
+        for result in results {
+            volatile.push_str(&format!(
+                "\n### {}\n\n{}\n",
+                result.provenance, result.output
+            ));
         }
     }
     let diff = proposed_diff(input.tool_name, input.original_args, input.cwd);
@@ -371,37 +406,158 @@ fn contained_regular_file(path: &Path, workspace_root: &Path) -> Option<PathBuf>
     }
 }
 
-async fn last_n_file_reads(session: &Session, last_n: u8) -> Vec<(String, String)> {
-    if last_n == 0 {
-        return Vec::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CuratedToolResult {
+    provenance: String,
+    output: String,
+}
+
+async fn stored_session_goal(session: &Session) -> Result<String> {
+    let goal = session
+        .db
+        .current_session_goal(session.id, false)
+        .await
+        .map_err(CleanRoomSessionGoalError::Load)?
+        .ok_or(CleanRoomSessionGoalError::Missing)?;
+    let mut task = goal.objective;
+    if let Some(context) = goal.context.filter(|context| !context.trim().is_empty()) {
+        task.push_str("\n\nContext:\n");
+        task.push_str(&context);
     }
-    let Ok(calls) = session.db.list_tool_calls_for_session(session.id).await else {
-        return Vec::new();
-    };
-    calls
+    Ok(task)
+}
+
+async fn curated_tool_results(
+    session: &Session,
+    last_n: u8,
+    tool_categories: &[VerificationToolCategory],
+    tool_allowlist: &[String],
+    target_path: Option<&Path>,
+) -> Result<Vec<CuratedToolResult>> {
+    if last_n == 0 {
+        return Ok(Vec::new());
+    }
+    let calls = session.db.list_tool_calls_for_session(session.id).await?;
+    Ok(curate_tool_calls(
+        calls,
+        last_n,
+        tool_categories,
+        tool_allowlist,
+        target_path,
+    ))
+}
+
+fn curate_tool_calls(
+    calls: Vec<ToolCallEvent>,
+    last_n: u8,
+    tool_categories: &[VerificationToolCategory],
+    tool_allowlist: &[String],
+    target_path: Option<&Path>,
+) -> Vec<CuratedToolResult> {
+    let mut selected = calls
         .into_iter()
-        .rev()
-        .filter(|call| call.tool == "read")
-        .take(last_n as usize)
-        .filter_map(|call| {
-            let path = call.path.clone().or_else(|| {
-                call.wire_input_json
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })?;
-            Some((path, call.output))
+        .enumerate()
+        .filter(|(_, call)| tool_is_selected(call, tool_categories, tool_allowlist))
+        .map(|(index, call)| {
+            let relevant = tool_result_is_relevant(&call, target_path);
+            (index, relevant, call)
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    // Relevance wins over recency; within either group, newest results win.
+    selected.sort_by_key(|(index, relevant, _)| {
+        (std::cmp::Reverse(*relevant), std::cmp::Reverse(*index))
+    });
+    selected.truncate(last_n as usize);
+    selected.sort_by_key(|(index, _, _)| *index);
+    selected
         .into_iter()
-        .rev()
+        .map(|(_, _, call)| CuratedToolResult {
+            provenance: tool_result_provenance(&call),
+            output: call.output,
+        })
         .collect()
+}
+
+fn tool_is_selected(
+    call: &ToolCallEvent,
+    tool_categories: &[VerificationToolCategory],
+    tool_allowlist: &[String],
+) -> bool {
+    tool_allowlist.iter().any(|tool| tool == &call.tool)
+        || tool_categories.iter().any(|category| match category {
+            VerificationToolCategory::Reads => call.tool == "read",
+            VerificationToolCategory::Exploration => {
+                matches!(
+                    call.tool.as_str(),
+                    "code" | "graph" | "search" | "grep" | "glob"
+                )
+            }
+        })
+}
+
+fn tool_result_is_relevant(call: &ToolCallEvent, target_path: Option<&Path>) -> bool {
+    let Some(target_path) = target_path else {
+        return false;
+    };
+    let target = target_path.to_string_lossy();
+    let file_name = target_path.file_name().and_then(|name| name.to_str());
+    let matches_subject = |value: &str| {
+        value == target.as_ref()
+            || value.ends_with(target.as_ref())
+            || file_name.is_some_and(|name| value.contains(name))
+    };
+    call.path.as_deref().is_some_and(matches_subject)
+        || ["path", "pattern", "query", "name", "token"]
+            .into_iter()
+            .filter_map(|field| call.wire_input_json.get(field).and_then(Value::as_str))
+            .any(matches_subject)
+        || matches_subject(&call.output)
+}
+
+fn tool_result_provenance(call: &ToolCallEvent) -> String {
+    let args = &call.wire_input_json;
+    let path = call
+        .path
+        .as_deref()
+        .or_else(|| args.get("path").and_then(Value::as_str));
+    let query = ["pattern", "query", "name", "token"]
+        .into_iter()
+        .find_map(|field| args.get(field).and_then(Value::as_str));
+    let mut fields = Vec::new();
+    if let Some(path) = path {
+        fields.push(format!("path: {path}"));
+    }
+    if let Some(query) = query {
+        fields.push(format!("query: {query}"));
+    }
+    if let (Some(start), Some(end)) = (
+        args.get("start_line").and_then(Value::as_u64),
+        args.get("end_line").and_then(Value::as_u64),
+    ) {
+        fields.push(format!("range: lines {start}-{end}"));
+    } else if let Some(offset) = args.get("offset").and_then(Value::as_u64) {
+        let limit = args.get("limit").and_then(Value::as_u64);
+        fields.push(match limit {
+            Some(limit) => format!("range: offset {offset}, limit {limit}"),
+            None => format!("range: offset {offset}"),
+        });
+    }
+    if let Some(kind) = args.get("kind").and_then(Value::as_str) {
+        fields.push(format!("kind: {kind}"));
+    }
+    if fields.is_empty() {
+        format!("{} result", call.tool)
+    } else {
+        format!("{} result — {}", call.tool, fields.join("; "))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::tool_calls::Recovery;
     use crate::session::Session;
+    use uuid::Uuid;
 
     fn session_at(root: &Path) -> Session {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -414,12 +570,251 @@ mod tests {
         .unwrap()
     }
 
+    fn tool_call(
+        session: &Session,
+        tool: &str,
+        timestamp: i64,
+        path: Option<&str>,
+        args: Value,
+        output: &str,
+    ) -> ToolCallEvent {
+        ToolCallEvent {
+            event_id: Uuid::new_v4(),
+            session_id: session.id,
+            call_id: format!("{tool}-{timestamp}"),
+            parent_call_id: None,
+            parent_child_index: None,
+            provider_item_id: None,
+            provider_call_id: None,
+            provider_call_id_source: None,
+            wire_api: None,
+            provider_family: None,
+            timestamp,
+            model: "test-model".into(),
+            provider: "test-provider".into(),
+            project_id: session.project_id.clone(),
+            project_root: session.project_root.display().to_string(),
+            agent: "Build".into(),
+            tool: tool.into(),
+            mcp_server: None,
+            path: path.map(str::to_string),
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            original_input_json: args.clone(),
+            wire_input_json: args,
+            output: output.into(),
+            truncated: false,
+            duration_ms: 0,
+            cockpit_version: None,
+            shape_fingerprint: None,
+            hint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_room_carries_the_persisted_session_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
+        let session = session_at(tmp.path());
+        session
+            .db
+            .create_session_goal(
+                session.id,
+                &session.project_id,
+                "Preserve the atomic write contract.",
+                Some("Do not change the public API."),
+                None,
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
+        let assembled = assemble_recipe(RecipeAssemblyInput {
+            recipe: &VerificationRecipe::clean_room_default(),
+            session: &session,
+            workspace_root: tmp.path(),
+            cwd: tmp.path(),
+            target_path: Some(&tmp.path().join("src.rs")),
+            tool_name: "write",
+            original_args: &args,
+            guidance_file_names: &[],
+            last_n_reads: 5,
+            include_linked_files: false,
+            inherit_framing: "",
+        })
+        .await
+        .unwrap();
+
+        assert!(assembled.prompt.contains("## Session goal"));
+        assert!(
+            assembled
+                .prompt
+                .contains("Preserve the atomic write contract.")
+        );
+        assert!(assembled.prompt.contains("Do not change the public API."));
+    }
+
+    #[tokio::test]
+    async fn clean_room_fails_closed_without_a_persisted_session_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
+        let session = session_at(tmp.path());
+        let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
+
+        let error = assemble_recipe(RecipeAssemblyInput {
+            recipe: &VerificationRecipe::clean_room_default(),
+            session: &session,
+            workspace_root: tmp.path(),
+            cwd: tmp.path(),
+            target_path: Some(&tmp.path().join("src.rs")),
+            tool_name: "write",
+            original_args: &args,
+            guidance_file_names: &[],
+            last_n_reads: 5,
+            include_linked_files: false,
+            inherit_framing: "",
+        })
+        .await
+        .expect_err("clean-room verification must require a stored goal");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a persisted session goal"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inherit_recipe_remains_a_full_history_generator_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
+        let session = session_at(tmp.path());
+        let args = serde_json::json!({ "path": "src.rs", "content": "fn new() {}\n" });
+        let assembled = assemble_recipe(RecipeAssemblyInput {
+            recipe: &VerificationRecipe::Inherit,
+            session: &session,
+            workspace_root: tmp.path(),
+            cwd: tmp.path(),
+            target_path: Some(&tmp.path().join("src.rs")),
+            tool_name: "write",
+            original_args: &args,
+            guidance_file_names: &[],
+            last_n_reads: 5,
+            include_linked_files: false,
+            inherit_framing: "Produce an alternative implementation.",
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            assembled
+                .prompt
+                .contains("Produce an alternative implementation.")
+        );
+        assert!(assembled.prompt.contains("## Proposed change"));
+        assert!(!assembled.prompt.contains("## Session goal"));
+    }
+
+    #[test]
+    fn curated_results_prefer_subject_relevance_and_keep_only_output_with_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session_at(tmp.path());
+        let target = tmp.path().join("src/target.rs");
+        let calls = vec![
+            tool_call(
+                &session,
+                "search",
+                1,
+                Some("src"),
+                serde_json::json!({
+                    "path": "src",
+                    "pattern": "target.rs",
+                    "internal_invocation_marker": "must-not-project"
+                }),
+                "src/target.rs:12: target evidence",
+            ),
+            tool_call(
+                &session,
+                "read",
+                2,
+                Some("src/unrelated.rs"),
+                serde_json::json!({ "path": "src/unrelated.rs" }),
+                "unrelated evidence",
+            ),
+        ];
+
+        let results = curate_tool_calls(
+            calls,
+            1,
+            &[
+                VerificationToolCategory::Reads,
+                VerificationToolCategory::Exploration,
+            ],
+            &[],
+            Some(&target),
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].provenance.contains("search result"));
+        assert!(results[0].provenance.contains("path: src"));
+        assert!(results[0].provenance.contains("query: target.rs"));
+        assert_eq!(results[0].output, "src/target.rs:12: target evidence");
+        assert!(!results[0].provenance.contains("internal_invocation_marker"));
+    }
+
+    #[test]
+    fn curated_result_categories_and_custom_allowlist_are_honored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session_at(tmp.path());
+        let calls = vec![
+            tool_call(
+                &session,
+                "read",
+                1,
+                Some("src/lib.rs"),
+                serde_json::json!({ "path": "src/lib.rs" }),
+                "read result",
+            ),
+            tool_call(
+                &session,
+                "context_pack",
+                2,
+                None,
+                serde_json::json!({ "topic": "verification" }),
+                "custom result",
+            ),
+        ];
+
+        let custom = curate_tool_calls(calls.clone(), 5, &[], &["context_pack".to_string()], None);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].output, "custom result");
+
+        let reads = curate_tool_calls(calls, 5, &[VerificationToolCategory::Reads], &[], None);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].output, "read result");
+    }
+
     #[tokio::test]
     async fn clean_room_stable_prefix_precedes_volatile_tail_bytewise() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# rules\nbe careful\n").unwrap();
         std::fs::write(tmp.path().join("src.rs"), "fn old() {}\n").unwrap();
         let session = session_at(tmp.path());
+        session
+            .db
+            .create_session_goal(
+                session.id,
+                &session.project_id,
+                "Keep the change safe.",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let args = serde_json::json!({
             "path": "src.rs",
             "content": "fn new() {}\n"
@@ -427,7 +822,6 @@ mod tests {
         let names = vec!["AGENTS.md".to_string()];
         let assembled = assemble_recipe(RecipeAssemblyInput {
             recipe: &VerificationRecipe::clean_room_default(),
-            history: &[],
             session: &session,
             workspace_root: tmp.path(),
             cwd: tmp.path(),
@@ -532,6 +926,34 @@ mod tests {
         assert!(
             !selected.1.contains("OUTSIDE"),
             "must not load the parent of project_root"
+        );
+    }
+
+    #[tokio::test]
+    async fn curated_tool_results_propagates_projection_storage_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session_at(tmp.path());
+        session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "ALTER TABLE tool_call_events
+                     RENAME TO tool_call_events_unavailable;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let error =
+            curated_tool_results(&session, 1, &[VerificationToolCategory::Reads], &[], None)
+                .await
+                .expect_err("projection storage read failures must not turn into empty evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("no such table: tool_call_events"),
+            "{error:#}"
         );
     }
 }

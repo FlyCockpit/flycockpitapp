@@ -24,6 +24,7 @@ pub mod device;
 // around the catalog/approval funnel.
 pub(crate) mod forwarded;
 pub mod invoke_prep;
+pub mod network;
 pub mod protocol;
 pub mod resolver;
 pub mod sandbox;

@@ -125,7 +125,8 @@ pub fn persist_onboarding_wizard_progress(run: &crate::wizard::WizardRun) -> Res
     anyhow::ensure!(
         matches!(
             run.descriptor().id,
-            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            crate::wizard::PROVIDER_WIZARD_ID
+                | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
                 | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
                 | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
         ),

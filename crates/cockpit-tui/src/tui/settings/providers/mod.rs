@@ -995,10 +995,27 @@ impl AddState {
     }
 
     pub(super) fn new_with_onboarding(onboarding: bool) -> Self {
-        Self {
+        let descriptor = cockpit_core::wizard::provider_descriptor();
+        let run = if onboarding {
+            cockpit_core::welcome::onboarding_wizard_progress(
+                cockpit_core::wizard::PROVIDER_WIZARD_ID,
+            )
+            .and_then(|progress| {
+                cockpit_core::wizard::WizardRun::resume_from_answers_json(
+                    descriptor.clone(),
+                    &progress,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| {
+                WizardRun::new(descriptor).expect("built-in provider wizard descriptor is valid")
+            })
+        } else {
+            WizardRun::new(descriptor).expect("built-in provider wizard descriptor is valid")
+        };
+        let mut state = Self {
             onboarding,
-            run: WizardRun::new(cockpit_core::wizard::provider_descriptor())
-                .expect("built-in provider wizard descriptor is valid"),
+            run,
             template_cursor: 0,
             wire_api_cursor: 0,
             template: None,
@@ -1014,7 +1031,9 @@ impl AddState {
             copilot_auth: None,
             oauth_auth: None,
             detected_env_offer: None,
-        }
+        };
+        state.restore_non_secret_inputs();
+        state
     }
 
     pub(super) fn is_step(&self, step: &str) -> bool {
@@ -1043,6 +1062,86 @@ impl AddState {
             .expect("provider validation step exists");
         self.saved_provider_id = Some(provider_id.to_string());
         self.error = Some("Resume setup: test the saved credential with the daemon.".into());
+    }
+
+    fn checkpoint(&mut self) {
+        if self.onboarding
+            && let Err(error) =
+                cockpit_core::welcome::persist_onboarding_wizard_progress(&self.run)
+        {
+            self.error = Some(format!("could not save setup progress: {error}"));
+        }
+    }
+
+    fn restore_non_secret_inputs(&mut self) {
+        let Some(WizardAnswer::Select(template_id)) = self.run.answer("template") else {
+            return;
+        };
+        let Some(template) = cockpit_core::providers::template_by_id(template_id) else {
+            return;
+        };
+        self.template = Some(template);
+        self.template_cursor = onboarding_ordered_templates()
+            .iter()
+            .position(|candidate| candidate.id == template.id)
+            .unwrap_or(0);
+        self.id_field
+            .set(if template.use_id_as_default { template.id } else { "" });
+        self.url_field.set(template.url);
+        self.env_var_field.set(
+            cockpit_core::providers::detected_env_var(template)
+                .or(template.default_env_var)
+                .or_else(|| template.env_var_candidates.first().copied())
+                .unwrap_or("API_KEY"),
+        );
+        self.detected_env_offer =
+            cockpit_core::providers::detected_env_var(template).map(str::to_string);
+        if self.detected_env_offer.is_some() {
+            self.auth_method_cursor = 1;
+        }
+        if let Some(WizardAnswer::Select(wire)) = self.run.answer("wire-api") {
+            self.wire_api_cursor = ["auto", "completions", "responses", "anthropic"]
+                .iter()
+                .position(|candidate| *candidate == wire.as_str())
+                .unwrap_or(0);
+        }
+        if let Some(WizardAnswer::Text(id)) = self.run.answer("id") {
+            self.id_field.set(id);
+        }
+        if let Some(WizardAnswer::Text(url)) = self.run.answer("url") {
+            self.url_field.set(url);
+        }
+        *self.headers = HeaderEditor::new_for_provider(
+            self.id_field.text(),
+            templates::default_headers_for(template),
+            true,
+        );
+        if let Some(WizardAnswer::Select(method)) = self.run.answer("auth-method") {
+            self.auth_method_cursor = [
+                "paste-key",
+                "env-var",
+                "advanced-headers",
+                "copy-detected-env",
+            ]
+            .iter()
+            .position(|candidate| *candidate == method.as_str())
+            .unwrap_or(0);
+        }
+        match self.run.current_step_id() {
+            Some("copilot-auth") => self.copilot_auth = Some(CopilotSetupState::new()),
+            #[cfg(feature = "grok-subscription")]
+            Some("grok-oauth") => {
+                self.oauth_auth = Some(Box::new(OAuthFlowState::new(OAuthProvider::Grok)));
+            }
+            Some("codex-oauth") => {
+                self.oauth_auth = Some(Box::new(OAuthFlowState::new(OAuthProvider::Codex)));
+            }
+            _ => {}
+        }
+        self.error = Some(
+            "Resumed provider setup. Credential text is never written to the resume file."
+                .to_string(),
+        );
     }
 }
 
@@ -1712,6 +1811,7 @@ impl SettingsCx {
                     s.run
                         .submit(WizardAnswer::Select(t.id.to_string()))
                         .expect("provider template is a valid select answer");
+                    s.checkpoint();
                 }
                 _ => {}
             },
@@ -1733,6 +1833,7 @@ impl SettingsCx {
                             s.error = Some(error);
                         } else {
                             s.error = None;
+                            s.checkpoint();
                         }
                     }
                     _ => {}
@@ -1752,6 +1853,8 @@ impl SettingsCx {
                         s.headers.set_provider_id(&id);
                         if let Err(error) = s.run.submit(WizardAnswer::Text(id)) {
                             s.error = Some(error);
+                        } else {
+                            s.checkpoint();
                         }
                     }
                 }
@@ -1769,6 +1872,7 @@ impl SettingsCx {
                         if let Err(error) = s.run.submit(WizardAnswer::Text(url)) {
                             s.error = Some(error);
                         } else {
+                            s.checkpoint();
                             match s.run.current_step_id() {
                                 Some("copilot-auth") => {
                                     s.copilot_auth = Some(CopilotSetupState::new());
@@ -1857,6 +1961,7 @@ impl SettingsCx {
                             s.error = Some(error);
                         } else {
                             s.error = None;
+                            s.checkpoint();
                         }
                     }
                     _ => {}

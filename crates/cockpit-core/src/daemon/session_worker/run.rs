@@ -10840,7 +10840,7 @@ pub(super) async fn run_worker(
                                 Some(reservation) => reject_oversized_text_artifact_admission(
                                     &session,
                                     reservation,
-                                    crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                    crate::db::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
                                 )
                                 .await,
                                 None => proto::ErrorPayload {

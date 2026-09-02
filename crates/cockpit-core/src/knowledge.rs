@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -3218,7 +3218,7 @@ fn read_private_sidecar_bytes(
         let name = sidecar
             .file_name()
             .context("knowledge sidecar has no file name")?;
-        let mut file = cockpit_host::private_fs::open_private_file_in_dir_fd(
+        let file = cockpit_host::private_fs::open_private_file_in_dir_fd(
             &process_lock.directory,
             name,
             cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
@@ -3226,10 +3226,9 @@ fn read_private_sidecar_bytes(
         )
         .map_err(anyhow::Error::from)
         .context("opening retained private knowledge sidecar")?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("reading knowledge sidecar {label}"))?;
-        return Ok(bytes);
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        return cockpit_host::bounded::read_reader_at_most(file, cap, "knowledge sidecar")
+            .with_context(|| format!("reading knowledge sidecar {label}"));
     }
     #[cfg(not(unix))]
     {
@@ -3249,9 +3248,9 @@ fn read_private_sidecar_bytes(
             cockpit_host::private_fs::repair_private_file(sidecar, label)
                 .map_err(anyhow::Error::from)?;
         }
-        cockpit_host::private_fs::read_private_file(sidecar, label)
-            .map_err(anyhow::Error::from)?
-            .context("knowledge sidecar disappeared before its verified read")
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        cockpit_host::bounded::read_at_most(sidecar, cap)
+            .with_context(|| format!("reading knowledge sidecar {label}"))
     }
 }
 

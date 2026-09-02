@@ -3102,7 +3102,7 @@ impl Driver {
                                 text: format!("Redaction refresh failed: {error:#}"),
                             })
                             .await;
-                        return;
+                        return true;
                     }
                 };
                 // J2: route the per-turn refresh through the hub so it unions the
@@ -3134,7 +3134,7 @@ impl Driver {
                             // Fail-closed: do not advance `self.redact` ahead of
                             // the durable table when the persist did not commit.
                             tracing::warn!(error = %error, "persisting redaction table failed");
-                            return;
+                            return true;
                         }
                         table
                     }
@@ -3142,7 +3142,7 @@ impl Driver {
                         // The committed table is left live under the hub lock;
                         // skip this refresh rather than clobber it.
                         tracing::warn!(error = %error, "refreshing redaction table under hub lock failed");
-                        return;
+                        return true;
                     }
                 };
                 for path in table.unsupported_files() {

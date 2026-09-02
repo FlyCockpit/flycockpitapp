@@ -406,7 +406,10 @@ impl ValidationLock {
 
 impl Drop for ValidationLock {
     fn drop(&mut self) {
-        let owner = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let owner = crate::resource_limits::read_project_text(&self.path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         if owner.split_whitespace().nth(1) == Some(self.nonce.as_str()) {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -436,11 +439,12 @@ fn publish_validation_lock(target: &Path, path: &Path, nonce: &str) -> std::io::
 }
 
 fn reclaim_stale_validation_lock(path: &Path) -> Result<()> {
-    let owner = match std::fs::read_to_string(path) {
-        Ok(owner) => owner,
-        // A published lock always has owner bytes. Missing/unreadable is not
-        // proof of death: it is the window a waiter used to steal a live claim.
-        Err(_) => return Ok(()),
+    let owner = match crate::resource_limits::read_project_text(path) {
+        Ok(Some(owner)) => owner,
+        // A published lock always has owner bytes. Missing/unreadable/over-cap
+        // is not proof of death: it is the window a waiter used to steal a live
+        // claim. Over-cap also must not OOM the daemon on a planted lock file.
+        Ok(None) | Err(_) => return Ok(()),
     };
     let Some(pid) = owner
         .split_whitespace()

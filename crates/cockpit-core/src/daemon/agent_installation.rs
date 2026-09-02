@@ -3669,11 +3669,22 @@ impl AgentInstallationService {
             .and_then(|value| value.strip_suffix(".md"))
             .filter(|value| !value.is_empty())
             .context("source Markdown path has no agent filename")?;
-        let fetched = self
-            .fetcher
-            .fetch_github_markdown(&source)
-            .await
-            .context("fetching GitHub agent source")?;
+        let fetched = if source.owner == "FlyCockpit"
+            && source.repository == "agents"
+            && source.requested_revision.as_deref()
+                == Some(crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION)
+            && source.markdown_path == "agents/frontier-coding/agent.md"
+        {
+            FetchedAgentSource {
+                commit_sha: crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION.to_string(),
+                markdown: crate::daemon::agent_catalog::bundled_frontier_markdown().to_vec(),
+            }
+        } else {
+            self.fetcher
+                .fetch_github_markdown(&source)
+                .await
+                .context("fetching GitHub agent source")?
+        };
         ensure!(
             is_commit_sha(&fetched.commit_sha),
             "source fetch did not resolve an immutable commit SHA"

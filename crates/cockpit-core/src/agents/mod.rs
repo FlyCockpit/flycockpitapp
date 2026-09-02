@@ -1447,6 +1447,91 @@ pub fn parse_daemon_agent_snapshot(text: &str, name: &str, source: PathBuf) -> R
     parse_agent_with_scope(text, name, source, DefinitionScope::DaemonSnapshot)
 }
 
+/// The strict launch-v1 agent-definition document carried by Markdown
+/// frontmatter and mirrored by the first-party agent catalog.  Keeping the
+/// catalog projection on this exact type prevents discovery metadata from
+/// inventing a second, weaker agent schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDefinitionFrontmatter {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u8,
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub roles: Vec<AgentRole>,
+    #[serde(rename = "modelSlots")]
+    pub model_slots: BTreeMap<String, ModelSlot>,
+    #[serde(default)]
+    pub delegation: Option<DelegationPolicy>,
+    #[serde(default)]
+    pub questions: Option<QuestionPolicy>,
+    #[serde(default)]
+    pub verification: Option<VerificationPolicy>,
+    #[serde(rename = "allowedKnowledgeBases", default)]
+    pub allowed_knowledge_bases: Option<BTreeSet<String>>,
+    #[serde(rename = "toolTierPreferences", default)]
+    pub tool_tier_preferences: BTreeMap<String, ToolTier>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub capabilities: BTreeSet<AgentCapability>,
+    #[serde(rename = "toolSteering", default)]
+    pub tool_steering: Option<ToolSteering>,
+    #[serde(rename = "contextPolicy", default)]
+    pub context_policy: Option<ContextPolicy>,
+    #[serde(rename = "mcpBindings", default)]
+    pub mcp_bindings: Vec<McpBinding>,
+}
+
+impl AgentDefinitionFrontmatter {
+    fn launch_definition(&self) -> VnextAgentDef {
+        VnextAgentDef {
+            schema_version: self.schema_version,
+            agent_id: self.agent_id.clone(),
+            roles: self.roles.clone(),
+            capabilities: self.capabilities.clone(),
+            model_slots: self.model_slots.clone(),
+            delegation: self.delegation.clone().unwrap_or_default(),
+            questions: self.questions.clone(),
+            verification: self.verification.clone(),
+            allowed_knowledge_bases: self.allowed_knowledge_bases.clone(),
+            tool_tier_preferences: self.tool_tier_preferences.clone(),
+        }
+    }
+
+    /// Validate the unified schema without granting a catalog entry any
+    /// special publisher authority.
+    pub fn validate_catalog_definition(&self) -> Result<()> {
+        ensure!(!self.description.trim().is_empty(), "description must be non-empty");
+        self.launch_definition()
+            .validate_for_scope(DefinitionScope::DaemonSnapshot)
+    }
+}
+
+impl AgentDef {
+    /// Project a parsed Markdown definition back into the exact unified
+    /// frontmatter shape used by the catalog index.
+    pub fn definition_frontmatter(&self) -> Option<AgentDefinitionFrontmatter> {
+        let definition = self.vnext.as_ref()?;
+        Some(AgentDefinitionFrontmatter {
+            schema_version: definition.schema_version,
+            agent_id: definition.agent_id.clone(),
+            roles: definition.roles.clone(),
+            model_slots: definition.model_slots.clone(),
+            delegation: (!definition.delegation.is_off()).then(|| definition.delegation.clone()),
+            questions: definition.questions.clone(),
+            verification: definition.verification.clone(),
+            allowed_knowledge_bases: definition.allowed_knowledge_bases.clone(),
+            tool_tier_preferences: definition.tool_tier_preferences.clone(),
+            description: self.description.clone(),
+            capabilities: definition.capabilities.clone(),
+            tool_steering: self.tool_steering,
+            context_policy: self.context_policy.clone(),
+            mcp_bindings: self.mcp_bindings.clone(),
+        })
+    }
+}
+
 /// Parse a definition with origin supplied by its trusted owner. The only
 /// daemon-local owner today is the persisted assistant loader; all ordinary
 /// workspace paths use [`parse_agent`] and cannot claim the `local` publisher.
@@ -1457,38 +1542,6 @@ fn parse_agent_with_scope(
     scope: DefinitionScope,
 ) -> Result<AgentDef> {
     let (fm_raw, body) = split_frontmatter(text);
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Frontmatter {
-        #[serde(rename = "schemaVersion")]
-        schema_version: u8,
-        #[serde(rename = "agentId")]
-        agent_id: String,
-        roles: Vec<AgentRole>,
-        #[serde(rename = "modelSlots")]
-        model_slots: BTreeMap<String, ModelSlot>,
-        #[serde(default)]
-        delegation: Option<DelegationPolicy>,
-        #[serde(default)]
-        questions: Option<QuestionPolicy>,
-        #[serde(default)]
-        verification: Option<VerificationPolicy>,
-        #[serde(rename = "allowedKnowledgeBases", default)]
-        allowed_knowledge_bases: Option<BTreeSet<String>>,
-        #[serde(rename = "toolTierPreferences", default)]
-        tool_tier_preferences: BTreeMap<String, ToolTier>,
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        capabilities: BTreeSet<AgentCapability>,
-        #[serde(rename = "toolSteering", default)]
-        tool_steering: Option<ToolSteering>,
-        #[serde(rename = "contextPolicy", default)]
-        context_policy: Option<ContextPolicy>,
-        #[serde(rename = "mcpBindings", default)]
-        mcp_bindings: Vec<McpBinding>,
-    }
 
     if fm_raw.trim().is_empty() {
         bail!(
@@ -1528,7 +1581,7 @@ fn parse_agent_with_scope(
             );
         }
     }
-    let fm: Frontmatter = serde_yaml::from_str(fm_raw).map_err(|e| {
+    let fm: AgentDefinitionFrontmatter = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
             "agent `{name}` ({}) has invalid frontmatter: {e}",
             source.display()
@@ -1541,18 +1594,7 @@ fn parse_agent_with_scope(
         );
     }
 
-    let definition = VnextAgentDef {
-        schema_version: fm.schema_version,
-        agent_id: fm.agent_id,
-        roles: fm.roles,
-        capabilities: fm.capabilities,
-        model_slots: fm.model_slots,
-        delegation: fm.delegation.unwrap_or_default(),
-        questions: fm.questions,
-        verification: fm.verification,
-        allowed_knowledge_bases: fm.allowed_knowledge_bases,
-        tool_tier_preferences: fm.tool_tier_preferences,
-    };
+    let definition = fm.launch_definition();
     definition.validate_for_scope(scope).map_err(|error| {
         anyhow::anyhow!(
             "agent `{name}` ({}) has invalid launch-v1 definition: {error}",

@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "catalog": {
+    "name": "FlyCockpit Agents",
+    "repository": "FlyCockpit/agents",
+    "defaultBranch": "main",
+    "license": "MIT"
+  },
+  "agents": [
+    {
+      "definition": {
+        "schemaVersion": 1,
+        "agentId": "authored/frontier-coding",
+        "roles": ["code"],
+        "capabilities": ["computerUse"],
+        "description": "General-purpose coding agent for configured frontier models.",
+        "toolTierPreferences": { "bash": "discoverable" },
+        "modelSlots": {
+          "primary": {
+            "purpose": "General frontier coding model",
+            "minContextTokens": 32768,
+            "requiredCapabilities": ["computer_use", "text_generation", "tool_calling"],
+            "locality": "remote",
+            "allowDefaultFallback": true
+          }
+        }
+      },
+      "catalog": {
+        "slug": "frontier-coding",
+        "displayName": "Frontier Coding",
+        "definitionPath": "agents/frontier-coding/agent.md",
+        "distribution": "bundled_snapshot",
+        "hardware": { "kind": "any" }
+      }
+    },
+    {
+      "definition": {
+        "schemaVersion": 1,
+        "agentId": "authored/qwen-3090",
+        "roles": ["code"],
+        "description": "Local Qwen coding agent for a single RTX 3090 deployment.",
+        "toolTierPreferences": { "bash": "discoverable" },
+        "modelSlots": {
+          "primary": {
+            "purpose": "Local Qwen coding model",
+            "minContextTokens": 32768,
+            "requiredCapabilities": ["text_generation", "tool_calling"],
+            "locality": "local",
+            "allowDefaultFallback": false,
+            "suggestedModels": [
+              {
+                "recommendationId": "qwen3-coder-30b-a3b",
+                "upstreamIdentity": "qwen/qwen3-coder-30b-a3b-instruct",
+                "providerAliases": [
+                  { "providerId": "openai-compatible", "modelId": "Qwen3-Coder-30B-A3B-Instruct" }
+                ],
+                "authorLabel": "FlyCockpit curated local profile",
+                "rationale": "Targeted at a local single-RTX-3090 Qwen deployment."
+              }
+            ]
+          }
+        }
+      },
+      "catalog": {
+        "slug": "qwen-3090",
+        "displayName": "Qwen Coding (RTX 3090)",
+        "definitionPath": "agents/qwen-3090/agent.md",
+        "distribution": "repository_only",
+        "hardware": { "kind": "gpu", "gpuModel": "RTX 3090", "gpuCount": 1 }
+      }
+    },
+    {
+      "definition": {
+        "schemaVersion": 1,
+        "agentId": "authored/dsv4-2x-spark",
+        "roles": ["code"],
+        "description": "Local DeepSeek V4 coding agent for two DGX Spark systems.",
+        "toolTierPreferences": { "bash": "discoverable" },
+        "modelSlots": {
+          "primary": {
+            "purpose": "Local DeepSeek V4 coding model",
+            "minContextTokens": 65536,
+            "requiredCapabilities": ["text_generation", "tool_calling"],
+            "locality": "local",
+            "allowDefaultFallback": false,
+            "suggestedModels": [
+              {
+                "recommendationId": "deepseek-v4",
+                "upstreamIdentity": "deepseek/deepseek-v4",
+                "providerAliases": [
+                  { "providerId": "openai-compatible", "modelId": "DeepSeek-V4" }
+                ],
+                "authorLabel": "FlyCockpit curated local profile",
+                "rationale": "Targeted at a local DeepSeek V4 deployment across two DGX Spark systems."
+              }
+            ]
+          }
+        }
+      },
+      "catalog": {
+        "slug": "dsv4-2x-spark",
+        "displayName": "DeepSeek V4 Coding (2× DGX Spark)",
+        "definitionPath": "agents/dsv4-2x-spark/agent.md",
+        "distribution": "repository_only",
+        "hardware": { "kind": "dgx_spark", "gpuCount": 2 }
+      }
+    },
+    {
+      "definition": {
+        "schemaVersion": 1,
+        "agentId": "authored/glm-4x-spark",
+        "roles": ["code"],
+        "description": "Local GLM coding agent for four DGX Spark systems.",
+        "toolTierPreferences": { "bash": "discoverable" },
+        "modelSlots": {
+          "primary": {
+            "purpose": "Local GLM coding model",
+            "minContextTokens": 65536,
+            "requiredCapabilities": ["text_generation", "tool_calling"],
+            "locality": "local",
+            "allowDefaultFallback": false,
+            "suggestedModels": [
+              {
+                "recommendationId": "glm-4-7",
+                "upstreamIdentity": "zai/glm-4.7",
+                "providerAliases": [{ "providerId": "openai-compatible", "modelId": "GLM-4.7" }],
+                "authorLabel": "FlyCockpit curated local profile",
+                "rationale": "Targeted at a local GLM deployment across four DGX Spark systems."
+              }
+            ]
+          }
+        }
+      },
+      "catalog": {
+        "slug": "glm-4x-spark",
+        "displayName": "GLM Coding (4× DGX Spark)",
+        "definitionPath": "agents/glm-4x-spark/agent.md",
+        "distribution": "repository_only",
+        "hardware": { "kind": "dgx_spark", "gpuCount": 4 }
+      }
+    }
+  ]
+}

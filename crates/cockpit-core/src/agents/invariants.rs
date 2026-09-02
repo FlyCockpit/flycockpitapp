@@ -191,10 +191,12 @@ pub fn validate_grant(
                 "delegation to `{target_name}` may not be granted the docs-answerer-only sandboxed tool `{tool}`"
             );
         }
-        if ACQUISITION_TERMINAL_TOOLS.contains(&tool.as_str()) && def.name != "sealed-acquisition" {
+        if ACQUISITION_TERMINAL_TOOLS.contains(&tool.as_str())
+            && target_name != "sealed-acquisition"
+        {
             bail!(
                 "agent `{}` may request but may not grant itself the trusted-child acquisition sub-profile tool `{tool}`",
-                def.name
+                target_name
             );
         }
         if tool == SPAWN_TOOL && !SPAWN_AGENTS.contains(&target_name) {

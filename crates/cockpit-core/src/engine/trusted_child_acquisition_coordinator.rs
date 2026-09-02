@@ -15,7 +15,7 @@ use crate::config::extended::{ApprovalMode, ExtendedConfig, SealedAcquisitionCon
 use crate::config::providers::ProvidersConfig;
 use crate::credentials::CredentialStore;
 use crate::engine::builtin::SpawnArgs;
-use crate::engine::driver::run_noninteractive_resumable;
+use crate::engine::driver::run_fresh_noninteractive_resumable;
 use crate::engine::message::Message;
 use crate::engine::model::Model;
 use crate::engine::model_roles::resolve_trusted_child_model;
@@ -135,108 +135,119 @@ static PRODUCTION_CAPTURE_REGISTRY: OnceLock<TrustedChildCaptureRegistry> = Once
 /// The sole production parent entry point. The dispatcher has the live parent
 /// frame, so it can mint every child input and execution dependency itself;
 /// the model supplies only the requested name, safe description, and command.
-pub(crate) async fn run_parent_acquisition_tool(
-    env: &crate::engine::agent::tool_dispatch::DispatchEnv<'_>,
-    args: &serde_json::Value,
-) -> anyhow::Result<crate::engine::tool::ToolOutput> {
-    let name = args
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let description = args
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let command = args
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let providers = env.ctx.config.providers();
-    let extended = env.ctx.config.extended();
-    let acquisition_id = uuid::Uuid::now_v7().to_string();
-    let record_id = uuid::Uuid::now_v7().to_string();
-    let spawn_args = SpawnArgs {
-        compiled_guidance: Vec::new(),
-        guidance_compiler: None,
-        model: env.agent.model.clone(),
-        params: env.agent.params.clone(),
-        env_overlay: env.agent.env_overlay.clone(),
-        cwd: env.ctx.cwd.clone(),
-        config: env.ctx.config.clone(),
-        session_short_id: env.ctx.session.short_id(),
-        workspace_scratch_dir: env.ctx.session.workspace_scratch_dir(),
-        assistant_identity_prefix: env.agent.assistant_identity_prefix.clone(),
-        model_system_prompt_snapshot: env.ctx.session.model_system_prompt_snapshot(),
-        knowledge_base_system_prefix: env.ctx.session.knowledge_base_system_prompt(),
-        interactive: false,
-        mcp_parent_reachable: Some(env.agent.mcp_resolver.catalog().admitted_entries()),
-        mcp_root_catalog: env.agent.mcp_resolver.root_catalog(),
-        model_override: None,
-        delegation_model: None,
-        delegated: true,
-        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
-        vnext_grant: None,
-        vnext_host_policy: None,
-        vnext_local_installation_resolver:
-            crate::agents::LocalInstallationResolver::no_installations(),
-        parent_vnext_grant: None,
-        parent_posture: None,
-        swarm_depth: 0,
-        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
-        granted_tools: Vec::new(),
-        lock_identity: None,
-        write_scope: env.agent.write_scope.clone(),
-        dream_read_scope: env.ctx.session.dream_read_scope(),
-        workspace_lease: env.agent.workspace_lease.clone(),
-        credential_store: env.ctx.session.provider_credential_store(&providers).ok(),
-        media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
-    };
-    let outcome = run_trusted_child_acquisition(
-        AcquisitionRequest {
-            caller_mode: env.ctx.session.approval_mode(),
-            category: "trusted-child-acquisition",
-            delegating_agent_name: &env.agent.name,
-            extended: &extended,
-            providers: &providers,
-            session_model: &env.agent.model,
-            store: env.ctx.session.provider_credential_store(&providers).ok(),
-            acquisition_id: &acquisition_id,
-            record_id: &record_id,
-            value_name: name,
-            description,
-            generation: i64::try_from(env.ctx.config.generation()).unwrap_or(i64::MAX),
-            value_version: 1,
-            now_ms: chrono::Utc::now().timestamp_millis(),
-            command,
-            allowed_sealed_record_ids: BTreeSet::new(),
-        },
-        AcquisitionExecutionContext {
-            spawn_args,
-            session: env.ctx.session.clone(),
-            locks: env.ctx.locks.clone(),
-            redaction: env.ctx.redact.clone(),
-            config: env.ctx.config.clone(),
+pub(crate) fn run_parent_acquisition_tool<'a>(
+    env: &'a crate::engine::agent::tool_dispatch::DispatchEnv<'_>,
+    args: &'a serde_json::Value,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = anyhow::Result<crate::engine::tool::ToolOutput>>
+            + Send
+            + 'a,
+    >,
+> {
+    // The acquisition child re-enters ordinary dispatch. Erase this future at
+    // the parent/child boundary so the outer interrupt scope's `Send`
+    // requirement does not recursively depend on its own opaque async type.
+    Box::pin(async move {
+        let name = args
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let description = args
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let command = args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let providers = env.ctx.config.providers();
+        let extended = env.ctx.config.extended();
+        let acquisition_id = uuid::Uuid::now_v7().to_string();
+        let record_id = uuid::Uuid::now_v7().to_string();
+        let spawn_args = SpawnArgs {
+            compiled_guidance: Vec::new(),
             guidance_compiler: None,
-            interrupts: env.ctx.interrupts.clone(),
-            cancel: env.ctx.cancel.clone(),
-            approver: env.ctx.approver.clone(),
-            resource_scheduler: env.ctx.resource_scheduler.clone(),
-            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
-        },
-        PRODUCTION_CAPTURE_REGISTRY.get_or_init(TrustedChildCaptureRegistry::new),
-    )
-    .await;
-    let parent_result = match outcome {
-        AcquisitionOutcome::Sealed => "sealed acquisition completed".to_owned(),
-        AcquisitionOutcome::RequiresUser(question) => format!(
-            "sealed acquisition requires user input ({}): {}",
-            question.reason().as_str(),
-            question.prompt(),
-        ),
-        AcquisitionOutcome::Failed => "sealed acquisition failed".to_owned(),
-    };
-    Ok(crate::engine::tool::ToolOutput::text(parent_result))
+            model: env.agent.model.clone(),
+            params: env.agent.params.clone(),
+            env_overlay: env.agent.env_overlay.clone(),
+            cwd: env.ctx.cwd.clone(),
+            config: env.ctx.config.clone(),
+            session_short_id: env.ctx.session.short_id(),
+            workspace_scratch_dir: env.ctx.session.workspace_scratch_dir(),
+            assistant_identity_prefix: env.agent.assistant_identity_prefix.clone(),
+            model_system_prompt_snapshot: env.ctx.session.model_system_prompt_snapshot(),
+            knowledge_base_system_prefix: env.ctx.session.knowledge_base_system_prompt(),
+            interactive: false,
+            mcp_parent_reachable: Some(env.agent.mcp_resolver.catalog().admitted_entries()),
+            mcp_root_catalog: env.agent.mcp_resolver.root_catalog(),
+            model_override: None,
+            delegation_model: None,
+            delegated: true,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            vnext_host_policy: None,
+            vnext_local_installation_resolver:
+                crate::agents::LocalInstallationResolver::no_installations(),
+            parent_vnext_grant: None,
+            parent_posture: None,
+            swarm_depth: 0,
+            swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+            granted_tools: Vec::new(),
+            lock_identity: None,
+            write_scope: env.agent.write_scope.clone(),
+            dream_read_scope: env.ctx.session.dream_read_scope(),
+            workspace_lease: env.agent.workspace_lease.clone(),
+            credential_store: env.ctx.session.provider_credential_store(&providers).ok(),
+            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
+        };
+        let outcome = run_trusted_child_acquisition(
+            AcquisitionRequest {
+                caller_mode: env.ctx.session.approval_mode(),
+                category: "trusted-child-acquisition",
+                delegating_agent_name: &env.agent.name,
+                extended: &extended,
+                providers: &providers,
+                session_model: &env.agent.model,
+                store: env.ctx.session.provider_credential_store(&providers).ok(),
+                acquisition_id: &acquisition_id,
+                record_id: &record_id,
+                value_name: name,
+                description,
+                generation: i64::try_from(env.ctx.config.generation()).unwrap_or(i64::MAX),
+                value_version: 1,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+                command,
+                allowed_sealed_record_ids: BTreeSet::new(),
+            },
+            AcquisitionExecutionContext {
+                spawn_args,
+                session: env.ctx.session.clone(),
+                locks: env.ctx.locks.clone(),
+                redaction: env.ctx.redact.clone(),
+                config: env.ctx.config.clone(),
+                guidance_compiler: None,
+                interrupts: env.ctx.interrupts.clone(),
+                cancel: env.ctx.cancel.clone(),
+                approver: env.ctx.approver.clone(),
+                resource_scheduler: env.ctx.resource_scheduler.clone(),
+                local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+            },
+            PRODUCTION_CAPTURE_REGISTRY.get_or_init(TrustedChildCaptureRegistry::new),
+        )
+        .await;
+        let parent_result = match outcome {
+            AcquisitionOutcome::Sealed => "sealed acquisition completed".to_owned(),
+            AcquisitionOutcome::RequiresUser(question) => format!(
+                "sealed acquisition requires user input ({}): {}",
+                question.reason().as_str(),
+                question.prompt(),
+            ),
+            AcquisitionOutcome::Failed => "sealed acquisition failed".to_owned(),
+        };
+        Ok(crate::engine::tool::ToolOutput::text(parent_result))
+    })
 }
 
 /// Perform one acquisition. The returned closed outcome is the only parent
@@ -408,7 +419,7 @@ pub async fn run_trusted_child_acquisition(
     for nudge in 0..=MAX_TERMINAL_NUDGES {
         let result = with_acquisition_runtime(
             runtime.clone(),
-            run_noninteractive_resumable(
+            run_fresh_noninteractive_resumable(
                 agent,
                 prompt,
                 history,
@@ -425,15 +436,6 @@ pub async fn run_trusted_child_acquisition(
                 crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
                 MAX_ACQUISITION_TURNS_PER_ATTEMPT,
                 execution.local_installations.clone(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
             ),
         )
         .await;

@@ -10461,12 +10461,65 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     .await
 }
 
+/// Run a fresh noninteractive child while retaining its transcript for a
+/// bounded host-directed follow-up. Recovery-only executor controls remain
+/// private to this module; callers outside the driver can only start a fresh
+/// child and cannot manufacture a recovered execution context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_fresh_noninteractive_resumable(
+    child: Agent,
+    initial_prompt: Message,
+    prior_history: Vec<Message>,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+    local_installations: crate::agents::LocalInstallationResolver,
+) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
+    run_noninteractive_resumable(
+        child,
+        initial_prompt,
+        prior_history,
+        session,
+        locks,
+        redact,
+        cwd,
+        config,
+        guidance_compiler,
+        interrupts,
+        cancel,
+        approver,
+        resource_scheduler,
+        loop_guard_threshold,
+        max_turns,
+        local_installations,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await
+}
+
 /// Run a child agent's loop to completion, optionally **rehydrated** from a
 /// prior transcript (`prior_history`). Returns the report + the full
 /// transcript. [`run_noninteractive`] is the no-rehydrate wrapper used by the
 /// `docs` pipeline.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_noninteractive_resumable(
+pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     child: Agent,
     initial_prompt: Message,
     prior_history: Vec<Message>,

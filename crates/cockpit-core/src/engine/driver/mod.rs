@@ -43,7 +43,7 @@ use noninteractive::{
     stale_handle_error,
 };
 pub(crate) use noninteractive::{
-    NoninteractiveSteerTarget, run_noninteractive, run_noninteractive_resumable,
+    NoninteractiveSteerTarget, run_fresh_noninteractive_resumable, run_noninteractive,
 };
 use queue::*;
 use reports::*;

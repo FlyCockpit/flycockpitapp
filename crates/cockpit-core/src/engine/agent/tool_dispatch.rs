@@ -1856,10 +1856,12 @@ async fn execute_ordinary_call_unscoped(
                 tool_was_dispatched = true;
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
                     if resolved_name == "acquire_sealed_value" {
-                        crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
+                        let started = std::time::Instant::now();
+                        let result = crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
                             env, &args,
                         )
-                        .await
+                        .await;
+                        (result, started.elapsed().as_millis() as u64)
                     } else {
                         dispatch_one_timed(
                             env.active_tools,

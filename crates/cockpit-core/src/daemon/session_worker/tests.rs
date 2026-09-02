@@ -1586,7 +1586,11 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
 /// unconditionally `.expect()` a wire receipt and panicked the session
 /// worker on every scheduled job and Dream run. Both origins must drive the
 /// REAL `run_worker` (no mocked worker boundary) through a full model turn
-/// to completion without panicking.
+/// to completion without panicking. The acked `QueueItem.id` (the
+/// daemon-minted receipt) must also be the `turn_id` the turn settles under:
+/// the daemon schedulers `watch_turn` exactly that id, so a mismatched
+/// `AgentIdle` would strand every scheduled job and Dream run behind a
+/// one-hour timeout even after the panic is fixed.
 #[test]
 fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
     crate::test_env::run_async_with_large_stack(|| async {
@@ -1765,11 +1769,17 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
         }
 
         // Completion is observed through the worker's own event stream — the
-        // same `AgentIdle` boundary the TUI consumes — because the turn
-        // correlation the daemon schedulers use is out of scope here; the
-        // regression is the worker panic, and the ack plus one settled turn
-        // prove the real `run_worker` handled both daemon-origin sources.
-        async fn await_turn_idle(events: &mut crate::daemon::EventReceiver, label: &str) {
+        // same `AgentIdle` boundary the daemon schedulers settle on. The
+        // scheduler contract is that the `QueueItem.id` returned by the
+        // `UserMessage` ack IS the `turn_id` published by `AgentIdle` (the
+        // id `watch_turn` matches), so this binds the acked id to the
+        // published idle id on the REAL `run_worker` — for daemon-origin
+        // submissions, the id the worker minted at arm entry.
+        async fn await_turn_idle(
+            events: &mut crate::daemon::EventReceiver,
+            expected_turn_id: Uuid,
+            label: &str,
+        ) {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     match events
@@ -1779,8 +1789,9 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                         .event
                     {
                         proto::Event::AgentIdle {
-                            turn_id: Some(_), ..
-                        } => return,
+                            turn_id: Some(turn_id),
+                            ..
+                        } if turn_id == expected_turn_id.to_string() => return,
                         proto::Event::SessionDriverFailed { error, .. } => {
                             panic!("{label} session driver failed: {error}")
                         }
@@ -1803,7 +1814,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
             "scheduled regression prompt",
         )
         .await;
-        await_turn_idle(&mut events, "scheduled job").await;
+        await_turn_idle(&mut events, scheduled.id, "scheduled job").await;
 
         // A manual Dream run arrives from `daemon::dream_scheduler` with an
         // `ExternalRoot` origin, no principal, no job id, and no client
@@ -1816,7 +1827,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
             "manual Dream regression prompt",
         )
         .await;
-        await_turn_idle(&mut events, "Dream run").await;
+        await_turn_idle(&mut events, dream.id, "Dream run").await;
         assert_ne!(
             scheduled.id, dream.id,
             "each daemon-origin submission gets its own minted receipt identity"

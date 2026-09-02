@@ -9060,13 +9060,22 @@ impl Driver {
                 .await;
             return;
         }
+        // A retraction settles the submission without ever starting a turn,
+        // so no lifecycle id is in flight. Bind the submission's own settled
+        // identity (its receipt id == queue item id) so a `watch_turn`
+        // watcher holding the acked id resolves on this `AgentIdle` instead
+        // of being stranded behind a timeout.
+        let retraction_turn_id = client_submission_ids.first().copied();
         let _ = tx
             .send(TurnEvent::UserMessageRetracted {
                 client_submission_ids,
             })
             .await;
         self.emit_context_projection(tx).await;
-        let turn_id = self.current_lifecycle_turn_id.take();
+        let turn_id = self
+            .current_lifecycle_turn_id
+            .take()
+            .or_else(|| retraction_turn_id.map(|id| id.to_string()));
         let reason = self.take_idle_reason().await;
         let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
     }
@@ -11840,7 +11849,24 @@ impl Driver {
         // before assembling or dispatching the user's inference.
         self.preempt_shadow_brief_for_foreground().await;
         self.preempt_self_improvement_review_for_foreground();
-        let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
+        // The lifecycle turn id IS the queue identity the dispatcher acked:
+        // a `SessionWork::UserMessage` ack hands back the queue item id
+        // (the client or daemon-minted receipt id; `commit_idempotent_push`
+        // keys the item by `receipt.id`, and the queue pop records the same
+        // id in `queue_item_ids`), and daemon consumers (`scheduler`,
+        // `dream_scheduler`) settle the submission by watching exactly that
+        // id through `watch_turn` / `Event::AgentIdle`. A fresh v4 here would
+        // publish an `AgentIdle` no watcher can ever match, stranding the
+        // submission behind a one-hour timeout. Injects with no queue
+        // identity (loop ticks, job completions, goal roots, AsyncUser)
+        // have no watcher and keep a fresh v4. For a folded batch only the
+        // driving submission's item survives as the turn id; leading ids
+        // are finished into history and carry no turn of their own.
+        let lifecycle_turn_id = submission
+            .queue_item_ids
+            .first()
+            .map(|queue_item_id| queue_item_id.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
         // (below): `consume_active_node_override_for_turn` runs the AC5 "second

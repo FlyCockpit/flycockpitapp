@@ -432,8 +432,7 @@ pub struct SessionConfigSnapshot {
     /// matching post event.
     pub hooks: crate::config::extended::hooks::HookRegistry,
     /// Injected host capabilities used to compute effective sandbox mode.
-    /// Unpublished (empty features) leaves host Sandbox usable; Refuse is
-    /// the fail-closed backstop.
+    /// Unpublished (empty features) fail-closes sandboxed intents to Refuse.
     pub host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     /// Daemon-composition-only host probe runtime.  It is not config and is
     /// intentionally retained when a config watcher replaces the surrounding
@@ -2112,7 +2111,7 @@ impl SessionWorkerHandle {
     }
 
     /// Broadcast intent vs effective sandbox mode so attach/reconnect can
-    /// show "intent Sandbox, effective Off (missing bwrap)".
+    /// show "intent Sandbox, effective Refuse (missing bwrap)".
     pub fn broadcast_sandbox_state(&self) {
         let snapshot = self.config_snapshot();
         let mode = self.session.sandbox_mode();
@@ -2181,6 +2180,11 @@ impl SessionWorkerHandle {
             return;
         }
 
+        if self.session.sandbox_mode().refuses() {
+            self.emit_capability_fail_closed_notice();
+            return;
+        }
+
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -2223,6 +2227,32 @@ impl SessionWorkerHandle {
                 }
             }
         });
+    }
+
+    fn emit_capability_fail_closed_notice(&self) {
+        let snapshot = self.config_snapshot();
+        let intent = snapshot.extended.sandbox.default_mode;
+        let (remedy, fix_command) =
+            super::sandbox_capability_unavailable_notice(intent, &snapshot.host_capabilities)
+                .unwrap_or_else(|| {
+                    (
+                        super::fail_closed_capability_reason(intent, &snapshot.host_capabilities),
+                        None,
+                    )
+                });
+        let notice = SandboxUnavailableNotice {
+            remedy,
+            fix_command,
+        };
+        *self
+            .sandbox_unavailable_notice
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notice.clone());
+        // Capability fail-closed must surface even when no live bwrap probe
+        // runs. Send on this path first, then arm so later bash refusals do
+        // not hide the original warning.
+        send_sandbox_unavailable_notice(&self.event_tx, &self.redaction, self.session_id, &notice);
+        let _ = forward_sandbox_unavailable(&self.sandbox_notice_armed);
     }
 }
 
@@ -2610,8 +2640,8 @@ pub(crate) fn spawn(
     //   (b) else this client passed `--no-sandbox` → OFF for the
     //       sessions it creates.
     //   (c) else effective_sandbox_mode(persisted intent, host caps).
-    // Unavailable container is Off, never a silent rewrite to host Sandbox.
-    // A later `/sandbox` flip overrides this for the session.
+    // Unavailable sandbox/container is Refuse, never silent Off or a rewrite
+    // to host Sandbox. A later `/sandbox off` is the explicit acknowledgement.
     session.set_sandbox_mode(resolve_sandbox_default_with(
         daemon_no_sandbox,
         client_no_sandbox,

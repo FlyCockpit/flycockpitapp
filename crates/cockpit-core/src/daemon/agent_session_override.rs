@@ -81,6 +81,7 @@ fn sandbox_rank(mode: SandboxMode) -> u8 {
         SandboxMode::Sandbox => 1,
         SandboxMode::Container => 2,
         SandboxMode::ContainerReadonly => 3,
+        SandboxMode::Refuse => 4,
     }
 }
 
@@ -97,6 +98,7 @@ fn sandbox_label(mode: SandboxMode) -> &'static str {
         SandboxMode::Sandbox => "sandbox",
         SandboxMode::Container => "container",
         SandboxMode::ContainerReadonly => "container_readonly",
+        SandboxMode::Refuse => "refuse",
     }
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn sandbox_from_label(label: &str) -> Option<SandboxMode> {
         "sandbox" => Some(SandboxMode::Sandbox),
         "container" => Some(SandboxMode::Container),
         "container_readonly" => Some(SandboxMode::ContainerReadonly),
+        "refuse" => Some(SandboxMode::Refuse),
         _ => None,
     }
 }

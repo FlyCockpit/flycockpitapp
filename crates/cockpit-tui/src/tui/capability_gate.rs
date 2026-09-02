@@ -89,6 +89,13 @@ pub fn sandbox_instruct(mode: SandboxMode, caps: &HostCapabilitySnapshot) -> Cap
                 fix_command: None,
             };
         }
+        SandboxMode::Refuse => {
+            return CapabilityInstruct {
+                message: "configured sandbox cannot run until the host capability is available"
+                    .into(),
+                fix_command: None,
+            };
+        }
         SandboxMode::Sandbox => FEATURE_SANDBOX_HOST,
         SandboxMode::Container | SandboxMode::ContainerReadonly => FEATURE_SANDBOX_CONTAINER,
     };
@@ -260,6 +267,7 @@ pub fn sandbox_mode_display(mode: SandboxMode, caps: &HostCapabilitySnapshot) ->
         }
         SandboxMode::Container => "container".to_string(),
         SandboxMode::ContainerReadonly => "container-readonly".to_string(),
+        SandboxMode::Refuse => "refused".to_string(),
     };
     if mode.is_container() && !sandbox_mode_available(mode, caps) {
         format!("{label} (unavailable here)")
@@ -342,7 +350,10 @@ pub fn sandbox_intent_effective_banner(
     effective: SandboxMode,
     caps: &HostCapabilitySnapshot,
 ) -> Option<String> {
-    if intent == SandboxMode::Off || effective != SandboxMode::Off || intent == effective {
+    if intent == SandboxMode::Off || intent == effective {
+        return None;
+    }
+    if effective != SandboxMode::Off && effective != SandboxMode::Refuse {
         return None;
     }
     let instruct = sandbox_instruct(intent, caps);
@@ -351,11 +362,19 @@ pub fn sandbox_intent_effective_banner(
         SandboxMode::Container => "Container",
         SandboxMode::ContainerReadonly => "Container-readonly",
         SandboxMode::Off => "Off",
+        SandboxMode::Refuse => "Refuse",
     };
-    let mut text = format!(
-        "{label} is selected but effective Off because {}.",
-        instruct.message
-    );
+    let mut text = if effective == SandboxMode::Refuse {
+        format!(
+            "{label} is selected but cannot run because {}. bash will not run unconfined.",
+            instruct.message
+        )
+    } else {
+        format!(
+            "{label} is selected but effective Off because {}.",
+            instruct.message
+        )
+    };
     if let Some(fix) = &instruct.fix_command
         && !text.contains(fix)
     {
@@ -363,7 +382,11 @@ pub fn sandbox_intent_effective_banner(
         text.push_str(fix);
         text.push('.');
     }
-    text.push_str(" Run /sandbox off to keep Off.");
+    if effective == SandboxMode::Refuse {
+        text.push_str(" Run /sandbox off to allow unconfined execution.");
+    } else {
+        text.push_str(" Run /sandbox off to keep Off.");
+    }
     Some(text)
 }
 
@@ -439,5 +462,47 @@ pub fn unified_secret_store(
         effective_placement: placement,
         fail_closed_reason: None,
         fix_command: None,
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_banner_tests {
+    use super::*;
+    use cockpit_proto::FeatureCapabilityState;
+
+    #[test]
+    fn banner_names_refuse_when_intent_is_sandbox_and_capability_is_down() {
+        let caps = snapshot_with_sandbox(
+            FeatureCapabilityState::Failed,
+            FeatureCapabilityState::Available,
+        );
+        let text =
+            sandbox_intent_effective_banner(SandboxMode::Sandbox, SandboxMode::Refuse, &caps)
+                .expect("fail-closed Refuse must show a banner");
+        assert!(text.contains("cannot run"), "{text}");
+        assert!(text.contains("/sandbox off"), "{text}");
+        assert!(!text.contains("effective Off"), "{text}");
+    }
+
+    #[test]
+    fn banner_names_refuse_for_unpublished_snapshot() {
+        let caps = HostCapabilitySnapshot::unpublished();
+        let text =
+            sandbox_intent_effective_banner(SandboxMode::Sandbox, SandboxMode::Refuse, &caps)
+                .expect("unpublished snapshot Refuse must show a banner");
+        assert!(text.contains("unavailable"), "{text}");
+        assert!(text.contains("will not run unconfined"), "{text}");
+    }
+
+    #[test]
+    fn matching_intent_and_effective_has_no_banner() {
+        let caps = snapshot_with_sandbox(
+            FeatureCapabilityState::Available,
+            FeatureCapabilityState::Available,
+        );
+        assert!(
+            sandbox_intent_effective_banner(SandboxMode::Sandbox, SandboxMode::Sandbox, &caps)
+                .is_none()
+        );
     }
 }

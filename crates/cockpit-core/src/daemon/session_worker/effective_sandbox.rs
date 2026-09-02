@@ -1,8 +1,8 @@
 //! Persist sandbox *intent*; compute *effective* mode from host capabilities.
 //!
-//! Unavailable container never silently rewrites to host Sandbox. Missing host
-//! sandbox is effective Off, not Refuse. Refuse remains the fail-closed
-//! backstop if a session still believes it is sandboxed.
+//! Unavailable container never silently rewrites to host Sandbox. A configured
+//! sandbox/container intent whose capability is missing, Failed, Unsupported,
+//! or unpublished is effective [`SandboxMode::Refuse`], never silent Off.
 
 use cockpit_proto::{
     FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot, SecretStoreSnapshot,
@@ -68,9 +68,8 @@ impl std::fmt::Display for SetSandboxError {
 
 impl std::error::Error for SetSandboxError {}
 
-/// Snapshot with no feature rows. Runtime treats missing `sandbox.host` as
-/// still usable (Refuse remains the backstop). Wizard treats missing rows as
-/// unselectable.
+/// Snapshot with no feature rows. Runtime fail-closes sandboxed intents to
+/// Refuse. Wizard treats missing rows as unselectable.
 pub fn unpublished_host_capability_snapshot() -> HostCapabilitySnapshot {
     HostCapabilitySnapshot::unpublished()
 }
@@ -146,11 +145,12 @@ fn feature_state_is_available(state: FeatureCapabilityState) -> bool {
 /// Whether `intent` can be the live effective mode under `caps`.
 ///
 /// A missing feature row is unavailable. An unpublished snapshot therefore
-/// yields effective Off for Sandbox/container intents, never a silent
-/// host-Sandbox enable.
+/// cannot honor Sandbox/container intents. [`SandboxMode::Refuse`] is never
+/// a selectable intent.
 pub fn sandbox_mode_available(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> bool {
     match intent {
         SandboxMode::Off => true,
+        SandboxMode::Refuse => false,
         SandboxMode::Sandbox => match feature_row(caps, FEATURE_SANDBOX_HOST) {
             Some(row) => feature_state_is_available(row.state),
             None => false,
@@ -169,6 +169,7 @@ pub fn sandbox_mode_available(intent: SandboxMode, caps: &HostCapabilitySnapshot
 pub fn sandbox_mode_selectable(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> bool {
     match intent {
         SandboxMode::Off => true,
+        SandboxMode::Refuse => false,
         SandboxMode::Sandbox => feature_row(caps, FEATURE_SANDBOX_HOST)
             .is_some_and(|row| feature_state_is_available(row.state)),
         SandboxMode::Container | SandboxMode::ContainerReadonly => {
@@ -180,23 +181,71 @@ pub fn sandbox_mode_selectable(intent: SandboxMode, caps: &HostCapabilitySnapsho
 
 /// Compute the mode this session actually runs from persisted intent + snapshot.
 ///
-/// There is no container → host Sandbox rewrite. Unavailable container is
-/// effective Off even when host sandbox works.
+/// There is no container → host Sandbox rewrite. Unavailable sandbox or
+/// container is [`SandboxMode::Refuse`], never silent Off. Explicit Off
+/// (`--no-sandbox` / `/sandbox off`) remains Off.
 pub fn effective_sandbox_mode(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> SandboxMode {
-    if sandbox_mode_available(intent, caps) {
-        intent
-    } else {
-        SandboxMode::Off
+    match intent {
+        SandboxMode::Off => SandboxMode::Off,
+        SandboxMode::Refuse => SandboxMode::Refuse,
+        SandboxMode::Sandbox | SandboxMode::Container | SandboxMode::ContainerReadonly => {
+            if sandbox_mode_available(intent, caps) {
+                intent
+            } else {
+                SandboxMode::Refuse
+            }
+        }
     }
 }
 
+/// Reason and optional fix command when `intent` cannot be honored.
+///
+/// `None` when `intent` is Off or the snapshot can honor it.
+pub fn sandbox_capability_unavailable_notice(
+    intent: SandboxMode,
+    caps: &HostCapabilitySnapshot,
+) -> Option<(String, Option<String>)> {
+    if matches!(intent, SandboxMode::Off) || sandbox_mode_available(intent, caps) {
+        return None;
+    }
+    let row = capability_row_for_mode(intent, caps);
+    let reason = row.map(|row| row.reason.clone()).unwrap_or_else(|| {
+        if caps.generation == 0 && caps.features.is_empty() {
+            format!(
+                "{} is unavailable because the host capability snapshot is unpublished",
+                sandbox_mode_label(intent)
+            )
+        } else {
+            format!("{} is unavailable", sandbox_mode_label(intent))
+        }
+    });
+    Some((reason, row.and_then(|row| row.fix_command.clone())))
+}
+
+/// User-facing capability reason for a fail-closed session.
+pub fn fail_closed_capability_reason(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> String {
+    sandbox_capability_unavailable_notice(intent, caps)
+        .map(|(reason, _)| reason)
+        .unwrap_or_else(|| format!("{} is unavailable", sandbox_mode_label(intent)))
+}
+
 /// Decide a `SetSandbox` request. Unavailable intent is a typed reject and
-/// must not be persisted.
+/// must not be persisted. [`SandboxMode::Refuse`] is not a selectable intent.
 pub fn evaluate_set_sandbox(
     requested: SandboxMode,
     persisted_intent: SandboxMode,
     caps: &HostCapabilitySnapshot,
 ) -> Result<SetSandboxApplied, SandboxCapabilityMissing> {
+    if requested == SandboxMode::Refuse {
+        return Err(SandboxCapabilityMissing {
+            requested,
+            persisted_intent,
+            effective: effective_sandbox_mode(persisted_intent, caps),
+            reason: "refuse is a runtime fail-closed state, not a selectable sandbox mode"
+                .to_string(),
+            fix_command: None,
+        });
+    }
     if sandbox_mode_available(requested, caps) {
         return Ok(SetSandboxApplied {
             persisted_intent: requested,
@@ -220,7 +269,7 @@ fn capability_row_for_mode(
     caps: &HostCapabilitySnapshot,
 ) -> Option<&FeatureCapabilityRow> {
     match mode {
-        SandboxMode::Off => None,
+        SandboxMode::Off | SandboxMode::Refuse => None,
         SandboxMode::Sandbox => feature_row(caps, FEATURE_SANDBOX_HOST),
         SandboxMode::Container | SandboxMode::ContainerReadonly => {
             feature_row(caps, FEATURE_SANDBOX_CONTAINER)
@@ -234,6 +283,7 @@ fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
         SandboxMode::Sandbox => "sandbox",
         SandboxMode::Container => "container",
         SandboxMode::ContainerReadonly => "container_readonly",
+        SandboxMode::Refuse => "refuse",
     }
 }
 
@@ -286,19 +336,19 @@ mod tests {
                 SandboxMode::Sandbox,
                 host_missing,
                 container_up,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
             (
                 SandboxMode::Sandbox,
                 host_failed,
                 container_up,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
             (
                 SandboxMode::Sandbox,
                 host_unsupported,
                 container_up,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
             (
                 SandboxMode::Container,
@@ -316,13 +366,13 @@ mod tests {
                 SandboxMode::Container,
                 host_up,
                 container_down,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
             (
                 SandboxMode::Container,
                 host_up,
                 container_failed,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
             (
                 SandboxMode::ContainerReadonly,
@@ -334,7 +384,7 @@ mod tests {
                 SandboxMode::ContainerReadonly,
                 host_up,
                 container_down,
-                SandboxMode::Off,
+                SandboxMode::Refuse,
             ),
         ];
 
@@ -349,21 +399,21 @@ mod tests {
     }
 
     #[test]
-    fn host_sandbox_missing_does_not_keep_sandbox_on() {
+    fn host_sandbox_missing_refuses_instead_of_off() {
         let caps = sandbox_capability_snapshot(
             FeatureCapabilityState::Missing,
             FeatureCapabilityState::Available,
         );
         let effective = effective_sandbox_mode(SandboxMode::Sandbox, &caps);
-        assert_eq!(effective, SandboxMode::Off);
+        assert_eq!(effective, SandboxMode::Refuse);
         assert!(
-            !effective.enabled(),
-            "missing host sandbox is effective Off, not Refuse"
+            effective.enabled() && effective.refuses(),
+            "missing host sandbox is effective Refuse, never silent Off"
         );
     }
 
     #[test]
-    fn unpublished_snapshot_does_not_enable_host_sandbox() {
+    fn unpublished_snapshot_refuses_host_sandbox() {
         let caps = HostCapabilitySnapshot {
             generation: 0,
             features: Vec::new(),
@@ -372,29 +422,41 @@ mod tests {
         };
         assert_eq!(
             effective_sandbox_mode(SandboxMode::Sandbox, &caps),
-            SandboxMode::Off
+            SandboxMode::Refuse
         );
         assert!(evaluate_set_sandbox(SandboxMode::Sandbox, SandboxMode::Off, &caps).is_err());
+        let notice = sandbox_capability_unavailable_notice(SandboxMode::Sandbox, &caps)
+            .expect("unpublished snapshot must surface a fail-closed notice");
+        assert!(
+            notice.0.contains("unpublished"),
+            "unpublished snapshot notice: {}",
+            notice.0
+        );
     }
 
     #[test]
-    fn container_unavailable_defaults_off_not_host_sandbox() {
+    fn container_unavailable_refuses_not_host_sandbox() {
         let caps = sandbox_capability_snapshot(
             FeatureCapabilityState::Available,
             FeatureCapabilityState::Missing,
         );
         assert_eq!(
             effective_sandbox_mode(SandboxMode::Container, &caps),
-            SandboxMode::Off
+            SandboxMode::Refuse
         );
         assert_eq!(
             effective_sandbox_mode(SandboxMode::ContainerReadonly, &caps),
-            SandboxMode::Off
+            SandboxMode::Refuse
         );
         assert_ne!(
             effective_sandbox_mode(SandboxMode::Container, &caps),
             SandboxMode::Sandbox,
             "unavailable container must not silently rewrite to host Sandbox"
+        );
+        assert_ne!(
+            effective_sandbox_mode(SandboxMode::Container, &caps),
+            SandboxMode::Off,
+            "unavailable container must not silently fail open to Off"
         );
     }
 
@@ -462,14 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn windows_unsupported_host_sandbox_is_effective_off() {
+    fn windows_unsupported_host_sandbox_is_effective_refuse() {
         let caps = sandbox_capability_snapshot(
             FeatureCapabilityState::Unsupported,
             FeatureCapabilityState::Missing,
         );
         assert_eq!(
             effective_sandbox_mode(SandboxMode::Sandbox, &caps),
-            SandboxMode::Off
+            SandboxMode::Refuse
         );
         let caps = sandbox_capability_snapshot(
             FeatureCapabilityState::Unsupported,
@@ -479,5 +541,60 @@ mod tests {
             effective_sandbox_mode(SandboxMode::Container, &caps),
             SandboxMode::Container
         );
+    }
+
+    #[test]
+    fn configured_sandbox_refuses_for_missing_failed_and_empty_snapshot() {
+        let missing = sandbox_capability_snapshot(
+            FeatureCapabilityState::Missing,
+            FeatureCapabilityState::Available,
+        );
+        let failed = sandbox_capability_snapshot(
+            FeatureCapabilityState::Failed,
+            FeatureCapabilityState::Available,
+        );
+        let empty = unpublished_host_capability_snapshot();
+        for (caps, label) in [
+            (missing, "missing"),
+            (failed, "failed"),
+            (empty, "empty-snapshot"),
+        ] {
+            let effective = effective_sandbox_mode(SandboxMode::Sandbox, &caps);
+            assert_eq!(
+                effective,
+                SandboxMode::Refuse,
+                "intent=Sandbox capability {label} must refuse, not fail open"
+            );
+            assert!(
+                sandbox_capability_unavailable_notice(SandboxMode::Sandbox, &caps).is_some(),
+                "intent=Sandbox capability {label} must surface a notice"
+            );
+        }
+    }
+
+    #[test]
+    fn set_sandbox_rejects_refuse_as_requested_intent() {
+        let caps = sandbox_capability_snapshot(
+            FeatureCapabilityState::Available,
+            FeatureCapabilityState::Available,
+        );
+        let err = evaluate_set_sandbox(SandboxMode::Refuse, SandboxMode::Sandbox, &caps)
+            .expect_err("Refuse is not a selectable intent");
+        assert_eq!(err.requested, SandboxMode::Refuse);
+        assert_eq!(err.persisted_intent, SandboxMode::Sandbox);
+        assert_eq!(err.effective, SandboxMode::Sandbox);
+    }
+
+    #[test]
+    fn explicit_off_stays_off_when_capabilities_are_down() {
+        let caps = sandbox_capability_snapshot(
+            FeatureCapabilityState::Failed,
+            FeatureCapabilityState::Failed,
+        );
+        assert_eq!(
+            effective_sandbox_mode(SandboxMode::Off, &caps),
+            SandboxMode::Off
+        );
+        assert!(sandbox_capability_unavailable_notice(SandboxMode::Off, &caps).is_none());
     }
 }

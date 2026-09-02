@@ -206,6 +206,16 @@ impl Tool for CustomBashTool {
             &ctx.config.extended(),
         )
         .await;
+        if ctx.session.sandbox_mode().refuses() {
+            let snapshot = ctx.config.snapshot();
+            let reason = crate::daemon::session_worker::fail_closed_capability_reason(
+                snapshot.extended.sandbox.default_mode,
+                &snapshot.host_capabilities,
+            );
+            return Ok(ToolOutput::text(format!(
+                "Error: the configured sandbox cannot start ({reason}); custom tools will not run until the user turns the sandbox off explicitly"
+            )));
+        }
         let sandbox_on = ctx.session.sandbox_enabled()
             || !denied_knowledge_paths.is_empty()
             || !write_denied_knowledge_paths.is_empty();

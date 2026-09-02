@@ -3936,6 +3936,39 @@ async fn sandbox_default_precedence_client_then_on() {
     );
 }
 
+#[tokio::test]
+async fn sandbox_default_capability_unavailable_is_refuse_not_off() {
+    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let missing = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Missing,
+        FeatureCapabilityState::Available,
+    );
+    let failed = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Failed,
+        FeatureCapabilityState::Available,
+    );
+    let empty = crate::daemon::session_worker::unpublished_host_capability_snapshot();
+
+    for (caps, label) in [
+        (missing, "missing"),
+        (failed, "failed"),
+        (empty, "empty-snapshot"),
+    ] {
+        assert_eq!(
+            resolve_sandbox_default_with(false, false, SandboxMode::Sandbox, &caps),
+            SandboxMode::Refuse,
+            "intent=Sandbox capability {label} must refuse"
+        );
+        assert_eq!(
+            resolve_sandbox_default_with(true, false, SandboxMode::Sandbox, &caps),
+            SandboxMode::Off,
+            "explicit daemon --no-sandbox stays Off even when caps are down"
+        );
+    }
+}
+
 #[test]
 fn set_sandbox_rejects_unavailable_intent_does_not_persist() {
     use crate::tools::sandbox_mode::SandboxMode;
@@ -4459,6 +4492,64 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
         }
         other => panic!("expected SandboxUnavailable, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn capability_refuse_probe_emits_visible_sandbox_unavailable_notice() {
+    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session.set_sandbox_mode(SandboxMode::Refuse);
+    let locks = Arc::new(LockManager::in_memory(db));
+    let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+    {
+        let mut snapshot = handle
+            .config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot.extended.sandbox.default_mode = SandboxMode::Sandbox;
+        snapshot.host_capabilities = crate::daemon::session_worker::sandbox_capability_snapshot(
+            FeatureCapabilityState::Failed,
+            FeatureCapabilityState::Available,
+        );
+    }
+
+    let mut rx = handle.subscribe();
+    handle.probe_sandbox_unavailable();
+
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("capability fail-closed notice broadcast")
+        .expect("event envelope");
+    match envelope.event {
+        proto::Event::SandboxUnavailable {
+            session_id, remedy, ..
+        } => {
+            assert_eq!(session_id, handle.session_id);
+            assert!(
+                !remedy.is_empty(),
+                "fail-closed notice must carry a visible reason"
+            );
+        }
+        other => panic!("expected SandboxUnavailable, got {other:?}"),
+    }
+    assert!(
+        handle
+            .sandbox_unavailable_notice
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some(),
+        "spawn-time capability refuse must remember the notice for attach hydration"
+    );
 }
 
 #[tokio::test]

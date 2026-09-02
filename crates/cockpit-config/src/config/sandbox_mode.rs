@@ -8,11 +8,22 @@ pub enum SandboxMode {
     Sandbox,
     Container,
     ContainerReadonly,
+    /// Runtime fail-closed effective state. Not a persistable config intent:
+    /// configured sandbox/container with an unavailable host capability maps
+    /// here so bash never silently runs unconfined.
+    Refuse,
 }
 
 impl SandboxMode {
+    /// Whether sandboxing is still required. [`Self::Refuse`] stays enabled so
+    /// callers never take the unconfined [`Self::Off`] path.
     pub fn enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    /// Runtime fail-closed: configured sandbox cannot be honored.
+    pub fn refuses(self) -> bool {
+        matches!(self, Self::Refuse)
     }
 
     pub fn is_container(self) -> bool {

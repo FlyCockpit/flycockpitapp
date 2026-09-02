@@ -2026,6 +2026,7 @@ pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxMode) -> 
         crate::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox",
         crate::tools::sandbox_mode::SandboxMode::Container => "container",
         crate::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
+        crate::tools::sandbox_mode::SandboxMode::Refuse => "refuse",
     }
 }
 

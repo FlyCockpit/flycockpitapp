@@ -267,6 +267,10 @@ pub(super) fn persist_sandbox_intent(
     // still overrode it, silently dropping a toggle-to-default. Writing the
     // intent to the nearest layer every time is idempotent and matches
     // the other session-preference persist helpers.
+    anyhow::ensure!(
+        mode != crate::tools::sandbox_mode::SandboxMode::Refuse,
+        "refuse is a runtime fail-closed state, not a persistable sandbox intent"
+    );
     cfg.sandbox.default_mode = mode;
     doc.write(&cfg)?;
     Ok(())
@@ -275,7 +279,8 @@ pub(super) fn persist_sandbox_intent(
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
 /// client `--no-sandbox` -> [`super::effective_sandbox_mode`]. Factored out
 /// from session spawn so the precedence can be unit-tested without touching
-/// process env. Unavailable container is effective Off, never host Sandbox.
+/// process env. Explicit `--no-sandbox` is Off. Unavailable sandbox or
+/// container is Refuse, never silent Off or a rewrite to host Sandbox.
 pub(super) fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,

@@ -51,8 +51,8 @@ use regex::Regex;
 /// than a hard byte-cap that could clip the failure tail.
 const MAX_LINES_BEFORE_TRUNCATE: usize = 400;
 /// Head lines kept on middle-truncation (3:2 head:tail, mirroring the
-/// byte-level [`crate::tools::common::truncate_head_tail`] split — the head
-/// carries the command's framing, the tail carries the failure signal).
+/// byte-level `crate::tools::common::truncate_head_tail_redacted` split — the
+/// head carries the command's framing, the tail carries the failure signal).
 const TRUNCATE_HEAD_LINES: usize = 240;
 /// Tail lines kept on middle-truncation. The failure signal (a panic, a
 /// non-zero-exit summary, the last assertion) almost always lives at the

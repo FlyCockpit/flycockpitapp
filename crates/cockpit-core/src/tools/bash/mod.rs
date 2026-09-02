@@ -13,7 +13,10 @@
 //! silently on macOS.
 //!
 //! Safety:
-//!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`].
+//!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`], and every
+//!     truncation routes through the redacting truncator
+//!     (`crate::tools::common::truncate_head_tail_redacted`) so a secret
+//!     straddling a truncation boundary never leaves a partial in model text.
 //!   - The env scrub list from plan §3c removes the well-known
 //!     injection-vector vars (`BASH_ENV`, `PROMPT_COMMAND`, …) and
 //!     anything matching shared secret-name patterns.
@@ -31,7 +34,7 @@ use crate::engine::tool::{
     ToolOutputSidecar, ToolPresentation, single_line_preview, string_field,
 };
 use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail_redacted};
 use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
@@ -1112,8 +1115,12 @@ async fn call_bash_inner(
     let knowledge_source = attached_knowledge_read.then(|| body.clone());
     let mut out = if truncated_for_display {
         // Head+tail so the `exit:` line and any stderr at the tail
-        // survive — the failure signal usually lives there.
-        let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
+        // survive — the failure signal usually lives there. The redacting
+        // truncator additionally elides the unsafe margin at the head→middle
+        // and middle→tail boundaries so a boundary-straddling secret PARTIAL
+        // never survives into the §7 whole-value scrub.
+        let mut out =
+            ToolOutput::truncated_text(truncate_head_tail_redacted(&ctx.redact, &body, OUTPUT_BYTE_CAP))
             .with_text_artifact_capture(capture_text_artifact_body(&body))
             .with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
@@ -2729,9 +2736,13 @@ fn render_bash_outcome(
     let truncated_for_display = body.len() > OUTPUT_BYTE_CAP;
     let sidecar = bash_output_sidecar(command, cwd, &final_outcome, &body, truncated_for_display);
     let mut out = if truncated_for_display {
-        ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&body))
-            .with_bash_meta(meta, resource_meta)
+        ToolOutput::truncated_text(truncate_head_tail_redacted(
+            &ctx.redact,
+            &body,
+            OUTPUT_BYTE_CAP,
+        ))
+        .with_text_artifact_capture(capture_text_artifact_body(&body))
+        .with_bash_meta(meta, resource_meta)
     } else {
         ToolOutput::text(body).with_bash_meta(meta, resource_meta)
     };
@@ -3025,6 +3036,7 @@ async fn run_prepared_command(
                 resource_lease.take(),
                 attached_knowledge_read,
                 identity_accounting,
+                ctx.redact.clone(),
             )
             .await;
             return RunOutcome::Backgrounded(job_id);
@@ -3063,6 +3075,7 @@ async fn spawn_adopted_shell_completion(
     resource_lease: Option<ResourceLeaseGuard>,
     attached_knowledge_read: bool,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    redact: std::sync::Arc<crate::redact::RedactionTable>,
 ) {
     let adopted_cancel = cancel.child_token();
     let waiter_cancel = adopted_cancel.clone();
@@ -3143,8 +3156,12 @@ async fn spawn_adopted_shell_completion(
                 } else {
                     outcome
                 };
+                // The adopted result lands as a steering submission, i.e.
+                // model-facing text: truncate through the redacting truncator
+                // so a boundary-straddling secret PARTIAL never survives into
+                // the §7 whole-value scrub.
                 let bounded = if outcome.len() > OUTPUT_BYTE_CAP {
-                    truncate_head_tail(&outcome, OUTPUT_BYTE_CAP)
+                    truncate_head_tail_redacted(&redact, &outcome, OUTPUT_BYTE_CAP)
                 } else {
                     outcome
                 };

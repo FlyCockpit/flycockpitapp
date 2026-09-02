@@ -1608,19 +1608,38 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
             .set_active_model("lmstudio", "session-model")
             .unwrap();
 
-        // One controlled chat-completions stream per submitted turn: a single
-        // visible text delta, the stop finish, then the stream terminator.
+        // A controlled chat-completions stream for every request the session
+        // makes: a single visible text delta, the stop finish, then the stream
+        // terminator. The loop serves any request count because a user turn
+        // is followed by detached same-model metadata-fork calls, which must
+        // not consume another turn's stream.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let provider_server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for turn in 0..2 {
-                let (mut socket, _) = listener.accept().await.expect("model accepts request");
+            let delta = serde_json::json!({
+                "id": "daemon-origin", "model": "session-model",
+                "choices": [{
+                    "delta": { "content": "daemon turn answer" },
+                    "finish_reason": null
+                }]
+            });
+            let finish = serde_json::json!({
+                "id": "daemon-origin", "model": "session-model",
+                "choices": [{ "delta": {}, "finish_reason": "stop" }]
+            });
+            let body = format!("data: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+            while let Ok((mut socket, _)) = listener.accept().await {
                 let mut read = Vec::new();
                 let mut chunk = [0_u8; 4096];
                 loop {
-                    let n = socket.read(&mut chunk).await.expect("model reads request");
-                    assert!(n > 0, "model request ended before its HTTP headers");
+                    let n = match socket.read(&mut chunk).await {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
                     read.extend_from_slice(&chunk[..n]);
                     let Some(header_end) = read.windows(4).position(|w| w == b"\r\n\r\n") else {
                         continue;
@@ -1641,32 +1660,17 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                         break;
                     }
                 }
-                let delta = serde_json::json!({
-                    "id": format!("daemon-origin-{turn}"),
-                    "model": "session-model",
-                    "choices": [{
-                        "delta": { "content": "daemon turn answer" },
-                        "finish_reason": null
-                    }]
-                });
-                let finish = serde_json::json!({
-                    "id": format!("daemon-origin-{turn}"),
-                    "model": "session-model",
-                    "choices": [{ "delta": {}, "finish_reason": "stop" }]
-                });
-                socket
+                if socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                     )
                     .await
-                    .expect("model writes stream headers");
-                socket
-                    .write_all(
-                        format!("data: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n").as_bytes(),
-                    )
-                    .await
-                    .expect("model writes stream body");
-                socket.flush().await.expect("model flushes stream body");
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
             }
         });
         let mut providers = lmstudio_test_providers();

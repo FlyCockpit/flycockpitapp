@@ -10079,14 +10079,14 @@ pub(super) async fn run_worker(
                     if submission.client_submissions.is_empty() {
                         let id = uuid::Uuid::new_v4();
                         let fingerprint = submission.client_fingerprint();
-                        submission
-                            .client_submissions
-                            .push(crate::engine::message::ClientSubmissionReceipt {
+                        submission.client_submissions.push(
+                            crate::engine::message::ClientSubmissionReceipt {
                                 id,
                                 fingerprint: fingerprint.clone(),
                                 wire_fingerprint: format!("daemon:{fingerprint}"),
                                 origin_principal: submission.origin_principal.clone(),
-                            });
+                            },
+                        );
                     }
                     let client_submission_id = submission
                         .client_submissions

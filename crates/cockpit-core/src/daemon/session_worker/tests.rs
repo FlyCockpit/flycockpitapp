@@ -1651,7 +1651,10 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                         .find_map(|line| {
                             line.split_once(':').and_then(|(name, value)| {
                                 name.eq_ignore_ascii_case("content-length").then(|| {
-                                    value.trim().parse::<usize>().expect("numeric content length")
+                                    value
+                                        .trim()
+                                        .parse::<usize>()
+                                        .expect("numeric content length")
                                 })
                             })
                         })
@@ -1753,14 +1756,11 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                 })
                 .await
                 .unwrap();
-            let (item, _queue) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                response,
-            )
-            .await
-            .expect("worker acknowledges the daemon-origin message without panicking")
-            .expect("worker response channel remains open")
-            .expect("daemon-origin message is accepted");
+            let (item, _queue) = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("worker acknowledges the daemon-origin message without panicking")
+                .expect("worker response channel remains open")
+                .expect("daemon-origin message is accepted");
             item
         }
 
@@ -1769,10 +1769,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
         // correlation the daemon schedulers use is out of scope here; the
         // regression is the worker panic, and the ack plus one settled turn
         // prove the real `run_worker` handled both daemon-origin sources.
-        async fn await_turn_idle(
-            events: &mut crate::daemon::EventReceiver,
-            label: &str,
-        ) {
+        async fn await_turn_idle(events: &mut crate::daemon::EventReceiver, label: &str) {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     match events

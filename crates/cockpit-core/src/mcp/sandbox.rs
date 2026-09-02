@@ -47,7 +47,7 @@ use monty::{
 };
 use serde_json::Value;
 
-use super::builtin::{HostContext, McpChildDispatch};
+use super::builtin::{HostContext, McpChildDispatch, ScrubbedMcpChildOutcome};
 use super::config::McpConfig;
 
 const STDOUT_FALLBACK_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
@@ -214,19 +214,14 @@ pub async fn run_envelope_with_host(
                         &call.kwargs,
                     )
                     .await
+                    .into_result()
                 };
                 let ext = match result {
                     Ok(obj) => ExtFunctionResult::Return(obj),
-                    Err(msg) => {
-                        let msg = scrub_host_error_for_sandbox(host, &msg).unwrap_or_else(|_| {
-                            "host call failed and its error could not be safely redacted"
-                                .to_string()
-                        });
-                        ExtFunctionResult::Error(MontyException::new(
-                            ExcType::ValueError,
-                            Some(msg),
-                        ))
-                    }
+                    Err(msg) => ExtFunctionResult::Error(MontyException::new(
+                        ExcType::ValueError,
+                        Some(msg),
+                    )),
                 };
                 progress = match call.resume(ext, PrintWriter::CollectString(&mut stdout)) {
                     Ok(progress) => progress,
@@ -483,6 +478,23 @@ async fn dispatch(
     method_call: bool,
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
+) -> ScrubbedHostResult<MontyObject> {
+    scrub_monty_result_for_sandbox(
+        host,
+        dispatch_raw(cfg, host, name, method_call, args, kwargs).await,
+    )
+}
+
+/// Raw host dispatch is private to the typed custody wrapper above. Every arm,
+/// including future arms, therefore has both its success and error variant
+/// scrubbed before the result can be consumed by the Monty run loop.
+async fn dispatch_raw(
+    cfg: &McpConfig,
+    host: &HostContext,
+    name: &str,
+    method_call: bool,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
 ) -> Result<MontyObject, String> {
     if name == "hexdigest" {
         return dataclass_attr(args.first(), "_hex")
@@ -502,15 +514,14 @@ async fn dispatch(
     match name {
         "request" | "get" | "post" | "put" | "patch" | "delete" => {
             let request = governed_request_from_monty(name, args, kwargs)?;
-            let response = super::network::dispatch(host, request)
+            super::network::dispatch(host, request)
                 .await
-                .map_err(|error| format!("requests.{name} failed: {error:#}"))?;
-            scrub_host_value_for_sandbox(host, response).map(response_to_monty)
+                .map_err(|error| format!("requests.{name} failed: {error:#}"))
+                .map(response_to_monty)
         }
-        "network_configure" => {
-            let value = configure_network_policy(host, args, kwargs).await?;
-            scrub_host_value_for_sandbox(host, value).map(|value| json_to_monty(&value))
-        }
+        "network_configure" => configure_network_policy(host, args, kwargs)
+            .await
+            .map(|value| json_to_monty(&value)),
         "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent" | "b64encode"
         | "b64decode" | "sha256" | "sha512" => dispatch_pure_host_module(name, args, kwargs),
         "search" => {
@@ -530,8 +541,7 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 let hits = super::catalog::search(cfg, host, &query).await;
-                let value = scrub_host_value_for_sandbox(host, hits_to_json(&hits))?;
-                Ok((json_to_monty(&value), value))
+                Ok(hits_to_json(&hits))
             })
             .await
         }
@@ -546,10 +556,7 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::grep_tool_names(cfg, host, &pattern).await {
-                    Ok(hits) => {
-                        let value = scrub_host_value_for_sandbox(host, hits_to_json(&hits))?;
-                        Ok((json_to_monty(&value), value))
-                    }
+                    Ok(hits) => Ok(hits_to_json(&hits)),
                     Err(e) => Err(e),
                 }
             })
@@ -566,11 +573,7 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::grep_tool_definitions(cfg, host, &pattern).await {
-                    Ok(hits) => {
-                        let value =
-                            scrub_host_value_for_sandbox(host, definition_hits_to_json(&hits))?;
-                        Ok((json_to_monty(&value), value))
-                    }
+                    Ok(hits) => Ok(definition_hits_to_json(&hits)),
                     Err(e) => Err(e),
                 }
             })
@@ -591,11 +594,7 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::describe(cfg, host, &server, &tool).await {
-                    Ok(desc) => {
-                        let value =
-                            scrub_host_value_for_sandbox(host, descriptor_to_json(&server, &desc))?;
-                        Ok((json_to_monty(&value), value))
-                    }
+                    Ok(desc) => Ok(descriptor_to_json(&server, &desc)),
                     Err(e) => Err(format!("mcp.describe failed: {e}")),
                 }
             })
@@ -604,114 +603,103 @@ async fn dispatch(
         "invoke" => {
             let server = str_arg(args, 0, "server", "mcp.invoke")?;
             let tool = str_arg(args, 1, "tool", "mcp.invoke")?;
-            if let Err(error) = super::catalog::ensure_external_server_access(host, &server) {
-                return Err(format!("mcp.invoke failed: {error}"));
-            }
             let mut call_args = match args.get(2) {
                 None | Some(MontyObject::None) => Value::Object(Default::default()),
                 Some(obj) => monty_to_json(obj),
             };
-            if let Err(error) = crate::tools::bash::reject_retired_sealed_child_bindings(&call_args)
-            {
-                return Err(format!("mcp.invoke failed: {error}"));
-            }
-            if super::builtin::is_builtin_server(&server) {
-                let tools = super::builtin::available_descriptors(host);
-                match crate::mcp::invoke_prep::repair_invoke_args_from_tools(
-                    &tools,
-                    None,
-                    &server,
-                    &tool,
-                    call_args.clone(),
-                    "mcp.invoke",
-                ) {
-                    crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
-                        call_args = args;
-                    }
-                    crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
-                        let error = format!("mcp.invoke failed: {message}");
-                        let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
-                        if let Some(recorder) = &host.child_events
-                            && let Some(span) = recorder.start(dispatch).await
-                        {
-                            recorder.finish(span, Err(error.clone()), 0).await;
-                        }
-                        return Err(error);
-                    }
-                }
-            } else if let Some(entry) = catalog.get(&server) {
-                #[cfg(test)]
-                let skip_prepare_for_stub = host.has_test_external_invoke();
-                #[cfg(not(test))]
-                let skip_prepare_for_stub = false;
-                if !skip_prepare_for_stub {
-                    if let Err(error) =
-                        super::catalog::ensure_external_server_host_access(host).await
-                    {
-                        return Err(format!("mcp.invoke failed: {error}"));
-                    }
-                    let prepared = entry
-                        .persistent_server()
-                        .expect("external catalog entries always have persistent server configuration")
-                        .with_selected_profile(&server, &entry.profile)
-                        .unwrap_or_else(|_| {
-                            entry
-                                .persistent_server()
-                                .expect("external catalog entries always have persistent server configuration")
-                                .clone()
-                        });
-                    match crate::mcp::invoke_prep::prepare_invoke_args_identified(
-                        &server,
-                        &prepared,
-                        &tool,
-                        call_args.clone(),
+            // Access, approval, and argument preparation may await. Complete
+            // all of them before starting a child span so cancellation in
+            // those phases cannot orphan a ToolCallStarted record.
+            let original_args = call_args.clone();
+            let preparation = async {
+                super::catalog::ensure_external_server_access(host, &server)
+                    .map_err(|error| format!("mcp.invoke failed: {error}"))?;
+                crate::tools::bash::reject_retired_sealed_child_bindings(&call_args)
+                    .map_err(|error| format!("mcp.invoke failed: {error}"))?;
+                if super::builtin::is_builtin_server(&server) {
+                    let tools = super::builtin::available_descriptors(host);
+                    call_args = match crate::mcp::invoke_prep::repair_invoke_args_from_tools(
+                        &tools,
                         None,
+                        &server,
+                        &tool,
+                        call_args,
                         "mcp.invoke",
-                        super::catalog::connect_context(host)
-                            .with_profile(entry.profile.clone())
-                            .with_agent_bound(entry.agent_bound),
-                        entry.source(),
-                        &entry.profile,
-                        entry.agent_bound,
-                    )
-                    .await
-                    {
-                        crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => {
-                            call_args = args;
-                        }
+                    ) {
+                        crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => args,
                         crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
-                            let error = format!("mcp.invoke failed: {message}");
-                            let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
-                            if let Some(recorder) = &host.child_events
-                                && let Some(span) = recorder.start(dispatch).await
-                            {
-                                recorder.finish(span, Err(error.clone()), 0).await;
-                            }
-                            return Err(error);
+                            return Err(format!("mcp.invoke failed: {message}"));
                         }
+                    };
+                } else if let Some(entry) = catalog.get(&server) {
+                    #[cfg(test)]
+                    let skip_prepare_for_stub = host.has_test_external_invoke();
+                    #[cfg(not(test))]
+                    let skip_prepare_for_stub = false;
+                    if !skip_prepare_for_stub {
+                        super::catalog::ensure_external_server_host_access(host)
+                            .await
+                            .map_err(|error| format!("mcp.invoke failed: {error}"))?;
+                        let prepared = entry
+                            .persistent_server()
+                            .expect("external catalog entries always have persistent server configuration")
+                            .with_selected_profile(&server, &entry.profile)
+                            .unwrap_or_else(|_| {
+                                entry
+                                    .persistent_server()
+                                    .expect("external catalog entries always have persistent server configuration")
+                                    .clone()
+                            });
+                        call_args = match crate::mcp::invoke_prep::prepare_invoke_args_identified(
+                            &server,
+                            &prepared,
+                            &tool,
+                            call_args,
+                            None,
+                            "mcp.invoke",
+                            super::catalog::connect_context(host)
+                                .with_profile(entry.profile.clone())
+                                .with_agent_bound(entry.agent_bound),
+                            entry.source(),
+                            &entry.profile,
+                            entry.agent_bound,
+                        )
+                        .await
+                        {
+                            crate::mcp::invoke_prep::NestedRepair::Dispatch { args, .. } => args,
+                            crate::mcp::invoke_prep::NestedRepair::Reject(message) => {
+                                return Err(format!("mcp.invoke failed: {message}"));
+                            }
+                        };
                     }
                 }
+                Ok(call_args)
             }
+            .await;
+            let call_args = match preparation {
+                Ok(call_args) => call_args,
+                Err(error) => {
+                    let dispatch = invoke_child_dispatch(&server, &tool, &original_args);
+                    return observe_child_completed(host, dispatch, Err(error), 0)
+                        .await
+                        .map(|value| json_to_monty(&value));
+                }
+            };
+            // Construct the successful dispatch only now, from the exact
+            // post-repair/prepared arguments sent on the wire. Preserve the
+            // established child lifecycle: the ordinary observer surrounds
+            // catalog invoke, and no preparation/access await is in its span.
             let dispatch = invoke_child_dispatch(&server, &tool, &call_args);
             observe_child(host, dispatch, async {
-                match super::catalog::invoke(cfg, host, &server, &tool, call_args).await {
-                    Ok(v) => scrub_invoke_result_for_sandbox(host, v),
-                    Err(e) => Err(format!("mcp.invoke failed: {e}")),
-                }
+                super::catalog::invoke(cfg, host, &server, &tool, call_args)
+                    .await
+                    .map_err(|error| format!("mcp.invoke failed: {error}"))
             })
             .await
             .map(|value| json_to_monty(&value))
         }
         other => Err(format!("unknown MCP sandbox function `mcp.{other}`")),
     }
-}
-
-/// The sandbox is a custody boundary, not merely a model-output boundary.
-/// Scrub invoke results before they become VM values so no script can encode
-/// or structurally transform an unredacted secret before it reaches governed
-/// egress. This is deliberately recursive over keys and scalar leaves too.
-fn scrub_invoke_result_for_sandbox(host: &HostContext, value: Value) -> Result<Value, String> {
-    scrub_host_value_for_sandbox(host, value)
 }
 
 fn scrub_host_value_for_sandbox(host: &HostContext, value: Value) -> Result<Value, String> {
@@ -734,6 +722,248 @@ fn scrub_host_error_for_sandbox(host: &HostContext, error: &str) -> Result<Strin
         .enforced_checked()
         .map_err(|failure| format!("host error redaction view failed closed: {failure:#}"))?;
     Ok(table.scrub(error))
+}
+
+/// The sole typed custody edge for host-call outcomes. Neither variant may be
+/// consumed by the VM or child recorder until it has been constructed here.
+/// Values are recursively scrubbed; errors are scrubbed or replaced with a
+/// fail-closed constant when the enforced redaction view cannot be obtained.
+#[derive(Debug, Clone)]
+enum ScrubbedHostResult<T> {
+    Ok(T),
+    Err(String),
+}
+
+/// Unforgeable outside this module: proves a recorder outcome was constructed
+/// by the sandbox custody implementation rather than a production sibling.
+pub(super) struct SandboxScrubProof(());
+
+impl<T> ScrubbedHostResult<T> {
+    fn into_result(self) -> Result<T, String> {
+        match self {
+            Self::Ok(value) => Ok(value),
+            Self::Err(error) => Err(error),
+        }
+    }
+}
+
+impl ScrubbedHostResult<Value> {
+    /// Cross the recorder's nominal custody fence without erasing this value
+    /// back to a raw `Result`. Both variants were scrubbed before this method
+    /// can be called because `ScrubbedHostResult`'s variants are module-private.
+    fn recorder_outcome(&self) -> ScrubbedMcpChildOutcome {
+        match self {
+            Self::Ok(value) => {
+                ScrubbedMcpChildOutcome::scrubbed_ok(SandboxScrubProof(()), value.clone())
+            }
+            Self::Err(error) => {
+                ScrubbedMcpChildOutcome::scrubbed_err(SandboxScrubProof(()), error.clone())
+            }
+        }
+    }
+}
+
+fn scrub_host_result_for_sandbox(
+    host: &HostContext,
+    result: Result<Value, String>,
+) -> ScrubbedHostResult<Value> {
+    match result {
+        Ok(value) => match scrub_host_value_for_sandbox(host, value) {
+            Ok(value) => ScrubbedHostResult::Ok(value),
+            Err(_) => {
+                ScrubbedHostResult::Err("host call result could not be safely redacted".to_string())
+            }
+        },
+        Err(error) => {
+            ScrubbedHostResult::Err(scrub_host_error_for_sandbox(host, &error).unwrap_or_else(
+                |_| "host call failed and its error could not be safely redacted".to_string(),
+            ))
+        }
+    }
+}
+
+fn scrub_monty_result_for_sandbox(
+    host: &HostContext,
+    result: Result<MontyObject, String>,
+) -> ScrubbedHostResult<MontyObject> {
+    match result {
+        Ok(value) => {
+            let Some(ctx) = host.native_tool_ctx.as_ref() else {
+                return ScrubbedHostResult::Ok(value);
+            };
+            match ctx.redact.enforced_checked() {
+                Ok(table) => ScrubbedHostResult::Ok(scrub_monty_for_sandbox(value, &table)),
+                Err(_) => ScrubbedHostResult::Err(
+                    "host call result could not be safely redacted".to_string(),
+                ),
+            }
+        }
+        Err(error) => {
+            ScrubbedHostResult::Err(scrub_host_error_for_sandbox(host, &error).unwrap_or_else(
+                |_| "host call failed and its error could not be safely redacted".to_string(),
+            ))
+        }
+    }
+}
+
+/// Recursively scrub Monty's data-bearing shapes without round-tripping
+/// through JSON, which would erase Response/Hash dataclass identity and alter
+/// method semantics in the VM.
+fn scrub_monty_for_sandbox(
+    value: MontyObject,
+    table: &crate::redact::RedactionTable,
+) -> MontyObject {
+    match value {
+        MontyObject::Bool(value) => {
+            scrub_monty_scalar(MontyObject::Bool(value), value.to_string(), table)
+        }
+        MontyObject::Int(value) => {
+            scrub_monty_scalar(MontyObject::Int(value), value.to_string(), table)
+        }
+        MontyObject::BigInt(value) => {
+            let canonical = value.to_string();
+            scrub_monty_scalar(MontyObject::BigInt(value), canonical, table)
+        }
+        MontyObject::Float(value) => {
+            scrub_monty_scalar(MontyObject::Float(value), value.to_string(), table)
+        }
+        MontyObject::String(value) => MontyObject::String(table.scrub(&value)),
+        MontyObject::Bytes(value) => MontyObject::Bytes(scrub_monty_bytes(value, table)),
+        MontyObject::Path(value) => MontyObject::Path(table.scrub(&value)),
+        MontyObject::List(values) => MontyObject::List(
+            values
+                .into_iter()
+                .map(|value| scrub_monty_for_sandbox(value, table))
+                .collect(),
+        ),
+        MontyObject::Tuple(values) => MontyObject::Tuple(
+            values
+                .into_iter()
+                .map(|value| scrub_monty_for_sandbox(value, table))
+                .collect(),
+        ),
+        MontyObject::Set(values) => MontyObject::Set(
+            values
+                .into_iter()
+                .map(|value| scrub_monty_for_sandbox(value, table))
+                .collect(),
+        ),
+        MontyObject::FrozenSet(values) => MontyObject::FrozenSet(
+            values
+                .into_iter()
+                .map(|value| scrub_monty_for_sandbox(value, table))
+                .collect(),
+        ),
+        MontyObject::NamedTuple {
+            type_name,
+            field_names,
+            values,
+        } => MontyObject::NamedTuple {
+            type_name: table.scrub(&type_name),
+            field_names: field_names
+                .into_iter()
+                .map(|field| table.scrub(&field))
+                .collect(),
+            values: values
+                .into_iter()
+                .map(|value| scrub_monty_for_sandbox(value, table))
+                .collect(),
+        },
+        MontyObject::Dict(values) => MontyObject::Dict(DictPairs::from(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        scrub_monty_for_sandbox(key, table),
+                        scrub_monty_for_sandbox(value, table),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+        MontyObject::Dataclass {
+            name,
+            type_id,
+            field_names,
+            attrs,
+            frozen,
+        } => MontyObject::Dataclass {
+            name: table.scrub(&name),
+            type_id,
+            field_names: field_names
+                .into_iter()
+                .map(|field| table.scrub(&field))
+                .collect(),
+            attrs: DictPairs::from(
+                attrs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            scrub_monty_for_sandbox(key, table),
+                            scrub_monty_for_sandbox(value, table),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            frozen,
+        },
+        MontyObject::Exception { exc_type, arg } => MontyObject::Exception {
+            exc_type,
+            arg: arg.map(|value| table.scrub(&value)),
+        },
+        MontyObject::Function { name, docstring } => MontyObject::Function {
+            name: table.scrub(&name),
+            docstring: docstring.map(|value| table.scrub(&value)),
+        },
+        MontyObject::Repr(value) => MontyObject::Repr(table.scrub(&value)),
+        MontyObject::Cycle(id, value) => MontyObject::Cycle(id, table.scrub(&value)),
+        MontyObject::DateTime(mut value) => {
+            value.timezone_name = value.timezone_name.map(|name| table.scrub(&name));
+            MontyObject::DateTime(value)
+        }
+        MontyObject::TimeZone(mut value) => {
+            value.name = value.name.map(|name| table.scrub(&name));
+            MontyObject::TimeZone(value)
+        }
+        MontyObject::FileHandle(mut value) => {
+            value.path = table.scrub(&value.path);
+            MontyObject::FileHandle(value)
+        }
+        // These variants carry no host-originated strings or recursively
+        // data-bearing children. Keeping every current variant explicit makes
+        // a future MontyObject addition a compile-time custody review.
+        MontyObject::Ellipsis => MontyObject::Ellipsis,
+        MontyObject::None => MontyObject::None,
+        MontyObject::Date(value) => MontyObject::Date(value),
+        MontyObject::TimeDelta(value) => MontyObject::TimeDelta(value),
+        MontyObject::Type(value) => MontyObject::Type(value),
+        MontyObject::BuiltinFunction(value) => MontyObject::BuiltinFunction(value),
+    }
+}
+
+fn scrub_monty_bytes(original: Vec<u8>, table: &crate::redact::RedactionTable) -> Vec<u8> {
+    let rendered = String::from_utf8_lossy(&original);
+    let scrubbed = table.scrub(&rendered);
+    if scrubbed == rendered {
+        // Preserve arbitrary binary bytes exactly when no table literal was
+        // present. If a literal is present, replacement takes precedence over
+        // byte identity so invalid UTF-8 cannot hide an adjacent ASCII secret.
+        original
+    } else {
+        scrubbed.into_bytes()
+    }
+}
+
+fn scrub_monty_scalar(
+    original: MontyObject,
+    canonical: String,
+    table: &crate::redact::RedactionTable,
+) -> MontyObject {
+    let scrubbed = table.scrub(&canonical);
+    if scrubbed == canonical {
+        original
+    } else {
+        MontyObject::String(scrubbed)
+    }
 }
 
 fn scrub_json_for_sandbox(value: &Value, table: &crate::redact::RedactionTable) -> Value {
@@ -789,6 +1019,12 @@ async fn configure_network_policy(
             )
         })
         .transpose()?;
+    // The registry is the authority for scoped metadata/seed forks, which do
+    // not carry a native tool context. Consult it before inspecting ToolCtx so
+    // its capability denial wins over incidental host-construction shape.
+    host.effective_network_capability()
+        .await
+        .map_err(|error| format!("network configuration is unavailable: {error:#}"))?;
     let ctx = host
         .native_tool_ctx
         .as_ref()
@@ -796,11 +1032,6 @@ async fn configure_network_policy(
     let agent_instance_id = ctx.agent_instance_id.ok_or_else(|| {
         "network configuration requires a daemon-owned agent instance".to_string()
     })?;
-    // Scoped contexts deny the entire capability, including authority
-    // mutation. Refuse before constructing or raising an owner prompt.
-    host.effective_network_capability()
-        .await
-        .map_err(|error| format!("network configuration is unavailable: {error:#}"))?;
     let host_name = host_name
         .map(|host| crate::db::monty_network::CanonicalNetworkHost::parse(&host))
         .transpose()
@@ -1431,21 +1662,47 @@ where
         None => None,
     };
     let start = Instant::now();
-    // Host-derived values and errors cross one fail-closed redaction edge
-    // before either the child-event observer or the sandbox VM can see them.
-    // Keeping this here prevents a new observed host call from accidentally
-    // persisting/broadcasting a raw error while relying on a caller to scrub.
-    let result = match work.await {
-        Ok(value) => scrub_host_value_for_sandbox(host, value),
-        Err(error) => Err(
-            scrub_host_error_for_sandbox(host, &error).unwrap_or_else(|_| {
-                "host call failed and its error could not be safely redacted".to_string()
-            }),
-        ),
-    };
+    let result = work.await;
+    // Recorder persistence is its own consumer of the typed custody seam. The
+    // raw result continues only to dispatch_raw, whose wrapper independently
+    // crosses the same seam before VM resumption.
+    let scrubbed = scrub_host_result_for_sandbox(host, result.clone());
     if let (Some(recorder), Some(span)) = (&host.child_events, span) {
         recorder
-            .finish(span, result.clone(), start.elapsed().as_millis() as u64)
+            .finish(
+                span,
+                scrubbed.recorder_outcome(),
+                start.elapsed().as_millis() as u64,
+            )
+            .await;
+    }
+    result
+}
+
+/// Record an already-completed pre-dispatch invoke failure (access,
+/// preparation, or rejection). The outcome crosses typed custody before
+/// either recorder write; VM custody is applied again by dispatch's wrapper.
+async fn observe_child_completed(
+    host: &HostContext,
+    mut dispatch: McpChildDispatch,
+    result: Result<Value, String>,
+    duration_ms: u64,
+) -> Result<Value, String> {
+    if result.is_err() {
+        dispatch.args = scrub_host_result_for_sandbox(host, Ok(dispatch.args))
+            .into_result()
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "error": "child dispatch input could not be safely redacted"
+                })
+            });
+    }
+    let scrubbed = scrub_host_result_for_sandbox(host, result.clone());
+    if let Some(recorder) = &host.child_events
+        && let Some(span) = recorder.start(dispatch).await
+    {
+        recorder
+            .finish(span, scrubbed.recorder_outcome(), duration_ms)
             .await;
     }
     result
@@ -1457,36 +1714,11 @@ async fn observe_child_monty<F>(
     work: F,
 ) -> Result<MontyObject, String>
 where
-    F: std::future::Future<Output = Result<(MontyObject, Value), String>>,
+    F: std::future::Future<Output = Result<Value, String>>,
 {
-    let span = match &host.child_events {
-        Some(recorder) => recorder.start(dispatch).await,
-        None => None,
-    };
-    let start = Instant::now();
-    // Discard the host-produced Monty object and rebuild it from the same
-    // redacted JSON value recorded by the observer. Thus persistence,
-    // broadcast, and VM resumption share exactly one sanitized result.
-    let result = match work.await {
-        Ok((_object, value)) => {
-            scrub_host_value_for_sandbox(host, value).map(|value| (json_to_monty(&value), value))
-        }
-        Err(error) => Err(
-            scrub_host_error_for_sandbox(host, &error).unwrap_or_else(|_| {
-                "host call failed and its error could not be safely redacted".to_string()
-            }),
-        ),
-    };
-    if let (Some(recorder), Some(span)) = (&host.child_events, span) {
-        let recorded = result
-            .as_ref()
-            .map(|(_obj, value)| value.clone())
-            .map_err(Clone::clone);
-        recorder
-            .finish(span, recorded, start.elapsed().as_millis() as u64)
-            .await;
-    }
-    result.map(|(obj, _value)| obj)
+    observe_child(host, dispatch, work)
+        .await
+        .map(|value| json_to_monty(&value))
 }
 
 fn str_arg(
@@ -1639,6 +1871,65 @@ mod tests {
             HostContext::empty_for_tests().with_test_builtin_gate(gate.clone()),
             gate,
         )
+    }
+
+    #[test]
+    fn monty_scrubber_covers_non_json_data_and_metadata_variants() {
+        const SECRET: &str = "monty-secret-abc123";
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            min_secret_length: 4,
+            ..Default::default()
+        };
+        let table = crate::redact::RedactionTable::build_with_env(
+            &cfg,
+            std::path::Path::new("."),
+            &std::collections::HashMap::from([("TOKEN".to_string(), SECRET.to_string())]),
+        )
+        .unwrap();
+
+        let values = vec![
+            MontyObject::Bytes(format!("binary:{SECRET}").into_bytes()),
+            MontyObject::Repr(format!("<{SECRET}>")),
+            MontyObject::Function {
+                name: format!("fn_{SECRET}"),
+                docstring: Some(format!("docs {SECRET}")),
+            },
+            MontyObject::NamedTuple {
+                type_name: format!("Type{SECRET}"),
+                field_names: vec![format!("field{SECRET}")],
+                values: vec![MontyObject::String(SECRET.to_string())],
+            },
+            MontyObject::Dataclass {
+                name: format!("Class{SECRET}"),
+                type_id: 7,
+                field_names: vec![format!("field{SECRET}")],
+                attrs: DictPairs::from(vec![(
+                    MontyObject::String(format!("key{SECRET}")),
+                    MontyObject::String(SECRET.to_string()),
+                )]),
+                frozen: true,
+            },
+            serde_json::from_value(serde_json::json!({
+                "Cycle": [0, format!("cycle {SECRET}")]
+            }))
+            .expect("Monty Cycle fixture"),
+        ];
+
+        for value in values {
+            let before_kind = std::mem::discriminant(&value);
+            let scrubbed = scrub_monty_for_sandbox(value, &table);
+            assert_eq!(
+                std::mem::discriminant(&scrubbed),
+                before_kind,
+                "scrubbing should preserve Monty variant identity"
+            );
+            assert!(
+                !format!("{scrubbed:?}").contains(SECRET),
+                "data-bearing variant leaked: {scrubbed:?}"
+            );
+        }
     }
 
     fn child_event_host(
@@ -2111,9 +2402,12 @@ mod tests {
     async fn external_mcp_invoke_prompts_when_ungranted() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        ctx.current_tool_call_id = Some("outer-awaiting-approval".to_string());
+        let session = ctx.session.clone();
         let session_id = ctx.session.id;
         let calls = Arc::new(AtomicUsize::new(0));
+        let approval_entered = Arc::new(tokio::sync::Notify::new());
         let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
             let calls = calls.clone();
             move |server, tool, args| {
@@ -2125,10 +2419,21 @@ mod tests {
                 }))
             }
         });
+        let host = host.with_test_external_approval_entered({
+            let approval_entered = approval_entered.clone();
+            move |_server, _tool| approval_entered.notify_one()
+        });
 
         let script = tokio::spawn(async move {
             run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
         });
+        approval_entered.notified().await;
+        assert!(
+            child_rows(&session, "outer-awaiting-approval")
+                .await
+                .is_empty(),
+            "approval/preparation must not be covered by a started child span"
+        );
         let row = resolve_next_interrupt(
             &db,
             session_id,
@@ -2146,6 +2451,9 @@ mod tests {
         assert_eq!(value["server"], "external");
         assert_eq!(value["tool"], "echo");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let rows = child_rows(&session, "outer-awaiting-approval").await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].hard_fail);
     }
 
     #[tokio::test]
@@ -2557,14 +2865,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_dispatch_is_recorded_and_script_continues() {
+    async fn production_invoke_rejection_and_success_are_both_recorded() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let (host, _gate, session, _rx) = child_event_host(tmp.path(), "outer-fail", false);
 
         let out = run_with_host(
             "try:\n\
-             \tmcp.invoke('cockpit', 'test_count', {'count': 1})\n\
+             \tmcp.invoke('cockpit', 'context_usag', {})\n\
              except Exception as e:\n\
              \tfailed = str(e)\n\
              mcp.invoke('cockpit', 'context_usage', {})",
@@ -2579,16 +2887,18 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].parent_child_index, Some(0));
         assert!(rows[0].hard_fail);
-        assert!(rows[0].output.contains("test_count"));
+        assert!(rows[0].output.contains("context_usag"));
+        assert_eq!(rows[0].tool, "context_usag");
         assert_eq!(rows[1].parent_child_index, Some(1));
         assert!(!rows[1].hard_fail);
         assert_eq!(rows[1].tool, "context_usage");
     }
 
     #[tokio::test]
-    async fn observed_host_error_is_scrubbed_once_before_recorder_and_vm() {
+    async fn invoke_pre_dispatch_rejection_is_scrubbed_for_recorder_and_vm() {
+        let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        let (mut host, _gate, _session, mut rx) =
+        let (mut host, _gate, session, mut rx) =
             child_event_host(tmp.path(), "outer-secret-fail", true);
         let redaction_cfg = crate::config::extended::RedactConfig {
             enabled: false,
@@ -2598,10 +2908,7 @@ mod tests {
         let table = crate::redact::RedactionTable::build_with_env_and_secrets(
             &redaction_cfg,
             tmp.path(),
-            &std::collections::HashMap::from([(
-                "TOKEN".to_string(),
-                "raw-host-secret".to_string(),
-            )]),
+            &std::collections::HashMap::from([("TOKEN".to_string(), "sealed_values".to_string())]),
             Vec::<(String, String)>::new(),
         )
         .unwrap();
@@ -2609,24 +2916,45 @@ mod tests {
             .expect("test host owns its tool context")
             .redact = Arc::new(table);
 
-        let error = observe_child(
-            &host,
-            McpChildDispatch::new(
-                "invoke",
-                Some("external".into()),
-                "echo",
-                Some(false),
-                serde_json::json!({}),
-            ),
-            async { Err("host failed with raw-host-secret".to_string()) },
-        )
-        .await
-        .unwrap_err();
-        assert!(!error.contains("raw-host-secret"), "{error}");
+        let args = vec![
+            MontyObject::String("cockpit".to_string()),
+            MontyObject::String("test_count".to_string()),
+            json_to_monty(&serde_json::json!({
+                "count": 1,
+                "sealed_values": {"TOKEN": "opaque-id"}
+            })),
+        ];
+        let error = dispatch(&cfg, &host, "invoke", false, &args, &[])
+            .await
+            .into_result()
+            .unwrap_err();
+        assert!(!error.contains("sealed_values"), "{error}");
+
+        let rows = child_rows(&session, "outer-secret-fail").await;
+        assert_eq!(rows.len(), 1, "pre-dispatch rejection must be observed");
+        assert!(rows[0].hard_fail);
+        assert!(
+            !rows[0].output.contains("sealed_values"),
+            "{}",
+            rows[0].output
+        );
+        assert!(
+            !rows[0]
+                .wire_input_json
+                .to_string()
+                .contains("sealed_values"),
+            "{}",
+            rows[0].wire_input_json
+        );
         let events = drain_events(&mut rx);
+        assert!(
+            child_starts(&events)
+                .iter()
+                .all(|(_, data)| !data.to_string().contains("sealed_values"))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
-            TurnEvent::ToolError { error, .. } if !error.contains("raw-host-secret")
+            TurnEvent::ToolError { error, .. } if !error.contains("sealed_values")
         )));
     }
 
@@ -2761,6 +3089,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_forks_deny_network_configuration_at_the_registry_boundary() {
+        let cfg = McpConfig::default();
+        let metadata = HostContext::empty_for_tests().with_builtin_registry(Arc::new(
+            crate::mcp::builtin::BuiltinRegistry::metadata_fork(),
+        ));
+        let metadata_error =
+            run_with_host("mcp.network_configure('enable_requests')", &cfg, &metadata)
+                .await
+                .unwrap_err();
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("the session-rename micro-fork"),
+            "{metadata_error:#}"
+        );
+        assert!(
+            !metadata_error.to_string().contains("live agent context"),
+            "registry denial must precede missing ToolCtx: {metadata_error:#}"
+        );
+
+        let seed = HostContext::empty_for_tests().with_builtin_registry(Arc::new(
+            crate::mcp::builtin::BuiltinRegistry::seed_reads_fork(Arc::new(std::sync::Mutex::new(
+                None,
+            ))),
+        ));
+        let seed_error = run_with_host("mcp.network_configure('enable_requests')", &cfg, &seed)
+            .await
+            .unwrap_err();
+        assert!(
+            seed_error
+                .to_string()
+                .contains("the explore seed-selection micro-fork"),
+            "{seed_error:#}"
+        );
+        assert!(
+            !seed_error.to_string().contains("live agent context"),
+            "registry denial must precede missing ToolCtx: {seed_error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn network_configuration_is_an_approved_owner_action_for_the_live_executor() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
@@ -2878,33 +3247,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invoke_results_are_scrubbed_before_the_vm_can_transform_them() {
-        let cfg = crate::config::extended::RedactConfig {
+    #[tokio::test]
+    async fn invoke_result_is_scrubbed_for_recorder_and_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, _gate, session, _rx) = child_event_host(tmp.path(), "outer-secret-ok", true);
+        let redaction_cfg = crate::config::extended::RedactConfig {
             enabled: false,
             min_secret_length: 4,
             ..Default::default()
         };
         let table = crate::redact::RedactionTable::build_with_env_and_secrets(
-            &cfg,
-            std::path::Path::new("."),
-            &std::collections::HashMap::from([(
-                "TOKEN".to_string(),
-                "mcp-invoke-secret".to_string(),
-            )]),
+            &redaction_cfg,
+            tmp.path(),
+            &std::collections::HashMap::from([("TOKEN".to_string(), "count_type".to_string())]),
             Vec::<(String, String)>::new(),
         )
-        .unwrap()
-        .enforced_checked()
         .unwrap();
-        let scrubbed = scrub_json_for_sandbox(
-            &serde_json::json!({
-                "mcp-invoke-secret": ["mcp-invoke-secret", 123],
-            }),
-            &table,
-        );
-        let rendered = scrubbed.to_string();
-        assert!(!rendered.contains("mcp-invoke-secret"), "{rendered}");
+        Arc::get_mut(host.native_tool_ctx.as_mut().unwrap())
+            .expect("test host owns its tool context")
+            .redact = Arc::new(table);
+
+        let args = vec![
+            MontyObject::String("cockpit".to_string()),
+            MontyObject::String("test_count".to_string()),
+            json_to_monty(&serde_json::json!({"count": 1})),
+        ];
+        let vm_value = dispatch(&McpConfig::default(), &host, "invoke", false, &args, &[])
+            .await
+            .into_result()
+            .unwrap();
+        let rendered = monty_to_json(&vm_value).to_string();
+        assert_eq!(monty_to_json(&vm_value)["count"], 1);
+        assert!(!rendered.contains("count_type"), "{rendered}");
+
+        let rows = child_rows(&session, "outer-secret-ok").await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].hard_fail);
+        assert!(!rows[0].output.contains("count_type"), "{}", rows[0].output);
     }
 
     #[tokio::test]

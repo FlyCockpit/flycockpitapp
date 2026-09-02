@@ -436,7 +436,7 @@ pub(crate) async fn turn_toolbox(
         let registry = toolbox.mcp_builtin_registry_for_context(&agent.name);
         let requests_enabled = match current_agent_instance_id() {
             Some(agent_instance_id) => registry
-                .effective_network_capability_for(session, agent_instance_id)
+                .effective_network_capability_for(Some(session), Some(agent_instance_id))
                 .await
                 .map(|capability| capability.requests_enabled())
                 .unwrap_or(false),

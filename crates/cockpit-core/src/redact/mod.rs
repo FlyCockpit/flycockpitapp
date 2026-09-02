@@ -44,6 +44,7 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+mod command_output;
 mod dotenv;
 mod protected;
 pub(crate) mod protected_redaction_history;

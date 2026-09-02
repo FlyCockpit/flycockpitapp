@@ -67,6 +67,49 @@ pub enum TargetUnavailableReason {
     VirtualIdentityUnavailable,
 }
 
+impl fmt::Display for TargetUnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HostIdentityUnavailable => "this host installation's identity is unavailable",
+            Self::FocusIdentityUnavailable => "the focused target's identity is unavailable",
+            Self::PermissionDenied => {
+                "the platform permission for reading target identity was denied"
+            }
+            Self::SessionInactive => "the platform session is inactive or logging out",
+            Self::SessionTransition => "the platform session is transitioning between login states",
+            Self::LockOrSecureDesktop => "the session is locked or on a secure desktop",
+            Self::StaleTarget => "the focused target changed between planning and dispatch",
+            Self::AmbiguousOutput => {
+                "the focused target does not map to exactly one display output"
+            }
+            Self::AdapterTerminalFailure => {
+                "the target identity adapter failed terminally and must be recreated"
+            }
+            Self::UnsupportedPlatform => {
+                "the current platform backend is unsupported for target identity"
+            }
+            Self::EpochOverflow => "the target identity generation counter exhausted its range",
+            Self::MissingCapability => "a required host capability for target identity is missing",
+            Self::VirtualDisplayNoPhysicalLease => {
+                "virtual displays never acquire a host-global physical input lease"
+            }
+            Self::ProviderUnregistered => "the target evidence provider is not registered",
+            Self::PortalExpired => "the desktop portal session expired",
+            Self::SourceReplaced => "the target evidence source was replaced",
+            Self::Reconnect => "the target evidence source requires reconnection",
+            Self::XwaylandFallbackForbidden => {
+                "Xwayland fallback evidence is forbidden for this target"
+            }
+            Self::PartialEvidence => "target identity evidence is incomplete",
+            Self::QueryMismatch => "the target identity query returned inconsistent answers",
+            Self::VirtualIdentityUnavailable => {
+                "the dispatch has neither a host lease nor a known virtual display identity"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
 /// Source of a particular evidence field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvidenceSource {

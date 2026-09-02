@@ -2,6 +2,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
+use anyhow::Context;
 use futures::StreamExt;
 use rig::providers::{anthropic, chatgpt, openai};
 
@@ -92,10 +93,10 @@ impl UsageAliasHttpClient {
                 reqwest::header::HeaderValue::from_str(&value)?,
             );
         }
-        let client = reqwest::Client::builder()
+        let client = crate::providers::provider_http::client_builder()
             .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .context("building credentialed inference HTTP client")?;
         Ok(Self {
             client,
             extra_headers: validated,
@@ -574,5 +575,66 @@ data: {"type":"content_block_stop","index":2}
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod redirect_policy_tests {
+    use super::*;
+    use rig::http_client::HttpClientExt;
+
+    #[tokio::test]
+    async fn inference_client_rejects_cross_origin_redirect_without_replaying_api_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind inference redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0_u8; 4096];
+            let read = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://credential-leak.invalid/chat/completions\r\n",
+                "Content-Length: 0\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+            request
+        });
+
+        let client =
+            UsageAliasHttpClient::new(vec![("x-api-key".to_string(), "leaked-secret".to_string())])
+                .expect("build inference client");
+        let url = format!("http://{addr}/v1/chat/completions");
+        let req = rig::http_client::Request::builder()
+            .method(rig::http_client::Method::POST)
+            .uri(url)
+            .body(bytes::Bytes::new())
+            .expect("build request");
+        let result = client.send::<bytes::Bytes, bytes::Bytes>(req).await;
+        let err = match result {
+            Ok(response) => panic!(
+                "redirect must fail closed before replaying credentials; got status {}",
+                response.status()
+            ),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("302"), "{message}");
+
+        let captured = handle.await.expect("server task");
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("x-api-key: leaked-secret"),
+            "{captured}"
+        );
     }
 }

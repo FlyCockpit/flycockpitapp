@@ -2311,8 +2311,7 @@ impl GithubHttpsAgentFetcher {
             .map(str::to_owned);
         Ok(Self {
             transport: Arc::new(ReqwestGithubHttpTransport {
-                client: reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
+                client: crate::providers::provider_http::client_builder()
                     .timeout(GITHUB_FETCH_TIMEOUT)
                     .user_agent("flycockpit-agent-installation")
                     .build()

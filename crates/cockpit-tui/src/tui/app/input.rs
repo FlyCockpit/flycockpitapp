@@ -3123,8 +3123,13 @@ impl App {
         let cfg = self.config_snapshot.providers.clone();
         self.submit_after_model_selection = true;
         if cfg.providers.is_empty() {
+            let onboarding = self.first_run_flow != FirstRunFlow::None;
             self.first_run_flow = FirstRunFlow::AwaitProvider;
-            self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+            self.dialog = if onboarding {
+                Dialog::open_onboarding_provider_add(&self.launch.cwd, Some(status))
+            } else {
+                Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status))
+            };
             return;
         }
         // Missing selection/configuration is recovered through `/model`, not

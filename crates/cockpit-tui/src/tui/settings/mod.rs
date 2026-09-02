@@ -2723,7 +2723,19 @@ fn setup_wizard_dialog(
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
 ) -> Result<Dialog, String> {
-    let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
+    let progress = cockpit_core::welcome::onboarding_wizard_progress(descriptor.id);
+    let run = match progress {
+        Some(progress) => cockpit_core::wizard::WizardRun::resume_from_answers_json(
+            descriptor.clone(),
+            &progress,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(wizard = descriptor.id, %error, "discarding invalid onboarding progress");
+            cockpit_core::wizard::WizardRun::new(descriptor)
+                .expect("validated setup descriptor remains valid")
+        }),
+        None => cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?,
+    };
     let mut cursor = 0;
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
@@ -5947,7 +5959,8 @@ impl Dialog {
             cockpit_core::wizard::SECURITY_WIZARD_ID
             | cockpit_core::wizard::MODEL_WIZARD_ID
             | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
+            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 setup_wizard_dialog(&global_root, descriptor, None)
@@ -5987,6 +6000,12 @@ impl Dialog {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         let descriptor =
             cockpit_core::wizard::onboarding_model_descriptor_for_cwd(&global_root, None);
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
+    pub fn open_onboarding_lifetime_setup(status: Option<String>) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = cockpit_core::wizard::onboarding_lifetime_descriptor();
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
@@ -9522,7 +9541,10 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             _ => {}
         },
         cockpit_core::wizard::StepKind::Action { .. } => {
-            if matches!(step.id, "security-save" | "model-save" | "profile-save") {
+            if matches!(
+                step.id,
+                "security-save" | "model-save" | "profile-save" | "lifetime-save"
+            ) {
                 let answers_json = match run.answers_json() {
                     Ok(answers_json) => answers_json,
                     Err(error) => {
@@ -9696,6 +9718,19 @@ fn apply_setup_wizard_daemon_completion(
                 ));
                 return;
             }
+            if matches!(
+                wizard.run.descriptor().id,
+                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+            ) && let Err(error) =
+                cockpit_core::welcome::persist_onboarding_wizard_progress(&wizard.run)
+            {
+                wizard.status = Some(format!(
+                    "Setup was saved, but progress could not be checkpointed: {error}"
+                ));
+                return;
+            }
             if !changed {
                 "Global setup is already up to date.".to_string()
             } else if matches!(
@@ -9717,6 +9752,10 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
+            } else if wizard.run.descriptor().id
+                == cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+            {
+                "Saved the agent lifetime for future daemon acquisition.".to_string()
             } else {
                 "Saved global security settings through the daemon.".to_string()
             }
@@ -9752,7 +9791,18 @@ fn submit_setup_wizard_answer(
         status,
     } = state;
     match run.submit(answer) {
-        Ok(()) => sync_setup_wizard_inputs(run, inputs),
+        Ok(()) => {
+            if matches!(
+                run.descriptor().id,
+                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+            ) && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(run)
+            {
+                *status = Some(format!("Could not save setup progress: {error}"));
+            }
+            sync_setup_wizard_inputs(run, inputs);
+        }
         Err(error) => *status = Some(error),
     }
 }

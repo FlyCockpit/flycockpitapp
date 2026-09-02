@@ -23,6 +23,7 @@ pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
 pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
 pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
+pub const ONBOARDING_LIFETIME_WIZARD_ID: &str = "onboarding-lifetime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -249,6 +250,33 @@ impl WizardRun {
             run.submit(answer)
                 .map_err(|error| anyhow!("invalid wizard answer: {error}"))?;
         }
+        Ok(run)
+    }
+
+    /// Rebuild an interrupted run from the answers accepted before its current
+    /// step. Unlike daemon application, resume never infers an action answer:
+    /// durable mutations must be dispatched again and acknowledged normally.
+    pub fn resume_from_answers_json(descriptor: WizardDescriptor, json: &str) -> Result<Self> {
+        let mut answers: BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(json).context("deserializing wizard progress")?;
+        anyhow::ensure!(
+            !answers
+                .values()
+                .any(|answer| matches!(answer, WizardAnswer::Secret(_))),
+            "wizard progress contains a secret answer"
+        );
+        let mut run = Self::new(descriptor)?;
+        while let Some(step) = run.current_step() {
+            let Some(answer) = answers.remove(step.id) else {
+                break;
+            };
+            run.submit(answer)
+                .map_err(|error| anyhow!("invalid resumed wizard answer: {error}"))?;
+        }
+        anyhow::ensure!(
+            answers.is_empty(),
+            "wizard progress contains answers outside the active branch"
+        );
         Ok(run)
     }
 
@@ -542,6 +570,45 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 None,
             ),
         ],
+    }
+}
+
+/// One-time owner-lifetime choice. Persistent is pre-selected, but the user
+/// must explicitly continue through this screen before onboarding completes.
+pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
+    WizardDescriptor {
+        id: ONBOARDING_LIFETIME_WIZARD_ID,
+        title: "Background agents",
+        description: "Choose what happens after the last Cockpit window closes",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        steps: vec![
+            StepDescriptor {
+                id: "background-agents",
+                prompt: "Keep agents running in the background after I close all windows.",
+                help: "On keeps agents and sessions running so you can reattach later. Off uses an ephemeral lifetime: closing the last client stops agents and owned processes.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(true)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "lifetime-save",
+                "Save agent lifetime",
+                "Saving agent lifetime…",
+                None,
+            ),
+        ],
+    }
+}
+
+pub fn onboarding_background_agents_answer(run: &WizardRun) -> Option<bool> {
+    match run.answer("background-agents") {
+        Some(WizardAnswer::Confirm(value)) => Some(*value),
+        _ => None,
     }
 }
 
@@ -1592,8 +1659,8 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
 
 /// Shared action-step constructor. Provider-wizard actions pass an explicit
 /// branch (`saving` or `done`). Terminal save actions (`profile-save`,
-/// `security-save`, `model-save`) must pass `None` so they finish the wizard
-/// instead of branching into the provider `saving` step.
+/// `security-save`, `model-save`, `lifetime-save`) must pass `None` so they
+/// finish the wizard instead of branching into the provider `saving` step.
 fn action_step(
     id: &'static str,
     prompt: &'static str,
@@ -2315,6 +2382,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interrupted_onboarding_wizard_resumes_after_last_accepted_answer() {
+        let descriptor = onboarding_profile_descriptor();
+        let mut run = WizardRun::new(descriptor.clone()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+
+        let resumed =
+            WizardRun::resume_from_answers_json(descriptor, &run.answers_json().unwrap()).unwrap();
+
+        assert_eq!(resumed.current_step_id(), Some("profile-save"));
+        assert_eq!(
+            resumed.answer("name"),
+            Some(&WizardAnswer::Text("Ada".into()))
+        );
+    }
+
+    #[test]
+    fn onboarding_lifetime_requires_explicit_persistent_or_ephemeral_choice() {
+        let mut run = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        assert_eq!(run.current_step_id(), Some("background-agents"));
+        assert_eq!(run.prefill(), Some(WizardAnswer::Confirm(true)));
+
+        run.submit(WizardAnswer::Confirm(false)).unwrap();
+
+        assert_eq!(run.current_step_id(), Some("lifetime-save"));
+        assert_eq!(onboarding_background_agents_answer(&run), Some(false));
+    }
+
     /// Terminal profile-save must finish the wizard. Branching to a
     /// provider-wizard `saving` step is a hard submit error and stalls
     /// first-run at AwaitProfile.
@@ -2342,6 +2437,36 @@ mod tests {
         assert_eq!(
             onboarding_name_answer(&reconstructed).as_deref(),
             Some("Ada")
+        );
+    }
+
+    /// Terminal lifetime-save must finish the wizard the same way profile-save
+    /// does: the client omits the action from answers_json, and daemon replay
+    /// infers the acknowledgement.
+    #[test]
+    fn onboarding_lifetime_save_completes_without_a_saving_step() {
+        let mut live = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        live.submit(WizardAnswer::Confirm(false)).unwrap();
+        assert_eq!(live.current_step_id(), Some("lifetime-save"));
+        live.submit(WizardAnswer::Acknowledged)
+            .expect("lifetime-save is a terminal action");
+        assert!(live.is_complete());
+        assert_eq!(onboarding_background_agents_answer(&live), Some(false));
+
+        let mut client = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        client.submit(WizardAnswer::Confirm(false)).unwrap();
+        let json = client.answers_json().unwrap();
+        assert!(
+            !json.contains("lifetime-save"),
+            "the client acknowledges the save only after the daemon reply: {json}"
+        );
+
+        let reconstructed = WizardRun::from_answers_json(onboarding_lifetime_descriptor(), &json)
+            .expect("daemon reconstruction infers the terminal save acknowledgement");
+        assert!(reconstructed.is_complete());
+        assert_eq!(
+            onboarding_background_agents_answer(&reconstructed),
+            Some(false)
         );
     }
 

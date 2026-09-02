@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -191,6 +191,10 @@ impl ProcessContainmentHandle {
     }
 
     /// Await same-generation empty oracle.
+    ///
+    /// This is a probe: a delivered SIGKILL that has not yet drained returns
+    /// drain-in-progress Uncertain and keeps the live oracle. Callers that
+    /// need ProvenEmpty must use [`Self::await_empty_until`].
     pub async fn await_empty(
         &self,
         lease: ContainmentLease,
@@ -198,6 +202,33 @@ impl ProcessContainmentHandle {
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::AwaitEmpty { lease, reply })?;
         Self::await_reply(rx).await?
+    }
+
+    /// Re-probe [`Self::await_empty`] until ProvenEmpty, a terminal
+    /// (non-drain) outcome, or `deadline`.
+    ///
+    /// A delivered SIGKILL that has not yet drained
+    /// ([`EmptyOutcome::is_drain_in_progress`]) is retried. Terminal
+    /// Uncertain (unattributable membership, missing locator, forced
+    /// fixture) is returned immediately so fail-open paths do not wait
+    /// the full deadline.
+    pub async fn await_empty_until(
+        &self,
+        lease: ContainmentLease,
+        deadline: Duration,
+    ) -> Result<EmptyOutcome, ContainmentError> {
+        let until = Instant::now() + deadline;
+        loop {
+            let outcome = self.await_empty(lease.clone()).await?;
+            if !outcome.is_drain_in_progress() {
+                return Ok(outcome);
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Ok(outcome);
+            }
+            tokio::time::sleep((until - now).min(Duration::from_millis(5))).await;
+        }
     }
 
     /// Startup recovery for durable rows.
@@ -1062,44 +1093,60 @@ async fn finish_session_deletion(
 
 async fn await_all_empty(
     state: &mut ActorState,
-    _deadline: Option<Duration>,
+    deadline: Option<Duration>,
 ) -> Result<(), ContainmentError> {
-    let leases: Vec<_> = state
-        .live
-        .iter()
-        .filter(|(_, e)| e.record.state.is_nonempty())
-        .map(|(id, e)| ContainmentLease {
-            containment_id: *id,
-            session_id: e.record.session_id,
-            generation: e.record.generation,
-            guarantee: e.record.guarantee,
-            token: e.lease_token.clone(),
-        })
-        .collect();
-    for lease in leases {
-        let _ = terminate_one(state, lease.clone()).await;
-        match await_empty_one(state, lease).await? {
-            EmptyOutcome::ProvenEmpty { .. } => {}
-            EmptyOutcome::Uncertain { .. } | EmptyOutcome::Unsupported { .. } => {}
+    // A delivered SIGKILL may take longer than one adapter probe to drain.
+    // Re-poll until Empty or the caller deadline so shutdown has a bounded
+    // path to ProvenEmpty; the Unix adapter keeps the empty oracle after
+    // SIGKILL Uncertain (signal authority is already one-shot).
+    let until = deadline.map(|d| Instant::now() + d);
+    loop {
+        let leases: Vec<_> = state
+            .live
+            .iter()
+            .filter(|(_, e)| e.record.state.is_nonempty())
+            .map(|(id, e)| ContainmentLease {
+                containment_id: *id,
+                session_id: e.record.session_id,
+                generation: e.record.generation,
+                guarantee: e.record.guarantee,
+                token: e.lease_token.clone(),
+            })
+            .collect();
+        for lease in leases {
+            let _ = terminate_one(state, lease.clone()).await;
+            match await_empty_one(state, lease).await? {
+                EmptyOutcome::ProvenEmpty { .. } => {}
+                EmptyOutcome::Uncertain { .. } | EmptyOutcome::Unsupported { .. } => {}
+            }
         }
+        let nonempty = state
+            .db
+            .list_nonempty_execution_containments(None)
+            .await
+            .map_err(|e| ContainmentError::Internal(e.to_string()))?;
+        let live_nonempty: Vec<_> = state
+            .live
+            .iter()
+            .filter(|(_, e)| e.record.state.is_nonempty())
+            .map(|(id, _)| *id)
+            .collect();
+        if nonempty.is_empty() && live_nonempty.is_empty() {
+            return Ok(());
+        }
+        let Some(until) = until else {
+            let mut blockers: Vec<Uuid> = nonempty.iter().map(|r| r.containment_id).collect();
+            blockers.extend(live_nonempty);
+            return Err(ContainmentError::ShutdownNotClean { blockers });
+        };
+        let now = Instant::now();
+        if now >= until {
+            let mut blockers: Vec<Uuid> = nonempty.iter().map(|r| r.containment_id).collect();
+            blockers.extend(live_nonempty);
+            return Err(ContainmentError::ShutdownNotClean { blockers });
+        }
+        tokio::time::sleep((until - now).min(Duration::from_millis(5))).await;
     }
-    let nonempty = state
-        .db
-        .list_nonempty_execution_containments(None)
-        .await
-        .map_err(|e| ContainmentError::Internal(e.to_string()))?;
-    let live_nonempty: Vec<_> = state
-        .live
-        .iter()
-        .filter(|(_, e)| e.record.state.is_nonempty())
-        .map(|(id, _)| *id)
-        .collect();
-    if !nonempty.is_empty() || !live_nonempty.is_empty() {
-        let mut blockers: Vec<Uuid> = nonempty.iter().map(|r| r.containment_id).collect();
-        blockers.extend(live_nonempty);
-        return Err(ContainmentError::ShutdownNotClean { blockers });
-    }
-    Ok(())
 }
 
 async fn persist_insert(
@@ -1191,7 +1238,7 @@ pub fn default_host_adapter() -> SharedAdapter {
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(super::macos::MacosNativeAdapter)
+        Arc::new(super::macos::MacosNativeAdapter::production())
     }
     #[cfg(target_os = "windows")]
     {

@@ -163,7 +163,13 @@ async fn run_system_process(
             let status = match result {
                 Ok(value) => value,
                 Err(error) => {
+                    // Observation failure must not skip group SIGKILL: `child`
+                    // is `kill_on_drop` and is declared after the guard, so
+                    // returning here would reap the leader before Drop could
+                    // terminate. Signal while the pin still holds.
+                    let cleanup = terminate_process_tree(&mut child, child_pid, &containment).await;
                     abort_unjoined_pipe_readers(&mut read_stdout, false, &mut read_stderr, false).await;
+                    let _ = cleanup;
                     return Err(error.into());
                 }
             };

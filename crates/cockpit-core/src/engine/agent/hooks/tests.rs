@@ -4146,6 +4146,24 @@ async fn tool_hook_runner_uncertain_after_spawn_fails_open() {
 }
 
 #[tokio::test]
+async fn tool_hook_runner_drain_in_progress_then_empty_keeps_output() {
+    // A delivered SIGKILL that has not yet drained must not discard a
+    // completed hook's stdout: the barrier re-probes until ProvenEmpty.
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_drain_probes(3);
+    let stdout = r#"{"decision":"allow"}"#;
+    let (result, ran) = drive_contained_hook(Arc::new(fake.clone()), child_completed(stdout)).await;
+    assert!(ran, "the child ran under a proven lease");
+    assert_eq!(
+        result.failure_reason, None,
+        "drain-in-progress Uncertain must be retried until ProvenEmpty, not mapped to containment_failure"
+    );
+    assert_eq!(result.stdout, stdout);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!fake.terminate_log().is_empty());
+}
+
+#[tokio::test]
 async fn tool_hook_runner_actor_terminate_error_is_failed() {
     // A terminate/await actor error fails open as `descendant_containment_failed`.
     let fake = FakeProvenAdapter::new(PlatformKind::Fake);
@@ -4179,6 +4197,42 @@ fn externally_documented_hook_failure_reason_constants_are_stable() {
         REASON_LOCAL_KNOWLEDGE_WRITE_FENCE,
         "local_knowledge_write_fence"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_hook_runner_native_process_tree_guard_runs_body() {
+    // Production Linux/macOS adapters are ProcessTreeGuard-backed. A real
+    // `/bin/echo` child must run (the previous stub returned Unsupported
+    // before spawn, so user-configured hooks never executed).
+    let (db, sid) = db_session().await;
+    let actor = ProcessContainmentActor::start(
+        db.clone(),
+        crate::process_containment::default_host_adapter(),
+    );
+    let runner = TokioCommandRunner::with_optional_containment(Some(actor.handle()));
+    let out = runner
+        .run(
+            Path::new("/bin/echo"),
+            &["contained-hook".to_string()],
+            &BTreeMap::new(),
+            Path::new("/tmp"),
+            "",
+            Duration::from_secs(5),
+            sid,
+        )
+        .await;
+    assert_eq!(
+        out.failure_reason, None,
+        "native process-tree containment must run the hook body: {out:?}"
+    );
+    assert!(
+        out.stdout.contains("contained-hook"),
+        "hook stdout missing: {:?}",
+        out.stdout
+    );
+    assert_eq!(out.exit_code, Some(0));
+    assert!(!out.spawn_failed);
 }
 
 #[tokio::test]

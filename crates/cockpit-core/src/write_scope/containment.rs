@@ -227,7 +227,8 @@ impl ContainmentBarrier for ProcessContainmentBarrier {
             ));
         }
         // Allocation is not membership. Persist MembershipProven only after
-        // the actor observes kernel membership (empty Windows jobs fail closed).
+        // the actor observes kernel membership (empty Windows jobs and Unix
+        // process groups fail closed).
         self.handle
             .prove_membership(&lease)
             .await

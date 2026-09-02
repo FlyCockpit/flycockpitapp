@@ -1,13 +1,19 @@
 //! macOS native containment adapter.
 //!
-//! Current supported macOS APIs provide no unprivileged kernel object that both
-//! captures arbitrary reparented/session-escaping descendants and proves the set
-//! empty. This adapter therefore returns Unsupported for Proven workflows.
+//! Backed by [`cockpit_host::process::ProcessTreeGuard`]: a fresh process
+//! group prepared before spawn. The adapter allocates that guard and never
+//! runs `req.program`. Callers spawn into the returned guard with
+//! `process_group(0)`, prove membership with `getpgid` / `kill(-pgid, 0)`,
+//! then terminate the group. This adapter never fabricates Proven from
+//! kqueue, libproc polling, inherited-FD sentinels, launchd heuristics, or
+//! shell syntax inspection.
 //!
-//! Process-group, kqueue, libproc polling, inherited-FD sentinels, launchd
-//! heuristics, and shell syntax inspection are never labeled Proven.
+//! Off-macOS hosts return Unsupported.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use cockpit_host::process::ProcessTreeGuard;
 
 use super::adapter::{
     AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
@@ -17,150 +23,191 @@ use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
     SafeLocator,
 };
+use super::unix::{UnixHost, UnixProcessTreeAdapter, impl_unix_host_adapter};
 
+/// Historical fail-open reason used by injectable Unsupported fixtures.
 pub const MACOS_UNSUPPORTED_REASON: &str = "macos_no_unprivileged_descendant_container";
 
-pub struct MacosNativeAdapter;
+pub use super::unix::{
+    MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST, PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN,
+};
+
+/// macOS native adapter: [`ProcessTreeGuard`] on macOS, Unsupported elsewhere.
+pub struct MacosNativeAdapter(UnixProcessTreeAdapter);
 
 impl Default for MacosNativeAdapter {
     fn default() -> Self {
-        Self
+        Self::production()
     }
 }
 
-#[async_trait]
-impl ContainmentAdapter for MacosNativeAdapter {
-    fn platform_kind(&self) -> PlatformKind {
-        PlatformKind::MacosUnsupported
+impl MacosNativeAdapter {
+    pub fn production() -> Self {
+        Self(UnixProcessTreeAdapter::new(UnixHost::Macos))
     }
 
-    fn guarantee(&self) -> ContainmentGuarantee {
-        ContainmentGuarantee::Unsupported
+    #[cfg(test)]
+    pub fn close_handles(&self, handle: &AdapterHandle) {
+        self.0.close_handles(handle);
     }
 
-    fn safe_metadata(&self) -> SafeContainmentMetadata {
-        SafeContainmentMetadata {
-            platform_kind: PlatformKind::MacosUnsupported,
-            guarantee: ContainmentGuarantee::Unsupported,
-            capability_reason: Some(MACOS_UNSUPPORTED_REASON.into()),
-            adapter_name: "macos_native_unsupported".into(),
-            management_boundary: None,
+    #[cfg(test)]
+    pub fn order(&self) -> Vec<&'static str> {
+        self.0.order()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn live_group_count(&self) -> usize {
+        self.0.live_group_count()
+    }
+}
+
+impl_unix_host_adapter!(MacosNativeAdapter);
+
+#[cfg(test)]
+mod macos_process_tree_guard {
+    #[cfg(target_os = "macos")]
+    use super::super::types::PROCESS_GROUP_STILL_POPULATED;
+    use super::*;
+
+    fn sleeper_request(generation: u64) -> NativeSpawnRequest {
+        NativeSpawnRequest {
+            containment_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            operation_id: "op".into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            cwd: "/tmp".into(),
+            require_proven: true,
         }
     }
 
-    async fn probe(&self) -> Result<SafeContainmentMetadata, ContainmentError> {
-        Ok(self.safe_metadata())
-    }
-
-    async fn create_and_spawn(
-        &self,
-        req: NativeSpawnRequest,
-    ) -> Result<AllocatedContainment, ContainmentError> {
-        // Fail before child creation / delegated child records.
-        let _ = req;
-        Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: MACOS_UNSUPPORTED_REASON.into(),
-        })
-    }
-
-    async fn prove_membership(
-        &self,
-        _handle: &AdapterHandle,
-        _generation: u64,
-    ) -> Result<(), ContainmentError> {
-        Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: MACOS_UNSUPPORTED_REASON.into(),
-        })
-    }
-
-    async fn create_container_and_exec(
-        &self,
-        _req: ContainerExecRequest,
-    ) -> Result<AllocatedContainment, ContainmentError> {
-        // Container path is a distinct adapter; native macOS does not implement it.
-        Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: "macos_native_is_not_container_adapter".into(),
-        })
-    }
-
-    async fn terminate(
-        &self,
-        _handle: &AdapterHandle,
-        _generation: u64,
-    ) -> Result<(), ContainmentError> {
-        Ok(())
-    }
-
-    async fn await_empty(
-        &self,
-        _handle: &AdapterHandle,
-        _generation: u64,
-    ) -> Result<EmptyOutcome, ContainmentError> {
-        Ok(EmptyOutcome::Unsupported {
-            reason: MACOS_UNSUPPORTED_REASON.into(),
-        })
-    }
-
-    async fn recover(
-        &self,
-        _locator: &SafeLocator,
-        _generation: u64,
-    ) -> Result<EmptyOutcome, ContainmentError> {
-        Ok(EmptyOutcome::Unsupported {
-            reason: MACOS_UNSUPPORTED_REASON.into(),
-        })
-    }
-}
-
-/// Heuristics that must never advertise Proven.
-#[allow(dead_code)]
-pub fn forbidden_proven_heuristics() -> &'static [&'static str] {
-    &[
-        "process_group",
-        "kqueue",
-        "libproc_polling",
-        "inherited_fd_sentinel",
-        "launchd_heuristic",
-        "shell_syntax_inspection",
-    ]
-}
-
-#[cfg(test)]
-mod macos_proven_containment_is_honestly_unsupported {
-    use super::*;
-
+    #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn strict_native_fails_before_user_code() {
-        let adapter = MacosNativeAdapter;
-        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Unsupported);
-        let err = adapter
+    async fn create_and_spawn_allocates_guard_without_running_user_code() {
+        use std::process::Stdio;
+
+        let adapter = MacosNativeAdapter::production();
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Proven);
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        assert_eq!(allocated.guarantee, ContainmentGuarantee::Proven);
+        assert!(adapter.order().contains(&"allocate_process_tree_guard"));
+
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated process-tree guard");
+        assert!(
+            !tree.group_is_bound(),
+            "lease creation must not place a process"
+        );
+        match adapter
+            .prove_membership(&allocated.handle, 1)
+            .await
+            .unwrap_err()
+        {
+            ContainmentError::DescendantContainmentUnavailable { reason } => {
+                assert_eq!(reason, PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN);
+            }
+            o => panic!("{o:?}"),
+        }
+
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        tree.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn process-group child");
+        tree.assign(&child)
+            .expect("record process-group membership");
+        adapter
+            .prove_membership(&allocated.handle, 1)
+            .await
+            .expect("kernel membership after assign");
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { reason, .. } => {
+                assert_eq!(reason, PROCESS_GROUP_STILL_POPULATED);
+            }
+            o => panic!("live group must not fabricate empty: {o:?}"),
+        }
+        tree.resume(&child).expect("unix resume is a no-op");
+
+        adapter.terminate(&allocated.handle, 1).await.unwrap();
+        let _ = child.wait().await;
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(
+            adapter.live_group_count(),
+            0,
+            "ProvenEmpty must reclaim the process-group guard"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn create_and_spawn_ignores_missing_user_program() {
+        let adapter = MacosNativeAdapter::production();
+        let allocated = adapter
             .create_and_spawn(NativeSpawnRequest {
                 containment_id: uuid::Uuid::new_v4(),
                 session_id: uuid::Uuid::new_v4(),
                 generation: 1,
                 operation_id: "op".into(),
-                program: "/bin/echo".into(),
-                args: vec!["hello".into()],
+                program: "/cockpit_missing_process_tree_probe".into(),
+                args: vec![],
                 cwd: "/tmp".into(),
                 require_proven: true,
             })
             .await
+            .expect("missing program must not be spawned at lease creation");
+        assert_eq!(allocated.guarantee, ContainmentGuarantee::Proven);
+        adapter.close_handles(&allocated.handle);
+        assert_eq!(adapter.live_group_count(), 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn production_adapter_is_unsupported_off_macos() {
+        let adapter = MacosNativeAdapter::production();
+        assert_eq!(adapter.guarantee(), ContainmentGuarantee::Unsupported);
+        assert_eq!(
+            adapter.safe_metadata().capability_reason.as_deref(),
+            Some(MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST)
+        );
+        let err = adapter
+            .create_and_spawn(sleeper_request(1))
+            .await
             .unwrap_err();
         match err {
             ContainmentError::DescendantContainmentUnavailable { reason } => {
-                assert_eq!(reason, MACOS_UNSUPPORTED_REASON);
+                assert_eq!(reason, MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST);
             }
             o => panic!("{o:?}"),
         }
     }
 
     #[test]
-    fn no_heuristic_backend_advertises_proven() {
-        for h in forbidden_proven_heuristics() {
-            assert_ne!(*h, "proven");
+    fn production_metadata_names_the_process_tree_guard() {
+        let meta = MacosNativeAdapter::production().safe_metadata();
+        assert_eq!(meta.adapter_name, "macos_process_tree_guard");
+        assert_eq!(
+            meta.management_boundary.as_deref(),
+            Some("unix_process_group")
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(meta.guarantee, ContainmentGuarantee::Proven);
+            assert_eq!(meta.platform_kind, PlatformKind::MacosProcessGroup);
         }
-        let meta = MacosNativeAdapter.safe_metadata();
-        assert_eq!(meta.guarantee, ContainmentGuarantee::Unsupported);
-        assert!(meta.capability_reason.is_some());
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(meta.guarantee, ContainmentGuarantee::Unsupported);
+            assert_eq!(meta.platform_kind, PlatformKind::MacosProcessGroup);
+            assert!(meta.capability_reason.is_some());
+        }
     }
 }

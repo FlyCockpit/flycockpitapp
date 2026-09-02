@@ -127,7 +127,7 @@ pub trait ContainmentAdapter: Send + Sync + 'static {
     ) -> Result<EmptyOutcome, ContainmentError>;
 
     /// Kernel job/group object the caller must spawn into. `None` on adapters
-    /// that do not own a bindable object (fakes, macOS, Linux-without-broker).
+    /// that do not own a bindable object (fakes, container).
     fn process_tree_guard(&self, handle: &AdapterHandle) -> Option<Arc<ProcessTreeGuard>> {
         let _ = handle;
         None

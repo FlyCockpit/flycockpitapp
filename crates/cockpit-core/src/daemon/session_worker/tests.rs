@@ -1794,6 +1794,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                         // `AgentIdle` under the same id, and the daemon
                         // schedulers must never read those as completion.
                         proto::Event::AgentIdle {
+                            session_id: _,
                             turn_id: Some(turn_id),
                             reason:
                                 crate::engine::IdleReason::Completed

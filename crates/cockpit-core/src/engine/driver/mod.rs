@@ -9146,11 +9146,6 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        let client_submission_ids = submission
-            .client_submissions
-            .iter()
-            .map(|receipt| receipt.id)
-            .collect();
         if !self
             .record_terminal_client_submissions(
                 &submission.client_submissions,
@@ -9192,10 +9187,17 @@ impl Driver {
         // `current_lifecycle_turn_completed` — and would silence the driving
         // turn's own truthful idle at the boundary. Only the idle boundary
         // publishes the driving turn's settlement (#275).
-        let retraction_turn_id = client_submission_ids.first().copied();
+        let retraction_turn_id = submission
+            .client_submissions
+            .first()
+            .map(|receipt| receipt.id);
         let _ = tx
             .send(TurnEvent::UserMessageRetracted {
-                client_submission_ids,
+                client_submission_ids: submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id)
+                    .collect(),
             })
             .await;
         self.emit_context_projection(tx).await;

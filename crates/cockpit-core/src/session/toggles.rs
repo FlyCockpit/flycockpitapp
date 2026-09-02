@@ -548,7 +548,8 @@ mod tests {
             mutating_session
                 .mutate_monty_session_network_grants(
                     crate::mcp::network::SessionNetworkMutation::GrantHost(
-                        "api.example.test".to_string(),
+                        crate::db::monty_network::CanonicalNetworkHost::parse("api.example.test")
+                            .unwrap(),
                     ),
                 )
                 .await

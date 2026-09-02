@@ -1051,7 +1051,7 @@ pub struct VnextAgentDef {
         default,
         skip_serializing_if = "BTreeSet::is_empty"
     )]
-    pub requested_network_hosts: BTreeSet<String>,
+    pub requested_network_hosts: BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
     /// Author preference for the governed `requests` facade. Like tool-tier
     /// preferences, this can request placement but cannot grant the package.
     #[serde(
@@ -1064,19 +1064,6 @@ pub struct VnextAgentDef {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-fn validate_requested_network_host(host: &str) -> Result<()> {
-    if host.is_empty()
-        || host.len() > 253
-        || host != host.to_ascii_lowercase()
-        || host
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
-    {
-        bail!("requestedNetworkHosts contains non-canonical host `{host}`");
-    }
-    Ok(())
 }
 
 impl VnextAgentDef {
@@ -1134,9 +1121,6 @@ impl VnextAgentDef {
         if self.requested_network_hosts.len() > 64 {
             bail!("requestedNetworkHosts may contain at most 64 hosts");
         }
-        for host in &self.requested_network_hosts {
-            validate_requested_network_host(host)?;
-        }
         Ok(())
     }
 
@@ -1152,7 +1136,9 @@ impl VnextAgentDef {
     /// Safe prompt-prefill data only. Callers must route any accepted host
     /// through the explicit user-action grant APIs; this accessor is not an
     /// authority projection.
-    pub fn requested_network_hosts(&self) -> &BTreeSet<String> {
+    pub fn requested_network_hosts(
+        &self,
+    ) -> &BTreeSet<crate::db::monty_network::CanonicalNetworkHost> {
         &self.requested_network_hosts
     }
 

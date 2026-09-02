@@ -9,11 +9,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use futures::StreamExt as _;
 use serde_json::Value;
 
 use super::builtin::HostContext;
+use crate::db::monty_network::CanonicalNetworkHost;
 
 pub const SAFE_STDLIB_PACKAGES: &[&str] = &[
     "json",
@@ -32,21 +33,21 @@ const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionNetworkMutation {
-    GrantHost(String),
-    RevokeHost(String),
+    GrantHost(CanonicalNetworkHost),
+    RevokeHost(CanonicalNetworkHost),
     RevokeAllHosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionNetworkGrantSnapshot {
     pub generation: u64,
-    pub hosts: BTreeSet<String>,
+    pub hosts: BTreeSet<CanonicalNetworkHost>,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionNetworkGrants {
     generation: u64,
-    hosts: BTreeSet<String>,
+    hosts: BTreeSet<CanonicalNetworkHost>,
 }
 
 impl SessionNetworkGrants {
@@ -56,11 +57,9 @@ impl SessionNetworkGrants {
     ) -> Result<SessionNetworkGrantSnapshot> {
         match mutation {
             SessionNetworkMutation::GrantHost(host) => {
-                validate_canonical_host(&host)?;
                 self.hosts.insert(host);
             }
             SessionNetworkMutation::RevokeHost(host) => {
-                validate_canonical_host(&host)?;
                 self.hosts.remove(&host);
             }
             SessionNetworkMutation::RevokeAllHosts => self.hosts.clear(),
@@ -79,7 +78,7 @@ impl SessionNetworkGrants {
         }
     }
 
-    pub fn fence_allows(&self, expected_generation: u64, host: &str) -> bool {
+    pub fn fence_allows(&self, expected_generation: u64, host: &CanonicalNetworkHost) -> bool {
         self.generation == expected_generation && self.hosts.contains(host)
     }
 }
@@ -88,47 +87,30 @@ impl SessionNetworkGrants {
 pub struct EffectiveNetworkPolicy {
     agent_generation: u64,
     session_generation: u64,
-    agent_hosts: BTreeSet<String>,
-    session_hosts: BTreeSet<String>,
+    agent_hosts: BTreeSet<CanonicalNetworkHost>,
+    session_hosts: BTreeSet<CanonicalNetworkHost>,
     pub requests_enabled: bool,
     pub approval_required: bool,
 }
 
 impl EffectiveNetworkPolicy {
-    pub fn permits(&self, host: &str) -> bool {
+    pub fn permits(&self, host: &CanonicalNetworkHost) -> bool {
         self.requests_enabled
             && (self.agent_hosts.contains(host) || self.session_hosts.contains(host))
     }
 }
 
 pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPolicy> {
-    if let Some(denial) = host.builtin_registry.monty_network_denial() {
-        bail!(
-            "{}",
-            denial["message"]
-                .as_str()
-                .unwrap_or("fork network capability denied")
-        );
-    }
-    let ctx = host
-        .native_tool_ctx
-        .as_ref()
-        .context("governed network requires a live agent context")?;
-    let agent_instance_id = ctx
-        .agent_instance_id
-        .context("governed network requires a daemon-owned agent instance")?;
-    let agent = ctx
-        .session
-        .db
-        .monty_network_agent_policy(agent_instance_id)
-        .await?;
-    let session = ctx.session.monty_session_network_grant_snapshot();
+    let capability = host.effective_network_capability().await?;
+    let requests_enabled = capability.requests_enabled();
+    let agent = capability.agent_policy;
+    let session = capability.session_policy;
     Ok(EffectiveNetworkPolicy {
         agent_generation: agent.generation,
         session_generation: session.generation,
         agent_hosts: agent.hosts,
         session_hosts: session.hosts,
-        requests_enabled: agent.requests_enabled,
+        requests_enabled,
         approval_required: agent.approval_required,
     })
 }
@@ -219,7 +201,7 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     let agent_instance_id = ctx
         .agent_instance_id
         .context("governed network requires a daemon-owned agent instance")?;
-    let request = request.redact_fully(&ctx.redact)?;
+    let mut request = request.redact_fully(&ctx.redact)?;
     ensure!(
         request.visited_fields == request.expected_fields,
         "governed request redaction proof is incomplete"
@@ -228,6 +210,9 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         !has_caller_supplied_host_header(&request.headers),
         "redacted governed request contains a forbidden Host header"
     );
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .context("invalid governed request method")?;
+    request.method = method.as_str().to_string();
     let url = reqwest::Url::parse(&request.url).context("invalid governed request URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -237,15 +222,33 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         url.username().is_empty() && url.password().is_none(),
         "URL userinfo is forbidden"
     );
-    let destination = url
-        .host_str()
-        .context("governed request URL has no host")?
-        .to_ascii_lowercase();
+    request.url = url.to_string();
+    let mut canonical_headers = BTreeMap::new();
+    for (name, value) in &request.headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        let value = reqwest::header::HeaderValue::from_str(value)?;
+        ensure!(
+            canonical_headers
+                .insert(name.as_str().to_string(), value.to_str()?.to_string())
+                .is_none(),
+            "duplicate governed request header after canonicalization"
+        );
+    }
+    request.headers = canonical_headers;
+    let destination =
+        CanonicalNetworkHost::parse(url.host_str().context("governed request URL has no host")?)?;
     ensure!(
         policy.permits(&destination),
         "network host `{destination}` is not user-granted"
     );
 
+    let approval_input = serde_json::json!({
+        "method": &request.method,
+        "url": &request.url,
+        "headers": &request.headers,
+        "body": &request.body,
+        "destination": &destination,
+    });
     if policy.approval_required {
         let approver = ctx
             .approver
@@ -253,13 +256,14 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
             .context("network policy requires approval but no approver is attached")?;
         let label = format!("Monty {} request to {destination}", request.method);
         ensure!(
-            approver.approve_tool_call(&label).await?.is_allowed(),
+            approver
+                .approve_monty_network_egress(&label, &approval_input)
+                .await?
+                .is_allowed(),
             "network request was not approved"
         );
     }
 
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .context("invalid governed request method")?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -298,6 +302,12 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
                     || current_session_policy.hosts.contains(&destination)),
             "network grant changed before dispatch; request refused"
         );
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "monty_network_egress",
+            &[serde_json::json!({"execute": {"wire_input": approval_input}})],
+        )
+        .await
+        .context("network request approval became stale")?;
         builder
             .send()
             .await
@@ -339,19 +349,6 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     }))
 }
 
-fn validate_canonical_host(host: &str) -> Result<()> {
-    if host.is_empty()
-        || host.len() > 253
-        || host != host.to_ascii_lowercase()
-        || host
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | ':'))
-    {
-        bail!("network grant host is not canonical");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,24 +356,21 @@ mod tests {
     #[test]
     fn session_grants_are_deny_by_default_and_generation_fenced() {
         let mut grants = SessionNetworkGrants::default();
+        let host = CanonicalNetworkHost::parse("api.example.test").unwrap();
         let initial = grants.snapshot();
         assert!(initial.hosts.is_empty());
-        assert!(!grants.fence_allows(initial.generation, "api.example.test"));
+        assert!(!grants.fence_allows(initial.generation, &host));
 
         let granted = grants
-            .apply(SessionNetworkMutation::GrantHost(
-                "api.example.test".to_string(),
-            ))
+            .apply(SessionNetworkMutation::GrantHost(host.clone()))
             .unwrap();
-        assert!(grants.fence_allows(granted.generation, "api.example.test"));
+        assert!(grants.fence_allows(granted.generation, &host));
 
         let revoked = grants
-            .apply(SessionNetworkMutation::RevokeHost(
-                "api.example.test".to_string(),
-            ))
+            .apply(SessionNetworkMutation::RevokeHost(host.clone()))
             .unwrap();
-        assert!(!grants.fence_allows(granted.generation, "api.example.test"));
-        assert!(!grants.fence_allows(revoked.generation, "api.example.test"));
+        assert!(!grants.fence_allows(granted.generation, &host));
+        assert!(!grants.fence_allows(revoked.generation, &host));
     }
 
     #[test]
@@ -469,8 +463,9 @@ mod tests {
 
     #[test]
     fn canonical_host_validation_rejects_url_shaped_grants() {
-        assert!(validate_canonical_host("api.example.test").is_ok());
-        assert!(validate_canonical_host("https://api.example.test").is_err());
-        assert!(validate_canonical_host("API.example.test").is_err());
+        assert!(CanonicalNetworkHost::parse("api.example.test").is_ok());
+        assert!(CanonicalNetworkHost::parse("https://api.example.test").is_err());
+        assert!(CanonicalNetworkHost::parse("API.example.test").is_err());
+        assert!(CanonicalNetworkHost::parse("api.example.test:443").is_err());
     }
 }

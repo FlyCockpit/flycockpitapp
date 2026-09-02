@@ -433,12 +433,12 @@ pub(crate) async fn turn_toolbox(
     // at the turn construction seam so delegated frames cannot inherit the
     // root session's advertised package set.
     if toolbox.names().contains(&"mcp") {
+        let registry = toolbox.mcp_builtin_registry_for_context(&agent.name);
         let requests_enabled = match current_agent_instance_id() {
-            Some(agent_instance_id) => session
-                .db
-                .monty_network_agent_policy(agent_instance_id)
+            Some(agent_instance_id) => registry
+                .effective_network_capability_for(session, agent_instance_id)
                 .await
-                .map(|policy| policy.requests_enabled)
+                .map(|capability| capability.requests_enabled())
                 .unwrap_or(false),
             None => false,
         };

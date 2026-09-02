@@ -323,6 +323,13 @@ pub enum AuthorizationRequest<'a> {
         /// Canonical, daemon-owned description of the exact policy mutation.
         input: &'a serde_json::Value,
     },
+    /// Approval for one exact, already-redacted Monty HTTP request. This is
+    /// distinct from generic native-tool approval so the durable operation
+    /// binds the transport method, URL, headers, body, and destination.
+    MontyNetworkEgress {
+        label: &'a str,
+        input: &'a serde_json::Value,
+    },
     ExternalMcpTool {
         agent: &'a str,
         profile: &'a str,
@@ -618,6 +625,9 @@ impl Approver {
             AuthorizationRequest::OwnerNetworkConfiguration { label, input } => {
                 self.approve_owner_network_configuration_inner(label, input)
                     .await
+            }
+            AuthorizationRequest::MontyNetworkEgress { label, input } => {
+                self.approve_monty_network_egress_inner(label, input).await
             }
             AuthorizationRequest::ExternalMcpTool {
                 agent,

@@ -6,9 +6,60 @@
 
 use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 use super::Db;
+
+/// Canonical host authority shared by authored requests, session grants,
+/// durable grants, and URL-derived destinations. Ports, URL syntax, userinfo,
+/// and mixed-case spellings are never host authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalNetworkHost(String);
+
+impl CanonicalNetworkHost {
+    pub fn parse(host: &str) -> Result<Self> {
+        if host.is_empty()
+            || host.len() > 253
+            || host != host.to_ascii_lowercase()
+            || host
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | ':'))
+        {
+            bail!("network host is not canonical");
+        }
+        Ok(Self(host.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalNetworkHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for CanonicalNetworkHost {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalNetworkHost {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let host = String::deserialize(deserializer)?;
+        Self::parse(&host).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MontyNetworkAgentPolicy {
@@ -16,7 +67,7 @@ pub struct MontyNetworkAgentPolicy {
     pub requests_enabled: bool,
     pub approval_required: bool,
     pub generation: u64,
-    pub hosts: std::collections::BTreeSet<String>,
+    pub hosts: std::collections::BTreeSet<CanonicalNetworkHost>,
 }
 
 impl MontyNetworkAgentPolicy {
@@ -30,7 +81,7 @@ impl MontyNetworkAgentPolicy {
         }
     }
 
-    pub fn permits(&self, host: &str) -> bool {
+    pub fn permits(&self, host: &CanonicalNetworkHost) -> bool {
         self.requests_enabled && self.hosts.contains(host)
     }
 }
@@ -39,8 +90,8 @@ impl MontyNetworkAgentPolicy {
 pub enum MontyNetworkAgentMutation {
     SetRequestsEnabled(bool),
     SetApprovalRequired(bool),
-    GrantHost(String),
-    RevokeHost(String),
+    GrantHost(CanonicalNetworkHost),
+    RevokeHost(CanonicalNetworkHost),
     RevokeAllHosts,
 }
 
@@ -67,7 +118,8 @@ fn read_policy(
     )?;
     let hosts = statement
         .query_map([&agent_instance_id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+        .map(|host| CanonicalNetworkHost::parse(&host?))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
     Ok(MontyNetworkAgentPolicy {
         agent_instance_id: Uuid::parse_str(&agent_instance_id)?,
         requests_enabled,
@@ -119,17 +171,15 @@ impl Db {
                     )?;
                 }
                 MontyNetworkAgentMutation::GrantHost(host) => {
-                    validate_canonical_host(&host)?;
                     conn.execute(
                         "INSERT INTO monty_network_agent_grants(agent_instance_id,host,granted_at_unix_ms) VALUES(?1,?2,?3) ON CONFLICT(agent_instance_id,host) DO UPDATE SET granted_at_unix_ms=excluded.granted_at_unix_ms",
-                        params![agent_instance_id, host, now_unix_ms],
+                        params![agent_instance_id, host.as_str(), now_unix_ms],
                     )?;
                 }
                 MontyNetworkAgentMutation::RevokeHost(host) => {
-                    validate_canonical_host(&host)?;
                     conn.execute(
                         "DELETE FROM monty_network_agent_grants WHERE agent_instance_id=?1 AND host=?2",
-                        params![agent_instance_id, host],
+                        params![agent_instance_id, host.as_str()],
                     )?;
                 }
                 MontyNetworkAgentMutation::RevokeAllHosts => {
@@ -167,19 +217,6 @@ impl Db {
     }
 }
 
-fn validate_canonical_host(host: &str) -> Result<()> {
-    if host.is_empty()
-        || host.len() > 253
-        || host != host.to_ascii_lowercase()
-        || host
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | ':'))
-    {
-        bail!("network grant host is not canonical");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,13 +243,15 @@ mod tests {
         let granted = db
             .mutate_monty_network_agent_policy(
                 agent_instance_id,
-                MontyNetworkAgentMutation::GrantHost("api.example.test".to_string()),
+                MontyNetworkAgentMutation::GrantHost(
+                    CanonicalNetworkHost::parse("api.example.test").unwrap(),
+                ),
                 11,
             )
             .await
             .unwrap();
         assert!(granted.generation > enabled.generation);
-        assert!(granted.permits("api.example.test"));
+        assert!(granted.permits(&CanonicalNetworkHost::parse("api.example.test").unwrap()));
         assert!(
             db.monty_network_agent_fence_is_current(agent_instance_id, granted.generation)
                 .await
@@ -222,13 +261,15 @@ mod tests {
         let revoked = db
             .mutate_monty_network_agent_policy(
                 agent_instance_id,
-                MontyNetworkAgentMutation::RevokeHost("api.example.test".to_string()),
+                MontyNetworkAgentMutation::RevokeHost(
+                    CanonicalNetworkHost::parse("api.example.test").unwrap(),
+                ),
                 12,
             )
             .await
             .unwrap();
         assert!(revoked.generation > granted.generation);
-        assert!(!revoked.permits("api.example.test"));
+        assert!(!revoked.permits(&CanonicalNetworkHost::parse("api.example.test").unwrap()));
         assert!(
             !db.monty_network_agent_fence_is_current(agent_instance_id, granted.generation)
                 .await

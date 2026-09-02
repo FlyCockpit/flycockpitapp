@@ -40,6 +40,18 @@ use crate::{
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
 const DEFAULT_CHILD_EVENT_CAP: usize = 50;
 
+#[derive(Debug, Clone)]
+pub struct EffectiveNetworkCapability {
+    pub agent_policy: crate::db::monty_network::MontyNetworkAgentPolicy,
+    pub session_policy: crate::mcp::network::SessionNetworkGrantSnapshot,
+}
+
+impl EffectiveNetworkCapability {
+    pub fn requests_enabled(&self) -> bool {
+        self.agent_policy.requests_enabled
+    }
+}
+
 #[derive(Clone)]
 pub struct HostContext {
     #[allow(dead_code)]
@@ -77,6 +89,21 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// One registry-owned network decision used by package exposure, model
+    /// advertisement, policy mutation, and transport egress.
+    pub async fn effective_network_capability(&self) -> Result<EffectiveNetworkCapability> {
+        let ctx = self
+            .native_tool_ctx
+            .as_ref()
+            .context("governed network requires a live agent context")?;
+        let agent_instance_id = ctx
+            .agent_instance_id
+            .context("governed network requires a daemon-owned agent instance")?;
+        self.builtin_registry
+            .effective_network_capability_for(&ctx.session, agent_instance_id)
+            .await
+    }
+
     pub fn from_tool_ctx(ctx: &ToolCtx) -> Self {
         let child_events = ctx.current_tool_call_id.as_ref().map(|parent_call_id| {
             McpChildEventRecorder::new(
@@ -878,6 +905,28 @@ pub struct BuiltinRegistry {
 }
 
 impl BuiltinRegistry {
+    pub(crate) async fn effective_network_capability_for(
+        &self,
+        session: &crate::session::Session,
+        agent_instance_id: Uuid,
+    ) -> Result<EffectiveNetworkCapability> {
+        if let Some(denial) = self.monty_network_denial() {
+            bail!(
+                "{}",
+                denial["message"]
+                    .as_str()
+                    .unwrap_or("scoped network capability denied")
+            );
+        }
+        Ok(EffectiveNetworkCapability {
+            agent_policy: session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await?,
+            session_policy: session.monty_session_network_grant_snapshot(),
+        })
+    }
+
     fn new(funcs: Vec<BuiltinFunction>) -> Self {
         let funcs = funcs
             .into_iter()

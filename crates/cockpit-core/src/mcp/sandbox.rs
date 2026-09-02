@@ -120,16 +120,11 @@ pub async fn run_envelope_with_host(
     cfg: &McpConfig,
     host: &HostContext,
 ) -> Result<ProjectionEnvelope> {
-    let requests_enabled = if host.native_tool_ctx.is_some()
-        && host.builtin_registry.monty_network_denial().is_none()
-    {
-        super::network::effective_policy(host)
-            .await
-            .map(|policy| policy.requests_enabled)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let requests_enabled = host
+        .effective_network_capability()
+        .await
+        .map(|capability| capability.requests_enabled())
+        .unwrap_or(false);
     let mut input_names = vec![
         "mcp".to_string(),
         "csv".to_string(),
@@ -222,10 +217,16 @@ pub async fn run_envelope_with_host(
                 };
                 let ext = match result {
                     Ok(obj) => ExtFunctionResult::Return(obj),
-                    Err(msg) => ExtFunctionResult::Error(MontyException::new(
-                        ExcType::ValueError,
-                        Some(msg),
-                    )),
+                    Err(msg) => {
+                        let msg = scrub_host_error_for_sandbox(host, &msg).unwrap_or_else(|_| {
+                            "host call failed and its error could not be safely redacted"
+                                .to_string()
+                        });
+                        ExtFunctionResult::Error(MontyException::new(
+                            ExcType::ValueError,
+                            Some(msg),
+                        ))
+                    }
                 };
                 progress = match call.resume(ext, PrintWriter::CollectString(&mut stdout)) {
                     Ok(progress) => progress,
@@ -501,14 +502,15 @@ async fn dispatch(
     match name {
         "request" | "get" | "post" | "put" | "patch" | "delete" => {
             let request = governed_request_from_monty(name, args, kwargs)?;
-            super::network::dispatch(host, request)
+            let response = super::network::dispatch(host, request)
                 .await
-                .map(response_to_monty)
-                .map_err(|error| format!("requests.{name} failed: {error:#}"))
+                .map_err(|error| format!("requests.{name} failed: {error:#}"))?;
+            scrub_host_value_for_sandbox(host, response).map(response_to_monty)
         }
-        "network_configure" => configure_network_policy(host, args, kwargs)
-            .await
-            .map(|value| json_to_monty(&value)),
+        "network_configure" => {
+            let value = configure_network_policy(host, args, kwargs).await?;
+            scrub_host_value_for_sandbox(host, value).map(|value| json_to_monty(&value))
+        }
         "reader" | "writer" | "mean" | "median" | "wrap" | "fill" | "dedent" | "b64encode"
         | "b64decode" | "sha256" | "sha512" => dispatch_pure_host_module(name, args, kwargs),
         "search" => {
@@ -528,7 +530,8 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 let hits = super::catalog::search(cfg, host, &query).await;
-                Ok((hits_to_monty(&hits), hits_to_json(&hits)))
+                let value = scrub_host_value_for_sandbox(host, hits_to_json(&hits))?;
+                Ok((json_to_monty(&value), value))
             })
             .await
         }
@@ -543,7 +546,10 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::grep_tool_names(cfg, host, &pattern).await {
-                    Ok(hits) => Ok((hits_to_monty(&hits), hits_to_json(&hits))),
+                    Ok(hits) => {
+                        let value = scrub_host_value_for_sandbox(host, hits_to_json(&hits))?;
+                        Ok((json_to_monty(&value), value))
+                    }
                     Err(e) => Err(e),
                 }
             })
@@ -560,10 +566,11 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::grep_tool_definitions(cfg, host, &pattern).await {
-                    Ok(hits) => Ok((
-                        definition_hits_to_monty(&hits),
-                        definition_hits_to_json(&hits),
-                    )),
+                    Ok(hits) => {
+                        let value =
+                            scrub_host_value_for_sandbox(host, definition_hits_to_json(&hits))?;
+                        Ok((json_to_monty(&value), value))
+                    }
                     Err(e) => Err(e),
                 }
             })
@@ -584,10 +591,11 @@ async fn dispatch(
             );
             observe_child_monty(host, dispatch, async {
                 match super::catalog::describe(cfg, host, &server, &tool).await {
-                    Ok(desc) => Ok((
-                        descriptor_to_monty(&server, &desc),
-                        descriptor_to_json(&server, &desc),
-                    )),
+                    Ok(desc) => {
+                        let value =
+                            scrub_host_value_for_sandbox(host, descriptor_to_json(&server, &desc))?;
+                        Ok((json_to_monty(&value), value))
+                    }
                     Err(e) => Err(format!("mcp.describe failed: {e}")),
                 }
             })
@@ -703,6 +711,10 @@ async fn dispatch(
 /// or structurally transform an unredacted secret before it reaches governed
 /// egress. This is deliberately recursive over keys and scalar leaves too.
 fn scrub_invoke_result_for_sandbox(host: &HostContext, value: Value) -> Result<Value, String> {
+    scrub_host_value_for_sandbox(host, value)
+}
+
+fn scrub_host_value_for_sandbox(host: &HostContext, value: Value) -> Result<Value, String> {
     let Some(ctx) = host.native_tool_ctx.as_ref() else {
         return Ok(value);
     };
@@ -711,6 +723,17 @@ fn scrub_invoke_result_for_sandbox(host: &HostContext, value: Value) -> Result<V
         .enforced_checked()
         .map_err(|error| format!("mcp.invoke redaction view failed closed: {error:#}"))?;
     Ok(scrub_json_for_sandbox(&value, &table))
+}
+
+fn scrub_host_error_for_sandbox(host: &HostContext, error: &str) -> Result<String, String> {
+    let Some(ctx) = host.native_tool_ctx.as_ref() else {
+        return Ok(error.to_string());
+    };
+    let table = ctx
+        .redact
+        .enforced_checked()
+        .map_err(|failure| format!("host error redaction view failed closed: {failure:#}"))?;
+    Ok(table.scrub(error))
 }
 
 fn scrub_json_for_sandbox(value: &Value, table: &crate::redact::RedactionTable) -> Value {
@@ -773,6 +796,15 @@ async fn configure_network_policy(
     let agent_instance_id = ctx.agent_instance_id.ok_or_else(|| {
         "network configuration requires a daemon-owned agent instance".to_string()
     })?;
+    // Scoped contexts deny the entire capability, including authority
+    // mutation. Refuse before constructing or raising an owner prompt.
+    host.effective_network_capability()
+        .await
+        .map_err(|error| format!("network configuration is unavailable: {error:#}"))?;
+    let host_name = host_name
+        .map(|host| crate::db::monty_network::CanonicalNetworkHost::parse(&host))
+        .transpose()
+        .map_err(|error| format!("network configuration host is invalid: {error:#}"))?;
     let label = match action.as_str() {
         "enable_requests" => format!("Enable governed requests for agent {}", ctx.agent_id),
         "disable_requests" => format!("Disable governed requests for agent {}", ctx.agent_id),
@@ -786,22 +818,38 @@ async fn configure_network_policy(
         ),
         "grant_host" => format!(
             "Grant Monty network host `{}` to agent {}",
-            host_name.as_deref().unwrap_or("<missing>"),
+            host_name
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("<missing>"),
             ctx.agent_id
         ),
         "revoke_host" => format!(
             "Revoke Monty network host `{}` from agent {}",
-            host_name.as_deref().unwrap_or("<missing>"),
+            host_name
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("<missing>"),
             ctx.agent_id
         ),
         "revoke_all_hosts" => format!("Revoke all Monty network hosts for agent {}", ctx.agent_id),
         "grant_session_host" => format!(
             "Grant Monty network host `{}` for this session",
-            host_name.as_deref().unwrap_or("<missing>")
+            host_name
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("<missing>")
         ),
         "revoke_session_host" => format!(
             "Revoke Monty network host `{}` for this session",
-            host_name.as_deref().unwrap_or("<missing>")
+            host_name
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("<missing>")
         ),
         "revoke_all_session_hosts" => "Revoke all session Monty network hosts".to_string(),
         _ => return Err("unknown mcp.network_configure action".to_string()),
@@ -812,7 +860,7 @@ async fn configure_network_policy(
     let approval_input = serde_json::json!({
         "agent_instance_id": agent_instance_id,
         "action": &action,
-        "host": host_name.as_deref(),
+        "host": host_name.as_ref(),
     });
     if !approver
         .approve_owner_network_configuration(&label, &approval_input)
@@ -1383,7 +1431,18 @@ where
         None => None,
     };
     let start = Instant::now();
-    let result = work.await;
+    // Host-derived values and errors cross one fail-closed redaction edge
+    // before either the child-event observer or the sandbox VM can see them.
+    // Keeping this here prevents a new observed host call from accidentally
+    // persisting/broadcasting a raw error while relying on a caller to scrub.
+    let result = match work.await {
+        Ok(value) => scrub_host_value_for_sandbox(host, value),
+        Err(error) => Err(
+            scrub_host_error_for_sandbox(host, &error).unwrap_or_else(|_| {
+                "host call failed and its error could not be safely redacted".to_string()
+            }),
+        ),
+    };
     if let (Some(recorder), Some(span)) = (&host.child_events, span) {
         recorder
             .finish(span, result.clone(), start.elapsed().as_millis() as u64)
@@ -1405,7 +1464,19 @@ where
         None => None,
     };
     let start = Instant::now();
-    let result = work.await;
+    // Discard the host-produced Monty object and rebuild it from the same
+    // redacted JSON value recorded by the observer. Thus persistence,
+    // broadcast, and VM resumption share exactly one sanitized result.
+    let result = match work.await {
+        Ok((_object, value)) => {
+            scrub_host_value_for_sandbox(host, value).map(|value| (json_to_monty(&value), value))
+        }
+        Err(error) => Err(
+            scrub_host_error_for_sandbox(host, &error).unwrap_or_else(|_| {
+                "host call failed and its error could not be safely redacted".to_string()
+            }),
+        ),
+    };
     if let (Some(recorder), Some(span)) = (&host.child_events, span) {
         let recorded = result
             .as_ref()
@@ -2515,6 +2586,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_host_error_is_scrubbed_once_before_recorder_and_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, _gate, _session, mut rx) =
+            child_event_host(tmp.path(), "outer-secret-fail", true);
+        let redaction_cfg = crate::config::extended::RedactConfig {
+            enabled: false,
+            min_secret_length: 4,
+            ..Default::default()
+        };
+        let table = crate::redact::RedactionTable::build_with_env_and_secrets(
+            &redaction_cfg,
+            tmp.path(),
+            &std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "raw-host-secret".to_string(),
+            )]),
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap();
+        Arc::get_mut(host.native_tool_ctx.as_mut().unwrap())
+            .expect("test host owns its tool context")
+            .redact = Arc::new(table);
+
+        let error = observe_child(
+            &host,
+            McpChildDispatch::new(
+                "invoke",
+                Some("external".into()),
+                "echo",
+                Some(false),
+                serde_json::json!({}),
+            ),
+            async { Err("host failed with raw-host-secret".to_string()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.contains("raw-host-secret"), "{error}");
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolError { error, .. } if !error.contains("raw-host-secret")
+        )));
+    }
+
+    #[tokio::test]
     async fn child_persistence_failure_does_not_fail_outer_call() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
@@ -2672,6 +2788,28 @@ mod tests {
         )
         .await;
         assert!(first.description.contains("Grant Monty network host"));
+        assert!(
+            db.interrupt_is_owner_network_configuration(session_id, first.interrupt_id)
+                .await
+                .unwrap(),
+            "the direct-hub fixture must retain the durable owner-network class"
+        );
+        let first_question = first
+            .questions
+            .as_ref()
+            .and_then(|set| set.questions.first())
+            .expect("owner-network prompt question");
+        assert!(
+            matches!(
+                first_question,
+                crate::daemon::proto::InterruptQuestion::Single {
+                    permission: true,
+                    approval_class: None,
+                    ..
+                }
+            ),
+            "owner-network authority must not be auto-approvable as command"
+        );
         let second = resolve_next_interrupt(
             &db,
             session_id,
@@ -2700,7 +2838,9 @@ mod tests {
             .monty_network_agent_policy(agent_instance_id)
             .await
             .unwrap();
-        assert!(policy.hosts.contains("api.example.test"));
+        assert!(policy.hosts.contains(
+            &crate::db::monty_network::CanonicalNetworkHost::parse("api.example.test").unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -2809,7 +2949,7 @@ mod tests {
             .mutate_monty_network_agent_policy(
                 agent_instance_id,
                 crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
-                    "127.0.0.1".to_string(),
+                    crate::db::monty_network::CanonicalNetworkHost::parse("127.0.0.1").unwrap(),
                 ),
                 2,
             )

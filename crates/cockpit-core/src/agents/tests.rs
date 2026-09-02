@@ -793,7 +793,10 @@ fn vnext_network_hosts_are_requests_not_grants() {
     let def = parse_agent(&document, "reviewer", "reviewer.md".into()).unwrap();
     assert_eq!(
         def.requested_network_hosts(),
-        &std::collections::BTreeSet::from(["api.example.test".to_string()])
+        &std::collections::BTreeSet::from([crate::db::monty_network::CanonicalNetworkHost::parse(
+            "api.example.test"
+        )
+        .unwrap()])
     );
     assert!(def.requests_requested());
     assert!(def.tools.is_none());
@@ -806,6 +809,8 @@ fn vnext_network_hosts_are_requests_not_grants() {
 
     let invalid = vnext_document("requestedNetworkHosts:\n  - HTTPS://api.example.test\n");
     assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+    let with_port = vnext_document("requestedNetworkHosts:\n  - api.example.test:443\n");
+    assert!(parse_agent(&with_port, "reviewer", "reviewer.md".into()).is_err());
 }
 
 #[test]

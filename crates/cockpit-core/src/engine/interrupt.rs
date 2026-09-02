@@ -4253,6 +4253,380 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monty_network_egress_handoff_binds_every_request_field_and_final_effect() {
+        let request_a = serde_json::json!({
+            "method": "POST",
+            "url": "https://api.example.test/v1/items?limit=2",
+            "headers": {"content-type": "application/json", "x-request": "a"},
+            "body": "{\"name\":\"alpha\"}",
+            "destination": "api.example.test",
+        });
+        let candidate_a = serde_json::json!({"execute": {"wire_input": request_a}});
+        let mismatches = [
+            (
+                "method",
+                serde_json::json!({"execute": {"wire_input": {
+                "method": "PUT", "url": "https://api.example.test/v1/items?limit=2",
+                "headers": {"content-type": "application/json", "x-request": "a"},
+                "body": "{\"name\":\"alpha\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "path",
+                serde_json::json!({"execute": {"wire_input": {
+                "method": "POST", "url": "https://api.example.test/v2/items?limit=2",
+                "headers": {"content-type": "application/json", "x-request": "a"},
+                "body": "{\"name\":\"alpha\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "query",
+                serde_json::json!({"execute": {"wire_input": {
+                "method": "POST", "url": "https://api.example.test/v1/items?limit=3",
+                "headers": {"content-type": "application/json", "x-request": "a"},
+                "body": "{\"name\":\"alpha\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "headers",
+                serde_json::json!({"execute": {"wire_input": {
+                "method": "POST", "url": "https://api.example.test/v1/items?limit=2",
+                "headers": {"content-type": "application/json", "x-request": "b"},
+                "body": "{\"name\":\"alpha\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "body",
+                serde_json::json!({"execute": {"wire_input": {
+                "method": "POST", "url": "https://api.example.test/v1/items?limit=2",
+                "headers": {"content-type": "application/json", "x-request": "a"},
+                "body": "{\"name\":\"beta\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "url",
+                serde_json::json!({"execute": {"wire_input": {
+                    "method": "POST", "url": "https://other.example.test/v1/items?limit=2",
+                    "headers": {"content-type": "application/json", "x-request": "a"},
+                    "body": "{\"name\":\"alpha\"}", "destination": "api.example.test"}}}),
+            ),
+            (
+                "destination",
+                serde_json::json!({"execute": {"wire_input": {
+                    "method": "POST", "url": "https://api.example.test/v1/items?limit=2",
+                    "headers": {"content-type": "application/json", "x-request": "a"},
+                    "body": "{\"name\":\"alpha\"}", "destination": "other.example.test"}}}),
+            ),
+            (
+                "generic command",
+                serde_json::json!({"execute": {
+                    "command": "curl https://api.example.test/v1/items?limit=2"
+                }}),
+            ),
+        ];
+
+        for (label, concrete_effect) in mismatches {
+            let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
+            let operation = crate::agent_tree::HostApprovalOperation::new(
+                "monty_network_egress",
+                serde_json::json!({
+                    "wire_input": request_a,
+                    "candidate_effects": [{"selection": "approve", "execute": {
+                        "wire_input": request_a
+                    }}],
+                }),
+            )
+            .unwrap();
+            insert_ready_host_effect_handoff(
+                &db,
+                session_id,
+                agent_instance_id,
+                revision,
+                &operation,
+            )
+            .await;
+            with_host_approval_effect_scope(
+                "monty_network_egress",
+                tokio_util::sync::CancellationToken::new(),
+                async {
+                    assert!(register_host_approval_effect_handoff(
+                        HostApprovalEffectHandoff::new(
+                            db.clone(),
+                            crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                            session_id,
+                            agent_instance_id,
+                            Uuid::nil(),
+                            operation,
+                        ),
+                    ));
+                    let error = recheck_current_host_approval_effect_boundary(
+                        "monty_network_egress",
+                        std::slice::from_ref(&concrete_effect),
+                    )
+                    .await
+                    .expect_err("request B must not claim request A's approval");
+                    assert!(
+                        error.to_string().contains(
+                            "no live host approval capability authorizes this effect boundary"
+                        ),
+                        "{label}: {error:#}"
+                    );
+                    Ok::<(), anyhow::Error>(())
+                },
+                |_: &()| Some(true),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
+        let operation = crate::agent_tree::HostApprovalOperation::new(
+            "monty_network_egress",
+            serde_json::json!({
+                "wire_input": request_a,
+                "candidate_effects": [{"selection": "approve", "execute": {
+                    "wire_input": request_a
+                }}],
+            }),
+        )
+        .unwrap();
+        insert_ready_host_effect_handoff(&db, session_id, agent_instance_id, revision, &operation)
+            .await;
+        with_host_approval_effect_scope(
+            "monty_network_egress",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db,
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        session_id,
+                        agent_instance_id,
+                        Uuid::nil(),
+                        operation,
+                    ),
+                ));
+                recheck_current_host_approval_effect_boundary(
+                    "monty_network_egress",
+                    std::slice::from_ref(&candidate_a),
+                )
+                .await
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .expect("the exact delivered Monty request claims and settles its approval");
+    }
+
+    #[tokio::test]
+    async fn monty_network_dispatch_rechecks_exact_handoff_before_listener_egress() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let size = first.read(&mut bytes).await.unwrap();
+            let first_request = String::from_utf8_lossy(&bytes[..size]).into_owned();
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+
+            let received_mismatch = match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((mut stream, _))) => {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    true
+                }
+                Ok(Err(error)) => panic!("listener failed: {error}"),
+                Err(_) => false,
+            };
+            (first_request, received_mismatch)
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut tool_ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: tool_ctx.session.id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let agent = match db
+            .transition_agent_instance(
+                tool_ctx.session.id,
+                agent.agent_instance_id,
+                agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                2,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected running transition: {outcome:?}"),
+        };
+        tool_ctx.agent_instance_id = Some(agent.agent_instance_id);
+        db.mutate_monty_network_agent_policy(
+            agent.agent_instance_id,
+            crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
+            3,
+        )
+        .await
+        .unwrap();
+        db.mutate_monty_network_agent_policy(
+            agent.agent_instance_id,
+            crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
+                crate::db::monty_network::CanonicalNetworkHost::parse("127.0.0.1").unwrap(),
+            ),
+            4,
+        )
+        .await
+        .unwrap();
+        let host = crate::mcp::builtin::HostContext::from_tool_ctx(&tool_ctx);
+
+        let exact_url = format!("http://{address}/approved");
+        let exact_wire_input = serde_json::json!({
+            "method": "GET",
+            "url": exact_url,
+            "headers": {},
+            "body": null,
+            "destination": "127.0.0.1",
+        });
+        let exact_operation = crate::agent_tree::HostApprovalOperation::new(
+            "monty_network_egress",
+            serde_json::json!({
+                "wire_input": exact_wire_input,
+                "candidate_effects": [{"selection": "approve", "execute": {
+                    "wire_input": exact_wire_input
+                }}],
+            }),
+        )
+        .unwrap();
+        insert_ready_host_effect_handoff(
+            &db,
+            tool_ctx.session.id,
+            agent.agent_instance_id,
+            agent.revision,
+            &exact_operation,
+        )
+        .await;
+        with_host_approval_effect_scope(
+            "monty_network_egress",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db.clone(),
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        tool_ctx.session.id,
+                        agent.agent_instance_id,
+                        Uuid::nil(),
+                        exact_operation,
+                    ),
+                ));
+                crate::mcp::network::dispatch(
+                    &host,
+                    crate::mcp::network::GovernedRequest {
+                        method: "GET".into(),
+                        url: exact_url,
+                        headers: std::collections::BTreeMap::new(),
+                        body: None,
+                    },
+                )
+                .await
+                .map(|_| ())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .expect("the exact candidate reaches the production network seam");
+
+        let mismatch_operation = crate::agent_tree::HostApprovalOperation::new(
+            "monty_network_egress",
+            serde_json::json!({
+                "wire_input": exact_wire_input,
+                "candidate_effects": [{"selection": "approve", "execute": {
+                    "wire_input": exact_wire_input
+                }}],
+            }),
+        )
+        .unwrap();
+        insert_ready_host_effect_handoff(
+            &db,
+            tool_ctx.session.id,
+            agent.agent_instance_id,
+            agent.revision,
+            &mismatch_operation,
+        )
+        .await;
+        let mismatch_url = format!("http://{address}/mismatched");
+        let error = with_host_approval_effect_scope(
+            "monty_network_egress",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db,
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        tool_ctx.session.id,
+                        agent.agent_instance_id,
+                        Uuid::nil(),
+                        mismatch_operation,
+                    ),
+                ));
+                crate::mcp::network::dispatch(
+                    &host,
+                    crate::mcp::network::GovernedRequest {
+                        method: "GET".into(),
+                        url: mismatch_url,
+                        headers: std::collections::BTreeMap::new(),
+                        body: None,
+                    },
+                )
+                .await
+                .map(|_| ())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .expect_err("a mismatched candidate is rejected by network::dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("network request approval became stale"),
+            "{error:#}"
+        );
+
+        let (first_request, received_mismatch) = server.await.unwrap();
+        assert!(
+            first_request.starts_with("GET /approved HTTP/1.1"),
+            "{first_request}"
+        );
+        assert!(
+            !received_mismatch,
+            "network::dispatch must recheck the exact candidate before socket egress"
+        );
+    }
+
+    #[tokio::test]
     async fn skill_manage_composed_fence_rejects_every_action_after_owner_revision_invalidates() {
         for (action, payload) in [
             (

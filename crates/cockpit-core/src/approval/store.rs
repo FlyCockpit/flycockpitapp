@@ -18,8 +18,9 @@
 //! Persistence honors cockpit's existing config discovery
 //! ([`crate::config::dirs`], [`crate::git::find_worktree_root`]) — no new
 //! location scheme. Project/Global are plain JSON files written atomically
-//! (owner-only temp + fsync + rename + directory fsync) under a
-//! cross-process lock; Session lives in SQLite. A corrupt or unreadable
+//! (a fresh owner-only exclusive temp + fsync + an identity-verified
+//! rename + directory fsync) under a cross-process lock bound to one
+//! verified lock object; Session lives in SQLite. A corrupt or unreadable
 //! `approvals.json` fails closed (issue #297): the corrupt bytes are
 //! quarantined for diagnosis — copied aside to a fresh owner-only file,
 //! never deleted, never overwriting, never touching the live path — and
@@ -36,7 +37,15 @@
 //! touching the live path), and every successful read enforces the
 //! owner-only posture on the store it consumed: a store whose
 //! permissions cannot be inspected or tightened to owner-only is
-//! refused, never consumed.
+//! refused, never consumed. Every pathname effect on store state is
+//! identity-guarded through a held handle: the staged temp is renamed
+//! into place only while its name still refers to the object this
+//! process wrote and synced, the lock is acquired (and the publish
+//! re-fenced) only while its name still refers to the object this
+//! process locked, and a failed write's partial copy is removed only
+//! while its name still refers to the object this process created — so
+//! a replacement object at a known pathname is never consumed,
+//! installed, or destroyed.
 //!
 //! ## Wrappers are never persisted (priority #1)
 //!
@@ -1862,7 +1871,10 @@ const APPROVALS_FILE: &str = "approvals.json";
 
 /// Cross-process advisory lock guarding every `approvals.json`
 /// read-modify-write cycle (issue #297). The lock file itself never holds
-/// store data.
+/// store data, is never truncated, and every acquirer verifies the
+/// pathname still refers to the object it locked — so all cycles for a
+/// directory serialize on one shared lock object, never on two
+/// replacement inodes.
 const APPROVALS_LOCK_FILE: &str = "approvals.json.lock";
 
 /// Name prefix of the quarantine copies a corrupt approvals file is renamed
@@ -2238,13 +2250,115 @@ fn quarantine_corrupt_approvals(
     None
 }
 
-/// Remove a failed quarantine candidate's partial copy: the live file
-/// still holds the full corrupt bytes (quarantine never touches the live
-/// path), so a partial candidate that would fence the store with a bogus
-/// artifact is best-effort removed.
-fn discard_partial_quarantine_candidate(out: std::fs::File, path: &Path) {
+/// Whether `path`'s directory entry still refers to the same filesystem
+/// object as the open `file` handle (issue #297). Every destructive or
+/// publishing effect on a pathname in this module — partial-copy cleanup,
+/// the store's staged-temp rename, the lock stability fences — must be
+/// able to prove it acts on the object this process created or holds, and
+/// this is that proof: identity probed through the held handle (`fstat`)
+/// and through the entry itself (`lstat`, never a follow — a symlink at
+/// the name has its own identity, and a rename or unlink acts on the
+/// entry). A missing entry is `Ok(false)`: the name no longer refers to
+/// the held object.
+///
+/// Non-unix exemption: stable std exposes no object-identity comparison
+/// primitive on those targets (`windows_by_handle`'s `file_index` /
+/// `volume_serial_number` are still unstable), so a mismatch cannot be
+/// proven there and the probe reports `Ok(true)`, preserving the
+/// platform's existing behavior instead of stubbing a false refusal —
+/// the same platform-honesty matrix `cockpit_host::private_fs` reports
+/// through `PRIVATE_FS_POLICY`. The races this probe guards against are
+/// pathname unlink-and-replace races; on Windows a name whose object is
+/// held open through a std handle cannot be replaced underneath it (no
+/// `FILE_SHARE_DELETE`), so the exposure is unix-shaped.
+#[cfg(unix)]
+fn same_object_at_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(named) => Ok(held.dev() == named.dev() && held.ino() == named.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// See the unix arm; the non-unix platform cannot prove a mismatch, so
+/// the probe passes and the caller keeps its existing behavior.
+#[cfg(not(unix))]
+fn same_object_at_path(_file: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// Remove a failed private-file attempt's partial copy, identity-guarded
+/// (issue #297): the removal happens only while the candidate pathname
+/// still refers to the object this process created and opened, proven
+/// through the held handle — never the pathname alone. Between the
+/// exclusive `create_new` and this cleanup, a non-cooperating writer can
+/// unlink the partial candidate and install a different object at the
+/// same name; a blind `remove_file(path)` would then destroy that
+/// replacement — including a preserved diagnostic artifact fencing the
+/// store. A mismatch is left exactly as found (the caller still fails
+/// closed), and identity that cannot be proven is never guessed:
+/// nothing is removed on a probe failure. The name is only ever removed
+/// by this failure path — a successful private file is the caller's to
+/// publish or keep.
+///
+/// Residual window: like every lstat→unlink pair, the probe and the
+/// removal are two steps; a swap landing between them is the same
+/// best-effort residual the identity-verified publish in
+/// [`store_approvals`] documents, not a silent unguarded deletion.
+fn discard_partial_private_candidate(out: std::fs::File, path: &Path) {
+    let still_created_object = same_object_at_path(&out, path);
     drop(out);
-    let _ = std::fs::remove_file(path);
+    match still_created_object {
+        Ok(true) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(false) => tracing::warn!(
+            path = %path.display(),
+            "a failed private-file candidate's name no longer refers to the object \
+             this process created; leaving whatever occupies it untouched"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "cannot prove the identity of a failed private-file candidate; leaving \
+             its name untouched"
+        ),
+    }
+}
+
+/// Open a fresh exclusive (owner-only on unix) file at `path`
+/// (`create_new`): the staging object for quarantine preservation copies
+/// and the atomic store's temp. `create_new` never follows a pre-existing
+/// symlink and never overwrites an existing artifact — the open fails
+/// with `AlreadyExists` instead — and the mode is pinned to exactly
+/// `0o600` through the open handle (creation modes are narrowed by
+/// umask; a handle chmod is not), cleaning up its own partial copy if the
+/// pin fails. The returned handle is the only proof of which object was
+/// created; every later effect on `path` is bound to it through
+/// [`same_object_at_path`].
+#[cfg(unix)]
+fn open_new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        discard_partial_private_candidate(file, path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
 }
 
 /// Write `bytes` to a fresh owner-only file at `path`: quarantine's
@@ -2253,27 +2367,21 @@ fn discard_partial_quarantine_candidate(out: std::fs::File, path: &Path) {
 /// `AlreadyExists` and the caller retries with the next candidate — and
 /// the copy is created owner-only and pinned to exactly `0o600` through
 /// the open handle (creation modes are narrowed by umask; a handle chmod
-/// is not). A failed attempt removes its partial copy so a bogus
-/// quarantine artifact never fences the store.
+/// is not). A failed attempt removes its partial copy — but only while
+/// the candidate pathname still refers to the object this process
+/// created ([`discard_partial_private_candidate`]), so a replacement
+/// artifact at the name is never destroyed — and no bogus quarantine
+/// artifact is left fencing the store.
 #[cfg(unix)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut out = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    if let Err(error) = out.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        discard_partial_quarantine_candidate(out, path);
-        return Err(error);
-    }
+    let mut out = open_new_private_file(path)?;
     if let Err(error) = out.write_all(bytes) {
-        discard_partial_quarantine_candidate(out, path);
+        discard_partial_private_candidate(out, path);
         return Err(error);
     }
     if let Err(error) = out.sync_all() {
-        discard_partial_quarantine_candidate(out, path);
+        discard_partial_private_candidate(out, path);
         return Err(error);
     }
     Ok(())
@@ -2282,16 +2390,13 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut out = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)?;
+    let mut out = open_new_private_file(path)?;
     if let Err(error) = out.write_all(bytes) {
-        discard_partial_quarantine_candidate(out, path);
+        discard_partial_private_candidate(out, path);
         return Err(error);
     }
     if let Err(error) = out.sync_all() {
-        discard_partial_quarantine_candidate(out, path);
+        discard_partial_private_candidate(out, path);
         return Err(error);
     }
     Ok(())
@@ -2331,7 +2436,7 @@ fn enforce_owner_only(
 }
 
 /// Off unix there are no owner/group/other mode bits to inspect or
-/// tighten (matching [`open_private_file`]'s no-mode fallback), so there
+/// tighten (matching [`open_new_private_file`]'s no-mode fallback), so there
 /// is no owner-only posture to enforce; the read stays valid.
 #[cfg(not(unix))]
 fn enforce_owner_only(
@@ -2421,56 +2526,100 @@ fn quarantine_residue_refusal(residue: &Path) -> String {
     )
 }
 
-/// Open a private (owner-only on unix) file for the approvals lock and the
-/// atomic temp file, so neither is ever world-readable.
-///
-/// Creation mode only applies to files this call creates (and umask can
-/// only narrow it); a **pre-existing** file keeps its old permissions. A
-/// stale `approvals.json.tmp` or `approvals.json.lock` left behind by an
-/// earlier crash or a bad umask could therefore be permissive, and
-/// truncating it would carry those permissions into the live store on
-/// rename. Tighten the mode explicitly after opening so an inherited file
-/// is owner-only too — through the returned handle, so the tightened
-/// object is exactly the one this process opened, never a concurrent
-/// replacement at the path (issue #297).
+/// Open the `approvals.json.lock` object (creating it if absent), the
+/// stable lock object every read-modify-write cycle for a directory must
+/// share (issue #297). Never truncates: the lock file holds no data, and
+/// a truncating open would destroy whatever a pre-existing symlink at
+/// the name points at. Unix opens with `O_NOFOLLOW`, so a planted symlink
+/// at the lock path is refused with `ELOOP` — acquisition fails closed —
+/// instead of silently locking (and tightening the mode of) the
+/// symlink's target. The mode is pinned to exactly `0o600` through the
+/// returned handle so a stale or permissive lock file is repaired on
+/// sight, and the tightened object is exactly the one this process
+/// opened — never a concurrent replacement at the path.
 #[cfg(unix)]
-fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_approvals_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
         .read(true)
         .write(true)
+        .create(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
+/// See the unix arm; neither truncation nor a follow happens here either,
+/// and the non-unix platform-honesty exemption for no-follow opens and
+/// identity probes is documented on [`same_object_at_path`] — stable std
+/// offers neither on this target.
 #[cfg(not(unix))]
-fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_approvals_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
         .read(true)
         .write(true)
+        .create(true)
         .open(path)
 }
 
-/// Open the cross-process advisory lock guarding `<dir>/approvals.json` and
-/// block until it is held exclusively (issue #297: concurrent writers used
-/// to be able to clobber the store with a stale read-modify-write
+/// Open the cross-process advisory lock guarding `<dir>/approvals.json`
+/// and block until it is held exclusively (issue #297: concurrent writers
+/// used to be able to clobber the store with a stale read-modify-write
 /// snapshot). The lock is released when the returned file is dropped.
+///
+/// The lock is bound to a stable lock **object**, not merely to the lock
+/// pathname: a name unlinked or replaced after one caller's open would
+/// leave two callers holding exclusive locks on two different inodes —
+/// both "successfully locked", neither serialized, both free to
+/// clobber each other with stale snapshots. Acquisition therefore
+/// verifies, through the held handle, that the pathname still refers to
+/// the object just locked, and re-acquires from scratch (bounded) when
+/// it does not, so every acquirer converges on the object the name
+/// currently names. A path that keeps being replaced fails the
+/// acquisition closed with a visible error — an actively replaced lock
+/// path is an attack or a broken repair, never something to proceed
+/// through. A holder whose lock object is replaced mid-cycle is fenced
+/// at publish time by [`store_approvals`].
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let lock_path = dir.join(APPROVALS_LOCK_FILE);
-    let file = open_private_file(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    // `File::lock` is the std blocking exclusive advisory lock (flock on
-    // unix, LockFileEx on windows): cross-process and cross-thread.
-    file.lock()
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-    Ok(file)
+    const ACQUIRE_ATTEMPTS: u32 = 8;
+    for attempt in 0..ACQUIRE_ATTEMPTS {
+        let file = open_approvals_lock_file(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        // `File::lock` is the std blocking exclusive advisory lock (flock on
+        // unix, LockFileEx on windows): cross-process and cross-thread.
+        file.lock()
+            .with_context(|| format!("locking {}", lock_path.display()))?;
+        // Identity fence: the object just locked must still be the one the
+        // lock pathname refers to. A mismatch means the name was replaced
+        // between the open and the lock — release this handle and take the
+        // current object instead.
+        match same_object_at_path(&file, &lock_path) {
+            Ok(true) => return Ok(file),
+            Ok(false) => {
+                tracing::warn!(
+                    path = %lock_path.display(),
+                    attempt,
+                    "the approvals lock path was replaced while the lock was being \
+                     acquired; retrying against the current lock object"
+                );
+                drop(file);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!("verifying the lock object at {}", lock_path.display())
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "the approvals lock at {} kept being replaced while it was being acquired; \
+         refusing to serialize on an unstable lock object",
+        lock_path.display()
+    );
 }
 
 /// Run one read-modify-write cycle on `<dir>/approvals.json` under the
@@ -2481,7 +2630,11 @@ fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
 /// A corrupt/unreadable store — or one with an unrepaired quarantine
 /// residue — fails closed with [`ApprovalsLoadError::refusal_message`]:
 /// never a silent `unwrap_or_default()` that would overwrite the corrupt
-/// bytes and drop every standing entry.
+/// bytes and drop every standing entry. The lock is one verified shared
+/// object ([`lock_approvals`]), and the publish re-fences that object
+/// before installing anything ([`store_approvals`]) — a lock file
+/// replaced mid-cycle aborts the write closed instead of racing whatever
+/// else now serializes on the replacement.
 fn mutate_approvals<R>(
     dir: &Path,
     mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
@@ -2496,7 +2649,7 @@ fn mutate_approvals<R>(
     };
     let (changed, value) = mutate(&mut file);
     if changed {
-        store_approvals(dir, &file)?;
+        store_approvals(dir, &_lock, &file)?;
     }
     Ok(value)
 }
@@ -2519,22 +2672,131 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write `file` to `<dir>/approvals.json` atomically (owner-only temp file +
-/// fsync + rename + directory fsync) so a crash mid-write can't corrupt
-/// the store, a crash after the rename can't lose it, and the file is
-/// never world-readable. Called with the approvals lock held.
-fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
+/// Create the staging temp for one atomic store publish: a fresh
+/// `create_new` owner-only file under an unpredictable
+/// `approvals.json.tmp-<hex>` name in `dir` (issue #297). The
+/// unpredictable name plus exclusive creation means no pre-existing
+/// artifact — a stale fixed-name temp, or a symlink planted at any
+/// guessable staging name — is ever followed, truncated, or
+/// overwritten, and a non-cooperating writer can neither pre-plant nor
+/// guess which entry the publish will rename. Collisions retry; bounded
+/// exhaustion fails the write closed.
+fn create_private_store_temp(dir: &Path) -> Result<(std::fs::File, PathBuf)> {
+    const ATTEMPTS: u8 = 32;
+    for _ in 0..ATTEMPTS {
+        let candidate = dir.join(format!("{APPROVALS_FILE}.tmp-{}", random_hex()));
+        match open_new_private_file(&candidate) {
+            Ok(out) => return Ok((out, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not create a unique private temp file in {}",
+        dir.display()
+    )
+}
+
+/// Sixteen random bytes as lowercase hex: the unpredictable staging-name
+/// entropy for [`create_private_store_temp`].
+fn random_hex() -> String {
+    use rand::Rng as _;
+    use std::fmt::Write as _;
+    let mut raw = [0_u8; 16];
+    rand::rng().fill_bytes(&mut raw);
+    let mut out = String::with_capacity(raw.len() * 2);
+    for byte in raw {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Write `file` to `<dir>/approvals.json` atomically (owner-only exclusive
+/// temp file + fsync + identity-verified rename + directory fsync) so a
+/// crash mid-write can't corrupt the store, a crash after the rename
+/// can't lose it, and the file is never world-readable. Called with the
+/// approvals lock held; `lock` is that held lock object.
+///
+/// Two invariants bind the publish (issue #297):
+///
+/// - **The installed store is the object that was written.** The staged
+///   temp is a fresh `create_new` file under an unpredictable name
+///   ([`create_private_store_temp`]) — never a guessable fixed `.tmp`
+///   whose entry a pre-planted symlink could steer the writer into
+///   truncating — and the rename is taken only while the temp pathname
+///   still refers to the object this process wrote and synced, proven
+///   through the held handle ([`same_object_at_path`]). A replacement at
+///   the staged name is left untouched and the publish fails closed, so
+///   a write never reports success while installing some other object's
+///   bytes. Residual window: like every probe→rename pair, the check and
+///   the rename are two steps; a swap landing between them is the same
+///   best-effort residual documented on
+///   [`discard_partial_private_candidate`], on an unguessable name —
+///   never a silent unguarded publish.
+/// - **The serialization boundary is still valid at publish time.** The
+///   held lock object must still be the one the lock pathname refers to
+///   (the same probe): a lock file replaced while this cycle ran means
+///   the exclusion this write relies on is gone, so the write aborts
+///   (fail closed with a visible error) instead of silently racing
+///   whatever else now serializes on the replacement.
+fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Result<()> {
     let path = dir.join(APPROVALS_FILE);
-    let tmp = dir.join(format!("{APPROVALS_FILE}.tmp"));
+    let lock_path = dir.join(APPROVALS_LOCK_FILE);
+    // Serialization-boundary fence: this publish is valid only while the
+    // lock object this cycle holds is still the one the lock pathname
+    // names. A replaced lock file means the boundary is gone — leave the
+    // store untouched and fail closed.
+    match same_object_at_path(lock, &lock_path) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals lock at {} no longer refers to the lock object held \
+             for this write; the store was left untouched",
+            lock_path.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
+        }
+    }
     let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
-    let mut out = open_private_file(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    let (mut out, tmp) = create_private_store_temp(dir)?;
     {
         use std::io::Write as _;
-        out.write_all(&json)
-            .and_then(|()| out.sync_all())
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        if let Err(error) = out.write_all(&json).and_then(|()| out.sync_all()) {
+            let write_error =
+                anyhow::Error::from(error).with_context(|| format!("writing {}", tmp.display()));
+            discard_partial_private_candidate(out, &tmp);
+            return Err(write_error);
+        }
     }
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    // Identity-bind the rename to the object that was written: the staged
+    // entry must still be the one this process created, wrote, and synced.
+    // A replacement at the name is not ours to remove or install — leave
+    // it untouched and abort the publish.
+    match same_object_at_path(&out, &tmp) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "aborting the approvals store write: the staged temp at {} was \
+             substituted before the rename; the store was left untouched",
+            tmp.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the staged temp at {}", tmp.display()));
+        }
+    }
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let rename_error =
+            anyhow::Error::from(error).with_context(|| format!("renaming into {}", path.display()));
+        // The staged entry is still ours here, so clean it up through the
+        // same identity guard (a swap in between leaves the replacement
+        // untouched, never destroyed).
+        discard_partial_private_candidate(out, &tmp);
+        return Err(rename_error);
+    }
     sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
 }
@@ -2901,8 +3163,10 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("git", Some("push"), false);
 
+        let _lock = lock_approvals(test_project_dir(&store)).unwrap();
         store_approvals(
             test_project_dir(&store),
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     info.key.as_storage_str(),
@@ -3027,8 +3291,10 @@ mod tests {
         let repo_dir = tmp.path().join(".cockpit");
         let command = cmd_info("cargo", Some("test"), false);
         let granted_dir = tmp.path().join("secrets");
+        let _lock = lock_approvals(&repo_dir).unwrap();
         store_approvals(
             &repo_dir,
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     command.key.as_storage_str(),
@@ -3092,8 +3358,10 @@ mod tests {
         );
         let project_dir = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&project_dir).unwrap();
+        let _lock = lock_approvals(&project_dir).unwrap();
         store_approvals(
             &project_dir,
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     "cargo test".to_string(),
@@ -4487,10 +4755,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join(APPROVALS_FILE);
 
-        // Pre-existing permissive temp/lock files, as a stale file from an
-        // earlier crash or a bad umask would leave behind: the writer must
-        // tighten them instead of truncating the permissive temp and
-        // renaming it into the live store (issue #297).
+        // Pre-existing permissive lock file and stale fixed-name temp, as
+        // an earlier crash or a bad umask would leave behind (issue #297):
+        // acquisition must tighten the lock through its own handle and
+        // never truncate it, and a staged publish must never consume the
+        // stale temp entry — it stages in a fresh exclusive temp of its
+        // own instead.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -4498,7 +4768,7 @@ mod tests {
             std::fs::write(&tmp, b"stale").unwrap();
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
             let lock = dir.path().join(APPROVALS_LOCK_FILE);
-            std::fs::write(&lock, b"").unwrap();
+            std::fs::write(&lock, b"lock sentinel").unwrap();
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
         }
 
@@ -4572,18 +4842,33 @@ mod tests {
         assert!(store_path.exists());
 
         // The store file and the lock file are never world-readable —
-        // including when they started as pre-existing permissive files.
+        // including when they started as pre-existing permissive files —
+        // the lock is never truncated by acquisition, and the stale
+        // fixed-name temp is never consumed by a publish (issue #297).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "approvals.json must be owner-only");
-            let lock_mode = std::fs::metadata(dir.path().join(APPROVALS_LOCK_FILE))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            let lock_path = dir.path().join(APPROVALS_LOCK_FILE);
+            let lock_mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(lock_mode, 0o600, "approvals lock must be owner-only");
+            assert_eq!(
+                std::fs::read(&lock_path).unwrap(),
+                b"lock sentinel".as_slice(),
+                "lock acquisition must never truncate the lock file"
+            );
+            let stale_tmp = dir.path().join(format!("{APPROVALS_FILE}.tmp"));
+            assert_eq!(
+                std::fs::read(&stale_tmp).unwrap(),
+                b"stale".as_slice(),
+                "a stale fixed-name temp must never be consumed by a publish"
+            );
+            let stale_mode = std::fs::metadata(&stale_tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                stale_mode, 0o666,
+                "an unconsumed stale temp is never touched"
+            );
         }
     }
 
@@ -4689,6 +4974,107 @@ mod tests {
         let err = write_private_file(&candidate, b"second").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&candidate).unwrap(), b"first".as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_partial_private_candidate_never_deletes_a_replacement_at_the_name() {
+        // Post-creation identity race (issue #297): between the exclusive
+        // create of a private candidate and its failure cleanup, a
+        // non-cooperating writer can unlink the candidate and install a
+        // different object at the same name. The cleanup must remove only
+        // the object this process created — proven through the held
+        // handle — and leave the replacement artifact exactly as found.
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("approvals.json.corrupt-1");
+        let out = open_new_private_file(&candidate).unwrap();
+        std::fs::remove_file(&candidate).unwrap();
+        std::fs::write(&candidate, b"replacement artifact").unwrap();
+
+        discard_partial_private_candidate(out, &candidate);
+
+        assert_eq!(
+            std::fs::read(&candidate).unwrap(),
+            b"replacement artifact".as_slice(),
+            "cleanup must never destroy an object it did not create"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_aborts_when_the_held_lock_no_longer_occupies_the_lock_path() {
+        // The lock must be one stable shared object (issue #297): if the
+        // lock pathname is replaced while a cycle holds a lock on the
+        // original object, the serialization boundary is gone, so the
+        // publish aborts rather than silently racing whatever now
+        // serializes on the replacement. A later cycle converges on the
+        // current lock object and succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        // Replace the lock path entry (unlink + install a different
+        // object), as a non-cooperating writer would.
+        std::fs::remove_file(dir.path().join(APPROVALS_LOCK_FILE)).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_LOCK_FILE), b"").unwrap();
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["stolen-boundary".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no longer refers to the lock object"),
+            "{message}"
+        );
+        // The store is left untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            b"{}".as_slice()
+        );
+        // The next cycle acquires the current lock object and succeeds.
+        drop(lock);
+        mutate_approvals(dir.path(), |file| {
+            file.commands_reject.insert("fresh".to_string());
+            (true, ())
+        })
+        .unwrap();
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(
+            file.commands_reject.contains("fresh"),
+            "a fresh cycle must serialize on the current lock object"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_acquisition_fails_closed_on_a_symlinked_lock_path() {
+        // A planted symlink at the lock path must never be followed
+        // (issue #297): acquisition refuses (fail closed) instead of
+        // locking — and truncating, and tightening the mode of — the
+        // symlink's target through a followed handle.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"must not be truncated").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(APPROVALS_LOCK_FILE)).unwrap();
+
+        let error = lock_approvals(dir.path()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(APPROVALS_LOCK_FILE), "{message}");
+        // The symlink's target is untouched — never truncated, never
+        // tightened through a followed handle.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not be truncated".as_slice()
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
     }
 
     #[cfg(unix)]

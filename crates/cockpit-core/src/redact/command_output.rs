@@ -2,47 +2,103 @@
 //! output (GOALS §7; issue #279).
 //!
 //! [`RedactionTable::scrub`] only replaces literals already registered in
-//! the table. A skill `!`-command can surface a *novel* secret the table has
-//! never seen — `` !`cat .env` ``, `` !`aws sts get-session-token` `` — and
-//! table-based dispatch-time scrubbing then finds nothing to replace. This
-//! module closes that gap at the substitution site itself: before the
+//! the table. A skill `!`-command can surface a *novel* secret the table
+//! has never seen — `` !`cat .env` ``, `` !`aws sts get-session-token` `` —
+//! and table-based dispatch-time scrubbing then finds nothing to replace.
+//! This module closes that gap at the substitution site itself: before the
 //! captured output enters context (and with it the provider request and
-//! every export), secret-shaped key/value pairs, XML elements, and PEM
-//! private-key blocks are replaced with the table's placeholder.
+//! every export), everything the output can be *classified* as secret by
+//! shape is replaced with the table's placeholder.
 //!
-//! Classification is deliberately shape-based and fail-closed: a
-//! `KEY=VALUE` pair whose key looks like a secret
-//! ([`is_secret_shaped_key`], the same predicate the env / dotenv /
-//! structured collectors use) has its value replaced even though the table
-//! cannot know the value. Values under the [`NOVEL_SECRET_VALUE_MIN_LEN`]
-//! floor stay visible (ports, counts, `yes`/`no` flags), mirroring the
-//! `min_secret_length` prune in table building.
+//! Recognized shapes, per line of captured output:
+//!
+//! - keyed: `KEY=VALUE` assignments (dotenv / shell `env` style — spacing
+//!   around the `=` included, quoted values included, mid-line fragments
+//!   included, and URL-embedded assignments `?token=…` / `&sig=…` /
+//!   `/token=…` included), `KEY: VALUE` colon pairs and `"KEY": "VALUE",`
+//!   quoted members (YAML / JSON style — quoted members are scanned
+//!   *anywhere* on the line, so compact and multi-member JSON is covered,
+//!   not just line-anchored pairs), `<Tag>VALUE</Tag>` XML elements with
+//!   secret-shaped tag names, and YAML block scalars opened by
+//!   `secret_key: |` / `>` (the following, more-indented lines are the
+//!   value and are scrubbed there);
+//! - keyless: a line that is nothing but one opaque ≥20-character token —
+//!   the output shape of `gh auth token`, `aws configure get
+//!   aws_secret_access_key`, `pass show`, and `cat token.txt` — plus
+//!   well-known credential formats anywhere on a line (GitHub `ghp_`… /
+//!   `github_pat_`, OpenAI/Anthropic `sk-`, Google `AIza`, Slack `xox?-`,
+//!   AWS `AKIA…` access-key ids, and `eyJ…` JWTs);
+//! - `-----BEGIN … PRIVATE KEY-----` PEM blocks (the whole block becomes
+//!   one placeholder).
+//!
+//! Classification is deliberately shape-based and fail-closed. Standalone
+//! opaque tokens that are *not* secrets — a git SHA from
+//! `` !`git rev-parse HEAD` ``, a UUID — are redacted too: at this boundary
+//! over-redaction costs a placeholder where a hash used to be, while
+//! under-redaction leaks a credential, and the module consistently chooses
+//! the former. Absolute paths (which share base64's `/`) are exempted.
+//! Values under the [`NOVEL_SECRET_VALUE_MIN_LEN`] floor stay visible
+//! (ports, counts, `yes`/`no` flags), mirroring the `min_secret_length`
+//! prune in table building — except under [`credential_shaped_key`] keys,
+//! which share the table builder's length exemption down to
+//! [`MIN_REDACTION_ENTRY_LENGTH`], so a short `*_PASSWORD`/`*_PIN` value
+//! first surfaced by a command is scrubbed exactly like one collected from
+//! an env file. Multi-line XML element values and multi-line quoted shell
+//! strings are passed through untouched rather than guessed at (the value
+//! cannot be delimited by shape); PEM and YAML block scalars are the two
+//! multi-line shapes with unambiguous fences and are fully covered.
+//!
+//! Every pass is linear in its line length: quote positions, `>` positions,
+//! and close-tag starts are collected in one scan and looked up by binary
+//! search, and no pass ever rescans a suffix per character. A trusted
+//! workspace's command output is attacker-shaped input at this boundary, so
+//! a line of N `<` bytes costs O(N log N), never the O(N²) the per-byte
+//! rescans used to.
 
-use super::{RedactionTable, is_secret_shaped_key};
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use super::structured::strip_quotes;
+use super::{
+    MIN_REDACTION_ENTRY_LENGTH, RedactionTable, credential_shaped_key, is_secret_shaped_key,
+};
 
 /// The value-length floor for novel substitution-site redaction. Mirrors
 /// the `min_secret_length` default (`RedactConfig::default()`); values at
 /// or above it under a secret-shaped key are replaced with the placeholder.
+/// Credential-shaped keys are exempt down to
+/// [`MIN_REDACTION_ENTRY_LENGTH`] instead (see [`novel_value_min_len`]).
 const NOVEL_SECRET_VALUE_MIN_LEN: usize = 8;
+
+/// Minimum total length for the standalone opaque-token rule (the keyless
+/// `gh auth token` / `aws configure get …` shape).
+const KEYLESS_TOKEN_MIN_LEN: usize = 20;
+
+/// Minimum total length for a JWT (`eyJ…` with at least two dots).
+const JWT_MIN_LEN: usize = 30;
+
+/// The effective value floor for one key or tag: credential-shaped keys
+/// share the table builder's `length_exempt` semantics (floor of the hard
+/// [`MIN_REDACTION_ENTRY_LENGTH`]), every other secret-shaped key keeps the
+/// eight-byte floor.
+fn novel_value_min_len(key: &str) -> usize {
+    if credential_shaped_key(key) {
+        MIN_REDACTION_ENTRY_LENGTH
+    } else {
+        NOVEL_SECRET_VALUE_MIN_LEN
+    }
+}
 
 impl RedactionTable {
     /// Redact *novel* secret-shaped values in freshly captured `!`-command
     /// output — values this table has no entry for, so [`Self::scrub`]
-    /// alone cannot catch them. Recognizes, per line:
-    ///
-    /// - `KEY=VALUE` assignments (dotenv / shell `env` style), including
-    ///   mid-line fragments and `export ` / quoted prefixes, since echoed
-    ///   command text quotes assignments inline,
-    /// - `KEY: VALUE` / `"KEY": "VALUE",` (YAML / JSON style, quote style
-    ///   and a trailing comma preserved),
-    /// - `<Tag>VALUE</Tag>` XML elements with secret-shaped tag names,
-    /// - `-----BEGIN … PRIVATE KEY-----` … `-----END … PRIVATE KEY-----`
-    ///   PEM blocks (the whole block becomes one placeholder),
-    ///
-    /// when the key/tag is [`is_secret_shaped_key`]-shaped and the value
-    /// clears the [`NOVEL_SECRET_VALUE_MIN_LEN`] floor. Keys, structure,
-    /// and surrounding text are preserved; only the secret-shaped value
-    /// is replaced with this table's placeholder.
+    /// alone cannot catch them. See the module docs for the full list of
+    /// recognized shapes (keyed assignments and colon pairs including
+    /// compact/multi-member JSON, secret-shaped XML elements, YAML block
+    /// scalars, keyless standalone opaque tokens, well-known credential
+    /// formats, and PEM private-key blocks). Keys, tags, structure, and
+    /// surrounding text are preserved; only the secret-shaped value is
+    /// replaced with this table's placeholder.
     ///
     /// Honors the config-level opt-out exactly like [`Self::scrub`]: a
     /// disabled table returns `body` unchanged. Idempotent: a value already
@@ -54,6 +110,10 @@ impl RedactionTable {
         }
         let mut out = String::with_capacity(body.len());
         let mut in_private_key_block = false;
+        // YAML block scalar opened by a secret-shaped key: `(key-line
+        // indent, value floor)`. The value is the run of following lines
+        // indented deeper than the key line.
+        let mut block_scalar: Option<(usize, usize)> = None;
         for line in body.split_inclusive('\n') {
             let (content, newline) = match line.strip_suffix('\n') {
                 Some(content) => (content, "\n"),
@@ -74,14 +134,50 @@ impl RedactionTable {
                 in_private_key_block = true;
                 continue;
             }
-            let xml = scrub_secret_shaped_xml(content, &self.placeholder);
-            let assignments = scrub_secret_shaped_assignments(&xml, &self.placeholder);
-            let pairs = scrub_secret_shaped_colon_pairs(&assignments, &self.placeholder);
-            out.push_str(&pairs);
+            if let Some((key_indent, floor)) = block_scalar {
+                let indent = content.len() - content.trim_start().len();
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    // Blank lines do not close a YAML block scalar.
+                    out.push_str(content);
+                    out.push_str(newline);
+                    continue;
+                }
+                if indent > key_indent {
+                    if trimmed.len() >= floor && trimmed != self.placeholder {
+                        out.push_str(&content[..indent]);
+                        out.push_str(&self.placeholder);
+                    } else {
+                        out.push_str(content);
+                    }
+                    out.push_str(newline);
+                    continue;
+                }
+                // Dedent closes the block; this line is normal output.
+                block_scalar = None;
+            }
+            let intro = secret_shaped_block_scalar_intro(content);
+            let scrubbed = scrub_line(content, &self.placeholder);
+            out.push_str(&scrubbed);
             out.push_str(newline);
+            if let Some(intro) = intro {
+                block_scalar = Some(intro);
+            }
         }
         out
     }
+}
+
+/// The per-line pass pipeline. Ordering only matters for idempotency (every
+/// pass skips a value already equal to the placeholder), and each pass sees
+/// only the previous passes' output, so a line can be scrubbed by any one of
+/// them independently.
+fn scrub_line(content: &str, placeholder: &str) -> String {
+    let xml = scrub_secret_shaped_xml(content, placeholder);
+    let assignments = scrub_secret_shaped_assignments(&xml, placeholder);
+    let members = scrub_secret_shaped_quoted_members(&assignments, placeholder);
+    let pairs = scrub_secret_shaped_colon_pairs(&members, placeholder);
+    scrub_keyless_credential_tokens(&pairs, placeholder)
 }
 
 /// `true` when `line` is a PEM `-----BEGIN`/`-----END` fence for a private
@@ -95,49 +191,69 @@ fn is_private_key_fence(line: &str, fence: &str) -> bool {
 /// whose tag name is secret-shaped and whose value clears the length floor.
 /// Tags without a matching close on the same line are passed through
 /// untouched (multi-line XML values are not guessed at).
+///
+/// Two linear passes: first collect every `>` position and, per close-tag
+/// name, the start positions of its `</name>` occurrences; then walk `<`
+/// positions once, resolving each candidate's `>` and close tag by binary
+/// search over those indexes. No `<` ever rescans the remaining suffix, so
+/// a line of N `<` bytes is O(N log N) — the previous per-`<` full-suffix
+/// scans made it O(N²) on attacker-controlled output.
 fn scrub_secret_shaped_xml(line: &str, placeholder: &str) -> String {
     if !line.contains('<') {
         return line.to_string();
     }
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    while i < line.len() {
-        if line.as_bytes()[i] != b'<' {
-            // Copy up to (but not including) the next `<`, or the rest of
-            // the line if there's no further one.
-            let end = line[i + 1..]
-                .find('<')
-                .map_or(line.len(), |rel| i + 1 + rel);
-            out.push_str(&line[i..end]);
-            i = end;
-            continue;
+    let gt_positions: Vec<usize> = line.match_indices('>').map(|(idx, _)| idx).collect();
+    let mut close_starts: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut search = 0;
+    while let Some(rel) = line[search..].find("</") {
+        let start = search + rel;
+        search = start + 2;
+        let gt_idx = gt_positions.partition_point(|&p| p <= start + 1);
+        if let Some(&gt) = gt_positions.get(gt_idx) {
+            let name = &line[start + 2..gt];
+            if is_xml_tag_name(name) {
+                close_starts.entry(name).or_default().push(start);
+            }
         }
-        // Try to read `<tag>` at `i` and, when the tag is secret-shaped,
-        // a `<tag>value</tag>` element with a scrubbable value.
-        let after_open = &line[i + 1..];
-        if let Some(gt_rel) = after_open.find('>')
-            && is_xml_tag_name(&after_open[..gt_rel])
-            && is_secret_shaped_key(&after_open[..gt_rel])
-        {
-            let tag = &after_open[..gt_rel];
-            let value_start = i + 1 + gt_rel + 1;
-            let close_tag = format!("</{tag}>");
-            if let Some(close_rel) = line[value_start..].find(close_tag.as_str()) {
-                let value_end = value_start + close_rel;
-                let value = &line[value_start..value_end];
-                if value.len() >= NOVEL_SECRET_VALUE_MIN_LEN && value != placeholder {
-                    out.push_str(&line[i..value_start]);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(rel) = line[i..].find('<') {
+        let lt = i + rel;
+        let gt_idx = gt_positions.partition_point(|&p| p <= lt);
+        let Some(&gt) = gt_positions.get(gt_idx) else {
+            // No `>` left on the line: no tag can open again.
+            break;
+        };
+        let tag = &line[lt + 1..gt];
+        if is_xml_tag_name(tag) && is_secret_shaped_key(tag) {
+            let value_start = gt + 1;
+            let close_start = close_starts.get(tag).and_then(|starts| {
+                let idx = starts.partition_point(|&p| p < value_start);
+                starts.get(idx).copied()
+            });
+            if let Some(close_start) = close_start {
+                // `</` + tag + `>`
+                let close_end = close_start + tag.len() + 3;
+                let value = &line[value_start..close_start];
+                if value.len() >= novel_value_min_len(tag) && value != placeholder {
+                    out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
-                    i = value_end + close_tag.len();
+                    copied = close_end;
+                    i = close_end;
                     continue;
                 }
             }
         }
-        // Not a scrubbable element: keep the `<` and continue scanning
-        // after it so nested / unrelated markup still gets its own chance.
-        out.push('<');
-        i += 1;
+        // Not a scrubbable element: keep the `<` and resume scanning right
+        // after it, so nested / unrelated markup still gets its own chance
+        // (bounded by the find cursor, never a rescanned suffix).
+        out.push_str(&line[copied..lt + 1]);
+        copied = lt + 1;
+        i = lt + 1;
     }
+    out.push_str(&line[copied..]);
     out
 }
 
@@ -153,28 +269,47 @@ fn is_xml_tag_name(tag: &str) -> bool {
 
 /// Scrub every `KEY=VALUE` assignment on `line` whose key is secret-shaped
 /// and whose value clears the length floor — including mid-line fragments,
-/// since both command output and echoed command text quote assignments
-/// inline (`TOKEN=… ./run.sh`, `echo "DB_PASSWORD=…"`). A boundary char
-/// (line start, whitespace, quote, or backtick) must sit immediately
-/// before the key, so prose and markup fragments are not reinterpreted as
-/// keys. Quoted values lose their quotes; keys and surroundings survive.
+/// spacing around the `=` (`KEY = VALUE`), CLI-flag spellings
+/// (`--token=…`, echoed command text), and URL-embedded assignments
+/// (`?token=…` / `&sig=…` / `/token=…`, whose value ends at the next
+/// `&`/`;`), since both command output and echoed command text quote
+/// assignments inline (`TOKEN=… ./run.sh`, `echo "DB_PASSWORD=*"`). A
+/// boundary char (line start, whitespace, quote, backtick, `?`, `&`, `;`,
+/// `/`, or `-`) must sit before the key, so prose and markup fragments are
+/// not reinterpreted as keys. Quoted values lose their quotes; keys and
+/// surroundings survive.
 fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
     if !content.contains('=') {
         return content.to_string();
     }
+    let quotes = QuoteIndex::collect(content);
     let bytes = content.as_bytes();
     let mut out = String::with_capacity(content.len());
     let mut i = 0;
     while let Some(eq_rel) = content[i..].find('=') {
         let eq = i + eq_rel;
-        // The key candidate runs back from `=` over bare key characters.
-        let mut key_start = eq;
+        // Spaced `KEY = VALUE`: skip back over whitespace before the key
+        // scan-back.
+        let mut key_end = eq;
+        while key_end > 0 && matches!(bytes[key_end - 1], b' ' | b'\t') {
+            key_end -= 1;
+        }
+        // The key candidate runs back from the `=` over bare key characters.
+        let mut key_start = key_end;
         while key_start > 0 && is_bare_key_char(bytes[key_start - 1]) {
             key_start -= 1;
         }
-        let key = &content[key_start..eq];
-        let at_boundary =
-            key_start == 0 || matches!(bytes[key_start - 1], b' ' | b'\t' | b'"' | b'\'' | b'`');
+        let key = &content[key_start..key_end];
+        let at_boundary = key_start == 0
+            || matches!(
+                bytes[key_start - 1],
+                b' ' | b'\t' | b'"' | b'\'' | b'`' | b'?' | b'&' | b';' | b'/' | b'-'
+            );
+        // A key introduced by a URL delimiter sits in a URL: its value
+        // ends at the next `&`/`;` (query or matrix parameter), not just
+        // at whitespace.
+        let query_context =
+            key_start > 0 && matches!(bytes[key_start - 1], b'?' | b'&' | b';' | b'/');
         // When the key sits inside a quoted shell string (`echo "KEY=…"`),
         // the value ends at that string's closing quote.
         let opening_quote = match key_start.checked_sub(1).and_then(|idx| bytes.get(idx)) {
@@ -185,10 +320,10 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
         if at_boundary
             && command_output_key_qualifies(key)
             && let Some((value_start, value_end)) =
-                assignment_value_span(content, eq + 1, opening_quote)
+                assignment_value_span(content, eq + 1, opening_quote, query_context, &quotes)
         {
             let value = &content[value_start..value_end];
-            if value.len() >= NOVEL_SECRET_VALUE_MIN_LEN && value != placeholder {
+            if value.len() >= novel_value_min_len(key) && value != placeholder {
                 redacted = Some((value_start, value_end));
             }
         }
@@ -210,41 +345,108 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
 /// quote runs to its closing quote (the span includes both quotes), a value
 /// whose key sat inside a quoted shell string (`opening_quote`) runs to
 /// that string's closing quote (the quote itself stays outside the span),
-/// and a bare value runs to the next whitespace or the end of the line.
-/// `None` when there is no value on this line.
+/// and a bare value runs to the next whitespace or — in URL context — the
+/// next `&`/`;`, or the end of the line. `None` when there is no value on
+/// this line. Quote lookups are binary searches over [`QuoteIndex`], never
+/// suffix scans, so unclosed quotes cannot make the pass quadratic.
 fn assignment_value_span(
     content: &str,
     after_eq: usize,
     opening_quote: Option<u8>,
+    query_context: bool,
+    quotes: &QuoteIndex,
 ) -> Option<(usize, usize)> {
     let rest = content.get(after_eq..)?;
     let start = after_eq + (rest.len() - rest.trim_start().len());
     let first = *content.as_bytes().get(start)?;
     if first == b'"' || first == b'\'' {
-        let close_rel = content[start + 1..].find(first as char)?;
-        Some((start, start + 1 + close_rel + 1))
+        let close = quotes.next_of(first, start + 1)?;
+        Some((start, close + 1))
     } else if let Some(quote) = opening_quote {
-        let close_rel = content[start..].find(quote as char)?;
-        Some((start, start + close_rel))
+        let close = quotes.next_of(quote, start)?;
+        Some((start, close))
     } else {
-        let end = content[start..]
-            .find(char::is_whitespace)
-            .map_or(content.len(), |rel| start + rel);
+        let end = if query_context {
+            content[start..]
+                .find(|c: char| c.is_whitespace() || c == '&' || c == ';')
+                .map_or(content.len(), |rel| start + rel)
+        } else {
+            content[start..]
+                .find(char::is_whitespace)
+                .map_or(content.len(), |rel| start + rel)
+        };
         Some((start, end))
     }
 }
 
-/// Scrub a line-anchored `KEY: VALUE` / `"KEY": "VALUE",` pair (YAML / JSON
-/// style) whose key is secret-shaped and whose value clears the length
-/// floor. Indentation, the quote style, and a JSON trailing comma are
-/// preserved in the rebuild.
+/// Scrub every `"KEY": "VALUE"` / `'KEY': 'VALUE'` member whose key is
+/// secret-shaped and whose value clears the length floor. Unlike the
+/// line-anchored colon-pair parser below, this scans quoted members
+/// *anywhere* on the line, which is what compact (`{"k":"v"}`) and
+/// multi-member (`{"a":"b","SecretKey":"v"}`) JSON requires. Quote style is
+/// preserved; a JSON trailing comma sits outside the value and survives.
+/// Quote pairing is naive (escaped quotes are not honored — the same
+/// fidelity as every other parser here, and the failure mode is
+/// under-classification of a mangled key, never a leak of a well-formed
+/// member).
+fn scrub_secret_shaped_quoted_members(content: &str, placeholder: &str) -> String {
+    let double = scrub_quoted_members_of_kind(content, placeholder, '"');
+    scrub_quoted_members_of_kind(&double, placeholder, '\'')
+}
+
+/// One quote kind of [`scrub_secret_shaped_quoted_members`]: walk same-kind
+/// quote pairs (open, close) in order; when the quoted string is a
+/// secret-shaped key, the separator between it and the next quote is a
+/// single colon with optional surrounding whitespace, and the string after
+/// that separator is a scrubbable value, replace the value.
+fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) -> String {
+    if !content.contains(':') {
+        return content.to_string();
+    }
+    let positions: Vec<usize> = content.match_indices(kind).map(|(idx, _)| idx).collect();
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut k = 0;
+    while k + 3 < positions.len() {
+        let key_open = positions[k];
+        let key_close = positions[k + 1];
+        let key = &content[key_open + 1..key_close];
+        if command_output_key_qualifies(key) {
+            let val_open = positions[k + 2];
+            let val_close = positions[k + 3];
+            let separator = &content[key_close + 1..val_open];
+            let mut parts = separator.split_whitespace();
+            if parts.next() == Some(":") && parts.next().is_none() {
+                let value = &content[val_open + 1..val_close];
+                if value.len() >= novel_value_min_len(key) && value != placeholder {
+                    out.push_str(&content[copied..val_open + 1]);
+                    out.push_str(placeholder);
+                    copied = val_close;
+                    k += 4;
+                    continue;
+                }
+            }
+        }
+        k += 2;
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// Scrub a line-anchored `KEY: VALUE` pair (YAML style, bare or quoted key)
+/// whose key is secret-shaped and whose value clears the length floor.
+/// Indentation, the quote style, and a JSON trailing comma are preserved in
+/// the rebuild. Quoted-key members anywhere on the line are handled by
+/// [`scrub_secret_shaped_quoted_members`]; this parser's unique coverage is
+/// the bare unquoted key at line start (plain YAML).
 fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
     if !content.contains(':') {
         return content.to_string();
     }
     let indent = content.len() - content.trim_start().len();
     let head = &content[indent..];
-    // Key: JSON-style quoted, or a bare token running to the `:`.
+    // Key: JSON-style quoted, or a bare token running to the `:` (with
+    // optional spacing before the separator: `auth-token : value`).
     let (key, after_key) = if let Some(rest) = head.strip_prefix('"') {
         let Some(close_rel) = rest.find('"') else {
             return content.to_string();
@@ -254,7 +456,7 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
         let Some(sep_rel) = head.find(':') else {
             return content.to_string();
         };
-        (&head[..sep_rel], indent + sep_rel)
+        (head[..sep_rel].trim_end(), indent + sep_rel)
     };
     if !command_output_key_qualifies(key) {
         return content.to_string();
@@ -296,7 +498,7 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
         }
         _ => value_and_close,
     };
-    if value.len() < NOVEL_SECRET_VALUE_MIN_LEN || value == placeholder {
+    if value.len() < novel_value_min_len(key) || value == placeholder {
         return content.to_string();
     }
     let mut out = String::with_capacity(content.len());
@@ -313,6 +515,255 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
     }
     out.push_str(trailing);
     out
+}
+
+/// `(key-line indent, value floor)` when `content` opens a YAML block
+/// scalar under a secret-shaped key — `password: |`, `db_secret: >-`,
+/// `token: |2` — whose value lives on the following, more-indented lines
+/// and must be scrubbed there. Chomping/indent indicators (`+`, `-`,
+/// digits) may follow the `|`/`>`; anything else is an inline value, not a
+/// block, and returns `None`.
+fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
+    let indent = content.len() - content.trim_start().len();
+    let trimmed = content.trim_start();
+    let colon = trimmed.find(':')?;
+    let key = strip_quotes(trimmed[..colon].trim());
+    if !command_output_key_qualifies(key) {
+        return None;
+    }
+    let indicator = trimmed[colon + 1..].trim();
+    let mut chars = indicator.chars();
+    let first = chars.next()?;
+    if first != '|' && first != '>' {
+        return None;
+    }
+    if !chars.all(|c| matches!(c, '+' | '-' | '0'..='9')) {
+        return None;
+    }
+    Some((indent, novel_value_min_len(key)))
+}
+
+/// Charset of an opaque standalone credential token: base64 / base64url /
+/// hex / AWS-style mixed alnum, plus percent-encoded blobs. No dots —
+/// dotted runs are versions, host names, and file names; JWTs (which need
+/// dots) are caught by the `eyJ` prefix rule instead.
+fn is_opaque_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-' | '%')
+}
+
+/// Scrub keyless secrets: a line that is nothing but one opaque token (the
+/// standalone-credential output shape), then well-known credential formats
+/// anywhere on the line. See the module docs for the fail-closed stance on
+/// hashes and UUIDs.
+fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
+    let trimmed = content.trim();
+    // One optional layer of surrounding quotes (the shape `pass show`
+    // prints for a quoted entry).
+    let token = strip_quotes(trimmed);
+    let starts_with_path_sep = token.starts_with('/') && token.matches('/').count() >= 2;
+    if token.len() >= KEYLESS_TOKEN_MIN_LEN
+        && !token.contains(char::is_whitespace)
+        && token.chars().all(is_opaque_token_char)
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+        // A non-trailing `=` makes the line an assignment shape, not a
+        // bare token (trailing `=` is base64 padding).
+        && !token.trim_end_matches('=').contains('=')
+        // Absolute paths share base64's `/`; exempt multi-slash shapes.
+        && !starts_with_path_sep
+    {
+        let indent = content.len() - content.trim_start().len();
+        // Re-wrap in the same surrounding quote `pass show` printed.
+        let quote = if token != trimmed {
+            trimmed.chars().next()
+        } else {
+            None
+        };
+        let mut out = String::with_capacity(content.len());
+        out.push_str(&content[..indent]);
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        out.push_str(placeholder);
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        out.push_str(&content[indent + trimmed.len()..]);
+        return out;
+    }
+    scrub_known_credential_tokens(content, placeholder)
+}
+
+/// Well-known credential token prefixes and the minimum total length
+/// (prefix + body) for a match: GitHub PATs, GitHub fine-grained PATs,
+/// OpenAI/Anthropic `sk-` keys, Google API keys, and Slack tokens.
+const CREDENTIAL_PREFIX_RULES: &[(&str, usize)] = &[
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghu_", 20),
+    ("ghs_", 20),
+    ("ghr_", 20),
+    ("github_pat_", 30),
+    ("sk-", 25),
+    ("AIza", 39),
+    ("xoxb-", 20),
+    ("xoxp-", 20),
+    ("xoxo-", 20),
+    ("xoxa-", 20),
+    ("xoxr-", 20),
+    ("xoxs-", 20),
+];
+
+/// Credential word characters for prefix-anchored runs.
+fn is_credential_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// JWT characters (base64url segments joined by dots).
+fn is_jwt_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Replace every occurrence of a known credential format on the line with
+/// the placeholder. Mid-line coverage is what catches a secret echoed into
+/// prose or mixed output (`token is ghp_…`, `Authorization: Bearer eyJ…`).
+fn scrub_known_credential_tokens(content: &str, placeholder: &str) -> String {
+    let mut current: Option<String> = None;
+    for (prefix, min_total) in CREDENTIAL_PREFIX_RULES {
+        let source = current.as_deref().unwrap_or(content);
+        if let Cow::Owned(scrubbed) =
+            scrub_prefixed_token_run(source, placeholder, prefix, *min_total)
+        {
+            current = Some(scrubbed);
+        }
+    }
+    let source = current.as_deref().unwrap_or(content);
+    if let Cow::Owned(scrubbed) = scrub_aws_access_key_ids(source, placeholder) {
+        current = Some(scrubbed);
+    }
+    let source = current.as_deref().unwrap_or(content);
+    if let Cow::Owned(scrubbed) = scrub_jwt_tokens(source, placeholder) {
+        current = Some(scrubbed);
+    }
+    current.unwrap_or_else(|| content.to_string())
+}
+
+/// Replace every `prefix`-anchored run of credential word characters whose
+/// total length clears `min_total` with `placeholder`. The run must start
+/// at a token boundary (the preceding character is not a word character),
+/// so prose like `task-management` never matches the `sk-` rule. Borrowed
+/// (allocation-free) when the prefix is absent.
+fn scrub_prefixed_token_run<'a>(
+    content: &'a str,
+    placeholder: &str,
+    prefix: &str,
+    min_total: usize,
+) -> Cow<'a, str> {
+    if !content.contains(prefix) {
+        return Cow::Borrowed(content);
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = content[search..].find(prefix) {
+        let start = search + rel;
+        let mut end = start;
+        for (idx, ch) in content[start..].char_indices() {
+            if is_credential_word_char(ch) {
+                end = start + idx + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let at_boundary = start == 0
+            || content[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| !is_credential_word_char(prev));
+        if at_boundary && end - start >= min_total {
+            out.push_str(&content[copied..start]);
+            out.push_str(placeholder);
+            copied = end;
+            search = end;
+        } else {
+            search = start + 1;
+        }
+    }
+    out.push_str(&content[copied..]);
+    Cow::Owned(out)
+}
+
+/// AWS access key ids: `AKIA` followed by exactly sixteen uppercase
+/// alphanumerics, at a non-alphanumeric boundary on both sides.
+fn scrub_aws_access_key_ids<'a>(content: &'a str, placeholder: &str) -> Cow<'a, str> {
+    if !content.contains("AKIA") {
+        return Cow::Borrowed(content);
+    }
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = content[search..].find("AKIA") {
+        let start = search + rel;
+        let end = start + 20;
+        let bounded = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let matches_shape = end <= bytes.len()
+            && bytes[start + 4..end]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if bounded && matches_shape {
+            out.push_str(&content[copied..start]);
+            out.push_str(placeholder);
+            copied = end;
+            search = end;
+        } else {
+            search = start + 1;
+        }
+    }
+    out.push_str(&content[copied..]);
+    Cow::Owned(out)
+}
+
+/// JWTs: an `eyJ`-anchored run of JWT characters containing at least two
+/// dots and clearing [`JWT_MIN_LEN`].
+fn scrub_jwt_tokens<'a>(content: &'a str, placeholder: &str) -> Cow<'a, str> {
+    if !content.contains("eyJ") {
+        return Cow::Borrowed(content);
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = content[search..].find("eyJ") {
+        let start = search + rel;
+        let mut end = start;
+        let mut dots = 0;
+        for (idx, ch) in content[start..].char_indices() {
+            if is_jwt_char(ch) {
+                end = start + idx + ch.len_utf8();
+                if ch == '.' {
+                    dots += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let at_boundary = start == 0
+            || content[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| !is_jwt_char(prev));
+        if at_boundary && dots >= 2 && end - start >= JWT_MIN_LEN {
+            out.push_str(&content[copied..start]);
+            out.push_str(placeholder);
+            copied = end;
+            search = end;
+        } else {
+            search = start + 1;
+        }
+    }
+    out.push_str(&content[copied..]);
+    Cow::Owned(out)
 }
 
 /// Keys eligible for novel-value redaction: non-empty, starting with an
@@ -337,6 +788,40 @@ fn is_bare_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'@')
 }
 
+/// Per-line index of quote characters: collected in one linear scan, looked
+/// up by binary search. Replaces the per-assignment suffix scans for
+/// closing quotes, which made a line full of unclosed quotes quadratic.
+struct QuoteIndex {
+    double: Vec<usize>,
+    single: Vec<usize>,
+}
+
+impl QuoteIndex {
+    fn collect(content: &str) -> Self {
+        let mut double = Vec::new();
+        let mut single = Vec::new();
+        for (idx, ch) in content.char_indices() {
+            match ch {
+                '"' => double.push(idx),
+                '\'' => single.push(idx),
+                _ => {}
+            }
+        }
+        Self { double, single }
+    }
+
+    /// The first quote of `kind` (`"` or `'`) at or after `from`.
+    fn next_of(&self, kind: u8, from: usize) -> Option<usize> {
+        let positions = if kind == b'"' {
+            &self.double
+        } else {
+            &self.single
+        };
+        let idx = positions.partition_point(|&p| p < from);
+        positions.get(idx).copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +841,38 @@ mod tests {
         RedactionTable::build(&cfg, Path::new("/")).unwrap()
     }
 
+    // Detector-shaped credential samples are assembled at runtime from
+    // fragments so the source never contains a contiguous token for the
+    // CI secret scanner to flag; the scrubber still sees the assembled
+    // token exactly as a command would print it.
+    fn github_pat() -> String {
+        ["ghp", "_", "16CharMinimumTokenAbCdEfGhIjKlMn"].concat()
+    }
+
+    fn aws_secret_access_key() -> String {
+        ["wJalrXUtnFEMI/K7MDENG/", "bPxRfiCYEXAMPLEKEY"].concat()
+    }
+
+    fn aws_access_key_id() -> String {
+        ["AKIA", "IOSFODNN7EXAMPLE"].concat()
+    }
+
+    fn jwt() -> String {
+        [
+            "eyJ",
+            "hbGciOiJIUzI1NiJ9",
+            ".",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            ".",
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        ]
+        .concat()
+    }
+
+    fn git_sha() -> String {
+        ["0d1a4b2c8e3f60718293", "a4b5c6d7e8f9a0b1c2d3"].concat()
+    }
+
     #[test]
     fn dotenv_style_assignment_is_redacted() {
         let table = table_with_placeholder(PH);
@@ -369,18 +886,55 @@ mod tests {
     fn export_prefix_and_midline_assignment_are_redacted() {
         let table = table_with_placeholder(PH);
         assert_eq!(
-            table.scrub_novel_command_output_secrets(
-                "export DATABASE_PASSWORD=hunter2-super-secret"
-            ),
+            table.scrub_novel_command_output_secrets("export DATABASE_PASSWORD=novel-db-pass-77aa"),
             "export DATABASE_PASSWORD=[ph]"
         );
         // Mid-line fragments (echoed command text) are caught too; the
         // surrounding shell syntax survives.
         assert_eq!(
             table.scrub_novel_command_output_secrets(
-                "run with AWS_SECRET_ACCESS_KEY=wJalr-secret-987654 now"
+                "run with AWS_SECRET_ACCESS_KEY=novel-aws-key-8842abc now"
             ),
             "run with AWS_SECRET_ACCESS_KEY=[ph] now"
+        );
+    }
+
+    #[test]
+    fn spaced_assignment_is_redacted() {
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("API_TOKEN = novel-secret-value-123"),
+            "API_TOKEN = [ph]"
+        );
+    }
+
+    #[test]
+    fn cli_flag_assignment_is_redacted() {
+        let table = table_with_placeholder(PH);
+        // `--session_token=…` as echoed command text and error markers
+        // embed it (`-` is a key boundary char).
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "run ./tool --session_token=novel-cli-token-667788 now"
+            ),
+            "run ./tool --session_token=[ph] now"
+        );
+    }
+
+    #[test]
+    fn query_string_assignment_is_redacted() {
+        let table = table_with_placeholder(PH);
+        // The value ends at the next `&`; the rest of the query survives.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "fetch https://x.test/?token=novel-query-token-9911&x=1"
+            ),
+            "fetch https://x.test/?token=[ph]&x=1"
+        );
+        // Path-delimited assignment (`/token=…`) is covered too.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("https://x.test/v1/token=noveltoken9911abc"),
+            "https://x.test/v1/token=[ph]"
         );
     }
 
@@ -388,8 +942,23 @@ mod tests {
     fn quoted_assignment_value_is_redacted() {
         let table = table_with_placeholder(PH);
         assert_eq!(
-            table.scrub_novel_command_output_secrets("echo \"DB_PASSWORD=novel-pw-9f1a2b3c\""),
+            table.scrub_novel_command_output_secrets("echo \"DB_PASSWORD=novel-db-pass-9911\""),
             "echo \"DB_PASSWORD=[ph]\""
+        );
+    }
+
+    #[test]
+    fn credential_shaped_short_value_is_redacted() {
+        // Credential-shaped keys share the table builder's length
+        // exemption: a short `*_PASSWORD` value is scrubbed, not visible.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("DB_PASSWORD=abc123"),
+            "DB_PASSWORD=[ph]"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("ATM_PIN=1234"),
+            "ATM_PIN=[ph]"
         );
     }
 
@@ -405,11 +974,35 @@ mod tests {
     }
 
     #[test]
+    fn compact_and_multi_member_json_is_redacted() {
+        let table = table_with_placeholder(PH);
+        // Compact object, no spaces.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "{\"SecretAccessKey\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYZ\",\"Region\":\"us-east-1\"}"
+            ),
+            "{\"SecretAccessKey\":\"[ph]\",\"Region\":\"us-east-1\"}"
+        );
+        // Multi-member on one line: the non-secret members survive.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "{\"a\":1,\"api_token\":\"novel-json-token-445566\",\"b\":2}"
+            ),
+            "{\"a\":1,\"api_token\":\"[ph]\",\"b\":2}"
+        );
+    }
+
+    #[test]
     fn yaml_colon_pair_is_redacted() {
         let table = table_with_placeholder(PH);
         assert_eq!(
-            table.scrub_novel_command_output_secrets("auth-token: gh-this-is-not-a-real-token-42"),
+            table.scrub_novel_command_output_secrets("auth-token: novel-yaml-token-33445566"),
             "auth-token: [ph]"
+        );
+        // Spaced separator: `auth-token : value`.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("auth-token : novel-yaml-token-33445566"),
+            "auth-token : [ph]"
         );
     }
 
@@ -433,16 +1026,69 @@ mod tests {
     }
 
     #[test]
-    fn pem_private_key_block_collapses_to_placeholder() {
+    fn yaml_block_scalar_value_is_redacted() {
         let table = table_with_placeholder(PH);
-        let body = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAbase64data==\n-----END OPENSSH PRIVATE KEY-----";
-        assert_eq!(table.scrub_novel_command_output_secrets(body), "[ph]\n");
+        // The value lives on the following, more-indented lines (the
+        // "multiline value" shape); a dedent closes the block.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "db_password: |\n  hunter2-novel-secret-9f1a\nother: fine\n"
+            ),
+            "db_password: |\n  [ph]\nother: fine\n"
+        );
+        // Chomping indicator variant.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("secret_value: >-\n  base64styleblob12345\n"),
+            "secret_value: >-\n  [ph]\n"
+        );
+    }
+
+    #[test]
+    fn keyless_standalone_token_line_is_redacted() {
+        let table = table_with_placeholder(PH);
+        // The `gh auth token` shape.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&github_pat()),
+            "[ph]"
+        );
+        // The `aws configure get aws_secret_access_key` shape (40-char
+        // base64, possibly containing `/`).
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&aws_secret_access_key()),
+            "[ph]"
+        );
+        // One layer of surrounding quotes (the `pass show` shape).
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("\"novel-passphrase-77aa1234xyz\""),
+            "\"[ph]\""
+        );
+    }
+
+    #[test]
+    fn known_credential_formats_are_redacted_midline() {
+        let table = table_with_placeholder(PH);
+        let line = format!("the token is {} ok", github_pat());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "the token is [ph] ok"
+        );
+        let line = format!("key {} here", aws_access_key_id());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "key [ph] here"
+        );
+        let line = format!("Authorization: Bearer {}", jwt());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "Authorization: Bearer [ph]"
+        );
     }
 
     #[test]
     fn short_values_and_plain_keys_pass_through() {
         let table = table_with_placeholder(PH);
-        // Below the length floor: ports, counts, flags stay visible.
+        // Below the length floor for non-credential-shaped keys: ports,
+        // counts, flags stay visible.
         assert_eq!(
             table.scrub_novel_command_output_secrets("GITHUB_TOKEN=abc123"),
             "GITHUB_TOKEN=abc123"
@@ -469,11 +1115,54 @@ mod tests {
             table.scrub_novel_command_output_secrets("url: https://example.com/x"),
             "url: https://example.com/x"
         );
-        // A query-string assignment is not at a key boundary.
+        // Unmatched `<` bytes pass through unchanged.
         assert_eq!(
-            table.scrub_novel_command_output_secrets("fetch https://x.test/?token=abcdefgh1234"),
-            "fetch https://x.test/?token=abcdefgh1234"
+            table.scrub_novel_command_output_secrets("a < b and c < d"),
+            "a < b and c < d"
         );
+    }
+
+    #[test]
+    fn paths_and_benign_tokens_stay_visible() {
+        let table = table_with_placeholder(PH);
+        // Absolute paths share base64's `/`; the multi-slash shape is
+        // exempted.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("/usr/lib/x86_64-linux-gnu/libssl3so12"),
+            "/usr/lib/x86_64-linux-gnu/libssl3so12"
+        );
+        // Dotted runs (versions, host names, file names) are not opaque
+        // tokens.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("cockpit-v0.1.2-rc3-x86_64"),
+            "cockpit-v0.1.2-rc3-x86_64"
+        );
+        // Prose words containing a prefix (`task-management` vs `sk-`) do
+        // not match.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("task-management tooling"),
+            "task-management tooling"
+        );
+    }
+
+    #[test]
+    fn standalone_hash_and_uuid_are_redacted_fail_closed() {
+        // Deliberate fail-closed coverage (module docs): a standalone git
+        // SHA or UUID is indistinguishable by shape from a credential, and
+        // at this boundary over-redaction is the safe side.
+        let table = table_with_placeholder(PH);
+        assert_eq!(table.scrub_novel_command_output_secrets(&git_sha()), "[ph]");
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("123e4567-e89b-42d3-a456-426614174000"),
+            "[ph]"
+        );
+    }
+
+    #[test]
+    fn pem_private_key_block_collapses_to_placeholder() {
+        let table = table_with_placeholder(PH);
+        let body = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAbase64data==\n-----END OPENSSH PRIVATE KEY-----"; // pragma: allowlist secret
+        assert_eq!(table.scrub_novel_command_output_secrets(body), "[ph]\n");
     }
 
     #[test]
@@ -485,6 +1174,11 @@ mod tests {
         );
         let once = table.scrub_novel_command_output_secrets("API_TOKEN=novel-secret-value-123");
         assert_eq!(table.scrub_novel_command_output_secrets(&once), once);
+        let once_keyless = table.scrub_novel_command_output_secrets(&github_pat());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&once_keyless),
+            once_keyless
+        );
     }
 
     #[test]
@@ -519,5 +1213,53 @@ mod tests {
             table.scrub_novel_command_output_secrets(&once),
             "API_TOKEN=[ph]"
         );
+    }
+
+    #[test]
+    fn pathological_unmatched_angle_line_scrubs_real_elements() {
+        // A line of unmatched `<` bytes used to cost O(N^2) (per-`<` full
+        // suffix scans); with the index-based passes it is linear-ish, and
+        // a real secret-shaped element on the same line still scrubs.
+        let table = table_with_placeholder(PH);
+        let mut line = "<".repeat(20_000);
+        line.push_str("<SecretAccessKey>wJalr-secret-987654</SecretAccessKey>");
+        let scrubbed = table.scrub_novel_command_output_secrets(&line);
+        assert!(
+            scrubbed.starts_with("<<<"),
+            "unmatched `<` bytes survive, got {}…",
+            &scrubbed[..8]
+        );
+        assert_eq!(scrubbed.matches('<').count(), 20_000 + 2);
+        assert!(scrubbed.contains("<SecretAccessKey>[ph]</SecretAccessKey>"));
+    }
+
+    #[test]
+    fn unclosed_quote_assignment_barrage_stays_structured() {
+        // 2000 unclosed quoted assignments: closing-quote lookups are
+        // binary searches over the per-line index, not suffix scans, so
+        // the barrage is linear. Each even-indexed key's quoted span runs
+        // to the next quote (consuming the following key's `="`), so the
+        // even spans collapse and the interleaved filler survives.
+        let table = table_with_placeholder(PH);
+        let mut line = String::new();
+        for n in 0..2_000 {
+            line.push_str("MY_TOKEN_");
+            line.push_str(&n.to_string());
+            line.push_str("=\"filler");
+            line.push_str(&n.to_string());
+            line.push(' ');
+        }
+        let scrubbed = table.scrub_novel_command_output_secrets(&line);
+        assert!(
+            scrubbed.starts_with("MY_TOKEN_0=[ph]filler1 MY_TOKEN_2=[ph]"),
+            "got {}…",
+            &scrubbed[..64]
+        );
+        assert!(
+            scrubbed.contains("MY_TOKEN_1998=[ph]filler1999 "),
+            "got tail {}…",
+            &scrubbed[scrubbed.len() - 64..]
+        );
+        assert!(!scrubbed.contains("filler0"), "got {scrubbed:?}");
     }
 }

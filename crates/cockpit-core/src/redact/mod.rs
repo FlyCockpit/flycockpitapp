@@ -575,7 +575,12 @@ fn key_name_segments(name: &str) -> Vec<String> {
     segments
 }
 
-fn credential_shaped_key(name: &str) -> bool {
+/// Narrow credential-shape predicate: the `_PIN` / `_PASSWORD` / `_PASSWD` /
+/// `_SECRET` key family that bypasses the `min_secret_length` prune in table
+/// building. `pub(crate)` so the substitution-site novel-secret scrub
+/// (issue #279) applies the same exemption to freshly captured command
+/// output, keeping the two length floors one invariant instead of two.
+pub(crate) fn credential_shaped_key(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.ends_with("_PIN")
         || upper.ends_with("_PASSWORD")

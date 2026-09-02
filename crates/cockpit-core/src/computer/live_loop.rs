@@ -131,8 +131,8 @@ mod tests {
         DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance, ProviderId,
     };
     use crate::computer::{
-        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
-        DisplayGeometry, LogicalSize, PixelSize, ScaleFactor,
+        ComputerActionOutcome, ComputerBackend, DisplayGeometry, LogicalSize,
+        NormalizedComputerAction, NormalizedComputerEffect, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -175,20 +175,13 @@ mod tests {
             Ok(self.geometry.clone())
         }
 
-        async fn execute(&mut self, _actions: &[ComputerAction]) -> ComputerBatchReport {
+        async fn execute_normalized_one(
+            &mut self,
+            action: &NormalizedComputerAction,
+        ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
             self.execute_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ComputerBatchReport {
-                completed: Vec::new(),
-                failure: None,
-            }
-        }
-
-        async fn execute_one(
-            &mut self,
-            action: &ComputerAction,
-        ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
-            if matches!(action, ComputerAction::CaptureFull) {
+            if matches!(action.effect(), NormalizedComputerEffect::CaptureFull) {
                 Ok(ComputerActionOutcome::Captured(
                     crate::computer::CaptureFrame {
                         png: vec![0x89, 0x50, 0x4e, 0x47],

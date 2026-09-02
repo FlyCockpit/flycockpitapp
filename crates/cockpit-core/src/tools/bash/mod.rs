@@ -1745,7 +1745,9 @@ async fn defensive_human_escalation_offer(
 ) -> Result<Option<ToolOutput>> {
     if matches!(
         crate::tools::escalate::escalation_route(
-            ctx.session.approval_mode(),
+            crate::tools::trusted_child_acquisition::effective_approval_mode(
+                ctx.session.approval_mode(),
+            ),
             None, // Defensive human offers force Auto through the user.
         ),
         crate::tools::escalate::EscalationRoute::RunUnconfinedOnce
@@ -1755,7 +1757,9 @@ async fn defensive_human_escalation_offer(
             .map(Some);
     }
     if !matches!(
-        ctx.session.approval_mode(),
+        crate::tools::trusted_child_acquisition::effective_approval_mode(
+            ctx.session.approval_mode(),
+        ),
         crate::config::extended::ApprovalMode::Manual | crate::config::extended::ApprovalMode::Auto
     ) {
         return Ok(None);

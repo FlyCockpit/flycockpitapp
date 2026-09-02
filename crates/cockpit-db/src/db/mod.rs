@@ -72,6 +72,7 @@ pub mod local_operation_receipts;
 pub mod locks;
 pub mod media_attachments;
 pub mod message_attachments;
+pub mod monty_network;
 pub mod needs_attention;
 #[cfg(feature = "remote")]
 pub mod org_sync;
@@ -436,6 +437,11 @@ pub struct Db {
     /// the shared permit until its tool call returns; a consent mutation takes
     /// the exclusive side before its SQLite write can commit.
     history_scope_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Process-local revocation fence for governed Monty egress. A request
+    /// retains the shared permit from its final policy read through transport
+    /// dispatch; durable policy mutations take the exclusive side before
+    /// their SQLite transaction commits.
+    monty_network_egress_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Shared side of the history-scope revocation fence.
@@ -444,6 +450,14 @@ pub struct Db {
 /// already-authorized history response. Dropping it is the disclosure
 /// linearization point, after which a pending consent revocation may commit.
 pub struct HistoryScopeDisclosurePermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+/// Shared side of the durable Monty-network revocation fence.
+///
+/// The permit is intentionally opaque. Callers retain it from their final
+/// durable-policy check through the actual transport egress boundary.
+pub struct MontyNetworkEgressPermit {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
@@ -627,6 +641,7 @@ impl Db {
         repair_db_file_permissions(path);
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
+        reconcile_interrupted_sealed_value_acquisitions(&conn)?;
         timer.phase("migrate");
 
         drop(conn);
@@ -640,6 +655,7 @@ impl Db {
             _diagnostic_lock: None,
             read_only: false,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         timer.done();
         Ok(db)
@@ -651,6 +667,7 @@ impl Db {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
         migrate(&conn)?;
+        reconcile_interrupted_sealed_value_acquisitions(&conn)?;
 
         let db = Self {
             memory: Some(Arc::new(Mutex::new(conn))),
@@ -661,6 +678,7 @@ impl Db {
             _diagnostic_lock: None,
             read_only: false,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         Ok(db)
     }
@@ -756,6 +774,7 @@ impl Db {
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -779,6 +798,16 @@ impl Db {
     pub async fn history_scope_disclosure_permit(&self) -> HistoryScopeDisclosurePermit {
         HistoryScopeDisclosurePermit {
             _guard: self.history_scope_gate.clone().read_owned().await,
+        }
+    }
+
+    /// Acquire the shared durable Monty-network egress fence. The permit must
+    /// be held from the final policy check through `RequestBuilder::send`.
+    /// `mutate_monty_network_agent_policy` takes the exclusive side before
+    /// committing any durable policy change.
+    pub async fn monty_network_egress_permit(&self) -> MontyNetworkEgressPermit {
+        MontyNetworkEgressPermit {
+            _guard: self.monty_network_egress_gate.clone().read_owned().await,
         }
     }
 
@@ -1058,6 +1087,20 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
         f(&guard)
     }
+}
+
+/// An acquisition child has no resumable secret output. On process recovery,
+/// every audit row left pending by a dropped runtime is therefore terminally
+/// failed before the database is exposed to readers or a new acquisition.
+fn reconcile_interrupted_sealed_value_acquisitions(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE sealed_value_acquisition_audit
+            SET outcome = 'failed', completed_at_ms = ?1
+          WHERE outcome = 'pending' AND completed_at_ms IS NULL",
+        rusqlite::params![chrono::Utc::now().timestamp_millis()],
+    )
+    .context("reconciling interrupted sealed value acquisitions")?;
+    Ok(())
 }
 
 // Canonical `BEGIN IMMEDIATE` transaction wrapper: rolls back on body error,
@@ -3539,6 +3582,54 @@ mod tests {
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
+    }
+
+    #[test]
+    fn opening_database_terminalizes_only_interrupted_acquisition_audits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("interrupted-acquisition.db");
+        let db = Db::open(&path).unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            conn.execute_batch(
+                "INSERT INTO sealed_value_acquisition_audit
+                     (acquisition_id, record_id, session_id, project_key, name, description,
+                      child_agent, consent_mode, outcome, created_at_ms, completed_at_ms)
+                 VALUES
+                     ('interrupted', 'record-interrupted', 'session-interrupted', 'project',
+                      'interrupted_value', 'interrupted acquisition', 'sealed-acquisition',
+                      'audit_only', 'pending', 1, NULL),
+                     ('already-terminal', 'record-terminal', 'session-terminal', 'project',
+                      'terminal_value', 'terminal acquisition', 'sealed-acquisition',
+                      'audit_only', 'failed', 2, 77);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+
+        // This models a cancellation or runtime shutdown after publishing the
+        // audit row. Reopen recovery runs before the DB can be observed again.
+        let recovered = Db::open(&path).unwrap();
+        let rows: Vec<(String, Option<i64>)> = recovered
+            .blocking_for_sync_cli(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT outcome, completed_at_ms
+                       FROM sealed_value_acquisition_audit
+                      ORDER BY acquisition_id",
+                )?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("failed".to_owned(), Some(77)));
+        assert_eq!(rows[1].0, "failed");
+        assert!(
+            rows[1].1.is_some(),
+            "recovery must terminalize the interrupted pending audit"
+        );
     }
 
     #[test]

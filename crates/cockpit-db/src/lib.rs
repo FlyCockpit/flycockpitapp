@@ -5,6 +5,7 @@
 //! of CLI, daemon, TUI, engine, config, approval, and redaction logic.
 
 pub mod db;
+pub use db::monty_network;
 
 /// Local v0.1 image-sidecar grant authority. Named so callers do not have to
 /// reach through `db::image_sidecar` for the ledger row types.

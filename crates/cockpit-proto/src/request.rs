@@ -3562,9 +3562,7 @@ impl Request {
                         | "onboarding-agent"
                         | "onboarding-lifetime"
                 ) {
-                    return Err(
-                        "setup wizard id is not supported".to_string(),
-                    );
+                    return Err("setup wizard id is not supported".to_string());
                 }
                 if answers_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("setup wizard answers exceed maximum length".to_string());

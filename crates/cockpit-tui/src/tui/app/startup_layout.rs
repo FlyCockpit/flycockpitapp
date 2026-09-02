@@ -198,16 +198,15 @@ impl App {
                 if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Agent) {
                     return false;
                 }
-                self.dialog =
-                    match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
-                        "Choose and install an agent for the default model.".to_string(),
-                    )) {
-                        Ok(dialog) => dialog,
-                        Err(error) => {
-                            self.show_toast(error, super::ToastKind::Error);
-                            return false;
-                        }
-                    };
+                self.dialog = match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
+                    "Choose and install an agent for the default model.".to_string(),
+                )) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return false;
+                    }
+                };
                 self.first_run_flow = FirstRunFlow::AwaitAgent;
                 true
             }

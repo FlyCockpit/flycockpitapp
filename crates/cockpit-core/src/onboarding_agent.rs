@@ -242,28 +242,29 @@ pub fn build_onboarding_agent_plan(
 /// Default sidecar choice. Only local/private self-hosted vision models are
 /// eligible for silent preference. A cloud-only catalog deliberately returns
 /// `None` so the UI must ask or offer disable.
-pub fn preferred_self_hosted_sidecar(
-    providers: &ProvidersConfig,
-) -> Option<SidecarProviderModel> {
-    providers.providers.iter().find_map(|(provider_id, provider)| {
-        provider.models.iter().find_map(|model| {
-            let supports_images = providers
-                .resolve_effective_model_capabilities(
-                    provider_id,
-                    &model.id,
-                    providers.resolution_generation,
-                )
-                .supports_image_input();
-            let self_hosted = matches!(
-                providers.resolve_location(provider_id, &model.id),
-                Some(ModelLocation::Local | ModelLocation::PrivateRemote)
-            );
-            (supports_images && self_hosted).then(|| SidecarProviderModel {
-                provider: provider_id.clone(),
-                model: model.id.clone(),
+pub fn preferred_self_hosted_sidecar(providers: &ProvidersConfig) -> Option<SidecarProviderModel> {
+    providers
+        .providers
+        .iter()
+        .find_map(|(provider_id, provider)| {
+            provider.models.iter().find_map(|model| {
+                let supports_images = providers
+                    .resolve_effective_model_capabilities(
+                        provider_id,
+                        &model.id,
+                        providers.resolution_generation,
+                    )
+                    .supports_image_input();
+                let self_hosted = matches!(
+                    providers.resolve_location(provider_id, &model.id),
+                    Some(ModelLocation::Local | ModelLocation::PrivateRemote)
+                );
+                (supports_images && self_hosted).then(|| SidecarProviderModel {
+                    provider: provider_id.clone(),
+                    model: model.id.clone(),
+                })
             })
         })
-    })
 }
 
 fn resolve_sidecar_selection(
@@ -282,18 +283,15 @@ fn resolve_sidecar_selection(
         });
     };
     ensure!(
-        providers.providers.get(provider).is_some_and(|entry| {
-            entry.models.iter().any(|candidate| candidate.id == *model)
-        }),
+        providers
+            .providers
+            .get(provider)
+            .is_some_and(|entry| { entry.models.iter().any(|candidate| candidate.id == *model) }),
         "selected sidecar model is not configured"
     );
     ensure!(
         providers
-            .resolve_effective_model_capabilities(
-                provider,
-                model,
-                providers.resolution_generation,
-            )
+            .resolve_effective_model_capabilities(provider, model, providers.resolution_generation,)
             .supports_image_input(),
         "selected sidecar model is not vision-capable"
     );

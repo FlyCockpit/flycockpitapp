@@ -47,8 +47,7 @@ pub async fn prepare_onboarding_agent_answers(
     let descriptor = crate::wizard::onboarding_agent_descriptor(&providers);
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
     let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
-    let (slug, answers) =
-        crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
+    let (slug, answers) = crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
     let entry = catalog
         .index
         .entry(&slug)
@@ -57,7 +56,9 @@ pub async fn prepare_onboarding_agent_answers(
     Ok(PreparedOnboardingAgent { plan, providers })
 }
 
-pub fn persist_onboarding_agent_plan(plan: &crate::onboarding_agent::OnboardingAgentPlan) -> Result<()> {
+pub fn persist_onboarding_agent_plan(
+    plan: &crate::onboarding_agent::OnboardingAgentPlan,
+) -> Result<()> {
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let model_target = crate::config::providers::provider_file_path_for_config(
         &global_config,

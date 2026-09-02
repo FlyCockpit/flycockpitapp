@@ -586,13 +586,21 @@ pub struct ExtendedConfig {
     /// supersedes the legacy built-in-only `defaultPrimaryAgent` switch for
     /// new code sessions. The stored value is the agent's final ID segment,
     /// never a source path or repository locator.
-    #[serde(rename = "defaultAgent", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "defaultAgent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_agent: Option<String>,
 
     /// Host-owned per-agent onboarding overrides. These are separate from the
     /// portable definition's author preferences and therefore cannot be
     /// supplied by an agent repository.
-    #[serde(rename = "agentRuntimeDefaults", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "agentRuntimeDefaults",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub agent_runtime_defaults: BTreeMap<String, AgentRuntimeDefaults>,
 
     /// Raw removed/unknown `defaultPrimaryAgent` value that degraded to
@@ -1191,9 +1199,17 @@ pub enum AgentRuntimeToolTier {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRuntimeDefaults {
-    #[serde(rename = "toolTiers", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "toolTiers",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub tool_tiers: BTreeMap<String, AgentRuntimeToolTier>,
-    #[serde(rename = "montyPackages", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "montyPackages",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub monty_packages: Vec<String>,
 }
 

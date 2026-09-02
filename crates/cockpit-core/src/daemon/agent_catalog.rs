@@ -91,7 +91,10 @@ impl AgentCatalogIndex {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.schema_version == 1, "agent catalog schemaVersion must be 1");
+        ensure!(
+            self.schema_version == 1,
+            "agent catalog schemaVersion must be 1"
+        );
         ensure!(
             self.catalog.repository == FIRST_PARTY_REPOSITORY
                 && self.catalog.default_branch == FIRST_PARTY_DEFAULT_BRANCH,
@@ -174,7 +177,10 @@ impl AgentCatalogEntry {
     /// Re-validate the pinned package's authoritative `agent.md`. The index
     /// is advisory and cannot substitute different tools, capabilities, or
     /// model requirements at install time.
-    pub fn validate_fetched_agent_markdown(&self, markdown: &[u8]) -> Result<crate::agents::AgentDef> {
+    pub fn validate_fetched_agent_markdown(
+        &self,
+        markdown: &[u8],
+    ) -> Result<crate::agents::AgentDef> {
         let text = std::str::from_utf8(markdown).context("catalog agent.md is not UTF-8")?;
         let parsed = crate::agents::parse_daemon_agent_snapshot(
             text,
@@ -286,10 +292,11 @@ async fn fetch_catalog_at_revision_with_client(
     revision: &str,
     origin: AgentCatalogOrigin,
 ) -> Result<ResolvedAgentCatalog> {
-    ensure!(valid_commit_sha(revision), "catalog revision must be a commit SHA");
-    let url = format!(
-        "https://raw.githubusercontent.com/FlyCockpit/agents/{revision}/index.json"
+    ensure!(
+        valid_commit_sha(revision),
+        "catalog revision must be a commit SHA"
     );
+    let url = format!("https://raw.githubusercontent.com/FlyCockpit/agents/{revision}/index.json");
     let bytes = fetch_bounded(client, &url)
         .await
         .context("fetching pinned agent catalog index")?;

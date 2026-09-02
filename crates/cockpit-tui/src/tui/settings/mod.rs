@@ -9764,8 +9764,7 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
-            } else if wizard.run.descriptor().id
-                == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
+            } else if wizard.run.descriptor().id == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
             {
                 "Installed the pinned agent and saved its model, trust, tool tiers, default, and sidecar settings."
                     .to_string()

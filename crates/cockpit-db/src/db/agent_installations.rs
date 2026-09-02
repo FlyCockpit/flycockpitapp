@@ -1219,7 +1219,8 @@ impl Db {
     }
 
     pub async fn default_agent_installation(&self) -> Result<Option<Uuid>> {
-        self.read(|conn| default_agent_installation_conn(conn)).await
+        self.read(|conn| default_agent_installation_conn(conn))
+            .await
     }
 
     /// Read the selected immutable profile reference, all visible installation
@@ -3403,9 +3404,7 @@ fn default_agent_installation_conn(conn: &Connection) -> Result<Option<Uuid>> {
         |row| row.get::<_, String>(0),
     )
     .optional()?
-    .map(|value| {
-        Uuid::parse_str(&value).context("stored default agent installation id is invalid")
-    })
+    .map(|value| Uuid::parse_str(&value).context("stored default agent installation id is invalid"))
     .transpose()
 }
 

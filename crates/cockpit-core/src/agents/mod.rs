@@ -1502,7 +1502,10 @@ impl AgentDefinitionFrontmatter {
     /// Validate the unified schema without granting a catalog entry any
     /// special publisher authority.
     pub fn validate_catalog_definition(&self) -> Result<()> {
-        ensure!(!self.description.trim().is_empty(), "description must be non-empty");
+        ensure!(
+            !self.description.trim().is_empty(),
+            "description must be non-empty"
+        );
         self.launch_definition()
             .validate_for_scope(DefinitionScope::DaemonSnapshot)
     }

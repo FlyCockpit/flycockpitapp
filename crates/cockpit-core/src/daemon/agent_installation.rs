@@ -3717,19 +3717,18 @@ impl AgentInstallationService {
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
         if source.owner == "FlyCockpit" && source.repository == "agents" {
-            let catalog = if fetched.commit_sha
-                == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION
-            {
-                crate::daemon::agent_catalog::ResolvedAgentCatalog {
-                    revision: fetched.commit_sha.clone(),
-                    origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
-                    index: crate::daemon::agent_catalog::cached_catalog()?,
-                }
-            } else {
-                crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
-                    .await
-                    .context("fetching pinned first-party catalog index")?
-            };
+            let catalog =
+                if fetched.commit_sha == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION {
+                    crate::daemon::agent_catalog::ResolvedAgentCatalog {
+                        revision: fetched.commit_sha.clone(),
+                        origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+                        index: crate::daemon::agent_catalog::cached_catalog()?,
+                    }
+                } else {
+                    crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
+                        .await
+                        .context("fetching pinned first-party catalog index")?
+                };
             let entry = catalog
                 .index
                 .agents
@@ -10362,7 +10361,7 @@ mod tests {
                     source_locator: "owner/repo@main:agents/helper.md".into(),
                     target_installation_id: Some(installation_id.clone()),
                     replace_acknowledged: true,
-                third_party_trust_confirmed: true,
+                    third_party_trust_confirmed: true,
                     ..ServiceHarness::request("dirty-update")
                 },
                 2,

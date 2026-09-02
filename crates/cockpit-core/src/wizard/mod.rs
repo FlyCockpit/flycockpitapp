@@ -11,12 +11,11 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, apply_model_answers, apply_security_answers,
+    ModelAnswersOutcome, PreparedOnboardingAgent, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
     persist_onboarding_agent_plan, prepare_onboarding_agent_answers, security_config_path,
-    PreparedOnboardingAgent,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -642,11 +641,8 @@ pub fn onboarding_agent_descriptor(
                         offering.model_id.clone(),
                     ))
                     .or_insert_with(|| SelectOption {
-                        id: format!(
-                            "{}/{}",
-                            offering.provider_profile_handle, offering.model_id
-                        )
-                        .into(),
+                        id: format!("{}/{}", offering.provider_profile_handle, offering.model_id)
+                            .into(),
                         label: format!(
                             "{}/{}",
                             offering.provider_profile_handle, offering.model_id
@@ -697,7 +693,9 @@ pub fn onboarding_agent_descriptor(
         }
     }
     let sidecar_default = crate::onboarding_agent::preferred_self_hosted_sidecar(providers)
-        .map(|sidecar| WizardAnswer::Select(format!("local:{}/{}", sidecar.provider, sidecar.model)))
+        .map(|sidecar| {
+            WizardAnswer::Select(format!("local:{}/{}", sidecar.provider, sidecar.model))
+        })
         .unwrap_or_else(|| WizardAnswer::Select("disabled".into()));
     WizardDescriptor {
         id: ONBOARDING_AGENT_WIZARD_ID,
@@ -711,7 +709,9 @@ pub fn onboarding_agent_descriptor(
                 prompt: "Choose an agent compatible with your configured models",
                 help: "Cockpit prefers the live FlyCockpit/agents catalog and uses this bundled snapshot when offline.",
                 help_hook: None,
-                kind: StepKind::Select { options: agent_options },
+                kind: StepKind::Select {
+                    options: agent_options,
+                },
                 default_answer: None,
                 prefill: None,
                 validate: Some(validate_select),
@@ -723,10 +723,20 @@ pub fn onboarding_agent_descriptor(
                 prompt: "How should Cockpit classify the default model?",
                 help: "Trusted models may receive unredacted content. Untrusted models keep outbound redaction enabled. Cockpit never chooses this for you.",
                 help_hook: None,
-                kind: StepKind::Select { options: vec![
-                    SelectOption { id: "untrusted".into(), label: "Untrusted".into(), description: "Keep outbound secret redaction enabled".into() },
-                    SelectOption { id: "trusted".into(), label: "Trusted".into(), description: "Allow content without untrusted-model redaction".into() },
-                ] },
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "untrusted".into(),
+                            label: "Untrusted".into(),
+                            description: "Keep outbound secret redaction enabled".into(),
+                        },
+                        SelectOption {
+                            id: "trusted".into(),
+                            label: "Trusted".into(),
+                            description: "Allow content without untrusted-model redaction".into(),
+                        },
+                    ],
+                },
                 default_answer: None,
                 prefill: None,
                 validate: Some(validate_select),
@@ -738,7 +748,9 @@ pub fn onboarding_agent_descriptor(
                 prompt: "Choose this agent's default model",
                 help: "Only configured models compatible with the selected agent can be installed. If you make the agent the default, this also becomes Cockpit's default model.",
                 help_hook: None,
-                kind: StepKind::Select { options: compatible_models.into_values().collect() },
+                kind: StepKind::Select {
+                    options: compatible_models.into_values().collect(),
+                },
                 default_answer: active_model_default,
                 prefill: None,
                 validate: Some(validate_select),
@@ -762,10 +774,20 @@ pub fn onboarding_agent_descriptor(
                 prompt: "Tool configuration",
                 help: "Author defaults preserve the agent's native/Monty tiers. Advanced lets you enable, disable, or make tools Monty-only.",
                 help_hook: None,
-                kind: StepKind::Select { options: vec![
-                    SelectOption { id: "author-defaults".into(), label: "Use author tiers".into(), description: "Recommended default".into() },
-                    SelectOption { id: "advanced".into(), label: "Advanced".into(), description: "Review each tool tier".into() },
-                ] },
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "author-defaults".into(),
+                            label: "Use author tiers".into(),
+                            description: "Recommended default".into(),
+                        },
+                        SelectOption {
+                            id: "advanced".into(),
+                            label: "Advanced".into(),
+                            description: "Review each tool tier".into(),
+                        },
+                    ],
+                },
                 default_answer: Some(WizardAnswer::Select("author-defaults".into())),
                 prefill: None,
                 validate: Some(validate_select),
@@ -778,7 +800,9 @@ pub fn onboarding_agent_descriptor(
                 help: "Monty-only removes a tool from the provider-visible schema while retaining governed discovery.",
                 help_hook: None,
                 kind: StepKind::ToolSurface,
-                default_answer: Some(WizardAnswer::ToolSurface(crate::agents::ToolSurfaceSelection::default())),
+                default_answer: Some(WizardAnswer::ToolSurface(
+                    crate::agents::ToolSurfaceSelection::default(),
+                )),
                 prefill: None,
                 validate: None,
                 write: None,
@@ -801,7 +825,9 @@ pub fn onboarding_agent_descriptor(
                 prompt: "Choose an image sidecar",
                 help: "Local/self-hosted vision models are preferred. Selecting a remote model requires a separate egress confirmation.",
                 help_hook: None,
-                kind: StepKind::Select { options: sidecar_options },
+                kind: StepKind::Select {
+                    options: sidecar_options,
+                },
                 default_answer: Some(sidecar_default),
                 prefill: None,
                 validate: Some(validate_select),
@@ -847,7 +873,10 @@ fn validate_required_confirmation(
     }
 }
 
-fn onboarding_tool_configuration_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+fn onboarding_tool_configuration_branch(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> Option<&'static str> {
     match answer {
         WizardAnswer::Select(value) if value == "advanced" => Some("advanced-tools"),
         WizardAnswer::Select(_) => Some("requests-package"),
@@ -856,7 +885,9 @@ fn onboarding_tool_configuration_branch(_: &WizardRun, answer: &WizardAnswer) ->
 }
 
 fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
-    let WizardAnswer::Select(value) = answer else { return None };
+    let WizardAnswer::Select(value) = answer else {
+        return None;
+    };
     if value == "disabled" {
         return Some("make-default");
     }

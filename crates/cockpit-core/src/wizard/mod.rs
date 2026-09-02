@@ -11,12 +11,13 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, PreparedOnboardingAgent, apply_model_answers, apply_security_answers,
-    apply_security_answers_with_caps, apply_setup_wizard_answers,
-    apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
-    persist_onboarding_agent_plan, prepare_onboarding_agent_answers,
-    prepare_onboarding_agent_answers_for_catalog, security_config_path,
+    ModelAnswersOutcome, OnboardingConfigRollback, PreparedOnboardingAgent, apply_model_answers,
+    apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
+    apply_setup_wizard_answers_authoritative, capture_onboarding_agent_config,
+    compose_wizard_host_capabilities, descriptor_for_cwd, descriptor_for_cwd_with_caps,
+    model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd, persist_onboarding_agent_plan,
+    prepare_onboarding_agent_answers, prepare_onboarding_agent_answers_for_catalog,
+    security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -235,7 +236,7 @@ impl WizardRun {
         let mut answers = self
             .answers
             .iter()
-            .map(|(id, answer)| ((*id).to_string(), answer))
+            .map(|(id, answer)| ((*id).to_string(), answer.clone()))
             .collect::<BTreeMap<_, _>>();
         if let Some(revision) = &self.descriptor.onboarding_catalog_revision {
             answers.insert(
@@ -392,7 +393,7 @@ impl WizardRun {
             if !self
                 .select_options()
                 .iter()
-                .any(|option| option.id == value)
+                .any(|option| option.id.as_ref() == value.as_str())
             {
                 let error = "choose one of the available options".to_string();
                 self.error = Some(error.clone());

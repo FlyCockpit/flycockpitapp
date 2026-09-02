@@ -102,7 +102,7 @@ impl AgentCatalogHostHardware {
     /// Best-effort local inventory for interactive discovery.  This never
     /// treats a missing or failed probe as compatible.
     pub fn detect_current_host() -> Self {
-        let gpu_models = nvidia_gpu_models()
+        let gpu_models: Vec<String> = nvidia_gpu_models()
             .and_then(|output| String::from_utf8(output).ok())
             .map(|output| {
                 output

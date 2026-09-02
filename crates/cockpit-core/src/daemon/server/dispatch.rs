@@ -17503,9 +17503,12 @@ async fn handle_serialized_request_impl(
                                 previous_default_installation_id,
                             )
                             .await;
-                            return Err(internal(compensation.err().map_or(error, |recovery| {
-                                anyhow::anyhow!("agent onboarding installation service unavailable ({error:#}); recovery remains pending: {recovery:#}")
-                            })));
+                            return Err(internal(match compensation {
+                                Ok(()) => error,
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding installation service unavailable ({error:#}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
                         }
                     };
                     let install = service
@@ -17596,10 +17599,12 @@ async fn handle_serialized_request_impl(
                                     previous_default_installation_id,
                                 )
                                 .await;
-                                return Err(internal(compensation.err().map_or_else(
-                                    || anyhow::Error::from(error),
-                                    |recovery| anyhow::anyhow!("agent onboarding returned an invalid installation identity ({error}); recovery remains pending: {recovery:#}"),
-                                )));
+                                return Err(internal(match compensation {
+                                    Ok(()) => anyhow::Error::from(error),
+                                    Err(recovery) => anyhow::anyhow!(
+                                        "agent onboarding returned an invalid installation identity ({error}); recovery remains pending: {recovery:#}"
+                                    ),
+                                }));
                             }
                         },
                         cockpit_proto::AgentInstallationResultV1::Error { error } => {
@@ -17653,11 +17658,12 @@ async fn handle_serialized_request_impl(
                                 previous_default_installation_id,
                             )
                             .await;
-                            return Err(internal(compensation.err().map_or(error, |recovery| {
-                                anyhow::anyhow!(
+                            return Err(internal(match compensation {
+                                Ok(()) => error,
+                                Err(recovery) => anyhow::anyhow!(
                                     "agent onboarding config publication failed ({error:#}); recovery remains pending: {recovery:#}"
-                                )
-                            })));
+                                ),
+                            }));
                         }
                     };
                     if prepared.plan.make_default
@@ -17676,11 +17682,12 @@ async fn handle_serialized_request_impl(
                             previous_default_installation_id,
                         )
                         .await;
-                        return Err(internal(compensation.err().map_or(error, |recovery| {
-                            anyhow::anyhow!(
+                        return Err(internal(match compensation {
+                            Ok(()) => error,
+                            Err(recovery) => anyhow::anyhow!(
                                 "agent onboarding default selection failed ({error:#}); recovery remains pending: {recovery:#}"
-                            )
-                        })));
+                            ),
+                        }));
                     }
                     // A complete publication is visible only after every
                     // participant succeeds. Release the durable owner before

@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt as _;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::builtin::HostContext;
 use crate::db::monty_network::CanonicalNetworkHost;
@@ -85,6 +86,11 @@ impl SessionNetworkGrants {
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNetworkPolicy {
+    /// Immutable installed-agent identity resolved at preflight. Dispatch
+    /// re-resolves under the durable fence and refuses the request if this
+    /// identity changed, so a profile rebinding cannot carry a prior
+    /// installation's grant across the transport boundary.
+    installation_id: Uuid,
     agent_generation: u64,
     session_generation: u64,
     agent_hosts: BTreeSet<CanonicalNetworkHost>,
@@ -106,6 +112,7 @@ pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPoli
     let agent = capability.agent_policy;
     let session = capability.session_policy;
     Ok(EffectiveNetworkPolicy {
+        installation_id: capability.installation_id,
         agent_generation: agent.generation,
         session_generation: session.generation,
         agent_hosts: agent.hosts,

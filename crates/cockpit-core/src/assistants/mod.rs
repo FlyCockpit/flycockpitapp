@@ -4,6 +4,7 @@
 //! definition stored at `<assistant-home>/assistant.md`. The markdown parser is
 //! deliberately the same parser used for agents.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -622,6 +623,8 @@ pub fn descriptor() -> WizardDescriptor {
         description: "Create a persistent assistant identity backed by an agent definition.",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "description",

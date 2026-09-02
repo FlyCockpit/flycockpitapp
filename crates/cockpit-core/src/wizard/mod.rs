@@ -11,10 +11,12 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, apply_model_answers, apply_security_answers,
-    apply_security_answers_with_caps, apply_setup_wizard_answers,
-    apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
+    ModelAnswersOutcome, OnboardingConfigRollback, PreparedOnboardingAgent, apply_model_answers,
+    apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
+    apply_setup_wizard_answers_authoritative, capture_onboarding_agent_config,
+    compose_wizard_host_capabilities, descriptor_for_cwd, descriptor_for_cwd_with_caps,
+    model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd, persist_onboarding_agent_plan,
+    prepare_onboarding_agent_answers, prepare_onboarding_agent_answers_for_catalog,
     security_config_path,
 };
 
@@ -23,6 +25,7 @@ pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
 pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
 pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
+pub const ONBOARDING_AGENT_WIZARD_ID: &str = "onboarding-agent";
 pub const ONBOARDING_LIFETIME_WIZARD_ID: &str = "onboarding-lifetime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +121,15 @@ pub struct WizardDescriptor {
     pub steps: Vec<StepDescriptor>,
     pub write_policy: WritePolicy,
     pub(crate) model_context: Option<ModelWizardContext>,
+    /// The onboarding agent picker is the other dependent-select wizard: its
+    /// model choices are a function of the agent chosen on the preceding
+    /// screen. Keeping that relationship in the descriptor makes it apply to
+    /// both renderers and authoritative answer replay.
+    pub(crate) onboarding_agent_models: BTreeMap<String, Vec<SelectOption>>,
+    /// Immutable catalog identity carried with the rendered picker.  It is
+    /// encoded with the answers so authoritative replay fetches this exact
+    /// catalog revision instead of resolving `main` a second time.
+    pub(crate) onboarding_catalog_revision: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -221,11 +233,17 @@ impl WizardRun {
     /// Encode the completed answers for the daemon-owned setup mutation RPC.
     /// Descriptors and hooks never cross the wire.
     pub fn answers_json(&self) -> Result<String> {
-        let answers = self
+        let mut answers = self
             .answers
             .iter()
-            .map(|(id, answer)| ((*id).to_string(), answer))
+            .map(|(id, answer)| ((*id).to_string(), answer.clone()))
             .collect::<BTreeMap<_, _>>();
+        if let Some(revision) = &self.descriptor.onboarding_catalog_revision {
+            answers.insert(
+                "__onboarding_catalog_revision".to_string(),
+                WizardAnswer::Text(revision.clone()),
+            );
+        }
         serde_json::to_string(&answers).context("serializing wizard answers")
     }
 
@@ -299,6 +317,17 @@ impl WizardRun {
         let StepKind::Select { options } = &step.kind else {
             return Vec::new();
         };
+        if step.id == "default-model" && self.descriptor.id == ONBOARDING_AGENT_WIZARD_ID {
+            let Some(WizardAnswer::Select(agent)) = self.answer("agent") else {
+                return Vec::new();
+            };
+            return self
+                .descriptor
+                .onboarding_agent_models
+                .get(agent)
+                .cloned()
+                .unwrap_or_default();
+        }
         if step.id != "model" {
             return options.clone();
         }
@@ -357,6 +386,20 @@ impl WizardRun {
             return Err("wizard was aborted".to_string());
         }
         let step = &self.descriptor.steps[current];
+        if matches!(step.kind, StepKind::Select { .. }) {
+            let WizardAnswer::Select(value) = &answer else {
+                return Err("choose one option".to_string());
+            };
+            if !self
+                .select_options()
+                .iter()
+                .any(|option| option.id.as_ref() == value.as_str())
+            {
+                let error = "choose one of the available options".to_string();
+                self.error = Some(error.clone());
+                return Err(error);
+            }
+        }
         if let Some(validate) = step.validate
             && let Err(error) = validate(self, &answer)
         {
@@ -550,6 +593,8 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
         description: "Set an optional display name",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "name",
@@ -582,6 +627,8 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
         description: "Choose what happens after the last Cockpit window closes",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "background-agents",
@@ -602,6 +649,529 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
                 None,
             ),
         ],
+    }
+}
+
+/// Agent installation and default-selection step. Discovery is filtered by
+/// the configured model catalog before the user sees it. Callers resolve the
+/// preferred live-or-cached catalog before constructing this descriptor, and
+/// the apply boundary pins the resulting first-party revision.
+pub fn onboarding_agent_descriptor(
+    providers: &crate::config::providers::ProvidersConfig,
+    catalog: &crate::daemon::agent_catalog::AgentCatalogIndex,
+    catalog_revision: String,
+) -> WizardDescriptor {
+    let suggestions = catalog.suggestions_for_models(providers);
+    let mut agent_options: Vec<SelectOption> = suggestions
+        .iter()
+        .map(|entry| SelectOption {
+            id: entry.catalog.slug.clone().into(),
+            label: entry.catalog.display_name.clone().into(),
+            description: entry.definition.description.clone().into(),
+        })
+        .collect();
+    let offerings = crate::daemon::agent_installation::setup_offerings(providers);
+    let mut onboarding_agent_models: BTreeMap<String, Vec<SelectOption>> = suggestions
+        .into_iter()
+        .filter_map(|entry| {
+            let primary = entry.definition.model_slots.get("primary")?;
+            let options =
+                crate::agents::ranked_compatible_offerings(primary, &offerings, providers)
+                    .into_iter()
+                    .map(|offering| SelectOption {
+                        id: format!("{}/{}", offering.provider_profile_handle, offering.model_id)
+                            .into(),
+                        label: format!(
+                            "{}/{}",
+                            offering.provider_profile_handle, offering.model_id
+                        )
+                        .into(),
+                        description: "Compatible with the selected agent".into(),
+                    })
+                    .collect();
+            Some((entry.catalog.slug.clone(), options))
+        })
+        .collect();
+    // A third-party definition cannot be trusted from a catalog preview. The
+    // installer fetches and validates the pinned source before binding; this
+    // list merely lets the user nominate an already-configured model for that
+    // authoritative compatibility check.
+    agent_options.push(SelectOption {
+        id: "third-party".into(),
+        label: "Install a third-party agent".into(),
+        description: "Requires a pinned source and explicit trust confirmation".into(),
+    });
+    onboarding_agent_models.insert(
+        "third-party".to_string(),
+        offerings
+            .iter()
+            .map(|offering| SelectOption {
+                id: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                label: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                description: "Compatibility is verified from the fetched pinned definition".into(),
+            })
+            .collect(),
+    );
+    let mut sidecar_options = vec![SelectOption {
+        id: "disabled".into(),
+        label: "Disable image sidecar".into(),
+        description: "Screenshots will not be sent to a separate vision model".into(),
+    }];
+    for (provider_id, provider) in &providers.providers {
+        for model in &provider.models {
+            if !providers
+                .resolve_effective_model_capabilities(
+                    provider_id,
+                    &model.id,
+                    providers.resolution_generation,
+                )
+                .supports_image_input()
+            {
+                continue;
+            }
+            let self_hosted = matches!(
+                providers.resolve_location(provider_id, &model.id),
+                Some(crate::config::providers::ModelLocation::Local)
+                    | Some(crate::config::providers::ModelLocation::PrivateRemote)
+            );
+            let locality = if self_hosted { "local" } else { "remote" };
+            sidecar_options.push(SelectOption {
+                id: format!("{locality}:{provider_id}/{}", model.id).into(),
+                label: format!("{provider_id}/{}", model.id).into(),
+                description: if self_hosted {
+                    "Local/self-hosted vision model (preferred)".into()
+                } else {
+                    "Remote vision model; screenshots and image content leave this machine".into()
+                },
+            });
+        }
+    }
+    let sidecar_default = crate::onboarding_agent::preferred_self_hosted_sidecar(providers)
+        .map(|sidecar| {
+            WizardAnswer::Select(format!("local:{}/{}", sidecar.provider, sidecar.model))
+        })
+        .unwrap_or_else(|| WizardAnswer::Select("disabled".into()));
+    WizardDescriptor {
+        id: ONBOARDING_AGENT_WIZARD_ID,
+        title: "Install your coding agent",
+        description: "Choose an agent, confirm model trust, configure tools, and select an image sidecar",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        onboarding_agent_models,
+        onboarding_catalog_revision: Some(catalog_revision),
+        steps: vec![
+            StepDescriptor {
+                id: "agent",
+                prompt: "Choose an agent compatible with your configured models",
+                help: "Cockpit prefers the live FlyCockpit/agents catalog and uses this bundled snapshot when offline.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: agent_options,
+                },
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(onboarding_agent_branch),
+            },
+            StepDescriptor {
+                id: "third-party-source",
+                prompt: "Pinned third-party agent source",
+                help: "Enter OWNER/REPOSITORY@COMMIT_OR_TAG:path/to/agent.md. A moving branch is not accepted.",
+                help_hook: None,
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_third_party_source),
+                write: None,
+                branch: Some(|_, _| Some("third-party-warning")),
+            },
+            StepDescriptor {
+                id: "third-party-warning",
+                prompt: "Third-party agent security warning",
+                help: "Third-party agent Markdown is executable policy input. It can steer tool use and delegation. Review the publisher and pinned revision before continuing.",
+                help_hook: None,
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(|_, _| Some("third-party-trust-confirm")),
+            },
+            StepDescriptor {
+                id: "third-party-trust-confirm",
+                prompt: "I trust this third-party publisher and pinned revision.",
+                help: "This confirmation is required separately from model trust.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: Some(|_, _| Some("model-trust")),
+            },
+            StepDescriptor {
+                id: "model-trust",
+                prompt: "How should Cockpit classify the default model?",
+                help: "Trusted models may receive unredacted content. Untrusted models keep outbound redaction enabled. Cockpit never chooses this for you.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "untrusted".into(),
+                            label: "Untrusted".into(),
+                            description: "Keep outbound secret redaction enabled".into(),
+                        },
+                        SelectOption {
+                            id: "trusted".into(),
+                            label: "Trusted".into(),
+                            description: "Allow content without untrusted-model redaction".into(),
+                        },
+                    ],
+                },
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "default-model",
+                prompt: "Choose this agent's default model",
+                help: "Only configured models compatible with the selected agent can be installed. If you make the agent the default, this also becomes Cockpit's default model.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    // [`WizardRun::select_options`] resolves these from the
+                    // preceding agent answer, including during authoritative
+                    // answer replay.
+                    options: Vec::new(),
+                },
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "model-trust-confirm",
+                prompt: "I confirm this model trust classification.",
+                help: "This confirmation is required even for the bundled agent and even when the provider already has a trust value.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: Some(onboarding_post_model_trust_branch),
+            },
+            StepDescriptor {
+                id: "tool-configuration",
+                prompt: "Tool configuration",
+                help: "Author defaults preserve the agent's native/Monty tiers. Advanced lets you enable, disable, or make tools Monty-only.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "author-defaults".into(),
+                            label: "Use author tiers".into(),
+                            description: "Recommended default".into(),
+                        },
+                        SelectOption {
+                            id: "advanced".into(),
+                            label: "Advanced".into(),
+                            description: "Review each tool tier".into(),
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("author-defaults".into())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(onboarding_tool_configuration_branch),
+            },
+            StepDescriptor {
+                id: "advanced-tools",
+                prompt: "Set per-tool tiers",
+                help: "Monty-only removes a tool from the provider-visible schema while retaining governed discovery.",
+                help_hook: None,
+                kind: StepKind::ToolSurface,
+                default_answer: Some(WizardAnswer::ToolSurface(
+                    crate::agents::ToolSurfaceSelection::default(),
+                )),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(|_, _| Some("monty-packages")),
+            },
+            StepDescriptor {
+                id: "monty-packages",
+                prompt: "Monty packages",
+                help: "Available by default: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib. The governed requests facade is per-agent and disabled by default; it becomes available only after an explicit owner-approved network-policy change, and never exposes raw sockets.",
+                help_hook: None,
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(|_, _| Some("sidecar")),
+            },
+            StepDescriptor {
+                id: "sidecar",
+                prompt: "Choose an image sidecar",
+                help: "Local/self-hosted vision models are preferred. Selecting a remote model requires a separate egress confirmation.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: sidecar_options,
+                },
+                default_answer: Some(sidecar_default),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(onboarding_sidecar_branch),
+            },
+            StepDescriptor {
+                id: "sidecar-egress-confirm",
+                prompt: "I understand screenshots and image content will leave this machine.",
+                help: "This is separate from model trust and is required for a cloud/unknown-location sidecar.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: None,
+            },
+            StepDescriptor {
+                id: "make-default",
+                prompt: "Make this the default agent and its selected model the default model?",
+                help: "You can change either default later in Settings.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(true)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "agent-install",
+                "Install agent",
+                "Installing pinned agent…",
+                None,
+            ),
+        ],
+    }
+}
+
+fn validate_required_confirmation(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Confirm(true) => Ok(()),
+        _ => Err("explicit confirmation is required".into()),
+    }
+}
+
+fn onboarding_agent_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    matches!(answer, WizardAnswer::Select(value) if value == "third-party")
+        .then_some("third-party-source")
+        .or(Some("model-trust"))
+}
+
+fn validate_third_party_source(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(locator) = answer else {
+        return Err("third-party source is required".into());
+    };
+    let source = crate::daemon::agent_installation::CanonicalAgentSource::parse(locator)
+        .map_err(|error| error.to_string())?;
+    if source.owner == "FlyCockpit" && source.repository == "agents" {
+        return Err("first-party agents must be selected from the catalog".into());
+    }
+    if source.requested_revision.is_none() {
+        return Err("third-party source must pin a commit or tag".into());
+    }
+    Ok(())
+}
+
+fn onboarding_tool_configuration_branch(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> Option<&'static str> {
+    match answer {
+        WizardAnswer::Select(value) if value == "advanced" => Some("advanced-tools"),
+        WizardAnswer::Select(_) => Some("monty-packages"),
+        _ => None,
+    }
+}
+
+fn onboarding_post_model_trust_branch(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    Some("tool-configuration")
+}
+
+fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    let WizardAnswer::Select(value) = answer else {
+        return None;
+    };
+    if value == "disabled" {
+        return Some("make-default");
+    }
+    if value.starts_with("local:") {
+        Some("make-default")
+    } else {
+        Some("sidecar-egress-confirm")
+    }
+}
+
+pub fn onboarding_agent_answers(
+    run: &WizardRun,
+    catalog_revision: String,
+) -> Result<(String, crate::onboarding_agent::OnboardingAgentAnswers)> {
+    use crate::onboarding_agent::{
+        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingSidecarSelection,
+        OnboardingToolConfiguration, OnboardingToolMode,
+    };
+    let agent = match run.answer("agent") {
+        Some(WizardAnswer::Select(value)) => value.clone(),
+        _ => return Err(anyhow!("agent selection is required")),
+    };
+    let model_trust = match run.answer("model-trust") {
+        Some(WizardAnswer::Select(value)) if value == "trusted" => OnboardingModelTrust::Trusted,
+        Some(WizardAnswer::Select(value)) if value == "untrusted" => {
+            OnboardingModelTrust::Untrusted
+        }
+        _ => return Err(anyhow!("model trust selection is required")),
+    };
+    let model_trust_confirmed = matches!(
+        run.answer("model-trust-confirm"),
+        Some(WizardAnswer::Confirm(true))
+    );
+    let third_party_source = (agent == "third-party")
+        .then(|| match run.answer("third-party-source") {
+            Some(WizardAnswer::Text(source)) => Ok(source.clone()),
+            _ => Err(anyhow!("third-party source is required")),
+        })
+        .transpose()?;
+    let third_party_trust_confirmed = !agent.eq("third-party")
+        || matches!(
+            run.answer("third-party-trust-confirm"),
+            Some(WizardAnswer::Confirm(true))
+        );
+    let (default_model_provider, default_model) = match run.answer("default-model") {
+        Some(WizardAnswer::Select(value)) => value
+            .split_once('/')
+            .map(|(provider, model)| (provider.to_string(), model.to_string()))
+            .context("default model selection omitted provider or model")?,
+        _ => return Err(anyhow!("default model selection is required")),
+    };
+    let tools = match run.answer("tool-configuration") {
+        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
+            OnboardingToolConfiguration::AuthorDefaults
+        }
+        Some(WizardAnswer::Select(value)) if value == "advanced" => {
+            let selection = match run.answer("advanced-tools") {
+                Some(WizardAnswer::ToolSurface(selection)) => selection,
+                _ => return Err(anyhow!("advanced tool configuration is required")),
+            };
+            let mut modes = BTreeMap::new();
+            for tool in crate::agents::known_tool_names() {
+                let selected = selection.tools.iter().any(|selected| selected == tool);
+                let tier = if selected {
+                    Some(
+                        selection
+                            .tool_tiers
+                            .get(*tool)
+                            .copied()
+                            .unwrap_or(crate::agents::ToolTier::Enabled),
+                    )
+                } else {
+                    crate::agents::legal_tool_tiers(tool)
+                        .contains(&crate::agents::ToolTier::Disabled)
+                        .then_some(crate::agents::ToolTier::Disabled)
+                };
+                if let Some(tier) = tier {
+                    modes.insert(
+                        (*tool).to_string(),
+                        match tier {
+                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
+                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
+                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
+                        },
+                    );
+                }
+            }
+            OnboardingToolConfiguration::Advanced(modes)
+        }
+        _ => return Err(anyhow!("tool configuration selection is required")),
+    };
+    let sidecar = match run.answer("sidecar") {
+        Some(WizardAnswer::Select(value)) if value == "disabled" => {
+            OnboardingSidecarSelection::Disabled
+        }
+        Some(WizardAnswer::Select(value)) => {
+            let selector = if let Some(selector) = value.strip_prefix("local:") {
+                selector
+            } else if let Some(selector) = value.strip_prefix("remote:") {
+                selector
+            } else {
+                return Err(anyhow!("invalid sidecar selection"));
+            };
+            let (provider, model) = selector
+                .split_once('/')
+                .context("sidecar selection omitted provider or model")?;
+            OnboardingSidecarSelection::Model {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                // Locality labels are presentation-only. The authoritative
+                // resolver derives locality from the configured model; this
+                // bit is exclusively the user's explicit confirmation.
+                remote_image_egress_confirmed: matches!(
+                    run.answer("sidecar-egress-confirm"),
+                    Some(WizardAnswer::Confirm(true))
+                ),
+            }
+        }
+        _ => return Err(anyhow!("sidecar selection is required")),
+    };
+    Ok((
+        agent,
+        OnboardingAgentAnswers {
+            catalog_revision,
+            default_model_provider,
+            default_model,
+            model_trust,
+            model_trust_confirmed,
+            third_party_source,
+            third_party_trust_confirmed,
+            tools,
+            sidecar,
+            make_default: matches!(
+                run.answer("make-default"),
+                Some(WizardAnswer::Confirm(true))
+            ),
+        },
+    ))
+}
+
+/// Extract the descriptor-bound catalog revision before a daemon reconstructs
+/// the wizard. This is deliberately an opaque answer-envelope field: clients
+/// never choose it, and the selected entry is still revalidated against the
+/// exact pinned catalog before any side effect starts.
+pub fn onboarding_catalog_revision_from_answers_json(answers_json: &str) -> Result<String> {
+    let answers: BTreeMap<String, WizardAnswer> =
+        serde_json::from_str(answers_json).context("deserializing wizard answers")?;
+    match answers.get("__onboarding_catalog_revision") {
+        Some(WizardAnswer::Text(revision))
+            if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Ok(revision.clone())
+        }
+        _ => Err(anyhow!(
+            "onboarding agent answers are missing the descriptor catalog revision; reopen the picker"
+        )),
     }
 }
 
@@ -659,6 +1229,8 @@ fn model_descriptor_with_selection_mode(
         description: "Set trust, capabilities, limits, thinking, delegation, and default model",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: Some(model_context),
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "provider",
@@ -1054,6 +1626,8 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         description: "Configure an inference provider and its authentication",
         write_policy: WritePolicy::PerStep,
         model_context: None,
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: ProviderWizardStep::Template.source_id(),
@@ -1289,6 +1863,8 @@ pub fn security_descriptor_for_config_with_caps(
         description: "Review sandboxing, approvals, redaction, and workspace trust",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
+        onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "sandbox",
@@ -1659,8 +2235,9 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
 
 /// Shared action-step constructor. Provider-wizard actions pass an explicit
 /// branch (`saving` or `done`). Terminal save actions (`profile-save`,
-/// `security-save`, `model-save`, `lifetime-save`) must pass `None` so they
-/// finish the wizard instead of branching into the provider `saving` step.
+/// `security-save`, `model-save`, `lifetime-save`, `agent-install`) must pass
+/// `None` so they finish the wizard instead of branching into the provider
+/// `saving` step.
 fn action_step(
     id: &'static str,
     prompt: &'static str,
@@ -2595,6 +3172,8 @@ mod tests {
             description: "Test wizard",
             write_policy: policy,
             model_context: None,
+            onboarding_agent_models: BTreeMap::new(),
+            onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {
                     id: "start",
@@ -2682,6 +3261,8 @@ mod tests {
             description: "Prefill test",
             write_policy: WritePolicy::CommitAtEnd,
             model_context: None,
+            onboarding_agent_models: BTreeMap::new(),
+            onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {
                     id: "value",

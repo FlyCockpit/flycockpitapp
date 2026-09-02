@@ -3271,7 +3271,12 @@ pub(crate) fn same_file_identity_nofollow(left: &Path, right: &Path) -> Result<b
     Ok(left_identity == right_identity)
 }
 
-pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+/// Replace one trusted config leaf atomically.
+///
+/// Higher-level configuration sagas use this only to restore bytes they
+/// captured under their publication authority after a later participant
+/// failed. It is not a general uncoordinated file-write escape hatch.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     prepare_atomic_write(path, contents)?.commit()
 }
 

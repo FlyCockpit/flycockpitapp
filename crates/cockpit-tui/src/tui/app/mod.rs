@@ -478,6 +478,7 @@ enum FirstRunFlow {
     AwaitProvider,
     AwaitProviderValidation,
     AwaitModel,
+    AwaitAgent,
     AwaitLifetime,
     AwaitFinish,
 }
@@ -3979,6 +3980,7 @@ impl App {
                     }
                 }
                 cockpit_core::welcome::OnboardingStage::Model => FirstRunFlow::AwaitModel,
+                cockpit_core::welcome::OnboardingStage::Agent => FirstRunFlow::AwaitAgent,
                 cockpit_core::welcome::OnboardingStage::Lifetime => FirstRunFlow::AwaitLifetime,
                 cockpit_core::welcome::OnboardingStage::Complete => FirstRunFlow::None,
             },

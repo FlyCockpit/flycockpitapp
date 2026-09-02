@@ -109,6 +109,128 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// An onboarding apply owns only the installation whose UUID is the fresh
+/// inner operation key it minted. Installation may instead return an existing
+/// same-source object; cleanup must never infer ownership from an answer or a
+/// returned receipt identity.
+async fn cleanup_owned_onboarding_installation(
+    ctx: &DaemonContext,
+    operation_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    match ctx
+        .db
+        .delete_agent_installation(operation_id, crate::workspace_lease::now_unix_ms())
+        .await?
+    {
+        cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Tombstoned
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Deleted
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::AlreadyDeleted
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::NotFound => Ok(()),
+    }
+}
+
+/// Release a completed journal.  Delete the durable intent before its private
+/// preimage: a death after the row is gone can leave an orphaned private file,
+/// but can never leave boot recovery blocked on a preimage that was already
+/// destroyed.
+async fn settle_onboarding_publication_journal(
+    ctx: &DaemonContext,
+    operation_id: uuid::Uuid,
+    backup: &std::path::Path,
+) -> anyhow::Result<()> {
+    let operation = operation_id.to_string();
+    ctx.db
+        .write(move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
+                rusqlite::params![operation],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "onboarding publication journal disappeared before settlement"
+            );
+            Ok(())
+        })
+        .await?;
+    if let Err(error) = crate::wizard::OnboardingConfigRollback::discard_durable_journal(backup) {
+        // The SQLite intent is already gone, so this private preimage can no
+        // longer block recovery. It is an orphan eligible for later private
+        // state collection, not a reason to report a completed publication as
+        // failed or recreate recovery ownership.
+        tracing::warn!(%error, path = %backup.display(), "onboarding publication journal preimage orphaned after settlement");
+    }
+    Ok(())
+}
+
+async fn compensate_onboarding_agent_publication(
+    ctx: &DaemonContext,
+    operation_id: uuid::Uuid,
+    backup: &std::path::Path,
+    previous_default_installation_id: Option<uuid::Uuid>,
+) -> anyhow::Result<()> {
+    // Always attempt every inverse operation.  The journal remains intact on
+    // any failure, so startup can retry exactly this full compensation.
+    let config = crate::wizard::OnboardingConfigRollback::restore_durable_journal(backup);
+    let installation = cleanup_owned_onboarding_installation(ctx, operation_id).await;
+    let default = ctx
+        .db
+        .restore_default_agent_installation(
+            previous_default_installation_id,
+            crate::workspace_lease::now_unix_ms(),
+        )
+        .await;
+    if let (Ok(()), Ok(()), Ok(())) = (&config, &installation, &default) {
+        return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
+    }
+    Err(anyhow::anyhow!(
+        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}",
+        config
+            .err()
+            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
+        installation
+            .err()
+            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
+        default
+            .err()
+            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
+    ))
+}
+
+/// Reconcile an interrupted onboarding publication before the daemon accepts
+/// clients. The intent is created before installation, so restoring its exact
+/// config preimage, prior DB default, and operation-named installation exposes
+/// none of an interrupted plan. A missing/corrupt private journal fails closed
+/// and keeps the socket unpublished.
+pub(super) async fn recover_onboarding_agent_publication_journals(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let rows: Vec<(String, String, Option<String>)> = ctx
+        .db
+        .read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT operation_id,backup_path,previous_default_installation_id FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
+            )?;
+            Ok(statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    for (operation, backup_path, previous_default) in rows {
+        let operation_id = uuid::Uuid::parse_str(&operation)
+            .map_err(|error| internal(anyhow::Error::from(error)))?;
+        let backup = std::path::PathBuf::from(backup_path);
+        let previous_default = previous_default
+            .map(|value| uuid::Uuid::parse_str(&value))
+            .transpose()
+            .map_err(|error| internal(anyhow::Error::from(error)))?;
+        compensate_onboarding_agent_publication(ctx, operation_id, &backup, previous_default)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
 /// the proposal scope. Session and persistent rules are keyed by that create
 /// identity, not by the session `active_model`: a computer-capable child
@@ -17306,6 +17428,292 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let mutation = async {
+                if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
+                    // Catalog I/O is deliberately outside the publication
+                    // boundary. Once it is resolved, the config snapshot used
+                    // to validate the plan and every config publication share
+                    // the daemon-wide serialization gate.
+                    let catalog_revision =
+                        crate::wizard::onboarding_catalog_revision_from_answers_json(&answers_json)
+                            .map_err(internal)?;
+                    // The renderer's catalog revision is an authority input,
+                    // not a hint. A live picker must never silently replay
+                    // against a newer `main` (or a different offline cache).
+                    let catalog = if catalog_revision
+                        == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION
+                    {
+                        crate::daemon::agent_catalog::ResolvedAgentCatalog {
+                            revision: catalog_revision,
+                            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+                            index: crate::daemon::agent_catalog::cached_catalog()
+                                .map_err(internal)?,
+                        }
+                    } else {
+                        crate::daemon::agent_catalog::fetch_catalog_at_revision(&catalog_revision)
+                            .await
+                            .map_err(internal)?
+                    };
+                    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+                    let prepared = crate::wizard::prepare_onboarding_agent_answers_for_catalog(
+                        &answers_json,
+                        catalog,
+                    )
+                    .map_err(internal)?;
+                    // Each apply attempt owns a fresh installation operation.
+                    // The outer setup RPC supplies its own replay fence; using
+                    // the answers as this inner idempotency key would replay a
+                    // prior installation and let a later failed publication
+                    // delete somebody else's already-successful result.
+                    let operation_key = uuid::Uuid::now_v7().to_string();
+                    let owned_installation_id = uuid::Uuid::parse_str(&operation_key)
+                        .expect("fresh UUID operation key parses");
+                    // Prepare the cross-authority rollback before *any*
+                    // installation side effect. A daemon death at every later
+                    // boundary is recovered before the socket is published.
+                    let _publication_rollback =
+                        crate::wizard::capture_onboarding_agent_config(&prepared.plan)
+                            .map_err(internal)?;
+                    let previous_default_installation_id = ctx
+                        .db
+                        .default_agent_installation()
+                        .await
+                        .map_err(internal)?;
+                    let publication_backup = _publication_rollback
+                        .write_durable_journal(owned_installation_id)
+                        .map_err(internal)?;
+                    let journal_operation = operation_key.clone();
+                    let journal_backup = publication_backup.to_string_lossy().into_owned();
+                    let journal_previous_default =
+                        previous_default_installation_id.map(|id| id.to_string());
+                    if let Err(error) = ctx
+                        .db
+                        .write(move |conn| {
+                            conn.execute(
+                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
+                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,crate::workspace_lease::now_unix_ms()],
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                    {
+                        let _ = crate::wizard::OnboardingConfigRollback::discard_durable_journal(
+                            &publication_backup,
+                        );
+                        return Err(internal(error));
+                    }
+                    let service = match ctx.agent_installation_service() {
+                        Ok(service) => service,
+                        Err(error) => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                            )
+                            .await;
+                            return Err(internal(match compensation {
+                                Ok(()) => error,
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding installation service unavailable ({error:#}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
+                        }
+                    };
+                    let install = service
+                        .begin(
+                            cockpit_proto::AgentInstallationBeginV1 {
+                                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                                idempotency_key: operation_key.clone(),
+                                operation: cockpit_proto::AgentInstallationOperationKind::Install,
+                                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                                workspace_path: None,
+                                source_locator: prepared.plan.source_locator.clone(),
+                                target_installation_id: None,
+                                replace_acknowledged: false,
+                                third_party_trust_confirmed: prepared
+                                    .plan
+                                    .third_party_trust_confirmed,
+                                requested_slot: Some("primary".into()),
+                                roles: Vec::new(),
+                                computer_use: false,
+                                primary_slot_id: None,
+                                auto_select_first_exact: false,
+                            },
+                            crate::workspace_lease::now_unix_ms(),
+                        )
+                        .await;
+                    let terminal = match install {
+                        cockpit_proto::AgentInstallationResultV1::NeedsChoice {
+                            continuation_token,
+                            choices,
+                            ..
+                        } => {
+                            let choice = choices
+                                .iter()
+                                .find(|choice| {
+                                    choice.model_id == prepared.plan.default_model.model
+                                        && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
+                                            &prepared.providers,
+                                            choice,
+                                        )
+                                        .as_deref()
+                                            == Some(prepared.plan.default_model.provider.as_str())
+                                });
+                            let Some(choice) = choice else {
+                                let compensation = compensate_onboarding_agent_publication(
+                                    ctx,
+                                    owned_installation_id,
+                                    &publication_backup,
+                                    previous_default_installation_id,
+                                )
+                                .await;
+                                return match compensation {
+                                    Ok(()) => Err(internal(anyhow::anyhow!(
+                                        "selected onboarding model is absent from daemon binding choices"
+                                    ))),
+                                    Err(recovery) => Err(internal(anyhow::anyhow!(
+                                        "selected onboarding model is absent from daemon binding choices; recovery remains pending: {recovery:#}"
+                                    ))),
+                                };
+                            };
+                            service
+                                .submit_choice(
+                                    cockpit_proto::AgentInstallationSubmitChoiceV1 {
+                                        dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                                        continuation_token,
+                                        choice_id: Some(choice.choice_id.clone()),
+                                        defer: false,
+                                    },
+                                    crate::workspace_lease::now_unix_ms(),
+                                )
+                                .await
+                        }
+                        result => result,
+                    };
+                    let installed_id = match terminal {
+                        cockpit_proto::AgentInstallationResultV1::Receipt {
+                            status:
+                                cockpit_proto::AgentInstallationReceiptStatusV1::Installed
+                                | cockpit_proto::AgentInstallationReceiptStatusV1::Bound,
+                            installation_id: Some(installation_id),
+                            ..
+                        } => match uuid::Uuid::parse_str(&installation_id) {
+                            Ok(installation_id) => installation_id,
+                            Err(error) => {
+                                let compensation = compensate_onboarding_agent_publication(
+                                    ctx,
+                                    owned_installation_id,
+                                    &publication_backup,
+                                    previous_default_installation_id,
+                                )
+                                .await;
+                                return Err(internal(match compensation {
+                                    Ok(()) => anyhow::Error::from(error),
+                                    Err(recovery) => anyhow::anyhow!(
+                                        "agent onboarding returned an invalid installation identity ({error}); recovery remains pending: {recovery:#}"
+                                    ),
+                                }));
+                            }
+                        },
+                        cockpit_proto::AgentInstallationResultV1::Error { error } => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                            )
+                            .await;
+                            return match compensation {
+                                Ok(()) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding install failed: {}",
+                                    error.message
+                                ))),
+                                Err(recovery) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding install failed: {}; recovery remains pending: {recovery:#}",
+                                    error.message
+                                ))),
+                            };
+                        }
+                        _ => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                            )
+                            .await;
+                            return match compensation {
+                                Ok(()) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding did not produce a usable primary binding"
+                                ))),
+                                Err(recovery) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding did not produce a usable primary binding; recovery remains pending: {recovery:#}"
+                                ))),
+                            };
+                        }
+                    };
+                    // Publish config before selecting the DB default. If any
+                    // later participant fails, compensate both authorities
+                    // while the publication gate still excludes other daemon
+                    // writers; onboarding must not leave a visible half-plan.
+                    match crate::wizard::persist_onboarding_agent_plan(&prepared.plan) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                            )
+                            .await;
+                            return Err(internal(match compensation {
+                                Ok(()) => error,
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding config publication failed ({error:#}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
+                        }
+                    };
+                    if prepared.plan.make_default
+                        && let Err(error) = ctx
+                            .db
+                            .set_default_agent_installation(
+                                installed_id,
+                                crate::workspace_lease::now_unix_ms(),
+                            )
+                            .await
+                    {
+                        let compensation = compensate_onboarding_agent_publication(
+                            ctx,
+                            owned_installation_id,
+                            &publication_backup,
+                            previous_default_installation_id,
+                        )
+                        .await;
+                        return Err(internal(match compensation {
+                            Ok(()) => error,
+                            Err(recovery) => anyhow::anyhow!(
+                                "agent onboarding default selection failed ({error:#}); recovery remains pending: {recovery:#}"
+                            ),
+                        }));
+                    }
+                    // A complete publication is visible only after every
+                    // participant succeeds. Release the durable owner before
+                    // deleting its private preimage so re-entry can never be
+                    // blocked on an already-discarded recovery file.
+                    settle_onboarding_publication_journal(
+                        ctx,
+                        owned_installation_id,
+                        &publication_backup,
+                    )
+                    .await
+                    .map_err(internal)?;
+                    return Ok(Response::SetupWizardApplied {
+                        changed: true,
+                        model_file_written: true,
+                        default_scope: Some("global".into()),
+                    });
+                }
                 let result = crate::wizard::apply_setup_wizard_answers_authoritative(
                     std::path::Path::new(&project_root),
                     &wizard_id,

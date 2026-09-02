@@ -200,6 +200,24 @@ impl CanonicalAgentSource {
     pub fn identity(&self) -> String {
         format!("{}/{}:{}", self.owner, self.repository, self.markdown_path)
     }
+
+    /// Resolve the installed name for both the legacy flat `agents/name.md`
+    /// layout and package-style `agents/name/agent.md` definitions.
+    pub fn agent_name(&self) -> Result<&str> {
+        let mut segments = self.markdown_path.rsplit('/');
+        let filename = segments
+            .next()
+            .context("source Markdown path has no agent filename")?;
+        if filename == "agent.md"
+            && let Some(package_name) = segments.next().filter(|value| !value.is_empty())
+        {
+            return Ok(package_name);
+        }
+        filename
+            .strip_suffix(".md")
+            .filter(|value| !value.is_empty())
+            .context("source Markdown path has no agent filename")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2652,6 +2670,12 @@ impl AgentInstallationService {
                 request.operation,
                 AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
             ) {
+            let source = CanonicalAgentSource::parse(&request.source_locator)?;
+            ensure!(
+                (source.owner == "FlyCockpit" && source.repository == "agents")
+                    || request.third_party_trust_confirmed,
+                "third-party agent installation requires explicit security confirmation"
+            );
             Some(
                 self.prefetch_fresh_source(
                     &request,
@@ -3662,18 +3686,23 @@ impl AgentInstallationService {
         expected_agent_id: Option<&str>,
     ) -> Result<FetchedAgentSource> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
-        let fetched = self
-            .fetcher
-            .fetch_github_markdown(&source)
-            .await
-            .context("fetching GitHub agent source")?;
+        let name = source.agent_name()?;
+        let fetched = if source.owner == "FlyCockpit"
+            && source.repository == "agents"
+            && source.requested_revision.as_deref()
+                == Some(crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION)
+            && source.markdown_path == "agents/frontier-coding/agent.md"
+        {
+            FetchedAgentSource {
+                commit_sha: crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION.to_string(),
+                markdown: crate::daemon::agent_catalog::bundled_frontier_markdown().to_vec(),
+            }
+        } else {
+            self.fetcher
+                .fetch_github_markdown(&source)
+                .await
+                .context("fetching GitHub agent source")?
+        };
         ensure!(
             is_commit_sha(&fetched.commit_sha),
             "source fetch did not resolve an immutable commit SHA"
@@ -3687,6 +3716,9 @@ impl AgentInstallationService {
         let definition =
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
+        if source.owner == "FlyCockpit" && source.repository == "agents" {
+            validate_first_party_catalog_source(&source, &fetched).await?;
+        }
         let vnext = definition
             .vnext
             .as_ref()
@@ -3726,13 +3758,7 @@ impl AgentInstallationService {
         fetched: &FetchedAgentSource,
     ) -> Result<()> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
+        let name = source.agent_name()?;
         let target = owned_path(
             &self.daemon_agents_dir,
             workspace_root,
@@ -3798,13 +3824,7 @@ impl AgentInstallationService {
         prefetched: Option<FetchedAgentSource>,
     ) -> Result<AgentInstallationResultV1> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
-        let name = source
-            .markdown_path
-            .rsplit('/')
-            .next()
-            .and_then(|value| value.strip_suffix(".md"))
-            .filter(|value| !value.is_empty())
-            .context("source Markdown path has no agent filename")?;
+        let name = source.agent_name()?;
         ensure!(
             !crate::agents::is_builtin_agent(name),
             "daemon installation may not overwrite a protected builtin agent"
@@ -3873,6 +3893,9 @@ impl AgentInstallationService {
         let definition =
             crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
                 .context("invalid fetched AgentDef")?;
+        if source.owner == "FlyCockpit" && source.repository == "agents" {
+            validate_first_party_catalog_source(&source, &fetched).await?;
+        }
         ensure!(
             definition.vnext.is_some(),
             "installed agent must be a vNext AgentDef"
@@ -4797,6 +4820,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn is_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+/// The first-party catalog is the authority for both the package definition
+/// and whether that package is installable on this host.  This is called at
+/// prefetch and again immediately before publication because an idempotent
+/// replay may use durable staged bytes instead of taking the fresh path.
+async fn validate_first_party_catalog_source(
+    source: &CanonicalAgentSource,
+    fetched: &FetchedAgentSource,
+) -> Result<()> {
+    let catalog = if fetched.commit_sha == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION {
+        crate::daemon::agent_catalog::ResolvedAgentCatalog {
+            revision: fetched.commit_sha.clone(),
+            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+            index: crate::daemon::agent_catalog::cached_catalog()?,
+        }
+    } else {
+        crate::daemon::agent_catalog::fetch_catalog_at_revision(&fetched.commit_sha)
+            .await
+            .context("fetching pinned first-party catalog index")?
+    };
+    let entry = catalog
+        .index
+        .agents
+        .iter()
+        .find(|entry| entry.catalog.definition_path == source.markdown_path)
+        .context("pinned first-party agent is absent from its catalog index")?;
+    entry
+        .validate_fetched_agent_markdown(&fetched.markdown)
+        .context("first-party catalog definition mismatch")?;
+    ensure!(
+        entry.is_eligible_for_hardware(
+            &crate::daemon::agent_catalog::AgentCatalogHostHardware::detect_current_host()
+        ),
+        "selected catalog agent is not eligible for this host's hardware"
+    );
+    Ok(())
+}
+
 fn validate_idempotency_key(value: &str) -> Result<()> {
     ensure!(
         !value.trim().is_empty() && value.len() <= 256,
@@ -5812,13 +5873,7 @@ fn staged_source_journal_metadata(
     fetched: &FetchedAgentSource,
 ) -> Result<(String, String)> {
     let source = CanonicalAgentSource::parse(source_locator)?;
-    let target_name = source
-        .markdown_path
-        .rsplit('/')
-        .next()
-        .and_then(|value| value.strip_suffix(".md"))
-        .filter(|value| !value.is_empty())
-        .context("source Markdown path has no agent filename")?;
+    let target_name = source.agent_name()?;
     let digest = sha256_hex(&fetched.markdown);
     let metadata = serde_json::to_string(&JournalStagedSource {
         target_name: target_name.to_owned(),
@@ -7586,6 +7641,7 @@ mod tests {
                 source_locator: "owner/repo@main:agents/helper.md".into(),
                 target_installation_id: None,
                 replace_acknowledged: false,
+                third_party_trust_confirmed: true,
                 requested_slot: None,
                 roles: Vec::new(),
                 computer_use: false,
@@ -8285,7 +8341,11 @@ mod tests {
     }
     #[test]
     fn agent_installation_daemon_source_parser_refuses_urls_traversal_and_non_markdown() {
-        assert!(CanonicalAgentSource::parse("owner/repo@main:agents/helper.md").is_ok());
+        let flat = CanonicalAgentSource::parse("owner/repo@main:agents/helper.md").unwrap();
+        assert_eq!(flat.agent_name().unwrap(), "helper");
+        let package =
+            CanonicalAgentSource::parse("owner/repo@main:agents/frontier-coding/agent.md").unwrap();
+        assert_eq!(package.agent_name().unwrap(), "frontier-coding");
         for source in [
             "https://github.com/owner/repo:a.md",
             "owner/repo:../a.md",
@@ -10322,6 +10382,7 @@ mod tests {
                     source_locator: "owner/repo@main:agents/helper.md".into(),
                     target_installation_id: Some(installation_id.clone()),
                     replace_acknowledged: true,
+                    third_party_trust_confirmed: true,
                     ..ServiceHarness::request("dirty-update")
                 },
                 2,

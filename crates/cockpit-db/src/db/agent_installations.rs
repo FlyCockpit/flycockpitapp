@@ -1206,6 +1206,83 @@ impl Db {
             .await
     }
 
+    pub async fn set_default_agent_installation(
+        &self,
+        installation_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let changed = conn.execute(
+                "INSERT INTO agent_default_installation(singleton,installation_id,updated_at_unix_ms)
+                 SELECT 1,i.installation_id,?2 FROM agent_installations i
+                 WHERE i.installation_id=?1 AND i.scope='global' AND i.deleted_at_unix_ms IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM agent_model_bindings b
+                       WHERE b.installation_id=i.installation_id
+                         AND b.definition_digest=i.source_digest
+                         AND b.slot_id='primary' AND b.is_default=1
+                         AND b.retired_at_unix_ms IS NULL
+                   )
+                 ON CONFLICT(singleton) DO UPDATE SET
+                   installation_id=excluded.installation_id,
+                   updated_at_unix_ms=excluded.updated_at_unix_ms",
+                params![installation_id.to_string(), now_unix_ms],
+            )?;
+            ensure!(
+                changed == 1,
+                "default agent must be a live, primary-bound global installation"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn default_agent_installation(&self) -> Result<Option<Uuid>> {
+        self.read(|conn| default_agent_installation_conn(conn))
+            .await
+    }
+
+    /// Restore the machine-wide default captured by a cross-authority
+    /// publication journal.  `None` is a real prior state, not a request to
+    /// leave whatever a partially published operation selected.
+    pub async fn restore_default_agent_installation(
+        &self,
+        installation_id: Option<Uuid>,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            if let Some(installation_id) = installation_id {
+                let changed = conn.execute(
+                    "INSERT INTO agent_default_installation(singleton,installation_id,updated_at_unix_ms)
+                     SELECT 1,i.installation_id,?2 FROM agent_installations i
+                     WHERE i.installation_id=?1 AND i.scope='global' AND i.deleted_at_unix_ms IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM agent_model_bindings b
+                           WHERE b.installation_id=i.installation_id
+                             AND b.definition_digest=i.source_digest
+                             AND b.slot_id='primary' AND b.is_default=1
+                             AND b.retired_at_unix_ms IS NULL
+                       )
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       installation_id=excluded.installation_id,
+                       updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![installation_id.to_string(), now_unix_ms],
+                )?;
+                ensure!(
+                    changed == 1,
+                    "onboarding recovery prior default is not a live, primary-bound global installation"
+                );
+            } else {
+                conn.execute(
+                    "DELETE FROM agent_default_installation WHERE singleton=1",
+                    [],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Read the selected immutable profile reference, all visible installation
     /// rows, observations, and matching current bindings through one SQLite
     /// read snapshot.  Definition files and provider config are intentionally
@@ -1224,7 +1301,8 @@ impl Db {
             conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
             let projection = (|| {
                 let selected_installation_id = snapshot_for_session(conn, session_id)?
-                    .map(|snapshot| snapshot.installation_id);
+                    .map(|snapshot| snapshot.installation_id)
+                    .or(default_agent_installation_conn(conn)?);
                 let mut installations =
                     installations_by_scope(conn, AgentInstallationScope::Global, "")?;
                 installations.extend(installations_by_scope(
@@ -3378,6 +3456,18 @@ fn session_preparation_eligibility(
 fn installation_by_id(conn: &Connection, id: Uuid) -> Result<Option<AgentInstallationRow>> {
     conn.query_row("SELECT installation_id,scope,canonical_workspace_id,source_agent_id,source_identity,source_revision,source_digest,fetched_at_unix_ms,installation_revision,deleted_at_unix_ms FROM agent_installations WHERE installation_id=?1",[id.to_string()],decode_installation).optional().context("looking up agent installation")
 }
+
+fn default_agent_installation_conn(conn: &Connection) -> Result<Option<Uuid>> {
+    conn.query_row(
+        "SELECT installation_id FROM agent_default_installation WHERE singleton=1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| Uuid::parse_str(&value).context("stored default agent installation id is invalid"))
+    .transpose()
+}
+
 fn decode_installation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentInstallationRow> {
     Ok(AgentInstallationRow {
         installation_id: parse_uuid(row.get::<_, String>(0)?)?,

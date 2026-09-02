@@ -59,6 +59,7 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             workspace,
             operation_key,
             yes,
+            trust_third_party,
         } => {
             begin(BeginInput {
                 source_locator: source,
@@ -67,6 +68,7 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
                 workspace,
                 operation_key,
                 yes,
+                third_party_trust_confirmed: trust_third_party,
                 ..BeginInput::default()
             })
             .await
@@ -79,6 +81,7 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             workspace,
             operation_key,
             yes,
+            trust_third_party,
         } => {
             // Keep the documented installation-id grammar at the client
             // boundary. The daemon resolves provenance and replacement within
@@ -93,6 +96,7 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
                 workspace,
                 operation_key,
                 yes,
+                third_party_trust_confirmed: trust_third_party,
                 target_installation_id: Some(installation_id),
                 ..BeginInput::default()
             })
@@ -190,6 +194,7 @@ struct BeginInput {
     source_locator: String,
     operation: AgentInstallationOperationKind,
     replace_acknowledged: bool,
+    third_party_trust_confirmed: bool,
     requested_slot: Option<String>,
     scope: Option<AgentScopeArg>,
     workspace: Option<PathBuf>,
@@ -206,6 +211,7 @@ impl Default for BeginInput {
             source_locator: String::new(),
             operation: AgentInstallationOperationKind::Install,
             replace_acknowledged: false,
+            third_party_trust_confirmed: false,
             requested_slot: None,
             scope: None,
             workspace: None,
@@ -223,6 +229,7 @@ async fn begin(input: BeginInput) -> Result<()> {
         source_locator,
         operation,
         replace_acknowledged,
+        mut third_party_trust_confirmed,
         requested_slot,
         scope,
         workspace,
@@ -232,6 +239,14 @@ async fn begin(input: BeginInput) -> Result<()> {
         displayed_choice_selector,
         target_installation_id,
     } = input;
+    if matches!(
+        operation,
+        AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
+    ) && !is_first_party_agent_source(&source_locator)
+        && !third_party_trust_confirmed
+    {
+        third_party_trust_confirmed = prompt_for_third_party_trust()?;
+    }
     let (scope, workspace_path) = scope_request(
         scope,
         workspace,
@@ -251,6 +266,7 @@ async fn begin(input: BeginInput) -> Result<()> {
             source_locator,
             target_installation_id,
             replace_acknowledged,
+            third_party_trust_confirmed,
             requested_slot,
             roles: Vec::new(),
             computer_use: false,
@@ -369,6 +385,7 @@ async fn create(
             source_locator: requested_name,
             target_installation_id: None,
             replace_acknowledged: false,
+            third_party_trust_confirmed: false,
             requested_slot: None,
             roles: roles.into_iter().map(Into::into).collect(),
             computer_use,
@@ -765,6 +782,37 @@ fn scope_request(
 
 fn stdin_is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn is_first_party_agent_source(source: &str) -> bool {
+    source.starts_with("FlyCockpit/agents@") || source.starts_with("FlyCockpit/agents:")
+}
+
+fn prompt_for_third_party_trust() -> Result<bool> {
+    if !stdin_is_interactive() {
+        return Err(anyhow!(AgentCommandError::new(
+            AgentCommandError::ACKNOWLEDGEMENT_REQUIRED,
+            "third-party agent source requires --trust-third-party after reviewing its code and prompt-injection risk"
+        )));
+    }
+    eprintln!(
+        "Security warning: this third-party agent can contain instructions and tool preferences that influence model behavior. Review the pinned source before installing it."
+    );
+    print!("Install this pinned third-party source? Type 'install': ");
+    io::stdout()
+        .flush()
+        .context("flushing third-party trust prompt")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("reading third-party trust confirmation")?;
+    if input.trim() != "install" {
+        return Err(anyhow!(AgentCommandError::new(
+            AgentCommandError::ACKNOWLEDGEMENT_REQUIRED,
+            "third-party agent installation was not confirmed"
+        )));
+    }
+    Ok(true)
 }
 
 fn prompt_for_scope() -> Result<AgentScopeArg> {

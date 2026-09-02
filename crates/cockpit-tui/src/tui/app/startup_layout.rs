@@ -86,6 +86,18 @@ impl App {
                     }
                 }
             }
+            FirstRunFlow::AwaitAgent => {
+                match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
+                    "Resume setup: install an agent and confirm its model, tools, trust, and sidecar."
+                        .to_string(),
+                )) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return;
+                    }
+                }
+            }
             FirstRunFlow::AwaitLifetime => {
                 match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(Some(
                     "Resume setup: choose what happens when the last Cockpit window closes."
@@ -180,6 +192,29 @@ impl App {
                 if !self.dialog.setup_wizard_is_complete_any(&[
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
                 ]) {
+                    return false;
+                }
+                self.refresh_bootstrap_config_snapshot();
+                if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Agent) {
+                    return false;
+                }
+                self.dialog = match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
+                    "Choose and install an agent for the default model.".to_string(),
+                )) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return false;
+                    }
+                };
+                self.first_run_flow = FirstRunFlow::AwaitAgent;
+                true
+            }
+            FirstRunFlow::AwaitAgent => {
+                if !self
+                    .dialog
+                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+                {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();

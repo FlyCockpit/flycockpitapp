@@ -23,6 +23,7 @@
 //!   status}` lets the user manage the lifecycle explicitly.
 
 pub(crate) mod acp_catalog_composition;
+pub mod agent_catalog;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod agent_session_override;

@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt as _;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::builtin::HostContext;
 use crate::db::monty_network::CanonicalNetworkHost;
@@ -85,6 +86,11 @@ impl SessionNetworkGrants {
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNetworkPolicy {
+    /// Immutable installed-agent identity resolved at preflight. Dispatch
+    /// re-resolves under the durable fence and refuses the request if this
+    /// identity changed, so a profile rebinding cannot carry a prior
+    /// installation's grant across the transport boundary.
+    installation_id: Uuid,
     agent_generation: u64,
     session_generation: u64,
     agent_hosts: BTreeSet<CanonicalNetworkHost>,
@@ -106,6 +112,7 @@ pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPoli
     let agent = capability.agent_policy;
     let session = capability.session_policy;
     Ok(EffectiveNetworkPolicy {
+        installation_id: capability.installation_id,
         agent_generation: agent.generation,
         session_generation: session.generation,
         agent_hosts: agent.hosts,
@@ -195,9 +202,10 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         .native_tool_ctx
         .as_ref()
         .context("governed network requires a live agent context")?;
-    // `effective_policy` performs the same fail-closed binding for its
-    // preflight. Bind it here as well: the final durable-policy read is the
-    // authority that linearizes transport egress with revocation.
+    // `effective_policy` resolves the execution instance to an immutable
+    // installed-agent identity for its preflight. Re-resolve under the final
+    // durable fence so a profile rebinding cannot carry a prior installation's
+    // grant across the actual transport boundary.
     let agent_instance_id = ctx
         .agent_instance_id
         .context("governed network requires a daemon-owned agent instance")?;
@@ -287,15 +295,21 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
     // after a preflight check.
     let response = {
         let _durable_egress_permit = ctx.session.db.monty_network_egress_permit().await;
+        let current_installation_id = ctx
+            .session
+            .db
+            .monty_network_installation_id_for_agent_instance(ctx.session.id, agent_instance_id)
+            .await?;
         let current_agent_policy = ctx
             .session
             .db
-            .monty_network_agent_policy(agent_instance_id)
+            .monty_network_installation_policy(current_installation_id)
             .await?;
         let _session_egress_permit = ctx.session.monty_network_egress_permit().await;
         let current_session_policy = ctx.session.monty_session_network_grant_snapshot();
         ensure!(
-            current_agent_policy.generation == policy.agent_generation
+            current_installation_id == policy.installation_id
+                && current_agent_policy.generation == policy.agent_generation
                 && current_session_policy.generation == policy.session_generation
                 && current_agent_policy.requests_enabled
                 && (current_agent_policy.hosts.contains(&destination)

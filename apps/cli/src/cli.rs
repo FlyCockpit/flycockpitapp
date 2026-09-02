@@ -1006,6 +1006,9 @@ pub enum AgentCommand {
         /// Bind only the first exact author-suggested compatible model.
         #[arg(long)]
         yes: bool,
+        /// Confirm the security warning for a non-FlyCockpit agent source.
+        #[arg(long)]
+        trust_third_party: bool,
     },
     /// Update an installed agent definition through the daemon.
     Update {
@@ -1024,6 +1027,9 @@ pub enum AgentCommand {
         /// Bind only the first exact author-suggested compatible model.
         #[arg(long)]
         yes: bool,
+        /// Confirm the security warning for a non-FlyCockpit agent source.
+        #[arg(long)]
+        trust_third_party: bool,
     },
     /// Bind a daemon-resolved installed agent slot.
     Bind {

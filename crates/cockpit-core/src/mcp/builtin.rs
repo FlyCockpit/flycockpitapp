@@ -42,7 +42,8 @@ const DEFAULT_CHILD_EVENT_CAP: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNetworkCapability {
-    pub agent_policy: crate::db::monty_network::MontyNetworkAgentPolicy,
+    pub installation_id: Uuid,
+    pub agent_policy: crate::db::monty_network::MontyNetworkInstallationPolicy,
     pub session_policy: crate::mcp::network::SessionNetworkGrantSnapshot,
 }
 
@@ -956,10 +957,15 @@ impl BuiltinRegistry {
         let session = session.context("governed network requires a live agent context")?;
         let agent_instance_id =
             agent_instance_id.context("governed network requires a daemon-owned agent instance")?;
+        let installation_id = session
+            .db
+            .monty_network_installation_id_for_agent_instance(session.id, agent_instance_id)
+            .await?;
         Ok(EffectiveNetworkCapability {
+            installation_id,
             agent_policy: session
                 .db
-                .monty_network_agent_policy(agent_instance_id)
+                .monty_network_installation_policy(installation_id)
                 .await?,
             session_policy: session.monty_session_network_grant_snapshot(),
         })

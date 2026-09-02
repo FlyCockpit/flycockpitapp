@@ -3555,12 +3555,14 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 if !matches!(
                     wizard_id.as_str(),
-                    "security" | "model" | "onboarding-model" | "onboarding-profile"
+                    "security"
+                        | "model"
+                        | "onboarding-model"
+                        | "onboarding-profile"
+                        | "onboarding-agent"
+                        | "onboarding-lifetime"
                 ) {
-                    return Err(
-                        "setup wizard must be security, model, onboarding-model, or onboarding-profile"
-                            .to_string(),
-                    );
+                    return Err("setup wizard id is not supported".to_string());
                 }
                 if answers_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("setup wizard answers exceed maximum length".to_string());

@@ -321,14 +321,16 @@ CREATE TABLE sessions (
 
 -- ---- Monty governed network capability -----------------------------------
 
--- Agent-scoped network authority is written only by an explicit owner action.
+-- Installation-scoped network authority is written only by an explicit owner action.
 -- Definition-authored requested hosts never enter these tables.  The policy
 -- generation changes on every mutation so dispatch can fence a request after
 -- redaction and immediately observe revocation before egress.
 CREATE TABLE monty_network_agent_policies (
-    -- The daemon-issued executor UUID is the authority subject. Display names
-    -- and authored agent ids are recyclable and must never inherit grants.
-    agent_instance_id TEXT PRIMARY KEY,
+    -- The immutable installation UUID is the durable authority subject.
+    -- Execution-instance UUIDs prove a live caller but are session-local and
+    -- must never cause an installed agent to lose its owner-granted policy.
+    installation_id TEXT PRIMARY KEY REFERENCES agent_installations(installation_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT,
     requests_enabled INTEGER NOT NULL DEFAULT 0 CHECK (requests_enabled IN (0, 1)),
     approval_required INTEGER NOT NULL DEFAULT 0 CHECK (approval_required IN (0, 1)),
     generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
@@ -336,7 +338,7 @@ CREATE TABLE monty_network_agent_policies (
 );
 
 CREATE TABLE monty_network_agent_grants (
-    agent_instance_id TEXT NOT NULL REFERENCES monty_network_agent_policies(agent_instance_id)
+    installation_id TEXT NOT NULL REFERENCES monty_network_agent_policies(installation_id)
         ON DELETE CASCADE ON UPDATE RESTRICT,
     host TEXT NOT NULL CHECK (
         length(CAST(host AS BLOB)) BETWEEN 1 AND 253
@@ -344,7 +346,7 @@ CREATE TABLE monty_network_agent_grants (
         AND host NOT GLOB '*[/:?#@]*'
     ),
     granted_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY (agent_instance_id, host)
+    PRIMARY KEY (installation_id, host)
 );
 
 -- Parent links form an acyclic ownership graph. The recursive UNION is also
@@ -7512,6 +7514,15 @@ CREATE TABLE agent_installations (
     UNIQUE (scope, scope_workspace_key, source_agent_id)
 );
 
+-- Machine-wide onboarding default. The referenced global installation still
+-- has to pass the normal observation/binding checks when a session snapshots
+-- it; this row is selection intent, not launch authority.
+CREATE TABLE agent_default_installation (
+    singleton                     INTEGER PRIMARY KEY CHECK (singleton = 1),
+    installation_id               TEXT NOT NULL UNIQUE REFERENCES agent_installations(installation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    updated_at_unix_ms             INTEGER NOT NULL
+);
+
 CREATE TABLE installation_observations (
     installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     observed_digest              TEXT NOT NULL,
@@ -7631,6 +7642,18 @@ CREATE TABLE installation_operations (
     created_at_unix_ms           INTEGER NOT NULL,
     updated_at_unix_ms           INTEGER NOT NULL,
     CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
+);
+
+-- Cross-authority onboarding publication intent. Config preimages remain in
+-- a daemon-private journal file; this row is the durable recovery owner that
+-- restores those bytes, restores the prior default selection, and removes
+-- only the installation named by operation.  The row and private preimage are
+-- one recovery authority: neither is discarded while compensation remains.
+CREATE TABLE onboarding_agent_publication_journals (
+    operation_id                 TEXT PRIMARY KEY,
+    backup_path                  TEXT NOT NULL,
+    previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    created_at_unix_ms           INTEGER NOT NULL
 );
 
 CREATE TABLE installation_continuations (

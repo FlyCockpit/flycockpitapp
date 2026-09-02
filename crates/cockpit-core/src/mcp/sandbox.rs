@@ -1032,6 +1032,12 @@ async fn configure_network_policy(
     let agent_instance_id = ctx.agent_instance_id.ok_or_else(|| {
         "network configuration requires a daemon-owned agent instance".to_string()
     })?;
+    let installation_id = ctx
+        .session
+        .db
+        .monty_network_installation_id_for_agent_instance(ctx.session.id, agent_instance_id)
+        .await
+        .map_err(|error| format!("network configuration requires an installed agent: {error:#}"))?;
     let host_name = host_name
         .map(|host| crate::db::monty_network::CanonicalNetworkHost::parse(&host))
         .transpose()
@@ -1090,6 +1096,7 @@ async fn configure_network_policy(
     })?;
     let approval_input = serde_json::json!({
         "agent_instance_id": agent_instance_id,
+        "installation_id": installation_id,
         "action": &action,
         "host": host_name.as_ref(),
     });
@@ -1107,6 +1114,15 @@ async fn configure_network_policy(
     )
     .await
     .map_err(|error| format!("network configuration approval became stale: {error:#}"))?;
+    let current_installation_id = ctx
+        .session
+        .db
+        .monty_network_installation_id_for_agent_instance(ctx.session.id, agent_instance_id)
+        .await
+        .map_err(|error| format!("network configuration executor changed: {error:#}"))?;
+    if current_installation_id != installation_id {
+        return Err("network configuration agent installation changed before mutation".to_string());
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let (agent_policy, session_policy) =
         async {
@@ -1115,8 +1131,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .mutate_monty_network_agent_policy(
-                            agent_instance_id,
+                        .mutate_monty_network_installation_policy(
+                            installation_id,
                             crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(
                                 true,
                             ),
@@ -1132,8 +1148,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .mutate_monty_network_agent_policy(
-                            agent_instance_id,
+                        .mutate_monty_network_installation_policy(
+                            installation_id,
                             crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(
                                 false,
                             ),
@@ -1149,8 +1165,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                 .session
                 .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
+                .mutate_monty_network_installation_policy(
+                    installation_id,
                     crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(true),
                     now,
                 )
@@ -1164,8 +1180,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                 .session
                 .db
-                .mutate_monty_network_agent_policy(
-                    agent_instance_id,
+                .mutate_monty_network_installation_policy(
+                    installation_id,
                     crate::db::monty_network::MontyNetworkAgentMutation::SetApprovalRequired(false),
                     now,
                 )
@@ -1179,8 +1195,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .mutate_monty_network_agent_policy(
-                            agent_instance_id,
+                        .mutate_monty_network_installation_policy(
+                            installation_id,
                             crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
                                 host_name
                                     .ok_or_else(|| anyhow::anyhow!("grant_host requires host"))?,
@@ -1197,8 +1213,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .mutate_monty_network_agent_policy(
-                            agent_instance_id,
+                        .mutate_monty_network_installation_policy(
+                            installation_id,
                             crate::db::monty_network::MontyNetworkAgentMutation::RevokeHost(
                                 host_name
                                     .ok_or_else(|| anyhow::anyhow!("revoke_host requires host"))?,
@@ -1215,8 +1231,8 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .mutate_monty_network_agent_policy(
-                            agent_instance_id,
+                        .mutate_monty_network_installation_policy(
+                            installation_id,
                             crate::db::monty_network::MontyNetworkAgentMutation::RevokeAllHosts,
                             now,
                         )
@@ -1240,7 +1256,7 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .monty_network_agent_policy(agent_instance_id)
+                        .monty_network_installation_policy(installation_id)
                         .await?;
                     (agent_policy, session_policy)
                 }
@@ -1258,7 +1274,7 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .monty_network_agent_policy(agent_instance_id)
+                        .monty_network_installation_policy(installation_id)
                         .await?;
                     (agent_policy, session_policy)
                 }
@@ -1272,7 +1288,7 @@ async fn configure_network_policy(
                     let agent_policy = ctx
                         .session
                         .db
-                        .monty_network_agent_policy(agent_instance_id)
+                        .monty_network_installation_policy(installation_id)
                         .await?;
                     (agent_policy, session_policy)
                 }
@@ -1288,7 +1304,7 @@ async fn configure_network_policy(
 }
 
 fn network_configuration_policy_json(
-    agent_policy: crate::db::monty_network::MontyNetworkAgentPolicy,
+    agent_policy: crate::db::monty_network::MontyNetworkInstallationPolicy,
     session_policy: super::network::SessionNetworkGrantSnapshot,
 ) -> Value {
     let mut hosts = agent_policy.hosts.clone();
@@ -1856,6 +1872,62 @@ mod tests {
     use super::*;
     use crate::engine::agent::TurnEvent;
     use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
+
+    async fn network_test_identity(
+        ctx: &mut crate::engine::tool::ToolCtx,
+    ) -> (uuid::Uuid, uuid::Uuid) {
+        let installation_id = uuid::Uuid::now_v7();
+        let db = ctx.session.db.clone();
+        let session_id = ctx.session.id;
+        let install = db
+            .install_agent(crate::db::agent_installations::AgentInstallationInput {
+                installation_id,
+                scope: crate::db::agent_installations::AgentInstallationScope::Global,
+                canonical_workspace_id: None,
+                source_agent_id: format!("network-test-{installation_id}"),
+                source_identity: format!("network-test:{installation_id}"),
+                source_revision: Some("test".into()),
+                source_digest: "a".repeat(64),
+                fetched_at_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            install,
+            crate::db::agent_installations::InstallAgentOutcome::Installed(_)
+        ));
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE agent_instances SET resolved_installation_id=?1 WHERE session_id=?2 AND agent_instance_id=?3",
+                rusqlite::params![
+                    installation_id.to_string(),
+                    session_id.to_string(),
+                    agent.agent_instance_id.to_string(),
+                ],
+            )?;
+            anyhow::ensure!(changed == 1, "network test agent disappeared");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        ctx.agent_instance_id = Some(agent.agent_instance_id);
+        (agent.agent_instance_id, installation_id)
+    }
     use crate::session::Session;
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -3064,12 +3136,11 @@ mod tests {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        let agent_instance_id = uuid::Uuid::new_v4();
-        ctx.agent_instance_id = Some(agent_instance_id);
+        let (_, installation_id) = network_test_identity(&mut ctx).await;
         ctx.session
             .db
-            .mutate_monty_network_agent_policy(
-                agent_instance_id,
+            .mutate_monty_network_installation_policy(
+                installation_id,
                 crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
                 1,
             )
@@ -3134,8 +3205,7 @@ mod tests {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let (mut ctx, db, hub) = approvable_ctx(tmp.path());
-        let agent_instance_id = uuid::Uuid::new_v4();
-        ctx.agent_instance_id = Some(agent_instance_id);
+        let (_, installation_id) = network_test_identity(&mut ctx).await;
         let session_id = ctx.session.id;
         let host = HostContext::from_tool_ctx(&ctx);
 
@@ -3204,7 +3274,7 @@ mod tests {
         assert_eq!(output, "[true,true,true,1,true,false,2]");
 
         let policy = db
-            .monty_network_agent_policy(agent_instance_id)
+            .monty_network_installation_policy(installation_id)
             .await
             .unwrap();
         assert!(policy.hosts.contains(
@@ -3217,8 +3287,7 @@ mod tests {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let (mut ctx, db, hub) = approvable_ctx(tmp.path());
-        let agent_instance_id = uuid::Uuid::new_v4();
-        ctx.agent_instance_id = Some(agent_instance_id);
+        let (_, installation_id) = network_test_identity(&mut ctx).await;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let session_id = ctx.session.id;
@@ -3240,7 +3309,7 @@ mod tests {
         task.await.unwrap().unwrap();
 
         assert!(
-            db.monty_network_agent_policy(agent_instance_id)
+            db.monty_network_installation_policy(installation_id)
                 .await
                 .unwrap()
                 .requests_enabled
@@ -3312,12 +3381,11 @@ mod tests {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        let agent_instance_id = uuid::Uuid::new_v4();
-        ctx.agent_instance_id = Some(agent_instance_id);
+        let (_, installation_id) = network_test_identity(&mut ctx).await;
         ctx.session
             .db
-            .mutate_monty_network_agent_policy(
-                agent_instance_id,
+            .mutate_monty_network_installation_policy(
+                installation_id,
                 crate::db::monty_network::MontyNetworkAgentMutation::SetRequestsEnabled(true),
                 1,
             )
@@ -3325,8 +3393,8 @@ mod tests {
             .unwrap();
         ctx.session
             .db
-            .mutate_monty_network_agent_policy(
-                agent_instance_id,
+            .mutate_monty_network_installation_policy(
+                installation_id,
                 crate::db::monty_network::MontyNetworkAgentMutation::GrantHost(
                     crate::db::monty_network::CanonicalNetworkHost::parse("127.0.0.1").unwrap(),
                 ),

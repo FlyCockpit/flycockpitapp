@@ -55,6 +55,12 @@ pub struct AgentInstallationBeginV1 {
     pub target_installation_id: Option<String>,
     #[serde(default)]
     pub replace_acknowledged: bool,
+    /// Required for any repository other than the first-party
+    /// `FlyCockpit/agents` catalog. Clients must show the third-party code and
+    /// prompt-injection warning before setting this bit; it is never inferred
+    /// from model trust or a non-interactive flag.
+    #[serde(default)]
+    pub third_party_trust_confirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_slot: Option<String>,
     /// Create-only explicit template choices. They are declarative AgentDef

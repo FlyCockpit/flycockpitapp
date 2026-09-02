@@ -80,6 +80,7 @@ fn begin(key: &str, operation: AgentInstallationOperationKind) -> AgentInstallat
         source_locator: "owner/repo@main:agents/helper.md".into(),
         target_installation_id: None,
         replace_acknowledged: false,
+        third_party_trust_confirmed: true,
         requested_slot: None,
         roles: Vec::new(),
         computer_use: false,

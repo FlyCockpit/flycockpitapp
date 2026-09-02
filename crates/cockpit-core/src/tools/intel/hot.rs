@@ -92,6 +92,10 @@ impl Tool for HotTool {
                 break;
             }
         }
-        Ok(finish(writer, "\n... [truncated; lower `limit`]\n"))
+        Ok(finish(
+            &ctx.redact,
+            writer,
+            "\n... [truncated; lower `limit`]\n",
+        ))
     }
 }

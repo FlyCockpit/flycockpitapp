@@ -50,7 +50,7 @@ use crate::config::dirs::{
 };
 use crate::config::files::{
     ConfigMutationLock, atomic_write_leaf_from_retained_directory,
-    prepare_atomic_write_from_retained_directory, read_file_nofollow, read_file_nofollow_bounded,
+    prepare_atomic_write_from_retained_directory, read_file_nofollow_bounded,
     read_optional_leaf_from_directory_handle, remove_leaf_from_retained_directory,
 };
 use crate::config::providers::{ActiveModelRef, ActiveModelWriteMode, ConfigDoc, ProvidersConfig};
@@ -2628,7 +2628,10 @@ pub(crate) fn masked_layers(paths: &[PathBuf]) -> (HashMap<PathBuf, Vec<u8>>, Ve
         if !record.needs_session_authority() && record.correlation.is_none() {
             continue;
         }
-        match read_file_nofollow(&backup_path_for_config(path)) {
+        match read_file_nofollow_bounded(
+            &backup_path_for_config(path),
+            crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES,
+        ) {
             Ok(Some(prior)) if bytes_digest(&prior) == record.old_config_digest => {
                 masks.insert(path.clone(), prior);
             }

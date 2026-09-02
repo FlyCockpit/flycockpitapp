@@ -2402,6 +2402,80 @@ async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
     assert_eq!(inference_request_statuses(&driver).await, vec!["cancelled"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stop_all_cancels_in_flight_turn_like_cancel_turn() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Hang)
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let cancel = driver.cancel_handle();
+    let (queue, tx, mut rx) = event_harness();
+
+    let handle = tokio::spawn(async move {
+        driver
+            .run_user_input(UserSubmission::text("hang then stop-all"), &queue, &tx)
+            .await
+            .unwrap();
+        driver
+    });
+    let _captured = provider.next_request().await;
+    cancel.cancel_all_session_work();
+    let driver = handle.await.unwrap();
+
+    let events = drain_events(&mut rx);
+    assert!(assistant_texts(&events).is_empty(), "{events:?}");
+    assert_eq!(inference_request_statuses(&driver).await, vec!["cancelled"]);
+}
+
+#[test]
+fn cancel_turn_does_not_cancel_session_owned_work() {
+    let (driver, _tmp) = test_driver(8);
+    let handle = driver.cancel_handle();
+    let loop_token = driver.session_work_cancel.child();
+    let delegate_token = driver.session_work_cancel.child();
+    handle.cancel_turn();
+    assert!(
+        !loop_token.is_cancelled(),
+        "TUI Ctrl+C must not stop scheduled loops"
+    );
+    assert!(
+        !delegate_token.is_cancelled(),
+        "TUI Ctrl+C must not stop background delegates from a prior turn"
+    );
+}
+
+#[test]
+fn stop_cancels_background_delegate_token_after_the_turn_ends() {
+    let (driver, _tmp) = test_driver(8);
+    let handle = driver.cancel_handle();
+    // A background delegate clones the originating turn's token, which is a
+    // child of the session-work root. After the turn ends the slot is empty
+    // so CancelTurn is a no-op — Stop must still reach that clone.
+    let turn_token = driver.session_work_cancel.child();
+    *crate::sync::lock_or_recover(&driver.cancel_current) = Some(turn_token.clone());
+    let delegate_token = turn_token.clone();
+    *crate::sync::lock_or_recover(&driver.cancel_current) = None;
+
+    handle.cancel_turn();
+    assert!(
+        !delegate_token.is_cancelled(),
+        "CancelTurn at idle must not stop a backgrounded delegate"
+    );
+
+    handle.cancel_all_session_work();
+    assert!(
+        delegate_token.is_cancelled(),
+        "Stop must cancel background delegates after their originating turn ended"
+    );
+    let later = driver.session_work_cancel.child();
+    assert!(
+        !later.is_cancelled(),
+        "work started after Stop must not be born cancelled"
+    );
+}
+
 /// The real chat-completions SSE shape for native reasoning before the stream
 /// stalls.  Keeping the connection open makes the cancellation boundary
 /// deterministic: the test must observe this delta before it requests cancel.

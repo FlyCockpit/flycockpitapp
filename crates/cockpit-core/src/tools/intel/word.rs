@@ -79,7 +79,7 @@ impl Tool for WordTool {
                 break;
             }
         }
-        let mut out = finish(writer, "\n... [truncated]\n");
+        let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
         append_freshen_note(&mut out, &freshen_report);
         Ok(out)
     }

@@ -552,7 +552,14 @@ mod gitignore_binding_tests {
 
 /// Build the bounded preview shown before replacing an existing file. Core
 /// deliberately produces plain text; terminal styling remains a TUI concern.
-pub(crate) fn file_write_preview(previous: &[u8], next: &[u8]) -> WriteContentPreview {
+/// The diff truncation routes through the redacting truncator with the
+/// session's redaction table so a registered secret straddling the
+/// truncation boundary never leaves a PARTIAL in the emitted preview.
+pub(crate) fn file_write_preview(
+    redact: &crate::redact::RedactionTable,
+    previous: &[u8],
+    next: &[u8],
+) -> WriteContentPreview {
     const CAP: usize = 12 * 1024;
     if crate::tools::common::looks_binary(previous) || crate::tools::common::looks_binary(next) {
         use sha2::{Digest as _, Sha256};
@@ -583,7 +590,7 @@ pub(crate) fn file_write_preview(previous: &[u8], next: &[u8]) -> WriteContentPr
     let content = if diff.len() > CAP {
         format!(
             "{}\n… [diff truncated; {} bytes omitted]",
-            crate::tools::common::truncate_head_tail(&diff, CAP),
+            crate::tools::common::truncate_head_tail_redacted(redact, &diff, CAP),
             diff.len() - CAP
         )
     } else {
@@ -627,6 +634,18 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
+        // Session redaction snapshot for the write-preview diff truncation:
+        // the preview must elide boundary-straddling secret partials just
+        // like the model-facing truncators do.
+        let redact = self
+            .redact
+            .as_ref()
+            .map(|slot| {
+                slot.read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
         let question = InterruptQuestion::Single {
             prompt: format!("Replace existing file `{target}`?"),
             options: vec![
@@ -663,7 +682,7 @@ impl Approver {
                 step_count: 1,
                 cwd: Some(self.store.cwd().display().to_string()),
                 remembered_key: Some(target.clone()),
-                write_content: Some(file_write_preview(previous, next)),
+                write_content: Some(file_write_preview(&redact, previous, next)),
                 risk_tier: Some("mutating".to_string()),
                 risk_reasons: vec!["replaces existing file contents".to_string()],
                 affected_targets: vec![target],
@@ -813,9 +832,13 @@ pub(crate) fn write_content_commitment(bytes: &[u8]) -> serde_json::Value {
 mod file_write_preview_tests {
     use super::file_write_preview;
 
+    fn empty_table() -> crate::redact::RedactionTable {
+        crate::redact::RedactionTable::empty()
+    }
+
     #[test]
     fn small_diff_includes_added_and_removed_lines() {
-        let preview = file_write_preview(b"old\nkeep\n", b"new\nkeep\n");
+        let preview = file_write_preview(&empty_table(), b"old\nkeep\n", b"new\nkeep\n");
         assert!(preview.content.contains("-old"), "{}", preview.content);
         assert!(preview.content.contains("+new"), "{}", preview.content);
     }
@@ -824,7 +847,7 @@ mod file_write_preview_tests {
     fn large_diff_is_truncated_and_marked() {
         let before = "old\n".repeat(5000);
         let after = "new\n".repeat(5000);
-        let preview = file_write_preview(before.as_bytes(), after.as_bytes());
+        let preview = file_write_preview(&empty_table(), before.as_bytes(), after.as_bytes());
         assert!(
             preview.content.contains("diff truncated"),
             "{}",
@@ -834,9 +857,44 @@ mod file_write_preview_tests {
 
     #[test]
     fn binary_write_reports_summary() {
-        let preview = file_write_preview(b"\0old", b"\0new");
+        let preview = file_write_preview(&empty_table(), b"\0old", b"\0new");
         assert!(preview.content.contains("binary replacement"));
         assert!(preview.content.contains("sha256"));
+    }
+
+    // A registered secret straddling the diff-truncation boundary leaves only
+    // a PARTIAL in the retained head; the redacting truncator must elide it so
+    // the whole-value scrub never sees a fragment it cannot match.
+    #[test]
+    fn large_diff_redacts_secret_straddling_truncation_boundary() {
+        // 300-byte registered literal — wide enough that the head cut
+        // (3/5 of the 12 KiB cap, just past the small unified-diff header)
+        // lands inside it regardless of a few bytes of header drift.
+        let secret = format!(
+            "sk-live-PREVIEWSTRADDLE-{}",
+            "s".repeat(300 - "sk-live-PREVIEWSTRADDLE-".len())
+        );
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(secret.clone(), "preview-leak-test".to_string())
+            .unwrap();
+        // The single deleted line starts ~40 bytes into the diff; place the
+        // secret ~7290 bytes into that line so it spans the head cut (~7344).
+        let before = format!("{}{secret}{}", "o".repeat(7290), "ld".repeat(6000));
+        let after = "new\n".repeat(6000);
+        let preview = file_write_preview(&table, before.as_bytes(), after.as_bytes());
+        assert!(
+            preview.content.contains("diff truncated"),
+            "{}",
+            preview.content
+        );
+        let prefix = &secret[..16];
+        let scrubbed = table.scrub(&preview.content);
+        assert!(
+            !scrubbed.contains(prefix),
+            "straddling prefix leaked into the preview: {}",
+            &scrubbed[..80.min(scrubbed.len())]
+        );
+        assert!(!scrubbed.contains(&secret));
     }
 }
 

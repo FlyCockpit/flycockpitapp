@@ -209,17 +209,6 @@ CREATE TABLE sessions (
         guidance_baseline_path IS NULL OR length(CAST(guidance_baseline_path AS BLOB)) BETWEEN 1 AND 32768
     ),
 
-    -- Accumulated session egress redaction table. Stores literal redaction
-    -- candidates so resumed raw transcripts remain covered even if the
-    -- original env/dotenv source has changed or disappeared.
-    redaction_table_json TEXT CHECK (
-        redaction_table_json IS NULL OR (
-            json_valid(redaction_table_json)
-            AND json_type(redaction_table_json) IN ('array', 'object')
-            AND length(CAST(redaction_table_json AS BLOB)) <= 8388608
-        )
-    ),
-
     -- Frozen model-specific system-prompt snapshot for this conversation
     -- lineage. JSON object keyed provider id -> model id -> prompt body.
     model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
@@ -6858,14 +6847,14 @@ CREATE TABLE secret_vault_authority (
     intent                TEXT    NOT NULL CHECK (intent IN ('database', 'keyring')),
     active_placement      TEXT    NOT NULL CHECK (active_placement IN ('database', 'keyring')),
     file_kek_mode         TEXT    CHECK (file_kek_mode IN ('machine_bound', 'passphrase')),
-    CHECK (
-        (active_placement = 'database' AND file_kek_mode IS NOT NULL)
-        OR (active_placement = 'keyring' AND file_kek_mode IS NULL)
-    ),
     kek_fingerprint       TEXT    NOT NULL,
     kek_version           INTEGER NOT NULL CHECK (kek_version >= 1),
     wrap_version          INTEGER NOT NULL CHECK (wrap_version = 1),
-    updated_at            INTEGER NOT NULL
+    updated_at            INTEGER NOT NULL,
+    CHECK (
+        (active_placement = 'database' AND file_kek_mode IS NOT NULL)
+        OR (active_placement = 'keyring' AND file_kek_mode IS NULL)
+    )
 );
 
 -- Non-secret Argon2id metadata for the advanced passphrase file KEK. The
@@ -6972,16 +6961,8 @@ CREATE TABLE secret_vault_sagas (
     op_id              TEXT    PRIMARY KEY,
     source_placement   TEXT    NOT NULL CHECK (source_placement IN ('database', 'keyring')),
     source_file_kek_mode TEXT  CHECK (source_file_kek_mode IN ('machine_bound', 'passphrase')),
-    CHECK (
-        (source_placement = 'database' AND source_file_kek_mode IS NOT NULL)
-        OR (source_placement = 'keyring' AND source_file_kek_mode IS NULL)
-    ),
     dest_placement     TEXT    NOT NULL CHECK (dest_placement IN ('database', 'keyring')),
     dest_file_kek_mode TEXT    CHECK (dest_file_kek_mode IN ('machine_bound', 'passphrase')),
-    CHECK (
-        (dest_placement = 'database' AND dest_file_kek_mode IS NOT NULL)
-        OR (dest_placement = 'keyring' AND dest_file_kek_mode IS NULL)
-    ),
     kek_fingerprint    TEXT    NOT NULL,
     phase              TEXT    NOT NULL CHECK (phase IN (
         'prepared',
@@ -6990,7 +6971,15 @@ CREATE TABLE secret_vault_sagas (
         'complete'
     )),
     created_at         INTEGER NOT NULL,
-    updated_at         INTEGER NOT NULL
+    updated_at         INTEGER NOT NULL,
+    CHECK (
+        (source_placement = 'database' AND source_file_kek_mode IS NOT NULL)
+        OR (source_placement = 'keyring' AND source_file_kek_mode IS NULL)
+    ),
+    CHECK (
+        (dest_placement = 'database' AND dest_file_kek_mode IS NOT NULL)
+        OR (dest_placement = 'keyring' AND dest_file_kek_mode IS NULL)
+    )
 );
 
 -- Recoverable bridge between the SQLite-backed owner vault and provider

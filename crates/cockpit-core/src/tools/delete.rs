@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
+use crate::resource_limits::{existing_file_unchanged, read_existing_for_mutation};
 use crate::tools::common::resolve;
 
 pub struct DeleteTool;
@@ -73,7 +74,7 @@ impl Tool for DeleteTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
-        let previous = std::fs::read(&path)
+        let previous = read_existing_for_mutation(&path)
             .map_err(|error| anyhow::anyhow!("read `{}`: {error}", path.display()))?;
         crate::tools::write::authorize_existing_write(ctx, &path, &previous, &[]).await?;
         let acquire =
@@ -94,7 +95,7 @@ impl Tool for DeleteTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
-        if std::fs::read(&path)? != previous {
+        if !existing_file_unchanged(&path, &previous)? {
             return Err(anyhow::anyhow!(
                 "`{}` changed while approval was pending; read it again before deleting",
                 path.display()
@@ -122,5 +123,37 @@ impl Tool for DeleteTool {
             path.display(),
             advisory.unwrap_or_default()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tool::Tool;
+    use crate::tools::common::test_ctx;
+
+    #[tokio::test]
+    async fn delete_rejects_an_existing_file_over_the_mutation_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("huge.txt");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
+            .unwrap();
+        drop(handle);
+        ctx.locks
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
+            .await;
+        let err = DeleteTool
+            .call(serde_json::json!({"path": "huge.txt"}), &ctx)
+            .await
+            .expect_err("oversized existing file must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("existing file") || msg.contains("byte limit"),
+            "{msg}"
+        );
+        assert!(file.exists(), "delete must not remove an over-cap file");
     }
 }

@@ -2431,6 +2431,11 @@ pub struct DaemonContext {
     pub(crate) acp_catalog_composition:
         Option<Arc<dyn crate::daemon::acp_catalog_composition::AcpCatalogCompositionServiceV1>>,
     pub paths: DaemonPaths,
+    /// Process-local owner capability required for `owner_only` RPCs on the
+    /// Unix-socket path (issue #296). In-process clients possess the endpoint
+    /// itself. Follow-up #337 replaces blanket `Owner` with authenticated
+    /// per-peer identity.
+    pub(crate) owner_capability: crate::daemon::owner_capability::OwnerCapability,
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
     pub canonical_cwd: PathBuf,
@@ -2852,6 +2857,7 @@ impl DaemonContext {
                 crate::daemon::acp_catalog_composition::DaemonAcpCatalogCompositionV1::default(),
             )),
             paths,
+            owner_capability: crate::daemon::owner_capability::OwnerCapability::mint(),
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -4509,6 +4515,9 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor lease recovery failed")?;
+    ctx.owner_capability
+        .publish(&ctx.paths.socket)
+        .context("publishing daemon-private owner capability")?;
     let recovered =
         crate::daemon::effective_default_recovery::recover_effective_default_journals_before_socket(
             &ctx.db,
@@ -4796,6 +4805,10 @@ fn validate_peer_uid(peer_uid: libc::uid_t, daemon_uid: libc::uid_t) -> Result<(
 
 struct MutableClientState {
     principal: ClientPrincipal,
+    /// Whether this connection has presented the daemon-private owner
+    /// capability. Socket peers start false; in-process clients start true.
+    /// Issue #296 / follow-up #337: this is not per-peer identity.
+    has_owner_capability: bool,
     terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -4820,6 +4833,7 @@ struct MutableClientState {
 #[derive(Clone)]
 pub(super) struct SharedClientState {
     principal: ClientPrincipal,
+    has_owner_capability: bool,
     capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -4899,6 +4913,7 @@ impl MutableClientState {
         let principal_id = principal.tag().unwrap_or_else(|| "local-owner".to_string());
         Self {
             principal,
+            has_owner_capability: false,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
                 client_instance_id,
@@ -4920,18 +4935,21 @@ impl MutableClientState {
 
     #[cfg(test)]
     fn detached_for_test() -> Self {
-        Self::detached_with_principal(
+        let mut state = Self::detached_with_principal(
             Arc::new(StdMutex::new(UploadAccounting::default())),
             ClientPrincipal::owner(),
             test_terminal_host(),
             Uuid::new_v4(),
             next_terminal_connection_epoch(),
-        )
+        );
+        state.has_owner_capability = true;
+        state
     }
 
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
+            has_owner_capability: self.has_owner_capability,
             // Capabilities survive the settings client's short transport
             // reconnects. Root, layer, identity and revision remain bound in
             // the capability itself; the owner is the stable authenticated
@@ -5157,6 +5175,8 @@ async fn run_in_process_client(
         client_instance_id,
         next_terminal_connection_epoch(),
     );
+    // Possession of the in-process endpoint is the owner capability.
+    state.has_owner_capability = true;
     let mut shared = state.shared_snapshot();
     let mut global_rx = ctx.subscribe_global();
     let mut session_event_rx: Option<EventReceiver> = None;
@@ -5426,7 +5446,10 @@ fn try_send_in_process_event(
 
 #[cfg(unix)]
 async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
-    handle_client_transport(stream, ctx).await
+    // Issue #296: socket peers are still Owner (follow-up #337) but start
+    // without the daemon-private capability. Secret RPCs fail closed until
+    // the peer presents the token a confined child cannot read.
+    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4(), false).await
 }
 
 #[cfg(feature = "remote")]
@@ -5439,7 +5462,7 @@ pub(crate) async fn handle_relay_channel_as_with_instance<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_transport_as(stream, ctx, principal, client_instance_id).await
+    handle_client_transport_as(stream, ctx, principal, client_instance_id, false).await
 }
 
 #[cfg(any(unix, test))]
@@ -5447,14 +5470,22 @@ async fn handle_client_transport<S>(stream: S, ctx: Arc<DaemonContext>) -> Resul
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4()).await
+    // Test helper: simulate a capability-bearing owner so existing socket
+    // matrix tests keep exercising handlers. Production accept uses
+    // `handle_client`, which starts without the capability.
+    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4(), true).await
 }
 
+/// Local socket peers are still `ClientPrincipal::Owner` (issue #296).
+/// `has_owner_capability` is the pre-launch fence: production accept passes
+/// `false` until the peer presents the daemon-private token. Follow-up #337
+/// replaces blanket Owner with authenticated per-peer identity.
 async fn handle_client_transport_as<S>(
     stream: S,
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
     client_instance_id: Uuid,
+    has_owner_capability: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -5539,6 +5570,7 @@ where
         principal,
         client_instance_id,
         next_terminal_connection_epoch(),
+        has_owner_capability,
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -5943,6 +5975,7 @@ async fn run_client_executor(
     principal: ClientPrincipal,
     client_instance_id: Uuid,
     connection_epoch: u64,
+    has_owner_capability: bool,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
@@ -5954,6 +5987,7 @@ async fn run_client_executor(
         client_instance_id,
         connection_epoch,
     );
+    state.has_owner_capability = has_owner_capability;
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
     loop {
@@ -6077,8 +6111,15 @@ async fn handle_envelope(
             id,
             #[cfg(feature = "remote")]
             operation,
+            owner_capability,
             request,
         } => {
+            if let Some(token) = owner_capability {
+                if ctx.owner_capability.verify(token.as_str()) {
+                    state.has_owner_capability = true;
+                    *shared = state.shared_snapshot();
+                }
+            }
             #[cfg(feature = "remote")]
             let remote_operation = match remote_dispatch::admit(
                 ctx,

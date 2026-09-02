@@ -122,8 +122,47 @@ impl BudgetedWriter {
     /// Consume the writer, returning the accumulated buffer. The caller
     /// is responsible for appending any truncation note it wants — the
     /// writer never injects one so the tools can phrase their own hint.
+    ///
+    /// Raw variant: no boundary elision. Production output paths must route
+    /// through [`Self::into_string_redacted`] (issue #294).
     pub fn into_string(self) -> String {
         self.buf
+    }
+
+    /// Consume the writer with the redaction-aware boundary treatment
+    /// (issue #294). When records were dropped at the cap, the retained
+    /// buffer's END abuts the omitted records: a registered secret
+    /// straddling that boundary — a multi-line literal spanning several
+    /// trailing records included, since the buffer is the joined contiguous
+    /// retained span — leaves only its PREFIX, which the downstream §7
+    /// whole-value scrub cannot match. Elide the unsafe back margin under
+    /// the CURRENT session table so only WHOLE secrets — which §7 scrubs
+    /// normally — remain in the emitted text.
+    pub fn into_string_redacted(self, redact: &crate::redact::RedactionTable) -> String {
+        if !self.truncated || self.buf.is_empty() {
+            return self.buf;
+        }
+        crate::tools::common::drop_back_margin(redact, &self.buf).to_string()
+    }
+
+    /// Redaction-aware [`Self::text_artifact_capture`]: the retained host
+    /// capture is a prefix cut of the source records, and when the capture
+    /// cap cut a record (`captured_dropped`) the stored content's END abuts
+    /// omitted bytes — a straddling secret's PARTIAL would survive the
+    /// admission/export whole-value scrubs. Elide the unsafe back margin.
+    pub fn text_artifact_capture_redacted(
+        &self,
+        redact: &crate::redact::RedactionTable,
+    ) -> Option<crate::engine::tool::TextArtifactCapture> {
+        let mut capture = self.text_artifact_capture();
+        if let Some(capture) = capture.as_mut()
+            && self.captured_dropped
+        {
+            let safe = crate::tools::common::drop_back_margin(redact, &capture.content);
+            capture.content = safe.to_string();
+            capture.stored_source_bytes = capture.content.len();
+        }
+        capture
     }
 
     fn retain(&mut self, record: &str) {

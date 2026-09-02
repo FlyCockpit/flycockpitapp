@@ -969,9 +969,7 @@ async fn fetch_models_at_detailed(
     timeout: Duration,
     catalog_abi: ModelCatalogAbi,
 ) -> Result<FetchModelsAtResult> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
+    let client = crate::providers::provider_http::build_with_timeout(timeout)
         .context("building reqwest client")?;
 
     let resp = send_models_request_with_retries(&client, url, headers).await?;
@@ -4690,5 +4688,32 @@ mod tests {
             entry.mark_model_fetch_failed_kept_existing(msg.clone());
             assert_kept(&entry, &msg, false);
         }
+    }
+
+    #[tokio::test]
+    async fn models_fetch_rejects_redirect_without_replaying_credentials() {
+        let (base_url, handle) = serve_model_responses(vec![
+            TestModelResponse::status(302, r#"{"error":"moved"}"#)
+                .with_header("Location", "http://credential-leak.invalid/v1/models"),
+        ])
+        .await;
+        let entry = ProviderEntry {
+            url: base_url.clone(),
+            allow_insecure_http: true,
+            ..ProviderEntry::default()
+        };
+        let resolved = ResolvedRequest {
+            base_url,
+            headers: vec![ResolvedHeader {
+                name: "x-api-key".into(),
+                value: "leaked-secret".into(),
+            }],
+            is_codex_credential: false,
+        };
+        let err = fetch_models_for_provider("custom", &entry, &resolved, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("302"), "{}", err);
+        assert_eq!(handle.await.unwrap().len(), 1);
     }
 }

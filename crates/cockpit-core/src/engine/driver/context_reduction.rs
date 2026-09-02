@@ -590,6 +590,7 @@ impl Driver {
                 prune::condense_candidates_with_artifact_calls(
                     &top.history,
                     &calls.model_context_calls,
+                    &self.redact,
                 )
             })
             .unwrap_or_default();

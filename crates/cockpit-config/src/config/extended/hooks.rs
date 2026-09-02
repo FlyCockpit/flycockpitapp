@@ -664,9 +664,8 @@ fn resolve_source(
     // above, which intentionally never canonicalizes/reopens their path.
     let source_identity_path =
         std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
-    let bytes = match std::fs::read(&source.path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let bytes = match crate::config::files::read_workspace_config_bytes(&source.path) {
+        Ok(bytes) => bytes,
         Err(error) => {
             warn(
                 registry,

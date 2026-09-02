@@ -2311,8 +2311,7 @@ impl GithubHttpsAgentFetcher {
             .map(str::to_owned);
         Ok(Self {
             transport: Arc::new(ReqwestGithubHttpTransport {
-                client: reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
+                client: crate::providers::provider_http::client_builder()
                     .timeout(GITHUB_FETCH_TIMEOUT)
                     .user_agent("flycockpit-agent-installation")
                     .build()
@@ -5191,7 +5190,6 @@ fn owned_file_exists(path: &Path, create_parent: bool) -> Result<bool> {
 
 #[cfg(unix)]
 fn read_owned_file(path: &Path, context: &str) -> Result<Vec<u8>> {
-    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     let parent = owned_parent(path, false)?;
     let leaf = owned_leaf(path)?;
@@ -5205,13 +5203,15 @@ fn read_owned_file(path: &Path, context: &str) -> Result<Vec<u8>> {
     };
     ensure!(fd >= 0, "{context}");
     // SAFETY: openat returned a unique owned descriptor.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let metadata = file.metadata().with_context(|| context.to_owned())?;
     ensure!(metadata.is_file(), "owned agent file is not regular");
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| context.to_owned())?;
-    Ok(bytes)
+    cockpit_host::bounded::read_reader_at_most(
+        file,
+        MAX_AGENT_MARKDOWN_BYTES as u64,
+        "owned agent definition",
+    )
+    .with_context(|| context.to_owned())
 }
 
 #[cfg(unix)]
@@ -5287,7 +5287,7 @@ fn remove_owned_file(path: &Path) -> Result<()> {
 #[cfg(windows)]
 mod held_windows_agent_files {
     use std::ffi::{OsStr, c_void};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -5581,7 +5581,7 @@ mod held_windows_agent_files {
     }
     pub fn read(path: &Path, context: &str) -> Result<Vec<u8>> {
         let parent = parent(path, false)?;
-        let mut file = open_relative(
+        let file = open_relative(
             &parent,
             &leaf(path)?,
             FILE_OPEN,
@@ -5590,10 +5590,12 @@ mod held_windows_agent_files {
         )
         .map_err(|status| anyhow::anyhow!("{context}: NTSTATUS {status:#x}"))?;
         verify_file(&file)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| context.to_owned())?;
-        Ok(bytes)
+        cockpit_host::bounded::read_reader_at_most(
+            file,
+            super::MAX_AGENT_MARKDOWN_BYTES as u64,
+            "owned agent definition",
+        )
+        .with_context(|| context.to_owned())
     }
     pub fn create(path: &Path, bytes: &[u8], context: &str) -> Result<()> {
         let parent = parent(path, true)?;
@@ -5731,7 +5733,8 @@ fn owned_file_exists(path: &Path, _create_parent: bool) -> Result<bool> {
 #[cfg(all(not(unix), not(windows)))]
 fn read_owned_file(path: &Path, context: &str) -> Result<Vec<u8>> {
     ensure!(owned_file_exists(path, false)?, "{context}");
-    std::fs::read(path).with_context(|| context.to_owned())
+    cockpit_host::bounded::read_at_most(path, MAX_AGENT_MARKDOWN_BYTES as u64)
+        .with_context(|| context.to_owned())
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -8468,6 +8471,27 @@ mod tests {
         std::fs::rename(&parent, &moved).expect("move parent");
         symlink(outside.path(), &parent).expect("ancestor symlink");
         assert!(write_owned_file_new(&target, b"owned", "test").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_installation_daemon_owned_file_helpers_refuse_over_cap_definitions() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("agents");
+        std::fs::create_dir_all(&parent).expect("parent");
+        let target = parent.join("helper.md");
+        let handle = std::fs::File::create(&target).expect("over-cap file");
+        handle
+            .set_len(MAX_AGENT_MARKDOWN_BYTES as u64 + 1)
+            .expect("set over-cap length");
+        drop(handle);
+        let err =
+            read_owned_file(&target, "test").expect_err("over-cap owned agent must fail closed");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("exceeds the") && text.contains("byte limit"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

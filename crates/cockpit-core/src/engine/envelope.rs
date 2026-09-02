@@ -95,7 +95,7 @@ impl Envelope {
     /// moment the next field would push past the cap, deterministically,
     /// preserving the tool-result pairing. The host-authored `files_changed`
     /// section is appended *after* the cap (it is a factual ledger).
-    pub fn render(&self) -> String {
+    pub fn render(&self, redact: &crate::redact::RedactionTable) -> String {
         let mut writer = BudgetedWriter::new(RETURN_MODEL_FIELDS_TOKEN_CAP);
 
         // `accomplished` always leads. An empty `accomplished` (a subagent that
@@ -122,7 +122,10 @@ impl Envelope {
             }
         }
 
-        let mut out = writer.into_string();
+        // The field budget drops whole fields, but the LAST retained field can
+        // still be cut mid-text; elide the cut's back margin so a
+        // boundary-straddling secret never survives as a partial (issue #294).
+        let mut out = writer.into_string_redacted(redact);
         if truncated {
             out.push_str("\n[note: some fields were truncated to stay within the report budget]\n");
         }
@@ -348,7 +351,7 @@ mod tests {
                 path: "/a.rs".into(),
                 hash: Some("abc123".into()),
             }]);
-        let r = env.render();
+        let r = env.render(&crate::redact::RedactionTable::empty());
         assert!(r.contains("## Accomplished"));
         assert!(r.contains("wrote it"));
         assert!(r.contains("## Files changed"));
@@ -359,7 +362,7 @@ mod tests {
     #[test]
     fn render_omits_empty_model_fields_and_files_section() {
         let env = Envelope::from_final_text("just text");
-        let r = env.render();
+        let r = env.render(&crate::redact::RedactionTable::empty());
         assert!(r.contains("## Accomplished"));
         assert!(r.contains("just text"));
         assert!(!r.contains("## Decisions made"));
@@ -381,7 +384,7 @@ mod tests {
                 hash: None,
             }],
         };
-        let r = env.render();
+        let r = env.render(&crate::redact::RedactionTable::empty());
         assert!(r.contains("## Accomplished"));
         assert!(r.contains("truncated to stay within the report budget"));
         // The dropped field is absent; the deterministic files section survives.

@@ -484,6 +484,7 @@ pub(super) fn assemble_subagent_report(
     history: &[Message],
     deferred_log: &crate::engine::deferred::DeferredLog,
     return_fields: Option<&serde_json::Value>,
+    redact: &crate::redact::RedactionTable,
 ) -> String {
     // Drain the deferred-log once on pop; nothing-deferred is the common path
     // and adds no framing (`plan.md §3d`).
@@ -505,7 +506,7 @@ pub(super) fn assemble_subagent_report(
     }
     .with_files_changed(crate::engine::envelope::files_changed_from_history(history));
 
-    format!("{}{}", envelope.render(), deferred_section)
+    format!("{}{}", envelope.render(redact), deferred_section)
 }
 
 pub(super) fn partial_progress_from_history(history: &[Message]) -> DelegationPartialProgress {

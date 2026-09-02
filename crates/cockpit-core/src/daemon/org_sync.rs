@@ -254,7 +254,14 @@ async fn sync_once_with_client_and_vault(
         .org_sync_state(&credential.server_url, &policy.org_id)
         .await?
         .ok_or_else(|| anyhow!("org sync state missing after policy upsert"))?;
-    let built = build_batch(db, credential, &policy, state.cursor_seq, vault).await?;
+    let built = match build_batch(db, credential, &policy, state.cursor_seq, vault).await {
+        Ok(built) => built,
+        Err(error) => {
+            db.update_org_sync_error(&credential.server_url, &policy.org_id, &error.to_string())
+                .await?;
+            return Err(error);
+        }
+    };
     match built {
         BatchBuild::Idle => Ok(OrgSyncOnceOutcome::Idle),
         BatchBuild::Filtered { cursor_seq } => {
@@ -344,18 +351,28 @@ async fn build_batch(
             batch_cursor_seq = row.seq;
             continue;
         }
-        let Some(event) = sync_event_json(db, vault, row).await? else {
-            if vault.is_none() {
+        let Some(vault) = vault else {
+            tracing::warn!(
+                session_id = %row.session_id,
+                seq = row.seq,
+                "deferring org sync event until a vault-backed redaction load is available"
+            );
+            break;
+        };
+        let event = match sync_event_json(db, vault, row).await {
+            Ok(event) => event,
+            Err(error) => {
+                if events.is_empty() {
+                    return Err(error);
+                }
                 tracing::warn!(
+                    error = %error,
                     session_id = %row.session_id,
                     seq = row.seq,
-                    "deferring org sync event until a vault-backed redaction load is available"
+                    "stopping org sync batch before a record whose redaction custody cannot be loaded"
                 );
                 break;
             }
-            batch_cursor_seq = row.seq;
-            tracing::warn!(session_id = %row.session_id, seq = row.seq, "skipping org sync event without a loadable session redaction table");
-            continue;
         };
         let size = serde_json::to_vec(&event)
             .map(|bytes| bytes.len())
@@ -392,12 +409,10 @@ async fn build_batch(
 
 async fn sync_event_json(
     db: &Db,
-    vault: Option<&crate::secure_key::SecretVault>,
+    vault: &crate::secure_key::SecretVault,
     row: &SessionEventRow,
-) -> Result<Option<Value>> {
-    let Some(redaction) = redaction_for_session(db, vault, row.session_id).await? else {
-        return Ok(None);
-    };
+) -> Result<Value> {
+    let redaction = redaction_for_session(db, vault, row.session_id).await?;
     let mut event = json!({
         "idempotencyKey": format!("session_event:{}", row.seq),
         "sourceTable": "session_events",
@@ -435,7 +450,7 @@ async fn sync_event_json(
             });
         }
     }
-    Ok(Some(scrub_json_value(event, &redaction)))
+    Ok(scrub_json_value(event, &redaction))
 }
 
 fn scrub_json_value(value: Value, redaction: &RedactionTable) -> Value {
@@ -630,9 +645,11 @@ mod tests {
                 sleep_log.lock().await.push(duration);
             })
         };
-        let outcome = sync_once_with_client(db, &credential, &client, &mut sleeper)
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(db).unwrap();
+        let outcome =
+            sync_once_with_client_and_vault(db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .unwrap();
         let requests = requests.lock().await.clone();
         let sleeps = sleeps.lock().await.clone();
         (outcome, requests, sleeps)
@@ -641,7 +658,7 @@ mod tests {
     async fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
         let session = db
             .blocking_write_for_sync_maintenance(|conn| {
-                crate::db::Db::insert_session_row_conn(
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
                         conn,
@@ -652,11 +669,11 @@ mod tests {
                 )
             })
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         db.insert_session_event(
             session.session_id,
@@ -769,8 +786,9 @@ mod tests {
             OrgSyncOnceOutcome::EnrollmentRequired { .. }
         ));
         db.set_org_sync_enrolled(&server, "org-1").await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         assert!(matches!(
-            sync_once_with_client(&db, &credential, &client, &mut sleeper)
+            sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
                 .await
                 .unwrap(),
             OrgSyncOnceOutcome::Uploaded { events: 1, .. }
@@ -893,11 +911,11 @@ mod tests {
             .create_session("p", "/tmp/project", "builder")
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         let removed_seq = db
             .insert_session_event(
@@ -923,12 +941,13 @@ mod tests {
             include_local_model_transcripts: true,
             raw: json!({}),
         };
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
         let built = build_batch(
             &db,
             &credential("https://app.example.test".to_string()),
             &policy,
             0,
-            None,
+            Some(&vault),
         )
         .await
         .unwrap();
@@ -975,9 +994,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        let outcome = sync_once_with_client(&db, &credential, &client, &mut sleeper)
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let outcome =
+            sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .unwrap();
         assert_eq!(
             outcome,
             OrgSyncOnceOutcome::Uploaded {
@@ -1094,7 +1115,8 @@ mod tests {
             raw: json!({}),
         };
         let credential = credential("http://localhost:1".to_string());
-        let built = build_batch(&db, &credential, &policy, 0, None)
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, &policy, 0, Some(&vault))
             .await
             .unwrap();
         match built {
@@ -1149,11 +1171,11 @@ mod tests {
             .create_session("p", "/tmp/project", "builder")
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+            &RedactionTable::empty().to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         let local = db
             .insert_session_event_with_context(
@@ -1229,11 +1251,11 @@ mod tests {
         let redaction = with_redaction_token_override("fci_instance_secret", || {
             RedactionTable::build(&RedactConfig::default(), tmp.path()).unwrap()
         });
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
             session.session_id,
-            Some(redaction.to_persisted_json().unwrap()),
+            &redaction.to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
         db.set_connector_enabled(&server, &credential.instance_id, true)
             .await
@@ -1246,7 +1268,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        sync_once_with_client(&db, &credential, &client, &mut sleeper)
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
             .await
             .unwrap();
         let seen = requests.lock().await;
@@ -1297,7 +1320,7 @@ mod tests {
                 "vault-less load must not advance past unread vault-backed events"
             ),
             BatchBuild::Ready { event_count, .. } => {
-                panic!("vault-less load must skip vault-only tables, got {event_count} events")
+                panic!("vault-less load must defer vault-backed events, got {event_count} events")
             }
         }
         let loaded = build_batch(&db, &credential, &policy, 0, Some(session.secret_vault()))
@@ -1309,6 +1332,72 @@ mod tests {
                 panic!("expected ready batch with vault")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn missing_redaction_table_fails_closed_without_advancing_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/project", "builder")
+            .await
+            .unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::UserMessage,
+            Some("builder"),
+            None,
+            &json!({"text": "must not be acknowledged without custody"}),
+        )
+        .await
+        .unwrap();
+        let (server, requests) = start_test_server(vec![response(200, active_policy())]).await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error =
+            sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .expect_err("missing custody must fail the batch");
+        let message = format!("{error:#}");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "missing table must be a typed redaction failure: {message}"
+        );
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
+        );
+        let state = db.org_sync_state(&server, "org-1").await.unwrap().unwrap();
+        assert_eq!(
+            state.cursor_seq, 0,
+            "cursor must not skip a custody failure"
+        );
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing to proceed unredacted")),
+            "custody failure must be acknowledged: {:?}",
+            state.last_error
+        );
+        assert!(
+            !requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request.starts_with("POST ")),
+            "plaintext must not be transmitted"
+        );
     }
 
     #[test]

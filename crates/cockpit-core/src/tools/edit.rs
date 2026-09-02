@@ -32,6 +32,7 @@ use std::ops::Range;
 
 use crate::db::tool_calls::Recovery;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
+use crate::resource_limits::{existing_file_unchanged, read_existing_for_mutation};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
 pub struct EditTool;
@@ -161,8 +162,8 @@ impl Tool for EditTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
-        let existing =
-            std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
+        let existing = read_existing_for_mutation(&path)
+            .map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
         let want_crlf = detect_crlf(&existing);
         let original = String::from_utf8_lossy(&existing).into_owned();
 
@@ -248,7 +249,7 @@ impl Tool for EditTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
-        if std::fs::read(&path)? != existing {
+        if !existing_file_unchanged(&path, &existing)? {
             return Err(anyhow::anyhow!(
                 "`{}` changed while approval was pending; read it again before editing",
                 path.display()
@@ -319,9 +320,12 @@ impl Tool for EditTool {
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
-        if let Some(note) =
-            crate::tools::data_syntax::data_syntax_note(&path, &normalized, &config.data_syntax)
-        {
+        if let Some(note) = crate::tools::data_syntax::data_syntax_note(
+            &ctx.redact,
+            &path,
+            &normalized,
+            &config.data_syntax,
+        ) {
             message.push_str(&note);
         }
         if let Some(advisory) = outcome.advisory() {

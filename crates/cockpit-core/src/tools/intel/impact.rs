@@ -62,6 +62,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
                         .unwrap_or_default();
                     if !write_retained_line(&mut writer, &format!("  {cf}:{cl}{sym}")) {
                         let mut out = finish(
+                            &ctx.redact,
                             writer,
                             "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
                         );
@@ -80,6 +81,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
                 for (callee, df, dl) in &calls {
                     if !write_retained_line(&mut writer, &format!("  {callee} -> {df}:{dl}")) {
                         let mut out = finish(
+                            &ctx.redact,
                             writer,
                             "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
                         );
@@ -91,6 +93,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
         }
     }
     let mut out = finish(
+        &ctx.redact,
         writer,
         "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
     );

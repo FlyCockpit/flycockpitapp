@@ -2000,7 +2000,6 @@ local	sessions	pending_remote_agent_selection	denormalized
 local	sessions	project_id	external
 local	sessions	project_root	non_relationship
 local	sessions	provider	denormalized
-local	sessions	redaction_table_json	non_relationship
 local	sessions	session_entry_mode	non_relationship
 local	sessions	session_id	primary
 local	sessions	shared_with_collaborators	non_relationship

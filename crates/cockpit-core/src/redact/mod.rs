@@ -44,6 +44,46 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+/// A redaction table could not be loaded on a security-relevant path.
+///
+/// Callers must fail closed (refuse to send, fork, export, or acknowledge
+/// first-party org-sync/audit records as processed) rather than substitute
+/// an empty table or skip the record. An empty table would let plaintext
+/// secrets flow into model context, provider requests, or exports.
+#[derive(Debug)]
+pub struct RedactionTableUnavailable {
+    context: &'static str,
+    source: String,
+}
+
+impl RedactionTableUnavailable {
+    pub fn new(context: &'static str, source: impl std::fmt::Display) -> Self {
+        Self {
+            context,
+            source: source.to_string(),
+        }
+    }
+
+    /// True when this typed fail-closed error is anywhere in an [`anyhow::Error`]
+    /// chain. First-party egress uses it to distinguish custody failures from
+    /// skippable malformed rows.
+    pub fn in_chain(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for RedactionTableUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "redaction table unavailable ({}); refusing to proceed unredacted: {}",
+            self.context, self.source
+        )
+    }
+}
+
+impl std::error::Error for RedactionTableUnavailable {}
+
 mod command_output;
 mod dotenv;
 mod protected;
@@ -1039,6 +1079,13 @@ impl RedactionTable {
     /// Build a table from the OS env + the env files matched under `cwd`.
     /// Honors `enabled`, `scan_environment`, `scan_dotenv`,
     /// `dotenv_patterns`, `extra_dotenv_paths`, and `min_secret_length`.
+    ///
+    /// This path does not open the credential store: named secrets, provider
+    /// credentials, and MCP tokens require
+    /// [`Self::build_with_env_and_credential_store`] (or
+    /// [`Self::build_with_env_and_store`] with an opened-store `Result`).
+    /// Session-attached outbound prompts must use those store-bearing
+    /// builders; a store-open failure there is fail-closed.
     pub fn build(cfg: &RedactConfig, cwd: &Path) -> Result<Self> {
         let env: HashMap<String, String> = std::env::vars_os()
             .map(|(name, value)| {
@@ -1048,14 +1095,7 @@ impl RedactionTable {
                 )
             })
             .collect();
-        #[cfg(test)]
-        {
-            Self::build_with_env(cfg, cwd, &env)
-        }
-        #[cfg(not(test))]
-        {
-            Self::build_with_env_and_store(cfg, cwd, &env)
-        }
+        Self::build_with_env(cfg, cwd, &env)
     }
 
     /// Build a table from the provided session env + the env files matched
@@ -1069,14 +1109,22 @@ impl RedactionTable {
         Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
     }
 
-    /// Production session-env builder. Named secrets are loaded here so the
-    /// injected [`Self::build_with_env`] seam remains hermetic for tests.
+    /// Production session-env builder that requires an opened credential store.
+    ///
+    /// A store-open failure is fail-closed: this never substitutes an empty
+    /// secret iterator, which would leak named secrets into model context.
+    /// Callers that already hold a store should use
+    /// [`Self::build_with_env_and_credential_store`].
     pub fn build_with_env_and_store(
         cfg: &RedactConfig,
         cwd: &Path,
         env: &HashMap<String, String>,
+        store: Result<crate::credentials::CredentialStore>,
     ) -> Result<Self> {
-        Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
+        let store = store.map_err(|error| {
+            RedactionTableUnavailable::new("opening credential store for redaction", error)
+        })?;
+        Self::build_with_env_and_credential_store(cfg, cwd, env, &store)
     }
 
     pub fn build_with_env_and_credential_store(
@@ -1096,7 +1144,7 @@ impl RedactionTable {
     }
 
     /// Hermetic table builder with an injected named-secret source. Production
-    /// callers use [`Self::build_with_env`], which reads the credential store;
+    /// session-env callers use [`Self::build_with_env_and_credential_store`];
     /// tests use this seam without touching a developer's credentials.
     pub fn build_with_env_and_secrets(
         cfg: &RedactConfig,
@@ -1163,6 +1211,9 @@ impl RedactionTable {
                     }
                     EnvFileScan::Unsupported => unsupported_files.push(path),
                     EnvFileScan::Unreadable => {}
+                    EnvFileScan::OverLimit => {
+                        return Err(EnvFileOverLimitError { path }.into());
+                    }
                 }
             }
         }
@@ -1530,15 +1581,23 @@ impl RedactionTable {
     /// This does not decide whether a path is secret and never reads any other
     /// path; callers pair it with `SecretPathMatcher` after their read gate.
     pub fn with_approved_secret_file(&self, cfg: &RedactConfig, path: &Path) -> Result<Self> {
-        let EnvFileScan::Candidates(candidates) = collect_env_file_candidates(path, &cfg.allowlist)
-        else {
-            return self.union(&Self::from_entries(
-                Vec::new(),
-                self.placeholder.clone(),
-                self.disabled,
-                Vec::new(),
-                self.protected.clone(),
-            )?);
+        let candidates = match collect_env_file_candidates(path, &cfg.allowlist) {
+            EnvFileScan::Candidates(candidates) => candidates,
+            EnvFileScan::OverLimit => {
+                anyhow::bail!(
+                    "env file `{}` exceeds the daemon file size limit; refusing to ingest secrets from an uncapped read",
+                    path.display()
+                );
+            }
+            EnvFileScan::Unsupported | EnvFileScan::Unreadable => {
+                return self.union(&Self::from_entries(
+                    Vec::new(),
+                    self.placeholder.clone(),
+                    self.disabled,
+                    Vec::new(),
+                    self.protected.clone(),
+                )?);
+            }
         };
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
@@ -2204,6 +2263,25 @@ pub(crate) fn match_sensitive_literals(
     matched
 }
 
+/// Table build refused because scanning an over-cap env file would miss
+/// secrets. Automatic per-turn refresh channels must fail the turn rather
+/// than continue with a stale table; fail-closed callers already propagate.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "env file `{path}` exceeds the daemon file size limit; refusing to build a redaction table that would miss its secrets"
+)]
+pub(crate) struct EnvFileOverLimitError {
+    path: PathBuf,
+}
+
+/// True when [`RedactionTable::build`] (and siblings) refused so a later
+/// consumer cannot proceed with a table that would miss secrets.
+pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EnvFileOverLimitError>().is_some())
+}
+
 /// Outcome of scanning one matched env file (§4).
 enum EnvFileScan {
     /// Parsed in a supported format; the carried candidates
@@ -2213,6 +2291,9 @@ enum EnvFileScan {
     Unsupported,
     /// Couldn't even read the file (missing / permission). Silent skip.
     Unreadable,
+    /// File exceeded the daemon project-file cap. Must fail the table build:
+    /// skipping it would miss secrets (fail open).
+    OverLimit,
 }
 
 #[cfg(test)]

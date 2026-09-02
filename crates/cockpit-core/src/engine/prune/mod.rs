@@ -511,8 +511,11 @@ pub fn prune_history(history: &mut [Message]) -> DedupPlan {
     plan
 }
 
-pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
-    condense_candidates_with_artifact_calls(history, &std::collections::BTreeSet::new())
+pub fn condense_candidates(
+    history: &[Message],
+    redact: &crate::redact::RedactionTable,
+) -> Vec<CondenseCandidate> {
+    condense_candidates_with_artifact_calls(history, &std::collections::BTreeSet::new(), redact)
 }
 
 /// Return newly eligible prune-boundary captures. Existing projections are
@@ -522,6 +525,7 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
 pub fn condense_candidates_with_artifact_calls(
     history: &[Message],
     model_context_artifact_calls: &std::collections::BTreeSet<String>,
+    redact: &crate::redact::RedactionTable,
 ) -> Vec<CondenseCandidate> {
     let mut calls: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -563,8 +567,13 @@ pub fn condense_candidates_with_artifact_calls(
                     {
                         continue;
                     }
+                    // The condense rewrite cuts at line/record boundaries;
+                    // pass the session table so any retention edge the table
+                    // cares about elides its margin (issue #294). History
+                    // bodies are already whole-value-scrubbed, so this is
+                    // defense-in-depth, not the primary barrier.
                     let Some(condensed_body) =
-                        shell_compress::prune_boundary_condense(command, &body)
+                        shell_compress::prune_boundary_condense(redact, command, &body)
                     else {
                         continue;
                     };
@@ -1211,7 +1220,7 @@ mod tests {
             tool_result("bash-one", &original),
         ];
 
-        let candidates = condense_candidates(&history);
+        let candidates = condense_candidates(&history, &crate::redact::RedactionTable::empty());
         assert_eq!(candidates.len(), 1);
         let expected = render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"));
 
@@ -1367,7 +1376,7 @@ mod tests {
             assistant_call("bash-b", "bash", json!({ "command": "cargo test" })),
             tool_result("bash-b", &second),
         ];
-        let candidates = condense_candidates(&history);
+        let candidates = condense_candidates(&history, &crate::redact::RedactionTable::empty());
         assert_eq!(candidates.len(), 2);
         let plan = CondensePlan {
             targets: candidates
@@ -1612,7 +1621,7 @@ mod tests {
             tool_result("c1", &long_shell_body()),
         ];
 
-        let candidates = condense_candidates(&history);
+        let candidates = condense_candidates(&history, &crate::redact::RedactionTable::empty());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].tool, "bash");
         assert!(candidates[0].condensed_body.len() < candidates[0].original_body.len());
@@ -1747,7 +1756,7 @@ mod tests {
             tool_result("c1", &original),
         ];
 
-        let candidates = condense_candidates(&history);
+        let candidates = condense_candidates(&history, &crate::redact::RedactionTable::empty());
         assert_eq!(candidates.len(), 1);
         assert!(apply_condensed_tool_result(
             &mut history,
@@ -1766,7 +1775,7 @@ mod tests {
             tool_result("c1", "ok\n"),
         ];
 
-        assert!(condense_candidates(&history).is_empty());
+        assert!(condense_candidates(&history, &crate::redact::RedactionTable::empty()).is_empty());
     }
 
     #[test]
@@ -1782,7 +1791,7 @@ mod tests {
             ];
 
             assert!(
-                condense_candidates(&history).is_empty(),
+                condense_candidates(&history, &crate::redact::RedactionTable::empty()).is_empty(),
                 "{tool} must not be prune-boundary condensed"
             );
         }
@@ -1795,11 +1804,18 @@ mod tests {
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &original),
         ];
-        let candidates = condense_candidates(&pruned);
+        let candidates = condense_candidates(&pruned, &crate::redact::RedactionTable::empty());
         let frame = render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"));
         apply_condensed_tool_result(&mut pruned, &candidates[0], &frame);
         let durable_prune_calls = std::collections::BTreeSet::from(["c1".to_owned()]);
-        assert!(condense_candidates_with_artifact_calls(&pruned, &durable_prune_calls).is_empty());
+        assert!(
+            condense_candidates_with_artifact_calls(
+                &pruned,
+                &durable_prune_calls,
+                &crate::redact::RedactionTable::empty()
+            )
+            .is_empty()
+        );
         let ledger = capture_ledger_with_prune_boundary_calls(&pruned, 2, &durable_prune_calls);
         assert_eq!(ledger.elided.len(), 1);
         assert_eq!(ledger.elided[0].reason, REASON_TOOL_RESULT_CONDENSED);

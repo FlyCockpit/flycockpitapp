@@ -3730,10 +3730,9 @@ fn recover_windows_agent_package_swap(root: &Path, name: &str) -> Result<(), Err
     validate_name(name)?;
     let left = root.join(".cockpit").join("agents").join(name);
     let marker = windows_agent_swap_marker(&left)?;
-    let raw = match std::fs::read(&marker) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(internal(error)),
+    let raw = match nofollow_read(&marker)? {
+        Some(raw) => raw,
+        None => return Ok(()),
     };
     let mut state: WindowsAgentPackageSwap = serde_json::from_slice(&raw).map_err(internal)?;
     finish_windows_agent_package_swap(&left, &mut state)?;

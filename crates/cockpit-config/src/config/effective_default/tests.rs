@@ -3238,6 +3238,61 @@ fn an_unmaskable_pending_layer_fails_the_load_closed() {
     );
 }
 
+/// A planted or grown rollback backup must not be read whole: the journal
+/// already has a during-IO cap, and the backup is the same project-tree class.
+#[test]
+fn an_over_cap_rollback_backup_is_unmaskable() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    crate::config::trust::clear_runtime_policy_for_tests();
+    reset_recovery_backoff_for_tests();
+    let user = user_dir(tmp.path());
+    write_layer(
+        &user,
+        Some(&selection("old", "a")),
+        &[("new", "b"), ("old", "a")],
+    );
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let config_path = user.join("config.json");
+    let mut sessions = FakeSessions {
+        revision: 1,
+        selection: Some(selection("old", "a")),
+        ..Default::default()
+    };
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterConfigReplaced));
+    let _ = mutate_effective_default(
+        &cwd,
+        Some(&selection("new", "b")),
+        ActiveModelWriteMode::Replace,
+        Some(participant(&mut sessions, selection("old", "a"))),
+        None,
+        None,
+    );
+    set_crash_inject(None);
+    let backup = backup_path_for_config(&config_path);
+    let handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&backup)
+        .expect("open rollback backup");
+    handle
+        .set_len(crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+        .expect("grow rollback backup past the config cap");
+    drop(handle);
+
+    let paths = config_file_paths_for_load(&cwd);
+    let (_, unmaskable) = masked_layers(&paths);
+    assert_eq!(
+        unmaskable.len(),
+        1,
+        "an over-cap rollback backup must be unmaskable"
+    );
+    assert!(
+        ConfigDoc::try_load_effective_from_paths(&paths).is_err(),
+        "an over-cap backup must fail the load closed"
+    );
+}
+
 /// A CAS that **committed and then reported an error** is the ambiguous case.
 /// Skipping compensation there would strand the session on the target while
 /// the config was rolled back. The recorded-revision guard resolves it: it

@@ -6,6 +6,81 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
 
+/// Read a project- or user-layer config file with
+/// [`MAX_WORKSPACE_CONFIG_FILE_BYTES`] applied *during* IO. Absence is
+/// `Ok(None)`. Over-cap, non-regular files, and other IO fail closed so a
+/// giant `.cockpit/config.json` cannot OOM the daemon.
+pub(crate) fn read_workspace_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match cockpit_host::bounded::read_at_most(path, MAX_WORKSPACE_CONFIG_FILE_BYTES as u64) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(cockpit_host::bounded::BoundedIoError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
+            anyhow::bail!(
+                "{} exceeds the {limit} byte limit ({actual} bytes)",
+                path.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// UTF-8 body of a workspace config file. Absence is `Ok(None)`. Over-cap,
+/// non-regular files, and invalid UTF-8 fail closed.
+pub(crate) fn read_workspace_config_text(path: &Path) -> Result<Option<String>> {
+    match read_workspace_config_bytes(path)? {
+        None => Ok(None),
+        Some(bytes) => {
+            let text =
+                String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))?;
+            Ok(Some(text))
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_config_read_tests {
+    #[test]
+    fn over_cap_fails_closed_and_absence_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.json");
+        assert!(
+            super::read_workspace_config_text(&missing)
+                .unwrap()
+                .is_none()
+        );
+
+        let small = temp.path().join("ok.json");
+        std::fs::write(&small, "{}").unwrap();
+        assert_eq!(
+            super::read_workspace_config_text(&small)
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+
+        let over = temp.path().join("over.json");
+        let handle = std::fs::File::create(&over).unwrap();
+        handle
+            .set_len(super::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+            .unwrap();
+        drop(handle);
+        let err = super::read_workspace_config_text(&over).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exceeds the") && text.contains("byte limit"),
+            "{text}"
+        );
+
+        let err = crate::config::read_config_file_nofollow(&over).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exceeds the byte limit"), "{text}");
+    }
+}
+
 #[cfg(unix)]
 fn ensure_dir_exists_private_if_created(path: &Path) -> Result<()> {
     open_directory_nofollow(path, true, false).map(drop)
@@ -851,7 +926,7 @@ pub(crate) fn read_file_nofollow_bounded(path: &Path, max_bytes: usize) -> Resul
             Err(error) if root_cause_is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let file = match open_file_at_nofollow(
+        let mut file = match open_file_at_nofollow(
             &parent,
             &file_name,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -861,7 +936,7 @@ pub(crate) fn read_file_nofollow_bounded(path: &Path, max_bytes: usize) -> Resul
             Err(error) if root_cause_is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        read_all_bounded(file, path, max_bytes).map(Some)
+        read_all_bounded(&mut file, path, max_bytes).map(Some)
     }
     #[cfg(windows)]
     {
@@ -875,7 +950,7 @@ pub(crate) fn read_file_nofollow_bounded(path: &Path, max_bytes: usize) -> Resul
             Err(error) if root_cause_is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let file = match open_windows_relative_nofollow(
+        let mut file = match open_windows_relative_nofollow(
             &parent,
             &name,
             false,
@@ -889,7 +964,7 @@ pub(crate) fn read_file_nofollow_bounded(path: &Path, max_bytes: usize) -> Resul
             }
         };
         reject_windows_reparse_handle(&file, path)?;
-        read_all_bounded(file, path, max_bytes).map(Some)
+        read_all_bounded(&mut file, path, max_bytes).map(Some)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -928,10 +1003,16 @@ pub(crate) fn read_file_nofollow_bounded(path: &Path, max_bytes: usize) -> Resul
     }
 }
 
+/// Read a no-follow file and return the held handle, bytes, and identity.
+///
+/// `max_bytes` caps the allocation made for contents. Config callers pass
+/// [`MAX_WORKSPACE_CONFIG_FILE_BYTES`]. Terminal-ingress callers pass `None`
+/// because those files are daemon-managed and admission-capped at write.
 pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
     writable: bool,
     enforce_private: bool,
+    max_bytes: Option<usize>,
 ) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
     #[cfg(unix)]
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
@@ -1039,7 +1120,10 @@ pub(crate) fn read_file_nofollow_with_identity(
         links: 1,
     };
     let mut file = file;
-    let bytes = read_all(&mut file, path)?;
+    let bytes = match max_bytes {
+        Some(max) => read_all_bounded(&mut file, path, max)?,
+        None => read_all(&mut file, path)?,
+    };
     Ok(Some((file, bytes, identity)))
 }
 
@@ -2189,7 +2273,6 @@ fn current_windows_user_sid() -> Result<Vec<u8>> {
     Ok(owned)
 }
 
-#[cfg(any(unix, windows))]
 fn read_all(mut file: impl std::io::Read, path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)
@@ -2197,8 +2280,7 @@ fn read_all(mut file: impl std::io::Read, path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(any(unix, windows))]
-fn read_all_bounded(mut file: std::fs::File, path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+fn read_all_bounded(file: &mut std::fs::File, path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     use std::io::Read as _;
 
     let metadata = file
@@ -2215,7 +2297,7 @@ fn read_all_bounded(mut file: std::fs::File, path: &Path, max_bytes: usize) -> R
         path.display()
     );
     let mut bytes = Vec::with_capacity((metadata.len() as usize).min(64 * 1024));
-    file.take(max_bytes.saturating_add(1) as u64)
+    std::io::Read::take(file, max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() > max_bytes {
@@ -3099,8 +3181,12 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
-        let Some((held_source, _, expected_identity)) =
-            read_file_nofollow_with_identity(source, false, false)?
+        let Some((held_source, _, expected_identity)) = read_file_nofollow_with_identity(
+            source,
+            false,
+            false,
+            Some(MAX_WORKSPACE_CONFIG_FILE_BYTES),
+        )?
         else {
             anyhow::bail!("rename source disappeared: {}", source.display());
         };
@@ -3215,8 +3301,12 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
         }
         source_parent.sync_all()?;
         destination_parent.sync_all()?;
-        let Some((destination_file, _, actual_identity)) =
-            read_file_nofollow_with_identity(destination, false, false)?
+        let Some((destination_file, _, actual_identity)) = read_file_nofollow_with_identity(
+            destination,
+            false,
+            false,
+            Some(MAX_WORKSPACE_CONFIG_FILE_BYTES),
+        )?
         else {
             anyhow::bail!(
                 "rename destination disappeared before identity verification: {}",
@@ -3261,10 +3351,21 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
 }
 
 pub(crate) fn same_file_identity_nofollow(left: &Path, right: &Path) -> Result<bool> {
-    let Some((_, _, left_identity)) = read_file_nofollow_with_identity(left, false, false)? else {
+    let Some((_, _, left_identity)) = read_file_nofollow_with_identity(
+        left,
+        false,
+        false,
+        Some(MAX_WORKSPACE_CONFIG_FILE_BYTES),
+    )?
+    else {
         return Ok(false);
     };
-    let Some((_, _, right_identity)) = read_file_nofollow_with_identity(right, false, false)?
+    let Some((_, _, right_identity)) = read_file_nofollow_with_identity(
+        right,
+        false,
+        false,
+        Some(MAX_WORKSPACE_CONFIG_FILE_BYTES),
+    )?
     else {
         return Ok(false);
     };

@@ -175,6 +175,16 @@ pub async fn run_envelope_with_host(
         inputs.push(host_module_namespace("requests"));
     }
     let tracker = LimitedTracker::new(limits());
+    // Session redaction table for the stdout-fallback truncation: a secret
+    // straddling the truncation boundary must not leave a PARTIAL in the
+    // model lane. Forks without a native-tool context (metadata/seed forks,
+    // tests) carry no registered literals, so the empty-table fallback keeps
+    // their truncation identical to the previous plain behavior.
+    let redact = host
+        .native_tool_ctx
+        .as_ref()
+        .map(|ctx| ctx.redact.clone())
+        .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
     let mut stdout = String::new();
     let mut envelope = ProjectionEnvelope::default();
     let mut progress = runner
@@ -188,7 +198,9 @@ pub async fn run_envelope_with_host(
                     recorder.finish_suppressed().await;
                 }
                 if envelope.model.is_empty() {
-                    envelope.model.push(render_complete_value(&value, &stdout)?);
+                    envelope
+                        .model
+                        .push(render_complete_value(&value, &stdout, &redact)?);
                 }
                 return Ok(envelope);
             }
@@ -405,7 +417,11 @@ fn serialize_projection_value(value: &MontyObject) -> Result<String, String> {
         .map_err(|error| format!("projection value is not JSON-serializable: {error}"))
 }
 
-fn render_complete_value(value: &MontyObject, stdout: &str) -> Result<String> {
+fn render_complete_value(
+    value: &MontyObject,
+    stdout: &str,
+    redact: &crate::redact::RedactionTable,
+) -> Result<String> {
     if !matches!(value, MontyObject::None) {
         return Ok(serde_json::to_string(&JsonMontyObject(value))?);
     }
@@ -419,7 +435,8 @@ fn render_complete_value(value: &MontyObject, stdout: &str) -> Result<String> {
         return Ok(normalized);
     }
 
-    Ok(crate::tools::common::truncate_head_tail(
+    Ok(crate::tools::common::truncate_head_tail_redacted(
+        redact,
         stdout,
         STDOUT_FALLBACK_BYTE_CAP,
     ))

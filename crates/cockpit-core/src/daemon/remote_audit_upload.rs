@@ -181,7 +181,18 @@ async fn sync_once_with_client_and_vault(
         .remote_audit_upload_state(&credential.server_url, &credential.instance_id)
         .await?
         .ok_or_else(|| anyhow!("remote audit upload state missing after upsert"))?;
-    let built = build_batch(db, credential, state.cursor_audit_id, vault).await?;
+    let built = match build_batch(db, credential, state.cursor_audit_id, vault).await {
+        Ok(built) => built,
+        Err(error) => {
+            db.update_remote_audit_upload_error(
+                &credential.server_url,
+                &credential.instance_id,
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     match built {
         BatchBuild::Idle => Ok(RemoteAuditUploadOnceOutcome::Idle),
         BatchBuild::Skipped { cursor_audit_id } => {
@@ -264,22 +275,29 @@ async fn build_batch(
     let mut batch_cursor = cursor_audit_id;
     let mut events = Vec::new();
     for row in &rows {
+        if row.session_id.is_some() && vault.is_none() {
+            tracing::warn!(
+                audit_id = row.audit_id,
+                "deferring remote audit row until a vault-backed redaction load is available"
+            );
+            break;
+        }
         let event = match audit_event_json(db, credential, row, vault).await {
             Ok(Some(event)) => event,
             Ok(None) => {
-                if vault.is_none() {
-                    tracing::warn!(
-                        audit_id = row.audit_id,
-                        "deferring remote audit row until a vault-backed redaction load is available"
-                    );
-                    break;
-                }
                 batch_cursor = row.audit_id;
-                tracing::warn!(
-                    audit_id = row.audit_id,
-                    "skipping remote audit row without a loadable session redaction table"
-                );
                 continue;
+            }
+            Err(error) if crate::redact::RedactionTableUnavailable::in_chain(&error) => {
+                if events.is_empty() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    error = %error,
+                    audit_id = row.audit_id,
+                    "stopping remote audit batch before a record whose redaction custody cannot be loaded"
+                );
+                break;
             }
             Err(error) => {
                 batch_cursor = row.audit_id;
@@ -341,11 +359,13 @@ async fn audit_event_json(
     let Some(session_id) = row.session_id else {
         return Ok(None);
     };
-    let Some(redaction) =
-        crate::daemon::egress::redaction_for_session(db, vault, session_id).await?
-    else {
-        return Ok(None);
-    };
+    let vault = vault.ok_or_else(|| {
+        crate::redact::RedactionTableUnavailable::new(
+            "loading session redaction table for first-party egress",
+            "vault handle is required",
+        )
+    })?;
+    let redaction = crate::daemon::egress::redaction_for_session(db, vault, session_id).await?;
     let kind = row.request_kind.trim();
     if kind.is_empty() {
         return Err(anyhow!("remote audit kind is empty"));
@@ -474,9 +494,11 @@ mod tests {
                 sleep_log.lock().await.push(duration);
             })
         };
-        let outcome = sync_once_with_client(db, &credential, &client, &mut sleeper)
-            .await
-            .unwrap();
+        let vault = crate::secure_key::vault_for_db(db).unwrap();
+        let outcome =
+            sync_once_with_client_and_vault(db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .unwrap();
         let requests = requests.lock().await.clone();
         let sleeps = sleeps.lock().await.clone();
         (outcome, requests, sleeps, server)
@@ -485,7 +507,7 @@ mod tests {
     async fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
         let session = db
             .write(|conn| {
-                crate::db::Db::insert_session_row_conn(
+                crate::db::Db::insert_session_row_without_redaction_custody_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
                         conn,
@@ -497,15 +519,13 @@ mod tests {
             })
             .await
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            db,
             session.session_id,
-            Some(
-                crate::redact::RedactionTable::empty()
-                    .to_persisted_json()
-                    .unwrap(),
-            ),
+            &crate::redact::RedactionTable::empty()
+                .to_persisted_json()
+                .unwrap(),
         )
-        .await
         .unwrap();
         db.insert_remote_audit_with_path(
             "flycockpit:user-1",
@@ -578,9 +598,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        let error = sync_once_with_client(&db, &credential, &client, &mut sleeper)
-            .await
-            .unwrap_err();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error =
+            sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("remote audit ingest failed"));
         let state = db
             .remote_audit_upload_state(&server, "inst-1")
@@ -614,7 +636,10 @@ mod tests {
         }
         let credential = credential("http://127.0.0.1:1".to_string());
         let rows = db.list_remote_audit_after(0, 101).await.unwrap();
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready {
                 payload,
@@ -646,13 +671,16 @@ mod tests {
         let session_id = db.list_remote_audit_after(0, 1).await.unwrap()[0]
             .session_id
             .unwrap();
-        db.set_session_redaction_table_json(
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &db,
             session_id,
-            Some(redaction.to_persisted_json().unwrap()),
+            &redaction.to_persisted_json().unwrap(),
         )
-        .await
         .unwrap();
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready { payload, .. } => {
                 let body = payload.to_string();
@@ -668,11 +696,128 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let audit_id = insert_remote(&db, "", None).await;
         let credential = credential("http://127.0.0.1:1".to_string());
-        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let built = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .unwrap();
         match built {
             BatchBuild::Skipped { cursor_audit_id } => assert_eq!(cursor_audit_id, audit_id),
             BatchBuild::Idle | BatchBuild::Ready { .. } => panic!("expected skipped row"),
         }
+    }
+
+    #[tokio::test]
+    async fn vault_less_load_defers_without_advancing_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        insert_remote(&db, "send_user_message", None).await;
+        let credential = credential("http://127.0.0.1:1".to_string());
+        let built = build_batch(&db, &credential, 0, None).await.unwrap();
+        match built {
+            BatchBuild::Idle => {}
+            BatchBuild::Skipped { cursor_audit_id } => assert_eq!(
+                cursor_audit_id, 0,
+                "vault-less load must not advance past unread vault-backed rows"
+            ),
+            BatchBuild::Ready { event_count, .. } => {
+                panic!("vault-less load must defer vault-backed rows, got {event_count} events")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_redaction_table_fails_closed_without_advancing_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .await
+            .unwrap();
+        db.insert_remote_audit_with_path(
+            "flycockpit:user-1",
+            "send_user_message",
+            Some(session.session_id),
+            "allowed",
+            None,
+        )
+        .await
+        .unwrap();
+        let (server, requests) = start_test_server(vec![response(
+            200,
+            r#"{"ok":true,"result":{"received":1,"ingested":1}}"#,
+        )])
+        .await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error =
+            sync_once_with_client_and_vault(&db, &credential, &client, &mut sleeper, Some(&vault))
+                .await
+                .expect_err("missing custody must fail the batch");
+        let message = format!("{error:#}");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "missing table must be a typed redaction failure: {message}"
+        );
+        assert!(
+            message.contains("refusing to proceed unredacted"),
+            "visible fail-closed signal missing: {message}"
+        );
+        let state = db
+            .remote_audit_upload_state(&server, "inst-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.cursor_audit_id, 0,
+            "cursor must not skip a custody failure"
+        );
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing to proceed unredacted")),
+            "custody failure must be acknowledged: {:?}",
+            state.last_error
+        );
+        assert!(
+            !requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request.starts_with("POST ")),
+            "plaintext must not be transmitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_redaction_table_fails_closed_instead_of_skipping() {
+        let db = Db::open_in_memory().unwrap();
+        insert_remote(&db, "send_user_message", None).await;
+        let session_id = db.list_remote_audit_after(0, 1).await.unwrap()[0]
+            .session_id
+            .unwrap();
+        crate::secure_key::tamper_item_ciphertext(
+            &db,
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &crate::secure_key::redaction_table_item_id(&session_id.to_string()),
+            |ciphertext| ciphertext[0] ^= 0xff,
+        )
+        .unwrap();
+        let credential = credential("http://127.0.0.1:1".to_string());
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let error = build_batch(&db, &credential, 0, Some(&vault))
+            .await
+            .expect_err("unreadable table must fail the batch");
+        assert!(
+            crate::redact::RedactionTableUnavailable::in_chain(&error),
+            "unreadable table must be a typed redaction failure: {error:#}"
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::config::extended::ApprovalMode;
 use crate::{
     engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args},
+    resource_limits::{existing_file_unchanged, read_existing_for_mutation},
     tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release},
 };
 
@@ -149,7 +150,7 @@ impl Tool for WriteTool {
         .await?;
         let exists = path.exists();
         let existing_before = if exists {
-            Some(std::fs::read(&path)?)
+            Some(read_existing_for_mutation(&path)?)
         } else {
             None
         };
@@ -208,7 +209,7 @@ impl Tool for WriteTool {
         )
         .await?;
         if let Some(previous) = &existing_before
-            && std::fs::read(&path)? != *previous
+            && !existing_file_unchanged(&path, previous)?
         {
             return Err(anyhow::anyhow!(
                 "`{}` changed while approval was pending; read it again before overwriting",
@@ -310,9 +311,12 @@ impl Tool for WriteTool {
         {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
-        if let Some(note) =
-            crate::tools::data_syntax::data_syntax_note(&path, &normalized, &config.data_syntax)
-        {
+        if let Some(note) = crate::tools::data_syntax::data_syntax_note(
+            &ctx.redact,
+            &path,
+            &normalized,
+            &config.data_syntax,
+        ) {
             message.push_str(&note);
         }
         if let Some(advisory) = outcome.advisory() {
@@ -3297,6 +3301,31 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("created.md")).unwrap(),
             "first\n"
         );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_an_existing_file_over_the_mutation_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("huge.txt");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
+            .unwrap();
+        drop(handle);
+        ctx.locks
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
+            .await;
+        let err = WriteTool
+            .call(
+                serde_json::json!({"path": "huge.txt", "content": "new\n"}),
+                &ctx,
+            )
+            .await
+            .expect_err("oversized existing file must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("existing file"), "{msg}");
+        assert!(msg.contains("byte limit"), "{msg}");
     }
 
     #[tokio::test]

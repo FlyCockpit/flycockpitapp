@@ -139,8 +139,12 @@ fn same_path_lexical_or_canonical(a: &Path, b: &Path) -> bool {
 ///
 /// A file that parses as none of these is [`EnvFileScan::Unsupported`].
 pub(super) fn collect_env_file_candidates(path: &Path, user_allowlist: &[String]) -> EnvFileScan {
-    let Ok(bytes) = std::fs::read(path) else {
-        return EnvFileScan::Unreadable;
+    let bytes = match crate::resource_limits::read_for_tool(path) {
+        Ok(bytes) => bytes,
+        Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
+            return EnvFileScan::OverLimit;
+        }
+        Err(_) => return EnvFileScan::Unreadable,
     };
     let text = String::from_utf8_lossy(&bytes);
     let display = path.display().to_string();

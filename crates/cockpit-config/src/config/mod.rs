@@ -44,10 +44,11 @@ pub mod resolve;
 pub mod sandbox_mode;
 pub mod trust;
 
-/// Maximum bytes accepted from one capability-bound workspace configuration
-/// leaf.  Every daemon-owned workspace reader, including hook configuration,
-/// uses this one policy limit so an attacker cannot turn a configuration
-/// refresh into an unbounded allocation.
+/// Maximum bytes accepted from one workspace configuration leaf, whether
+/// read through a retained directory handle or an ambient path loader
+/// (`ExtendedConfigDoc::load`, `ConfigDoc`, hook sources, provider files).
+/// Every daemon-owned workspace config reader uses this one policy limit so
+/// an attacker cannot turn a configuration refresh into an unbounded allocation.
 pub const MAX_WORKSPACE_CONFIG_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Immutable bytes captured from one attach-time configuration layer through
@@ -256,7 +257,7 @@ pub fn write_terminal_ingress_private_file(
     bytes: &[u8],
 ) -> anyhow::Result<TerminalIngressFileIdentity> {
     files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
-    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false, true)?
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false, true, None)?
         .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
     Ok(identity)
 }
@@ -304,14 +305,18 @@ impl Drop for VerifiedTerminalIngressFile {
 pub fn read_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    Ok(files::read_file_nofollow_with_identity(path, false, true)?
-        .map(|(_, bytes, identity)| (bytes, identity)))
+    Ok(
+        files::read_file_nofollow_with_identity(path, false, true, None)?
+            .map(|(_, bytes, identity)| (bytes, identity)),
+    )
 }
 
 /// Read an authority-bearing configuration file without following a planted
-/// path component. Missing files are reported as `None`.
+/// path component. Missing files are reported as `None`. Contents are capped
+/// at [`MAX_WORKSPACE_CONFIG_FILE_BYTES`] during IO so a planted or grown
+/// `.cockpit` leaf cannot OOM the daemon.
 pub fn read_config_file_nofollow(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
-    files::read_file_nofollow(path)
+    files::read_file_nofollow_bounded(path, MAX_WORKSPACE_CONFIG_FILE_BYTES)
 }
 
 /// Read a configuration target through the audited retained-parent,
@@ -321,8 +326,13 @@ pub fn read_config_file_nofollow(path: &std::path::Path) -> anyhow::Result<Optio
 pub fn read_config_file_nofollow_with_identity(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    Ok(files::read_file_nofollow_with_identity(path, false, false)?
-        .map(|(_, bytes, identity)| (bytes, identity)))
+    Ok(files::read_file_nofollow_with_identity(
+        path,
+        false,
+        false,
+        Some(MAX_WORKSPACE_CONFIG_FILE_BYTES),
+    )?
+    .map(|(_, bytes, identity)| (bytes, identity)))
 }
 
 /// Retain an existing directory without following any path component.
@@ -421,7 +431,7 @@ pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
     Ok(
-        files::read_file_nofollow_with_identity(path, true, true)?.map(
+        files::read_file_nofollow_with_identity(path, true, true, None)?.map(
             |(file, bytes, identity)| VerifiedTerminalIngressFile {
                 file,
                 bytes,

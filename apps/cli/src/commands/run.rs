@@ -2607,6 +2607,23 @@ mod tests {
     }
 
     #[test]
+    fn run_approve_command_cannot_grant_unclassified_owner_network_authority() {
+        let mut question = approval_question(GrantKind::Command);
+        let proto::InterruptQuestion::Single { approval_class, .. } = &mut question else {
+            panic!("approval fixture must be a single question");
+        };
+        *approval_class = None;
+        let resolution = resolve_run_interrupt(Some(&question), None, &[GrantKind::Command]);
+        assert!(!resolution.approved);
+        assert_eq!(resolution.class, None);
+        assert!(matches!(
+            resolution.response,
+            proto::ResolveResponse::Freetext { ref text }
+                if text == crate::approval::NONINTERACTIVE_RUN_DENIAL
+        ));
+    }
+
+    #[test]
     fn run_approve_class_grants_harness() {
         let question = approval_question(GrantKind::Harness);
         let resolution = resolve_run_interrupt(Some(&question), None, &[GrantKind::Harness]);

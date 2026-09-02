@@ -7,9 +7,10 @@
 //! `mcp.describe(server, tool)`, and `mcp.invoke(server, tool, args)`.
 //! `emit`, `show`, `notify`, and `attach` project values into host-owned lanes.
 //! If `emit` is unused, the final value or captured `print(...)` output remains
-//! the model fallback. The VM has no direct
-//! filesystem, network, or environment access; host functions remain subject to the same
-//! authorization as native tool calls.
+//! the model fallback. The VM has no direct filesystem, socket, or environment
+//! access. Optional network calls use the separately governed `requests`
+//! facade and host functions remain subject to the same authorization as
+//! native tool calls.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,7 +23,44 @@ use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, 
 use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
-pub struct McpTool;
+pub struct McpTool {
+    requests_enabled: bool,
+    description: String,
+    verbose_description: String,
+}
+
+impl McpTool {
+    pub fn for_requests_enabled(requests_enabled: bool) -> Self {
+        let mut packages = crate::mcp::network::SAFE_STDLIB_PACKAGES.to_vec();
+        if requests_enabled {
+            packages.push("requests (governed)");
+        }
+        let packages = packages.join(", ");
+        Self {
+            requests_enabled,
+            description: format!(
+                "{NORMAL_DESCRIPTION_PREFIX}{packages}{NORMAL_DESCRIPTION_SUFFIX}"
+            ),
+            verbose_description: format!(
+                "{DEFENSIVE_DESCRIPTION_PREFIX}{packages}{DEFENSIVE_DESCRIPTION_SUFFIX}"
+            ),
+        }
+    }
+
+    fn enabled_packages_description(&self) -> String {
+        let mut packages = crate::mcp::network::SAFE_STDLIB_PACKAGES.to_vec();
+        if self.requests_enabled {
+            packages.push("requests (governed)");
+        }
+        packages.join(", ")
+    }
+}
+
+impl Default for McpTool {
+    fn default() -> Self {
+        Self::for_requests_enabled(false)
+    }
+}
 
 /// A cancelled tool future drops its stack-local state before the dispatcher
 /// invokes [`Tool::on_abandon`]. Keep opaque-effect accounting here, keyed by
@@ -39,8 +77,9 @@ fn identity_accounting_key(ctx: &ToolCtx) -> usize {
     ctx as *const ToolCtx as usize
 }
 
-const NORMAL_DESCRIPTION: &str = "Run Python over native tools. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
-const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
+const NORMAL_DESCRIPTION_PREFIX: &str = "Run Python over native tools. Enabled packages: ";
+const NORMAL_DESCRIPTION_SUFFIX: &str = ". `requests` is a governed per-agent package: enable it or grant/revoke a host only with mcp.network_configure(...), which always requires an explicit user approval. Every request still requires an explicit user-granted host and whole-request redaction. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
+const DEFENSIVE_DESCRIPTION_PREFIX: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
      `mcp.grep_tool_definitions(regex)` for heavier regex discovery across names, descriptions, \
@@ -56,7 +95,8 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
      `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
      printed output is captured and returned as a fallback. The VM has no direct filesystem, \
-     network, or environment access; every host function remains subject to the same authorization as a native tool call.";
+     socket, or environment access. Enabled packages: ";
+const DEFENSIVE_DESCRIPTION_SUFFIX: &str = ". `requests`, when listed, uses the host's explicit user-granted host allowlist, whole-request redaction, revocation generation fence, and optional approval. Every host function remains subject to the same authorization as a native tool call.";
 
 pub(crate) async fn turn_start_advert_message(
     _toolbox: &ToolBox,
@@ -100,18 +140,18 @@ impl Tool for McpTool {
     }
 
     fn description(&self) -> &str {
-        NORMAL_DESCRIPTION
+        &self.description
     }
 
     fn verbose_description(&self) -> Option<String> {
-        Some(DEFENSIVE_DESCRIPTION.to_string())
+        Some(self.verbose_description.clone())
     }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "script": { "type": "string", "description": "Python script; use emit(x) to project model context" }
+                "script": { "type": "string", "description": format!("Python script; enabled packages: {}; use emit(x) to project model context", self.enabled_packages_description()) }
             },
             "required": ["script"]
         })
@@ -123,7 +163,7 @@ impl Tool for McpTool {
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "Python source using mcp.search, mcp.describe, and mcp.invoke; use emit(x) for model context, show(x) for display only, notify(s) for a human-only notice, and attach(x) for an artifact; with no emit, the final expression is returned and print(...) is the fallback when it is None"
+                    "description": format!("Python source using mcp.search, mcp.describe, and mcp.invoke. Enabled packages: {}. Use emit(x) for model context, show(x) for display only, notify(s) for a human-only notice, and attach(x) for an artifact; with no emit, the final expression is returned and print(...) is the fallback when it is None", self.enabled_packages_description())
                 }
             },
             "required": ["script"]
@@ -274,6 +314,7 @@ fn rendered_result_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tool::ToolBox;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -303,6 +344,24 @@ mod tests {
             .find(|definition| definition.name == "mcp")
             .unwrap()
             .description
+    }
+
+    #[test]
+    fn tool_description_advertises_enabled_safe_packages_and_default_off_requests() {
+        let disabled = McpTool::default();
+        let enabled = McpTool::for_requests_enabled(true);
+        for package in crate::mcp::network::SAFE_STDLIB_PACKAGES {
+            assert!(
+                disabled.description().contains(package),
+                "missing {package}"
+            );
+            assert!(
+                disabled.verbose_description().unwrap().contains(package),
+                "missing {package}"
+            );
+        }
+        assert!(!disabled.description().contains("requests (governed)"));
+        assert!(enabled.description().contains("requests (governed)"));
     }
 
     #[tokio::test]
@@ -360,7 +419,7 @@ mod tests {
             ),
         );
 
-        let error = McpTool
+        let error = McpTool::default()
             .call(
                 serde_json::json!({ "script": "mcp.invoke('sentinel', 'read', {})" }),
                 &ctx,
@@ -397,7 +456,7 @@ mod tests {
 
     #[test]
     fn description_is_one_sentence_terse() {
-        let t = McpTool;
+        let t = McpTool::default();
         assert!(t.description().len() <= 200, "terse budget");
         assert!(t.description().contains("mcp.search"));
         assert!(t.description().contains("mcp.grep_tool_names"));
@@ -409,7 +468,7 @@ mod tests {
 
     #[test]
     fn parameters_require_script_string() {
-        let p = McpTool.parameters();
+        let p = McpTool::default().parameters();
         assert_eq!(p["required"], serde_json::json!(["script"]));
         assert_eq!(p["properties"]["script"]["type"], "string");
     }
@@ -570,7 +629,7 @@ mod tests {
     async fn show_and_notify_stay_out_of_model_content() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        let output = McpTool
+        let output = McpTool::default()
             .call(
                 serde_json::json!({
                     "script": "emit('model only')\nshow({'detail': 'display only'})\nnotify('human only')"
@@ -594,7 +653,7 @@ mod tests {
 
     #[test]
     fn defensive_text_mentions_final_expression_and_print_fallback() {
-        let t = McpTool;
+        let t = McpTool::default();
         let desc = t.verbose_description().unwrap();
         assert!(desc.contains("final expression"), "{desc}");
         assert!(desc.contains("printed output"), "{desc}");
@@ -609,9 +668,9 @@ mod tests {
 
     #[test]
     fn mcp_description_is_static_across_catalog_change() {
-        let disabled = ToolBox::new().with(Arc::new(McpTool));
+        let disabled = ToolBox::new().with(Arc::new(McpTool::default()));
         let discoverable = ToolBox::new()
-            .with(Arc::new(McpTool))
+            .with(Arc::new(McpTool::default()))
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         assert_eq!(
@@ -627,21 +686,24 @@ mod tests {
     #[test]
     fn mcp_description_has_no_advert_suffix() {
         let toolbox = ToolBox::new()
-            .with(Arc::new(McpTool))
+            .with(Arc::new(McpTool::default()))
             .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         let normal = mcp_description(&toolbox, crate::agents::ToolSteering::Terse);
         let defensive = mcp_description(&toolbox, crate::agents::ToolSteering::Verbose);
 
-        assert_eq!(normal, NORMAL_DESCRIPTION);
-        assert_eq!(defensive, DEFENSIVE_DESCRIPTION);
+        assert_eq!(normal, McpTool::default().description());
+        assert_eq!(defensive, McpTool::default().verbose_description().unwrap());
         assert!(!normal.contains("Available built-in cockpit functions"));
         assert!(!defensive.contains("Available built-in cockpit functions"));
     }
 
     #[test]
     fn mcp_descriptions_teach_grep_functions() {
-        for description in [NORMAL_DESCRIPTION, DEFENSIVE_DESCRIPTION] {
+        for description in [
+            McpTool::default().description().to_string(),
+            McpTool::default().verbose_description().unwrap(),
+        ] {
             assert!(description.contains("grep_tool_names"), "{description}");
             assert!(
                 description.contains("grep_tool_definitions"),
@@ -649,15 +711,19 @@ mod tests {
             );
         }
         assert!(
-            DEFENSIVE_DESCRIPTION
-                .contains("Search or grep before concluding a capability is missing"),
-            "{DEFENSIVE_DESCRIPTION}"
+            McpTool::default()
+                .verbose_description()
+                .unwrap()
+                .contains("Search or grep before concluding a capability is missing")
         );
     }
 
     #[test]
     fn mcp_descriptions_teach_batch_isolation() {
-        for description in [NORMAL_DESCRIPTION, DEFENSIVE_DESCRIPTION] {
+        for description in [
+            McpTool::default().description().to_string(),
+            McpTool::default().verbose_description().unwrap(),
+        ] {
             assert!(description.contains("try/except"), "{description}");
             assert!(description.contains("invoke"), "{description}");
         }
@@ -666,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn model_context_invariance_with_child_events() {
         let tmp = tempfile::tempdir().unwrap();
-        let tool = McpTool;
+        let tool = McpTool::default();
         let args = serde_json::json!({ "script": "mcp.search('context_usage')" });
         let plain_ctx = crate::tools::common::test_ctx(tmp.path());
         let mut child_ctx = crate::tools::common::test_ctx(tmp.path());
@@ -677,10 +743,10 @@ mod tests {
         let plain = tool.call(args.clone(), &plain_ctx).await.unwrap();
         let with_children = tool.call(args, &child_ctx).await.unwrap();
 
-        assert_eq!(tool.description(), NORMAL_DESCRIPTION);
+        assert_eq!(tool.description(), McpTool::default().description());
         assert_eq!(
-            tool.verbose_description().as_deref(),
-            Some(DEFENSIVE_DESCRIPTION)
+            tool.verbose_description(),
+            McpTool::default().verbose_description()
         );
         assert_eq!(plain.content, with_children.content);
         assert_eq!(plain.truncated, with_children.truncated);
@@ -690,7 +756,7 @@ mod tests {
     async fn advert_compact_follows_goal_state() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        let toolbox = ToolBox::new().with(Arc::new(McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(McpTool::default()));
 
         ctx.session
             .db
@@ -748,7 +814,7 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             ctx.events = Some(tx);
 
-            let tool = McpTool;
+            let tool = McpTool::default();
             let output = tool
                 .call(
                     serde_json::json!({ "script": "mcp.search('context_usage')" }),
@@ -807,7 +873,7 @@ mod tests {
     async fn call_script(script: &str) -> Result<ToolOutput> {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        McpTool
+        McpTool::default()
             .call(serde_json::json!({ "script": script }), &ctx)
             .await
     }
@@ -910,7 +976,7 @@ mod tests {
         ctx.events = Some(tx);
         let session = ctx.session.clone();
         let call_id = "parent-mcp-fail".to_string();
-        let err = McpTool
+        let err = McpTool::default()
             .call(serde_json::json!({ "script": "1 / 0" }), &ctx)
             .await
             .expect_err("parent must Err");

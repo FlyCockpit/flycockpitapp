@@ -11577,10 +11577,36 @@ async fn handle_serialized_request_impl(
             response,
         } => {
             let att = require_attached(state)?;
+            let governed_network_operation = ctx
+                .db
+                .interrupt_governed_network_operation_kind(att.handle.session_id, interrupt_id)
+                .await
+                .map_err(internal)?;
+            let governed_network_attachment = if governed_network_operation.is_some() {
+                let guard = att._interactive_guard.as_ref().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "governed network approval requires the interactive attachment that rendered the prompt".into(),
+                })?;
+                if !crate::sync::lock_or_recover(&att.rendered_interrupts).contains(&interrupt_id) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Authorization,
+                        message:
+                            "governed network approval prompt was not rendered by this attachment"
+                                .into(),
+                    });
+                }
+                Some(guard.lease().try_acquire().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "governed network approval attachment is no longer live".into(),
+                })?)
+            } else {
+                None
+            };
             att.handle
                 .send_work(SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,
+                    governed_network_attachment,
                 })
                 .await
                 .map_err(session_work_error)?;
@@ -28678,6 +28704,7 @@ pub(super) async fn attach(
         code_root_capability: None,
         workspace_identity: Some(workspace_identity),
         _interactive_guard: interactive_guard,
+        rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
     });
 
     // Hydrate the queue and gitignore read-allowlist for this client. The

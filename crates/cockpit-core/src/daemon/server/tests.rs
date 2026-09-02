@@ -18422,12 +18422,16 @@ async fn dispatch_authz_request_after(
 ) -> std::result::Result<Response, ErrorPayload> {
     let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
     let mut client = ProtoStream::new(client_stream);
+    // Owner matrix cells keep the capability so they exercise the 284-row
+    // table rather than the pre-launch capability fence. Remote principals
+    // never receive the daemon-private token.
+    let has_owner_capability = principal.is_owner();
     let mut server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
         principal,
         Uuid::new_v4(),
-        principal.is_owner(),
+        has_owner_capability,
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {

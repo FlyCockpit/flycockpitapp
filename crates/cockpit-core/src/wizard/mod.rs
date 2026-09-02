@@ -567,6 +567,7 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 "profile-save",
                 "Continue to provider setup",
                 "Saving your profile…",
+                None,
             ),
         ],
     }
@@ -598,6 +599,7 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
                 "lifetime-save",
                 "Save agent lifetime",
                 "Saving agent lifetime…",
+                None,
             ),
         ],
     }
@@ -1130,6 +1132,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::Headers.source_id(),
                 "Advanced: edit HTTP headers",
                 "Editing provider headers…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::AuthMethod.source_id(),
@@ -1196,21 +1199,25 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::CopilotAuth.source_id(),
                 "Configure GitHub authentication",
                 "Configuring GitHub authentication…",
+                Some(action_to_saving),
             ),
             action_step(
                 ProviderWizardStep::GrokOAuth.source_id(),
                 "Sign in to Grok",
                 "Waiting for browser authorization…",
+                Some(action_to_saving),
             ),
             action_step(
                 ProviderWizardStep::CodexOAuth.source_id(),
                 "Sign in to Codex",
                 "Waiting for device authorization…",
+                Some(action_to_saving),
             ),
             action_step(
                 ProviderWizardStep::CopyDetectedEnv.source_id(),
                 "Copy detected environment credential",
                 "Copying detected credential into Cockpit's encrypted vault…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Saving.source_id(),
@@ -1230,11 +1237,13 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::TestKey.source_id(),
                 "Test key",
                 "Testing provider credentials…",
+                Some(fetching_to_done),
             ),
             action_step(
                 ProviderWizardStep::Fetching.source_id(),
                 "Fetch models",
                 "Fetching /models…",
+                Some(fetching_to_done),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Done.source_id(),
@@ -1648,7 +1657,12 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
-fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -> StepDescriptor {
+fn action_step(
+    id: &'static str,
+    prompt: &'static str,
+    progress: &'static str,
+    branch: Option<BranchHook>,
+) -> StepDescriptor {
     StepDescriptor {
         id,
         prompt,
@@ -1659,10 +1673,7 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
         prefill: None,
         validate: None,
         write: None,
-        branch: Some(match id {
-            "fetching" | "test-key" => fetching_to_done,
-            _ => action_to_saving,
-        }),
+        branch,
     }
 }
 
@@ -2371,6 +2382,41 @@ mod tests {
 
         assert_eq!(run.current_step_id(), Some("lifetime-save"));
         assert_eq!(onboarding_background_agents_answer(&run), Some(false));
+    }
+
+    #[test]
+    fn onboarding_profile_save_completes_without_a_saving_step() {
+        let descriptor = onboarding_profile_descriptor();
+        let mut run = WizardRun::new(descriptor.clone()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        let pending = run.answers_json().unwrap();
+
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+        assert!(run.is_complete());
+
+        let replayed = WizardRun::from_answers_json(descriptor, &pending).unwrap();
+        assert!(replayed.is_complete());
+        assert_eq!(
+            replayed.answer("name"),
+            Some(&WizardAnswer::Text("Ada".into()))
+        );
+    }
+
+    #[test]
+    fn onboarding_lifetime_save_completes_without_a_saving_step() {
+        let descriptor = onboarding_lifetime_descriptor();
+        let mut run = WizardRun::new(descriptor.clone()).unwrap();
+        run.submit(WizardAnswer::Confirm(false)).unwrap();
+        assert_eq!(run.current_step_id(), Some("lifetime-save"));
+        let pending = run.answers_json().unwrap();
+
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+        assert!(run.is_complete());
+
+        let replayed = WizardRun::from_answers_json(descriptor, &pending).unwrap();
+        assert!(replayed.is_complete());
+        assert_eq!(onboarding_background_agents_answer(&replayed), Some(false));
     }
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);

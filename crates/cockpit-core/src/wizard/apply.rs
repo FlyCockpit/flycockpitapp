@@ -1432,4 +1432,52 @@ mod tests {
         assert!(run.is_aborted());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
+
+    #[test]
+    fn apply_setup_wizard_answers_persists_onboarding_profile_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
+        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        let answers_json = run.answers_json().unwrap();
+
+        let (changed, model_file, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("profile apply must replay the inferred save acknowledgement");
+
+        assert!(changed);
+        assert!(!model_file);
+        assert_eq!(default_scope, None);
+        let cfg = ExtendedConfigDoc::load(&config_path).unwrap().config();
+        assert_eq!(cfg.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn apply_setup_wizard_answers_persists_onboarding_lifetime_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let config_path = global_config_file().unwrap();
+        let mut run = WizardRun::new(crate::wizard::onboarding_lifetime_descriptor()).unwrap();
+        run.submit(WizardAnswer::Confirm(false)).unwrap();
+        assert_eq!(run.current_step_id(), Some("lifetime-save"));
+        let answers_json = run.answers_json().unwrap();
+
+        let (changed, model_file, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("lifetime apply must replay the inferred save acknowledgement");
+
+        assert!(changed);
+        assert!(!model_file);
+        assert_eq!(default_scope, None);
+        let cfg = ExtendedConfigDoc::load(&config_path).unwrap().config();
+        assert!(!cfg.daemon.background_agents);
+    }
 }

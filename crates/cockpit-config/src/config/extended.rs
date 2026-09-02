@@ -2898,6 +2898,7 @@ impl ExtendedConfigDoc {
         parse_field!("schedule", schedule);
         parse_field!("resourceScheduler", resource_scheduler);
         parse_field!("sandbox", sandbox);
+        parse_field!("daemon", daemon);
         parse_field!("mediaResources", media_resources);
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);

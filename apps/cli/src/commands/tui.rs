@@ -61,7 +61,15 @@ pub async fn run(
     no_sandbox: bool,
     launch_start: Option<Instant>,
 ) -> Result<()> {
-    run_mode(project, no_sandbox, SessionMode::Code, launch_start).await
+    run_mode(
+        project,
+        no_sandbox,
+        SessionMode::Code,
+        launch_start,
+        false,
+        false,
+    )
+    .await
 }
 
 /// Start every interactive mode through the sole TUI/session construction
@@ -73,11 +81,18 @@ pub async fn run_mode(
     no_sandbox: bool,
     mode: SessionMode,
     launch_start: Option<Instant>,
+    skip_setup: bool,
+    force_setup: bool,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
         return Ok(());
     }
+
+    // Record a genuinely fresh install before daemon startup creates the
+    // config directory. Failure is user-visible and startup fails closed.
+    cockpit_core::welcome::initialize_onboarding_if_first_run()
+        .context("initializing first-run onboarding state")?;
 
     // Onboarding is user-global state. Establish its persistent owner before
     // workspace trust is consulted so the first-run configuration survives
@@ -97,6 +112,7 @@ pub async fn run_mode(
         launch_start,
         lifecycle,
     );
+    app.configure_onboarding_launch(skip_setup, force_setup);
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;
@@ -131,6 +147,7 @@ pub async fn run_with_session(
         launch_start,
         lifecycle,
     );
+    app.configure_onboarding_launch(false, false);
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;

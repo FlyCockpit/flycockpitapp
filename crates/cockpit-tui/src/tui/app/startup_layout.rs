@@ -1,8 +1,37 @@
 use super::*;
 
 impl App {
+    fn persist_first_run_stage(&mut self, stage: cockpit_core::welcome::OnboardingStage) -> bool {
+        match cockpit_core::welcome::persist_onboarding_stage(stage) {
+            Ok(()) => true,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not save setup progress: {error}"),
+                    super::ToastKind::Error,
+                );
+                false
+            }
+        }
+    }
+
+    pub fn configure_onboarding_launch(&mut self, skip: bool, force: bool) {
+        if skip {
+            self.first_run_flow = FirstRunFlow::None;
+            self.dialog = crate::tui::settings::Dialog::None;
+        } else if force && self.first_run_flow == FirstRunFlow::None {
+            // `cockpit setup` resumes an interrupted stage. Once a completed
+            // installation explicitly re-enters setup, begin a new persisted
+            // run so a later quit remains resumable as well.
+            if self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Welcome) {
+                self.first_run_flow = FirstRunFlow::AwaitWelcome;
+                self.dialog =
+                    crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd);
+            }
+        }
+    }
+
     /// If the user has no providers configured in the active config
-    /// layer, open `/settings → Providers → Add` directly. No-op when
+    /// layer, open onboarding directly. No-op when
     /// providers already exist or when the settings dialog is already
     /// open. Evaluated each launch so emptying the providers list
     /// re-triggers the wizard on the next start.
@@ -10,17 +39,96 @@ impl App {
         if self.dialog.is_active() {
             return;
         }
-        if !self.has_no_providers_at_startup {
+        if self.first_run_flow == FirstRunFlow::None {
             return;
         }
-        self.first_run_flow = FirstRunFlow::AwaitProvider;
-        self.dialog = crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
+        self.dialog = match self.first_run_flow {
+            FirstRunFlow::AwaitWelcome => {
+                crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd)
+            }
+            FirstRunFlow::AwaitProfile => match crate::tui::settings::Dialog::open_setup_wizard(
+                &self.launch.cwd,
+                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            ) {
+                Ok(dialog) => dialog,
+                Err(error) => {
+                    self.show_toast(error, super::ToastKind::Error);
+                    return;
+                }
+            },
+            FirstRunFlow::AwaitProvider => {
+                crate::tui::settings::Dialog::open_onboarding_provider_add(
+                    &self.launch.cwd,
+                    Some("Resume setup: add and validate a provider credential.".to_string()),
+                )
+            }
+            FirstRunFlow::AwaitProviderValidation => {
+                let Some(provider_id) =
+                    cockpit_core::welcome::onboarding_provider_pending_validation()
+                else {
+                    self.first_run_flow = FirstRunFlow::AwaitProvider;
+                    self.maybe_open_add_provider_wizard();
+                    return;
+                };
+                crate::tui::settings::Dialog::open_onboarding_provider_validation(
+                    &self.launch.cwd,
+                    &provider_id,
+                )
+            }
+            FirstRunFlow::AwaitModel => {
+                match crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
+                    "Resume setup: enter a model ID and its context settings.".to_string(),
+                )) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return;
+                    }
+                }
+            }
+            FirstRunFlow::AwaitFinish => crate::tui::settings::Dialog::open_first_run_complete(
+                "Setup is ready. Suggested first prompt: ‘Help me understand this codebase.’"
+                    .to_string(),
+            ),
+            FirstRunFlow::None => return,
+        };
     }
 
     pub(super) fn service_first_run_flow(&mut self) -> bool {
         match self.first_run_flow {
             FirstRunFlow::None => false,
-            FirstRunFlow::AwaitProvider => {
+            FirstRunFlow::AwaitWelcome => {
+                if !self
+                    .dialog
+                    .setup_wizard_is_active(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
+                    return false;
+                }
+                if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Profile) {
+                    return false;
+                }
+                self.first_run_flow = FirstRunFlow::AwaitProfile;
+                true
+            }
+            FirstRunFlow::AwaitProfile => {
+                if !self
+                    .dialog
+                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
+                    return false;
+                }
+                self.refresh_bootstrap_config_snapshot();
+                if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Provider) {
+                    return false;
+                }
+                self.dialog = crate::tui::settings::Dialog::open_onboarding_provider_add(
+                    &self.launch.cwd,
+                    Some("Choose a subscription or API provider. Press Esc for ‘I’ll do this later’; setup will return next launch.".to_string()),
+                );
+                self.first_run_flow = FirstRunFlow::AwaitProvider;
+                true
+            }
+            FirstRunFlow::AwaitProvider | FirstRunFlow::AwaitProviderValidation => {
                 let Some(provider_id) = self.dialog.take_completed_provider_id() else {
                     return false;
                 };
@@ -28,34 +136,38 @@ impl App {
                 let model_id =
                     first_provider_model_id(&self.config_snapshot.providers, &provider_id);
                 let dialog = match model_id.as_deref() {
-                    Some(model_id) => crate::tui::settings::Dialog::open_model_setup_preselected(
-                        &self.launch.cwd,
-                        &provider_id,
-                        model_id,
-                        Some("Choose the model Cockpit should use by default.".to_string()),
-                    ),
-                    None => crate::tui::settings::Dialog::open_setup_wizard(
-                        &self.launch.cwd,
-                        cockpit_core::wizard::MODEL_WIZARD_ID,
-                    ),
+                    Some(model_id) => {
+                        crate::tui::settings::Dialog::open_onboarding_model_setup_preselected(
+                            &provider_id,
+                            model_id,
+                            Some("Choose the model Cockpit should use by default.".to_string()),
+                        )
+                    }
+                    None => crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
+                        "No model catalog is available. Enter the exact model ID and context settings manually."
+                            .to_string(),
+                    )),
                 };
                 match dialog {
                     Ok(dialog) => {
+                        if !self
+                            .persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Model)
+                        {
+                            return false;
+                        }
                         self.dialog = dialog;
                         self.first_run_flow = FirstRunFlow::AwaitModel;
                     }
                     Err(error) => {
-                        self.first_run_flow = FirstRunFlow::None;
                         self.show_toast(error, super::ToastKind::Error);
                     }
                 }
                 true
             }
             FirstRunFlow::AwaitModel => {
-                if !self
-                    .dialog
-                    .setup_wizard_is_complete(cockpit_core::wizard::MODEL_WIZARD_ID)
-                {
+                if !self.dialog.setup_wizard_is_complete_any(&[
+                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+                ]) {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
@@ -71,8 +183,43 @@ impl App {
                     .unwrap_or_else(|| {
                         "Model configuration finished; no default model was selected.".to_string()
                     });
-                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(summary);
-                self.first_run_flow = FirstRunFlow::None;
+                let sandbox = self
+                    .host_capabilities
+                    .feature("sandbox.host")
+                    .map(|row| format!("Sandbox: {:?} ({})", row.state, row.reason))
+                    .unwrap_or_else(|| "Sandbox: capability check pending".to_string());
+                let missing_dependencies = self
+                    .host_capabilities
+                    .dependencies
+                    .iter()
+                    .filter(|row| {
+                        !matches!(
+                            row.state,
+                            cockpit_proto::CatalogDependencyState::Available
+                                | cockpit_proto::CatalogDependencyState::NotApplicable
+                        )
+                    })
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>();
+                let dependencies = if missing_dependencies.is_empty() {
+                    "Dependencies: ready".to_string()
+                } else {
+                    format!(
+                        "Dependencies needing attention: {}",
+                        missing_dependencies.join(", ")
+                    )
+                };
+                #[cfg(windows)]
+                let windows_warning = " Windows: bash will run unsandboxed.";
+                #[cfg(not(windows))]
+                let windows_warning = "";
+                if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Complete) {
+                    return false;
+                }
+                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(format!(
+                    "{summary} {sandbox}. {dependencies}.{windows_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
+                ));
+                self.first_run_flow = FirstRunFlow::AwaitFinish;
                 if self.submit_after_model_selection {
                     match configured_model {
                         Some(active) => {
@@ -92,6 +239,34 @@ impl App {
                                     .to_string(),
                             );
                         }
+                    }
+                }
+                true
+            }
+            FirstRunFlow::AwaitFinish => {
+                let Some(choice) = self.dialog.take_first_run_choice() else {
+                    return false;
+                };
+                match choice {
+                    crate::tui::settings::FirstRunChoice::AddAnotherProvider => {
+                        if !self.persist_first_run_stage(
+                            cockpit_core::welcome::OnboardingStage::Provider,
+                        ) {
+                            self.dialog = crate::tui::settings::Dialog::open_first_run_complete(
+                                "Setup is ready. Choose Add another provider again after setup progress can be saved."
+                                    .to_string(),
+                            );
+                            return false;
+                        }
+                        self.dialog = crate::tui::settings::Dialog::open_onboarding_provider_add(
+                            &self.launch.cwd,
+                            Some("Add another provider; live validation is required.".to_string()),
+                        );
+                        self.first_run_flow = FirstRunFlow::AwaitProvider;
+                    }
+                    crate::tui::settings::FirstRunChoice::StartCoding => {
+                        self.dialog = crate::tui::settings::Dialog::None;
+                        self.first_run_flow = FirstRunFlow::None;
                     }
                 }
                 true

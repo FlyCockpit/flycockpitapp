@@ -9,12 +9,146 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
 use crate::banner::render_unconditional;
 use crate::git::{self, repo_counts};
 pub use cockpit_proto::{LaunchBundle, LaunchInfo};
 
 pub const APP_NAME: &str = "FlyCockpit";
 pub const INPUT_PREFIX: &str = "❯ ";
+const ONBOARDING_STATE_FILE: &str = "onboarding.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardingStage {
+    Welcome,
+    Profile,
+    Provider,
+    Model,
+    Complete,
+}
+
+impl Default for OnboardingStage {
+    fn default() -> Self {
+        Self::Welcome
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OnboardingState {
+    stage: OnboardingStage,
+    /// A provider save is in flight or has committed but still needs its
+    /// live validation. Keeping this alongside the stage lets a restart
+    /// resume validation instead of opening a fresh add wizard; an explicit
+    /// offline continuation advances the stage and clears this marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_pending_validation: Option<String>,
+}
+
+fn onboarding_state_path() -> Result<PathBuf> {
+    Ok(crate::config::dirs::global_config_dir()
+        .context("resolving global config directory for onboarding")?
+        .join(ONBOARDING_STATE_FILE))
+}
+
+pub fn onboarding_stage() -> OnboardingStage {
+    let Ok(path) = onboarding_state_path() else {
+        // A directory-resolution failure must never disable onboarding. The
+        // caller will retry the normal durable state write before advancing.
+        return OnboardingStage::Welcome;
+    };
+    onboarding_stage_at(&path)
+}
+
+fn onboarding_stage_at(path: &Path) -> OnboardingStage {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A missing state file is first-run only when the config directory
+            // did not already exist. Established installs must never be pushed
+            // into onboarding merely because they predate onboarding.json.
+            return if path.parent().is_some_and(|parent| parent.exists()) {
+                OnboardingStage::Complete
+            } else {
+                OnboardingStage::Welcome
+            };
+        }
+        Err(_) => {
+            // Permission and I/O failures are not evidence that onboarding
+            // completed. Resume conservatively, where progress writes will
+            // expose the underlying failure to the user.
+            return OnboardingStage::Welcome;
+        }
+    };
+    serde_json::from_slice::<OnboardingState>(&bytes)
+        .map(|state| state.stage)
+        .unwrap_or(OnboardingStage::Welcome)
+}
+
+pub fn onboarding_provider_pending_validation() -> Option<String> {
+    let path = onboarding_state_path().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<OnboardingState>(&bytes)
+        .ok()?
+        .provider_pending_validation
+}
+
+pub fn persist_onboarding_provider_pending_validation(provider_id: &str) -> Result<()> {
+    let path = onboarding_state_path()?;
+    persist_onboarding_state_at(
+        &path,
+        OnboardingState {
+            stage: OnboardingStage::Provider,
+            provider_pending_validation: Some(provider_id.to_string()),
+        },
+    )
+}
+
+/// Establish the durable Welcome marker before another startup owner (notably
+/// the daemon) creates the config directory. Existing config directories are
+/// deliberately left untouched.
+pub fn initialize_onboarding_if_first_run() -> Result<bool> {
+    let path = onboarding_state_path()?;
+    initialize_onboarding_at(&path)
+}
+
+fn initialize_onboarding_at(path: &Path) -> Result<bool> {
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("onboarding state has no parent");
+    };
+    if parent.exists() {
+        return Ok(false);
+    }
+    persist_onboarding_stage_at(path, OnboardingStage::Welcome)?;
+    Ok(true)
+}
+
+pub fn persist_onboarding_stage(stage: OnboardingStage) -> Result<()> {
+    let path = onboarding_state_path()?;
+    persist_onboarding_stage_at(&path, stage)
+}
+
+fn persist_onboarding_stage_at(path: &Path, stage: OnboardingStage) -> Result<()> {
+    persist_onboarding_state_at(
+        path,
+        OnboardingState {
+            stage,
+            provider_pending_validation: None,
+        },
+    )
+}
+
+fn persist_onboarding_state_at(path: &Path, state: OnboardingState) -> Result<()> {
+    let parent = path.parent().context("onboarding state has no parent")?;
+    std::fs::create_dir_all(parent).context("creating onboarding state directory")?;
+    let bytes = serde_json::to_vec_pretty(&state).context("serializing onboarding state")?;
+    let _guard = crate::config::hold_config_mutation_lock(&path)?;
+    crate::config::write_config_bytes_atomic(&path, &bytes)
+        .context("publishing onboarding state")?;
+    Ok(())
+}
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -356,6 +490,59 @@ mod tests {
     use crate::config::providers::{
         CapabilityStatus, ModelCapabilities, ModelEntry, ProviderEntry, ProvidersConfig,
     };
+
+    #[test]
+    fn missing_state_on_existing_install_is_complete() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            onboarding_stage_at(&root.path().join(ONBOARDING_STATE_FILE)),
+            OnboardingStage::Complete
+        );
+    }
+
+    #[test]
+    fn only_absent_config_directory_initializes_onboarding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("new-config");
+        let state = config.join(ONBOARDING_STATE_FILE);
+        assert!(initialize_onboarding_at(&state).unwrap());
+        assert_eq!(onboarding_stage_at(&state), OnboardingStage::Welcome);
+        std::fs::remove_file(&state).unwrap();
+        assert!(!initialize_onboarding_at(&state).unwrap());
+        assert_eq!(onboarding_stage_at(&state), OnboardingStage::Complete);
+    }
+
+    #[test]
+    fn unreadable_state_path_resumes_onboarding() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join(ONBOARDING_STATE_FILE);
+        std::fs::create_dir(&state).unwrap();
+
+        assert_eq!(onboarding_stage_at(&state), OnboardingStage::Welcome);
+    }
+
+    #[test]
+    fn provider_validation_continuation_is_durable() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("new-config").join(ONBOARDING_STATE_FILE);
+
+        persist_onboarding_state_at(
+            &state,
+            OnboardingState {
+                stage: OnboardingStage::Provider,
+                provider_pending_validation: Some("openai".into()),
+            },
+        )
+        .unwrap();
+        let decoded: OnboardingState =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+
+        assert_eq!(decoded.stage, OnboardingStage::Provider);
+        assert_eq!(
+            decoded.provider_pending_validation.as_deref(),
+            Some("openai")
+        );
+    }
 
     #[test]
     fn image_support_uses_resolved_model_capabilities() {

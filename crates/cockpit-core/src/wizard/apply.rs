@@ -83,6 +83,18 @@ pub fn descriptor_for_cwd_with_caps(
             &current, None,
         ));
     }
+    if id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID {
+        let current = ConfigDoc::load(&global_config)
+            .ok()
+            .map(|doc| doc.providers())
+            .unwrap_or_default();
+        return Some(crate::wizard::onboarding_model_descriptor_with_selection(
+            &current, None,
+        ));
+    }
+    if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
+        return Some(crate::wizard::onboarding_profile_descriptor());
+    }
     crate::wizard::descriptor(id)
 }
 
@@ -95,6 +107,18 @@ pub fn model_descriptor_for_cwd(_cwd: &Path, preselect: Option<(&str, &str)>) ->
         .map(|doc| doc.providers())
         .unwrap_or_default();
     crate::wizard::model_descriptor_with_selection(&current, preselect)
+}
+
+pub fn onboarding_model_descriptor_for_cwd(
+    _cwd: &Path,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
+    let current = global_config_file()
+        .ok()
+        .and_then(|path| ConfigDoc::load(&path).ok())
+        .map(|doc| doc.providers())
+        .unwrap_or_default();
+    crate::wizard::onboarding_model_descriptor_with_selection(&current, preselect)
 }
 
 /// Where onboarding security answers are written: the always-writable global
@@ -122,13 +146,20 @@ pub fn apply_setup_wizard_answers(
 ) -> Result<(bool, bool, Option<String>)> {
     if !matches!(
         wizard_id,
-        crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID
+        crate::wizard::SECURITY_WIZARD_ID
+            | crate::wizard::MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
     let descriptor = descriptor_for_cwd(wizard_id, cwd)
         .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
+    if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
+        let changed = apply_onboarding_profile_answers(&run)?.is_some();
+        return Ok((changed, false, None));
+    }
     if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
         let changed = apply_security_answers(cwd, &run)?.is_some();
         return Ok((changed, false, None));
@@ -151,7 +182,10 @@ pub async fn apply_setup_wizard_answers_authoritative(
 ) -> Result<(bool, bool, Option<String>)> {
     if !matches!(
         wizard_id,
-        crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID
+        crate::wizard::SECURITY_WIZARD_ID
+            | crate::wizard::MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+            | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
@@ -159,6 +193,10 @@ pub async fn apply_setup_wizard_answers_authoritative(
     let descriptor = descriptor_for_cwd_with_caps(wizard_id, cwd, Some(&caps))
         .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
+    if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
+        let changed = apply_onboarding_profile_answers(&run)?.is_some();
+        return Ok((changed, false, None));
+    }
     if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
         let changed = apply_security_answers_with_caps(cwd, &run, Some(&caps))?.is_some();
         return Ok((changed, false, None));
@@ -169,6 +207,19 @@ pub async fn apply_setup_wizard_answers_authoritative(
         outcome.model_file.is_some(),
         outcome.default_scope,
     ))
+}
+
+fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
+    let target = global_config_file().context("resolving global config for onboarding profile")?;
+    let mut doc = ExtendedConfigDoc::load(&target)?;
+    let mut config = doc.config();
+    let next = crate::wizard::onboarding_name_answer(run);
+    if config.name == next {
+        return Ok(None);
+    }
+    config.name = next;
+    doc.write(&config)?;
+    Ok(Some(target))
 }
 
 /// Persist security-wizard answers. When `caps` is present, unavailable
@@ -282,11 +333,14 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         .providers
         .get(&provider_id)
         .with_context(|| format!("provider `{provider_id}` not found"))?;
-    provider_read
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
+    let onboarding = run.descriptor().id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID;
+    if !onboarding {
+        provider_read
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .with_context(|| format!("model `{provider_id}:{model_id}` not found"))?;
+    }
     let inherited_trust = effective.provider_trust_default(&provider_id);
     let current_trust = effective.resolve_trust(&provider_id, &model_id);
     let inherited_thinking = effective.provider_default_thinking_mode_default(&provider_id);
@@ -299,24 +353,24 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     let mut model_doc = ConfigDoc::load(&model_target)?;
     let mut layer_cfg = model_doc.providers();
     let provider = layer_cfg.providers.entry(provider_id.clone()).or_default();
-    let model_index = if let Some(index) = provider
+    let (model_index, model_inserted) = if let Some(index) = provider
         .models
         .iter()
         .position(|model| model.id == model_id)
     {
-        index
+        (index, false)
     } else {
         provider.models.push(crate::config::providers::ModelEntry {
             id: model_id.clone(),
             ..Default::default()
         });
-        provider.models.len() - 1
+        (provider.models.len() - 1, true)
     };
     let model = provider
         .models
         .get_mut(model_index)
         .expect("model index was just resolved");
-    let mut model_changed = false;
+    let mut model_changed = model_inserted;
 
     if let Some(selected) = model_trust_answer(run) {
         let next = if selected == current_trust {
@@ -333,13 +387,14 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     }
 
     let selected_capabilities = model_capability_answers(run);
+    let configure_capabilities = run.answer("capabilities").is_some();
     let next_images = capability_status_override(
         selected_capabilities.contains("images"),
         current_capabilities.image_input.status,
         base_capabilities.image_input.status,
         model.capability_overrides.image_input,
     );
-    if model.capability_overrides.image_input != next_images {
+    if configure_capabilities && model.capability_overrides.image_input != next_images {
         model.capability_overrides.image_input = next_images;
         model_changed = true;
     }
@@ -349,7 +404,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         base_capabilities.tool_calling,
         model.capability_overrides.tool_calling,
     );
-    if model.capability_overrides.tool_calling != next_tools {
+    if configure_capabilities && model.capability_overrides.tool_calling != next_tools {
         model.capability_overrides.tool_calling = next_tools;
         model_changed = true;
     }
@@ -359,7 +414,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         base_capabilities.reasoning,
         model.capability_overrides.reasoning,
     );
-    if model.capability_overrides.reasoning != next_reasoning {
+    if configure_capabilities && model.capability_overrides.reasoning != next_reasoning {
         model.capability_overrides.reasoning = next_reasoning;
         model_changed = true;
     }
@@ -369,7 +424,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         base_capabilities.structured_outputs,
         model.capability_overrides.structured_outputs,
     );
-    if model.capability_overrides.structured_outputs != next_structured {
+    if configure_capabilities && model.capability_overrides.structured_outputs != next_structured {
         model.capability_overrides.structured_outputs = next_structured;
         model_changed = true;
     }
@@ -414,6 +469,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     }
 
     let selected_subagent = model_subagent_answers(run);
+    let configure_subagents = run.answer("subagent-flags").is_some();
     let subagent_value = selected_subagent.contains("subagent_invokable");
     let next_subagent = if subagent_value == current_subagent {
         model.subagent_invokable
@@ -422,7 +478,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     } else {
         Some(subagent_value)
     };
-    if model.subagent_invokable != next_subagent {
+    if configure_subagents && model.subagent_invokable != next_subagent {
         model.subagent_invokable = next_subagent;
         model_changed = true;
     }
@@ -434,7 +490,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     } else {
         Some(can_delegate_value)
     };
-    if model.can_delegate != next_can_delegate {
+    if configure_subagents && model.can_delegate != next_can_delegate {
         model.can_delegate = next_can_delegate;
         model_changed = true;
     }
@@ -697,6 +753,31 @@ mod tests {
             },
             mode,
         }
+    }
+
+    #[test]
+    fn onboarding_profile_apply_writes_name_from_client_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".to_string())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        let answers_json = run.answers_json().unwrap();
+
+        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("daemon apply reconstructs profile-save and writes the name");
+
+        assert!(changed);
+        assert!(!model_file_written);
+        assert_eq!(default_scope, None);
+        let config = ExtendedConfigDoc::load(&global_config_file().unwrap())
+            .unwrap()
+            .config();
+        assert_eq!(config.name.as_deref(), Some("Ada"));
     }
 
     #[test]

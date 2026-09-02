@@ -501,6 +501,15 @@ async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Re
     crate::assistants::validate_named_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
     let project_root_str = project_root.to_string_lossy().into_owned();
+    // Named assistant chat enters the TUI through a separate path. Establish
+    // the first-run marker before its persistent daemon creates the config
+    // directory, just as the regular interactive launch does.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        cockpit_core::welcome::initialize_onboarding_if_first_run()
+            .context("initializing first-run onboarding state")?;
+    }
     let daemon = ensure_assistant_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant chat")?;

@@ -51,6 +51,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_sandbox: bool,
 
+    /// Start immediately without first-run setup. Setup remains incomplete and
+    /// is offered again next launch; run `cockpit setup` to re-enter it now.
+    #[arg(long, global = true)]
+    pub skip_setup: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -79,6 +84,8 @@ pub struct PublicCli {
     pub debug_last_message: bool,
     #[arg(long, global = true)]
     pub no_sandbox: bool,
+    #[arg(long, global = true)]
+    pub skip_setup: bool,
     #[command(subcommand)]
     pub command: Option<PublicCommand>,
 }
@@ -142,6 +149,7 @@ impl From<PublicCli> for Cli {
             pure: value.pure,
             debug_last_message: value.debug_last_message,
             no_sandbox: value.no_sandbox,
+            skip_setup: value.skip_setup,
             command: value.command.map(|command| match command {
                 PublicCommand::Acp => Command::Acp,
                 PublicCommand::Ask(args) => Command::Ask(args),

@@ -5999,6 +5999,53 @@ fn refetch_result_with_fallback_available_opens_explicit_prompt() {
 }
 
 #[test]
+fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
+    let (_tmp, mut dialog) =
+        dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
+    let mut add = AddState::new_with_onboarding(true);
+    add.saved_provider_id = Some("p".into());
+    add.run.return_to("test-key").unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackAvailable {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason:
+                "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
+                    .into(),
+        }),
+    );
+
+    let TestPageRef::Providers(ProvidersPage::Add(state)) = dialog.test_page() else {
+        panic!("expected onboarding add wizard");
+    };
+    assert!(state.onboarding);
+    assert!(state.is_step("test-key"));
+    assert!(state.fetch.is_none());
+    assert!(state.error.as_deref().is_some_and(|message| {
+        message.contains("live validation unavailable")
+            && message.contains("returned 500")
+            && message.contains("[redacted]")
+            && !message.contains("sk-test-token")
+    }));
+
+    dialog.handle_key(press(KeyCode::Char('o')));
+
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.onboarding
+                && state.is_step("done")
+                && state
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("continuing offline"))
+    ));
+}
+
+#[test]
 fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));

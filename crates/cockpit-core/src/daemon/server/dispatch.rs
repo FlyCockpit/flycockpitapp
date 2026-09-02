@@ -21642,6 +21642,10 @@ async fn stage_and_recover_provider_batch(
     let batch_id = Uuid::now_v7().to_string();
 
     for mut upsert in mutation.upserts {
+        // Secret resolution validates a header against the complete provider
+        // projection. Keep that projection separate from the mutable headers
+        // below so a batch cannot observe a partially staged entry.
+        let entry_for_secret_resolution = upsert.entry.clone();
         let prior = desired
             .providers
             .get(&upsert.provider_id)
@@ -21683,6 +21687,16 @@ async fn stage_and_recover_provider_batch(
             .enumerate()
         {
             if let Some(secret) = secret {
+                let header_name = header.name.clone();
+                let header_value = header.value.clone();
+                let secret = resolve_provider_header_secret(
+                    secret,
+                    &upsert.provider_id,
+                    &entry_for_secret_resolution,
+                    &header_name,
+                    &header_value,
+                    |variable| std::env::var(variable),
+                )?;
                 let slug = upsert
                     .provider_id
                     .chars()
@@ -21691,7 +21705,7 @@ async fn stage_and_recover_provider_batch(
                     .collect::<String>();
                 let name = format!("provider-{slug}-{batch_id}-{index}");
                 header.value = format!("$secret:{name}");
-                staged.push((name, secret.into_zeroizing()));
+                staged.push((name, secret));
             }
         }
         validate_daemon_provider_url(&upsert.entry.url)?;
@@ -21920,6 +21934,54 @@ async fn stage_and_recover_provider_batch(
         result_revision,
         config_generation,
     })
+}
+
+fn resolve_provider_header_secret(
+    secret: cockpit_proto::ProviderSecretValue,
+    provider_id: &str,
+    entry: &crate::config::providers::ProviderEntry,
+    header_name: &str,
+    header_value: &str,
+    lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
+) -> std::result::Result<zeroize::Zeroizing<String>, ErrorPayload> {
+    let cockpit_proto::ProviderSecretValue::DetectedEnvironment {
+        template_id,
+        variable,
+    } = secret
+    else {
+        return secret
+            .into_literal()
+            .ok_or_else(|| bad_request("invalid provider secret source"));
+    };
+    let effective_template = entry.effective_template(provider_id);
+    let template = crate::providers::template_by_id(&template_id);
+    if effective_template != Some(template_id.as_str())
+        || !template
+            .is_some_and(|template| template.env_var_candidates.contains(&variable.as_str()))
+    {
+        return Err(bad_request(
+            "detected environment copy does not match the provider template candidate",
+        ));
+    }
+    let template = template.expect("validated template exists");
+    let placeholder_headers = crate::providers::headers_for_pasted_key(template, "");
+    let Some(header_index) = placeholder_headers.iter().position(|header| {
+        header.name.eq_ignore_ascii_case(header_name) && header.value == header_value
+    }) else {
+        return Err(bad_request(
+            "detected environment copy does not match the template header",
+        ));
+    };
+    let value = lookup(&variable).map_err(|_| {
+        bad_request(format!(
+            "detected environment variable `{variable}` is unavailable to the daemon"
+        ))
+    })?;
+    let resolved = crate::providers::headers_for_pasted_key(template, &value)
+        .get(header_index)
+        .map(|header| header.value.clone())
+        .ok_or_else(|| bad_request("provider template header shape changed"))?;
+    Ok(zeroize::Zeroizing::new(resolved))
 }
 
 struct ProviderMutationJournalCommit {
@@ -22238,15 +22300,51 @@ async fn provider_models_fetch(
                 )
                 .await
                 .map_err(internal)?;
-            let fetched = crate::providers::models_fetch::fetch_models_for_provider_with_store(
-                &provider_id,
-                &entry,
-                &resolved,
-                std::time::Duration::from_secs(15),
-                Some(store.clone()),
-                |name| env.get(name).cloned(),
-            )
-            .await;
+            let fetched = if let Some(template_id) = entry.effective_template(&provider_id)
+                && let Some(template) = crate::providers::template_by_id(template_id)
+            {
+                // A catalog refresh is also onboarding's live credential
+                // proof. Templates without /models use their declared cheap
+                // auth call; environment references are resolved here in the
+                // daemon process, proving daemon visibility rather than TUI
+                // visibility.
+                crate::providers::auth_check::check_provider_auth_with_store(
+                    &provider_id,
+                    &entry,
+                    template,
+                    std::time::Duration::from_secs(15),
+                    Some(store.clone()),
+                )
+                .await
+                .map(|outcome| match outcome {
+                    crate::providers::auth_check::AuthCheckSuccess::Models { models, catalog } => {
+                        crate::providers::models_fetch::FetchOutcome::Models { models, catalog }
+                    }
+                    crate::providers::auth_check::AuthCheckSuccess::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    } => crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    },
+                    crate::providers::auth_check::AuthCheckSuccess::Checked => {
+                        crate::providers::models_fetch::FetchOutcome::Unsupported
+                    }
+                })
+                .map_err(anyhow::Error::new)
+            } else {
+                crate::providers::models_fetch::fetch_models_for_provider_with_store(
+                    &provider_id,
+                    &entry,
+                    &resolved,
+                    std::time::Duration::from_secs(15),
+                    Some(store.clone()),
+                    |name| env.get(name).cloned(),
+                )
+                .await
+            };
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
                     let mut updated = entry.clone();
@@ -22884,6 +22982,47 @@ struct ProviderConfigJournal {
 #[cfg(test)]
 mod provider_atomic_authority_tests {
     use super::*;
+
+    #[test]
+    fn detected_environment_copy_is_resolved_inside_daemon_boundary() {
+        let template = crate::providers::template_by_id("openai").unwrap();
+        let variable = template.env_var_candidates[0];
+        let mut entry = crate::config::providers::ProviderEntry {
+            template: Some(template.id.to_string()),
+            ..Default::default()
+        };
+        entry.headers = crate::providers::headers_for_pasted_key(template, "");
+        let resolved = resolve_provider_header_secret(
+            cockpit_proto::ProviderSecretValue::detected_environment(
+                template.id.to_string(),
+                variable.to_string(),
+            ),
+            "openai",
+            &entry,
+            &entry.headers[0].name,
+            &entry.headers[0].value,
+            |name| {
+                assert_eq!(name, variable);
+                Ok("daemon-visible-secret".to_string())
+            },
+        )
+        .unwrap();
+        assert!(resolved.contains("daemon-visible-secret"));
+
+        let error = resolve_provider_header_secret(
+            cockpit_proto::ProviderSecretValue::detected_environment(
+                template.id.to_string(),
+                "MISSING".to_string(),
+            ),
+            "openai",
+            &entry,
+            &entry.headers[0].name,
+            &entry.headers[0].value,
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+    }
 
     fn capability() -> ProviderEditCapability {
         ProviderEditCapability {
@@ -24335,7 +24474,9 @@ async fn provider_config_save_under_lock(
     let mut staged = Vec::new();
     for (index, (header, secret)) in entry.headers.iter_mut().zip(header_secrets).enumerate() {
         if let Some(secret) = secret {
-            let secret = secret.into_zeroizing();
+            let secret = secret.into_literal().ok_or_else(|| {
+                bad_request("detected environment copy is only accepted by provider mutations")
+            })?;
             if secret.is_empty() {
                 return Err(bad_request("provider header secret must not be empty"));
             }

@@ -14,12 +14,15 @@ pub use apply::{
     ModelAnswersOutcome, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, security_config_path,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
+    security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
 pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
+pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
+pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -236,6 +239,12 @@ impl WizardRun {
             let answer = answers
                 .get(step.id)
                 .cloned()
+                .or_else(|| {
+                    // The client acknowledges the terminal save action only after
+                    // the daemon response. It is the sole answer replay may infer.
+                    matches!(&step.kind, StepKind::Action { .. })
+                        .then_some(WizardAnswer::Acknowledged)
+                })
                 .ok_or_else(|| anyhow!("missing answer for wizard step `{}`", step.id))?;
             run.submit(answer)
                 .map_err(|error| anyhow!("invalid wizard answer: {error}"))?;
@@ -508,6 +517,38 @@ pub fn registry() -> Vec<WizardDescriptor> {
     ]
 }
 
+/// The small durable profile step shown on every fresh-install onboarding.
+/// An empty name is a deliberate skip, not an omitted screen.
+pub fn onboarding_profile_descriptor() -> WizardDescriptor {
+    WizardDescriptor {
+        id: ONBOARDING_PROFILE_WIZARD_ID,
+        title: "What should Cockpit call you?",
+        description: "Set an optional display name",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        steps: vec![
+            StepDescriptor {
+                id: "name",
+                prompt: "Your name (leave blank to skip)",
+                help: "This stays in your global Cockpit config and can be changed later.",
+                help_hook: None,
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: Some(onboarding_name_prefill),
+                validate: Some(validate_onboarding_name),
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "profile-save",
+                "Continue to provider setup",
+                "Saving your profile…",
+                None,
+            ),
+        ],
+    }
+}
+
 pub fn descriptor(id: &str) -> Option<WizardDescriptor> {
     registry().into_iter().find(|wizard| wizard.id == id)
 }
@@ -522,6 +563,23 @@ pub fn model_descriptor_with_selection(
     cfg: &crate::config::providers::ProvidersConfig,
     preselect: Option<(&str, &str)>,
 ) -> WizardDescriptor {
+    model_descriptor_with_selection_mode(cfg, preselect, false)
+}
+
+pub fn onboarding_model_descriptor_with_selection(
+    cfg: &crate::config::providers::ProvidersConfig,
+    preselect: Option<(&str, &str)>,
+) -> WizardDescriptor {
+    let mut descriptor = model_descriptor_with_selection_mode(cfg, preselect, true);
+    descriptor.id = ONBOARDING_MODEL_WIZARD_ID;
+    descriptor
+}
+
+fn model_descriptor_with_selection_mode(
+    cfg: &crate::config::providers::ProvidersConfig,
+    preselect: Option<(&str, &str)>,
+    onboarding: bool,
+) -> WizardDescriptor {
     let provider_options = cfg
         .providers
         .keys()
@@ -532,7 +590,7 @@ pub fn model_descriptor_with_selection(
         })
         .collect();
     let model_context = model_wizard_context(cfg, preselect);
-    WizardDescriptor {
+    let mut descriptor = WizardDescriptor {
         id: MODEL_WIZARD_ID,
         title: "Configure model",
         description: "Set trust, capabilities, limits, thinking, delegation, and default model",
@@ -555,19 +613,44 @@ pub fn model_descriptor_with_selection(
             },
             StepDescriptor {
                 id: "model",
-                prompt: "Choose a model",
-                help: "Only models configured for the selected provider are shown.",
+                prompt: if onboarding { "Model ID" } else { "Choose a model" },
+                help: if onboarding { "Enter the exact provider model ID. This also works when the provider has no catalog endpoint or the catalog is unavailable." } else { "Only models configured for the selected provider are shown." },
                 help_hook: None,
-                kind: StepKind::Select {
+                kind: if onboarding { StepKind::Text } else { StepKind::Select {
                     // Resolved from the provider answer by `select_options`.
                     // Do not restore an all-provider static list here.
                     options: Vec::new(),
-                },
+                } },
                 default_answer: None,
-                prefill: Some(model_ref_prefill),
-                validate: Some(validate_model_ref_matches_provider),
+                prefill: Some(if onboarding { onboarding_model_id_prefill } else { model_ref_prefill }),
+                validate: Some(if onboarding { validate_onboarding_model_id } else { validate_model_ref_matches_provider }),
                 write: None,
                 branch: None,
+            },
+            StepDescriptor {
+                id: "configuration",
+                prompt: "Model configuration",
+                help: "Smart defaults keep detected context, capabilities, modalities, compaction, and request-wire settings. Open Advanced only when you need an override.",
+                help_hook: None,
+                kind: StepKind::Select {
+                    options: vec![
+                        SelectOption {
+                            id: "smart-defaults".into(),
+                            label: "Use smart defaults".into(),
+                            description: "Recommended; keep detected provider and model behavior".into(),
+                        },
+                        SelectOption {
+                            id: "advanced".into(),
+                            label: "Advanced".into(),
+                            description: "Review trust, capabilities, context, thinking, and delegation".into(),
+                        },
+                    ],
+                },
+                default_answer: Some(WizardAnswer::Select("smart-defaults".to_string())),
+                prefill: None,
+                validate: Some(validate_select),
+                write: None,
+                branch: Some(model_configuration_branch),
             },
             StepDescriptor {
                 id: "trust",
@@ -784,7 +867,11 @@ pub fn model_descriptor_with_selection(
                 branch: None,
             },
         ],
+    };
+    if !onboarding {
+        descriptor.steps.retain(|step| step.id != "configuration");
     }
+    descriptor
 }
 
 fn model_wizard_context(
@@ -881,8 +968,13 @@ pub fn provider_descriptor() -> WizardDescriptor {
 pub fn provider_descriptor_with_template(default_template: Option<&str>) -> WizardDescriptor {
     use crate::providers::TEMPLATES;
 
-    let template_options = TEMPLATES
-        .iter()
+    let mut ordered_templates = TEMPLATES.iter().collect::<Vec<_>>();
+    ordered_templates.sort_by_key(|template| match template.id {
+        "codex-oauth" | "copilot" | "grok-oauth" => 0,
+        _ => 1,
+    });
+    let template_options = ordered_templates
+        .into_iter()
         .map(|template| SelectOption {
             id: template.id.into(),
             label: template.display_label(),
@@ -977,6 +1069,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::Headers.source_id(),
                 "Advanced: edit HTTP headers",
                 "Editing provider headers…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::AuthMethod.source_id(),
@@ -1037,16 +1130,19 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::CopilotAuth.source_id(),
                 "Configure GitHub authentication",
                 "Configuring GitHub authentication…",
+                Some(action_to_saving),
             ),
             action_step(
                 ProviderWizardStep::GrokOAuth.source_id(),
                 "Sign in to Grok",
                 "Waiting for browser authorization…",
+                Some(action_to_saving),
             ),
             action_step(
                 ProviderWizardStep::CodexOAuth.source_id(),
                 "Sign in to Codex",
                 "Waiting for device authorization…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Saving.source_id(),
@@ -1091,6 +1187,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::TestKey.source_id(),
                 "Test key",
                 "Testing provider credentials…",
+                Some(fetching_to_done),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::TestSkipped.source_id(),
@@ -1108,6 +1205,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 ProviderWizardStep::Fetching.source_id(),
                 "Fetch models",
                 "Fetching /models…",
+                Some(fetching_to_done),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Done.source_id(),
@@ -1367,11 +1465,35 @@ pub fn model_provider_answer(run: &WizardRun) -> Option<String> {
 }
 
 pub fn model_ref_answer(run: &WizardRun) -> Option<(String, String)> {
-    let WizardAnswer::Select(value) = run.answer("model")? else {
+    match run.answer("model")? {
+        WizardAnswer::Select(value) => {
+            let (provider, model) = value.split_once(':')?;
+            Some((provider.to_string(), model.to_string()))
+        }
+        WizardAnswer::Text(model) => Some((model_provider_answer(run)?, model.trim().to_string())),
+        _ => None,
+    }
+}
+
+fn onboarding_model_id_prefill(run: &WizardRun) -> Option<WizardAnswer> {
+    let WizardAnswer::Select(value) = model_ref_prefill(run)? else {
         return None;
     };
-    let (provider, model) = value.split_once(':')?;
-    Some((provider.to_string(), model.to_string()))
+    let (_, model) = value.split_once(':')?;
+    Some(WizardAnswer::Text(model.to_string()))
+}
+
+fn validate_onboarding_model_id(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    match answer {
+        WizardAnswer::Text(value) if !value.trim().is_empty() && !value.contains(':') => Ok(()),
+        WizardAnswer::Text(_) => {
+            Err("enter a non-empty model ID without a provider prefix".to_string())
+        }
+        _ => Err("model ID must be text".to_string()),
+    }
 }
 
 pub fn model_trust_answer(run: &WizardRun) -> Option<crate::config::providers::ModelTrust> {
@@ -1417,10 +1539,24 @@ pub fn model_default_thinking_answer(
 }
 
 pub fn model_make_default_answer(run: &WizardRun) -> bool {
+    if matches!(
+        run.answer("configuration"),
+        Some(WizardAnswer::Select(value)) if value == "smart-defaults"
+    ) {
+        return true;
+    }
     matches!(
         run.answer("default-model"),
         Some(WizardAnswer::Confirm(true))
     )
+}
+
+pub fn onboarding_name_answer(run: &WizardRun) -> Option<String> {
+    let WizardAnswer::Text(value) = run.answer("name")? else {
+        return None;
+    };
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn model_system_prompt_answer(run: &WizardRun) -> Option<Option<String>> {
@@ -1483,7 +1619,12 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
-fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -> StepDescriptor {
+fn action_step(
+    id: &'static str,
+    prompt: &'static str,
+    progress: &'static str,
+    branch: Option<BranchHook>,
+) -> StepDescriptor {
     StepDescriptor {
         id,
         prompt,
@@ -1494,10 +1635,7 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
         prefill: None,
         validate: None,
         write: None,
-        branch: Some(match id {
-            "fetching" | "test-key" => fetching_to_done,
-            _ => action_to_saving,
-        }),
+        branch,
     }
 }
 
@@ -1506,6 +1644,31 @@ fn validate_select(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<
         WizardAnswer::Select(value) if !value.is_empty() => Ok(()),
         _ => Err("choose one option".to_string()),
     }
+}
+
+fn onboarding_name_prefill(_: &WizardRun) -> Option<WizardAnswer> {
+    ["USER", "USERNAME"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .map(WizardAnswer::Text)
+}
+
+fn validate_onboarding_name(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(value) = answer else {
+        return Err("enter a name or leave it blank to skip".to_string());
+    };
+    if value.chars().count() > 80 {
+        return Err("name must be 80 characters or fewer".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("name cannot contain control characters".to_string());
+    }
+    Ok(())
 }
 
 fn validate_provider_template(
@@ -2015,6 +2178,13 @@ fn model_system_prompt_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'
     })
 }
 
+fn model_configuration_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    Some(match answer {
+        WizardAnswer::Select(value) if value == "advanced" => "trust",
+        _ => "model-save",
+    })
+}
+
 fn provider_auth_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     Some(match selected_provider_template(run)?.id {
         "copilot" => "copilot-auth",
@@ -2091,6 +2261,67 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn onboarding_model_wizard_accepts_manual_model_id_and_context() {
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "openai".into(),
+            crate::config::providers::ProviderEntry::default(),
+        );
+        let descriptor = onboarding_model_descriptor_with_selection(&providers, None);
+        let model = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "model")
+            .unwrap();
+        assert!(matches!(model.kind, StepKind::Text));
+        assert!(
+            descriptor
+                .steps
+                .iter()
+                .any(|step| step.id == "context-tokens")
+        );
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.submit(WizardAnswer::Text("manual-model-id".into()))
+            .unwrap();
+        assert_eq!(
+            model_ref_answer(&run),
+            Some(("openai".into(), "manual-model-id".into()))
+        );
+    }
+
+    /// Terminal profile-save must finish the wizard. Branching to a
+    /// provider-wizard `saving` step is a hard submit error and stalls
+    /// first-run at AwaitProfile.
+    #[test]
+    fn onboarding_profile_save_completes_without_saving_step() {
+        let mut live = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        live.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(live.current_step_id(), Some("profile-save"));
+        live.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action");
+        assert!(live.is_complete());
+        assert_eq!(onboarding_name_answer(&live).as_deref(), Some("Ada"));
+
+        let mut client = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        client.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        let json = client.answers_json().unwrap();
+        assert!(
+            !json.contains("profile-save"),
+            "the client acknowledges the save only after the daemon reply: {json}"
+        );
+
+        let reconstructed = WizardRun::from_answers_json(onboarding_profile_descriptor(), &json)
+            .expect("daemon reconstruction infers the terminal save acknowledgement");
+        assert!(reconstructed.is_complete());
+        assert_eq!(
+            onboarding_name_answer(&reconstructed).as_deref(),
+            Some("Ada")
+        );
+    }
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 

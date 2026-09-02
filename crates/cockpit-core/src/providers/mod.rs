@@ -113,7 +113,7 @@ impl ProviderTemplate {
     /// built-in template.
     pub fn disabled_reason(&self) -> Option<&'static str> {
         self.is_disabled().then_some(
-            "Disabled pending xAI authorization. Learn more / petition: https://github.com/FlyCockpit/flycockpitapp/issues/196 — use a custom OpenAI-compatible provider with auth_command instead.",
+            "Grok subscriptions are not yet officially supported - we are trying to get approval from xAI to enable this feature.",
         )
     }
 
@@ -589,6 +589,16 @@ pub fn headers_for_env_var(template: &ProviderTemplate, env_var: &str) -> Vec<He
         return default_headers_for(template);
     };
     headers_with_key_value(template, api_key.value_for_env_var(env_var))
+}
+
+/// First non-empty credential candidate visible to this process. Callers use
+/// the name only; credential bytes never leave the environment owner.
+pub fn detected_env_var(template: &ProviderTemplate) -> Option<&'static str> {
+    template
+        .env_var_candidates
+        .iter()
+        .copied()
+        .find(|name| env_var_is_nonempty(name))
 }
 
 fn headers_with_key_value(template: &ProviderTemplate, key_value: String) -> Vec<HeaderSpec> {

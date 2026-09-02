@@ -454,11 +454,7 @@ fn provider_mutation_request(
                 header_secrets: save
                     .header_secrets
                     .into_iter()
-                    .map(|secret| {
-                        secret.map(|mut value| {
-                            cockpit_proto::ProviderSecretValue::new(std::mem::take(&mut *value))
-                        })
-                    })
+                    .map(|secret| secret)
                     .collect(),
             })
             .collect(),
@@ -638,7 +634,21 @@ pub(crate) struct ProviderMutationPlan {
 pub(crate) struct ProviderSavePlan {
     provider_id: String,
     entry: ProviderEntry,
-    header_secrets: Vec<Option<zeroize::Zeroizing<String>>>,
+    header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>>,
+}
+
+#[derive(Clone)]
+pub(super) struct DetectedEnvironmentCopy {
+    pub(super) template_id: String,
+    pub(super) variable: String,
+}
+
+struct PendingProviderAdd {
+    id: String,
+    entry: ProviderEntry,
+    supports_models_endpoint: bool,
+    detected_environment_copy: Option<DetectedEnvironmentCopy>,
+    onboarding: bool,
 }
 
 impl std::fmt::Debug for ProviderMutationPlan {
@@ -859,13 +869,7 @@ pub(crate) async fn execute_settings_daemon_work(
                         header_secrets: save
                             .header_secrets
                             .into_iter()
-                            .map(|secret| {
-                                secret.map(|mut value| {
-                                    cockpit_proto::ProviderSecretValue::new(std::mem::take(
-                                        &mut *value,
-                                    ))
-                                })
-                            })
+                            .map(|secret| secret)
                             .collect(),
                     })
                     .collect(),
@@ -2532,6 +2536,11 @@ pub const DIALOG_HEIGHT: u16 = 20;
 
 pub enum Dialog {
     None,
+    OnboardingWelcome {
+        cwd: PathBuf,
+        frame: usize,
+        reduced_motion: bool,
+    },
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2581,11 +2590,19 @@ pub enum Dialog {
     SetupWizard(Box<SetupWizardDialog>),
     FirstRunComplete {
         summary: String,
+        cursor: usize,
+        choice: Option<FirstRunChoice>,
     },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstRunChoice {
+    AddAnotherProvider,
+    StartCoding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3045,7 +3062,7 @@ pub struct SettingsCx {
     completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
     completed_web_credential: Option<(String, Result<(), String>)>,
     completed_provider_auth: Option<CompletedProviderAuthMutation>,
-    pending_provider_add: Option<(String, ProviderEntry, bool)>,
+    pending_provider_add: Option<PendingProviderAdd>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -3399,6 +3416,38 @@ impl SettingsCx {
         self.queue_settlement_query(client_operation_id, *original);
     }
 
+    /// Resolve an add-wizard save that the daemon proved did not commit.
+    ///
+    /// A first-run add persists a validation continuation before dispatch so
+    /// cancellation cannot lose a committed provider. The opposite is also
+    /// required: once authority rejects the mutation, remove that
+    /// continuation and return the wizard to an editable state rather than
+    /// resuming validation for a provider that does not exist.
+    fn reject_pending_provider_add(&mut self, error: String) {
+        let Some(pending) = self.pending_provider_add.take() else {
+            return;
+        };
+
+        // The staged entry was never daemon-owned. Restore the last
+        // authoritative snapshot so retrying the add does not see a phantom
+        // duplicate provider.
+        self.config = self.original_config.clone();
+
+        let error = if pending.onboarding {
+            match cockpit_core::welcome::persist_onboarding_stage(
+                cockpit_core::welcome::OnboardingStage::Provider,
+            ) {
+                Ok(()) => error,
+                Err(clear_error) => format!(
+                    "{error}; could not clear the setup validation continuation: {clear_error}"
+                ),
+            }
+        } else {
+            error
+        };
+        self.completed_provider_add = Some(Err(error));
+    }
+
     /// Apply a daemon-recorded terminal rejection without feeding it back
     /// through the transport-error path. Transport failures leave authority
     /// fenced and are queried again; this path is proof that the mutation did
@@ -3416,10 +3465,7 @@ impl SettingsCx {
                 self.completed_provider_mutation = Some(Err(message.clone()));
                 self.completed_provider_mutation_navigation =
                     self.pending_provider_mutation_navigation.take();
-                if self.pending_provider_add.is_some() {
-                    self.pending_provider_add = None;
-                    self.completed_provider_add = Some(Err(message.clone()));
-                }
+                self.reject_pending_provider_add(message.clone());
             }
             PendingSettingsOperation::SimpleMutation { action, .. } => match action {
                 SettingsMutationAction::McpSave { .. } => {
@@ -4110,8 +4156,15 @@ impl SettingsCx {
                         self.completed_provider_mutation = Some(Ok(()));
                         self.completed_provider_mutation_navigation =
                             self.pending_provider_mutation_navigation.take();
-                        if let Some(pending) = self.pending_provider_add.take() {
-                            self.completed_provider_add = Some(Ok(pending));
+                        if let Some(PendingProviderAdd {
+                            id,
+                            entry,
+                            supports_models_endpoint,
+                            ..
+                        }) = self.pending_provider_add.take()
+                        {
+                            self.completed_provider_add =
+                                Some(Ok((id, entry, supports_models_endpoint)));
                         }
                     }
                     Ok(other) => {
@@ -4123,6 +4176,7 @@ impl SettingsCx {
                             self.completed_provider_mutation = Some(Err(error.clone()));
                             self.completed_provider_mutation_navigation =
                                 self.pending_provider_mutation_navigation.take();
+                            self.reject_pending_provider_add(error.clone());
                             self.extended_warnings = vec![format!("save failed: {error}")];
                         } else {
                             tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
@@ -5795,7 +5849,63 @@ impl Dialog {
         Self::open_providers_add_with_status(cwd, None)
     }
 
+    pub fn open_onboarding_provider_add(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, true)
+    }
+
+    /// Resume validation of a provider whose daemon-owned save committed
+    /// after the add wizard was cancelled.
+    pub fn open_onboarding_provider_validation(cwd: &std::path::Path, provider_id: &str) -> Self {
+        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
+        match path {
+            Ok((path, global_root)) => {
+                let mut s = SettingsDialog::open_from_picker(path, global_root);
+                if s.config.providers.contains_key(provider_id) {
+                    let mut add = AddState::new_with_onboarding(true);
+                    add.resume_onboarding_validation(provider_id);
+                    s.page = providers_page(ProvidersPage::Add(add));
+                } else {
+                    let mut add = AddState::new_with_onboarding(true);
+                    add.error = Some(format!(
+                        "The saved provider `{provider_id}` is no longer configured. Add and validate a provider to resume setup."
+                    ));
+                    s.page = providers_page(ProvidersPage::Add(add));
+                }
+                Dialog::Settings(Box::new(s))
+            }
+            Err(error) => Dialog::CreateConfig {
+                choices: Vec::new(),
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status: Some(format!(
+                    "could not resolve the global Cockpit config: {error}"
+                )),
+            },
+        }
+    }
+
+    pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
+        let reduced_motion = std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+            || ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"]
+                .into_iter()
+                .any(|name| std::env::var(name).is_ok_and(|value| value != "0"));
+        Self::OnboardingWelcome {
+            cwd: cwd.to_path_buf(),
+            frame: 0,
+            reduced_motion,
+        }
+    }
+
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, false)
+    }
+
+    fn open_providers_add_mode(
+        cwd: &std::path::Path,
+        status: Option<String>,
+        onboarding: bool,
+    ) -> Self {
         // The provider wizard is the first-run destination for the
         // always-writable global layer, not the generic config-location
         // picker. Opening (or cancelling) it must not create a config layer.
@@ -5806,7 +5916,7 @@ impl Dialog {
         match path {
             Ok((path, global_root)) => {
                 let mut s = SettingsDialog::open_from_picker(path, global_root);
-                let mut add = AddState::new();
+                let mut add = AddState::new_with_onboarding(onboarding);
                 add.error = status;
                 s.page = providers_page(ProvidersPage::Add(add));
                 Dialog::Settings(Box::new(s))
@@ -5834,7 +5944,10 @@ impl Dialog {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         match wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
+            cockpit_core::wizard::SECURITY_WIZARD_ID
+            | cockpit_core::wizard::MODEL_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 setup_wizard_dialog(&global_root, descriptor, None)
@@ -5857,6 +5970,26 @@ impl Dialog {
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
+    pub fn open_onboarding_model_setup_preselected(
+        provider_id: &str,
+        model_id: &str,
+        status: Option<String>,
+    ) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
+            &global_root,
+            Some((provider_id, model_id)),
+        );
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
+    pub fn open_onboarding_model_setup(status: Option<String>) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor =
+            cockpit_core::wizard::onboarding_model_descriptor_for_cwd(&global_root, None);
+        setup_wizard_dialog(&global_root, descriptor, status)
+    }
+
     pub fn open_model_setup_choice(
         cwd: &std::path::Path,
         confirmed: Option<(String, String)>,
@@ -5871,7 +6004,18 @@ impl Dialog {
     }
 
     pub fn open_first_run_complete(summary: String) -> Self {
-        Dialog::FirstRunComplete { summary }
+        Dialog::FirstRunComplete {
+            summary,
+            cursor: 1,
+            choice: None,
+        }
+    }
+
+    pub fn take_first_run_choice(&mut self) -> Option<FirstRunChoice> {
+        let Dialog::FirstRunComplete { choice, .. } = self else {
+            return None;
+        };
+        choice.take()
     }
 
     pub fn take_completed_provider_id(&mut self) -> Option<String> {
@@ -5894,6 +6038,18 @@ impl Dialog {
             Dialog::SetupWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
+    }
+
+    pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {
+        matches!(
+            self,
+            Dialog::SetupWizard(wizard)
+                if wizard_ids.contains(&wizard.run.descriptor().id) && wizard.run.is_complete()
+        )
+    }
+
+    pub fn setup_wizard_is_active(&self, wizard_id: &str) -> bool {
+        matches!(self, Dialog::SetupWizard(wizard) if wizard.run.descriptor().id == wizard_id)
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -6047,17 +6203,52 @@ impl Dialog {
 
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
-    pub fn tick(&mut self) {
-        if let Dialog::Settings(s) = self {
-            s.tick();
+    pub fn tick(&mut self) -> bool {
+        match self {
+            Dialog::Settings(s) => {
+                s.tick();
+                false
+            }
+            Dialog::OnboardingWelcome {
+                frame,
+                reduced_motion,
+                ..
+            } if !*reduced_motion => {
+                *frame = frame.wrapping_add(1);
+                true
+            }
+            _ => false,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::FirstRunComplete { .. } => {
-                matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
+            Dialog::OnboardingWelcome { cwd, .. } => {
+                match Self::open_setup_wizard(
+                    cwd,
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                ) {
+                    Ok(next) => *self = next,
+                    Err(error) => {
+                        *self = Dialog::CreateConfig {
+                            choices: Vec::new(),
+                            cursor: 0,
+                            cwd: cwd.clone(),
+                            status: Some(format!("Could not open profile setup: {error}")),
+                        };
+                    }
+                }
+                false
+            }
+            Dialog::FirstRunComplete { cursor, choice, .. } => {
+                match list_key_action(key, cursor, 2) {
+                    ListAction::Stay => {}
+                    ListAction::Close => *choice = Some(FirstRunChoice::StartCoding),
+                    ListAction::Select(0) => *choice = Some(FirstRunChoice::AddAnotherProvider),
+                    ListAction::Select(_) => *choice = Some(FirstRunChoice::StartCoding),
+                }
+                false
             }
             Dialog::WorkspaceTrust { cursor, chosen, .. } => {
                 match workspace_trust_key_action(key, cursor) {
@@ -6444,6 +6635,11 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
+            Dialog::OnboardingWelcome {
+                frame: animation_frame,
+                reduced_motion,
+                ..
+            } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -6502,7 +6698,9 @@ impl Dialog {
                 *cursor,
             ),
             Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
-            Dialog::FirstRunComplete { summary } => render_first_run_complete(frame, area, summary),
+            Dialog::FirstRunComplete {
+                summary, cursor, ..
+            } => render_first_run_complete(frame, area, summary, *cursor),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -8814,10 +9012,27 @@ impl SettingsCx {
                 if !changed {
                     return None;
                 }
+                let detected_copy = self.pending_provider_add.as_ref().and_then(|pending| {
+                    (pending.id == *provider_id)
+                        .then(|| pending.detected_environment_copy.clone())
+                        .flatten()
+                });
+                let detected_header_index = detected_copy.as_ref().and_then(|copy| {
+                    let template = cockpit_core::providers::template_by_id(&copy.template_id)?;
+                    let placeholder_headers =
+                        cockpit_core::providers::headers_for_pasted_key(template, "");
+                    entry.headers.iter().position(|header| {
+                        placeholder_headers.iter().any(|placeholder| {
+                            placeholder.name.eq_ignore_ascii_case(&header.name)
+                                && placeholder.value == header.value
+                        })
+                    })
+                });
                 let header_secrets = entry
                     .headers
                     .iter_mut()
-                    .map(|header| {
+                    .enumerate()
+                    .map(|(index, header)| {
                         let value = header.value.trim();
                         let is_secret = !value.is_empty()
                             && !value.starts_with('$')
@@ -8826,9 +9041,19 @@ impl SettingsCx {
                                 value,
                             )
                             && !secret_display::is_mask_value(value);
-                        is_secret.then(|| {
-                            zeroize::Zeroizing::new(std::mem::take(&mut header.value))
-                        })
+                        if detected_header_index == Some(index) {
+                            let copy = detected_copy.as_ref().expect("copy index has copy details");
+                            Some(cockpit_proto::ProviderSecretValue::detected_environment(
+                                copy.template_id.clone(),
+                                copy.variable.clone(),
+                            ))
+                        } else {
+                            is_secret.then(|| {
+                                cockpit_proto::ProviderSecretValue::new(std::mem::take(
+                                    &mut header.value,
+                                ))
+                            })
+                        }
                     })
                     .collect::<Vec<_>>();
                 Some(ProviderSavePlan {
@@ -9297,7 +9522,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
             _ => {}
         },
         cockpit_core::wizard::StepKind::Action { .. } => {
-            if matches!(step.id, "security-save" | "model-save") {
+            if matches!(step.id, "security-save" | "model-save" | "profile-save") {
                 let answers_json = match run.answers_json() {
                     Ok(answers_json) => answers_json,
                     Err(error) => {
@@ -9473,7 +9698,11 @@ fn apply_setup_wizard_daemon_completion(
             }
             if !changed {
                 "Global setup is already up to date.".to_string()
-            } else if wizard.run.descriptor().id == cockpit_core::wizard::MODEL_WIZARD_ID {
+            } else if matches!(
+                wizard.run.descriptor().id,
+                cockpit_core::wizard::MODEL_WIZARD_ID
+                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
+            ) {
                 let mut parts = Vec::new();
                 if model_file_written {
                     parts.push("Saved global model settings.".to_string());
@@ -10076,23 +10305,82 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     );
 }
 
-fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str) {
+fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Setup complete ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let lines = vec![
+    let mut lines = vec![
         Line::from("Cockpit is ready."),
         Line::from(summary.to_string()),
         Line::default(),
         Line::from("Next: run /setup security to choose project trust and approval defaults."),
         Line::from("Use /help any time to see available commands."),
         Line::default(),
-        Line::from(Span::styled("Press Enter to start.", muted)),
     ];
+    for (index, label) in ["Add another provider", "Start coding"].iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!("{} {label}", if index == cursor { "›" } else { " " }),
+            if index == cursor {
+                Style::default().fg(Color::Yellow)
+            } else {
+                muted
+            },
+        )));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_onboarding_welcome(
+    frame: &mut Frame,
+    area: Rect,
+    animation_frame: usize,
+    reduced_motion: bool,
+) {
+    let block = Block::default().borders(Borders::ALL).title(" Welcome ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let stages = ["·", "✦", "✈", "✦"];
+    let mark = if reduced_motion {
+        "✈"
+    } else {
+        stages[(animation_frame / 3) % stages.len()]
+    };
+    let description = if inner.width < 54 {
+        "Your coding cockpit."
+    } else {
+        "A focused cockpit for coding with the models you choose."
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{mark}  FlyCockpit"),
+            if reduced_motion {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
+        )),
+        Line::default(),
+        Line::from(description),
+        Line::default(),
+        Line::from("No Cockpit telemetry is collected."),
+        Line::from("Inference providers may have their own telemetry policies."),
+        Line::default(),
+        Line::from(Span::styled(
+            "Press any key to begin setup.",
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        )),
+    ];
+    lines.truncate(lines.len().min(inner.height as usize));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {

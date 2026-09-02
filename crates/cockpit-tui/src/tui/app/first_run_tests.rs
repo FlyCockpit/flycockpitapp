@@ -51,13 +51,27 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
     cfg
 }
 
+fn advance_welcome_and_profile(app: &mut App, cwd: &std::path::Path) {
+    app.first_run_flow = FirstRunFlow::AwaitWelcome;
+    app.dialog = crate::tui::settings::Dialog::open_setup_wizard(
+        cwd,
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+    )
+    .unwrap();
+    assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
+    assert_eq!(app.first_run_flow, FirstRunFlow::AwaitProfile);
+    app.dialog.test_mark_setup_complete("profile-save");
+    assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
+    assert!(app.dialog.test_provider_is_add());
+}
+
 #[test]
 fn first_run_chains_provider_then_model() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
+    advance_welcome_and_profile(&mut app, tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
@@ -65,7 +79,7 @@ fn first_run_chains_provider_then_model() {
 
     assert_eq!(
         app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::MODEL_WIZARD_ID)
+        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
     );
     assert_eq!(
         app.dialog.test_setup_prefill(),
@@ -91,14 +105,14 @@ fn first_run_flow_completes_end_to_end() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
+    advance_welcome_and_profile(&mut app, tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     assert_eq!(
         app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::MODEL_WIZARD_ID)
+        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("model-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));

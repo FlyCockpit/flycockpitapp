@@ -953,7 +953,12 @@ pub fn onboarding_agent_descriptor(
                 write: None,
                 branch: None,
             },
-            action_step("agent-install", "Install agent", "Installing pinned agent…"),
+            action_step(
+                "agent-install",
+                "Install agent",
+                "Installing pinned agent…",
+                None,
+            ),
         ],
     }
 }
@@ -2230,8 +2235,9 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
 
 /// Shared action-step constructor. Provider-wizard actions pass an explicit
 /// branch (`saving` or `done`). Terminal save actions (`profile-save`,
-/// `security-save`, `model-save`, `lifetime-save`) must pass `None` so they
-/// finish the wizard instead of branching into the provider `saving` step.
+/// `security-save`, `model-save`, `lifetime-save`, `agent-install`) must pass
+/// `None` so they finish the wizard instead of branching into the provider
+/// `saving` step.
 fn action_step(
     id: &'static str,
     prompt: &'static str,

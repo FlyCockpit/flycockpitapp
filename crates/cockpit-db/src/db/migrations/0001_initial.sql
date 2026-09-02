@@ -5365,7 +5365,7 @@ CREATE TABLE execution_containments (
     operation_id            TEXT NOT NULL,
     generation              INTEGER NOT NULL,
     platform_kind           TEXT NOT NULL CHECK (platform_kind IN (
-        'linux_cgroup', 'windows_job', 'macos_unsupported',
+        'linux_process_group', 'windows_job', 'macos_process_group',
         'docker', 'podman', 'fake', 'unsupported'
     )),
     state                   TEXT NOT NULL CHECK (state IN (

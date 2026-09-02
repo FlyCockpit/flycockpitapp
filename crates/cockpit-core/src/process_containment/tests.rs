@@ -257,6 +257,14 @@ async fn native_unix_adapter_allocates_process_tree_guard_through_actor() {
     let handle = actor.handle();
     let meta = handle.safe_metadata().await.expect("safe metadata");
     assert_eq!(meta.guarantee, ContainmentGuarantee::Proven);
+    assert!(
+        matches!(
+            meta.platform_kind,
+            PlatformKind::LinuxProcessGroup | PlatformKind::MacosProcessGroup
+        ),
+        "native Unix adapter must persist a process-group kind, got {:?}",
+        meta.platform_kind
+    );
     let lease = handle
         .create_and_spawn(session, "op", "/bin/true", vec![], "/tmp", true)
         .await

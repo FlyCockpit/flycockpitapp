@@ -339,14 +339,14 @@ impl FakeUnsupportedAdapter {
     pub fn macos() -> Self {
         Self {
             reason: "macos_no_unprivileged_descendant_container".into(),
-            kind: PlatformKind::MacosUnsupported,
+            kind: PlatformKind::MacosProcessGroup,
         }
     }
 
     pub fn management_boundary() -> Self {
         Self {
             reason: "management_boundary_unavailable".into(),
-            kind: PlatformKind::LinuxCgroup,
+            kind: PlatformKind::LinuxProcessGroup,
         }
     }
 }

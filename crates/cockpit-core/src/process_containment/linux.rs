@@ -39,6 +39,7 @@ impl LinuxCgroupAdapter {
         Self(UnixProcessTreeAdapter::new(UnixHost::Linux))
     }
 
+    #[cfg(test)]
     pub fn close_handles(&self, handle: &AdapterHandle) {
         self.0.close_handles(handle);
     }
@@ -179,6 +180,7 @@ mod linux_process_tree_guard {
     async fn production_adapter_is_proven_on_linux() {
         let adapter = LinuxCgroupAdapter::production();
         assert_eq!(adapter.guarantee(), ContainmentGuarantee::Proven);
+        assert_eq!(adapter.platform_kind(), PlatformKind::LinuxProcessGroup);
         let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
         assert_eq!(allocated.guarantee, ContainmentGuarantee::Proven);
         adapter.close_handles(&allocated.handle);

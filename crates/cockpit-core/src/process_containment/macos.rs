@@ -46,6 +46,7 @@ impl MacosNativeAdapter {
         Self(UnixProcessTreeAdapter::new(UnixHost::Macos))
     }
 
+    #[cfg(test)]
     pub fn close_handles(&self, handle: &AdapterHandle) {
         self.0.close_handles(handle);
     }
@@ -62,19 +63,6 @@ impl MacosNativeAdapter {
 }
 
 impl_unix_host_adapter!(MacosNativeAdapter);
-
-/// Heuristics that must never advertise Proven. ProcessTreeGuard-owned
-/// process groups are the kernel object; these are not.
-#[allow(dead_code)]
-pub fn forbidden_proven_heuristics() -> &'static [&'static str] {
-    &[
-        "kqueue",
-        "libproc_polling",
-        "inherited_fd_sentinel",
-        "launchd_heuristic",
-        "shell_syntax_inspection",
-    ]
-}
 
 #[cfg(test)]
 mod macos_process_tree_guard {
@@ -201,20 +189,22 @@ mod macos_process_tree_guard {
     }
 
     #[test]
-    fn no_heuristic_backend_advertises_proven() {
-        for h in forbidden_proven_heuristics() {
-            assert_ne!(*h, "proven");
-        }
+    fn production_metadata_names_the_process_tree_guard() {
+        let meta = MacosNativeAdapter::production().safe_metadata();
+        assert_eq!(meta.adapter_name, "macos_process_tree_guard");
+        assert_eq!(
+            meta.management_boundary.as_deref(),
+            Some("unix_process_group")
+        );
         #[cfg(target_os = "macos")]
         {
-            let meta = MacosNativeAdapter::production().safe_metadata();
             assert_eq!(meta.guarantee, ContainmentGuarantee::Proven);
-            assert_eq!(meta.adapter_name, "macos_process_tree_guard");
+            assert_eq!(meta.platform_kind, PlatformKind::MacosProcessGroup);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let meta = MacosNativeAdapter::production().safe_metadata();
             assert_eq!(meta.guarantee, ContainmentGuarantee::Unsupported);
+            assert_eq!(meta.platform_kind, PlatformKind::MacosProcessGroup);
             assert!(meta.capability_reason.is_some());
         }
     }

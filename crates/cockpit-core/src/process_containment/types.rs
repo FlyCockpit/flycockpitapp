@@ -80,9 +80,11 @@ impl ContainmentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
-    LinuxCgroup,
+    /// Native Linux process-group boundary (`ProcessTreeGuard`).
+    LinuxProcessGroup,
     WindowsJob,
-    MacosUnsupported,
+    /// Native macOS process-group boundary (`ProcessTreeGuard`).
+    MacosProcessGroup,
     Docker,
     Podman,
     Fake,
@@ -92,9 +94,9 @@ pub enum PlatformKind {
 impl PlatformKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::LinuxCgroup => "linux_cgroup",
+            Self::LinuxProcessGroup => "linux_process_group",
             Self::WindowsJob => "windows_job",
-            Self::MacosUnsupported => "macos_unsupported",
+            Self::MacosProcessGroup => "macos_process_group",
             Self::Docker => "docker",
             Self::Podman => "podman",
             Self::Fake => "fake",
@@ -104,9 +106,9 @@ impl PlatformKind {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "linux_cgroup" => Some(Self::LinuxCgroup),
+            "linux_process_group" => Some(Self::LinuxProcessGroup),
             "windows_job" => Some(Self::WindowsJob),
-            "macos_unsupported" => Some(Self::MacosUnsupported),
+            "macos_process_group" => Some(Self::MacosProcessGroup),
             "docker" => Some(Self::Docker),
             "podman" => Some(Self::Podman),
             "fake" => Some(Self::Fake),

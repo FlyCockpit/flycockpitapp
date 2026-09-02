@@ -20,6 +20,39 @@ pub const CHILD_PIPE_CAPTURE_TAIL_BYTES: usize =
 
 const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 
+/// Unix process-group membership recorded on a [`ProcessTreeGuard`].
+///
+/// A numeric pgid is a recycled-identity hazard the moment the original
+/// group can empty. Signal authority is therefore one-shot, and an
+/// unattributable membership (spawned child, never bound) must never be
+/// treated as empty.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixGroup {
+    /// No child has been assigned. The empty oracle is empty.
+    Unbound,
+    /// Leader assigned. `signaled` is true after `terminate` has sent
+    /// SIGKILL once; further `terminate` calls must not re-signal.
+    Bound { pgid: libc::pid_t, signaled: bool },
+    /// A child ran (or assign failed after spawn) but this guard does not
+    /// hold an attributable pgid. Never empty; never a signal target.
+    Unattributable,
+}
+
+/// Result of the Unix empty oracle, including membership that cannot be
+/// attributed to this guard.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupPopulation {
+    Empty,
+    Populated,
+    Unattributable,
+}
+
+/// Stable reason when Unix membership cannot be attributed to this lease.
+#[cfg(unix)]
+pub const PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE: &str = "process_group_membership_unattributable";
+
 /// A descendant-containment boundary prepared before spawn and attached
 /// before child code is allowed to execute. Unix uses a fresh process group.
 /// Windows uses a pre-created kill-on-close Job Object and a suspended child,
@@ -27,7 +60,7 @@ const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 /// fail closed instead of pretending a direct-child kill contains descendants.
 pub struct ProcessTreeGuard {
     #[cfg(unix)]
-    pgid: Mutex<Option<libc::pid_t>>,
+    group: Mutex<UnixGroup>,
     #[cfg(windows)]
     job: Mutex<Option<windows_sys::Win32::Foundation::HANDLE>>,
 }
@@ -45,7 +78,7 @@ impl ProcessTreeGuard {
         #[cfg(unix)]
         {
             Ok(Self {
-                pgid: Mutex::new(None),
+                group: Mutex::new(UnixGroup::Unbound),
             })
         }
         #[cfg(windows)]
@@ -134,27 +167,48 @@ impl ProcessTreeGuard {
     pub fn assign(&self, child: &tokio::process::Child) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            let pid = child
-                .id()
-                .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
-            let pid = libc::pid_t::try_from(pid)
-                .map_err(|_| anyhow::anyhow!("child pid is not a valid process-group id"))?;
-            // SAFETY: `pid` is the child we just spawned and have not reaped;
-            // `getpgid` only queries the kernel process-group identity.
-            let pgid = unsafe { libc::getpgid(pid) };
-            if pgid < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if pgid != pid {
-                return Err(anyhow::anyhow!(
-                    "child is not the leader of its process group"
-                ));
-            }
-            *self
-                .pgid
+            let mut group = self
+                .group
                 .lock()
-                .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))? = Some(pgid);
-            Ok(())
+                .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
+            if matches!(*group, UnixGroup::Bound { .. }) {
+                return Err(anyhow::anyhow!("process group already bound"));
+            }
+            let result = (|| -> anyhow::Result<libc::pid_t> {
+                let pid = child
+                    .id()
+                    .ok_or_else(|| anyhow::anyhow!("child identity missing"))?;
+                let pid = libc::pid_t::try_from(pid)
+                    .map_err(|_| anyhow::anyhow!("child pid is not a valid process-group id"))?;
+                // SAFETY: `pid` is the child we just spawned and have not reaped;
+                // `getpgid` only queries the kernel process-group identity.
+                let pgid = unsafe { libc::getpgid(pid) };
+                if pgid < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if pgid != pid {
+                    return Err(anyhow::anyhow!(
+                        "child is not the leader of its process group"
+                    ));
+                }
+                Ok(pgid)
+            })();
+            match result {
+                Ok(pgid) => {
+                    *group = UnixGroup::Bound {
+                        pgid,
+                        signaled: false,
+                    };
+                    Ok(())
+                }
+                Err(error) => {
+                    // A child existed (or was claimed to) but membership did not
+                    // bind. Unbound-empty would fabricate ProvenEmpty for a
+                    // lease that ran user code.
+                    *group = UnixGroup::Unattributable;
+                    Err(error)
+                }
+            }
         }
         #[cfg(windows)]
         {
@@ -265,16 +319,33 @@ impl ProcessTreeGuard {
     pub fn terminate(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            let pgid = *self
-                .pgid
+            // A pgid is a bare integer identity. Signal it at most once:
+            // after the original group can empty, the same number may name
+            // an unrelated process group. Re-signaling is a recycled-PID
+            // SIGKILL. Keep the bound identity so the empty oracle can
+            // still observe ESRCH; Drop/retry must not send again.
+            let mut group = self
+                .group
                 .lock()
                 .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
-            if let Some(pgid) = pgid {
-                match signal_group(pgid, libc::SIGKILL) {
-                    Ok(()) => {}
-                    Err(error) if is_esrch(&error) => {}
-                    Err(error) => return Err(error.into()),
+            match *group {
+                UnixGroup::Bound {
+                    pgid,
+                    signaled: false,
+                } => {
+                    match signal_group(pgid, libc::SIGKILL) {
+                        Ok(()) => {}
+                        Err(error) if is_esrch(&error) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    *group = UnixGroup::Bound {
+                        pgid,
+                        signaled: true,
+                    };
                 }
+                UnixGroup::Bound { signaled: true, .. }
+                | UnixGroup::Unbound
+                | UnixGroup::Unattributable => {}
             }
         }
         #[cfg(windows)]
@@ -292,35 +363,107 @@ impl ProcessTreeGuard {
     }
 
     /// Forget the bound Unix process-group identity after the empty oracle
-    /// has fired, so Drop cannot signal a recycled pgid.
+    /// has fired, so Drop cannot signal a recycled pgid. Unattributable
+    /// membership is preserved: releasing must not turn a failed bind into
+    /// unbound-empty.
     #[cfg(unix)]
     pub fn release_group(&self) {
-        *self
-            .pgid
+        let mut group = self
+            .group
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(*group, UnixGroup::Unattributable) {
+            *group = UnixGroup::Unbound;
+        }
+    }
+
+    /// Drop signal/query authority without claiming the group empty. Used
+    /// when settlement is Uncertain after SIGKILL: the pgid must not be
+    /// retained for a later recycled-identity kill.
+    #[cfg(unix)]
+    pub fn release_signal_authority(&self) {
+        let mut group = self
+            .group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*group, UnixGroup::Bound { .. }) {
+            *group = UnixGroup::Unattributable;
+        }
     }
 
     /// Whether a process-group leader has been assigned to this guard.
     #[cfg(unix)]
     pub fn group_is_bound(&self) -> bool {
-        self.pgid
+        matches!(
+            *self
+                .group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            UnixGroup::Bound { .. }
+        )
+    }
+
+    /// Whether `terminate` has already sent SIGKILL for the bound identity.
+    #[cfg(unix)]
+    pub fn group_terminate_signaled(&self) -> bool {
+        matches!(
+            *self
+                .group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            UnixGroup::Bound { signaled: true, .. }
+        )
+    }
+
+    /// Whether membership cannot be attributed (assign failed, or signal
+    /// authority was dropped without an empty proof).
+    #[cfg(unix)]
+    pub fn group_is_unattributable(&self) -> bool {
+        matches!(
+            *self
+                .group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            UnixGroup::Unattributable
+        )
+    }
+
+    /// Unix empty oracle: `kill(-pgid, 0)` while membership is bound.
+    /// Unbound guards are empty. Unattributable membership is not empty.
+    #[cfg(unix)]
+    pub fn group_population(&self) -> anyhow::Result<GroupPopulation> {
+        match *self
+            .group
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
+            .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?
+        {
+            UnixGroup::Unbound => Ok(GroupPopulation::Empty),
+            UnixGroup::Unattributable => Ok(GroupPopulation::Unattributable),
+            UnixGroup::Bound { pgid, .. } => {
+                if group_exists(pgid) {
+                    Ok(GroupPopulation::Populated)
+                } else {
+                    Ok(GroupPopulation::Empty)
+                }
+            }
+        }
     }
 
     /// Whether the bound process group still has at least one member.
     ///
     /// This is the Unix empty oracle: `kill(-pgid, 0)`, not a local counter,
     /// child-exit wait, or `/proc` poll. Unbound guards are empty.
+    /// Unattributable membership returns an error so callers cannot treat
+    /// a spawned-but-unbound lease as ProvenEmpty.
     #[cfg(unix)]
     pub fn group_is_populated(&self) -> anyhow::Result<bool> {
-        let pgid = *self
-            .pgid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
-        Ok(pgid.map(group_exists).unwrap_or(false))
+        match self.group_population()? {
+            GroupPopulation::Empty => Ok(false),
+            GroupPopulation::Populated => Ok(true),
+            GroupPopulation::Unattributable => {
+                anyhow::bail!(PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE)
+            }
+        }
     }
 
     /// Close the owned Windows job as the kill-on-close fallback. The handle is
@@ -1051,8 +1194,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(empty, "SIGKILL plus reap must drain the process group");
+        assert!(
+            guard.group_terminate_signaled(),
+            "first terminate must consume signal authority"
+        );
+        guard.terminate().expect("second terminate is a no-op");
         guard.release_group();
         assert!(!guard.group_is_bound());
+        guard
+            .terminate()
+            .expect("released identity is not re-signaled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assign_failure_is_unattributable_not_empty() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // No process_group(0): the child is not a group leader, so assign
+        // cannot bind this guard to a fresh group.
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        let mut child = command.spawn().expect("spawn");
+        assert!(guard.assign(&child).is_err());
+        assert!(!guard.group_is_bound());
+        assert!(guard.group_is_unattributable());
+        assert_eq!(
+            guard.group_population().expect("population"),
+            GroupPopulation::Unattributable
+        );
+        assert!(
+            guard.group_is_populated().is_err(),
+            "spawned-but-unbound must not report empty"
+        );
+        guard.release_group();
+        assert!(
+            guard.group_is_unattributable(),
+            "release after empty proof must not wash assign-failure into unbound-empty"
+        );
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_signal_authority_forgets_pgid_without_claiming_empty() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        guard.assign(&child).expect("bind");
+        guard.terminate().expect("one-shot SIGKILL");
+        guard.release_signal_authority();
+        assert!(guard.group_is_unattributable());
+        assert_eq!(
+            guard.group_population().expect("population"),
+            GroupPopulation::Unattributable
+        );
+        guard
+            .terminate()
+            .expect("unattributable terminate is a no-op");
+        let _ = child.wait().await;
     }
 
     #[cfg(unix)]

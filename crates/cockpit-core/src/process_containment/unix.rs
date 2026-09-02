@@ -5,12 +5,26 @@
 //! `getpgid` / `kill(-pgid, 0)`, then terminate the group. The empty oracle is
 //! that same existence probe — never an in-memory populated flag. Off-host
 //! builds return Unsupported and never fabricate Proven.
+//!
+//! `ContainmentGuarantee::Proven` here means the kernel process-group
+//! existence probe is the empty oracle. Process groups are opt-out
+//! (`setpgid` / `setsid`); that is weaker than a Windows Job Object under
+//! the same `Proven` label and is the mandated [`ProcessTreeGuard`] ceiling,
+//! not a fabricated heuristic oracle.
+//!
+//! A pgid is a bare integer identity. Signal authority ends at settlement:
+//! `terminate` is one-shot, `ProvenEmpty` reclaims the live guard, and
+//! `Uncertain` after SIGKILL (or a failed bind) forgets the pgid so a later
+//! retry cannot SIGKILL a recycled process group. Adapter memory is the live
+//! map of in-flight leases only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cockpit_host::process::ProcessTreeGuard;
+#[cfg(unix)]
+use cockpit_host::process::{GroupPopulation, PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE};
 
 use super::adapter::{
     AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
@@ -41,8 +55,8 @@ impl UnixHost {
 
     fn platform_kind(self) -> PlatformKind {
         match self {
-            Self::Linux => PlatformKind::LinuxCgroup,
-            Self::Macos => PlatformKind::MacosUnsupported,
+            Self::Linux => PlatformKind::LinuxProcessGroup,
+            Self::Macos => PlatformKind::MacosProcessGroup,
         }
     }
 
@@ -78,7 +92,6 @@ struct UnixLive {
 pub(super) struct UnixProcessTreeAdapter {
     host: UnixHost,
     live: Mutex<HashMap<String, UnixLive>>,
-    emptied: Mutex<HashSet<String>>,
     #[cfg(test)]
     order_log: Mutex<Vec<&'static str>>,
 }
@@ -88,7 +101,6 @@ impl UnixProcessTreeAdapter {
         Self {
             host,
             live: Mutex::new(HashMap::new()),
-            emptied: Mutex::new(HashSet::new()),
             #[cfg(test)]
             order_log: Mutex::new(Vec::new()),
         }
@@ -131,7 +143,15 @@ impl UnixProcessTreeAdapter {
         {
             let _ = removed;
         }
-        self.emptied.lock().unwrap().insert(key.to_string());
+    }
+
+    #[cfg(unix)]
+    fn drop_signal_authority_and_reclaim(&self, key: &str) {
+        let removed = self.live.lock().unwrap().remove(key);
+        if let Some(job) = removed {
+            job.guard.release_signal_authority();
+            job.guard.release_group();
+        }
     }
 
     #[cfg(unix)]
@@ -168,6 +188,7 @@ impl UnixProcessTreeAdapter {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn close_handles(&self, handle: &AdapterHandle) {
         self.reclaim(&handle.key);
         self.push_order("release_group");
@@ -241,14 +262,19 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
                 let live = self.live.lock().unwrap();
                 match live.get(&handle.key) {
                     Some(job) if job.generation == generation => {
-                        if !job.guard.group_is_bound() {
+                        if job.guard.group_is_unattributable() {
+                            Err(Self::unavailable(PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE))
+                        } else if !job.guard.group_is_bound() {
                             Err(Self::unavailable(PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN))
                         } else {
-                            match job.guard.group_is_populated() {
-                                Ok(false) => {
+                            match job.guard.group_population() {
+                                Ok(GroupPopulation::Empty) => {
                                     Err(Self::unavailable(PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN))
                                 }
-                                Ok(true) => Ok(()),
+                                Ok(GroupPopulation::Populated) => Ok(()),
+                                Ok(GroupPopulation::Unattributable) => {
+                                    Err(Self::unavailable(PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE))
+                                }
                                 Err(e) => Err(Self::unavailable(format!(
                                     "process_group_query_failed: {e}"
                                 ))),
@@ -315,9 +341,6 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
         handle: &AdapterHandle,
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
-        if self.emptied.lock().unwrap().contains(&handle.key) {
-            return Ok(EmptyOutcome::ProvenEmpty { generation });
-        }
         let generation_match = {
             let live = self.live.lock().unwrap();
             live.get(&handle.key).map(|job| job.generation)
@@ -344,9 +367,33 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
                 reason: "process_group_locator_not_reusable".into(),
             },
         };
-        if matches!(outcome, EmptyOutcome::ProvenEmpty { .. }) {
-            self.reclaim(&handle.key);
-            self.push_order("process_group_empty");
+        match &outcome {
+            EmptyOutcome::ProvenEmpty { .. } => {
+                self.reclaim(&handle.key);
+                self.push_order("process_group_empty");
+            }
+            EmptyOutcome::Uncertain { .. } => {
+                #[cfg(unix)]
+                {
+                    // Probe Uncertain (still populated, never SIGKILL'd) keeps
+                    // the live guard so a later terminate can still kill.
+                    // Settlement Uncertain after SIGKILL or a failed bind
+                    // drops pgid authority so retries cannot target a recycle.
+                    let drop_authority = {
+                        let live = self.live.lock().unwrap();
+                        live.get(&handle.key)
+                            .map(|job| {
+                                job.guard.group_is_unattributable()
+                                    || job.guard.group_terminate_signaled()
+                            })
+                            .unwrap_or(false)
+                    };
+                    if drop_authority {
+                        self.drop_signal_authority_and_reclaim(&handle.key);
+                    }
+                }
+            }
+            EmptyOutcome::Unsupported { .. } => {}
         }
         Ok(outcome)
     }
@@ -357,27 +404,32 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
         let key = locator.locator_key.clone().unwrap_or_default();
-        if self.emptied.lock().unwrap().contains(&key) {
-            return Ok(EmptyOutcome::ProvenEmpty { generation });
-        }
         #[cfg(unix)]
         {
-            let populated = {
+            let population = {
                 let live = self.live.lock().unwrap();
-                live.get(&key).map(|job| job.guard.group_is_populated())
+                live.get(&key).map(|job| job.guard.group_population())
             };
-            match populated {
-                Some(Ok(false)) => {
+            match population {
+                Some(Ok(GroupPopulation::Empty)) => {
                     self.reclaim(&key);
                     return Ok(EmptyOutcome::ProvenEmpty { generation });
                 }
-                Some(Ok(true)) => {
+                Some(Ok(GroupPopulation::Populated)) => {
                     return Ok(EmptyOutcome::Uncertain {
                         generation,
                         reason: "process_group_still_populated_after_restart".into(),
                     });
                 }
+                Some(Ok(GroupPopulation::Unattributable)) => {
+                    self.drop_signal_authority_and_reclaim(&key);
+                    return Ok(EmptyOutcome::Uncertain {
+                        generation,
+                        reason: PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE.into(),
+                    });
+                }
                 Some(Err(e)) => {
+                    self.drop_signal_authority_and_reclaim(&key);
                     return Ok(EmptyOutcome::Uncertain {
                         generation,
                         reason: format!("process_group_query_failed: {e}"),
@@ -417,18 +469,10 @@ async fn unix_wait_group_empty(
     // Brief poll so SIGKILL'd zombies reaped by init are not reported as a
     // still-populated group. Live descendants stay Uncertain.
     for _ in 0..20 {
-        let populated = {
+        let population = {
             let live = adapter.live.lock().unwrap();
             match live.get(&handle.key) {
-                Some(job) if job.generation == generation => match job.guard.group_is_populated() {
-                    Ok(populated) => populated,
-                    Err(e) => {
-                        return EmptyOutcome::Uncertain {
-                            generation,
-                            reason: format!("process_group_query_failed: {e}"),
-                        };
-                    }
-                },
+                Some(job) if job.generation == generation => job.guard.group_population(),
                 _ => {
                     return EmptyOutcome::Uncertain {
                         generation,
@@ -437,8 +481,23 @@ async fn unix_wait_group_empty(
                 }
             }
         };
-        if !populated {
-            return EmptyOutcome::ProvenEmpty { generation };
+        match population {
+            Ok(GroupPopulation::Empty) => {
+                return EmptyOutcome::ProvenEmpty { generation };
+            }
+            Ok(GroupPopulation::Populated) => {}
+            Ok(GroupPopulation::Unattributable) => {
+                return EmptyOutcome::Uncertain {
+                    generation,
+                    reason: PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE.into(),
+                };
+            }
+            Err(e) => {
+                return EmptyOutcome::Uncertain {
+                    generation,
+                    reason: format!("process_group_query_failed: {e}"),
+                };
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -512,3 +571,119 @@ macro_rules! impl_unix_host_adapter {
 }
 
 pub(super) use impl_unix_host_adapter;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod unix_settlement_invariants {
+    use super::*;
+    use cockpit_host::process::PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE;
+    use std::process::Stdio;
+
+    fn native_adapter() -> UnixProcessTreeAdapter {
+        #[cfg(target_os = "linux")]
+        {
+            UnixProcessTreeAdapter::new(UnixHost::Linux)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            UnixProcessTreeAdapter::new(UnixHost::Macos)
+        }
+    }
+
+    fn sleeper_request(generation: u64) -> NativeSpawnRequest {
+        NativeSpawnRequest {
+            containment_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            operation_id: "op".into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            cwd: "/tmp".into(),
+            require_proven: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn never_spawned_lease_is_proven_empty_and_reclaimed() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
+            o => panic!("unbound lease must be empty: {o:?}"),
+        }
+        assert_eq!(adapter.live_group_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn assign_failure_settles_uncertain_not_empty() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated guard");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn outside the lease group");
+        assert!(
+            tree.assign(&child).is_err(),
+            "child that is not a group leader must fail bind"
+        );
+        assert!(tree.group_is_unattributable());
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { generation, reason } => {
+                assert_eq!(generation, 1);
+                assert_eq!(reason, PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE);
+            }
+            o => panic!("spawned-unbound must not fabricate ProvenEmpty: {o:?}"),
+        }
+        assert_eq!(
+            adapter.live_group_count(),
+            0,
+            "Uncertain bind-failure must drop signal authority"
+        );
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn completed_leases_do_not_accumulate_adapter_state() {
+        let adapter = native_adapter();
+        for generation in 1..=8 {
+            let allocated = adapter
+                .create_and_spawn(sleeper_request(generation))
+                .await
+                .unwrap();
+            match adapter
+                .await_empty(&allocated.handle, generation)
+                .await
+                .unwrap()
+            {
+                EmptyOutcome::ProvenEmpty { .. } => {}
+                o => panic!("{o:?}"),
+            }
+        }
+        assert_eq!(
+            adapter.live_group_count(),
+            0,
+            "adapter memory must be bounded by live leases"
+        );
+    }
+
+    #[test]
+    fn platform_kind_names_the_process_group() {
+        let adapter = native_adapter();
+        let meta = adapter.safe_metadata();
+        assert_eq!(meta.guarantee, ContainmentGuarantee::Proven);
+        assert_eq!(
+            meta.management_boundary.as_deref(),
+            Some("unix_process_group")
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(meta.platform_kind, PlatformKind::LinuxProcessGroup);
+        #[cfg(target_os = "macos")]
+        assert_eq!(meta.platform_kind, PlatformKind::MacosProcessGroup);
+    }
+}

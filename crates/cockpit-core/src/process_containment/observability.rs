@@ -117,10 +117,10 @@ mod containment_safe_observability {
     #[test]
     fn doctor_and_error_metadata_have_no_secrets_or_pid_oracle() {
         let meta = SafeContainmentMetadata {
-            platform_kind: PlatformKind::LinuxCgroup,
+            platform_kind: PlatformKind::LinuxProcessGroup,
             guarantee: ContainmentGuarantee::Unsupported,
             capability_reason: Some("management_boundary_unavailable".into()),
-            adapter_name: "linux_cgroup_namespace_guard".into(),
+            adapter_name: "linux_process_tree_guard".into(),
             management_boundary: None,
         };
         let lines = doctor_lines(&meta);

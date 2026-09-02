@@ -535,11 +535,20 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 write: None,
                 branch: None,
             },
-            action_step(
-                "profile-save",
-                "Continue to provider setup",
-                "Saving your profile…",
-            ),
+            StepDescriptor {
+                id: "profile-save",
+                prompt: "Continue to provider setup",
+                help: "The profile is written atomically at this step.",
+                help_hook: None,
+                kind: StepKind::Action {
+                    progress: "Saving your profile…",
+                },
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
         ],
     }
 }
@@ -1061,7 +1070,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_auth_branch),
             },
             action_step(
-                ProviderWizardStep::Headers.source_id(),
+                ProviderWizardStep::Headers,
                 "Advanced: edit HTTP headers",
                 "Editing provider headers…",
             ),
@@ -1127,22 +1136,22 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(action_to_saving),
             },
             action_step(
-                ProviderWizardStep::CopilotAuth.source_id(),
+                ProviderWizardStep::CopilotAuth,
                 "Configure GitHub authentication",
                 "Configuring GitHub authentication…",
             ),
             action_step(
-                ProviderWizardStep::GrokOAuth.source_id(),
+                ProviderWizardStep::GrokOAuth,
                 "Sign in to Grok",
                 "Waiting for browser authorization…",
             ),
             action_step(
-                ProviderWizardStep::CodexOAuth.source_id(),
+                ProviderWizardStep::CodexOAuth,
                 "Sign in to Codex",
                 "Waiting for device authorization…",
             ),
             action_step(
-                ProviderWizardStep::CopyDetectedEnv.source_id(),
+                ProviderWizardStep::CopyDetectedEnv,
                 "Copy detected environment credential",
                 "Copying detected credential into Cockpit's encrypted vault…",
             ),
@@ -1161,12 +1170,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_after_save_branch),
             },
             action_step(
-                ProviderWizardStep::TestKey.source_id(),
+                ProviderWizardStep::TestKey,
                 "Test key",
                 "Testing provider credentials…",
             ),
             action_step(
-                ProviderWizardStep::Fetching.source_id(),
+                ProviderWizardStep::Fetching,
                 "Fetch models",
                 "Fetching /models…",
             ),
@@ -1582,9 +1591,16 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
-fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -> StepDescriptor {
+/// Provider-wizard action that advances to `saving`, except `Fetching` /
+/// `TestKey` which finish at `done`. Terminal save actions (`profile-save`,
+/// `security-save`, `model-save`) must be last-step descriptors with no branch.
+fn action_step(
+    step: ProviderWizardStep,
+    prompt: &'static str,
+    progress: &'static str,
+) -> StepDescriptor {
     StepDescriptor {
-        id,
+        id: step.source_id(),
         prompt,
         help: progress,
         help_hook: None,
@@ -1593,8 +1609,8 @@ fn action_step(id: &'static str, prompt: &'static str, progress: &'static str) -
         prefill: None,
         validate: None,
         write: None,
-        branch: Some(match id {
-            "fetching" | "test-key" => fetching_to_done,
+        branch: Some(match step {
+            ProviderWizardStep::Fetching | ProviderWizardStep::TestKey => fetching_to_done,
             _ => action_to_saving,
         }),
     }
@@ -2246,6 +2262,28 @@ mod tests {
                 .any(|step| step.source_id().contains("skip")),
             "the provider wizard must not expose an unvalidated completion branch"
         );
+    }
+
+    #[test]
+    fn onboarding_profile_save_completes_without_a_saving_branch() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action, not a branch to `saving`");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), Some("Ada".into()));
+    }
+
+    #[test]
+    fn onboarding_profile_blank_name_is_a_skip_that_still_completes() {
+        let mut run = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text(String::new())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        run.submit(WizardAnswer::Acknowledged)
+            .expect("skipping the name still completes profile-save");
+        assert!(run.is_complete());
+        assert_eq!(onboarding_name_answer(&run), None);
     }
 
     #[test]

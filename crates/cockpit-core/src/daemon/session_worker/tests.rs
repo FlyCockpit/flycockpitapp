@@ -1686,7 +1686,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
         let model =
             Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
         let (handle, join, start_permit) = spawn(
             session.clone(),
             Arc::new(tokio::sync::Mutex::new(

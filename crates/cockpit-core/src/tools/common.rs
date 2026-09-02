@@ -305,14 +305,26 @@ pub fn read_slice_with_byte_cap(
         kept += 1;
     }
 
-    let shown: Vec<&str> = if stopped_for_byte_cap {
-        // Back margin: the lines after the cap-stop were omitted, so the last
-        // kept line may end mid-secret (multi-line partials included, via the
-        // joined-content coordinates again).
+    // Back margin: the retained window's END abuts omitted content when
+    // EITHER cap fires — the byte cap stopped mid-window, or the LINE LIMIT
+    // left lines past the window unshown (`more_lines`) — so the last kept
+    // line may end mid-secret (multi-line partials included, via the
+    // joined-content coordinates again). Issue #294: the limit edge is an
+    // omission edge exactly like the byte-cap edge; a boundary-blind
+    // line-limit cut would hand the §7 whole-value scrub a straddling
+    // secret's unmatchable PREFIX.
+    let shown: Vec<&str> = if stopped_for_byte_cap || more_lines {
         let kept_content = safe_lines[..kept].join("\n");
-        drop_back_margin(redact, &kept_content)
-            .split('\n')
-            .collect::<Vec<&str>>()
+        let safe = drop_back_margin(redact, &kept_content);
+        // Fail-closed: when the elision empties the segment (nothing was
+        // kept, or the whole kept span lay inside the unsafe margin), show
+        // NO lines — never a fabricated empty `${n}|` row — so `next_offset`
+        // stays at the window start and paging re-offers rather than skips.
+        if safe.is_empty() {
+            Vec::new()
+        } else {
+            safe.split('\n').collect()
+        }
     } else {
         safe_lines[..kept].to_vec()
     };
@@ -888,6 +900,34 @@ mod tests {
         assert!(!scrubbed.contains("SECRET-BACKTAIL-99"));
         assert!(slice.truncated);
         assert!(slice.numbered.starts_with("1|"), "{}", slice.numbered);
+    }
+
+    // The LINE-LIMIT back edge (issue #294): `limit` omits the lines after the
+    // window exactly like the byte cap does, so a multi-line registered
+    // literal whose first line ends the last permitted line and whose second
+    // line begins the first omitted line must be elided too — the whole-value
+    // §7 scrub cannot match the surviving PREFIX.
+    #[tokio::test]
+    async fn read_slice_line_limit_edge_elides_multi_line_straddling_secret() {
+        const SECRET: &str = "SECRET-LINEHEAD-99\nSECRET-LINETAIL-99"; // 37 bytes
+        let table = leak_table(SECRET);
+        let partial_head = "SECRET-LINEHEAD-99";
+        // Line 1 ends with the literal's first line; the byte cap never
+        // engages (tiny body), so only `limit = 1` cuts the window.
+        let line1 = format!("{}{partial_head}", "x".repeat(400));
+        let body = format!("{line1}\nSECRET-LINETAIL-99 filler\n");
+        let slice = read_slice(&table, &body, 1, 1);
+        let scrubbed = table.scrub(&slice.numbered);
+        assert!(
+            !scrubbed.contains(partial_head),
+            "line-limit back-edge partial leaked: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("SECRET-LINETAIL-99"));
+        assert!(slice.truncated);
+        assert!(slice.numbered.starts_with("1|"), "{}", slice.numbered);
+        // The elided tail is re-offered, never skipped: the resume offset is
+        // the first line after the one retained row.
+        assert_eq!(slice.next_offset, 2);
     }
 
     // A secret fully contained in the retained head (or tail) is NOT a boundary

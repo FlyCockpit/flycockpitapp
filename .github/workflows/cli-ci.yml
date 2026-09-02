@@ -235,7 +235,7 @@ jobs:
       - name: Check advisory exception policy (expiry + audit flags)
         id: advisory-exceptions
         run: |
-          flags="$(python3 scripts/check-advisory-exceptions.sh)"
+          flags="$(bash scripts/check-advisory-exceptions.sh)"
           echo "audit-flags=$flags" >> "$GITHUB_OUTPUT"
 
       # Fails on any RUSTSEC advisory affecting the locked graph except the

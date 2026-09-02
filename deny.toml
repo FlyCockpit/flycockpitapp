@@ -159,9 +159,25 @@ skip = [
 ]
 
 [sources]
-# Crates must come from crates.io or the one pinned git dependency; any other
-# registry or git source fails CI.
+# Crates must come from crates.io or one of the two pinned git sources — the
+# exact URLs present in the committed Cargo.lock — and any other registry or
+# git source fails CI.
 unknown-registry = "deny"
 unknown-git = "deny"
+# An allowlisted git URL may not be retargeted off its lockfile commit: only
+# `rev = "<sha>"` specs are accepted (cargo-deny values, least to most
+# specific: any, branch, tag, rev). A branch/tag/default-track spec on an
+# allowed URL would turn the lockfile's exact commit into a wildcard that
+# `cargo update` silently moves, so it fails the gate too.
+required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/pydantic/monty.git"]
+# Both git sources actually in the locked graph:
+# - pydantic/monty: the embedded Python sandbox VM, pinned by `rev` in the
+#   workspace root Cargo.toml.
+# - samuelcolvin/ruff: the ruff_python_* parser/stdlib crates monty depends
+#   on inside its pinned checkout; their rev is locked transitively with
+#   monty's.
+allow-git = [
+    "https://github.com/pydantic/monty.git",
+    "https://github.com/samuelcolvin/ruff.git",
+]

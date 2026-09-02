@@ -66,10 +66,11 @@ pub enum ScheduleCommand {
     /// Cancel a job (loop / timer / background) by id. From the human
     /// ("stop checking the deploy", `/schedule cancel <id>`).
     Cancel { job_id: String },
-    /// Cancel every running or queued async job in this session. This is an
-    /// exit-guard operation, so it deliberately has broader scope than the
-    /// human `/schedule cancel <id>` command.
-    CancelAll,
+    /// Cancel every running or queued async job admitted under
+    /// `through_generation` or earlier. Stop rotates the session-work root
+    /// first and sends this command afterward; the generation fence keeps a
+    /// delayed sweep from killing work started after Stop.
+    CancelAll { through_generation: u64 },
     /// A running recursive `Swarm` child called `spawn` (GOALS
     /// §24). Per single-async-job authority a child does **not** spawn async
     /// work directly — it posts this request and main (the authority) decides:
@@ -170,6 +171,13 @@ pub enum ScheduleEvent {
     },
 }
 
+/// A recursive swarm spawn waiting for a concurrency slot, stamped with
+/// the session-work generation it was admitted under.
+struct QueuedSwarm {
+    spec: SpawnSpec,
+    generation: u64,
+}
+
 /// One row in the live-jobs registry. Cloned cheaply into the
 /// [`ScheduleSnapshot`] the TUI strip / `/schedule` read.
 struct ScheduleEntry {
@@ -187,6 +195,9 @@ struct ScheduleEntry {
     /// `cancel_all` *before* aborting the task so in-flight provider calls
     /// observe the token rather than racing a drop.
     cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Session-work generation this job was admitted under. A delayed
+    /// Stop sweep only cancels jobs with `generation <= through_generation`.
+    generation: u64,
     /// For in-context loops: the scheduler state needed to re-arm.
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
@@ -497,7 +508,9 @@ pub struct ScheduleAuthority {
     running_swarm: usize,
     /// Recursive `Swarm` spawns that arrived while at the concurrency cap
     /// (GOALS §24). Drained FIFO as running jobs complete and slots free.
-    swarm_queue: std::collections::VecDeque<SpawnSpec>,
+    /// Each entry keeps the generation it was admitted under so a Stop of
+    /// an earlier generation cannot start it on the rotated root.
+    swarm_queue: std::collections::VecDeque<QueuedSwarm>,
     /// Accepted-user epoch for this thread. Idle forks subscribe to it so a
     /// user message resets their countdown without polling.
     idle_activity_tx: watch::Sender<Instant>,
@@ -660,6 +673,7 @@ impl ScheduleAuthority {
             .job_id
             .clone()
             .expect("spawn_swarm assigns a job id before queueing");
+        let generation = self.session_work_cancel.generation();
         if self.swarm_at_capacity() {
             if self.swarm_queue.len() >= MAX_SWARM_QUEUE_LEN {
                 return format!(
@@ -668,27 +682,27 @@ impl ScheduleAuthority {
                     MAX_SWARM_QUEUE_LEN
                 );
             }
-            self.swarm_queue.push_back(spec);
+            self.swarm_queue.push_back(QueuedSwarm { spec, generation });
             return format!(
                 "queued swarm subagent `{job_id}` (swarm concurrency cap {} reached; {} waiting) — starts when a slot frees",
                 self.swarm_max_concurrency,
                 self.swarm_queue.len()
             );
         }
-        let job_id = self.start_swarm_now(spec);
+        let job_id = self.start_swarm_now(spec, generation);
         format!("scheduled swarm subagent `{job_id}` (running in the background)")
     }
 
     /// Start a recursive `Swarm` subagent task immediately (slot already
     /// reserved by the caller's cap check). Registers the job, bumps the
     /// running count, and spawns the runner. Returns the job id.
-    fn start_swarm_now(&mut self, spec: SpawnSpec) -> String {
+    fn start_swarm_now(&mut self, spec: SpawnSpec, generation: u64) -> String {
         let job_id = spec.job_id.clone().unwrap_or_else(new_job_id);
         let label = swarm_label(&spec);
         self.running_swarm += 1;
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
 
-        let cancel = self.session_work_cancel.child();
+        let cancel = self.session_work_cancel.child_for_generation(generation);
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -737,6 +751,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(handle.abort_handle()),
             cancel: Some(cancel),
+            generation,
             in_context: None,
             background: None,
             active_idle_wake: None,
@@ -752,10 +767,10 @@ impl ScheduleAuthority {
     pub fn swarm_completed(&mut self) {
         self.running_swarm = self.running_swarm.saturating_sub(1);
         while !self.swarm_at_capacity() {
-            let Some(spec) = self.swarm_queue.pop_front() else {
+            let Some(QueuedSwarm { spec, generation }) = self.swarm_queue.pop_front() else {
                 break;
             };
-            self.start_swarm_now(spec);
+            self.start_swarm_now(spec, generation);
         }
     }
 
@@ -840,7 +855,7 @@ impl ScheduleAuthority {
         let job_id = new_job_id();
         let kind = args.kind();
         let label = loop_label(&args);
-        let cancel = self.session_work_cancel.child();
+        let (cancel, generation) = self.session_work_cancel.child_with_generation();
         let entry = ScheduleEntry {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -849,6 +864,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: None,
             cancel: Some(cancel),
+            generation,
             in_context: Some(InContextLoop {
                 next_delay_secs: args.interval_secs,
                 args,
@@ -873,7 +889,7 @@ impl ScheduleAuthority {
         let label = loop_label(&args);
         self.emit_started(&job_id, &label, kind);
         let active_idle_wake = args.idle.then(new_active_idle_wake);
-        let cancel = self.session_work_cancel.child();
+        let (cancel, generation) = self.session_work_cancel.child_with_generation();
 
         let run_ctx = LoopRunCtx {
             job_id: job_id.clone(),
@@ -898,6 +914,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(handle.abort_handle()),
             cancel: Some(cancel),
+            generation,
             in_context: None,
             background: None,
             active_idle_wake,
@@ -945,7 +962,7 @@ impl ScheduleAuthority {
         let job_id = new_job_id();
         let label = background_label(&args);
         self.emit_started(&job_id, &label, ScheduleKind::Background);
-        let cancel = self.session_work_cancel.child();
+        let (cancel, generation) = self.session_work_cancel.child_with_generation();
 
         let (handle, task) = background::spawn(background::BackgroundSpawn {
             job_id: job_id.clone(),
@@ -967,6 +984,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(abort),
             cancel: Some(cancel),
+            generation,
             in_context: None,
             background: Some(Arc::new(handle)),
             active_idle_wake: None,
@@ -997,10 +1015,16 @@ impl ScheduleAuthority {
             &idle_wake_claim,
             Some(IdleWakeCancellationClaim::Publishing)
         );
-        // Fire the job token first so in-flight provider calls and child
-        // processes observe cancellation, then abort the task as a fallback.
+        // Fire the job token first so in-flight provider calls observe
+        // cancellation. Group-kill a background shell from the handle
+        // *before* aborting the runner: abort drops the future without
+        // polling it, so the runner's token/`kill_rx` branch would never
+        // SIGTERM the process group.
         if let Some(cancel) = entry.cancel.take() {
             cancel.cancel();
+        }
+        if let Some(bg) = &entry.background {
+            bg.kill();
         }
         // Stop any armed tick timer + spawned task.
         if let Some(ic) = &mut entry.in_context
@@ -1010,9 +1034,6 @@ impl ScheduleAuthority {
         }
         if !publication_owned_by_runner && let Some(a) = entry.abort.take() {
             a.abort();
-        }
-        if let Some(bg) = &entry.background {
-            bg.kill();
         }
         // In-context loops: the iterations already reached main; emit a
         // terminal completion so the strip clears and a marker shows.
@@ -1095,12 +1116,26 @@ impl ScheduleAuthority {
         true
     }
 
-    /// Cancel the complete live and queued async-job set. Snapshotting the
-    /// ids before removal keeps each cancellation on the same single authority
-    /// path and prevents iteration from observing its own mutation.
+    /// Cancel every live and queued async job admitted under the current
+    /// session-work generation or earlier. Tests and in-process callers that
+    /// already hold the authority use this; the worker Stop path sends
+    /// [`ScheduleCommand::CancelAll`] with the generation captured at rotate
+    /// so a delayed sweep cannot kill later work.
     pub fn cancel_all(&mut self) {
-        self.swarm_queue.clear();
-        let job_ids = self.registry.keys().cloned().collect::<Vec<_>>();
+        self.cancel_all_through(self.session_work_cancel.generation());
+    }
+
+    /// Cancel live and queued jobs whose admission generation is `<=`
+    /// `through_generation`. Newer jobs (admitted after Stop rotated) stay.
+    pub fn cancel_all_through(&mut self, through_generation: u64) {
+        self.swarm_queue
+            .retain(|queued| queued.generation > through_generation);
+        let job_ids = self
+            .registry
+            .iter()
+            .filter(|(_, entry)| entry.generation <= through_generation)
+            .map(|(job_id, _)| job_id.clone())
+            .collect::<Vec<_>>();
         for job_id in job_ids {
             self.cancel(&job_id);
         }
@@ -1155,7 +1190,9 @@ impl ScheduleAuthority {
             ScheduleCommand::Cancel { job_id } => {
                 self.cancel(&job_id);
             }
-            ScheduleCommand::CancelAll => self.cancel_all(),
+            ScheduleCommand::CancelAll { through_generation } => {
+                self.cancel_all_through(through_generation);
+            }
             // A running `Swarm` child requested a deeper spawn (GOALS §24).
             // Main is the single authority: schedule it or queue it under the
             // global cap. The pointer return is dropped here — the child
@@ -1745,6 +1782,45 @@ mod tests {
             "Stop must cancel swarm child inference tokens"
         );
         assert_eq!(auth.running_swarm(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_all_through_does_not_kill_work_admitted_after_stop() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let before = parse_loop_start(&serde_json::json!({
+            "interval": 60, "prompt": "before", "limit": 2, "keep_in_context": false
+        }))
+        .unwrap();
+        let before_id = auth.start_loop_forked(before);
+        let before_token = auth
+            .job_cancel_token(&before_id)
+            .expect("pre-Stop loop has a token");
+        let through = auth.session_work_cancel_for_tests().cancel_and_rotate();
+        assert!(before_token.is_cancelled());
+
+        let after = parse_loop_start(&serde_json::json!({
+            "interval": 60, "prompt": "after", "limit": 2, "keep_in_context": false
+        }))
+        .unwrap();
+        let after_id = auth.start_loop_forked(after);
+        let after_token = auth
+            .job_cancel_token(&after_id)
+            .expect("post-Stop loop has a token");
+        assert!(!after_token.is_cancelled());
+
+        auth.cancel_all_through(through);
+        assert!(
+            !after_token.is_cancelled(),
+            "a delayed CancelAll of the Stop generation must not kill later work"
+        );
+        assert!(
+            auth.job_cancel_token(&after_id).is_some(),
+            "post-Stop loop must remain registered"
+        );
+        assert!(
+            auth.job_cancel_token(&before_id).is_none(),
+            "pre-Stop loop must still be swept"
+        );
     }
 
     #[tokio::test(start_paused = true)]

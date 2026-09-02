@@ -44,6 +44,10 @@ pub struct BackgroundHandle {
     attached_knowledge_read: bool,
     /// Set when the job is asked to die; the spawned task observes it.
     kill_tx: tokio::sync::watch::Sender<bool>,
+    /// Leader pid of the shell's process group, published once the child
+    /// is spawned. `kill()` SIGTERMs this group even if the runner has
+    /// already been aborted and cannot poll `cancel` / `kill_rx`.
+    pgid: Arc<Mutex<Option<u32>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,8 +181,26 @@ impl BackgroundHandle {
         }
     }
 
-    /// Signal the spawned task to kill the child. Idempotent.
+    /// Group-kill the shell, then signal the runner. Idempotent.
+    ///
+    /// The process-group SIGTERM (and a delayed SIGKILL) is issued from this
+    /// handle so Stop / `background.cancel` still contains descendants when
+    /// the authority aborts the runner immediately afterward. The watch send
+    /// remains so a still-running runner can `terminate_group_async` itself.
     pub fn kill(&self) {
+        let pgid = self
+            .pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pgid) = pgid {
+            cockpit_host::process::terminate_process_group(pgid);
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cockpit_host::process::kill_process_group(pgid);
+            });
+        }
         let _ = self.kill_tx.send(true);
     }
 }
@@ -304,12 +326,14 @@ pub fn spawn(
         Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP)));
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
     let attached_knowledge_read = !launch.attached_knowledge_paths.is_empty();
+    let pgid = Arc::new(Mutex::new(None));
 
     let handle = BackgroundHandle {
         label: label.clone(),
         ring: ring.clone(),
         attached_knowledge_read,
         kill_tx,
+        pgid: pgid.clone(),
     };
 
     let task = spawn_guarded_background(
@@ -325,6 +349,7 @@ pub fn spawn(
             event_tx.clone(),
             kill_rx,
             cancel,
+            pgid,
         ),
         event_tx,
         job_id,
@@ -342,8 +367,9 @@ pub struct BackgroundSpawn {
     pub redact: Arc<RedactionTable>,
     pub turn_tx: mpsc::Sender<TurnEvent>,
     pub event_tx: mpsc::Sender<ScheduleEvent>,
-    /// Session-work child token. Stop fires this so the runner kills the
-    /// subprocess even if `kill()` races with task abort.
+    /// Session-work child token. Stop fires this so a still-running runner
+    /// kills the subprocess; [`BackgroundHandle::kill`] group-kills even if
+    /// the runner is aborted first.
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -510,6 +536,7 @@ async fn run_background(
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
     cancel: tokio_util::sync::CancellationToken,
+    pgid: Arc<Mutex<Option<u32>>>,
 ) {
     if cancel.is_cancelled() {
         let _ = event_tx
@@ -557,6 +584,11 @@ async fn run_background(
             return;
         }
     };
+    if let Some(id) = child.id() {
+        *pgid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1484,6 +1516,65 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_kill_group_terminates_descendants_after_runner_abort() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let heartbeat = tmp.path().join("heartbeat");
+        let ready = tmp.path().join("ready");
+        let script = format!(
+            "( while true; do touch '{}'; sleep 0.1; done ) & touch '{}'; sleep 30",
+            heartbeat.display(),
+            ready.display()
+        );
+        let (handle, task) = spawn_test_job(
+            "group-kill",
+            &script,
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact,
+            turn_tx,
+            event_tx,
+        );
+
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "shell never created the ready file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        while !heartbeat.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "descendant never created the heartbeat file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+        let _ = task.await;
+        handle.kill();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let mtime_after_kill = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let mtime_later = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        assert_eq!(
+            mtime_after_kill, mtime_later,
+            "descendant heartbeat kept updating after handle.kill() with the runner already aborted"
+        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -815,14 +815,17 @@ impl CancelHandle {
         }
     }
 
-    /// Stop-all: cancel every descendant of the session-work root (foreground
-    /// turn, scheduled loops, swarm children, background shells, background
-    /// delegates) and rotate the root so later work is not pre-cancelled.
-    /// Also cancels the live `cancel_current` slot so keep-warm / other
-    /// non-descendant tokens installed there abort too.
-    pub fn cancel_all_session_work(&self) {
-        self.session_work.cancel_and_rotate();
+    /// Stop-all: cancel the live turn slot, then every descendant of the
+    /// session-work root (scheduled loops, swarm children, background shells,
+    /// background delegates), and rotate the root so later work is not
+    /// pre-cancelled. The live slot is cancelled *before* rotate so a run
+    /// that installs a fresh-root child into the slot cannot be killed by a
+    /// trailing `cancel_noninteractive`. Returns the generation that Stop
+    /// cancelled; a later `ScheduleCommand::CancelAll` must carry that
+    /// generation so it cannot sweep work admitted after the rotate.
+    pub fn cancel_all_session_work(&self) -> u64 {
         self.cancel_noninteractive();
+        self.session_work.cancel_and_rotate()
     }
 }
 
@@ -3965,6 +3968,31 @@ impl Driver {
         self.schedule.command_sender()
     }
 
+    /// Drain a schedule command from the worker (or an in-task timer).
+    /// `CancelAll` also aborts background-delegate join handles of that
+    /// generation: token fire is cooperative, and Stop must halt inference
+    /// that has not yet polled its token.
+    fn handle_schedule_command(&mut self, cmd: ScheduleCommand) {
+        let stop_generation = match &cmd {
+            ScheduleCommand::CancelAll { through_generation } => Some(*through_generation),
+            _ => None,
+        };
+        self.schedule.handle_command(cmd);
+        if let Some(through_generation) = stop_generation {
+            self.abort_noninteractive_jobs_through(through_generation);
+        }
+    }
+
+    /// Apply the job-lifecycle half of Stop: authority registry sweep plus
+    /// background-delegate abort, filtered by the generation captured at
+    /// rotate. Tests that cannot go through the worker command channel use
+    /// this so they exercise the same pair the driver main loop runs.
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn apply_session_work_stop(&mut self, through_generation: u64) {
+        self.schedule.cancel_all_through(through_generation);
+        self.abort_noninteractive_jobs_through(through_generation);
+    }
+
     /// Attach the worker's one durable root identity before the first driver
     /// turn.  Child IDs are attached at the task-delegation creation boundary.
     pub fn set_root_agent_instance_id(&mut self, agent_instance_id: uuid::Uuid) {
@@ -5769,7 +5797,7 @@ impl Driver {
                 cmd = self.job_cmd_rx.recv() => {
                     goal_watchdog = None;
                     if let Some(cmd) = cmd {
-                        self.schedule.handle_command(cmd);
+                        self.handle_schedule_command(cmd);
                         continue;
                     } else {
                         break;

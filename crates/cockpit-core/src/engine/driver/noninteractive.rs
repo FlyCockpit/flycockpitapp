@@ -1099,6 +1099,9 @@ pub(in crate::engine::driver) struct BackgroundNoninteractiveJob {
     /// from `original_args_json`.
     pub(in crate::engine::driver) workspace_leases:
         crate::workspace_lease::JobIssuedWorkspaceLeaseIds,
+    /// Session-work generation this job was admitted under. Stop aborts
+    /// only jobs with `generation <=` the generation captured at rotate.
+    generation: u64,
 }
 
 impl BackgroundNoninteractiveJob {
@@ -1113,10 +1116,11 @@ impl BackgroundNoninteractiveJob {
             workspace_leases: crate::workspace_lease::new_job_issued_workspace_lease_ids(
                 workspace_leases,
             ),
+            generation: 0,
         }
     }
 
-    fn spawn<F>(workspace_leases: Vec<Option<String>>, fut: F) -> Self
+    fn spawn<F>(workspace_leases: Vec<Option<String>>, generation: u64, fut: F) -> Self
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -1132,6 +1136,7 @@ impl BackgroundNoninteractiveJob {
             delivered: false,
             handle,
             workspace_leases,
+            generation,
         }
     }
 
@@ -1145,6 +1150,12 @@ impl BackgroundNoninteractiveJob {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(id);
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 }
 
@@ -2499,12 +2510,15 @@ impl Driver {
             .iter()
             .map(|child| child.task.workspace_lease.clone())
             .collect();
+        let (child_cancels, generation) = self
+            .session_work_cancel
+            .children_with_generation(task.children.len());
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+            BackgroundNoninteractiveJob::spawn(workspace_leases, generation, async move {
                 let _permits = permits;
                 let result = runner
-                    .execute_recovered_batch_noninteractive_task(task, &tx_for_task)
+                    .execute_recovered_batch_noninteractive_task(task, &tx_for_task, child_cancels)
                     .await;
                 if activation_gate.is_aborted() {
                     return;
@@ -2526,6 +2540,7 @@ impl Driver {
         &mut self,
         task: RecoveredBatchNoninteractiveTask,
         tx: &mpsc::Sender<TurnEvent>,
+        mut child_cancels: Vec<tokio_util::sync::CancellationToken>,
     ) -> Result<BatchNoninteractiveCompletion> {
         use futures::StreamExt as _;
 
@@ -2622,8 +2637,14 @@ impl Driver {
             let mut child_runner = self.clone_for_background_noninteractive(tx);
             let child_tx = tx.clone();
             let child_task_call_id = task_call_id.clone();
+            let child_cancel = child_cancels.pop().unwrap_or_else(|| {
+                // Fail closed: a missing pre-minted token must not mint from
+                // the live root after Stop has rotated.
+                let cancelled = tokio_util::sync::CancellationToken::new();
+                cancelled.cancel();
+                cancelled
+            });
             runs.push(async move {
-                let child_cancel = child_runner.session_work_cancel.child();
                 let outcome = child_runner
                     .execute_single_noninteractive_task(child.task, &child_tx, child_cancel)
                     .await?;
@@ -2737,11 +2758,11 @@ impl Driver {
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
         let workspace_leases = vec![task.workspace_lease.clone()];
+        let (cancel, generation) = self.session_work_cancel.child_with_generation();
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+            BackgroundNoninteractiveJob::spawn(workspace_leases, generation, async move {
                 let _permits = permits;
-                let cancel = runner.session_work_cancel.child();
                 let result = runner
                     .execute_single_noninteractive_task(task, &tx_for_task, cancel)
                     .await;
@@ -3128,9 +3149,10 @@ impl Driver {
             let completion_task_provider_item_id = task_provider_item_id.clone();
             let completion_task_function_call_id = task_function_call_id.clone();
             let workspace_leases = vec![task.workspace_lease.clone()];
+            let generation = self.session_work_cancel.generation();
             self.noninteractive_jobs.insert(
                 task_call_id.clone(),
-                BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
+                BackgroundNoninteractiveJob::spawn(workspace_leases, generation, async move {
                     // Keep the reservation alive for the full background child
                     // lifetime, including time spent after the foreground has moved on.
                     let _vnext_admissions = vnext_admissions;
@@ -5774,6 +5796,31 @@ impl Driver {
         });
     }
 
+    /// Abort and drop background-delegate jobs admitted under
+    /// `through_generation` or earlier. Stop uses this so a job that has
+    /// not yet polled its cancel token cannot keep billing after rotate.
+    /// Newer jobs (admitted after Stop) stay.
+    pub(in crate::engine::driver) fn abort_noninteractive_jobs_through(
+        &mut self,
+        through_generation: u64,
+    ) {
+        self.noninteractive_jobs.retain(|task_call_id, job| {
+            if job.generation > through_generation {
+                return true;
+            }
+            if !job.handle.is_finished() {
+                tracing::debug!(
+                    task_call_id,
+                    generation = job.generation,
+                    through_generation,
+                    "aborting background delegate on session Stop"
+                );
+                job.handle.abort();
+            }
+            false
+        });
+    }
+
     pub(in crate::engine::driver) async fn release_noninteractive_child_locks(
         &self,
         rows: &[crate::db::task_delegations::DelegationChildDetail],
@@ -6706,9 +6753,10 @@ impl Driver {
         let completion_task_call_id = task_call_id.clone();
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
+        let generation = self.session_work_cancel.generation();
         self.noninteractive_jobs.insert(
             task_call_id.clone(),
-            BackgroundNoninteractiveJob::spawn(minted_workspace_leases, async move {
+            BackgroundNoninteractiveJob::spawn(minted_workspace_leases, generation, async move {
                 let result = runner
                     .execute_batch_noninteractive_task_with_admissions(
                         task,
@@ -11017,6 +11065,16 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        if cancel.is_cancelled() {
+            return Err(NoninteractiveRunError::new(
+                anyhow::Error::new(crate::engine::model::InferenceCancelled {
+                    phase: crate::engine::model::InferencePhase::Prep,
+                }),
+                history,
+                fallback_decision,
+                fallback_tried,
+            ));
+        }
         let persist_owns_unsettled_started = pending_scheduled_turn
             .as_ref()
             .is_some_and(|plan| plan.has_unsettled_started_calls());

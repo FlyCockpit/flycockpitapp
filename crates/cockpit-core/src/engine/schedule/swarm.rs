@@ -1542,6 +1542,148 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stop_cancels_in_flight_swarm_inference() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+        let mut provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Hang)
+            .start()
+            .await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        std::fs::write(&config_path, r#"{}"#).unwrap();
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "cloud".into(),
+            crate::config::providers::ProviderEntry {
+                url: provider.base_url(),
+                trust: Some(crate::config::providers::ModelTrust::Untrusted),
+                timeout: crate::config::providers::TimeoutConfig {
+                    ttft_secs: 10,
+                    idle_secs: 10,
+                },
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "worker".into(),
+                    subagent_invokable: Some(true),
+                    can_delegate: Some(true),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+        doc.write(&providers).unwrap();
+
+        let table = Arc::new(crate::redact::RedactionTable::empty());
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let (_extended, effective_providers) =
+            crate::engine::model_roles::load_model_role_config(&config);
+        let parent_model = Arc::new(
+            crate::engine::model::Model::for_provider(
+                &effective_providers,
+                "cloud",
+                "worker",
+                table.clone(),
+            )
+            .unwrap(),
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "Swarm",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let parent = Agent {
+            name: "Swarm".to_string(),
+            system: "s".to_string(),
+            role_prompt: "s".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model: parent_model,
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: true,
+            tool_steering: crate::agents::ToolSteering::Terse,
+            posture: crate::agents::PostureResolution::standard(),
+            context_policy: None,
+            lock_identity: "Swarm".to_string(),
+            write_scope: None,
+            workspace_lease: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            definition: None,
+            assistant_identity_prefix: None,
+            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
+        };
+        let ctx = ScheduleContext {
+            dream_read_scope: session.dream_read_scope(),
+            session,
+            locks,
+            redact: table,
+            cwd: tmp.path().to_path_buf(),
+            config,
+            guidance_compiler: None,
+            local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+            agent: Arc::new(parent),
+            write_scope: None,
+        };
+
+        let mut spec = spec(1, 3);
+        spec.worker = SpawnWorkerKind::Scout;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (turn_tx, mut turn_rx) = mpsc::channel(256);
+        tokio::spawn(async move { while turn_rx.recv().await.is_some() {} });
+        let (event_tx, mut event_rx) = mpsc::channel::<ScheduleEvent>(64);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let run = tokio::spawn(run_swarm(SwarmRunCtx {
+            job_id: "job-stop-inflight".to_string(),
+            label: "scout".to_string(),
+            spec,
+            ctx,
+            turn_tx,
+            event_tx,
+            cmd_tx,
+            cancel: cancel.clone(),
+        }));
+
+        let _captured = provider.next_request().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("Stop must abort in-flight swarm inference")
+            .expect("run_swarm join");
+
+        match event_rx.recv().await {
+            Some(ScheduleEvent::SwarmChildStarted { .. }) => {}
+            other => panic!("expected SwarmChildStarted first, got {other:?}"),
+        }
+        match event_rx.recv().await {
+            Some(ScheduleEvent::Completed { failed, result, .. }) => {
+                assert!(!failed, "cancellation is not a job failure: {result}");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected cancelled Completed, got {other:?}"),
+        }
+        assert_eq!(
+            provider.request_count(),
+            1,
+            "Stop must not start another billed swarm request"
+        );
+    }
+
     /// Fix-3: L22 at the SINGLE swarm gate funnel. Every gate site in
     /// `run_swarm_loop` routes through `swarm_child_stop_continuation`, which fails
     /// closed for a goal-supervision worker BEFORE dispatching any hook. Driving

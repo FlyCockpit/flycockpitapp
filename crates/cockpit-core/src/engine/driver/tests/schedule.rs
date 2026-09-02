@@ -67,8 +67,8 @@ async fn stop_all_cancels_scheduled_loop_token_and_registry() {
         "CancelTurn must not stop scheduled loops"
     );
 
-    driver.cancel_handle().cancel_all_session_work();
-    driver.schedule.cancel_all();
+    let through = driver.cancel_handle().cancel_all_session_work();
+    driver.apply_session_work_stop(through);
     assert!(
         token.is_cancelled(),
         "Stop must cancel the loop's inference token"

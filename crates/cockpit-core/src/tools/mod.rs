@@ -59,6 +59,7 @@ pub mod text_search;
 pub mod thread_start;
 pub mod todo;
 pub mod transcribe_audio;
+pub mod trusted_child_acquisition;
 pub mod unlock;
 pub mod use_sealed_value;
 pub mod web;

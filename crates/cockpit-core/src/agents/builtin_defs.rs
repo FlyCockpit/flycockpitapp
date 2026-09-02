@@ -137,6 +137,7 @@ pub(crate) fn embedded_internal_default(name: &str) -> Option<AgentDef> {
         "docs-answerer" => Some(docs_answerer_def()),
         "Dream" => Some(dream_def()),
         "dream-worker" => Some(dream_worker_def()),
+        "sealed-acquisition" => Some(sealed_acquisition_def()),
         "standard" => Some(standard_def()),
         _ => None,
     }
@@ -381,6 +382,7 @@ fn assistant_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             "write",
             "edit",
             "delete",
@@ -417,6 +419,7 @@ fn careful_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             "search",
             "write",
             "edit",
@@ -462,6 +465,7 @@ fn build_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             // full intel (GOALS §21)
             "context_pack",
             "code",
@@ -702,6 +706,7 @@ fn plan_def() -> AgentDef {
         &[
             "read",
             "bash",
+            "acquire_sealed_value",
             // full intel (GOALS §21)
             "context_pack",
             "code",
@@ -861,6 +866,31 @@ fn docs_answerer_def() -> AgentDef {
                 .to_string(),
         ),
     );
+    def
+}
+
+fn sealed_acquisition_def() -> AgentDef {
+    let mut def = def(
+        "sealed-acquisition",
+        "Host-constrained trusted-child credential acquisition profile.",
+        AgentMode::Subagent,
+        &[
+            "run_acquisition_command",
+            "list_sealed_value_descriptions",
+            "use_sealed_value",
+            "capture_sealed_value",
+            "acquisition_requires_user",
+            "acquisition_fail",
+        ],
+        crate::engine::builtin::SEALED_ACQUISITION_PROMPT,
+    );
+    def.scan_tool_results = Some(false);
+    if let Some(vnext) = &mut def.vnext {
+        vnext
+            .capabilities
+            .insert(AgentCapability::SealedAcquisitionCapture);
+        vnext.allowed_knowledge_bases = Some(std::collections::BTreeSet::new());
+    }
     def
 }
 

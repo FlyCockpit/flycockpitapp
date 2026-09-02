@@ -101,6 +101,10 @@ pub enum AgentCapability {
     SandboxEscalate,
     ForkContext,
     ScopedParallelWrite,
+    /// Request for the host-only trusted-child acquisition sub-profile. A
+    /// definition can declare the request, but ordinary posture resolution
+    /// never turns it into authority; only the owner acquisition action does.
+    SealedAcquisitionCapture,
 }
 
 impl AgentCapability {
@@ -111,6 +115,7 @@ impl AgentCapability {
             "sandboxEscalate" => Some(Self::SandboxEscalate),
             "forkContext" => Some(Self::ForkContext),
             "scopedParallelWrite" => Some(Self::ScopedParallelWrite),
+            "sealedAcquisitionCapture" => Some(Self::SealedAcquisitionCapture),
             _ => None,
         }
     }
@@ -122,6 +127,7 @@ impl AgentCapability {
             Self::SandboxEscalate => "sandboxEscalate",
             Self::ForkContext => "forkContext",
             Self::ScopedParallelWrite => "scopedParallelWrite",
+            Self::SealedAcquisitionCapture => "sealedAcquisitionCapture",
         }
     }
 }
@@ -237,7 +243,13 @@ impl PostureResolution {
                         .capabilities
                         .iter()
                         .copied()
-                        .filter(|capability| *capability != AgentCapability::ComputerUse)
+                        .filter(|capability| {
+                            !matches!(
+                                capability,
+                                AgentCapability::ComputerUse
+                                    | AgentCapability::SealedAcquisitionCapture
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -572,6 +584,11 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
         return validate_invariants(def);
     };
     vnext.validate()?;
+    // Admission of the complete acquisition-private class must inspect the
+    // original definition: its empty source + portable id + capability are
+    // binary-stamped provenance. Never ask a provenance-stripped legacy clone
+    // to reconstruct that fact.
+    validate_invariants(def)?;
     let Some(tools) = &def.tools else {
         return Ok(());
     };
@@ -580,7 +597,19 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
     // workspace launch-v1 documents default to `All`.
     let mut legacy = def.clone();
     legacy.vnext = None;
-    legacy.tools = Some(tools.clone());
+    legacy.tools = Some(
+        tools
+            .iter()
+            .filter(|tool| !invariants::is_acquisition_private_tool(tool))
+            .cloned()
+            .collect(),
+    );
+    legacy
+        .tool_tiers
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
+    legacy
+        .tool_descriptions
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
     validate_invariants(&legacy)
 }
 

@@ -1102,6 +1102,7 @@ mod tests {
             ring,
             attached_knowledge_read: true,
             kill_tx,
+            pgid: Arc::new(Mutex::new(None)),
         };
 
         let tail = handle.tail(10, &RedactionTable::empty());

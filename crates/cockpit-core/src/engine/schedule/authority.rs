@@ -1368,6 +1368,7 @@ fn background_label(args: &BackgroundStartArgs) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::schedule::SessionWorkCancel;
     use crate::engine::schedule::spec::parse_loop_start;
     use std::time::Duration;
 
@@ -1474,7 +1475,7 @@ mod tests {
             turn_tx,
             ctx,
             max,
-            super::SessionWorkCancel::new(),
+            SessionWorkCancel::new(),
         );
         (authority, event_rx, turn_rx, tmp)
     }

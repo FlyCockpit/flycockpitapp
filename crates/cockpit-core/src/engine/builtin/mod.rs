@@ -1161,6 +1161,14 @@ pub(crate) fn materialize_tool_by_name(
     args: &SpawnArgs,
 ) -> Result<ToolBox> {
     use crate::tools;
+    if crate::agents::invariants::is_acquisition_private_tool(name)
+        && !def.is_some_and(crate::agents::invariants::is_binary_owned_sealed_acquisition)
+    {
+        let agent = def.map_or("unattributed definition", |def| def.name.as_str());
+        bail!(
+            "agent `{agent}` may not materialize binary-owned trusted-child acquisition tool `{name}`"
+        );
+    }
     // Noninteractive/background agents are never eligible to inherit a
     // foreground root's session authority. Do not even retain a dormant media
     // factory on their per-agent toolbox: a concurrent foreground turn may
@@ -7365,6 +7373,49 @@ pub(crate) mod tests {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
+    }
+
+    #[test]
+    fn acquisition_private_tools_materialize_only_for_binary_owned_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let embedded = crate::agents::embedded_internal_default("sealed-acquisition")
+            .expect("embedded sealed acquisition definition");
+        for name in crate::agents::invariants::ACQUISITION_PRIVATE_TOOLS {
+            let toolbox = materialize_tool_by_name(ToolBox::new(), name, Some(&embedded), &args)
+                .unwrap_or_else(|error| panic!("embedded acquisition tool {name}: {error}"));
+            assert_eq!(toolbox.names(), vec![*name]);
+
+            let mut forged = embedded.clone();
+            forged.source = "workspace/sealed-acquisition.md".into();
+            let error = materialize_tool_by_name(ToolBox::new(), name, Some(&forged), &args)
+                .err()
+                .expect("workspace definition must not materialize private tool")
+                .to_string();
+            assert!(error.contains(name), "{error}");
+
+            let error = materialize_tool_by_name(ToolBox::new(), name, None, &args)
+                .err()
+                .expect("unattributed materialization must fail closed")
+                .to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn binary_owned_sealed_acquisition_constructs_through_builtin_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = load("sealed-acquisition", &test_spawn_args(tmp.path()))
+            .expect("embedded sealed-acquisition must survive host projection and construct");
+        let names = agent.tools.names();
+        for private_tool in crate::agents::invariants::ACQUISITION_PRIVATE_TOOLS {
+            assert!(
+                names.contains(private_tool),
+                "constructed sealed-acquisition surface lacks {private_tool}: {names:?}"
+            );
+        }
+        let definition = agent.definition.expect("constructed definition snapshot");
+        assert!(crate::agents::invariants::is_binary_owned_sealed_acquisition(&definition));
     }
 
     /// Dead native `handoff` tool must not be grantable, inventoried, or

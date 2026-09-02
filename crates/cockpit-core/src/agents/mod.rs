@@ -584,6 +584,11 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
         return validate_invariants(def);
     };
     vnext.validate()?;
+    // Admission of the complete acquisition-private class must inspect the
+    // original definition: its empty source + portable id + capability are
+    // binary-stamped provenance. Never ask a provenance-stripped legacy clone
+    // to reconstruct that fact.
+    validate_invariants(def)?;
     let Some(tools) = &def.tools else {
         return Ok(());
     };
@@ -592,7 +597,19 @@ fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
     // workspace launch-v1 documents default to `All`.
     let mut legacy = def.clone();
     legacy.vnext = None;
-    legacy.tools = Some(tools.clone());
+    legacy.tools = Some(
+        tools
+            .iter()
+            .filter(|tool| !invariants::is_acquisition_private_tool(tool))
+            .cloned()
+            .collect(),
+    );
+    legacy
+        .tool_tiers
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
+    legacy
+        .tool_descriptions
+        .retain(|tool, _| !invariants::is_acquisition_private_tool(tool));
     validate_invariants(&legacy)
 }
 

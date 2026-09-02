@@ -74,11 +74,34 @@ pub const STRUCTURAL_TOOLS: &[&str] = &[
     "start_build",
 ];
 
-const ACQUISITION_TERMINAL_TOOLS: &[&str] = &[
+/// Host-private tools exposed only to the binary-owned sealed-acquisition
+/// child. Keep the class centralized: every definition, delegation, and
+/// materialization admission seam consults this exact predicate.
+pub(crate) const ACQUISITION_PRIVATE_TOOLS: &[&str] = &[
+    "run_acquisition_command",
     "capture_sealed_value",
     "acquisition_requires_user",
     "acquisition_fail",
 ];
+
+pub(crate) fn is_acquisition_private_tool(tool: &str) -> bool {
+    ACQUISITION_PRIVATE_TOOLS.contains(&tool)
+}
+
+/// The empty source and reserved portable identity are stamped only by the
+/// embedded-definition constructor. A workspace or daemon-snapshot definition
+/// cannot acquire this provenance merely by choosing the reserved display
+/// name.
+pub(crate) fn is_binary_owned_sealed_acquisition(def: &AgentDef) -> bool {
+    def.name == "sealed-acquisition"
+        && def.source.as_os_str().is_empty()
+        && def.vnext.as_ref().is_some_and(|vnext| {
+            vnext.agent_id == "cockpit/sealed-acquisition"
+                && vnext
+                    .capabilities
+                    .contains(&super::AgentCapability::SealedAcquisitionCapture)
+        })
+}
 
 /// Tools that may be granted **only to primary (chat-owning) agents** —
 /// the external-harness delegation tools (GOALS §6,
@@ -191,12 +214,9 @@ pub fn validate_grant(
                 "delegation to `{target_name}` may not be granted the docs-answerer-only sandboxed tool `{tool}`"
             );
         }
-        if ACQUISITION_TERMINAL_TOOLS.contains(&tool.as_str())
-            && target_name != "sealed-acquisition"
-        {
+        if is_acquisition_private_tool(tool) {
             bail!(
-                "agent `{}` may request but may not grant itself the trusted-child acquisition sub-profile tool `{tool}`",
-                target_name
+                "delegation to `{target_name}` may not be granted binary-owned trusted-child acquisition tool `{tool}`"
             );
         }
         if tool == SPAWN_TOOL && !SPAWN_AGENTS.contains(&target_name) {
@@ -312,6 +332,25 @@ pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
 pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     validate_posture_fields(def)?;
     validate_read_image_tier_override(def)?;
+    for tool in def
+        .tools
+        .iter()
+        .flat_map(|tools| tools.iter())
+        .chain(def.tool_tiers.keys())
+        .chain(def.tool_descriptions.keys())
+        .chain(
+            def.vnext
+                .iter()
+                .flat_map(|vnext| vnext.tool_tier_preferences.keys()),
+        )
+    {
+        if is_acquisition_private_tool(tool) && !is_binary_owned_sealed_acquisition(def) {
+            bail!(
+                "agent `{}` may not hold binary-owned trusted-child acquisition tool `{tool}`",
+                def.name
+            );
+        }
+    }
     if let Some(vnext) = &def.vnext {
         // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
@@ -552,6 +591,75 @@ mod grant_tests {
     #[test]
     fn empty_grant_ok() {
         assert!(validate_grant("explore", AgentMode::Subagent, &[]).is_ok());
+    }
+
+    #[test]
+    fn acquisition_private_class_is_complete_and_never_delegation_grantable() {
+        assert_eq!(
+            ACQUISITION_PRIVATE_TOOLS,
+            &[
+                "run_acquisition_command",
+                "capture_sealed_value",
+                "acquisition_requires_user",
+                "acquisition_fail",
+            ]
+        );
+        for tool in ACQUISITION_PRIVATE_TOOLS {
+            for target in ["sealed-acquisition", "custom-child"] {
+                let error = validate_grant(target, AgentMode::Subagent, &g(&[tool]))
+                    .expect_err("binary-owned acquisition tools are not parent-grantable")
+                    .to_string();
+                assert!(error.contains(tool), "{error}");
+                assert!(error.contains("binary-owned"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_private_class_requires_embedded_provenance_in_base_definition() {
+        let embedded = crate::agents::embedded_internal_default("sealed-acquisition")
+            .expect("embedded sealed acquisition definition");
+        assert!(is_binary_owned_sealed_acquisition(&embedded));
+        validate_invariants(&embedded).expect("binary-owned definition owns private tools");
+
+        for tool in ACQUISITION_PRIVATE_TOOLS {
+            let forged = tiered_def("sealed-acquisition", &[tool], tool, ToolTier::Enabled);
+            let error = validate_invariants(&forged)
+                .expect_err("display name alone cannot forge acquisition provenance")
+                .to_string();
+            assert!(error.contains(tool), "{error}");
+
+            let mut forged_vnext = embedded.clone();
+            forged_vnext.source = "workspace/sealed-acquisition.md".into();
+            forged_vnext.tools = Some(g(&[tool]));
+            let error = validate_invariants(&forged_vnext)
+                .expect_err("launch-v1 early return cannot bypass private-tool admission")
+                .to_string();
+            assert!(error.contains(tool), "{error}");
+        }
+    }
+
+    #[test]
+    fn authored_vnext_preferences_cannot_request_any_acquisition_private_tool() {
+        let embedded = crate::agents::embedded_internal_default("sealed-acquisition")
+            .expect("embedded sealed acquisition definition");
+        for tool in ACQUISITION_PRIVATE_TOOLS {
+            let mut authored = embedded.clone();
+            authored.source = "workspace/custom.md".into();
+            authored.name = "custom".into();
+            let vnext = authored.vnext.as_mut().expect("launch-v1 definition");
+            vnext.agent_id = "workspace/custom".into();
+            vnext.capabilities.clear();
+            vnext
+                .tool_tier_preferences
+                .insert((*tool).to_string(), ToolTier::Enabled);
+
+            let error = validate_invariants(&authored)
+                .expect_err("authored preference must not name a private acquisition tool")
+                .to_string();
+            assert!(error.contains(tool), "{error}");
+            assert!(error.contains("binary-owned"), "{error}");
+        }
     }
 
     /// Write/lock tools are not grantable per delegation: write-capability is

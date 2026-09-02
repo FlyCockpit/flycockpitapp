@@ -17,8 +17,13 @@
 //!
 //! Persistence honors cockpit's existing config discovery
 //! ([`crate::config::dirs`], [`crate::git::find_worktree_root`]) — no new
-//! location scheme. Project/Global are plain JSON files written
-//! atomically (temp + rename); Session lives in SQLite.
+//! location scheme. Project/Global are plain JSON files written atomically
+//! (owner-only temp + fsync + rename) under a cross-process lock; Session
+//! lives in SQLite. A corrupt or unreadable `approvals.json` fails closed
+//! (issue #297): the corrupt bytes are quarantined for diagnosis — renamed
+//! aside, never deleted — and approval-dependent decisions are refused
+//! with a repair-oriented error rather than silently dropping every
+//! standing allow/reject entry.
 //!
 //! ## Wrappers are never persisted (priority #1)
 //!
@@ -411,6 +416,42 @@ impl GrantStore {
             scopes.push(Scope::Global);
         }
         scopes
+    }
+
+    /// Fail-closed health gate over the approvals files (issue #297),
+    /// checked at approval-decision boundaries before any grant/reject
+    /// lookup. A missing store file is the normal first-run state
+    /// (healthy). A corrupt or unreadable file is quarantined by the load
+    /// and fails closed with a repair-oriented error — a corrupt
+    /// `approvals.json` can never silently drop standing rejects and
+    /// proceed as if nothing were saved. The gate also refuses while a
+    /// quarantine copy from an earlier detection is still present (the
+    /// store has not been repaired yet), including one left by another
+    /// process.
+    pub fn approvals_store_health(&self) -> Result<()> {
+        for dir in [
+            self.project_approvals_dir.as_deref(),
+            self.global_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(corrupt) = load_approvals(dir) {
+                tracing::error!(
+                    path = %corrupt.path.display(),
+                    preserved = ?corrupt.preserved,
+                    error = %corrupt.error,
+                    "corrupt approvals store detected; refusing approval-dependent actions fail closed"
+                );
+                return Err(anyhow::Error::msg(corrupt.refusal_message()));
+            }
+            if let Some(residue) = find_quarantine_residue(dir) {
+                return Err(anyhow::Error::msg(quarantine_residue_refusal(
+                    &residue,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Whether a command key is already **allowed** at *any* scope that
@@ -1168,20 +1209,21 @@ impl GrantStore {
         signature: &str,
         verdict: LoopVerdict,
     ) -> Result<()> {
-        let mut file = load_approvals(dir).unwrap_or_default();
-        // Clear the opposite verdict so the file never carries a
-        // contradictory pair for one signature.
-        match verdict {
-            LoopVerdict::Accept => {
-                file.loop_reject.remove(signature);
-                file.loop_accept.insert(signature.to_string());
+        mutate_approvals(dir, |file| {
+            // Clear the opposite verdict so the file never carries a
+            // contradictory pair for one signature.
+            match verdict {
+                LoopVerdict::Accept => {
+                    file.loop_reject.remove(signature);
+                    file.loop_accept.insert(signature.to_string());
+                }
+                LoopVerdict::Reject => {
+                    file.loop_accept.remove(signature);
+                    file.loop_reject.insert(signature.to_string());
+                }
             }
-            LoopVerdict::Reject => {
-                file.loop_accept.remove(signature);
-                file.loop_reject.insert(signature.to_string());
-            }
-        }
-        store_approvals(dir, &file)
+            (true, ())
+        })
     }
 
     // ---- internals --------------------------------------------------------
@@ -1423,16 +1465,46 @@ impl GrantStore {
 
     // ---- project / global scope (JSON files) ------------------------------
 
+    /// Load the project `approvals.json`. A corrupt/unreadable file reads as
+    /// `None` (no grants) after the load quarantined it — conservative, and
+    /// the decision-boundary health gate (or the next decision's) refuses
+    /// with a visible error instead of proceeding on the dropped entries.
     fn project_file(&self) -> Option<ApprovalsFile> {
         let dir = self.project_approvals_dir.as_ref()?;
-        load_approvals(dir)
+        match load_approvals(dir) {
+            Ok(file) => file,
+            Err(corrupt) => {
+                tracing::error!(
+                    path = %corrupt.path.display(),
+                    error = %corrupt.error,
+                    "corrupt project approvals store read; treating as no grants until the health gate refuses"
+                );
+                None
+            }
+        }
     }
 
+    /// Load the global `approvals.json`, mirroring [`Self::project_file`].
     fn global_file(&self) -> Option<ApprovalsFile> {
         let dir = self.global_dir.as_ref()?;
-        load_approvals(dir)
+        match load_approvals(dir) {
+            Ok(file) => file,
+            Err(corrupt) => {
+                tracing::error!(
+                    path = %corrupt.path.display(),
+                    error = %corrupt.error,
+                    "corrupt global approvals store read; treating as no grants until the health gate refuses"
+                );
+                None
+            }
+        }
     }
 
+    /// Insert a grant into the `approvals.json` in `dir` via one locked
+    /// read-modify-write cycle. A corrupt store fails closed — the corrupt
+    /// bytes were already quarantined by the load and this refuses instead
+    /// of recreating a fresh store that silently drops every standing
+    /// entry.
     fn file_insert(
         &self,
         dir: &Path,
@@ -1442,27 +1514,27 @@ impl GrantStore {
         access: Option<SandboxPathAccess>,
         risk_tier: Option<RiskTier>,
     ) -> Result<()> {
-        let mut file = load_approvals(dir).unwrap_or_default();
-        // Clear the opposite polarity within this same file too, so one
-        // `approvals.json` never lists a key in both an allow and a reject
-        // set (belt-and-braces with `clear_key_everywhere`, which already
-        // visited this scope — but this keeps `file_insert` self-consistent).
-        verdict_remove(&mut file, kind, verdict.opposite(), key);
-        verdict_insert(&mut file, kind, verdict, key, access, risk_tier);
-        store_approvals(dir, &file)
+        mutate_approvals(dir, |file| {
+            // Clear the opposite polarity within this same file too, so one
+            // `approvals.json` never lists a key in both an allow and a reject
+            // set (belt-and-braces with `clear_key_everywhere`, which already
+            // visited this scope — but this keeps `file_insert`
+            // self-consistent).
+            verdict_remove(file, kind, verdict.opposite(), key);
+            verdict_insert(file, kind, verdict, key, access, risk_tier);
+            (true, ())
+        })
     }
 
     /// Remove a grant of `verdict` polarity for an exact `key` from the
     /// `approvals.json` in `dir`. A missing file / missing key is a no-op
-    /// (no write). Used to clear the opposite polarity before writing.
+    /// (no write). A corrupt store fails closed with the quarantine
+    /// refusal instead of being silently treated as empty. Used to clear
+    /// the opposite polarity before writing.
     fn file_remove(&self, dir: &Path, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
-        let Some(mut file) = load_approvals(dir) else {
-            return Ok(());
-        };
-        if verdict_remove(&mut file, kind, verdict, key) {
-            store_approvals(dir, &file)?;
-        }
-        Ok(())
+        mutate_approvals(dir, |file| {
+            (verdict_remove(file, kind, verdict, key), ())
+        })
     }
 }
 
@@ -1709,12 +1781,27 @@ impl ManagedGrants {
 }
 
 /// Read every persisted grant from the `approvals.json` in `dir` (the
-/// machine-local project approvals dir or the global config dir). A missing or
-/// unparseable file reads as no grants — the management UI shows an empty
-/// scope, never an error. Entries come out sorted by the on-disk `BTreeMap`
-/// / `BTreeSet` ordering, so the listing is stable.
+/// machine-local project approvals dir or the global config dir). A missing
+/// file reads as no grants — the management UI shows an empty scope, never an
+/// error. A corrupt file is quarantined (renamed aside, never deleted) and
+/// reads as no grants here; the approval-decision health gate refuses
+/// approval-dependent actions while the quarantine copy exists, so the
+/// corruption surfaces there with a repair-oriented error. Entries come out
+/// sorted by the on-disk `BTreeMap` / `BTreeSet` ordering, so the listing is
+/// stable.
 pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
-    let file = load_approvals(dir).unwrap_or_default();
+    let file = match load_approvals(dir) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(corrupt) => {
+            tracing::error!(
+                path = %corrupt.path.display(),
+                preserved = ?corrupt.preserved,
+                error = %corrupt.error,
+                "corrupt approvals store detected; quarantined for diagnosis and listing as empty"
+            );
+            ApprovalsFile::default()
+        }
+    };
     ManagedGrants {
         commands: file
             .commands
@@ -1738,57 +1825,272 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
 }
 
 /// Remove a single grant `key` of `kind` from the `approvals.json` in
-/// `dir`, rewriting the file via the same load→mutate→atomic-store path
-/// the approval store uses to *record* grants. Reloading first means a
-/// concurrent edit to a different entry is preserved (we only drop the one
-/// key, never clobber the whole file from a stale snapshot). Returns `true`
-/// if the key was present and removed; `false` (no write) if it wasn't —
-/// so a double-delete or a vanished entry is a harmless no-op. The change
-/// takes effect on the next approval check, which re-reads the file.
+/// `dir`, rewriting the file via the same locked load→mutate→atomic-store
+/// path the approval store uses to *record* grants. Holding the approvals
+/// lock across the whole cycle means a concurrent edit to a different
+/// entry is preserved (we only drop the one key, never clobber the whole
+/// file from a stale snapshot). A corrupt store fails closed with the
+/// quarantine refusal — it is never silently treated as empty and
+/// rewritten. Returns `true` if the key was present and removed; `false`
+/// (no write) if it wasn't — so a double-delete or a vanished entry is a
+/// harmless no-op. The change takes effect on the next approval check,
+/// which re-reads the file.
 pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
-    let mut file = load_approvals(dir).unwrap_or_default();
-    let removed = match kind {
-        ManagedGrantKind::Command => {
-            if file.commands.remove(key).is_some() {
-                true
-            } else {
-                let stored = file
-                    .commands
-                    .keys()
-                    .find(|stored| command_shape_display(stored) == key)
-                    .cloned();
-                stored.is_some_and(|stored| file.commands.remove(&stored).is_some())
+    mutate_approvals(dir, |file| {
+        let removed = match kind {
+            ManagedGrantKind::Command => {
+                if file.commands.remove(key).is_some() {
+                    true
+                } else {
+                    let stored = file
+                        .commands
+                        .keys()
+                        .find(|stored| command_shape_display(stored) == key)
+                        .cloned();
+                    stored.is_some_and(|stored| file.commands.remove(&stored).is_some())
+                }
             }
-        }
-        ManagedGrantKind::Path => file.paths.remove(key).is_some(),
-        ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
-        ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
-        ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
-    };
-    if !removed {
-        return Ok(false);
-    }
-    store_approvals(dir, &file)?;
-    Ok(true)
+            ManagedGrantKind::Path => file.paths.remove(key).is_some(),
+            ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
+            ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
+            ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
+        };
+        (removed, removed)
+    })
 }
 
 /// File name for the per-scope approvals store inside an approvals dir.
 const APPROVALS_FILE: &str = "approvals.json";
 
-fn load_approvals(dir: &Path) -> Option<ApprovalsFile> {
-    let path = dir.join(APPROVALS_FILE);
-    let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Cross-process advisory lock guarding every `approvals.json`
+/// read-modify-write cycle (issue #297). The lock file itself never holds
+/// store data.
+const APPROVALS_LOCK_FILE: &str = "approvals.json.lock";
+
+/// Name prefix of the quarantine copies a corrupt approvals file is renamed
+/// aside to — `approvals.json.corrupt-<unix_ms>[-<n>]` — so the original
+/// bytes survive for diagnosis. Never deleted.
+const APPROVALS_QUARANTINE_PREFIX: &str = "approvals.json.corrupt";
+
+/// A corrupt/unreadable approvals store detected at load time (issue #297).
+/// The store fails closed around one of these: the corrupt bytes are
+/// preserved for diagnosis by renaming the file aside — never deleted or
+/// overwritten — and approval-dependent decisions are refused with a
+/// repair-oriented error instead of silently dropping every standing
+/// allow/reject entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptApprovalsStore {
+    /// The store file that failed to load.
+    pub path: PathBuf,
+    /// Where the corrupt bytes were preserved (rename aside). `None` when
+    /// the quarantine rename itself failed — the original file is then
+    /// left in place, still never deleted.
+    pub preserved: Option<PathBuf>,
+    /// Why the load failed (read or JSON parse error).
+    pub error: String,
 }
 
-/// Write `file` to `<dir>/approvals.json` atomically (temp + rename) so a
-/// crash mid-write can't corrupt the store. Creates `dir` if needed.
-fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
+impl CorruptApprovalsStore {
+    /// Repair-oriented refusal: what was found, where the original bytes
+    /// are preserved, and how to recover. Surfaced verbatim to the user
+    /// at the approval-decision boundary.
+    pub fn refusal_message(&self) -> String {
+        match &self.preserved {
+            Some(preserved) => format!(
+                "approval store `{}` is corrupt ({}) and was set aside for diagnosis at \
+                 `{}`; nothing was deleted. This action is refused rather than silently \
+                 dropping saved allow/reject decisions. Restore `{}` from the preserved \
+                 copy as valid JSON and remove the `{}` copy, then re-run the action.",
+                self.path.display(),
+                self.error,
+                preserved.display(),
+                self.path.display(),
+                preserved.display(),
+            ),
+            None => format!(
+                "approval store `{}` could not be read ({}) and its contents are \
+                 untrustworthy. This action is refused rather than silently dropping \
+                 saved allow/reject decisions. Repair the file to valid JSON, then \
+                 re-run the action.",
+                self.path.display(),
+                self.error,
+            ),
+        }
+    }
+}
+
+/// Load the `approvals.json` in `dir`. A missing file is `Ok(None)` — the
+/// normal first-run state. A corrupt/unreadable file is an error: the
+/// corrupt bytes are renamed aside — never deleted — so they survive for
+/// diagnosis and can never be silently overwritten by a later write.
+fn load_approvals(
+    dir: &Path,
+) -> std::result::Result<Option<ApprovalsFile>, CorruptApprovalsStore> {
+    let path = dir.join(APPROVALS_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CorruptApprovalsStore {
+                path,
+                preserved: None,
+                error: error.to_string(),
+            });
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) => Err(CorruptApprovalsStore {
+            preserved: quarantine_corrupt_approvals(&path),
+            path,
+            error: error.to_string(),
+        }),
+    }
+}
+
+/// Rename a corrupt approvals file aside so its contents are preserved for
+/// diagnosis — never deleted — and the store path is vacated for repair.
+/// Best-effort and collision-tolerant: on failure the original is left in
+/// place (the caller still fails closed) and `None` is returned.
+fn quarantine_corrupt_approvals(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let stem = path.file_name()?.to_str()?.to_string();
+    let millis = chrono::Utc::now().timestamp_millis();
+    for attempt in 0..16u32 {
+        let candidate = if attempt == 0 {
+            dir.join(format!("{stem}.corrupt-{millis}"))
+        } else {
+            dir.join(format!("{stem}.corrupt-{millis}-{attempt}"))
+        };
+        match std::fs::rename(path, &candidate) {
+            Ok(()) => return Some(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    attempt,
+                    "quarantine rename attempt failed"
+                );
+            }
+        }
+    }
+    tracing::error!(
+        path = %path.display(),
+        "quarantining the corrupt approvals store failed; refusing without renaming"
+    );
+    None
+}
+
+/// Find a preserved quarantine copy in `dir`, if any. Its presence keeps
+/// approval-dependent actions refused (the store has not been repaired
+/// yet), including a quarantine left by another process.
+fn find_quarantine_residue(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(APPROVALS_QUARANTINE_PREFIX))
+        })
+}
+
+/// Refusal for a store whose corruption was already quarantined earlier
+/// (the live load now succeeds on the vacated path, but the owner has not
+/// repaired the store yet). Fail closed until the residue is resolved.
+fn quarantine_residue_refusal(residue: &Path) -> String {
+    format!(
+        "a corrupt approvals store was quarantined earlier; its original bytes are \
+         preserved at `{}` (never deleted). Approval-dependent actions are refused \
+         until the store is repaired: restore or repair `{}` to valid JSON and \
+         remove the preserved copy, then re-run the action.",
+        residue.display(),
+        residue.with_file_name(APPROVALS_FILE).display(),
+    )
+}
+
+/// Open a private (owner-only on unix) file for the approvals lock and the
+/// atomic temp file, so neither is ever world-readable.
+#[cfg(unix)]
+fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+/// Open the cross-process advisory lock guarding `<dir>/approvals.json` and
+/// block until it is held exclusively (issue #297: concurrent writers used
+/// to be able to clobber the store with a stale read-modify-write
+/// snapshot). The lock is released when the returned file is dropped.
+fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock_path = dir.join(APPROVALS_LOCK_FILE);
+    let file =
+        open_private_file(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    // `File::lock` is the std blocking exclusive advisory lock (flock on
+    // unix, LockFileEx on windows): cross-process and cross-thread.
+    file.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(file)
+}
+
+/// Run one read-modify-write cycle on `<dir>/approvals.json` under the
+/// cross-process lock (load → mutate → atomic store while holding
+/// `approvals.json.lock`), so concurrent writers serialize instead of
+/// clobbering each other's entries with stale snapshots. The closure
+/// returns `(changed, value)`; the file is rewritten only when `changed`.
+/// A corrupt/unreadable store fails closed with
+/// [`CorruptApprovalsStore::refusal_message`] — never a silent
+/// `unwrap_or_default()` that would overwrite the corrupt bytes and drop
+/// every standing entry.
+fn mutate_approvals<R>(
+    dir: &Path,
+    mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
+) -> Result<R> {
+    let _lock = lock_approvals(dir)?;
+    let mut file = match load_approvals(dir) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(corrupt) => return Err(anyhow::Error::msg(corrupt.refusal_message())),
+    };
+    let (changed, value) = mutate(&mut file);
+    if changed {
+        store_approvals(dir, &file)?;
+    }
+    Ok(value)
+}
+
+/// Write `file` to `<dir>/approvals.json` atomically (owner-only temp file +
+/// fsync + rename) so a crash mid-write can't corrupt the store and the
+/// file is never world-readable. Called with the approvals lock held.
+fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
     let path = dir.join(APPROVALS_FILE);
     let tmp = dir.join(format!("{APPROVALS_FILE}.tmp"));
     let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
-    std::fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
+    let mut out =
+        open_private_file(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    {
+        use std::io::Write as _;
+        out.write_all(&json)
+            .and_then(|()| out.sync_all())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
 }
@@ -3467,6 +3769,176 @@ mod tests {
         // No file at all: deleting an absent key returns false, writes nothing.
         assert!(!delete_managed_grant(dir.path(), ManagedGrantKind::Command, "nope").unwrap());
         assert!(!dir.path().join(APPROVALS_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn approvals_store_missing_files_are_healthy_first_run_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        // No approvals.json anywhere: the normal first-run state, not a
+        // refusal.
+        store.approvals_store_health().unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_store_fails_closed_instead_of_dropping_standing_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("rm", Some("-rf"), false);
+
+        // Seed a standing project-scope reject.
+        store
+            .record_command_reject(&info, Scope::Project)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.command_reject_scope(&info.key).await,
+            Some(Scope::Project)
+        );
+
+        // Corrupt the persisted store (as a partial write or disk damage
+        // would).
+        let dir = test_project_dir(&store).to_path_buf();
+        let store_path = dir.join(APPROVALS_FILE);
+        let valid_bytes = std::fs::read(&store_path).unwrap();
+        let corrupt_bytes = b"{\"commands_reject\": ".as_slice();
+        std::fs::write(&store_path, corrupt_bytes).unwrap();
+
+        // The health gate fails closed with a visible, repair-oriented
+        // error — the standing reject is not silently dropped.
+        let err = store.approvals_store_health().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("corrupt"), "{msg}");
+        assert!(msg.contains("approvals.json"), "{msg}");
+        assert!(msg.contains("Restore"), "{msg}");
+
+        // The corrupt bytes were preserved for diagnosis — renamed aside,
+        // never deleted — and the active store path is vacated.
+        assert!(!store_path.exists());
+        let residue = find_quarantine_residue(&dir).expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
+
+        // Still refusing: the store has not been repaired yet.
+        assert!(store.approvals_store_health().is_err());
+
+        // Repair: restore the valid store and remove the quarantine copy.
+        std::fs::write(&store_path, &valid_bytes).unwrap();
+        std::fs::remove_file(&residue).unwrap();
+        store.approvals_store_health().unwrap();
+
+        // The standing reject is honored again.
+        assert_eq!(
+            store.command_reject_scope(&info.key).await,
+            Some(Scope::Project)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_global_approvals_store_refuses_the_health_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        std::fs::write(global.path().join(APPROVALS_FILE), b"not json at all").unwrap();
+
+        let err = store.approvals_store_health().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("corrupt"), "{msg}");
+        // The corrupt global store was quarantined, not deleted.
+        let residue =
+            find_quarantine_residue(global.path()).expect("global quarantine copy preserved");
+        assert_eq!(
+            std::fs::read(&residue).unwrap(),
+            b"not json at all".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_into_corrupt_approvals_store_fails_closed_without_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("gh", Some("pr"), false);
+
+        // Corrupt the project store before any record.
+        let dir = test_project_dir(&store).to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join(APPROVALS_FILE);
+        let corrupt_bytes = b"{".as_slice();
+        std::fs::write(&store_path, corrupt_bytes).unwrap();
+
+        // A record at project scope must fail closed rather than recreate a
+        // fresh store that silently drops every standing entry.
+        let err = match store
+            .record_command(&info, RiskTier::Mutating, Scope::Project)
+            .await
+        {
+            Ok(()) => panic!("recording into a corrupt store must fail closed"),
+            Err(StoreError::Io(error)) => format!("{error:#}"),
+            Err(other) => panic!("unexpected store error: {other}"),
+        };
+        assert!(err.contains("corrupt"), "{err}");
+
+        // The corrupt bytes are preserved (renamed aside, never deleted) and
+        // the active store path was NOT rewritten with a fresh file.
+        assert!(!store_path.exists());
+        let residue = find_quarantine_residue(&dir).expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
+    }
+
+    #[test]
+    fn approvals_writes_are_serialized_and_owner_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(APPROVALS_FILE);
+
+        // Seed one entry.
+        mutate_approvals(dir.path(), |file| {
+            file.commands_reject.insert("seed".to_string());
+            (true, ())
+        })
+        .unwrap();
+
+        // Concurrent read-modify-write cycles must serialize under the
+        // cross-process lock: every writer's entry survives.
+        let mut handles = Vec::new();
+        for writer in 0..8u32 {
+            let dir = dir.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                mutate_approvals(&dir, move |file| {
+                    file.commands_reject.insert(format!("key-{writer}"));
+                    (true, ())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        for writer in 0..8u32 {
+            assert!(
+                file.commands_reject.contains(&format!("key-{writer}")),
+                "writer {writer}'s entry was clobbered"
+            );
+        }
+        assert!(file.commands_reject.contains("seed"));
+        assert!(store_path.exists());
+
+        // The store file and the lock file are never world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "approvals.json must be owner-only");
+            let lock_mode = std::fs::metadata(dir.path().join(APPROVALS_LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(lock_mode, 0o600, "approvals lock must be owner-only");
+        }
     }
 
     #[tokio::test]

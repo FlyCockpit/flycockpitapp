@@ -2,9 +2,9 @@
 //!
 //! One actor thread serializes create/rotate/retire against the wrap-key vault
 //! (and, for tests, an injected [`fake::FakeNativeStore`]). Production KEK
-//! placement is the OS keyring on first-run when the probe is available,
-//! otherwise a `private_fs` file. dest=database is rejected while the probe
-//! is available. Tests never touch real OS keyrings or mutate
+//! placement defaults to the OS keyring on first-run when available, while an
+//! explicit first-run intent can select the machine-bound or passphrase file
+//! vault. Tests never touch real OS keyrings or mutate
 //! the process-global default store.
 //!
 //! Consumer ciphertext tables integrate via transaction-scoped hooks
@@ -46,7 +46,8 @@ pub use consumer::{
 };
 pub use error::SecureKeyError;
 pub use kek_store::{
-    FileKekStore, KekStore, KeyringKekStore, MemoryKekStore, file_kek_supported, kek_file_path,
+    FileKekStore, KekStore, KeyringKekStore, MemoryKekStore, Passphrase, PassphraseKdfParams,
+    PassphraseKekStore, file_kek_supported, kek_file_path,
 };
 pub use key_material::{KEY_BYTE_LEN, SecureKeyBytes, generate_key_bytes, key_digest};
 pub use migrate::{
@@ -58,9 +59,12 @@ pub use namespace::{
     SECURE_KEY_SERVICE,
 };
 pub use resolve::{
-    DEFAULT_FIX_COMMAND, EffectiveSecretStore, KekUnavailable, SecretStoreInjected,
-    ensure_secret_vault, kek_dir_for_db, migrate_installation_kek, open_for_db,
-    project_secret_store_snapshot, resolve_secret_store, vault_for_db,
+    DEFAULT_FIX_COMMAND, EffectiveSecretStore, FirstRunSecretStoreCapabilities,
+    FirstRunSecretStoreIntent, KekUnavailable, MACHINE_BOUND_FILE_VAULT_WARNING,
+    SecretStoreInjected, SecretVaultOpenOptions, ensure_secret_vault,
+    ensure_secret_vault_with_options, first_run_secret_store_capabilities, kek_dir_for_db,
+    migrate_installation_kek, open_for_db, project_secret_store_snapshot, resolve_secret_store,
+    resolve_secret_store_with_intent, vault_for_db,
 };
 
 #[cfg(feature = "test-support")]

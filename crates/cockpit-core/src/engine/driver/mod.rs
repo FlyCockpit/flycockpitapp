@@ -42,7 +42,9 @@ use noninteractive::{
     PartialProgressFileEdit, SingleNoninteractiveTask, VnextChildAdmissionRegistry, handle_footer,
     stale_handle_error,
 };
-pub(crate) use noninteractive::{NoninteractiveSteerTarget, run_noninteractive};
+pub(crate) use noninteractive::{
+    NoninteractiveSteerTarget, run_fresh_noninteractive_resumable, run_noninteractive,
+};
 use queue::*;
 use reports::*;
 #[allow(unused_imports)]

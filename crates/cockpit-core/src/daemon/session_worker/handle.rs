@@ -1494,6 +1494,13 @@ impl SessionWorkerHandle {
         self.interactive_clients
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         InteractiveClientGuard {
+            lease: InteractiveAttachmentLease {
+                state: Arc::new(std::sync::Mutex::new(InteractiveAttachmentState {
+                    live: true,
+                    session_id: self.session_id,
+                    attachment_id: Uuid::new_v4(),
+                })),
+            },
             counter: self.interactive_clients.clone(),
             session_id: self.session_id,
             locks: self.locks.clone(),
@@ -1535,6 +1542,7 @@ impl SessionWorkerHandle {
 /// interactive-client count on drop, so a disconnect (even an abrupt one)
 /// correctly returns the session to headless behavior.
 pub struct InteractiveClientGuard {
+    pub(super) lease: InteractiveAttachmentLease,
     pub(super) counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Session this guard belongs to — used by the last-detach-while-idle
     /// release edge (implementation note).
@@ -1547,8 +1555,59 @@ pub struct InteractiveClientGuard {
     pub(super) live: Arc<LiveState>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InteractiveAttachmentLease {
+    pub(super) state: Arc<std::sync::Mutex<InteractiveAttachmentState>>,
+}
+
+impl InteractiveAttachmentLease {
+    pub fn is_live(&self) -> bool {
+        crate::sync::lock_or_recover(&self.state).live
+    }
+
+    /// Atomically bind an answer to this exact attachment lifetime. Once
+    /// acquired, the permit remains valid through worker settlement even if
+    /// detach races immediately afterward; a later/recycled attachment owns a
+    /// different state allocation and cannot recreate this permit.
+    pub fn try_acquire(&self) -> Option<InteractiveAttachmentPermit> {
+        let state = crate::sync::lock_or_recover(&self.state);
+        state.live.then(|| InteractiveAttachmentPermit {
+            _state: self.state.clone(),
+            session_id: state.session_id,
+            attachment_id: state.attachment_id,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct InteractiveAttachmentState {
+    pub(super) live: bool,
+    pub(super) session_id: Uuid,
+    pub(super) attachment_id: Uuid,
+}
+
+#[derive(Debug)]
+pub struct InteractiveAttachmentPermit {
+    _state: Arc<std::sync::Mutex<InteractiveAttachmentState>>,
+    session_id: Uuid,
+    attachment_id: Uuid,
+}
+
+impl InteractiveAttachmentPermit {
+    pub fn belongs_to(&self, session_id: Uuid) -> bool {
+        self.session_id == session_id && !self.attachment_id.is_nil()
+    }
+}
+
+impl InteractiveClientGuard {
+    pub fn lease(&self) -> InteractiveAttachmentLease {
+        self.lease.clone()
+    }
+}
+
 impl Drop for InteractiveClientGuard {
     fn drop(&mut self) {
+        crate::sync::lock_or_recover(&self.lease.state).live = false;
         // Saturating: never underflow even on a double-drop path. `prev` is
         // the count before this drop, so the count is now `prev - 1`.
         let prev = self
@@ -2317,6 +2376,7 @@ pub enum SessionWork {
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,
+        governed_network_attachment: Option<InteractiveAttachmentPermit>,
     },
     /// A typed durable decision answer. This is intentionally handled by the
     /// owning session worker so the continuation, session-scoped event, and

@@ -1,5 +1,96 @@
 use super::*;
 
+/// Governed-network approvals are exact interactive host decisions. The
+/// durable operation kind and canonical input classify them; no generic grant
+/// class is exposed to noninteractive clients.
+fn governed_network_question(label: &str, offered: &[Scope]) -> InterruptQuestion {
+    let mut question = approval_question(
+        label,
+        true,
+        GrantKind::Command,
+        None,
+        None,
+        None,
+        offered,
+        None,
+    );
+    let InterruptQuestion::Single { approval_class, .. } = &mut question else {
+        unreachable!("approval_question returns a single question")
+    };
+    *approval_class = None;
+    question
+}
+
+#[cfg(test)]
+mod governed_network_question_tests {
+    use super::*;
+
+    #[test]
+    fn exact_network_decisions_expose_no_generic_grant_class() {
+        let question = governed_network_question("network", &[Scope::Once]);
+        assert!(matches!(
+            question,
+            InterruptQuestion::Single {
+                permission: true,
+                approval_class: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_approver_cannot_settle_monty_network_egress() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            db.clone(),
+            ctx.session.id,
+        ));
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        );
+        let approver = Approver::new_for_session(
+            store,
+            db.clone(),
+            ctx.session.clone(),
+            redaction,
+            ctx.agent_id,
+            interrupts,
+        );
+        let decision = approver
+            .approve_monty_network_egress(
+                "Monty POST request",
+                &serde_json::json!({
+                    "method": "POST",
+                    "url": "https://api.example.test/v1/items?limit=2",
+                    "headers": {},
+                    "body": null,
+                    "destination": "api.example.test",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(decision, Decision::NoninteractiveDeny));
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "headless callers cannot manufacture a settleable network prompt"
+        );
+    }
+}
+
 impl Approver {
     /// Prompt for an ACP-forwarded connect or tool effect without reading or
     /// writing any persistent grant/reject record. `Session` is presented as
@@ -374,6 +465,117 @@ impl Approver {
             "tool_call",
             label,
             &[Scope::Once],
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
+
+    /// Approve a Monty network-policy mutation made by the session owner.
+    ///
+    /// This is deliberately separate from [`Self::approve_tool_call`]. A
+    /// policy mutation can expand an agent's future egress authority, so Yolo
+    /// and Auto are not authority to accept it. The only allow path is a
+    /// response from a currently attached interactive client, and the prompt
+    /// binds that response to the exact daemon-owned mutation input.
+    pub async fn approve_owner_network_configuration(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::OwnerNetworkConfiguration { label, input })
+            .await
+    }
+
+    pub async fn approve_monty_network_egress(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::MontyNetworkEgress { label, input })
+            .await
+    }
+
+    pub(super) async fn approve_monty_network_egress_inner(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
+        let offered = [Scope::Once];
+        let question = governed_network_question(label, &offered);
+        let set = approval_option_set("monty_network_egress", true, &offered, None);
+        let choice = self
+            .raise_and_decode(
+                label,
+                question,
+                "monty_network_egress",
+                serde_json::json!({
+                    "wire_input": input,
+                    "candidate_effects": [
+                        {"selection": "approve", "execute": {"wire_input": input}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
+            .await?;
+        Ok(match choice {
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Deny
+            | ApprovalChoice::Reject(_)
+            | ApprovalChoice::Approve(Scope::Session | Scope::Project | Scope::Global)
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+        })
+    }
+
+    pub(super) async fn approve_owner_network_configuration_inner(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        // Do this before raising an interrupt and deliberately before any
+        // approval-mode branch. An unattended or auto-allow run cannot grant
+        // itself future network authority.
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
+        let offered = [Scope::Once];
+        let question = governed_network_question(label, &offered);
+        let set = approval_option_set("owner_network_configuration", true, &offered, None);
+        let choice = self
+            .raise_and_decode(
+                label,
+                question,
+                "owner_network_configuration",
+                serde_json::json!({
+                    "wire_input": input,
+                    "candidate_effects": [
+                        {"selection": "approve", "execute": {"wire_input": input}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
+            .await?;
+        let decision = match choice {
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Deny
+            | ApprovalChoice::Reject(_)
+            | ApprovalChoice::Approve(Scope::Session | Scope::Project | Scope::Global)
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+        };
+        self.record_permission_decision(
+            "owner_network_configuration",
+            label,
+            &offered,
             decision,
             DecisionSource::UserPrompt,
         )

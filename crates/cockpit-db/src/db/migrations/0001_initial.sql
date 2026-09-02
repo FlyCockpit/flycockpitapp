@@ -319,6 +319,34 @@ CREATE TABLE sessions (
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
+-- ---- Monty governed network capability -----------------------------------
+
+-- Agent-scoped network authority is written only by an explicit owner action.
+-- Definition-authored requested hosts never enter these tables.  The policy
+-- generation changes on every mutation so dispatch can fence a request after
+-- redaction and immediately observe revocation before egress.
+CREATE TABLE monty_network_agent_policies (
+    -- The daemon-issued executor UUID is the authority subject. Display names
+    -- and authored agent ids are recyclable and must never inherit grants.
+    agent_instance_id TEXT PRIMARY KEY,
+    requests_enabled INTEGER NOT NULL DEFAULT 0 CHECK (requests_enabled IN (0, 1)),
+    approval_required INTEGER NOT NULL DEFAULT 0 CHECK (approval_required IN (0, 1)),
+    generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE monty_network_agent_grants (
+    agent_instance_id TEXT NOT NULL REFERENCES monty_network_agent_policies(agent_instance_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT,
+    host TEXT NOT NULL CHECK (
+        length(CAST(host AS BLOB)) BETWEEN 1 AND 253
+        AND host = lower(host)
+        AND host NOT GLOB '*[/:?#@]*'
+    ),
+    granted_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (agent_instance_id, host)
+);
+
 -- Parent links form an acyclic ownership graph. The recursive UNION is also
 -- cycle-safe if a pre-release database was externally corrupted before this
 -- trigger existed; valid mutations fail before introducing another cycle.
@@ -6420,6 +6448,47 @@ CREATE TABLE sealed_value_records (
     UNIQUE (scope, scope_key, name)
 );
 
+-- ---- trusted-child sealed acquisition audit -------------------------------
+-- Agent-acquired values occupy a separate namespace without widening the
+-- owner-authored record schema. Presence of a succeeded row is the namespace
+-- discriminator; the record itself remains an ordinary session-scoped sealed
+-- reference and therefore follows the existing session purge lifecycle.
+--
+-- Attempts are inserted before child dispatch and terminalized exactly once.
+-- No literal, output, command, value length, or destination argument is stored
+-- here. A `requires_user` outcome preserves only the child question that was
+-- validated by the closed acquisition outcome. `record_id` is intentionally not
+-- a foreign key: failed attempts and session teardown must not erase the
+-- owner-visible audit trail.
+CREATE TABLE sealed_value_acquisition_audit (
+    acquisition_id     TEXT    PRIMARY KEY,
+    record_id          TEXT    NOT NULL,
+    session_id         TEXT    NOT NULL,
+    project_key        TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    description        TEXT    NOT NULL,
+    child_agent        TEXT    NOT NULL,
+    source_tool_call_id TEXT,
+    consent_mode       TEXT    NOT NULL CHECK (consent_mode IN ('audit_only', 'approval')),
+    outcome            TEXT    NOT NULL CHECK (outcome IN ('pending', 'sealed', 'requires_user', 'failed')),
+    requires_user_reason TEXT CHECK (requires_user_reason IN ('missing_credential', 'interactive_login', 'owner_knowledge')),
+    requires_user_prompt TEXT,
+    created_at_ms      INTEGER NOT NULL,
+    completed_at_ms    INTEGER,
+    CHECK ((outcome = 'pending') = (completed_at_ms IS NULL)),
+    CHECK (outcome <> 'sealed' OR source_tool_call_id IS NOT NULL),
+    CHECK ((requires_user_reason IS NULL) = (requires_user_prompt IS NULL)),
+    CHECK ((outcome = 'requires_user') =
+           (requires_user_reason IS NOT NULL AND requires_user_prompt IS NOT NULL))
+);
+
+CREATE INDEX idx_sealed_value_acquisition_audit_session
+    ON sealed_value_acquisition_audit(session_id, created_at_ms DESC);
+
+CREATE UNIQUE INDEX idx_sealed_value_acquisition_succeeded_record
+    ON sealed_value_acquisition_audit(record_id)
+    WHERE outcome = 'sealed';
+
 
 -- Session-scope records follow their session out of existence. There is no
 -- foreign key because `scope_key` is polymorphic across the three scopes.
@@ -6778,19 +6847,34 @@ CREATE INDEX idx_protected_leak_records_history
 
 -- ---- wrap-key secret vault -------------------------------------------------
 -- Coordination + AEAD ciphertext + wrapped DEKs only. KEK bytes and DEK
--- plaintext never live in SQLite. First-run persists intent=keyring /
--- active_placement=keyring when the OS keyring probe is available, else
--- database. dest=database is rejected while the probe is available.
+-- plaintext never live in SQLite. First-run defaults to keyring when the OS
+-- keyring probe is available, but can explicitly choose the file vault.
 
 -- Installation-scoped authority singleton. No secret bytes.
 CREATE TABLE secret_vault_authority (
     id                    INTEGER PRIMARY KEY CHECK (id = 1),
     intent                TEXT    NOT NULL CHECK (intent IN ('database', 'keyring')),
     active_placement      TEXT    NOT NULL CHECK (active_placement IN ('database', 'keyring')),
+    file_kek_mode         TEXT    CHECK (file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (active_placement = 'database' AND file_kek_mode IS NOT NULL)
+        OR (active_placement = 'keyring' AND file_kek_mode IS NULL)
+    ),
     kek_fingerprint       TEXT    NOT NULL,
     kek_version           INTEGER NOT NULL CHECK (kek_version >= 1),
     wrap_version          INTEGER NOT NULL CHECK (wrap_version = 1),
     updated_at            INTEGER NOT NULL
+);
+
+-- Non-secret Argon2id metadata for the advanced passphrase file KEK. The
+-- passphrase and the derived KEK are never persisted.
+CREATE TABLE secret_vault_passphrase_kdf (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    algorithm   TEXT    NOT NULL CHECK (algorithm = 'argon2id'),
+    memory_kib  INTEGER NOT NULL CHECK (memory_kib >= 8 AND memory_kib <= 65536),
+    iterations  INTEGER NOT NULL CHECK (iterations >= 1 AND iterations <= 10),
+    parallelism INTEGER NOT NULL CHECK (parallelism >= 1 AND parallelism <= 4),
+    salt        BLOB    NOT NULL CHECK (length(salt) >= 16 AND length(salt) <= 64)
 );
 
 -- Wrapped DEKs. No KEK bytes. No DEK plaintext.
@@ -6885,7 +6969,17 @@ END;
 CREATE TABLE secret_vault_sagas (
     op_id              TEXT    PRIMARY KEY,
     source_placement   TEXT    NOT NULL CHECK (source_placement IN ('database', 'keyring')),
+    source_file_kek_mode TEXT  CHECK (source_file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (source_placement = 'database' AND source_file_kek_mode IS NOT NULL)
+        OR (source_placement = 'keyring' AND source_file_kek_mode IS NULL)
+    ),
     dest_placement     TEXT    NOT NULL CHECK (dest_placement IN ('database', 'keyring')),
+    dest_file_kek_mode TEXT    CHECK (dest_file_kek_mode IN ('machine_bound', 'passphrase')),
+    CHECK (
+        (dest_placement = 'database' AND dest_file_kek_mode IS NOT NULL)
+        OR (dest_placement = 'keyring' AND dest_file_kek_mode IS NULL)
+    ),
     kek_fingerprint    TEXT    NOT NULL,
     phase              TEXT    NOT NULL CHECK (phase IN (
         'prepared',

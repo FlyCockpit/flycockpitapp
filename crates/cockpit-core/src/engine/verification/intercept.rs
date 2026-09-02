@@ -39,11 +39,13 @@ use super::{
         CandidateSetEstimateInput, encoding_for_model_id, estimate_candidate_set,
         input_cost_microusd,
     },
-    generate::{CollectedCandidate, CollectionInput, collect_candidates},
-    recipe::{
-        RecipeAssemblyInput, assemble_recipe, generator_recipe_for_slot, select_guidance_for_target,
-    },
+    generate::{CollectedCandidate, CollectionInput, collect_candidates, generator_budget_text},
+    recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
 };
+
+#[path = "generator_context.rs"]
+pub(super) mod generator_context;
+use generator_context::EffectiveGeneratorContext;
 
 /// Outcome of the verification intercept.
 #[derive(Debug, Clone, PartialEq)]
@@ -326,7 +328,21 @@ async fn run_verification(
     .map(|(_, body)| body)
     .unwrap_or_default();
     let author_slot = author_slot_for_agent(input.agent);
-    for generator in &rule.generators {
+    let generators = rule
+        .generators
+        .iter()
+        .map(|generator| {
+            EffectiveGeneratorContext::new(generator, &author_slot, input.agent, input.history)
+        })
+        .collect::<Vec<_>>();
+    let candidate_schema = input
+        .agent
+        .tools
+        .get(input.resolved_name)
+        .map(|tool| tool.parameters())
+        .unwrap_or(Value::Null);
+    let generator_audit_name = format!("{}:verification-generator", input.agent.name);
+    for effective in &generators {
         let model = if profile_snapshot_id.is_nil() {
             Some(input.agent.model.clone())
         } else {
@@ -334,7 +350,7 @@ async fn run_verification(
                 input.session,
                 input.ctx,
                 profile_snapshot_id,
-                &generator.slot,
+                effective.slot(),
             )
             .await
             .ok()
@@ -343,9 +359,7 @@ async fn run_verification(
             estimated_cost = None;
             continue;
         };
-        let generator_recipe =
-            generator_recipe_for_slot(&generator.recipe, generator.slot == author_slot);
-        let (include_linked_files, last_n_reads) = match generator_recipe.as_ref() {
+        let (include_linked_files, last_n_reads) = match effective.recipe() {
             crate::agents::VerificationRecipe::Inherit => {
                 (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS)
             }
@@ -356,7 +370,7 @@ async fn run_verification(
             } => (*include_linked_files, *last_n_reads),
         };
         let recipe = assemble_recipe(RecipeAssemblyInput {
-            recipe: generator_recipe.as_ref(),
+            recipe: effective.recipe(),
             session: input.session,
             workspace_root: input.session.project_root.as_path(),
             cwd: input.ctx.cwd.as_path(),
@@ -368,26 +382,15 @@ async fn run_verification(
             include_linked_files,
             inherit_framing: "Produce an alternative implementation of the proposed write/edit. Answer through verification_candidate.",
         }).await?;
-        let generator_history = if matches!(
-            generator_recipe.as_ref(),
-            crate::agents::VerificationRecipe::Inherit
-        ) {
-            input.history
-        } else {
-            &[]
-        };
-        let assembled_generator = super::generate::conservative_generator_budget_text(
-            input.agent,
-            &recipe.prompt,
-            generator_history,
-        )?;
+        let request = effective.request(&recipe.prompt);
+        let assembled_generator = generator_budget_text(&model, &request)?;
         let price = super::estimate::model_prices(&prices, model.model_id_ref());
         let estimate = super::estimate::estimate_multi_turn_candidate(
             &assembled_generator,
             encoding_for_model_id(model.model_id_ref()),
             price.map(|price| price.0),
             price.map(|price| price.1),
-            generator.max_turns,
+            effective.max_turns(),
         );
         estimated_tokens = estimated_tokens.saturating_add(estimate.tokens);
         estimated_cost = match (estimated_cost, estimate.cost_microusd) {
@@ -414,7 +417,7 @@ async fn run_verification(
         // Price the actual fixed system/tool framing and a worst-case
         // serialized envelope for every candidate. Candidate bodies are
         // separately reserved at the completion-token cap below.
-        let candidate_envelopes = (0..rule.generators.len())
+        let candidate_envelopes = (0..generators.len())
             .map(|_| CollectedCandidate {
                 candidate_id: Uuid::from_u128(u128::MAX),
                 answer: super::generate::GeneratorAnswer {
@@ -453,7 +456,7 @@ async fn run_verification(
         // A candidate body is bounded by its completion cap. Re-encoding that
         // JSON inside the pretty adjudication envelope can expand control
         // characters to a six-byte escape, so reserve the full 6x expansion.
-        let candidate_input_tokens = (rule.generators.len() as u64)
+        let candidate_input_tokens = (generators.len() as u64)
             .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
             .saturating_mul(6);
         estimated_tokens = estimated_tokens
@@ -472,7 +475,7 @@ async fn run_verification(
     }
     let estimate = match estimated_cost {
         Some(cost) => VerificationEstimate::Known(crate::agents::VerificationBudget {
-            max_candidates: u16::try_from(rule.generators.len()).unwrap_or(u16::MAX),
+            max_candidates: u16::try_from(generators.len()).unwrap_or(u16::MAX),
             max_total_tokens: estimated_tokens,
             max_estimated_cost_microusd: cost,
             max_collection_millis: requested.max_collection_millis,
@@ -480,7 +483,6 @@ async fn run_verification(
         None => VerificationEstimate::UnknownPrice,
     };
     let estimate_known = matches!(estimate, VerificationEstimate::Known(_));
-    let generators = rule.generators.clone();
     let estimate_exceeds = match estimate {
         VerificationEstimate::Known(estimated) => !profile_budget.contains(estimated),
         VerificationEstimate::UnknownTokens | VerificationEstimate::UnknownPrice => true,
@@ -580,9 +582,10 @@ async fn run_verification(
     let collected = if !generators.is_empty() {
         match collect_candidates(&CollectionInput {
             session: input.session,
-            agent: input.agent,
+            author_model: &input.agent.model,
+            generator_audit_name: &generator_audit_name,
+            candidate_schema: &candidate_schema,
             ctx: input.ctx,
-            history: input.history,
             resolved_name: input.resolved_name,
             args: input.args,
             generators: &generators,
@@ -594,7 +597,6 @@ async fn run_verification(
             profile_snapshot_id,
             collection_deadline_unix_ms: deadline,
             original_digest: original_digest.clone(),
-            author_slot: author_slot_for_agent(input.agent),
         })
         .await
         {
@@ -1225,7 +1227,7 @@ mod tests {
             },
             message::{Message, ToolCall},
             model::{Model, ModelParams},
-            tool::{ToolBox, ToolCtx, ToolOutput},
+            tool::{ToolBox, ToolCtx, ToolEffect, ToolOutput},
         },
         redact::RedactionTable,
         session::Session,
@@ -1248,6 +1250,31 @@ mod tests {
 
     struct RevisionFailureTool {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ReadFixtureTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for ReadFixtureTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn description(&self) -> &str {
+            "Read-only generator custody fixture."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("read"))
+        }
     }
 
     #[async_trait]
@@ -1354,6 +1381,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_generator_projection_enforces_slot_custody_through_provider_assembly() {
+        let tools = ToolBox::new()
+            .with(Arc::new(ReadFixtureTool))
+            .with(Arc::new(NamedFixtureTool {
+                name: "write".to_string(),
+                called: Arc::new(AtomicBool::new(false)),
+            }));
+        let mut agent = test_agent(tools, None);
+        agent.params.additional_params = Some(serde_json::json!({
+            "author_custody_marker": "must-not-cross-foreign-slot"
+        }));
+        let history = vec![Message::user("author-history-must-not-cross-foreign-slot")];
+
+        let author = EffectiveGeneratorContext::new(
+            &GeneratorSpec {
+                slot: "author".to_string(),
+                recipe: VerificationRecipe::Inherit,
+                max_turns: 1,
+            },
+            "author",
+            &agent,
+            &history,
+        );
+        let author_request = author.request("candidate prompt");
+        let author_reservation = generator_budget_text(&agent.model, &author_request).unwrap();
+        let author_provider = super::super::inference::assemble_generator_provider_request(
+            &agent.model,
+            &author_request,
+        )
+        .unwrap()
+        .to_string();
+        assert!(author_reservation.contains("author-history-must-not-cross-foreign-slot"));
+        assert!(author_reservation.contains("\"name\":\"write\""));
+        assert!(author_provider.contains("author-history-must-not-cross-foreign-slot"));
+        assert!(author_provider.contains("must-not-cross-foreign-slot"));
+
+        let foreign = EffectiveGeneratorContext::new(
+            &GeneratorSpec {
+                slot: "reviewer".to_string(),
+                recipe: VerificationRecipe::Inherit,
+                max_turns: 3,
+            },
+            "author",
+            &agent,
+            &history,
+        );
+        assert!(matches!(
+            foreign.recipe(),
+            VerificationRecipe::CleanRoom { .. }
+        ));
+        let conversation = foreign.start_conversation();
+        let foreign_request = conversation.request("candidate prompt");
+        let foreign_reservation = generator_budget_text(&agent.model, &foreign_request).unwrap();
+        let foreign_provider = super::super::inference::assemble_generator_provider_request(
+            &agent.model,
+            &foreign_request,
+        )
+        .unwrap()
+        .to_string();
+        for projection in [&foreign_reservation, &foreign_provider] {
+            assert!(!projection.contains("author-history-must-not-cross-foreign-slot"));
+            assert!(!projection.contains("must-not-cross-foreign-slot"));
+            assert!(!projection.contains("\"name\":\"write\""));
+            assert!(projection.contains("\"name\":\"read\""));
+            assert!(projection.contains("\"name\":\"verification_candidate\""));
+        }
+    }
+
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
             id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),
@@ -1447,6 +1543,8 @@ mod tests {
             }),
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         };
         definition.resolve_grant(&host()).expect("grant resolves")
     }
@@ -1791,6 +1889,8 @@ mod tests {
             }),
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         };
         let grant = definition.resolve_grant(&host()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1872,6 +1972,8 @@ mod tests {
             }),
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         };
         definition.resolve_grant(&host()).unwrap()
     }
@@ -1908,6 +2010,8 @@ mod tests {
             }),
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         };
         definition.resolve_grant(&host()).unwrap()
     }

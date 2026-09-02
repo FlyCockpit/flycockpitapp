@@ -434,6 +434,7 @@ pub enum Response {
     /// The safe sealed-value inventory. Never carries a literal.
     SealedOwnerInventory {
         items: Vec<crate::SealedOwnerInventoryItem>,
+        acquisitions: Vec<crate::SealedAcquisitionAuditItem>,
     },
     /// A sealed value's safe description was edited.
     SealedOwnerDescriptionEdited {
@@ -1845,9 +1846,16 @@ impl Response {
     /// the `BoundedRequestResponse` class by construction. The daemon directory
     /// funnel MUST build the response through this constructor rather than the
     /// bare variant.
-    pub fn sealed_owner_inventory(mut items: Vec<crate::SealedOwnerInventoryItem>) -> Self {
+    pub fn sealed_owner_inventory(
+        mut items: Vec<crate::SealedOwnerInventoryItem>,
+        mut acquisitions: Vec<crate::SealedAcquisitionAuditItem>,
+    ) -> Self {
         items.truncate(crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
-        Self::SealedOwnerInventory { items }
+        acquisitions.truncate(crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
+        Self::SealedOwnerInventory {
+            items,
+            acquisitions,
+        }
     }
 
     /// Build a `SealedActions` response clamped to
@@ -1987,7 +1995,11 @@ mod tests {
             "sealed_owner_operation_applied"
         );
         assert_eq!(
-            Response::SealedOwnerInventory { items: Vec::new() }.wire_tag(),
+            Response::SealedOwnerInventory {
+                items: Vec::new(),
+                acquisitions: Vec::new(),
+            }
+            .wire_tag(),
             "sealed_owner_inventory"
         );
         assert_eq!(
@@ -2050,15 +2062,34 @@ mod tests {
                 revealed_literal: None,
             },
             Response::SealedOwnerOperationCancelled { spent: true },
-            Response::sealed_owner_inventory(vec![crate::SealedOwnerInventoryItem {
-                record_id: "rec-1".into(),
-                name: "deploy_token".into(),
-                description: "safe description".into(),
-                scope_kind: crate::SealedOwnerScopeKind::Global,
-                scope_key: String::new(),
-                active_version: 1,
-                created_at_ms: 0,
-            }]),
+            Response::sealed_owner_inventory(
+                vec![crate::SealedOwnerInventoryItem {
+                    record_id: "rec-1".into(),
+                    name: "deploy_token".into(),
+                    description: "safe description".into(),
+                    scope_kind: crate::SealedOwnerScopeKind::Global,
+                    scope_key: String::new(),
+                    active_version: 1,
+                    created_at_ms: 0,
+                    namespace: crate::SealedOwnerNamespace::OwnerAuthored,
+                }],
+                vec![crate::SealedAcquisitionAuditItem {
+                    acquisition_id: "acq-1".into(),
+                    record_id: "rec-1".into(),
+                    session_id: "session-1".into(),
+                    project_key: "project-1".into(),
+                    name: "deploy_token".into(),
+                    description: "safe acquisition audit".into(),
+                    child_agent: "sealed-acquisition".into(),
+                    source_tool_call_id: Some("call-1".into()),
+                    consent_mode: "audit_only".into(),
+                    outcome: "sealed".into(),
+                    requires_user_reason: None,
+                    requires_user_prompt: None,
+                    created_at_ms: 0,
+                    completed_at_ms: Some(1),
+                }],
+            ),
             Response::SealedOwnerDescriptionEdited {
                 record_id: "rec-1".into(),
             },
@@ -2115,11 +2146,34 @@ mod tests {
                 scope_key: String::new(),
                 active_version: 1,
                 created_at_ms: 0,
+                namespace: crate::SealedOwnerNamespace::OwnerAuthored,
             })
             .collect();
-        match Response::sealed_owner_inventory(items) {
-            Response::SealedOwnerInventory { items } => {
-                assert_eq!(items.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS)
+        let acquisitions = (0..over)
+            .map(|i| crate::SealedAcquisitionAuditItem {
+                acquisition_id: format!("acq-{i}"),
+                record_id: format!("rec-{i}"),
+                session_id: "session".into(),
+                project_key: "project".into(),
+                name: "n".into(),
+                description: "d".into(),
+                child_agent: "sealed-acquisition".into(),
+                source_tool_call_id: None,
+                consent_mode: "audit_only".into(),
+                outcome: "failed".into(),
+                requires_user_reason: None,
+                requires_user_prompt: None,
+                created_at_ms: 0,
+                completed_at_ms: Some(1),
+            })
+            .collect();
+        match Response::sealed_owner_inventory(items, acquisitions) {
+            Response::SealedOwnerInventory {
+                items,
+                acquisitions,
+            } => {
+                assert_eq!(items.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
+                assert_eq!(acquisitions.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
             }
             other => panic!("expected inventory, got {}", other.wire_tag()),
         }

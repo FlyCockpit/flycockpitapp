@@ -11,8 +11,9 @@ use crate::computer::host_identity::{
 use crate::computer::platform::macos::{
     AU_DEFAUDITSID, AxValueTag, AxWindowRect, CgSessionKey, CgSessionSnapshot, CgSessionValue,
     CgWindowCandidate, MacAxAttribute, MacAxNotification, MacCallbackGate,
-    MacCallbackTerminalReason, MacObservedEpoch, MacProducerKind, TASK_AUDIT_TOKEN_COUNT_EXPECTED,
-    extract_audit_session_id, join_ax_to_cg_window, select_display_for_window, validate_cg_session,
+    MacCallbackTerminalReason, MacFocusedWindowLifetimeEpoch, MacObservedEpoch, MacProducerKind,
+    TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
+    select_display_for_window, validate_cg_session,
 };
 use crate::computer::platform::wayland::{
     FakeWaylandProvider, WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,
@@ -774,6 +775,15 @@ fn computer_target_observed_epoch_and_aba_claim() {
         unavailable: false,
     };
     assert!(overflow.consume(MacProducerKind::AxMoved).is_err());
+
+    // A replacement AX window is a new lifetime even if its compositor ID,
+    // PID, application ID, and geometry have all been recycled. The adapter
+    // mixes this epoch into its opaque focused-window ID before the planning
+    // and pre-handoff fingerprints consume it.
+    let mut lifetime = MacFocusedWindowLifetimeEpoch::default();
+    assert_eq!(lifetime.observe(false).unwrap(), 1);
+    assert_eq!(lifetime.observe(true).unwrap(), 1);
+    assert_eq!(lifetime.observe(false).unwrap(), 2);
     assert!(overflow.unavailable);
     assert!(overflow.consume(MacProducerKind::AxMoved).is_err());
 

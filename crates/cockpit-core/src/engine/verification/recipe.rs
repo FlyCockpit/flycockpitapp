@@ -4,7 +4,6 @@
 //! (decision 11). Linked files are resolved against three bases, existence-
 //! validated, contained under the workspace root, and capped.
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -62,21 +61,6 @@ pub async fn assemble_recipe(input: RecipeAssemblyInput<'_>) -> Result<Assembled
     match input.recipe {
         VerificationRecipe::Inherit => assemble_inherit(input),
         VerificationRecipe::CleanRoom { .. } => assemble_clean_room(input).await,
-    }
-}
-
-/// A full transcript is meaningful only when the generator shares the
-/// author's slot (and therefore its cache/prompt identity). Foreign slots
-/// always receive the default curated clean-room projection, even when the
-/// configured recipe says `Inherit`.
-pub(crate) fn generator_recipe_for_slot<'a>(
-    recipe: &'a VerificationRecipe,
-    same_as_author: bool,
-) -> Cow<'a, VerificationRecipe> {
-    if same_as_author || !matches!(recipe, VerificationRecipe::Inherit) {
-        Cow::Borrowed(recipe)
-    } else {
-        Cow::Owned(VerificationRecipe::clean_room_default())
     }
 }
 
@@ -584,19 +568,6 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn foreign_inherit_uses_the_default_clean_room_recipe() {
-        let inherit = VerificationRecipe::Inherit;
-        assert_eq!(
-            generator_recipe_for_slot(&inherit, false).as_ref(),
-            &VerificationRecipe::clean_room_default()
-        );
-        assert_eq!(
-            generator_recipe_for_slot(&inherit, true).as_ref(),
-            &VerificationRecipe::Inherit
-        );
     }
 
     fn tool_call(

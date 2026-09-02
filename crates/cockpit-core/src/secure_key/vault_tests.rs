@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use cockpit_db::secret_vault::{
-    SecretVaultKind, SecretVaultPlacement, count_active_keys_conn, insert_key_conn,
-    load_authority_conn, load_item_conn,
+    SecretVaultFileKekMode, SecretVaultKind, SecretVaultPlacement, count_active_keys_conn,
+    insert_key_conn, load_authority_conn, load_item_conn, load_passphrase_kdf_conn,
 };
 use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacement};
 
@@ -15,9 +15,11 @@ use crate::db::installation_identity::ensure_installation_identity_conn;
 use crate::redact::start_standalone_redaction_key_resolver_with;
 use crate::secure_key::fake::FakeNativeStore;
 use crate::secure_key::{
-    FileKekStore, KekStore, KeyringProbeResult, MemoryKekStore, SecretStoreInjected, SecretVault,
-    VaultFault, VaultFaultPoint, VaultNativeStore, ensure_secret_vault, kek_dir_for_db,
-    migrate_kek_placement, reject_keyring_if_unavailable, resolve_secret_store, resume_kek_migrate,
+    FileKekStore, FirstRunSecretStoreIntent, KekStore, KeyringProbeResult, MemoryKekStore,
+    Passphrase, SecretStoreInjected, SecretVault, SecretVaultOpenOptions, VaultFault,
+    VaultFaultPoint, VaultNativeStore, ensure_secret_vault, ensure_secret_vault_with_options,
+    kek_dir_for_db, migrate_kek_placement, reject_keyring_if_unavailable, resolve_secret_store,
+    resolve_secret_store_with_intent, resume_kek_migrate,
 };
 
 use super::error::SecureKeyError;
@@ -116,6 +118,7 @@ fn assert_no_plaintext_bytes(db: &Db, needle: &[u8]) {
                 "secure_key_sagas",
                 "secure_key_consumer_refs",
                 "secret_vault_authority",
+                "secret_vault_passphrase_kdf",
                 "secret_vault_keys",
                 "secret_vault_items",
                 "secret_vault_sagas",
@@ -660,7 +663,7 @@ fn secret_store_migrate_resumes_after_activation() {
     assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
     resume_kek_migrate(
         &db,
-        file_kek.clone(),
+        Some(file_kek.clone()),
         keyring_kek.clone(),
         SecretVaultPlacement::Keyring,
         &available_probe(),
@@ -690,7 +693,7 @@ fn secret_store_migrate_resumes_after_source_delete() {
     .unwrap_err();
     resume_kek_migrate(
         &db,
-        file_kek.clone(),
+        Some(file_kek.clone()),
         keyring_kek.clone(),
         SecretVaultPlacement::Keyring,
         &available_probe(),
@@ -742,7 +745,7 @@ fn resume_activated_database_migrate_rejects_available_keyring() {
     assert_eq!(file_kek.len(), 1);
     let err = resume_kek_migrate(
         &db,
-        keyring_kek.clone(),
+        Some(keyring_kek.clone()),
         file_kek.clone(),
         SecretVaultPlacement::Database,
         &available_probe(),
@@ -1179,6 +1182,311 @@ fn persisted_database_never_opens_platform_store() {
 fn resolve_first_run_is_keyring_when_available() {
     let decision = resolve_secret_store(None, &available_probe()).unwrap();
     assert_eq!(decision, SecretVaultPlacement::Keyring);
+}
+
+#[test]
+fn explicit_first_run_file_intent_overrides_an_available_keyring() {
+    let decision = resolve_secret_store_with_intent(
+        None,
+        &available_probe(),
+        FirstRunSecretStoreIntent::FileMachineBound,
+    )
+    .unwrap();
+    assert_eq!(decision, SecretVaultPlacement::Database);
+}
+
+#[test]
+fn first_run_file_choice_persists_when_keyring_is_available() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let effective = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek),
+            keyring_kek: Some(keyring_kek),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FileMachineBound,
+            passphrase: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(effective.placement, SecretStorePlacement::Database);
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .expect("persisted authority");
+    assert_eq!(authority.intent, SecretVaultPlacement::Database);
+    assert_eq!(authority.active_placement, SecretVaultPlacement::Database);
+    assert_eq!(
+        authority.file_kek_mode,
+        Some(SecretVaultFileKekMode::MachineBound)
+    );
+}
+
+#[test]
+fn passphrase_file_vault_persists_argon2_parameters_and_reopens() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let first = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(
+                Passphrase::from_bytes(b"correct horse battery staple".to_vec()).unwrap(),
+            ),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.placement, SecretStorePlacement::Database);
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .expect("passphrase authority");
+    assert_eq!(
+        authority.file_kek_mode,
+        Some(SecretVaultFileKekMode::Passphrase)
+    );
+    let params = db
+        .blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+        .unwrap()
+        .expect("persisted KDF parameters");
+    assert_eq!(params.memory_kib, 19_456);
+    assert_eq!(params.iterations, 2);
+    assert_eq!(params.parallelism, 1);
+    assert_eq!(params.salt.len(), 16);
+
+    let reopened = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: Some(
+                Passphrase::from_bytes(b"correct horse battery staple".to_vec()).unwrap(),
+            ),
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.placement, SecretStorePlacement::Database);
+}
+
+#[test]
+fn first_run_rejects_passphrases_for_non_passphrase_intents() {
+    for intent in [
+        FirstRunSecretStoreIntent::Automatic,
+        FirstRunSecretStoreIntent::Keyring,
+        FirstRunSecretStoreIntent::FileMachineBound,
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let error = match ensure_secret_vault_with_options(
+            &db,
+            &available_probe(),
+            &tmp.path().join("secret-vault"),
+            SecretStoreInjected::default(),
+            SecretVaultOpenOptions {
+                first_run_intent: intent,
+                passphrase: Some(Passphrase::from_bytes(b"not silently ignored".to_vec()).unwrap()),
+            },
+        ) {
+            Ok(_) => panic!("non-passphrase first run must reject a supplied passphrase"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .reason
+                .contains("only with the FilePassphrase first-run intent")
+        );
+    }
+}
+
+#[test]
+fn first_run_passphrase_intent_requires_a_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let error = match ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: None,
+        },
+    ) {
+        Ok(_) => panic!("passphrase first run must require a passphrase"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .reason
+            .contains("first-run passphrase vault initialization requires a passphrase")
+    );
+}
+
+#[test]
+fn persisted_passphrase_kdf_limits_fail_closed_before_derivation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"bounded metadata".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    db.blocking_write_for_sync_maintenance(|conn| {
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+        conn.execute(
+            "UPDATE secret_vault_passphrase_kdf SET memory_kib = 65537 WHERE id = 1",
+            [],
+        )?;
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let error = match ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected::default(),
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: Some(Passphrase::from_bytes(b"bounded metadata".to_vec()).unwrap()),
+        },
+    ) {
+        Ok(_) => panic!("out-of-range persisted KDF parameters must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.reason.contains("memory cost 65537 KiB"));
+}
+
+#[test]
+fn prepared_passphrase_to_keyring_migration_recovers_with_the_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let keyring = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring.clone()),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"recovery passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    let error = migrate_kek_placement(
+        first.vault.as_ref(),
+        keyring.clone(),
+        SecretVaultPlacement::Keyring,
+        &available_probe(),
+        &VaultFault::at(VaultFaultPoint::BeforeActivation),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("BeforeActivation"));
+
+    let recovered = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: Some(Passphrase::from_bytes(b"recovery passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered.placement, SecretStorePlacement::Keyring);
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .expect("activated authority");
+    assert_eq!(authority.active_placement, SecretVaultPlacement::Keyring);
+    assert_eq!(authority.file_kek_mode, None);
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn activated_passphrase_to_keyring_migration_recovers_without_retired_passphrase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let keyring = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring.clone()),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
+            passphrase: Some(Passphrase::from_bytes(b"retired passphrase".to_vec()).unwrap()),
+        },
+    )
+    .unwrap();
+    let error = migrate_kek_placement(
+        first.vault.as_ref(),
+        keyring.clone(),
+        SecretVaultPlacement::Keyring,
+        &available_probe(),
+        &VaultFault::at(VaultFaultPoint::AfterActivation),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("AfterActivation"));
+
+    let recovered = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring),
+            legacy_keyring: None,
+        },
+        SecretVaultOpenOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.placement, SecretStorePlacement::Keyring);
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

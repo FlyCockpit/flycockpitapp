@@ -998,7 +998,8 @@ fn stop_reason(reason: &cockpit_proto::IdleReason) -> &'static str {
             "max_turn_requests"
         }
         cockpit_proto::IdleReason::NeedsIntervention { .. }
-        | cockpit_proto::IdleReason::Error { .. } => "refusal",
+        | cockpit_proto::IdleReason::Error { .. }
+        | cockpit_proto::IdleReason::PreflightRejected => "refusal",
         cockpit_proto::IdleReason::Interrupted => "cancelled",
     }
 }

@@ -611,6 +611,7 @@ pub mod integration {
             crate::engine::IdleReason::UsageLimited => "usage_limited".to_string(),
             crate::engine::IdleReason::Error { class } => format!("error:{class}"),
             crate::engine::IdleReason::Interrupted => "interrupted".to_string(),
+            crate::engine::IdleReason::PreflightRejected => "preflight_rejected".to_string(),
         }
     }
 

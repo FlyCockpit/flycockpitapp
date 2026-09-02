@@ -91,8 +91,23 @@ const RECENT_TURN_COMPLETION_CAPACITY: usize = 64;
 /// Terminal outcome of one dispatched turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
-    Completed { reason: proto::IdleReason },
-    Failed { error: String },
+    /// The turn idled after successfully completing. The settlement layer
+    /// (`resolve_turn_terminal_event`) only resolves this for success idle
+    /// reasons (`Completed`, `GoalComplete`); every other idle reason
+    /// resolves as [`TurnOutcome::DidNotComplete`] so no consumer can
+    /// mistake a parked, limited, or retracted turn for success.
+    Completed {
+        reason: proto::IdleReason,
+    },
+    /// The turn idled without completing successfully — parked interrupt,
+    /// budget/usage limit, preflight rejection, or error-class stop. The
+    /// submission is not a success; consumers must fail closed on it.
+    DidNotComplete {
+        reason: proto::IdleReason,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -181,8 +196,15 @@ pub(super) fn resolve_turn_terminal_event(
             ..
         } => completions.resolve(
             turn_id.clone(),
-            TurnOutcome::Completed {
-                reason: reason.clone(),
+            match reason {
+                proto::IdleReason::Completed | proto::IdleReason::GoalComplete => {
+                    TurnOutcome::Completed {
+                        reason: reason.clone(),
+                    }
+                }
+                non_success => TurnOutcome::DidNotComplete {
+                    reason: non_success.clone(),
+                },
             },
         ),
         proto::Event::SessionDriverFailed {

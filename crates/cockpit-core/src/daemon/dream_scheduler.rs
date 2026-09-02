@@ -634,9 +634,11 @@ fn classify_dream_turn_terminal(
         Ok(TurnOutcome::Completed {
             reason: crate::engine::IdleReason::Completed | crate::engine::IdleReason::GoalComplete,
         }) => Ok(()),
-        Ok(TurnOutcome::Completed { reason }) => anyhow::bail!(
-            "Dream turn `{turn_id}` ended without completing successfully: {reason:?}"
-        ),
+        Ok(TurnOutcome::Completed { reason }) | Ok(TurnOutcome::DidNotComplete { reason }) => {
+            anyhow::bail!(
+                "Dream turn `{turn_id}` ended without completing successfully: {reason:?}"
+            )
+        }
         Ok(TurnOutcome::Failed { error }) => anyhow::bail!("Dream session driver failed: {error}"),
         Err(_) => anyhow::bail!("Dream session ended before its turn completed"),
     }
@@ -1302,6 +1304,34 @@ mod tests {
                 }),
             )
             .is_ok()
+        );
+    }
+
+    /// #275 fail-open regression: a turn that parks on an interrupt or is
+    /// retracted at preflight settles the watched id without completing.
+    /// The classifier must reject those outcomes, never treat them as a
+    /// successful Dream run.
+    #[test]
+    fn dream_turn_terminal_classifier_rejects_did_not_complete() {
+        assert!(
+            classify_dream_turn_terminal(
+                "turn-1",
+                Ok(TurnOutcome::DidNotComplete {
+                    reason: crate::engine::IdleReason::PreflightRejected,
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            classify_dream_turn_terminal(
+                "turn-1",
+                Ok(TurnOutcome::DidNotComplete {
+                    reason: crate::engine::IdleReason::NeedsIntervention {
+                        code: "parked_interrupt".to_string()
+                    },
+                }),
+            )
+            .is_err()
         );
     }
 }

@@ -1788,9 +1788,16 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
                         .unwrap_or_else(|error| panic!("{label} event stream failed: {error}"))
                         .event
                     {
+                        // Settling the acked id is only a success when the
+                        // turn idled with a success reason: a preflight
+                        // rejection or parked interrupt publishes
+                        // `AgentIdle` under the same id, and the daemon
+                        // schedulers must never read those as completion.
                         proto::Event::AgentIdle {
                             turn_id: Some(turn_id),
-                            ..
+                            reason:
+                                crate::engine::IdleReason::Completed
+                                | crate::engine::IdleReason::GoalComplete,
                         } if turn_id == expected_turn_id.to_string() => return,
                         proto::Event::SessionDriverFailed { error, .. } => {
                             panic!("{label} session driver failed: {error}")
@@ -2649,6 +2656,46 @@ async fn turn_completion_resolves_when_the_turn_finished_before_the_watcher_regi
         completion.await.unwrap(),
         TurnOutcome::Completed {
             reason: crate::engine::IdleReason::GoalComplete
+        }
+    ));
+}
+
+/// #275 fail-open regression: an `AgentIdle` carrying the watched queue id
+/// is only a success when its reason is a success reason. A turn that parks
+/// on an interrupt (headless scheduled run with no interactive client) and
+/// a preflight-retracted submission both idle under the acked id; the
+/// settlement layer must resolve their watchers as `DidNotComplete`, never
+/// `Completed`, so daemon schedulers cannot record a run that never
+/// completed as a success.
+#[tokio::test]
+async fn non_success_idle_reasons_resolve_watchers_as_did_not_complete() {
+    let handle = test_session_handle();
+
+    let parked = handle.watch_turn("turn-parked");
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-parked".to_string()),
+        reason: crate::engine::IdleReason::NeedsIntervention {
+            code: "parked_interrupt".to_string(),
+        },
+    });
+    assert!(matches!(
+        parked.await.unwrap(),
+        TurnOutcome::DidNotComplete {
+            reason: crate::engine::IdleReason::NeedsIntervention { .. }
+        }
+    ));
+
+    let retracted = handle.watch_turn("turn-retracted");
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-retracted".to_string()),
+        reason: crate::engine::IdleReason::PreflightRejected,
+    });
+    assert!(matches!(
+        retracted.await.unwrap(),
+        TurnOutcome::DidNotComplete {
+            reason: crate::engine::IdleReason::PreflightRejected
         }
     ));
 }

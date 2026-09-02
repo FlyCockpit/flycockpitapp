@@ -1129,6 +1129,24 @@ async fn preflight_terminal_write_retry_does_not_rerun_preflight() {
         1,
         "only the durable terminal transition retracts the accepted message"
     );
+    // The retraction settles the acked id with the truthful non-success
+    // reason (#275): the idle must carry `PreflightRejected`, never the
+    // default `Completed` a daemon scheduler would read as a successful
+    // run of a prompt no provider ever saw.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                TurnEvent::AgentIdle {
+                    turn_id: Some(turn_id),
+                    reason: crate::engine::IdleReason::PreflightRejected,
+                } if *turn_id == id.to_string()
+            ))
+            .count(),
+        1,
+        "the retraction idles under the acked id with the truthful reason"
+    );
     assert!(queue.snapshot().await.is_empty());
     assert_eq!(provider_posts(&provider).len(), 0);
 }

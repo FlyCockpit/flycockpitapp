@@ -1101,6 +1101,14 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                 "assistant `{assistant}` completed scheduled turn in session {}",
                 handle.session_id
             )),
+            // A settled watch is only a success when the turn completed:
+            // a parked interrupt, a budget/usage limit, or a preflight
+            // rejection resolves as `DidNotComplete` and must count as a
+            // failed run, never a silent success.
+            Ok(Ok(TurnOutcome::DidNotComplete { reason })) => bail!(
+                "scheduled turn in session {} ended without completing: {reason:?}",
+                handle.session_id
+            ),
             Ok(Ok(TurnOutcome::Failed { error })) => {
                 bail!("scheduled session driver failed: {error}")
             }

@@ -4799,6 +4799,13 @@ impl Driver {
                 .cloned()
                 .context("parked interrupt replay produced no tool result")?
         };
+        // The replay is a NEW working span, not a resumption of the parked
+        // one: the parked turn already settled its watchers when it idled
+        // under the original queue id with `NeedsIntervention` (daemon
+        // schedulers resolve that as `DidNotComplete`, fail closed — #275),
+        // and interactive clients track the continuation as a fresh span.
+        // Reusing the parked id would let a post-resolution idle overwrite
+        // the truthful non-success settlement watchers already observed.
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         // Modes AC5 turn-consumption is wired in `refresh_active_frame_for_turn`
@@ -9064,7 +9071,11 @@ impl Driver {
         // so no lifecycle id is in flight. Bind the submission's own settled
         // identity (its receipt id == queue item id) so a `watch_turn`
         // watcher holding the acked id resolves on this `AgentIdle` instead
-        // of being stranded behind a timeout.
+        // of being stranded behind a timeout — and publish the truthful
+        // non-success reason. `take_idle_reason` would default to
+        // `Completed` here (no pending reason is set), which the settlement
+        // layer would hand to daemon schedulers as a successful run even
+        // though no provider request was ever made (#275).
         let retraction_turn_id = client_submission_ids.first().copied();
         let _ = tx
             .send(TurnEvent::UserMessageRetracted {
@@ -9076,8 +9087,12 @@ impl Driver {
             .current_lifecycle_turn_id
             .take()
             .or_else(|| retraction_turn_id.map(|id| id.to_string()));
-        let reason = self.take_idle_reason().await;
-        let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+        let _ = tx
+            .send(TurnEvent::AgentIdle {
+                turn_id,
+                reason: crate::engine::IdleReason::PreflightRejected,
+            })
+            .await;
     }
 
     async fn run_prepared_queued_user_batch(

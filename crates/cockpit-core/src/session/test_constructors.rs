@@ -86,53 +86,57 @@ impl Session {
         let (project_root, project_id) = Self::test_session_identity(project_root);
         let project_root = project_root.to_string_lossy().into_owned();
         let active_agent = active_agent.to_string();
-        db.write(move |conn| {
-            let mut row = match options.assistant {
-                Some(assistant) => {
-                    if let Some(entry_mode) = options.session_entry_mode {
-                        anyhow::ensure!(
-                            entry_mode == crate::daemon::proto::SessionEntryMode::Assistant,
-                            "assistant test row requires assistant entry mode"
-                        );
+        let row = db
+            .write(move |conn| {
+                let mut row = match options.assistant {
+                    Some(assistant) => {
+                        if let Some(entry_mode) = options.session_entry_mode {
+                            anyhow::ensure!(
+                                entry_mode == crate::daemon::proto::SessionEntryMode::Assistant,
+                                "assistant test row requires assistant entry mode"
+                            );
+                        }
+                        crate::db::Db::build_new_assistant_session_row_conn(
+                            conn,
+                            &project_id,
+                            &project_root,
+                            &active_agent,
+                            &assistant.name,
+                        )?
                     }
-                    crate::db::Db::build_new_assistant_session_row_conn(
+                    None => crate::db::Db::build_new_session_row_conn(
                         conn,
                         &project_id,
                         &project_root,
                         &active_agent,
-                        &assistant.name,
-                    )?
+                    )?,
+                };
+                match options.model_selection {
+                    TestModelSelectionFields::None => {}
+                    TestModelSelectionFields::Active(selection) => {
+                        row.provider = Some(selection.provider.clone());
+                        row.model = Some(selection.model.clone());
+                        row.model_selection_json = Some(serde_json::to_string(&selection)?);
+                    }
+                    TestModelSelectionFields::Raw {
+                        provider,
+                        model,
+                        model_selection_json,
+                    } => {
+                        row.provider = provider;
+                        row.model = model;
+                        row.model_selection_json = model_selection_json;
+                    }
                 }
-                None => crate::db::Db::build_new_session_row_conn(
-                    conn,
-                    &project_id,
-                    &project_root,
-                    &active_agent,
-                )?,
-            };
-            match options.model_selection {
-                TestModelSelectionFields::None => {}
-                TestModelSelectionFields::Active(selection) => {
-                    row.provider = Some(selection.provider.clone());
-                    row.model = Some(selection.model.clone());
-                    row.model_selection_json = Some(serde_json::to_string(&selection)?);
+                if let Some(entry_mode) = options.session_entry_mode {
+                    row.session_entry_mode = entry_mode.as_str().to_string();
                 }
-                TestModelSelectionFields::Raw {
-                    provider,
-                    model,
-                    model_selection_json,
-                } => {
-                    row.provider = provider;
-                    row.model = model;
-                    row.model_selection_json = model_selection_json;
-                }
-            }
-            if let Some(entry_mode) = options.session_entry_mode {
-                row.session_entry_mode = entry_mode.as_str().to_string();
-            }
-            crate::db::Db::insert_session_row_conn(conn, &row)
-        })
-        .await
+                crate::db::Db::insert_session_row_conn(conn, &row)
+            })
+            .await?;
+        let json = crate::redact::RedactionTable::empty().to_persisted_json()?;
+        super::lifecycle::write_redaction_table_json_to_vault(db, row.session_id, &json)?;
+        Ok(row)
     }
 
     pub fn create_for_test(

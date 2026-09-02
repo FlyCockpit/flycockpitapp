@@ -10954,6 +10954,14 @@ async fn remote_archive_stops_worker_before_committing_archive() {
 async fn fork_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    crate::session::lifecycle::write_redaction_table_json_to_vault(
+        &ctx.db,
+        parent.session_id,
+        &crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap(),
+    )
+    .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let operation = remote_owner_operation().await;

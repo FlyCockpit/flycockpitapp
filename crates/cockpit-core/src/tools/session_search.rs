@@ -532,8 +532,9 @@ async fn render_lineage(
 
 /// Build the model-visible redactor for one history target. A target session's
 /// persisted table is durable knowledge of secrets it observed, so it must be
-/// unioned with the caller's table even for same-workspace recall. Parse and
-/// union errors fail the search rather than exposing an unredacted snippet.
+/// unioned with the caller's table even for same-workspace recall. Missing
+/// custody, parse errors, and union errors fail the search rather than
+/// exposing an unredacted snippet.
 async fn redact_target_text(ctx: &ToolCtx, session_id: uuid::Uuid, text: &str) -> Result<String> {
     let Some(target_table) = ctx
         .session

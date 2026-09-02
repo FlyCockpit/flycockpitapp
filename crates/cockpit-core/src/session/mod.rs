@@ -3010,6 +3010,9 @@ mod tests {
         )
         .unwrap();
         parent.set_active_model("anthropic", "opus-4-7").unwrap();
+        parent
+            .persist_redaction_table(&crate::redact::RedactionTable::empty())
+            .unwrap();
         let fork_point = parent
             .record_event(
                 crate::db::session_log::SessionEventKind::UserMessage,
@@ -3533,6 +3536,9 @@ mod tests {
         )
         .unwrap();
         let _ = parent.note_user_content(&"x".repeat(1000));
+        parent
+            .persist_redaction_table(&crate::redact::RedactionTable::empty())
+            .unwrap();
         let fork = Session::create_fork_for_test(
             db,
             parent.id,

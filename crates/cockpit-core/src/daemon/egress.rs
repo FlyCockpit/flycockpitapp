@@ -93,19 +93,11 @@ pub(crate) async fn redaction_for_session(
         )
         .into());
     }
-    let json = crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)
-        .map_err(|error| {
-            crate::redact::RedactionTableUnavailable::new(
-                "loading session redaction table for first-party egress",
-                error,
-            )
-        })?
-        .ok_or_else(|| {
-            crate::redact::RedactionTableUnavailable::new(
-                "loading session redaction table for first-party egress",
-                format!("session {session_id} has no vault redaction table"),
-            )
-        })?;
+    let json = crate::session::lifecycle::require_redaction_table_json_from_vault(
+        vault,
+        session_id,
+        "loading session redaction table for first-party egress",
+    )?;
     crate::redact::RedactionTable::from_persisted_json(&json).map_err(|error| {
         crate::redact::RedactionTableUnavailable::new(
             "loading session redaction table for first-party egress",

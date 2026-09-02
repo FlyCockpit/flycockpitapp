@@ -535,9 +535,11 @@ async fn sealed_session_adoption_journals_protected_history() {
             live.scrub(LIT).contains(LIT),
             "the live redaction table must not adopt the literal when journaling fails"
         );
-        assert!(
-            session.persisted_redaction_table().unwrap().is_none(),
-            "no redaction table is persisted when the adoption rolls back"
+        let persisted = session.persisted_redaction_table().unwrap().unwrap();
+        assert_eq!(
+            persisted.scrub(LIT),
+            LIT,
+            "the rolled-back literal must not be adopted into the persisted table"
         );
     }
 }

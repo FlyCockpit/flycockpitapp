@@ -267,7 +267,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     let body = if spec.worker.is_goal_control() {
         result.trim().to_string()
     } else {
-        budget_result(&label, &spec, &result)
+        budget_result(&ctx.redact, &label, &spec, &result)
     };
     let _ = event_tx
         .send(ScheduleEvent::Completed {
@@ -915,7 +915,12 @@ fn compose_child_brief(spec: &SpawnSpec) -> String {
 /// Budget-cap the child's terminal result for injection into main context
 /// (GOALS §10). Leads with a pointer to the write scope so the aggregating
 /// parent knows where the detail lives.
-fn budget_result(label: &str, spec: &SpawnSpec, result: &str) -> String {
+fn budget_result(
+    redact: &crate::redact::RedactionTable,
+    label: &str,
+    spec: &SpawnSpec,
+    result: &str,
+) -> String {
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     let _ = writer.writeln(&format!("swarm `{label}` finished."));
     let _ = writer.writeln(&format!("output saved under: {}", spec.write_scope));
@@ -924,7 +929,10 @@ fn budget_result(label: &str, spec: &SpawnSpec, result: &str) -> String {
         let _ = writer.writeln("summary:");
         let _ = writer.writeln(trimmed);
     }
-    writer.into_string()
+    // The budget can cut the last retained line mid-line; elide the cut's
+    // back margin so a boundary-straddling secret never survives as a
+    // partial past the downstream whole-value scrub (issue #294).
+    writer.into_string_redacted(redact)
 }
 
 /// A stable-ish progress key for the parent swarm job (the depth + brief

@@ -522,6 +522,7 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
 pub fn condense_candidates_with_artifact_calls(
     history: &[Message],
     model_context_artifact_calls: &std::collections::BTreeSet<String>,
+    redact: &crate::redact::RedactionTable,
 ) -> Vec<CondenseCandidate> {
     let mut calls: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -563,8 +564,13 @@ pub fn condense_candidates_with_artifact_calls(
                     {
                         continue;
                     }
+                    // The condense rewrite cuts at line/record boundaries;
+                    // pass the session table so any retention edge the table
+                    // cares about elides its margin (issue #294). History
+                    // bodies are already whole-value-scrubbed, so this is
+                    // defense-in-depth, not the primary barrier.
                     let Some(condensed_body) =
-                        shell_compress::prune_boundary_condense(command, &body)
+                        shell_compress::prune_boundary_condense(redact, command, &body)
                     else {
                         continue;
                     };
@@ -1799,7 +1805,14 @@ mod tests {
         let frame = render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"));
         apply_condensed_tool_result(&mut pruned, &candidates[0], &frame);
         let durable_prune_calls = std::collections::BTreeSet::from(["c1".to_owned()]);
-        assert!(condense_candidates_with_artifact_calls(&pruned, &durable_prune_calls).is_empty());
+        assert!(
+            condense_candidates_with_artifact_calls(
+                &pruned,
+                &durable_prune_calls,
+                &crate::redact::RedactionTable::empty()
+            )
+            .is_empty()
+        );
         let ledger = capture_ledger_with_prune_boundary_calls(&pruned, 2, &durable_prune_calls);
         assert_eq!(ledger.elided.len(), 1);
         assert_eq!(ledger.elided[0].reason, REASON_TOOL_RESULT_CONDENSED);

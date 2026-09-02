@@ -111,7 +111,7 @@ impl Tool for OutlineTool {
                     break;
                 }
             }
-            let mut out = finish(writer, "\n... [truncated]\n");
+            let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
             append_freshen_note(&mut out, &freshen_report);
             fence_attached_knowledge_outline(&mut out, attached_knowledge_read);
             return Ok(out);
@@ -122,7 +122,7 @@ impl Tool for OutlineTool {
             writer.writeln("imports:");
             for (target, line) in &imports {
                 if !write_retained_line(&mut writer, &format!("  {line}: {target}")) {
-                    let mut out = finish(writer, "\n... [truncated]\n");
+                    let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
                     append_freshen_note(&mut out, &freshen_report);
                     fence_attached_knowledge_outline(&mut out, attached_knowledge_read);
                     return Ok(out);
@@ -163,7 +163,7 @@ impl Tool for OutlineTool {
         if symbols.is_empty() && imports.is_empty() {
             writer.writeln("  (no symbols or imports)");
         }
-        let mut out = finish(writer, "\n... [truncated]\n");
+        let mut out = finish(&ctx.redact, writer, "\n... [truncated]\n");
         append_freshen_note(&mut out, &freshen_report);
         fence_attached_knowledge_outline(&mut out, attached_knowledge_read);
         Ok(out)

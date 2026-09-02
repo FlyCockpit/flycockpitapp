@@ -3498,6 +3498,7 @@ impl Driver {
             &root.history,
             &root.agent.role_prompt,
             instructions.as_ref().map(|(_, body)| body.as_str()),
+            &self.redact,
         );
         crate::engine::preflight::run(
             enabled,
@@ -10664,7 +10665,7 @@ impl Driver {
         let mut allow = crate::config::extended::resolve_gitignore_allow(cwd);
         allow.extend(self.session.gitignore_session_allow());
         let caps = crate::tags::TagInlineCaps::for_context_policy(context_policy);
-        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps);
+        let policy = crate::tags::TagPolicy::new_for_caps(cwd, allow, caps, self.redact.clone());
         crate::tags::expand_assembly_tags_with_policy(&text, &policy).wire
     }
 

@@ -2398,7 +2398,11 @@ async fn execute_ordinary_call_unscoped(
     {
         artifact_captures.push(crate::engine::tool::ToolTextArtifactCapture {
             lane: crate::engine::tool::ToolArtifactLane::Model,
-            capture: crate::intel::budget::capture_text_artifact_body(&output_str),
+            // Boundary-safe capture: the host cap cut in
+            // `capture_text_artifact_body` can straddle a registered secret
+            // (issue #294) — elide the unsafe back margin so the retained
+            // artifact never carries a partial.
+            capture: crate::tools::common::boundary_safe_capture(&env.ctx.redact, &output_str),
             explicit: false,
         });
     }

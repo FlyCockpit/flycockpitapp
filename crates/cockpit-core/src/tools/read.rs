@@ -346,7 +346,7 @@ async fn render_read_bytes(
         _ => (READ_LINE_CAP, true),
     };
 
-    let slice = read_slice(&text, offset, limit);
+    let slice = read_slice(&ctx.redact, &text, offset, limit);
     if slice.offset_exceeded {
         let mut out = String::new();
         if default_offset && default_limit {
@@ -485,7 +485,7 @@ async fn read_range(
     let limit = requested_end
         .map(|end| end.max(start) - start + 1)
         .unwrap_or(usize::MAX);
-    let slice = read_slice(text, start, limit);
+    let slice = read_slice(&ctx.redact, text, start, limit);
     let total = slice.total_lines;
     let end = requested_end
         .unwrap_or_else(|| if start_byte.is_some() { start } else { total })

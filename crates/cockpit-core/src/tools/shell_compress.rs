@@ -72,17 +72,29 @@ const PRUNE_BOUNDARY_SIGNAL_TAIL: usize = 40;
 /// per-command strategy). `body` is the captured stream text. Returns the
 /// compressed text; an empty input returns empty.
 ///
+/// `redact` is the session redaction table (issue #294): every line-omission
+/// boundary this filter creates (middle-truncation head/tail edges, trace-block
+/// elisions, per-command noise drops, the prune-boundary signal budget) elides
+/// the unsafe margin in RAW joined-line coordinates, so a registered secret
+/// straddling the boundary — a multi-line literal spanning several lines
+/// included — never leaves a PARTIAL the downstream §7 whole-value scrub
+/// cannot match.
+///
 /// Order is: generic noise filter first (ANSI/spinner/dedup/boilerplate +
 /// middle-truncation), then the recognized per-command strategy. The
 /// per-command strategy runs second so it sees already-ANSI-stripped,
 /// dedup'd lines and only has to reason about clean text.
-pub fn compress_stream(command: &str, body: &str) -> String {
+pub fn compress_stream(
+    redact: &crate::redact::RedactionTable,
+    command: &str,
+    body: &str,
+) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let generic = generic_filter(body);
+    let generic = generic_filter(redact, body);
     match recognize(command) {
-        Some(family) => command_strategy(family, &generic),
+        Some(family) => command_strategy(family, redact, &generic),
         None => generic,
     }
 }
@@ -92,15 +104,19 @@ pub fn compress_stream(command: &str, body: &str) -> String {
 /// filters as live shell compression, then adds a bounded, exact diagnostic
 /// section so errors/warnings/exit/sandbox/security lines survive even when
 /// they appeared in the elided middle of a long log.
-pub fn prune_boundary_condense(command: &str, body: &str) -> Option<String> {
+pub fn prune_boundary_condense(
+    redact: &crate::redact::RedactionTable,
+    command: &str,
+    body: &str,
+) -> Option<String> {
     let line_count = body.lines().count();
     if body.len() < PRUNE_BOUNDARY_MIN_BYTES && line_count <= PRUNE_BOUNDARY_MIN_LINES {
         return None;
     }
 
-    let compressed = compress_stream(command, body);
+    let compressed = compress_stream(redact, command, body);
     let signal_lines = prune_boundary_signal_lines(body);
-    let signal = bounded_signal_lines(&signal_lines);
+    let signal = bounded_signal_lines(redact, &signal_lines);
 
     let mut out = String::new();
     out.push_str("[deterministic shell condensation]\n");
@@ -140,8 +156,15 @@ pub fn prune_boundary_condense(command: &str, body: &str) -> Option<String> {
 ///
 /// No stage removes a line on the basis of its *content* looking like an
 /// error — only structural noise (escape codes, redraws, spinner glyphs,
-/// exact duplicates) is touched.
-pub fn generic_filter(body: &str) -> String {
+/// exact duplicates) is touched. The CR-collapse, spinner-drop, and dedup
+/// stages are boundary-exempt: a `\r`-redraw only ever drops overwritten
+/// segments of the SAME terminal line, spinner lines are glyph/whitespace-only
+/// (a registered literal containing an entire spinner line is not a reachable
+/// registration shape), and the dedup retains one whole representative of
+/// every identical run (so a whole secret in the run stays scrub-matched).
+/// Only the middle-truncation stage creates content omissions, and it is
+/// margin-elided via `redact`.
+pub fn generic_filter(redact: &crate::redact::RedactionTable, body: &str) -> String {
     let stripped = strip_ansi(body);
     let mut out_lines: Vec<String> = Vec::new();
 
@@ -170,7 +193,7 @@ pub fn generic_filter(body: &str) -> String {
         push_with_count(&mut out_lines, p, prev_count);
     }
 
-    trace_aware_truncate_lines(out_lines)
+    trace_aware_truncate_lines(redact, out_lines)
 }
 
 /// Flush a deduplicated run: the line, plus a `  [×n]` suffix when it
@@ -245,7 +268,13 @@ fn is_spinner_or_progress(line: &str) -> bool {
 /// Always keeps HEAD + TAIL and inserts a single explicit elision marker
 /// naming the elided count — never silently drops the middle. The tail is
 /// always preserved so the failure signal (which lives at the tail) survives.
-fn middle_truncate_lines(lines: Vec<String>) -> String {
+///
+/// Redaction-aware (issue #294): the retained head's END and the retained
+/// tail's START each abut the elided middle, so a registered secret
+/// straddling either boundary — a multi-line literal spanning several lines
+/// included, via the joined-line coordinates — would leave a PARTIAL the §7
+/// whole-value scrub cannot match. The unsafe margin is elided on each side.
+fn middle_truncate_lines(redact: &crate::redact::RedactionTable, lines: Vec<String>) -> String {
     if lines.len() <= MAX_LINES_BEFORE_TRUNCATE {
         return lines.join("\n");
     }
@@ -253,23 +282,22 @@ fn middle_truncate_lines(lines: Vec<String>) -> String {
     let head = &lines[..TRUNCATE_HEAD_LINES];
     let tail = &lines[total - TRUNCATE_TAIL_LINES..];
     let elided = total - TRUNCATE_HEAD_LINES - TRUNCATE_TAIL_LINES;
-    let mut out = String::new();
-    out.push_str(&head.join("\n"));
-    out.push('\n');
-    out.push_str(&format!("… {elided} lines elided …"));
-    out.push('\n');
-    out.push_str(&tail.join("\n"));
-    out
+    let safe_head = crate::tools::common::drop_back_margin(redact, &head.join("\n"));
+    let safe_tail = crate::tools::common::drop_front_margin(redact, &tail.join("\n"));
+    format!("{safe_head}\n… {elided} lines elided …\n{safe_tail}")
 }
 
-fn trace_aware_truncate_lines(lines: Vec<String>) -> String {
+fn trace_aware_truncate_lines(
+    redact: &crate::redact::RedactionTable,
+    lines: Vec<String>,
+) -> String {
     if lines.len() <= MAX_LINES_BEFORE_TRUNCATE {
-        return summarize_trace_blocks(lines);
+        return summarize_trace_blocks(redact, lines);
     }
 
     let trace_blocks = trace_blocks(&lines);
     if trace_blocks.is_empty() {
-        return middle_truncate_lines(lines);
+        return middle_truncate_lines(redact, lines);
     }
 
     let total = lines.len();
@@ -295,20 +323,43 @@ fn trace_aware_truncate_lines(lines: Vec<String>) -> String {
         merged.push((start, end));
     }
 
+    // Margin-safe assembly (issue #294): each merged range is a contiguous
+    // retained span; the gaps between ranges are the elided middle. A
+    // registered secret straddling a gap edge — a multi-line literal spanning
+    // several retained lines included — would leave a PARTIAL the §7
+    // whole-value scrub cannot match, so the unsafe margin is elided at each
+    // span edge that abuts a gap (joined-line coordinates; the elision
+    // markers are fixed constants §7 scrubs whole).
     let mut out = Vec::new();
     let mut cursor = 0;
-    for (start, end) in merged {
+    for (idx, (start, end)) in merged.iter().copied().enumerate() {
         if start > cursor {
             out.push(format!("… {} lines elided …", start - cursor));
         }
-        out.extend(lines[start..end].iter().cloned());
+        let front_omitted = start > cursor;
+        let back_omitted = merged
+            .get(idx + 1)
+            .is_some_and(|(next_start, _)| *next_start > end)
+            || end < total;
+        let span = lines[start..end].join("\n");
+        let span = if front_omitted {
+            crate::tools::common::drop_front_margin(redact, &span)
+        } else {
+            &span[..]
+        };
+        let span = if back_omitted {
+            crate::tools::common::drop_back_margin(redact, span)
+        } else {
+            span
+        };
+        out.extend(span.split('\n').map(str::to_string));
         cursor = end;
     }
     if cursor < total {
         out.push(format!("… {} lines elided …", total - cursor));
     }
 
-    summarize_trace_blocks(out)
+    summarize_trace_blocks(redact, out)
 }
 
 // ─────────────────────── Layer 2: per-command strategy ───────────────────
@@ -635,68 +686,137 @@ fn looks_like_clean_log_boundary(trimmed: &str) -> bool {
     })
 }
 
-fn summarize_trace_blocks(lines: Vec<String>) -> String {
+fn summarize_trace_blocks(redact: &crate::redact::RedactionTable, lines: Vec<String>) -> String {
     let blocks = trace_blocks(&lines);
     if blocks.is_empty() {
         return lines.join("\n");
     }
 
-    let mut out = Vec::new();
+    // Margin-safe assembly (issue #294): retained rows and omission markers
+    // are tracked structurally, and every marker boundary is an emission
+    // discontinuity (a straddling secret cannot be whole-matched across an
+    // inserted marker), so each retained run's joined content gets the front
+    // margin elided when a marker precedes it and the back margin elided when
+    // a marker follows — covering multi-line literals spanning several rows.
+    // The head is always retained from line 0 and the tail to the last line,
+    // so the outermost edges need no elision.
+    let mut out: Vec<(String, bool)> = Vec::new();
     let mut cursor = 0;
     let mut skipped_blocks = 0;
     let keep_blocks = first_last_trace_blocks(&blocks);
     for (start, end) in blocks.iter().copied() {
         if !keep_blocks.contains(&(start, end)) {
-            out.extend(lines[cursor..start].iter().cloned());
+            for line in &lines[cursor..start] {
+                out.push((line.clone(), false));
+            }
             skipped_blocks += 1;
             cursor = end;
             continue;
         }
-        out.extend(lines[cursor..start].iter().cloned());
+        for line in &lines[cursor..start] {
+            out.push((line.clone(), false));
+        }
         if skipped_blocks > 0 {
-            out.push(format!("... [{skipped_blocks} trace blocks omitted]"));
+            out.push((format!("... [{skipped_blocks} trace blocks omitted]"), true));
             skipped_blocks = 0;
         }
         let block = &lines[start..end];
         if block.len() > TRACE_BLOCK_HEAD_LINES + TRACE_BLOCK_TAIL_LINES {
-            out.extend(block[..TRACE_BLOCK_HEAD_LINES].iter().cloned());
-            out.push(format!(
-                "... [{} trace lines elided] ...",
-                block.len() - TRACE_BLOCK_HEAD_LINES - TRACE_BLOCK_TAIL_LINES
+            for line in &block[..TRACE_BLOCK_HEAD_LINES] {
+                out.push((line.clone(), false));
+            }
+            out.push((
+                format!(
+                    "... [{} trace lines elided] ...",
+                    block.len() - TRACE_BLOCK_HEAD_LINES - TRACE_BLOCK_TAIL_LINES
+                ),
+                true,
             ));
-            out.extend(
-                block[block.len() - TRACE_BLOCK_TAIL_LINES..]
-                    .iter()
-                    .cloned(),
-            );
+            for line in &block[block.len() - TRACE_BLOCK_TAIL_LINES..] {
+                out.push((line.clone(), false));
+            }
         } else {
-            out.extend(block.iter().cloned());
+            for line in block {
+                out.push((line.clone(), false));
+            }
         }
         cursor = end;
     }
     if skipped_blocks > 0 {
-        out.push(format!("... [{skipped_blocks} trace blocks omitted]"));
+        out.push((format!("... [{skipped_blocks} trace blocks omitted]"), true));
     }
-    out.extend(lines[cursor..].iter().cloned());
-    out.join("\n")
+    for line in &lines[cursor..] {
+        out.push((line.clone(), false));
+    }
+
+    // Walk the rows: group contiguous retained runs, elide at marker edges.
+    let mut rendered: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut front_omitted = false;
+    for (text, is_marker) in out {
+        if is_marker {
+            flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
+            rendered.push(text);
+            // The run after a marker opens front-elided (emission split).
+            front_omitted = true;
+            continue;
+        }
+        run.push(text);
+    }
+    flush_compress_run(redact, &mut rendered, &mut run, front_omitted, false);
+    rendered.join("\n")
+}
+
+/// Flush one contiguous retained run of compression output through the
+/// redaction-aware margins (issue #294): the joined run content's front edge
+/// is elided when omitted content precedes it and its back edge when omitted
+/// content follows, so only WHOLE secrets — which §7 scrubs normally —
+/// remain. Shared by the trace-block summarizer and the noise-drop pass.
+fn flush_compress_run(
+    redact: &crate::redact::RedactionTable,
+    rendered: &mut Vec<String>,
+    run: &mut Vec<String>,
+    front_omitted: bool,
+    back_omitted: bool,
+) {
+    if run.is_empty() {
+        return;
+    }
+    let joined = run.join("\n");
+    let safe = if front_omitted {
+        crate::tools::common::drop_front_margin(redact, &joined)
+    } else {
+        &joined[..]
+    };
+    let safe = if back_omitted {
+        crate::tools::common::drop_back_margin(redact, safe)
+    } else {
+        safe
+    };
+    rendered.extend(safe.split('\n').map(str::to_string));
+    run.clear();
 }
 
 /// Apply the per-command strategy for `family` to already-generic-filtered
 /// `body`. Every strategy is "drop a small allowlist of known-noise lines,
 /// keep everything else" — so any error/warning/failure/diagnostic line, and
 /// any line the strategy doesn't explicitly recognize as noise, is kept.
-pub fn command_strategy(family: Family, body: &str) -> String {
+pub fn command_strategy(
+    family: Family,
+    redact: &crate::redact::RedactionTable,
+    body: &str,
+) -> String {
     match family {
-        Family::Rust => drop_noise(body, is_rust_noise),
-        Family::Git => drop_noise(body, is_git_noise),
-        Family::Js => drop_noise(body, is_js_noise),
-        Family::Go => drop_noise(body, is_go_noise),
-        Family::Python => drop_noise(body, is_python_noise),
-        Family::Ruby => drop_noise(body, is_ruby_noise),
-        Family::Jvm => drop_noise(body, is_jvm_noise),
-        Family::Dotnet => drop_noise(body, is_dotnet_noise),
-        Family::Cloud => drop_noise(body, is_cloud_noise),
-        Family::System => drop_noise(body, is_system_noise),
+        Family::Rust => drop_noise(redact, body, is_rust_noise),
+        Family::Git => drop_noise(redact, body, is_git_noise),
+        Family::Js => drop_noise(redact, body, is_js_noise),
+        Family::Go => drop_noise(redact, body, is_go_noise),
+        Family::Python => drop_noise(redact, body, is_python_noise),
+        Family::Ruby => drop_noise(redact, body, is_ruby_noise),
+        Family::Jvm => drop_noise(redact, body, is_jvm_noise),
+        Family::Dotnet => drop_noise(redact, body, is_dotnet_noise),
+        Family::Cloud => drop_noise(redact, body, is_cloud_noise),
+        Family::System => drop_noise(redact, body, is_system_noise),
     }
 }
 
@@ -705,27 +825,52 @@ pub fn command_strategy(family: Family, body: &str) -> String {
 /// kept when [`looks_like_signal`] judges it diagnostic, regardless of the
 /// family predicate — the belt-and-suspenders signal guarantee: even a buggy
 /// noise predicate can't eat an error/warning/panic/failure line.
-fn drop_noise(body: &str, is_noise: impl Fn(&str) -> bool) -> String {
-    let mut kept: Vec<String> = Vec::new();
+///
+/// Redaction-aware (issue #294): every dropped noise line is an omission
+/// boundary for its retained neighbours, so each contiguous kept run gets
+/// the unsafe margin elided at the edges that abut dropped lines (in joined
+/// line coordinates, covering multi-line registered literals). With <3
+/// omissions the summary marker is elided too, but the run-edge margins
+/// still apply — the omission is real even when unmarked.
+fn drop_noise(
+    redact: &crate::redact::RedactionTable,
+    body: &str,
+    is_noise: impl Fn(&str) -> bool,
+) -> String {
+    let mut rendered: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut front_omitted = false;
     let mut omitted = OmittedCounts::default();
     for line in body.lines() {
         if looks_like_signal(line) || !is_noise(line) {
-            kept.push(line.to_string());
+            run.push(line.to_string());
         } else {
             omitted.add(classify_omitted_line(line));
+            flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
+            front_omitted = true;
         }
     }
+    let total_omitted = omitted.total();
     // If the strategy dropped everything (e.g. a clean, all-progress run),
     // never return empty for tiny cleanups — that would hide that the command
     // ran. Fall back to the original body unless the omission is material
     // enough to warrant an explicit summary.
-    if kept.is_empty() && !body.trim().is_empty() && omitted.total() < 3 {
+    if rendered.is_empty() && run.is_empty() && !body.trim().is_empty() && total_omitted < 3 {
         return body.to_string();
     }
-    if omitted.total() >= 3 {
-        kept.push(omitted.marker());
+    if total_omitted >= 3 {
+        flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
+        rendered.push(omitted.marker());
+    } else {
+        flush_compress_run(
+            redact,
+            &mut rendered,
+            &mut run,
+            front_omitted,
+            total_omitted > 0,
+        );
     }
-    kept.join("\n")
+    rendered.join("\n")
 }
 
 /// Whether a line carries signal that must NEVER be dropped: errors,
@@ -802,7 +947,7 @@ fn looks_like_prune_boundary_diagnostic(line: &str) -> bool {
         || lower.contains("backtrace")
 }
 
-fn bounded_signal_lines(lines: &[String]) -> String {
+fn bounded_signal_lines(redact: &crate::redact::RedactionTable, lines: &[String]) -> String {
     if lines.is_empty() {
         return String::new();
     }
@@ -810,13 +955,19 @@ fn bounded_signal_lines(lines: &[String]) -> String {
         return lines.join("\n");
     }
     let omitted = lines.len() - PRUNE_BOUNDARY_SIGNAL_HEAD - PRUNE_BOUNDARY_SIGNAL_TAIL;
-    let mut out = String::new();
-    out.push_str(&lines[..PRUNE_BOUNDARY_SIGNAL_HEAD].join("\n"));
-    out.push('\n');
-    out.push_str(&format!("… {omitted} diagnostic lines elided …"));
-    out.push('\n');
-    out.push_str(&lines[lines.len() - PRUNE_BOUNDARY_SIGNAL_TAIL..].join("\n"));
-    out
+    // Margin-safe head+tail (issue #294): the retained head's END and the
+    // retained tail's START each abut the elided middle; elide the unsafe
+    // margin on each side (joined-line coordinates cover multi-line
+    // registered literals straddling either boundary).
+    let head = crate::tools::common::drop_back_margin(
+        redact,
+        &lines[..PRUNE_BOUNDARY_SIGNAL_HEAD].join("\n"),
+    );
+    let tail = crate::tools::common::drop_front_margin(
+        redact,
+        &lines[lines.len() - PRUNE_BOUNDARY_SIGNAL_TAIL..].join("\n"),
+    );
+    format!("{head}\n… {omitted} diagnostic lines elided …\n{tail}")
 }
 
 // ── Per-family noise predicates ───────────────────────────────────────────
@@ -1357,7 +1508,11 @@ warning: unused variable: `x`
 error[E0382]: borrow of moved value: `v`
   --> src/main.rs:5:9
     Finished dev [unoptimized] in 2.3s";
-        let out = compress_stream("cargo build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "cargo build",
+            input,
+        );
         assert!(!out.contains("Compiling foo"));
         assert!(!out.contains("Downloading"));
         assert!(!out.contains("Finished"));
@@ -1376,7 +1531,11 @@ error[E0382]: borrow of moved value: `v`
    Compiling d v0.1.0
 done";
 
-        let out = compress_stream("cargo build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "cargo build",
+            input,
+        );
 
         assert!(out.contains("done"), "{out}");
         assert!(out.contains("4 lines omitted"), "{out}");
@@ -1390,7 +1549,11 @@ done";
     #[test]
     fn tiny_clean_progress_omission_still_falls_back_to_original() {
         let input = "   Compiling foo v0.1.0\n   Compiling bar v0.2.0";
-        let out = compress_stream("cargo build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "cargo build",
+            input,
+        );
         assert_eq!(out, input);
     }
 
@@ -1406,7 +1569,7 @@ Changes not staged for commit:
 	modified:   src/main.rs
 
 no changes added to commit (use \"git add\" and/or \"git commit -a\")";
-        let out = compress_stream("git status", input);
+        let out = compress_stream(&crate::redact::RedactionTable::empty(), "git status", input);
         assert!(!out.contains("(use \"git restore"));
         assert!(!out.contains("(use \"git add <file>"));
         // File state preserved.
@@ -1423,7 +1586,11 @@ npm notice New version of npm available
 added 421 packages
 src/index.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.
 npm ERR! code ELIFECYCLE";
-        let out = compress_stream("npm run build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "npm run build",
+            input,
+        );
         assert!(!out.contains("npm notice"));
         assert!(!out.contains("added 421 packages"));
         // Signal preserved.
@@ -1441,7 +1608,11 @@ ok  \tgithub.com/x/y\t0.123s
 --- FAIL: TestThing (0.01s)
     thing_test.go:14: expected 2, got 1
 FAIL";
-        let out = compress_stream("go test ./...", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "go test ./...",
+            input,
+        );
         assert!(!out.contains("go: downloading"));
         assert!(!out.contains("=== RUN"));
         assert!(!out.contains("--- PASS"));
@@ -1463,7 +1634,7 @@ test_x.py ..F.. [100%]
 _________________________________ test_thing __________________________________
 E   assert 1 == 2
 FAILED test_x.py::test_thing - assert 1 == 2";
-        let out = compress_stream("pytest -q", input);
+        let out = compress_stream(&crate::redact::RedactionTable::empty(), "pytest -q", input);
         assert!(!out.contains("platform linux"));
         assert!(!out.contains("rootdir:"));
         assert!(!out.contains("plugins:"));
@@ -1484,7 +1655,7 @@ collecting ...
 .................................... [100%]
 1 passed in 0.01s";
 
-        let out = compress_stream("pytest -q", input);
+        let out = compress_stream(&crate::redact::RedactionTable::empty(), "pytest -q", input);
 
         assert!(out.contains("1 passed"), "{out}");
         assert!(out.contains("6 lines omitted"), "{out}");
@@ -1501,7 +1672,11 @@ Run options: include {:focus=>true}
 Failures:
   1) Thing does stuff
      Failure/Error: expect(1).to eq(2)";
-        let out = compress_stream("rspec spec/", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "rspec spec/",
+            input,
+        );
         assert!(!out.contains("Using rake"));
         assert!(!out.contains("Run options:"));
         // Signal preserved.
@@ -1519,7 +1694,11 @@ Starting a Gradle Daemon
 5 actionable tasks: 5 executed
 src/main/java/App.java:7: error: cannot find symbol
 BUILD FAILED in 3s";
-        let out = compress_stream("./gradlew build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "./gradlew build",
+            input,
+        );
         assert!(!out.contains("> Task :compileJava"));
         assert!(!out.contains("Starting a Gradle Daemon"));
         assert!(!out.contains("actionable task"));
@@ -1536,7 +1715,11 @@ Restored /app/App.csproj (in 1.2 sec).
 Restore complete (1.5s)
 /app/Program.cs(8,13): error CS0103: The name 'x' does not exist
 Build FAILED.";
-        let out = compress_stream("dotnet build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "dotnet build",
+            input,
+        );
         assert!(!out.contains("Determining projects to restore"));
         assert!(!out.contains("Restored /app"));
         assert!(!out.contains("Restore complete"));
@@ -1553,7 +1736,11 @@ sha256abc: Downloading 50%
 sha256abc: Pull complete
 Step 5/8 : RUN make
 failed to solve: process \"/bin/sh -c make\" did not complete successfully: exit code 2";
-        let out = compress_stream("docker build .", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "docker build .",
+            input,
+        );
         assert!(!out.contains("Pulling fs layer"));
         assert!(!out.contains("Pull complete"));
         // Signal preserved.
@@ -1563,7 +1750,7 @@ failed to solve: process \"/bin/sh -c make\" did not complete successfully: exit
     #[test]
     fn system_is_largely_passthrough_after_generic() {
         let input = "src\nsrc/main.rs\nsrc/lib.rs\n2 directories, 5 files";
-        let out = compress_stream("tree src", input);
+        let out = compress_stream(&crate::redact::RedactionTable::empty(), "tree src", input);
         // Listing content + the useful count are all preserved.
         assert!(out.contains("src/main.rs"));
         assert!(out.contains("src/lib.rs"));
@@ -1575,7 +1762,11 @@ failed to solve: process \"/bin/sh -c make\" did not complete successfully: exit
         // An all-progress run must not collapse to empty — the model still
         // needs to see the command produced output.
         let input = "   Compiling foo v0.1.0\n   Compiling bar v0.2.0";
-        let out = compress_stream("cargo build", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "cargo build",
+            input,
+        );
         assert!(!out.trim().is_empty());
     }
 
@@ -1585,13 +1776,43 @@ failed to solve: process \"/bin/sh -c make\" did not complete successfully: exit
         // signal. `go: downloading ... error` is matched by is_go_noise's
         // prefix but the signal guard keeps it.
         let input = "go: downloading failed: error connecting to proxy";
-        let out = compress_stream("go test ./...", input);
+        let out = compress_stream(
+            &crate::redact::RedactionTable::empty(),
+            "go test ./...",
+            input,
+        );
         assert!(out.contains("error connecting to proxy"));
     }
 
     #[test]
     fn empty_input_is_empty() {
-        assert_eq!(compress_stream("cargo build", ""), "");
+        assert_eq!(
+            compress_stream(&crate::redact::RedactionTable::empty(), "cargo build", ""),
+            ""
+        );
         assert_eq!(generic_filter(""), "");
+    }
+    // A multi-line registered literal spanning a dropped-noise/kept-line
+    // boundary leaves a PARTIAL the downstream whole-value scrub cannot
+    // match. `drop_noise` must elide the run-edge margin (issue #294).
+    #[test]
+    fn drop_noise_run_edge_elides_multi_line_straddling_secret() {
+        const SECRET: &str = "Compiling SECRETMID-0123456789\nTAILSECRET-0123456789";
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$leak:dropnoise".to_string())
+            .unwrap();
+        // Three+ noise lines so the material-omission marker path runs (with
+        // fewer than three the whole result falls back to the raw body).
+        let body = "Compiling a\nCompiling b\nCompiling SECRETMID-0123456789\nTAILSECRET-0123456789 kept line\nCompiling c\nkept final line\n";
+        let out = drop_noise(&table, body, is_rust_noise);
+        let scrubbed = table.scrub(&out);
+        assert!(
+            !scrubbed.contains("SECRETMID-0123456789"),
+            "noise-drop partial leaked: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("TAILSECRET-0123456789"),
+            "run front-edge partial leaked: {scrubbed}"
+        );
     }
 }

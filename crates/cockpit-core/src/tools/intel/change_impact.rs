@@ -229,7 +229,7 @@ impl Tool for ChangeImpactTool {
                     suffix
                 ),
             ) {
-                return Ok(finish_change_impact(writer, &freshen_report));
+                return Ok(finish_change_impact(&ctx.redact, writer, &freshen_report));
             }
             for symbol in overlapping {
                 let sc = centrality.get(&symbol.path).copied().unwrap_or(0.0);
@@ -280,7 +280,7 @@ impl Tool for ChangeImpactTool {
                         calls
                     ),
                 ) {
-                    return Ok(finish_change_impact(writer, &freshen_report));
+                    return Ok(finish_change_impact(&ctx.redact, writer, &freshen_report));
                 }
             }
             if changed_symbols.len() > 80 {
@@ -301,7 +301,7 @@ impl Tool for ChangeImpactTool {
             {
                 any_reverse = true;
                 if !write_retained_line(&mut writer, &format!("  {} <- {}", file.path, dep)) {
-                    return Ok(finish_change_impact(writer, &freshen_report));
+                    return Ok(finish_change_impact(&ctx.redact, writer, &freshen_report));
                 }
             }
         }
@@ -334,7 +334,7 @@ impl Tool for ChangeImpactTool {
                         caller_file, caller_line, in_sym, sym.path, sym.line, sym.name
                     ),
                 ) {
-                    return Ok(finish_change_impact(writer, &freshen_report));
+                    return Ok(finish_change_impact(&ctx.redact, writer, &freshen_report));
                 }
             }
             for (callee, def_file, def_line) in
@@ -356,7 +356,7 @@ impl Tool for ChangeImpactTool {
                         sym.path, sym.line, callee, def_file, def_line
                     ),
                 ) {
-                    return Ok(finish_change_impact(writer, &freshen_report));
+                    return Ok(finish_change_impact(&ctx.redact, writer, &freshen_report));
                 }
             }
         }
@@ -364,12 +364,16 @@ impl Tool for ChangeImpactTool {
             writer.writeln("  none");
         }
         writer.writeln(&format!("next: read narrow changed ranges; run `graph` callers/calls for high-risk symbols; run `graph` importers on high-risk files{}", path_filter.as_ref().map(|p| format!(" under `{p}`")).unwrap_or_default()));
-        Ok(finish_change_impact(writer, &freshen_report))
+        Ok(finish_change_impact(&ctx.redact, writer, &freshen_report))
     }
 }
 
-fn finish_change_impact(writer: BudgetedWriter, report: &FreshenReport) -> ToolOutput {
-    let mut out = finish(writer, "\n... [truncated; narrow with `path`]\n");
+fn finish_change_impact(
+    redact: &crate::redact::RedactionTable,
+    writer: BudgetedWriter,
+    report: &FreshenReport,
+) -> ToolOutput {
+    let mut out = finish(redact, writer, "\n... [truncated; narrow with `path`]\n");
     append_freshen_note(&mut out, report);
     out
 }

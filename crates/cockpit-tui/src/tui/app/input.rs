@@ -2798,10 +2798,24 @@ impl App {
         allow.extend(self.gitignore_session_allow.clone());
         // Tag caps are daemon-owned agent policy. The TUI expands with the
         // Standard profile and never resolves agent definitions from disk.
+        // Build the same non-bypassable redaction table the driver uses
+        // (GOALS §7) so the inline expansion's line/byte-cap truncation
+        // elides a boundary-straddling secret (issue #294). The wire text
+        // is §7-scrubbed downstream, but a truncation partial would already
+        // be unmatchable there. Fail-open to an empty table if the build
+        // errors (the scrub still runs downstream on whole values).
+        let (extended, _) = cockpit_core::auto_title::load_configs_for(&self.launch.cwd);
+        let tag_redact =
+            cockpit_core::redact::RedactionTable::build(&extended.redact, &self.launch.cwd)
+                .map(std::sync::Arc::new)
+                .unwrap_or_else(|_| {
+                    std::sync::Arc::new(cockpit_core::redact::RedactionTable::empty())
+                });
         let tag_policy = cockpit_core::tags::TagPolicy::new_for_caps(
             &self.launch.cwd,
             allow,
             cockpit_core::tags::TagInlineCaps::STANDARD,
+            tag_redact,
         );
         let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text

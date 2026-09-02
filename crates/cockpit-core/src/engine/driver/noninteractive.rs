@@ -12170,7 +12170,13 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                 // No `return` tool call: fall back to wrapping the final text
                 // (envelope-holding agents only — the `docs` pipeline keeps its
                 // plain answer). `None` selects the fallback path.
-                let report = assemble_subagent_report(&agent, &history, &deferred_log, None);
+                let report = assemble_subagent_report(
+                    &agent,
+                    &history,
+                    &deferred_log,
+                    None,
+                    &agent.model.session_redact_table(),
+                );
                 let seed_reads = crate::engine::seed_reads::select_from_explore_fork(
                     session.clone(),
                     agent.model.clone(),
@@ -12216,8 +12222,13 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                 }
                 drop(child_tx);
                 let _ = forwarder.await;
-                let report =
-                    assemble_subagent_report(&agent, &history, &deferred_log, Some(&fields));
+                let report = assemble_subagent_report(
+                    &agent,
+                    &history,
+                    &deferred_log,
+                    Some(&fields),
+                    &agent.model.session_redact_table(),
+                );
                 let seed_reads = crate::engine::seed_reads::select_from_explore_fork(
                     session.clone(),
                     agent.model.clone(),

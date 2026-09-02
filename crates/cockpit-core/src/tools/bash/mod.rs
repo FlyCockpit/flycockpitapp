@@ -33,8 +33,9 @@ use crate::engine::tool::{
     ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolEffect, ToolOutput,
     ToolOutputSidecar, ToolPresentation, single_line_preview, string_field,
 };
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail_redacted};
+use crate::tools::common::{
+    OUTPUT_BYTE_CAP, boundary_safe_capture, boundary_safe_join, truncate_head_tail_redacted,
+};
 use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
@@ -1090,6 +1091,7 @@ async fn call_bash_inner(
     let body = render_output(
         &final_outcome,
         compress,
+        &ctx.redact,
         command,
         &cwd,
         BashOutputAnnotations {
@@ -1124,7 +1126,7 @@ async fn call_bash_inner(
             &body,
             OUTPUT_BYTE_CAP,
         ))
-        .with_text_artifact_capture(capture_text_artifact_body(&body))
+        .with_text_artifact_capture(boundary_safe_capture(&ctx.redact, &body))
         .with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
@@ -1936,6 +1938,7 @@ struct BashOutputAnnotations<'a> {
 fn render_output(
     o: &ShellOutcome,
     compress: bool,
+    redact: &crate::redact::RedactionTable,
     command: &str,
     cwd: &Path,
     annotations: BashOutputAnnotations<'_>,
@@ -1945,10 +1948,12 @@ fn render_output(
     let (stdout, stderr): (std::borrow::Cow<str>, std::borrow::Cow<str>) = if compress {
         (
             std::borrow::Cow::Owned(crate::tools::shell_compress::compress_stream(
+                redact,
                 command,
                 &stdout_raw,
             )),
             std::borrow::Cow::Owned(crate::tools::shell_compress::compress_stream(
+                redact,
                 command,
                 &stderr_raw,
             )),
@@ -2720,6 +2725,7 @@ fn render_bash_outcome(
     let body = render_output(
         &final_outcome,
         compress,
+        &ctx.redact,
         command,
         cwd,
         BashOutputAnnotations {
@@ -2744,7 +2750,7 @@ fn render_bash_outcome(
             &body,
             OUTPUT_BYTE_CAP,
         ))
-        .with_text_artifact_capture(capture_text_artifact_body(&body))
+        .with_text_artifact_capture(boundary_safe_capture(&ctx.redact, &body))
         .with_bash_meta(meta, resource_meta)
     } else {
         ToolOutput::text(body).with_bash_meta(meta, resource_meta)
@@ -3046,8 +3052,15 @@ async fn run_prepared_command(
         },
     };
 
-    let stdout = stdout_task.join().await.bytes;
-    let stderr = stderr_task.join().await.bytes;
+    // The bounded drain kept a HEAD + TAIL and omitted the middle when the
+    // stream overflowed: joining raw `.bytes` would preserve a registered
+    // secret straddling the omission boundary as two PARTIALS the downstream
+    // whole-value §7 scrub cannot match (issue #294). Join through the
+    // boundary-safe path so the unsafe margins at the junction are elided
+    // BEFORE the raw text flows anywhere (display body, compression,
+    // artifact capture, sidecar, export).
+    let stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await).into_bytes();
+    let stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await).into_bytes();
     let exit = status.code().unwrap_or(-1);
     let signaled = !status.success() && status.code().is_none();
 
@@ -3115,16 +3128,13 @@ async fn spawn_adopted_shell_completion(
                 };
                 let outcome = match wait_result {
                     Ok(Ok(status)) => {
-                        let stdout = stdout_task.join().await.bytes;
-                        let stderr = stderr_task.join().await.bytes;
+                        // Boundary-safe join for the bounded-drain omission
+                        // junction (issue #294), mirroring the foreground path.
+                        let stdout = boundary_safe_join(&redact, stdout_task.join().await);
+                        let stderr = boundary_safe_join(&redact, stderr_task.join().await);
                         let exit = status.code().unwrap_or(-1);
                         let signaled = !status.success() && status.code().is_none();
-                        format_combined(
-                            &String::from_utf8_lossy(&stdout),
-                            &String::from_utf8_lossy(&stderr),
-                            exit,
-                            signaled,
-                        )
+                        format_combined(&stdout, &stderr, exit, signaled)
                     }
                     Ok(Err(error)) => {
                         // A failed wait leaves adopted-process ownership

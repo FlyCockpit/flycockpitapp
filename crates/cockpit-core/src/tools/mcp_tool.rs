@@ -20,8 +20,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolArtifactLane, ToolBox, ToolCtx, ToolOutput, invalid_input};
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail_redacted};
+use crate::tools::common::{OUTPUT_BYTE_CAP, boundary_safe_capture, truncate_head_tail_redacted};
 
 pub struct McpTool {
     requests_enabled: bool,
@@ -284,21 +283,21 @@ fn rendered_result_output(
     if model_over_cap {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Model,
-            capture_text_artifact_body(&model),
+            boundary_safe_capture(&ctx.redact, &model),
             model_over_cap,
         );
     }
     if !display_lane.is_empty() {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Display,
-            capture_text_artifact_body(&display_lane),
+            boundary_safe_capture(&ctx.redact, &display_lane),
             display_lane.len() > OUTPUT_BYTE_CAP,
         );
     }
     for attached in attachments {
         output = output.with_text_artifact_lane(
             ToolArtifactLane::Attachment,
-            capture_text_artifact_body(&attached),
+            boundary_safe_capture(&ctx.redact, &attached),
             true,
         );
     }

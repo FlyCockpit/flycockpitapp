@@ -197,6 +197,7 @@ async fn bash_truncated_output_carries_capture_on_the_container_render_path() {
     let expected_body = render_output(
         &shell_out(&stdout, "", 0),
         false,
+        &crate::redact::RedactionTable::empty(),
         command,
         tmp.path(),
         BashOutputAnnotations::default(),
@@ -2879,6 +2880,7 @@ async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "printf blocked",
         tmp.path(),
         BashOutputAnnotations {
@@ -2948,6 +2950,7 @@ async fn confined_success_body_is_unchanged() {
     let expected = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "printf ok",
         tmp.path(),
         BashOutputAnnotations::default(),
@@ -3589,6 +3592,7 @@ async fn missing_binary_diagnostic_names_cockpit_environment() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "npm run build",
         Path::new("/repo"),
         BashOutputAnnotations::default(),
@@ -3647,6 +3651,7 @@ async fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "cargo test",
         Path::new("/repo"),
         BashOutputAnnotations::default(),

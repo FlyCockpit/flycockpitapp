@@ -136,6 +136,60 @@ pub(crate) fn drop_back_margin<'a>(table: &crate::redact::RedactionTable, seg: &
     &seg[..cut]
 }
 
+/// Fixed marker inserted at a bounded-drain head/tail junction whose middle was
+/// omitted. A constant (never secret-bearing); the §7 scrub matches it whole.
+pub(crate) const OMITTED_MIDDLE_MARKER: &str =
+    "\n... [output truncated: middle bytes elided] ...\n";
+
+/// Join a bounded-drain capture (retained HEAD + omitted MIDDLE + retained TAIL)
+/// into one string, eliding the unsafe margin at the head/tail junction so no
+/// boundary-straddling secret PARTIAL reaches the downstream §7 whole-value
+/// scrub (issue #294).
+///
+/// When nothing was dropped (`dropped_bytes == 0`) the head and tail are
+/// contiguous in the original stream — there is no omission boundary — so this is
+/// exactly the prior `head ++ tail` concatenation. It is likewise a no-op join
+/// when the table has no multi-byte literal (`max_match_len <= 1`), so an empty
+/// table never perturbs output. Otherwise it drops the back margin of the head
+/// (which may hold a straddling secret's PREFIX) and the front margin of the tail
+/// (which may hold a straddling secret's SUFFIX) and joins them around the fixed
+/// marker. The head and tail are UTF-8-lossy-decoded SEPARATELY at the
+/// stream-char-boundary split (`head_len`), so an invalid byte in one never
+/// shifts the junction offset.
+pub(crate) fn boundary_safe_join(
+    table: &crate::redact::RedactionTable,
+    cap: cockpit_host::process::BoundedPipeCapture,
+) -> String {
+    let split = cap.head_len.min(cap.bytes.len());
+    let head = String::from_utf8_lossy(&cap.bytes[..split]);
+    let tail = String::from_utf8_lossy(&cap.bytes[split..]);
+    if cap.dropped_bytes == 0 || table.max_match_len() <= 1 {
+        return format!("{head}{tail}");
+    }
+    let safe_head = drop_back_margin(table, &head);
+    let safe_tail = drop_front_margin(table, &tail);
+    format!("{safe_head}{OMITTED_MIDDLE_MARKER}{safe_tail}")
+}
+
+/// Boundary-safe [`TextArtifactCapture`] builder: the capture's retained body is
+/// a PREFIX cut of `combined` at the host byte cap, and a registered secret
+/// straddling that cut would leave only its PREFIX in the durable artifact —
+/// a partial the admission/export whole-value scrubs cannot match. Elides the
+/// unsafe back margin (no-op when nothing was dropped or the table is empty).
+pub(crate) fn boundary_safe_capture(
+    table: &crate::redact::RedactionTable,
+    combined: &str,
+) -> crate::engine::tool::TextArtifactCapture {
+    let mut base = crate::intel::budget::capture_text_artifact_body(combined);
+    if base.host_dropped_bytes == 0 {
+        return base;
+    }
+    let safe = drop_back_margin(table, &base.content);
+    base.content = safe.to_string();
+    base.stored_source_bytes = base.content.len();
+    base
+}
+
 /// Result of [`read_slice`]: the line-numbered body, whether it was
 /// capped, and the 1-indexed line the model/composer should pass as the
 /// next `offset` to continue reading. It also carries the total line
@@ -155,11 +209,26 @@ pub struct ReadSlice {
 /// tool uses the legacy 2000-line / 8 KB caps while tag inlining may pass a
 /// mode-specific byte ceiling via [`read_slice_with_byte_cap`]. An `offset`
 /// past EOF yields an empty body (caller decides how to message it).
-pub fn read_slice(text: &str, offset: usize, limit: usize) -> ReadSlice {
-    read_slice_with_byte_cap(text, offset, limit, OUTPUT_BYTE_CAP)
+///
+/// Both of the slice's omission edges — the lines before `offset` and any
+/// lines cut by the line/byte caps — are redaction-aware (issue #294): the
+/// unsafe margin at each edge that abuts omitted content is elided in RAW
+/// line-content coordinates (before the `${n}|` numbering is attached, so the
+/// line-number prefixes cannot interleave a partial) so a registered secret
+/// straddling either edge — a multi-line literal spanning the boundary
+/// included — never leaves a PARTIAL the downstream §7 whole-value scrub
+/// cannot match.
+pub fn read_slice(
+    redact: &crate::redact::RedactionTable,
+    text: &str,
+    offset: usize,
+    limit: usize,
+) -> ReadSlice {
+    read_slice_with_byte_cap(redact, text, offset, limit, OUTPUT_BYTE_CAP)
 }
 
 pub fn read_slice_with_byte_cap(
+    redact: &crate::redact::RedactionTable,
     text: &str,
     offset: usize,
     limit: usize,
@@ -167,51 +236,117 @@ pub fn read_slice_with_byte_cap(
 ) -> ReadSlice {
     let offset = offset.max(1);
     let byte_cap = output_byte_cap.saturating_sub(80);
-    let mut numbered = String::new();
-    let mut total_lines = 0;
-    let mut emitted = 0;
-    let mut truncated = false;
-    let mut stopped_for_byte_cap = false;
 
+    // Pass 1: walk every line for the total count and collect the requested
+    // window (`offset..`, at most `limit` lines). Nothing is rendered yet.
+    let mut total_lines = 0usize;
+    let mut window: Vec<&str> = Vec::new();
     for (i, line) in text.lines().enumerate() {
+        total_lines = i + 1;
         let line_no = i + 1;
-        total_lines = line_no;
-        if line_no < offset {
-            continue;
+        if line_no >= offset && window.len() < limit {
+            window.push(line);
         }
-        if emitted >= limit || stopped_for_byte_cap {
-            truncated = true;
-            continue;
-        }
-        let before_len = numbered.len();
-        push_numbered_line(&mut numbered, line_no, line);
-        if numbered.len() > byte_cap {
-            numbered.truncate(before_len);
-            stopped_for_byte_cap = true;
-            truncated = true;
-            continue;
-        }
-        emitted += 1;
+    }
+    let more_lines = total_lines > (offset - 1) + window.len();
+    let offset_exceeded = offset > total_lines;
+    if window.is_empty() {
+        return ReadSlice {
+            numbered: String::new(),
+            truncated: more_lines,
+            next_offset: if offset_exceeded {
+                total_lines + 1
+            } else {
+                offset
+            },
+            total_lines,
+            offset_exceeded,
+        };
     }
 
+    // Front margin: the lines before `offset` were omitted, so the first shown
+    // line may begin mid-secret. The margin is applied to the JOINED window
+    // content (a multi-line literal's partial may span several leading lines)
+    // in raw line-content coordinates — before numbering. Lines the margin
+    // consumed keep their numbers: the first RETAINED line is numbered by how
+    // many newlines the elided prefix crossed, so numbering stays faithful to
+    // the source even when the elision removes leading lines.
+    let joined = window.join("\n");
+    let (content, first_line_no) = if offset > 1 {
+        let safe = drop_front_margin(redact, &joined);
+        let dropped_bytes = joined.len() - safe.len();
+        let dropped_lines = joined[..dropped_bytes].matches('\n').count();
+        (safe.to_string(), offset + dropped_lines)
+    } else {
+        (joined, offset)
+    };
+    // Fail-closed margin: when the whole window sat inside the unsafe front
+    // margin, show nothing rather than a fragment.
+    let safe_lines: Vec<&str> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.split('\n').collect()
+    };
+
+    // Pass 2: dry-run the byte cap over the numbered rendering. A numbered
+    // line costs `line_no` digits + 1 (`|`) + line bytes + 1 (`\n`), so a
+    // line is kept iff the accumulated numbered length stays within the cap
+    // (exactly the original push-then-revert accounting).
+    let mut kept = 0usize;
+    let mut stopped_for_byte_cap = false;
+    let mut len_acc = 0usize;
+    for (idx, line) in safe_lines.iter().enumerate() {
+        let added = (first_line_no + idx).to_string().len() + 1 + line.len() + 1;
+        if len_acc + added > byte_cap {
+            stopped_for_byte_cap = true;
+            break;
+        }
+        len_acc += added;
+        kept += 1;
+    }
+
+    let shown: Vec<&str> = if stopped_for_byte_cap {
+        // Back margin: the lines after the cap-stop were omitted, so the last
+        // kept line may end mid-secret (multi-line partials included, via the
+        // joined-content coordinates again).
+        let kept_content = safe_lines[..kept].join("\n");
+        drop_back_margin(redact, &kept_content)
+            .split('\n')
+            .collect::<Vec<&str>>()
+    } else {
+        safe_lines[..kept].to_vec()
+    };
+
+    let mut numbered = String::with_capacity(len_acc);
+    let mut line_no = first_line_no;
+    for line in &shown {
+        push_numbered_line(&mut numbered, line_no, line);
+        line_no += 1;
+    }
+
+    // Defensive backstop mirroring the original contract: a single numbered
+    // line larger than the whole cap is cut mid-content. The retained end
+    // abuts the discarded remainder, so the same back-margin elision applies
+    // (no `${n}|` prefixes can interleave a trailing single-line partial).
     if numbered.len() > byte_cap {
         let safe = floor_char_boundary(&numbered, byte_cap);
         numbered.truncate(safe);
-        if !numbered.ends_with('\n') {
-            numbered.push('\n');
-        }
-        truncated = true;
+        let cut = drop_back_margin(redact, &numbered);
+        numbered.truncate(cut.len());
+        stopped_for_byte_cap = true;
     }
-    let offset_exceeded = offset > total_lines;
-    let next_offset = if offset_exceeded {
-        total_lines + 1
-    } else {
-        offset + emitted
-    };
+    if !numbered.is_empty() && !numbered.ends_with('\n') {
+        numbered.push('\n');
+    }
+
     ReadSlice {
         numbered,
-        truncated,
-        next_offset,
+        truncated: more_lines || stopped_for_byte_cap,
+        next_offset: if offset_exceeded {
+            total_lines + 1
+        } else {
+            offset + shown.len()
+        },
         total_lines,
         offset_exceeded,
     }
@@ -547,7 +682,7 @@ mod tests {
     #[tokio::test]
 
     async fn read_slice_empty_file_reports_eof_metadata() {
-        let slice = read_slice("", 1, READ_LINE_CAP);
+        let slice = read_slice(&empty_table(), "", 1, READ_LINE_CAP);
 
         assert_eq!(slice.numbered, "");
         assert!(!slice.truncated);
@@ -559,7 +694,7 @@ mod tests {
     #[tokio::test]
 
     async fn read_slice_offset_beyond_eof_reports_total_once() {
-        let slice = read_slice("a\nb\n", 4, 2);
+        let slice = read_slice(&empty_table(), "a\nb\n", 4, 2);
 
         assert_eq!(slice.numbered, "");
         assert!(!slice.truncated);
@@ -571,7 +706,7 @@ mod tests {
     #[tokio::test]
 
     async fn read_slice_exact_limit_is_not_truncated() {
-        let slice = read_slice("a\nb\nc\n", 2, 2);
+        let slice = read_slice(&empty_table(), "a\nb\nc\n", 2, 2);
 
         assert_eq!(slice.numbered, "2|b\n3|c\n");
         assert!(!slice.truncated);
@@ -583,7 +718,7 @@ mod tests {
     #[tokio::test]
 
     async fn read_slice_truncation_reports_next_offset() {
-        let slice = read_slice("a\nb\nc\n", 1, 2);
+        let slice = read_slice(&empty_table(), "a\nb\nc\n", 1, 2);
 
         assert_eq!(slice.numbered, "1|a\n2|b\n");
         assert!(slice.truncated);
@@ -596,7 +731,12 @@ mod tests {
 
     async fn read_slice_byte_cap_does_not_skip_unshown_lines() {
         let huge = "x".repeat(OUTPUT_BYTE_CAP + 200);
-        let slice = read_slice(&format!("{huge}\nsmall\n"), 1, READ_LINE_CAP);
+        let slice = read_slice(
+            &empty_table(),
+            &format!("{huge}\nsmall\n"),
+            1,
+            READ_LINE_CAP,
+        );
 
         assert_eq!(slice.numbered, "");
         assert!(slice.truncated);
@@ -609,8 +749,8 @@ mod tests {
 
     async fn read_slice_with_byte_cap_uses_explicit_ceiling() {
         let text = format!("{}\nsmall\n", "x".repeat(OUTPUT_BYTE_CAP + 200));
-        let legacy = read_slice(&text, 1, READ_LINE_CAP);
-        let larger = read_slice_with_byte_cap(&text, 1, READ_LINE_CAP, 48 * 1024);
+        let legacy = read_slice(&empty_table(), &text, 1, READ_LINE_CAP);
+        let larger = read_slice_with_byte_cap(&empty_table(), &text, 1, READ_LINE_CAP, 48 * 1024);
 
         assert!(legacy.truncated);
         assert_eq!(legacy.numbered, "");
@@ -699,6 +839,55 @@ mod tests {
             "tail-start straddling suffix leaked"
         );
         assert!(fixed.len() <= cap);
+    }
+
+    // A MULTI-LINE registered literal straddling the read-slice FRONT edge
+    // (the lines before `offset` were omitted): its second line begins the
+    // first shown line, and a boundary-blind slice would hand the §7
+    // whole-value scrub a partial it cannot match. The front-margin elision
+    // must remove it — and the retained lines must keep their TRUE source
+    // numbers after the elision consumed leading lines.
+    #[tokio::test]
+    async fn read_slice_front_edge_elides_multi_line_straddling_secret() {
+        const SECRET: &str = "SECRET-HEAD-99\nSECRET-TAIL-99"; // two-line literal
+        let table = leak_table(SECRET);
+        let partial_tail = "SECRET-TAIL-99";
+        let line4 = format!("filler four {}", "z".repeat(40));
+        let body = format!("filler one\nfiller two\n{partial_tail}\n{line4}\n");
+        let slice = read_slice(&table, &body, 3, 2);
+        let scrubbed = table.scrub(&slice.numbered);
+        assert!(
+            !scrubbed.contains(partial_tail),
+            "front-edge multi-line partial leaked: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("SECRET-HEAD-99"));
+        // The margin consumed leading lines; the first RETAINED line must
+        // still carry its true source number (4), not the window start (3).
+        assert!(slice.numbered.starts_with("4|"), "{}", slice.numbered);
+    }
+
+    // A multi-line registered literal straddling the read-slice BACK edge (the
+    // byte cap stopped mid-window): its first line ends the last kept line, and
+    // the back-margin elision must remove that partial before numbering.
+    #[tokio::test]
+    async fn read_slice_byte_cap_edge_elides_multi_line_straddling_secret() {
+        const SECRET: &str = "SECRET-BACKHEAD-99\nSECRET-BACKTAIL-99"; // 37 bytes
+        let table = leak_table(SECRET);
+        let partial_head = "SECRET-BACKHEAD-99";
+        // Line 1 ends with the literal's first line (418 bytes); a 430-byte
+        // numbered cap keeps line 1 and stops before line 2, putting the
+        // partial at the retained back edge.
+        let line1 = format!("{}{partial_head}", "x".repeat(400));
+        let body = format!("{line1}\nfiller tail\n");
+        let slice = read_slice_with_byte_cap(&table, &body, 1, 10, 510);
+        let scrubbed = table.scrub(&slice.numbered);
+        assert!(
+            !scrubbed.contains(partial_head),
+            "back-edge multi-line partial leaked: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("SECRET-BACKTAIL-99"));
+        assert!(slice.truncated);
+        assert!(slice.numbered.starts_with("1|"), "{}", slice.numbered);
     }
 
     // A secret fully contained in the retained head (or tail) is NOT a boundary

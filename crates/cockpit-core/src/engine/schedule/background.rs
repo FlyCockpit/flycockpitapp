@@ -145,7 +145,7 @@ pub fn background_launch_gate(
 impl BackgroundHandle {
     /// Budget-capped tail of the last `lines` output lines, scrubbed for
     /// secrets. Returns an empty string when no output has been produced.
-    pub fn tail(&self, lines: usize, _redact: &RedactionTable) -> String {
+    pub fn tail(&self, lines: usize, redact: &RedactionTable) -> String {
         let snapshot: Vec<String> = {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
@@ -164,7 +164,10 @@ impl BackgroundHandle {
                 break;
             }
         }
-        let body = writer.into_string();
+        // The tail budget can cut the last retained line mid-line; elide the
+        // cut's back margin under the table the CALLER (the driver, at
+        // `background.tail` time) holds — the current session table.
+        let body = writer.into_string_redacted(redact);
         if body.is_empty() {
             format!("`{}` has produced no output yet", self.label)
         } else {
@@ -303,7 +306,7 @@ pub fn spawn(
         command,
         cwd,
         launch,
-        redact,
+        redact_probe,
         turn_tx,
         event_tx,
     }: BackgroundSpawn,
@@ -328,7 +331,7 @@ pub fn spawn(
             cwd,
             launch,
             ring,
-            redact,
+            redact_probe,
             turn_tx,
             event_tx.clone(),
             kill_rx,
@@ -340,13 +343,20 @@ pub fn spawn(
     (handle, task)
 }
 
+/// Live probe for the session redaction table. A background job must elide
+/// every truncation boundary under the table CURRENT at the cut — the session
+/// can register a new secret after the job launched — so the reader task
+/// consults this probe per line instead of holding a launch snapshot
+/// (issue #294: stale-snapshot redaction identity).
+pub type RedactionProbe = Arc<dyn Fn() -> Arc<RedactionTable> + Send + Sync>;
+
 pub struct BackgroundSpawn {
     pub job_id: String,
     pub label: String,
     pub command: String,
     pub cwd: std::path::PathBuf,
     pub launch: BackgroundLaunch,
-    pub redact: Arc<RedactionTable>,
+    pub redact_probe: RedactionProbe,
     pub turn_tx: mpsc::Sender<TurnEvent>,
     pub event_tx: mpsc::Sender<ScheduleEvent>,
 }
@@ -509,7 +519,7 @@ async fn run_background(
     cwd: std::path::PathBuf,
     launch: BackgroundLaunch,
     ring: Arc<Mutex<BoundedOutputRing>>,
-    redact: Arc<RedactionTable>,
+    redact_probe: RedactionProbe,
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
@@ -558,8 +568,13 @@ async fn run_background(
     let mut err_lines =
         CappedLineReader::new(stderr.expect("stderr piped"), BACKGROUND_LINE_READ_CAP);
 
+    // Probe the LIVE table for every line: a secret registered mid-stream
+    // must elide the per-line cap boundary just like one registered before
+    // launch. The probe is an `Arc` clone per line — cheap, and lines arrive
+    // at reader cadence, not per byte.
     let push = |ring: &Arc<Mutex<BoundedOutputRing>>, line: String| {
-        ring.lock().unwrap().push(line, &redact);
+        let table = redact_probe();
+        ring.lock().unwrap().push(line, &table);
     };
 
     let mut stdout_done = false;
@@ -648,7 +663,10 @@ async fn run_background(
             break;
         }
     }
-    let body = writer.into_string();
+    // The result budget can cut the LAST retained line mid-line; the back
+    // margin of that cut must elide under the table current at completion.
+    let redact_now = redact_probe();
+    let body = writer.into_string_redacted(&redact_now);
 
     let (result, failed) = if killed {
         (format!("background `{label}` was cancelled"), false)
@@ -846,7 +864,7 @@ mod tests {
             command: command.to_string(),
             cwd,
             launch,
-            redact,
+            redact_probe: Arc::new(move || redact.clone()),
             turn_tx,
             event_tx,
         })

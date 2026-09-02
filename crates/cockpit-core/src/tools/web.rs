@@ -16,8 +16,7 @@ use crate::engine::tool::{
     ToolPresentation, bounded_preview, invalid_input, readable_args, single_line_preview,
     string_field,
 };
-use crate::intel::budget::capture_text_artifact_body;
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail_redacted};
+use crate::tools::common::{OUTPUT_BYTE_CAP, boundary_safe_capture, truncate_head_tail_redacted};
 use crate::tools::custom::{CustomBashTool, ToolTemplateProvenance, WEBFETCH, WEBSEARCH};
 
 const FIRECRAWL_API_KEY_ENV: &str = "FIRECRAWL_API_KEY";
@@ -551,7 +550,7 @@ fn capped_text(table: &crate::redact::RedactionTable, text: String) -> ToolOutpu
         // boundary must not leave a PARTIAL in the model-facing text that the
         // §7 whole-value scrub cannot match.
         ToolOutput::truncated_text(truncate_head_tail_redacted(&table, &text, OUTPUT_BYTE_CAP))
-            .with_text_artifact_capture(capture_text_artifact_body(&text))
+            .with_text_artifact_capture(boundary_safe_capture(table, &text))
     } else {
         ToolOutput::text(text)
     }

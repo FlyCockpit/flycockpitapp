@@ -658,10 +658,9 @@ async fn bounded_response_body(response: reqwest::Response) -> Result<String> {
 }
 
 fn oauth_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::providers::provider_http::client_builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building OAuth HTTP client")
 }

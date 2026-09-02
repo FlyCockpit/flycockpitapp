@@ -449,11 +449,17 @@ jobs:
           path: target/distrib/
           merge-multiple: true
 
+      # cargo-dist 0.32.0 metadata finalization, NOT a publication step:
+      # for GitHub hosting `dist host --steps=upload --steps=release`
+      # performs no GitHub API operations (src/host.rs `do_host` leaves
+      # upload/release to the CI job's `gh` commands). The one and only
+      # publication point in this workflow is the draft-first step after
+      # signing and attestation below.
       - id: host
         shell: bash
         run: |
           dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > target/distrib/dist-manifest.json
-          echo "artifacts uploaded and released successfully"
+          echo "dist finalized the release manifest; publication happens after signing below"
           cat target/distrib/dist-manifest.json
           echo "manifest=$(jq -c "." target/distrib/dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
@@ -497,7 +503,32 @@ jobs:
             cosign sign-blob --yes --bundle "${artifact}.sig.bundle" "$artifact"
           done
 
-      - name: Create or update GitHub Release
+      # Invariant (issue #306, review cycle 1): a public GitHub Release never
+      # exposes an asset without its detached Sigstore bundle. Assert bundle
+      # completeness BEFORE any publication command runs; a partial or failed
+      # sign step fails here instead of publishing un-bundled assets.
+      - name: Assert every release artifact has a signature bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' artifact; do
+            if [ ! -f "${artifact}.sig.bundle" ]; then
+              echo "::error::No signature bundle for $artifact; refusing to publish."
+              status=1
+            fi
+          done < <(find artifacts -type f ! -name '*-dist-manifest.json' -print0)
+          exit "$status"
+
+      # Publication is draft-first and therefore atomic (issue #306, review
+      # cycle 1): the release is created as a DRAFT (invisible to
+      # releases/latest, unlisted), every artifact and .sig.bundle is uploaded
+      # while it is still a draft, and only the final `--draft=false` makes it
+      # public. A cancel, timeout, or failure anywhere before that final
+      # command leaves a draft release — never a public release with missing or
+      # unsigned bytes. Re-entry is safe: an existing (possibly partial draft)
+      # release is edited, re-uploaded with --clobber, and un-drafted.
+      - name: Publish GitHub Release (draft-first)
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
@@ -519,10 +550,11 @@ jobs:
 
           if gh release view "$tag" > /dev/null 2>&1; then
             gh release edit "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
-            gh release upload "$tag" --clobber "${release_files[@]}"
           else
-            gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" "${release_files[@]}"
+            gh release create "$tag" --draft --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
           fi
+          gh release upload "$tag" --clobber "${release_files[@]}"
+          gh release edit "$tag" --draft=false
 
   publish-homebrew-formula:
     name: Publish Homebrew formula
@@ -614,6 +646,7 @@ jobs:
             echo '- CLI artifacts: GitHub Release ${{ needs.validate.outputs.tag }}'
             echo '- Shell installer: `curl --proto "=https" --tlsv1.2 -LsSf https://github.com/FlyCockpit/flycockpitapp/releases/latest/download/cockpit-cli-installer.sh | sh`'
             echo '- Homebrew: `brew install flycockpit/tap/cockpit`'
-            echo '- Every artifact is signed (keyless Sigstore, GitHub OIDC) with a detached `.sig.bundle` and carries a build-provenance attestation on the release commit. Verify a download with:'
+            echo '- Every artifact is signed (keyless Sigstore, GitHub OIDC) with a detached `.sig.bundle` uploaded alongside it and carries a build-provenance attestation on the release commit. Verify a download with:'
             echo '  `cosign verify-blob --bundle <artifact>.sig.bundle --certificate-identity-regexp=https://github.com/FlyCockpit/flycockpitapp/.github/ --certificate-oidc-issuer=https://token.actions.githubusercontent.com <artifact>`'
+            echo '- The installers cannot drift from the signed bytes: the shell installer verifies the SHA-256 digest embedded by cargo-dist before extracting, and the Homebrew formula pins the same digest, so both consume exactly the artifacts that were signed and attested. Sigstore bundle verification above is the provenance check for anyone who needs it.'
           } >> "$GITHUB_STEP_SUMMARY"

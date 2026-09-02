@@ -829,7 +829,7 @@ mod tests {
             TestUsageResponse::ok(r#"{"plan_type":"plus"}"#),
         ])
         .await;
-        let client = reqwest::Client::builder()
+        let client = crate::providers::provider_http::client_builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .unwrap();
@@ -850,7 +850,7 @@ mod tests {
             TestUsageResponse::status(504, r#"{"error":"bad gateway 3"}"#),
         ])
         .await;
-        let client = reqwest::Client::builder()
+        let client = crate::providers::provider_http::client_builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .unwrap();

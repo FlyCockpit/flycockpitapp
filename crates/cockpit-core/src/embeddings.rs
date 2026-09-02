@@ -425,6 +425,7 @@ mod tests {
     async fn capture_embedding_server_with_response_status(
         response_body: &'static str,
         status: &'static str,
+        location: Option<&'static str>,
     ) -> (
         String,
         tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
@@ -467,11 +468,15 @@ mod tests {
                     }
                 }
             }
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            let mut response = format!("HTTP/1.1 {status}\r\n");
+            if let Some(location) = location {
+                response.push_str(&format!("Location: {location}\r\n"));
+            }
+            response.push_str(&format!(
+                "content-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 response_body.len(),
                 response_body
-            );
+            ));
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (format!("http://{addr}/v1"), rx)
@@ -483,7 +488,7 @@ mod tests {
         String,
         tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
     ) {
-        capture_embedding_server_with_response_status(response_body, "200 OK").await
+        capture_embedding_server_with_response_status(response_body, "200 OK", None).await
     }
 
     async fn capture_embedding_server() -> (
@@ -912,10 +917,26 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_client_rejects_redirect_without_replaying_credentials() {
-        let (base_url, capture_rx) =
-            capture_embedding_server_with_response_status(r#"{"error":"moved"}"#, "302 Found")
-                .await;
-        let embedder = embedder(base_url, guard(false));
+        let (base_url, capture_rx) = capture_embedding_server_with_response_status(
+            r#"{"error":"moved"}"#,
+            "302 Found",
+            Some("http://credential-leak.invalid/v1/embeddings"),
+        )
+        .await;
+        let embedder = OpenAiCompatEmbedder::from_resolved_request(
+            models_fetch::ResolvedRequest {
+                base_url,
+                headers: vec![models_fetch::ResolvedHeader {
+                    name: "x-api-key".into(),
+                    value: "leaked-secret".into(),
+                }],
+                is_codex_credential: false,
+            },
+            "text-embedding-3-small".into(),
+            Some(3),
+            guard(false),
+        )
+        .unwrap();
         let err = embedder.embed(&["alpha"]).await.unwrap_err();
         assert!(err.to_string().contains("302"), "{err}");
         let captured = capture_rx.await.unwrap();
@@ -923,7 +944,7 @@ mod tests {
             captured
                 .head
                 .to_ascii_lowercase()
-                .contains("authorization: bearer"),
+                .contains("x-api-key: leaked-secret"),
             "{}",
             captured.head
         );

@@ -122,6 +122,7 @@ pub fn contents_equal(path: &Path, expected: &[u8]) -> Result<bool, BoundedIoErr
 
 /// Prefix plus full-file digest, streamed so the daemon never holds more than
 /// `prefix_cap` content bytes plus a small read buffer.
+#[derive(Debug)]
 pub struct PrefixedFile {
     pub prefix: Vec<u8>,
     pub digest: [u8; 32],

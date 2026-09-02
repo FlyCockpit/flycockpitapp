@@ -674,6 +674,7 @@ pub enum ActiveModelWriteMode {
 /// Read+write a provider config layer while preserving fields cockpit
 /// doesn't model. Global provider metadata lives in `config.json`; provider
 /// entries live in sibling `providers/*.json` files.
+#[derive(Debug)]
 pub struct ConfigDoc {
     pub path: PathBuf,
     pub(crate) raw: Value,

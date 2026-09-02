@@ -2624,6 +2624,7 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
 /// metadata in the same file): the raw `Value` is held alongside the typed view
 /// so a write only overwrites the keys it models and never destroys the
 /// sibling layer/provider metadata (or fields a future cockpit version added).
+#[derive(Debug)]
 pub struct ExtendedConfigDoc {
     pub path: PathBuf,
     raw: Value,

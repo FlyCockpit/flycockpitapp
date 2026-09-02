@@ -74,7 +74,7 @@ async fn turn_boundary_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
     );
     let notice = rx.try_recv().ok();
     assert!(
-        matches!(notice, Some(TurnEvent::Notice { text }) if text.contains("incomplete redaction table")),
+        matches!(notice, Some(TurnEvent::Notice { ref text }) if text.contains("incomplete redaction table")),
         "got {notice:?}"
     );
 }

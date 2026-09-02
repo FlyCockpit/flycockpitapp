@@ -3065,7 +3065,7 @@ async fn turn_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
     .await;
 
     assert!(
-        matches!(outcome, RedactionRefreshOutcome::Refused(message) if message.contains("exceeds the daemon file size limit")),
+        matches!(outcome, RedactionRefreshOutcome::Refused(ref message) if message.contains("exceeds the daemon file size limit")),
         "got {outcome:?}"
     );
     assert!(

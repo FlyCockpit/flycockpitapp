@@ -1800,14 +1800,8 @@ pub(crate) fn git_diff_file_blocking(
     if !outcome.success {
         return Err(bad_request(outcome.stderr.trim().to_string()));
     }
-    let cap = cockpit_host::text::floor_char_boundary(
-        &outcome.stdout,
-        FS_TEXT_READ_BYTE_CAP.min(outcome.stdout.len()),
-    );
-    Ok(Response::GitDiffFile {
-        diff: outcome.stdout[..cap].to_string(),
-        truncated: outcome.stdout.len() > cap,
-    })
+    let (diff, truncated) = truncate_git_diff_text(outcome.stdout);
+    Ok(Response::GitDiffFile { diff, truncated })
 }
 
 pub async fn git_diff(
@@ -1832,12 +1826,22 @@ pub(crate) fn git_diff_blocking(
         _ => return Err(bad_request("unsupported source for git_diff")),
     }
     .map_err(|error| bad_request(format!("{error:#}")))?;
-    let cap = cockpit_host::text::floor_char_boundary(&diff, FS_TEXT_READ_BYTE_CAP.min(diff.len()));
+    let (diff, truncated) = truncate_git_diff_text(diff);
     Ok(Response::GitDiff {
         source,
-        diff: diff[..cap].to_string(),
-        truncated: diff.len() > cap,
+        diff,
+        truncated,
     })
+}
+
+/// Cap git-diff payloads at the same text ceiling as `fs_read`, on a char
+/// boundary, so a huge worktree diff cannot balloon the daemon response.
+fn truncate_git_diff_text(diff: String) -> (String, bool) {
+    let limits = crate::resource_limits::ResourceLimits::defaults();
+    let cap =
+        cockpit_host::text::floor_char_boundary(&diff, limits.fs_read_text_bytes.min(diff.len()));
+    let truncated = diff.len() > cap;
+    (diff[..cap].to_string(), truncated)
 }
 
 pub async fn git_review_sources(

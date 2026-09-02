@@ -340,6 +340,26 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
         })
     }
 
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError> {
+        let _ = handle;
+        if !self.guard.verification.membership_proven {
+            return Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: GUARD_UNVERIFIED.into(),
+            });
+        }
+        let live = self.live.lock().unwrap();
+        if !live.contains_key(&generation) {
+            return Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: "cgroup_generation_missing_membership_unproven".into(),
+            });
+        }
+        Ok(())
+    }
+
     async fn create_container_and_exec(
         &self,
         _req: ContainerExecRequest,
@@ -454,8 +474,13 @@ mod linux_cgroup_namespace_guard {
         };
         let allocated = adapter.create_and_spawn(req).await.unwrap();
         assert_eq!(allocated.guarantee, ContainmentGuarantee::Proven);
-        // Membership proven before return (user code not started by adapter).
+        // Launcher cgroup membership is kernel-proven at allocate; durable
+        // MembershipProven is still the actor's prove_membership RPC.
         assert!(adapter.guard.verification.membership_proven);
+        adapter
+            .prove_membership(&allocated.handle, 1)
+            .await
+            .expect("launcher membership is the linux kernel witness");
     }
 
     #[cfg(target_os = "linux")]

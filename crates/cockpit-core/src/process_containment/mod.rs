@@ -4,7 +4,9 @@
 //! `execution_containments` rows. Callers receive a non-serializable
 //! [`ContainmentLease`] and must spawn user code only into that lease's
 //! process-tree guard when the adapter provides one. The adapter must not
-//! run `req.program`.
+//! run `req.program`. Durable `MembershipProven` is written only after
+//! [`ProcessContainmentHandle::prove_membership`] observes kernel membership;
+//! allocation is persisted as `PlatformAllocated`.
 //!
 //! ContainmentGuarantee is Proven or Unsupported only — no BestEffort.
 
@@ -41,4 +43,6 @@ pub use types::{
     ContainmentError, ContainmentGuarantee, ContainmentLease, ContainmentState, EmptyOutcome,
     LateCallbackKind, PlatformKind, SafeContainmentMetadata, SafeLocator,
 };
-pub use windows::{WINDOWS_JOB_UNAVAILABLE_ON_HOST, WindowsJobAdapter};
+pub use windows::{
+    WINDOWS_JOB_EMPTY_MEMBERSHIP_UNPROVEN, WINDOWS_JOB_UNAVAILABLE_ON_HOST, WindowsJobAdapter,
+};

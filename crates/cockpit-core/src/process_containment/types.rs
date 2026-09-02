@@ -280,13 +280,14 @@ pub enum ContainmentEvent {
         now_wall_ms: i64,
     },
     /// Platform allocation succeeded; membership not yet proven.
-    #[allow(dead_code)]
+    /// Durable state stays `Creating` with `pending_command = await_membership`.
     PlatformAllocated {
         generation: u64,
         locator: SafeLocator,
         now_wall_ms: i64,
     },
-    /// Spawn membership proven → Active.
+    /// Kernel membership proven → Active. Illegal unless `PlatformAllocated`
+    /// has already set `pending_command = await_membership`.
     MembershipProven {
         generation: u64,
         locator: SafeLocator,

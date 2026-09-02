@@ -80,6 +80,41 @@ async fn descendant_containment_tests_corrected_first() {
 }
 
 #[tokio::test]
+async fn create_and_spawn_does_not_persist_membership_until_proven() {
+    let db = Db::open_in_memory().unwrap();
+    let session = seed_session(&db).await;
+    let fake = FakeProvenAdapter::default();
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(fake));
+    let handle = actor.handle();
+
+    let lease = handle
+        .create_and_spawn(session, "op", "/bin/true", vec![], "/tmp", true)
+        .await
+        .unwrap();
+    let row = db
+        .get_execution_containment(lease.containment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state, "creating",
+        "allocation must persist PlatformAllocated, not MembershipProven"
+    );
+
+    handle.prove_membership(&lease).await.unwrap();
+    handle
+        .prove_membership(&lease)
+        .await
+        .expect("prove_membership is idempotent once Active");
+    let row = db
+        .get_execution_containment(lease.containment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "active");
+}
+
+#[tokio::test]
 async fn containment_generation_rejects_late_events() {
     let db = Db::open_in_memory().unwrap();
     let session = seed_session(&db).await;

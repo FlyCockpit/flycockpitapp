@@ -49,7 +49,10 @@ pub struct ContainerExecRequest {
     pub nonce: String,
 }
 
-/// Result of a successful platform allocation + membership proof.
+/// Result of a successful platform allocation. Membership is not proven here:
+/// [`ContainmentAdapter::prove_membership`] is the kernel witness, and the
+/// actor persists [`super::types::ContainmentEvent::MembershipProven`] only
+/// after that returns `Ok`.
 #[derive(Debug, Clone)]
 pub struct AllocatedContainment {
     pub locator: SafeLocator,
@@ -78,11 +81,23 @@ pub trait ContainmentAdapter: Send + Sync + 'static {
     /// instructions (`req.program` is identity/audit input, not a spawn).
     /// Callers place their own child via [`Self::process_tree_guard`], prove
     /// membership, then resume. Returns Unsupported before user code when the
-    /// platform cannot provide Proven.
+    /// platform cannot provide Proven. Success is allocation only — never a
+    /// membership witness.
     async fn create_and_spawn(
         &self,
         req: NativeSpawnRequest,
     ) -> Result<AllocatedContainment, ContainmentError>;
+
+    /// Kernel membership proof for an allocated generation.
+    ///
+    /// Must fail closed for an empty Windows Job Object (`ActiveProcesses == 0`)
+    /// or any other platform object that has never had a member placed. The
+    /// actor persists `MembershipProven` only after this returns `Ok`.
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError>;
 
     /// Container path: fresh container per generation, full immutable ID oracle.
     async fn create_container_and_exec(

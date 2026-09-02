@@ -3,7 +3,10 @@
 //! One bounded command queue serializes state transitions per containment.
 //! Callers receive a non-serializable [`ContainmentLease`] and must spawn user
 //! code only into that lease's process-tree guard when the adapter provides
-//! one. The adapter must not run `req.program`.
+//! one. The adapter must not run `req.program`. Allocation persists
+//! `PlatformAllocated` (still `Creating`); `MembershipProven` is written only
+//! after [`ProcessContainmentHandle::prove_membership`] observes kernel
+//! membership.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,11 +22,14 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::db::execution_containments::{CasExecutionContainment, ExecutionContainmentRow};
 
-use super::adapter::{AdapterHandle, ContainerExecRequest, NativeSpawnRequest, SharedAdapter};
+use super::adapter::{
+    AdapterHandle, AllocatedContainment, ContainerExecRequest, NativeSpawnRequest, SharedAdapter,
+};
 use super::state_machine::reduce;
 use super::types::{
     ContainmentError, ContainmentEvent, ContainmentGuarantee, ContainmentLease, ContainmentRecord,
-    EmptyOutcome, LateCallbackKind, LeaseToken, ReduceResult, SafeContainmentMetadata, SafeLocator,
+    ContainmentState, EmptyOutcome, LateCallbackKind, LeaseToken, ReduceResult,
+    SafeContainmentMetadata, SafeLocator,
 };
 
 /// Bounded queue capacity for the containment actor.
@@ -90,6 +96,10 @@ enum Op {
         lease: ContainmentLease,
         reply:
             Reply<Result<Option<Arc<cockpit_host::process::ProcessTreeGuard>>, ContainmentError>>,
+    },
+    ProveMembership {
+        lease: ContainmentLease,
+        reply: Reply<Result<(), ContainmentError>>,
     },
     Shutdown {
         reply: Reply<()>,
@@ -259,6 +269,18 @@ impl ProcessContainmentHandle {
     ) -> Result<Option<Arc<cockpit_host::process::ProcessTreeGuard>>, ContainmentError> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::ProcessTreeGuard {
+            lease: lease.clone(),
+            reply,
+        })?;
+        Self::await_reply(rx).await?
+    }
+
+    /// Persist `MembershipProven` only after the adapter's kernel membership
+    /// proof succeeds. Allocation (`create_and_spawn`) is not that proof.
+    /// Idempotent once the generation is already `Active`.
+    pub async fn prove_membership(&self, lease: &ContainmentLease) -> Result<(), ContainmentError> {
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::ProveMembership {
             lease: lease.clone(),
             reply,
         })?;
@@ -475,6 +497,10 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
                 let result = process_tree_guard_one(&state, &lease);
                 let _ = reply.send(result);
             }
+            Op::ProveMembership { lease, reply } => {
+                let result = prove_membership_one(&mut state, lease).await;
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -498,6 +524,100 @@ fn process_tree_guard_one(
         .as_ref()
         .ok_or_else(|| ContainmentError::Internal("missing handle".into()))?;
     Ok(state.adapter.process_tree_guard(handle))
+}
+
+async fn persist_allocated_lease(
+    state: &mut ActorState,
+    record: ContainmentRecord,
+    allocated: AllocatedContainment,
+) -> Result<ContainmentLease, ContainmentError> {
+    let generation = record.generation;
+    let record = match reduce(
+        Some(record.clone()),
+        ContainmentEvent::PlatformAllocated {
+            generation,
+            locator: allocated.locator.clone(),
+            now_wall_ms: wall_ms(),
+        },
+    ) {
+        ReduceResult::Applied(r) => *r,
+        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+    };
+    persist_cas_from_creating(state, &record).await?;
+
+    let token = Arc::new(LeaseToken::new(format!("lease-{}", record.containment_id)));
+    state.live.insert(
+        record.containment_id,
+        LiveEntry {
+            record: record.clone(),
+            handle: Some(allocated.handle),
+            lease_token: token.clone(),
+        },
+    );
+    Ok(ContainmentLease {
+        containment_id: record.containment_id,
+        session_id: record.session_id,
+        generation: record.generation,
+        guarantee: allocated.guarantee,
+        token,
+    })
+}
+
+async fn prove_membership_one(
+    state: &mut ActorState,
+    lease: ContainmentLease,
+) -> Result<(), ContainmentError> {
+    if !lease.is_alive() {
+        return Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: "containment lease was invalidated before membership could be proven".into(),
+        });
+    }
+    let (from_record, handle) = {
+        let entry = state
+            .live
+            .get(&lease.containment_id)
+            .ok_or(ContainmentError::NotFound(lease.containment_id))?;
+        if entry.record.generation != lease.generation {
+            return Err(ContainmentError::GenerationMismatch {
+                expected: entry.record.generation,
+                got: lease.generation,
+            });
+        }
+        if entry.record.state == ContainmentState::Active {
+            return Ok(());
+        }
+        if entry.record.state != ContainmentState::Creating {
+            return Err(ContainmentError::IllegalTransition {
+                from: entry.record.state.as_str().into(),
+                to: ContainmentState::Active.as_str().into(),
+            });
+        }
+        let handle = entry
+            .handle
+            .clone()
+            .ok_or_else(|| ContainmentError::Internal("missing handle".into()))?;
+        (entry.record.clone(), handle)
+    };
+    state
+        .adapter
+        .prove_membership(&handle, lease.generation)
+        .await?;
+    let rec = match reduce(
+        Some(from_record.clone()),
+        ContainmentEvent::MembershipProven {
+            generation: lease.generation,
+            locator: from_record.locator.clone(),
+            now_wall_ms: wall_ms(),
+        },
+    ) {
+        ReduceResult::Applied(r) => *r,
+        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+    };
+    persist_cas_from_creating(state, &rec).await?;
+    if let Some(entry) = state.live.get_mut(&lease.containment_id) {
+        entry.record = rec;
+    }
+    Ok(())
 }
 
 async fn create_native(
@@ -537,7 +657,7 @@ async fn create_native(
         guarantee,
         now_wall_ms: now,
     };
-    let mut record = match reduce(None, event) {
+    let record = match reduce(None, event) {
         ReduceResult::Applied(r) => *r,
         other => {
             return Err(ContainmentError::Internal(format!("reduce: {other:?}")));
@@ -602,35 +722,7 @@ async fn create_native(
         }
     };
 
-    record = match reduce(
-        Some(record.clone()),
-        ContainmentEvent::MembershipProven {
-            generation,
-            locator: allocated.locator.clone(),
-            now_wall_ms: wall_ms(),
-        },
-    ) {
-        ReduceResult::Applied(r) => *r,
-        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
-    };
-    persist_cas_from_creating(state, &record).await?;
-
-    let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
-    state.live.insert(
-        containment_id,
-        LiveEntry {
-            record: record.clone(),
-            handle: Some(allocated.handle),
-            lease_token: token.clone(),
-        },
-    );
-    Ok(ContainmentLease {
-        containment_id,
-        session_id,
-        generation,
-        guarantee: allocated.guarantee,
-        token,
-    })
+    persist_allocated_lease(state, record, allocated).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -662,7 +754,7 @@ async fn create_container(
     let platform_kind = state.adapter.platform_kind();
     let guarantee = ContainmentGuarantee::Proven;
 
-    let mut record = match reduce(
+    let record = match reduce(
         None,
         ContainmentEvent::BeginCreate {
             containment_id,
@@ -713,35 +805,7 @@ async fn create_container(
         }
     };
 
-    record = match reduce(
-        Some(record.clone()),
-        ContainmentEvent::MembershipProven {
-            generation,
-            locator: allocated.locator.clone(),
-            now_wall_ms: wall_ms(),
-        },
-    ) {
-        ReduceResult::Applied(r) => *r,
-        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
-    };
-    persist_cas_from_creating(state, &record).await?;
-
-    let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
-    state.live.insert(
-        containment_id,
-        LiveEntry {
-            record: record.clone(),
-            handle: Some(allocated.handle),
-            lease_token: token.clone(),
-        },
-    );
-    Ok(ContainmentLease {
-        containment_id,
-        session_id,
-        generation,
-        guarantee: allocated.guarantee,
-        token,
-    })
+    persist_allocated_lease(state, record, allocated).await
 }
 
 async fn terminate_one(

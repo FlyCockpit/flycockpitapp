@@ -785,6 +785,7 @@ async fn retained_unix_cwd_fd_survives_source_directory_swap() {
         "",
         Duration::from_secs(5),
         None,
+        None,
     )
     .await;
     assert!(!output.spawn_failed && !output.timed_out);

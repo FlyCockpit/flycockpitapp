@@ -1078,10 +1078,10 @@ where
 /// `tokio::process::Command` with `env_clear`, piped stdio, an independent
 /// stdout cap, and `kill_on_drop(true)` (in addition to the lease terminate +
 /// empty barrier that owns cancellation). When `tree` is present (Windows Job
-/// Object lease), the child is created suspended, assigned, then resumed only
-/// after this function is already running under [`HookLeaseGuard`]. It is
-/// invoked from inside [`run_hook_child_contained`] only after a proven lease
-/// exists.
+/// Object lease), the child is created suspended, assigned, membership is
+/// proven on the actor, then resumed only after this function is already
+/// running under [`HookLeaseGuard`]. It is invoked from inside
+/// [`run_hook_child_contained`] only after an allocated lease exists.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_real_hook_child(
     executable: &Path,
@@ -1091,6 +1091,7 @@ async fn spawn_real_hook_child(
     stdin: &str,
     timeout: Duration,
     tree: Option<&cockpit_host::process::ProcessTreeGuard>,
+    membership: Option<(&ProcessContainmentHandle, &ContainmentLease)>,
 ) -> ChildRunOutcome {
     // Keep the existing `Command::new(executable)` dispatch on Windows. Rust's
     // Windows implementation recognizes `.cmd` / `.bat`, resolves the system
@@ -1190,6 +1191,17 @@ async fn spawn_real_hook_child(
                 timed_out: false,
             };
         }
+        if !prove_lease_membership(membership).await {
+            let _ = tree.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
         if tree.resume(&child).is_err() {
             let _ = tree.terminate();
             let _ = child.start_kill();
@@ -1201,6 +1213,15 @@ async fn spawn_real_hook_child(
                 timed_out: false,
             };
         }
+    } else if !prove_lease_membership(membership).await {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return ChildRunOutcome {
+            stdout: String::new(),
+            exit_code: None,
+            spawn_failed: true,
+            timed_out: false,
+        };
     }
 
     // Take all three pipes so stdin write, stdout capture, and stderr drain run
@@ -1335,6 +1356,7 @@ pub(crate) async fn spawn_real_hook_child_for_test(
         stdin,
         timeout,
         None,
+        None,
     )
     .await;
     (output.stdout, output.spawn_failed, output.timed_out)
@@ -1347,6 +1369,15 @@ fn spawn_failed_outcome() -> ChildRunOutcome {
         spawn_failed: true,
         timed_out: false,
     }
+}
+
+async fn prove_lease_membership(
+    membership: Option<(&ProcessContainmentHandle, &ContainmentLease)>,
+) -> bool {
+    let Some((handle, lease)) = membership else {
+        return true;
+    };
+    handle.prove_membership(lease).await.is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1377,6 +1408,7 @@ async fn spawn_hook_child_for_lease(
         stdin,
         timeout,
         tree.as_deref(),
+        Some((handle, lease)),
     )
     .await
 }

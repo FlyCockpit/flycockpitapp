@@ -208,6 +208,24 @@ impl ContainmentAdapter for ContainerRuntimeAdapter {
         })
     }
 
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError> {
+        let live = self.live.lock().unwrap();
+        match live.get(&handle.key) {
+            Some(c) if c.generation == generation => Ok(()),
+            Some(c) => Err(ContainmentError::GenerationMismatch {
+                expected: c.generation,
+                got: generation,
+            }),
+            None => Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: "container_missing_membership_unproven".into(),
+            }),
+        }
+    }
+
     async fn create_container_and_exec(
         &self,
         req: ContainerExecRequest,

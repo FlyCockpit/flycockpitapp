@@ -33,6 +33,9 @@ use super::types::{
 /// Off-Windows hosts cannot create Job Objects.
 pub const WINDOWS_JOB_UNAVAILABLE_ON_HOST: &str = "windows_job_objects_unavailable_on_this_host";
 
+/// Kernel membership is unproven while the job still has zero ActiveProcesses.
+pub const WINDOWS_JOB_EMPTY_MEMBERSHIP_UNPROVEN: &str = "job_object_empty_membership_unproven";
+
 /// Nested-job or breakaway conditions force Unsupported.
 ///
 /// `nested_job_restricted` is set by [`WindowsJobAdapter::production`] from a
@@ -230,6 +233,50 @@ impl ContainmentAdapter for WindowsJobAdapter {
         #[cfg(not(windows))]
         {
             let _ = req;
+            Err(Self::unavailable(WINDOWS_JOB_UNAVAILABLE_ON_HOST))
+        }
+    }
+
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError> {
+        #[cfg(windows)]
+        {
+            let result = {
+                let jobs = self.jobs.lock().unwrap();
+                match jobs.get(&handle.key) {
+                    Some(job) if job.generation == generation => {
+                        if !job.guard.job_is_open() {
+                            Err(Self::unavailable("job_object_closed_before_membership"))
+                        } else {
+                            match job.guard.active_process_count() {
+                                Ok(0) => {
+                                    Err(Self::unavailable(WINDOWS_JOB_EMPTY_MEMBERSHIP_UNPROVEN))
+                                }
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    Err(Self::unavailable(format!("job_object_query_failed: {e}")))
+                                }
+                            }
+                        }
+                    }
+                    Some(job) => Err(ContainmentError::GenerationMismatch {
+                        expected: job.generation,
+                        got: generation,
+                    }),
+                    None => Err(Self::unavailable("job_object_missing_membership_unproven")),
+                }
+            };
+            if result.is_ok() {
+                self.push_order("QueryInformationJobObject_membership");
+            }
+            result
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (handle, generation);
             Err(Self::unavailable(WINDOWS_JOB_UNAVAILABLE_ON_HOST))
         }
     }
@@ -477,6 +524,16 @@ mod windows_job_spawn_before_resume {
             0,
             "lease creation must not place a process"
         );
+        match adapter
+            .prove_membership(&allocated.handle, 1)
+            .await
+            .unwrap_err()
+        {
+            ContainmentError::DescendantContainmentUnavailable { reason } => {
+                assert_eq!(reason, WINDOWS_JOB_EMPTY_MEMBERSHIP_UNPROVEN);
+            }
+            o => panic!("{o:?}"),
+        }
 
         let mut command = tokio::process::Command::new("cmd.exe");
         command
@@ -487,6 +544,10 @@ mod windows_job_spawn_before_resume {
         tree.apply_spawn_flags(&mut command);
         let mut child = command.spawn().expect("CreateProcessW CREATE_SUSPENDED");
         tree.assign(&child).expect("AssignProcessToJobObject");
+        adapter
+            .prove_membership(&allocated.handle, 1)
+            .await
+            .expect("kernel membership after AssignProcessToJobObject");
         match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
             EmptyOutcome::Uncertain { reason, .. } => {
                 assert_eq!(reason, "active_processes_nonzero");

@@ -87,9 +87,9 @@ pub trait ContainmentBarrier: Send + Sync {
         launch: &ExecutionLaunch,
     ) -> Result<ContainmentTicket, WriteScopeError>;
 
-    /// Prove membership / runtime ownership, then release user code. Separated
-    /// from `create` so a test can fail exactly here and assert the unwind
-    /// ordering.
+    /// Prove kernel membership, persist `MembershipProven`, then release user
+    /// code. Allocation from `create` is not that proof. Separated from
+    /// `create` so a test can fail exactly here and assert the unwind ordering.
     ///
     /// Takes ONLY an [`OwnershipRecorded`], which is unforgeable outside
     /// `coordinator` and is minted solely from the row returned by the persist.
@@ -226,6 +226,12 @@ impl ContainmentBarrier for ProcessContainmentBarrier {
                 "containment guarantee is not Proven; refusing to release user code",
             ));
         }
+        // Allocation is not membership. Persist MembershipProven only after
+        // the actor observes kernel membership (empty Windows jobs fail closed).
+        self.handle
+            .prove_membership(&lease)
+            .await
+            .map_err(map_containment_error)?;
         Ok(())
     }
 

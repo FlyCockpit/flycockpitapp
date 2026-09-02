@@ -444,10 +444,9 @@ fn oauth_http_client() -> Result<reqwest::Client> {
 }
 
 fn oauth_http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    crate::providers::provider_http::client_builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[cfg(test)]

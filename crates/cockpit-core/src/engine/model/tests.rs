@@ -5165,7 +5165,8 @@ fn outbound_guard_shared_by_dispatch_and_embedder() {
         "text-embedding-3-small".into(),
         Some(3),
         guard,
-    );
+    )
+    .unwrap();
 }
 
 #[tokio::test]

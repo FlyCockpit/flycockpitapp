@@ -381,13 +381,12 @@ impl ReadPool {
                 continue;
             }
 
-            while guard.is_empty() {
+            while guard.is_empty() && self.total.load(Ordering::SeqCst) >= self.max {
                 guard = self
                     .available
                     .wait(guard)
                     .map_err(|_| anyhow::anyhow!("db read pool mutex poisoned"))?;
             }
-            return Ok(guard.pop().expect("idle non-empty after condvar wait"));
         }
     }
 
@@ -405,12 +404,25 @@ impl ReadPool {
         F: FnOnce(&Connection) -> Result<T>,
     {
         let conn = self.checkout().map_err(annotate_database_storage_failure)?;
-        let result = f(&conn).map_err(annotate_database_storage_failure);
-        let checkin = self.checkin(conn);
-        match (result, checkin) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
+        match catch_unwind(AssertUnwindSafe(|| {
+            f(&conn).map_err(annotate_database_storage_failure)
+        })) {
+            Ok(result) => {
+                let checkin = self.checkin(conn);
+                match (result, checkin) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Err(e), _) => Err(e),
+                    (Ok(_), Err(e)) => Err(e),
+                }
+            }
+            Err(_) => {
+                drop(conn);
+                self.total.fetch_sub(1, Ordering::SeqCst);
+                self.available.notify_one();
+                Err(annotate_database_storage_failure(anyhow::anyhow!(
+                    "db read job panicked"
+                )))
+            }
         }
     }
 }

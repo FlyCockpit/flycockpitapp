@@ -498,7 +498,7 @@ pub fn apply_security_answers_with_caps(
         && mode != effective.sandbox.default_mode
     {
         if let Some(caps) = caps
-            && !crate::daemon::session_worker::sandbox_mode_selectable(mode, caps)
+            && !crate::daemon::session_worker::sandbox_mode_selectable(mode.into(), caps)
         {
             return Err(anyhow!(
                 "sandbox mode `{}` is not available on this host",
@@ -1115,7 +1115,7 @@ mod tests {
         let cfg = crate::config::extended::load_for_cwd(tmp.path());
         assert_eq!(
             cfg.sandbox.default_mode,
-            crate::tools::sandbox_mode::SandboxMode::Off
+            crate::tools::sandbox_mode::SandboxIntent::Off
         );
     }
 

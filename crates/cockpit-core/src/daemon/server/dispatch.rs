@@ -13785,7 +13785,7 @@ async fn handle_serialized_request_impl(
                 enabled: applied.effective.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
-                persisted_intent: Some(applied.persisted_intent),
+                persisted_intent: Some(applied.persisted_intent.into()),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "set_sandbox", response)
         }
@@ -27654,7 +27654,7 @@ async fn build_node_override_context(
     ctx: &DaemonContext,
     session_id: Uuid,
     agent_instance_id: Uuid,
-    session_sandbox_default: cockpit_config::config::sandbox_mode::SandboxMode,
+    session_sandbox_default: cockpit_config::config::sandbox_mode::SandboxIntent,
 ) -> std::result::Result<
     Option<crate::daemon::agent_session_override::NodeOverrideContext>,
     ErrorPayload,

@@ -252,7 +252,7 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
 /// project layer; scaffolds a project `.cockpit/` when no layer exists yet.
 pub(super) fn persist_sandbox_intent(
     project_root: &std::path::Path,
-    mode: crate::tools::sandbox_mode::SandboxMode,
+    mode: crate::tools::sandbox_mode::SandboxIntent,
 ) -> anyhow::Result<()> {
     use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
@@ -275,17 +275,18 @@ pub(super) fn persist_sandbox_intent(
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
 /// client `--no-sandbox` -> [`super::effective_sandbox_mode`]. Factored out
 /// from session spawn so the precedence can be unit-tested without touching
-/// process env. Unavailable container is effective Off, never host Sandbox.
+/// process env. Explicit `--no-sandbox` is Off. Unavailable sandbox or
+/// container is Refuse, never silent Off or a rewrite to host Sandbox.
 pub(super) fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,
-    configured_default: crate::tools::sandbox_mode::SandboxMode,
+    configured_default: crate::tools::sandbox_mode::SandboxIntent,
     caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> crate::tools::sandbox_mode::SandboxMode {
     if daemon_no_sandbox || client_no_sandbox {
         return crate::tools::sandbox_mode::SandboxMode::Off;
     }
-    super::effective_sandbox_mode(configured_default, caps)
+    super::apply_sandbox_intent(configured_default, caps)
 }
 
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the

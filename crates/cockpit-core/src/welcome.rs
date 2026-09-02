@@ -27,6 +27,7 @@ pub enum OnboardingStage {
     Profile,
     Provider,
     Model,
+    Lifetime,
     Complete,
 }
 
@@ -45,6 +46,16 @@ struct OnboardingState {
     /// offline continuation advances the stage and clears this marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_pending_validation: Option<String>,
+    /// Renderer-independent answers already accepted by the current
+    /// onboarding wizard. Secret answers are never eligible for this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wizard_progress: Option<OnboardingWizardProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OnboardingWizardProgress {
+    wizard_id: String,
+    answers_json: String,
 }
 
 fn onboarding_state_path() -> Result<PathBuf> {
@@ -102,8 +113,53 @@ pub fn persist_onboarding_provider_pending_validation(provider_id: &str) -> Resu
         OnboardingState {
             stage: OnboardingStage::Provider,
             provider_pending_validation: Some(provider_id.to_string()),
+            wizard_progress: None,
         },
     )
+}
+
+/// Persist the non-secret answers accepted so far by an onboarding wizard.
+/// The descriptor is rebuilt from current code on resume and every answer is
+/// validated again, so this file is a progress hint rather than authority.
+pub fn persist_onboarding_wizard_progress(run: &crate::wizard::WizardRun) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            run.descriptor().id,
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+                | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+                | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+        ),
+        "wizard `{}` is not resumable onboarding",
+        run.descriptor().id
+    );
+    anyhow::ensure!(
+        !run.answers()
+            .values()
+            .any(|answer| matches!(answer, crate::wizard::WizardAnswer::Secret(_))),
+        "refusing to persist a secret onboarding answer"
+    );
+    let path = onboarding_state_path()?;
+    let stage = onboarding_stage_at(&path);
+    persist_onboarding_state_at(
+        &path,
+        OnboardingState {
+            stage,
+            provider_pending_validation: None,
+            wizard_progress: Some(OnboardingWizardProgress {
+                wizard_id: run.descriptor().id.to_string(),
+                answers_json: run.answers_json()?,
+            }),
+        },
+    )
+}
+
+pub fn onboarding_wizard_progress(wizard_id: &str) -> Option<String> {
+    let path = onboarding_state_path().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let progress = serde_json::from_slice::<OnboardingState>(&bytes)
+        .ok()?
+        .wizard_progress?;
+    (progress.wizard_id == wizard_id).then_some(progress.answers_json)
 }
 
 /// Establish the durable Welcome marker before another startup owner (notably
@@ -136,6 +192,7 @@ fn persist_onboarding_stage_at(path: &Path, stage: OnboardingStage) -> Result<()
         OnboardingState {
             stage,
             provider_pending_validation: None,
+            wizard_progress: None,
         },
     )
 }
@@ -531,6 +588,7 @@ mod tests {
             OnboardingState {
                 stage: OnboardingStage::Provider,
                 provider_pending_validation: Some("openai".into()),
+                wizard_progress: None,
             },
         )
         .unwrap();
@@ -542,6 +600,30 @@ mod tests {
             decoded.provider_pending_validation.as_deref(),
             Some("openai")
         );
+    }
+
+    #[test]
+    fn wizard_progress_round_trips_without_secret_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("new-config").join(ONBOARDING_STATE_FILE);
+        persist_onboarding_state_at(
+            &state,
+            OnboardingState {
+                stage: OnboardingStage::Model,
+                provider_pending_validation: None,
+                wizard_progress: Some(OnboardingWizardProgress {
+                    wizard_id: crate::wizard::ONBOARDING_MODEL_WIZARD_ID.into(),
+                    answers_json: r#"{"provider":{"Select":"local"}}"#.into(),
+                }),
+            },
+        )
+        .unwrap();
+
+        let decoded: OnboardingState =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        let progress = decoded.wizard_progress.unwrap();
+        assert_eq!(progress.wizard_id, crate::wizard::ONBOARDING_MODEL_WIZARD_ID);
+        assert!(!progress.answers_json.contains("Secret"));
     }
 
     #[test]

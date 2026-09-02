@@ -23,6 +23,7 @@ pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
 pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
 pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
+pub const ONBOARDING_LIFETIME_WIZARD_ID: &str = "onboarding-lifetime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -249,6 +250,33 @@ impl WizardRun {
             run.submit(answer)
                 .map_err(|error| anyhow!("invalid wizard answer: {error}"))?;
         }
+        Ok(run)
+    }
+
+    /// Rebuild an interrupted run from the answers accepted before its current
+    /// step. Unlike daemon application, resume never infers an action answer:
+    /// durable mutations must be dispatched again and acknowledged normally.
+    pub fn resume_from_answers_json(descriptor: WizardDescriptor, json: &str) -> Result<Self> {
+        let mut answers: BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(json).context("deserializing wizard progress")?;
+        anyhow::ensure!(
+            !answers
+                .values()
+                .any(|answer| matches!(answer, WizardAnswer::Secret(_))),
+            "wizard progress contains a secret answer"
+        );
+        let mut run = Self::new(descriptor)?;
+        while let Some(step) = run.current_step() {
+            let Some(answer) = answers.remove(step.id) else {
+                break;
+            };
+            run.submit(answer)
+                .map_err(|error| anyhow!("invalid resumed wizard answer: {error}"))?;
+        }
+        anyhow::ensure!(
+            answers.is_empty(),
+            "wizard progress contains answers outside the active branch"
+        );
         Ok(run)
     }
 
@@ -541,6 +569,44 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 "Saving your profile…",
             ),
         ],
+    }
+}
+
+/// One-time owner-lifetime choice. Persistent is pre-selected, but the user
+/// must explicitly continue through this screen before onboarding completes.
+pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
+    WizardDescriptor {
+        id: ONBOARDING_LIFETIME_WIZARD_ID,
+        title: "Background agents",
+        description: "Choose what happens after the last Cockpit window closes",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        steps: vec![
+            StepDescriptor {
+                id: "background-agents",
+                prompt: "Keep agents running in the background after I close all windows.",
+                help: "On keeps agents and sessions running so you can reattach later. Off uses an ephemeral lifetime: closing the last client stops agents and owned processes.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(true)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "lifetime-save",
+                "Save agent lifetime",
+                "Saving agent lifetime…",
+            ),
+        ],
+    }
+}
+
+pub fn onboarding_background_agents_answer(run: &WizardRun) -> Option<bool> {
+    match run.answer("background-agents") {
+        Some(WizardAnswer::Confirm(value)) => Some(*value),
+        _ => None,
     }
 }
 
@@ -2277,6 +2343,34 @@ mod tests {
             model_ref_answer(&run),
             Some(("openai".into(), "manual-model-id".into()))
         );
+    }
+
+    #[test]
+    fn interrupted_onboarding_wizard_resumes_after_last_accepted_answer() {
+        let descriptor = onboarding_profile_descriptor();
+        let mut run = WizardRun::new(descriptor.clone()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
+
+        let resumed =
+            WizardRun::resume_from_answers_json(descriptor, &run.answers_json().unwrap()).unwrap();
+
+        assert_eq!(resumed.current_step_id(), Some("profile-save"));
+        assert_eq!(
+            resumed.answer("name"),
+            Some(&WizardAnswer::Text("Ada".into()))
+        );
+    }
+
+    #[test]
+    fn onboarding_lifetime_requires_explicit_persistent_or_ephemeral_choice() {
+        let mut run = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
+        assert_eq!(run.current_step_id(), Some("background-agents"));
+        assert_eq!(run.prefill(), Some(WizardAnswer::Confirm(true)));
+
+        run.submit(WizardAnswer::Confirm(false)).unwrap();
+
+        assert_eq!(run.current_step_id(), Some("lifetime-save"));
+        assert_eq!(onboarding_background_agents_answer(&run), Some(false));
     }
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);

@@ -95,6 +95,9 @@ pub fn descriptor_for_cwd_with_caps(
     if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
+    if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
+        return Some(crate::wizard::onboarding_lifetime_descriptor());
+    }
     crate::wizard::descriptor(id)
 }
 
@@ -150,6 +153,7 @@ pub fn apply_setup_wizard_answers(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
@@ -158,6 +162,10 @@ pub fn apply_setup_wizard_answers(
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
     if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         let changed = apply_onboarding_profile_answers(&run)?.is_some();
+        return Ok((changed, false, None));
+    }
+    if wizard_id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
+        let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
     if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
@@ -186,6 +194,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
+            | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
@@ -195,6 +204,10 @@ pub async fn apply_setup_wizard_answers_authoritative(
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
     if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         let changed = apply_onboarding_profile_answers(&run)?.is_some();
+        return Ok((changed, false, None));
+    }
+    if wizard_id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
+        let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
     if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
@@ -219,6 +232,22 @@ fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> 
     }
     config.name = next;
     doc.write(&config)?;
+    Ok(Some(target))
+}
+
+fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
+    let target = global_config_file().context("resolving global config for onboarding lifetime")?;
+    let mut doc = ExtendedConfigDoc::load(&target)?;
+    let mut config = doc.config();
+    let background_agents = crate::wizard::onboarding_background_agents_answer(run)
+        .context("background agent lifetime answer")?;
+    if config.daemon.background_agents == background_agents {
+        return Ok(None);
+    }
+    config.daemon.background_agents = background_agents;
+    doc.write(&config)?;
+    // TODO(#274): a live ephemeral owner is not promoted in place when this
+    // setting changes to persistent; the choice applies to later acquisition.
     Ok(Some(target))
 }
 

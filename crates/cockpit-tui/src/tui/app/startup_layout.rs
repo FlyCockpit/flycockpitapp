@@ -86,6 +86,18 @@ impl App {
                     }
                 }
             }
+            FirstRunFlow::AwaitLifetime => {
+                match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(Some(
+                    "Resume setup: choose what happens when the last Cockpit window closes."
+                        .to_string(),
+                )) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return;
+                    }
+                }
+            }
             FirstRunFlow::AwaitFinish => crate::tui::settings::Dialog::open_first_run_complete(
                 "Setup is ready. Suggested first prompt: ‘Help me understand this codebase.’"
                     .to_string(),
@@ -171,6 +183,33 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
+                if !self.persist_first_run_stage(
+                    cockpit_core::welcome::OnboardingStage::Lifetime,
+                ) {
+                    return false;
+                }
+                self.dialog = match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(
+                    Some(
+                        "Choose whether agents stay available for later reattachment."
+                            .to_string(),
+                    ),
+                ) {
+                    Ok(dialog) => dialog,
+                    Err(error) => {
+                        self.show_toast(error, super::ToastKind::Error);
+                        return false;
+                    }
+                };
+                self.first_run_flow = FirstRunFlow::AwaitLifetime;
+                true
+            }
+            FirstRunFlow::AwaitLifetime => {
+                if !self.dialog.setup_wizard_is_complete(
+                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+                ) {
+                    return false;
+                }
+                self.refresh_bootstrap_config_snapshot();
                 let configured_model = self.config_snapshot.providers.active_model.clone();
                 let summary = configured_model
                     .as_ref()
@@ -209,15 +248,12 @@ impl App {
                         missing_dependencies.join(", ")
                     )
                 };
-                #[cfg(windows)]
-                let windows_warning = " Windows: bash will run unsandboxed.";
-                #[cfg(not(windows))]
-                let windows_warning = "";
+                let platform_warning = onboarding_platform_warning();
                 if !self.persist_first_run_stage(cockpit_core::welcome::OnboardingStage::Complete) {
                     return false;
                 }
                 self.dialog = crate::tui::settings::Dialog::open_first_run_complete(format!(
-                    "{summary} {sandbox}. {dependencies}.{windows_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
+                    "{summary} {sandbox}. {dependencies}.{platform_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
                 ));
                 self.first_run_flow = FirstRunFlow::AwaitFinish;
                 if self.submit_after_model_selection {
@@ -498,6 +534,16 @@ impl App {
         let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
         sandbox_notice_wrapped_rows(&text, term_w)
     }
+}
+
+#[cfg(windows)]
+fn onboarding_platform_warning() -> &'static str {
+    " Windows: bash will run unsandboxed; bubblewrap is unavailable."
+}
+
+#[cfg(not(windows))]
+fn onboarding_platform_warning() -> &'static str {
+    ""
 }
 
 fn first_provider_model_id(

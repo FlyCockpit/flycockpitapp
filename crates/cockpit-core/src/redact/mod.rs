@@ -497,7 +497,11 @@ pub(crate) fn env_scrub_patterns(name: &str) -> bool {
 /// This is intentionally wider than [`credential_shaped_key`]: structured
 /// config registration uses this to decide whether a value enters the table at
 /// all, while `credential_shaped_key` only grants the min-length exemption to a
-/// smaller, high-confidence subset.
+/// smaller, high-confidence subset. The `authorization` segment covers the
+/// credential-bearing header family (`Authorization`,
+/// `Proxy-Authorization`, and the `:` / `=` spellings command output
+/// echoes): the whole value — auth scheme included (`Bearer …`,
+/// `Basic …`) — is treated as the secret.
 pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.ends_with("_KEY")
@@ -528,6 +532,7 @@ pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
                 | "credentials"
                 | "passphrase"
                 | "passphrases"
+                | "authorization"
         )
     }) {
         return true;
@@ -2465,6 +2470,9 @@ mod scrub_fast_path_tests {
             "SERVICE_PAT",
             "SERVICE_CREDENTIALS",
             "SERVICE_PASSPHRASE",
+            "authorization",
+            "Authorization",
+            "PROXY_AUTHORIZATION",
         ] {
             assert!(is_secret_shaped_key(key), "expected `{key}` to match");
         }

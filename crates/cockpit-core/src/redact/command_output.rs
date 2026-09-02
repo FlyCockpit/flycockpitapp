@@ -21,19 +21,28 @@
 //!   not just line-anchored pairs), `<Tag>VALUE</Tag>` XML elements with
 //!   secret-shaped tag names, and YAML block scalars opened by
 //!   `secret_key: |` / `>` (the following, more-indented lines are the
-//!   value and are scrubbed there);
-//! - keyless: a line that is nothing but one opaque ≥20-character token —
-//!   the output shape of `gh auth token`, `aws configure get
-//!   aws_secret_access_key`, `pass show`, and `cat token.txt` — plus
-//!   well-known credential formats anywhere on a line (GitHub `ghp_`… /
+//!   value and are scrubbed there). Credential-bearing header keys
+//!   (`Authorization`, `Proxy-Authorization` — see
+//!   [`is_secret_shaped_key`]) are secret-shaped keys here too, so
+//!   `Authorization: Bearer …` scrubs the whole value, scheme word
+//!   included;
+//! - keyless: every opaque ≥20-character credential-shaped token **at any
+//!   position on the line** — standing alone (the output shape of `gh
+//!   auth token`, `aws configure get aws_secret_access_key`, `pass
+//!   show`, and `cat token.txt`), embedded in prose (`credential is …`),
+//!   or inside a header (`Authorization: Bearer …`) — plus well-known
+//!   credential formats anywhere on a line (GitHub `ghp_`… /
 //!   `github_pat_`, OpenAI/Anthropic `sk-`, Google `AIza`, Slack `xox?-`,
-//!   AWS `AKIA…` access-key ids, and `eyJ…` JWTs);
+//!   AWS `AKIA…` access-key ids, and `eyJ…` JWTs). Position never decides
+//!   secrecy: the same token is classified identically wherever the
+//!   command printed it;
 //! - `-----BEGIN … PRIVATE KEY-----` PEM blocks (the whole block becomes
 //!   one placeholder).
 //!
-//! Classification is deliberately shape-based and fail-closed. Standalone
-//! opaque tokens that are *not* secrets — a git SHA from
-//! `` !`git rev-parse HEAD` ``, a UUID — are redacted too: at this boundary
+//! Classification is deliberately shape-based, position-independent, and
+//! fail-closed. Opaque tokens that are *not* secrets — a git SHA from
+//! `` !`git rev-parse HEAD` ``, a UUID, a build target triple, a digest —
+//! are redacted too, wherever they appear on the line: at this boundary
 //! over-redaction costs a placeholder where a hash used to be, while
 //! under-redaction leaks a credential, and the module consistently chooses
 //! the former. Absolute paths (which share base64's `/`) are exempted.
@@ -70,8 +79,8 @@ use super::{
 /// [`MIN_REDACTION_ENTRY_LENGTH`] instead (see [`novel_value_min_len`]).
 const NOVEL_SECRET_VALUE_MIN_LEN: usize = 8;
 
-/// Minimum total length for the standalone opaque-token rule (the keyless
-/// `gh auth token` / `aws configure get …` shape).
+/// Minimum total length for the opaque keyless-credential token rule (the
+/// `gh auth token` / `aws configure get …` shape, wherever it appears).
 const KEYLESS_TOKEN_MIN_LEN: usize = 20;
 
 /// Minimum total length for a JWT (`eyJ…` with at least two dots).
@@ -95,10 +104,10 @@ impl RedactionTable {
     /// alone cannot catch them. See the module docs for the full list of
     /// recognized shapes (keyed assignments and colon pairs including
     /// compact/multi-member JSON, secret-shaped XML elements, YAML block
-    /// scalars, keyless standalone opaque tokens, well-known credential
-    /// formats, and PEM private-key blocks). Keys, tags, structure, and
-    /// surrounding text are preserved; only the secret-shaped value is
-    /// replaced with this table's placeholder.
+    /// scalars, keyless opaque tokens at any line position, well-known
+    /// credential formats, and PEM private-key blocks). Keys, tags,
+    /// structure, and surrounding text are preserved; only the
+    /// secret-shaped value is replaced with this table's placeholder.
     ///
     /// Honors the config-level opt-out exactly like [`Self::scrub`]: a
     /// disabled table returns `body` unchanged. Idempotent: a value already
@@ -300,6 +309,14 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
             key_start -= 1;
         }
         let key = &content[key_start..key_end];
+        // CLI-flag spellings (`--session_token=…`, echoed command text):
+        // trim leading dashes so the flag's inner name is the key
+        // candidate. Without the trim the scan-back swallows the dashes,
+        // `--session_token` fails the alphanumeric-start qualifier, and
+        // the `-` entry in the boundary list below can never fire. Keys
+        // with *internal* dashes (`aws-secret-access-key`) keep their
+        // whole-name classification.
+        let key = key.trim_start_matches('-');
         let at_boundary = key_start == 0
             || matches!(
                 bytes[key_start - 1],
@@ -438,25 +455,39 @@ fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) ->
 /// Indentation, the quote style, and a JSON trailing comma are preserved in
 /// the rebuild. Quoted-key members anywhere on the line are handled by
 /// [`scrub_secret_shaped_quoted_members`]; this parser's unique coverage is
-/// the bare unquoted key at line start (plain YAML).
+/// the bare unquoted key at line start (plain YAML), including one leading
+/// YAML list marker (`- key: value`).
 fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
     if !content.contains(':') {
         return content.to_string();
     }
     let indent = content.len() - content.trim_start().len();
-    let head = &content[indent..];
+    let mut head = &content[indent..];
+    let mut head_off = indent;
+    // A YAML list item (`- key: value`) anchors the same pair as a
+    // line-start key: skip one `-` list marker plus the whitespace after
+    // it. Keys must start with an alphanumeric, so a `-`-prefixed head
+    // never qualified before — this only adds coverage.
+    if let Some(rest) = head.strip_prefix('-') {
+        let ws = rest.len() - rest.trim_start().len();
+        let inner = &rest[ws..];
+        if !inner.is_empty() && !inner.starts_with('-') {
+            head = inner;
+            head_off = indent + 1 + ws;
+        }
+    }
     // Key: JSON-style quoted, or a bare token running to the `:` (with
     // optional spacing before the separator: `auth-token : value`).
     let (key, after_key) = if let Some(rest) = head.strip_prefix('"') {
         let Some(close_rel) = rest.find('"') else {
             return content.to_string();
         };
-        (&head[1..1 + close_rel], indent + 1 + close_rel + 1)
+        (&head[1..1 + close_rel], head_off + 1 + close_rel + 1)
     } else {
         let Some(sep_rel) = head.find(':') else {
             return content.to_string();
         };
-        (head[..sep_rel].trim_end(), indent + sep_rel)
+        (head[..sep_rel].trim_end(), head_off + sep_rel)
     };
     if !command_output_key_qualifies(key) {
         return content.to_string();
@@ -522,10 +553,20 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
 /// `token: |2` — whose value lives on the following, more-indented lines
 /// and must be scrubbed there. Chomping/indent indicators (`+`, `-`,
 /// digits) may follow the `|`/`>`; anything else is an inline value, not a
-/// block, and returns `None`.
+/// block, and returns `None`. One leading YAML list marker
+/// (`- key: |`) is skipped first, so a list-item block classifies exactly
+/// like a line-anchored one (the returned floor indentation stays the key
+/// line's own indent, which list-item value lines exceed).
 fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
     let indent = content.len() - content.trim_start().len();
-    let trimmed = content.trim_start();
+    let mut trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        let ws = rest.len() - rest.trim_start().len();
+        let inner = &rest[ws..];
+        if !inner.is_empty() && !inner.starts_with('-') {
+            trimmed = inner;
+        }
+    }
     let colon = trimmed.find(':')?;
     let key = strip_quotes(trimmed[..colon].trim());
     if !command_output_key_qualifies(key) {
@@ -543,55 +584,94 @@ fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
     Some((indent, novel_value_min_len(key)))
 }
 
-/// Charset of an opaque standalone credential token: base64 / base64url /
-/// hex / AWS-style mixed alnum, plus percent-encoded blobs. No dots —
-/// dotted runs are versions, host names, and file names; JWTs (which need
-/// dots) are caught by the `eyJ` prefix rule instead.
+/// Charset of an opaque credential token: base64 / base64url / hex /
+/// AWS-style mixed alnum, plus percent-encoded blobs. No dots — dotted
+/// runs are versions, host names, and file names; JWTs (which need dots)
+/// are caught by the `eyJ` prefix rule instead.
 fn is_opaque_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-' | '%')
 }
 
-/// Scrub keyless secrets: a line that is nothing but one opaque token (the
-/// standalone-credential output shape), then well-known credential formats
-/// anywhere on the line. See the module docs for the fail-closed stance on
+/// Scrub keyless secrets: well-known credential formats anywhere on the
+/// line, then every opaque credential-shaped token anywhere on the line.
+/// The opaque-token rule is position-independent: a token that would be
+/// redacted standing alone — the `gh auth token` / `pass show` output
+/// shape — is redacted embedded in prose (`credential is …`) or inside a
+/// header (`Authorization: Bearer …`) exactly the same. Position never
+/// decides secrecy. See the module docs for the fail-closed stance on
 /// hashes and UUIDs.
 fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
-    let trimmed = content.trim();
-    // One optional layer of surrounding quotes (the shape `pass show`
-    // prints for a quoted entry).
-    let token = strip_quotes(trimmed);
-    let starts_with_path_sep = token.starts_with('/') && token.matches('/').count() >= 2;
-    if token.len() >= KEYLESS_TOKEN_MIN_LEN
+    // Known formats first: they delimit multi-part tokens (a JWT's dot
+    // segments are not opaque-run characters) that the embedded run pass
+    // would otherwise chop into partial redactions.
+    let known = scrub_known_credential_tokens(content, placeholder);
+    scrub_embedded_opaque_tokens(&known, placeholder)
+}
+
+/// `true` when `token` has the shape of a novel keyless credential: an
+/// opaque run of at least [`KEYLESS_TOKEN_MIN_LEN`] characters mixing
+/// letters and digits, with no non-trailing `=` (that is an assignment,
+/// not a bare token; trailing `=` is base64 padding) and not an absolute
+/// path (which shares base64's `/`). The predicate is deliberately
+/// position-independent: the standalone `gh auth token` output, the same
+/// token quoted by `pass show`, and the same token embedded in prose or a
+/// header all classify identically, so no rendering position can make a
+/// credential pass.
+fn is_novel_opaque_credential(token: &str) -> bool {
+    token.len() >= KEYLESS_TOKEN_MIN_LEN
         && !token.contains(char::is_whitespace)
         && token.chars().all(is_opaque_token_char)
         && token.chars().any(|c| c.is_ascii_digit())
         && token.chars().any(|c| c.is_ascii_alphabetic())
-        // A non-trailing `=` makes the line an assignment shape, not a
+        // A non-trailing `=` makes the span an assignment shape, not a
         // bare token (trailing `=` is base64 padding).
         && !token.trim_end_matches('=').contains('=')
         // Absolute paths share base64's `/`; exempt multi-slash shapes.
-        && !starts_with_path_sep
-    {
-        let indent = content.len() - content.trim_start().len();
-        // Re-wrap in the same surrounding quote `pass show` printed.
-        let quote = if token != trimmed {
-            trimmed.chars().next()
-        } else {
-            None
-        };
-        let mut out = String::with_capacity(content.len());
-        out.push_str(&content[..indent]);
-        if let Some(q) = quote {
-            out.push(q);
-        }
-        out.push_str(placeholder);
-        if let Some(q) = quote {
-            out.push(q);
-        }
-        out.push_str(&content[indent + trimmed.len()..]);
-        return out;
+        && !(token.starts_with('/') && token.matches('/').count() >= 2)
+}
+
+/// Replace every maximal run of opaque token characters that
+/// [`is_novel_opaque_credential`] classifies as a credential with the
+/// placeholder. Runs are bounded by any non-opaque character (whitespace,
+/// quotes, punctuation), so surrounding prose, one layer of `pass show`
+/// quotes, and line position all survive untouched — including the
+/// whole-line shapes, which are simply runs bounded by the line edges or
+/// quotes. Linear in the line: one scan collects the runs and each run is
+/// checked once. A run already equal to the placeholder is left alone, so
+/// re-scrubbing stays idempotent even for a user-configured opaque-shaped
+/// placeholder.
+fn scrub_embedded_opaque_tokens(content: &str, placeholder: &str) -> String {
+    if content.len() < KEYLESS_TOKEN_MIN_LEN {
+        return content.to_string();
     }
-    scrub_known_credential_tokens(content, placeholder)
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut run_start: Option<usize> = None;
+    for (idx, ch) in content.char_indices() {
+        if is_opaque_token_char(ch) {
+            run_start.get_or_insert(idx);
+            continue;
+        }
+        let Some(start) = run_start.take() else {
+            continue;
+        };
+        let run = &content[start..idx];
+        if run != placeholder && is_novel_opaque_credential(run) {
+            out.push_str(&content[copied..start]);
+            out.push_str(placeholder);
+            copied = idx;
+        }
+    }
+    if let Some(start) = run_start {
+        let run = &content[start..];
+        if run != placeholder && is_novel_opaque_credential(run) {
+            out.push_str(&content[copied..start]);
+            out.push_str(placeholder);
+            copied = content.len();
+        }
+    }
+    out.push_str(&content[copied..]);
+    out
 }
 
 /// Well-known credential token prefixes and the minimum total length
@@ -919,6 +999,14 @@ mod tests {
             ),
             "run ./tool --session_token=[ph] now"
         );
+        // Dash-internal keys keep their whole-name classification; the
+        // flag's leading dashes are what get trimmed.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "flag --aws-secret-access-key=novelsecret123456789 now"
+            ),
+            "flag --aws-secret-access-key=[ph] now"
+        );
     }
 
     #[test]
@@ -1077,10 +1165,107 @@ mod tests {
             table.scrub_novel_command_output_secrets(&line),
             "key [ph] here"
         );
+        // `Authorization` classifies as a credential-bearing key, so the
+        // keyed pass scrubs the whole value — scheme word included —
+        // before the format passes ever see it.
         let line = format!("Authorization: Bearer {}", jwt());
         assert_eq!(
             table.scrub_novel_command_output_secrets(&line),
-            "Authorization: Bearer [ph]"
+            "Authorization: [ph]"
+        );
+    }
+
+    #[test]
+    fn mixed_prose_unknown_opaque_token_is_redacted() {
+        // The position-independence invariant: an unknown opaque
+        // credential is redacted wherever the command printed it —
+        // embedded in prose, not only as a whole line.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("credential is novelOpaqueCredential123456"),
+            "credential is [ph]"
+        );
+        // Mid-line AWS secret key (base64 with `/`, not path-anchored).
+        let line = format!("the key is {} today", aws_secret_access_key());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "the key is [ph] today"
+        );
+        // One layer of `pass show`-style quotes mid-line: quotes survive.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("prints \"novel-passphrase-77aa1234xyz\" now"),
+            "prints \"[ph]\" now"
+        );
+    }
+
+    #[test]
+    fn authorization_header_value_is_redacted_wholesale() {
+        // `Authorization` is a credential-bearing key: the whole value —
+        // the auth scheme word included — is the secret (`curl -v` echo
+        // shape), so even a short bearer token under the keyless token
+        // floor cannot survive under it.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "Authorization: Bearer novelOpaqueCredential123456"
+            ),
+            "Authorization: [ph]"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("Authorization: Bearer shortTok1"),
+            "Authorization: [ph]"
+        );
+    }
+
+    #[test]
+    fn yaml_list_item_keyed_members_are_redacted() {
+        // One leading list marker is skipped, so `- key: value` members
+        // classify exactly like line-anchored ones.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("- password: hunter2-novel-secret-9f"),
+            "- password: [ph]"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "- \"db_password\": \"hunter2-novel-secret-9f\""
+            ),
+            "- \"db_password\": \"[ph]\""
+        );
+        // Block scalar under a list-item key.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(
+                "- db_password: |\n    hunter2-novel-secret-9f\n"
+            ),
+            "- db_password: |\n    [ph]\n"
+        );
+    }
+
+    #[test]
+    fn midline_opaque_identifier_is_redacted_fail_closed() {
+        // Position-independent fail-closed: a full git SHA mid-line is
+        // shape-identical to a credential and is redacted wherever it
+        // appears — the documented over-redaction trade.
+        let table = table_with_placeholder(PH);
+        let line = format!("merged commit {} into main", git_sha());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "merged commit [ph] into main"
+        );
+    }
+
+    #[test]
+    fn embedded_pass_keeps_short_and_digitless_prose_visible() {
+        // The shape floor keeps ordinary prose safe: no digit, or under
+        // the opaque-token floor, means visible.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("internationalization remains readable"),
+            "internationalization remains readable"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("well-known-compound-word stays"),
+            "well-known-compound-word stays"
         );
     }
 

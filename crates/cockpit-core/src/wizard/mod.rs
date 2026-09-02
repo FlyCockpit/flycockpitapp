@@ -898,7 +898,19 @@ pub fn onboarding_agent_descriptor(
                 prefill: None,
                 validate: None,
                 write: None,
-                branch: None,
+                branch: Some(|_, _| Some("monty-packages")),
+            },
+            StepDescriptor {
+                id: "monty-packages",
+                prompt: "Monty packages",
+                help: "Available by default: json, csv, re, datetime, math, statistics, textwrap, base64, hashlib. The governed requests facade is per-agent and disabled by default; it becomes available only after an explicit owner-approved network-policy change, and never exposes raw sockets.",
+                help_hook: None,
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(|_, _| Some("sidecar")),
             },
             StepDescriptor {
                 id: "sidecar",
@@ -983,14 +995,14 @@ fn onboarding_tool_configuration_branch(
 ) -> Option<&'static str> {
     match answer {
         WizardAnswer::Select(value) if value == "advanced" => Some("advanced-tools"),
-        WizardAnswer::Select(_) => Some("sidecar"),
+        WizardAnswer::Select(_) => Some("monty-packages"),
         _ => None,
     }
 }
 
 fn onboarding_post_model_trust_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     matches!(run.answer("agent"), Some(WizardAnswer::Select(agent)) if agent == "third-party")
-        .then_some("sidecar")
+        .then_some("monty-packages")
         .or(Some("tool-configuration"))
 }
 

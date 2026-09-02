@@ -1100,7 +1100,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         )),
         Arc::new(tools::web::WebSearchTool),
         Arc::new(tools::web::WebFetchTool),
-        Arc::new(tools::mcp_tool::McpTool),
+        Arc::new(tools::mcp_tool::McpTool::default()),
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::StartBuildTool),
@@ -1226,7 +1226,7 @@ pub(crate) fn materialize_tool_by_name(
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "raise" => tb.with(Arc::new(tools::raise::RaiseTool)),
         "schedule" => tb.with(Arc::new(tools::schedule::ScheduleTool)),
-        "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool)),
+        "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool::default())),
         "webfetch" | "websearch" => tb.with(tools::web::materialize_web_tool(
             name,
             &args.config,
@@ -2863,7 +2863,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // confined to read/grep/glob and its resolver has only its fixed package
     // lookup surface, so neither stage may receive the scripting escape hatch.
     if !is_docs_pipeline(&def.name) && !tb.names().contains(&"mcp") {
-        tb = tb.with(Arc::new(crate::tools::mcp_tool::McpTool));
+        tb = tb.with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
     }
     // vNext deliberately has no `tools:` authority field.  Delegation is the
     // sole declarative request that can cause the host to expose the
@@ -3761,7 +3761,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
     .with(Arc::new(crate::tools::harness::HarnessListTool))
     .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
     // MCP (GOALS §18a): Monty Python sandbox.
-    .with(Arc::new(crate::tools::mcp_tool::McpTool));
+    .with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
     let tools = with_recall_tools(
         with_custom_tools(
             with_task_for_targets(base_tools, args, &sub_refs),
@@ -4059,7 +4059,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
                 args.swarm_depth,
                 args.swarm_max_depth,
             )))
-            .with(Arc::new(crate::tools::mcp_tool::McpTool)),
+            .with(Arc::new(crate::tools::mcp_tool::McpTool::default())),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
@@ -4189,7 +4189,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     .with(Arc::new(crate::tools::skill::SkillTool))
     .with(Arc::new(crate::tools::harness::HarnessListTool))
     .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
-    .with(Arc::new(crate::tools::mcp_tool::McpTool));
+    .with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
     let tools = with_recall_tools(
         with_custom_tools(
             with_task_for_targets(base_tools, args, &["explore"]),
@@ -4253,7 +4253,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
             .with(Arc::new(crate::tools::schedule::ScheduleTool))
             .with(Arc::new(crate::tools::question::QuestionTool))
-            .with(Arc::new(crate::tools::mcp_tool::McpTool)),
+            .with(Arc::new(crate::tools::mcp_tool::McpTool::default())),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
@@ -4327,7 +4327,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
                     args.swarm_depth,
                     args.swarm_max_depth,
                 )))
-                .with(Arc::new(crate::tools::mcp_tool::McpTool)),
+                .with(Arc::new(crate::tools::mcp_tool::McpTool::default())),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),

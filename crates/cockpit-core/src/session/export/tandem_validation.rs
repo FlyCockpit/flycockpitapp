@@ -363,7 +363,7 @@ fn known_tool_schemas() -> BTreeMap<String, Value> {
         Box::new(tools::question::QuestionTool),
         Box::new(tools::skill::SkillTool),
         Box::new(tools::schedule::ScheduleTool),
-        Box::new(tools::mcp_tool::McpTool),
+        Box::new(tools::mcp_tool::McpTool::default()),
     ];
     all.into_iter()
         .map(|tool| (tool.name().to_string(), tool.parameters()))

@@ -1223,6 +1223,47 @@ impl Db {
             .await
     }
 
+    /// Restore the machine-wide default captured by a cross-authority
+    /// publication journal.  `None` is a real prior state, not a request to
+    /// leave whatever a partially published operation selected.
+    pub async fn restore_default_agent_installation(
+        &self,
+        installation_id: Option<Uuid>,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            if let Some(installation_id) = installation_id {
+                let changed = conn.execute(
+                    "INSERT INTO agent_default_installation(singleton,installation_id,updated_at_unix_ms)
+                     SELECT 1,i.installation_id,?2 FROM agent_installations i
+                     WHERE i.installation_id=?1 AND i.scope='global' AND i.deleted_at_unix_ms IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM agent_model_bindings b
+                           WHERE b.installation_id=i.installation_id
+                             AND b.definition_digest=i.source_digest
+                             AND b.slot_id='primary' AND b.is_default=1
+                             AND b.retired_at_unix_ms IS NULL
+                       )
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       installation_id=excluded.installation_id,
+                       updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![installation_id.to_string(), now_unix_ms],
+                )?;
+                ensure!(
+                    changed == 1,
+                    "onboarding recovery prior default is not a live, primary-bound global installation"
+                );
+            } else {
+                conn.execute(
+                    "DELETE FROM agent_default_installation WHERE singleton=1",
+                    [],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Read the selected immutable profile reference, all visible installation
     /// rows, observations, and matching current bindings through one SQLite
     /// read snapshot.  Definition files and provider config are intentionally

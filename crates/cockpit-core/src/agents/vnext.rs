@@ -1044,6 +1044,26 @@ pub struct VnextAgentDef {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub tool_tier_preferences: BTreeMap<String, ToolTier>,
+    /// Author request used only to pre-fill an owner approval prompt. This is
+    /// never projected into the effective egress allowlist.
+    #[serde(
+        rename = "requestedNetworkHosts",
+        default,
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub requested_network_hosts: BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
+    /// Author preference for the governed `requests` facade. Like tool-tier
+    /// preferences, this can request placement but cannot grant the package.
+    #[serde(
+        rename = "requestsRequested",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub requests_requested: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl VnextAgentDef {
@@ -1098,6 +1118,9 @@ impl VnextAgentDef {
                 bail!("toolTierPreferences may not name host-placement tool `{tool}`");
             }
         }
+        if self.requested_network_hosts.len() > 64 {
+            bail!("requestedNetworkHosts may contain at most 64 hosts");
+        }
         Ok(())
     }
 
@@ -1108,6 +1131,21 @@ impl VnextAgentDef {
     pub fn supports_computer_use(&self) -> bool {
         self.capabilities
             .contains(&crate::agents::AgentCapability::ComputerUse)
+    }
+
+    /// Safe prompt-prefill data only. Callers must route any accepted host
+    /// through the explicit user-action grant APIs; this accessor is not an
+    /// authority projection.
+    pub fn requested_network_hosts(
+        &self,
+    ) -> &BTreeSet<crate::db::monty_network::CanonicalNetworkHost> {
+        &self.requested_network_hosts
+    }
+
+    /// Safe prompt-prefill preference only; the durable per-agent toggle is
+    /// authoritative and can be changed only through a user-action mutation.
+    pub fn requests_requested(&self) -> bool {
+        self.requests_requested
     }
 
     /// Existing runtime snapshots still require a single launch lane. This is
@@ -2857,6 +2895,8 @@ mod tests {
             verification: None,
             allowed_knowledge_bases: None,
             tool_tier_preferences: std::collections::BTreeMap::new(),
+            requested_network_hosts: std::collections::BTreeSet::new(),
+            requests_requested: false,
         }
     }
 

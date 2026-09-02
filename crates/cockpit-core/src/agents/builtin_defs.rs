@@ -364,6 +364,8 @@ fn builtin_vnext(name: &str, _mode: AgentMode) -> VnextAgentDef {
         verification: None,
         allowed_knowledge_bases: None,
         tool_tier_preferences: std::collections::BTreeMap::new(),
+        requested_network_hosts: std::collections::BTreeSet::new(),
+        requests_requested: false,
     }
 }
 

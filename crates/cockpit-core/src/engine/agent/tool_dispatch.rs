@@ -4983,7 +4983,7 @@ mod tests {
     #[tokio::test]
     async fn under_cap_mcp_emit_stays_inline_when_artifact_policy_is_lower() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let tools = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool::default()));
         let mut agent = test_agent(tools.clone());
         agent.context_policy = Some(crate::agents::ContextPolicy {
             artifact_spill_bytes: Some(1),

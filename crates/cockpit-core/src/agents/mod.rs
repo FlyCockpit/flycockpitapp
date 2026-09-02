@@ -1048,6 +1048,30 @@ pub fn next_primary_in_cycle(current: &str, order: &[String]) -> String {
 }
 
 impl AgentDef {
+    /// Author-requested host names for owner-prompt prefill. This is not the
+    /// effective network policy and never widens it.
+    pub fn requested_network_hosts(
+        &self,
+    ) -> &BTreeSet<crate::db::monty_network::CanonicalNetworkHost> {
+        self.vnext
+            .as_ref()
+            .map(VnextAgentDef::requested_network_hosts)
+            .unwrap_or_else(|| {
+                static EMPTY: std::sync::OnceLock<
+                    BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
+                > = std::sync::OnceLock::new();
+                EMPTY.get_or_init(BTreeSet::new)
+            })
+    }
+
+    /// Author preference used only to pre-fill an owner prompt. This cannot
+    /// enable the governed package or widen the effective allowlist.
+    pub fn requests_requested(&self) -> bool {
+        self.vnext
+            .as_ref()
+            .is_some_and(VnextAgentDef::requests_requested)
+    }
+
     /// The knowledge-base restriction authored in this exact definition.
     /// Running agents retain an `AgentDef` snapshot, so knowledge access is
     /// governed by that snapshot rather than a same-named reloaded definition.
@@ -1340,6 +1364,15 @@ impl AgentDef {
                 serde_yaml::to_value(&vnext.tool_tier_preferences)?,
             );
         }
+        if !vnext.requested_network_hosts.is_empty() {
+            fm.insert(
+                "requestedNetworkHosts".into(),
+                serde_yaml::to_value(&vnext.requested_network_hosts)?,
+            );
+        }
+        if vnext.requests_requested {
+            fm.insert("requestsRequested".into(), true.into());
+        }
         if !vnext.capabilities.is_empty() {
             fm.insert(
                 "capabilities".into(),
@@ -1471,6 +1504,10 @@ pub struct AgentDefinitionFrontmatter {
     pub allowed_knowledge_bases: Option<BTreeSet<String>>,
     #[serde(rename = "toolTierPreferences", default)]
     pub tool_tier_preferences: BTreeMap<String, ToolTier>,
+    #[serde(rename = "requestedNetworkHosts", default)]
+    pub requested_network_hosts: BTreeSet<crate::db::monty_network::CanonicalNetworkHost>,
+    #[serde(rename = "requestsRequested", default)]
+    pub requests_requested: bool,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -1496,6 +1533,8 @@ impl AgentDefinitionFrontmatter {
             verification: self.verification.clone(),
             allowed_knowledge_bases: self.allowed_knowledge_bases.clone(),
             tool_tier_preferences: self.tool_tier_preferences.clone(),
+            requested_network_hosts: self.requested_network_hosts.clone(),
+            requests_requested: self.requests_requested,
         }
     }
 
@@ -1526,6 +1565,8 @@ impl AgentDef {
             verification: definition.verification.clone(),
             allowed_knowledge_bases: definition.allowed_knowledge_bases.clone(),
             tool_tier_preferences: definition.tool_tier_preferences.clone(),
+            requested_network_hosts: definition.requested_network_hosts.clone(),
+            requests_requested: definition.requests_requested,
             description: self.description.clone(),
             capabilities: definition.capabilities.clone(),
             tool_steering: self.tool_steering,

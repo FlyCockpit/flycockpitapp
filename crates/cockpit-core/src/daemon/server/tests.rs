@@ -15391,6 +15391,7 @@ async fn attached_state_with_worker_receiver(
                     .expect("test workspace identity"),
                 ),
                 _interactive_guard: None,
+                rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
             }),
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
@@ -22597,6 +22598,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     SessionWork::ResolveInterrupt {
                         interrupt_id,
                         response,
+                        governed_network_attachment: _,
                     },
                 ) => {
                     assert_eq!(interrupt_id, Uuid::from_u128(2));
@@ -33105,7 +33107,10 @@ async fn recv_writer_body(
         match writer_rx.recv().await.expect(label) {
             ClientWriterMessage::SetVersion(_) => continue,
             ClientWriterMessage::Envelope(envelope) => return envelope.body,
-            ClientWriterMessage::EnvelopeWithAck { envelope, .. } => return envelope.body,
+            ClientWriterMessage::EnvelopeWithAck { envelope, ack } => {
+                let _ = ack.send(Ok(()));
+                return envelope.body;
+            }
         }
     }
 }
@@ -33800,7 +33805,8 @@ async fn attach_replay_precedes_live_events_under_task_split() {
             .expect("live subscription command"),
         ClientEventCommand::Attach {
             session_id: _,
-            rx: _
+            rx: _,
+            ..
         }
     ));
 }
@@ -33925,7 +33931,8 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
             .expect("live subscription command"),
         ClientEventCommand::Attach {
             session_id: _,
-            rx: _
+            rx: _,
+            ..
         }
     ));
     slow_release.notify_waiters();
@@ -33964,6 +33971,7 @@ async fn client_io_split_detach_silences_session_events() {
         .send(ClientEventCommand::Attach {
             session_id,
             rx: session_rx,
+            rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
         })
         .await
         .unwrap();
@@ -34033,6 +34041,7 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
         .send(ClientEventCommand::Attach {
             session_id,
             rx: session_rx,
+            rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
         })
         .await
         .unwrap();
@@ -34723,6 +34732,7 @@ async fn btw_concurrent_with_parent_turn() {
             code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
+            rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -34802,6 +34812,7 @@ async fn btw_concurrent_with_parent_turn() {
             code_root_capability: None,
             workspace_identity: None,
             _interactive_guard: None,
+            rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
         }),
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -39120,3 +39131,460 @@ async fn boot_with_db_resolves_referenced_command_secret() {
 // `prepare_fork_task_context` production path instead of manually copying the
 // cache onto a bare child session (which would pass even if the production copy
 // were removed).
+
+#[test]
+fn interrupt_provenance_requires_successful_event_enqueue() {
+    let interrupt_id = Uuid::new_v4();
+    let event = proto::Event::InterruptRaised {
+        session_id: Uuid::new_v4(),
+        interrupt_id,
+        agent: "builder".into(),
+        description: "approve".into(),
+        question: None,
+        questions: None,
+        pending_count: 1,
+        reason: proto::InterruptRaiseReason::Initial,
+    };
+    let rendered = Arc::new(StdMutex::new(HashSet::new()));
+    mark_rendered_interrupt_if_forwarded(&rendered, &event, false);
+    assert!(!crate::sync::lock_or_recover(&rendered).contains(&interrupt_id));
+    mark_rendered_interrupt_if_forwarded(&rendered, &event, true);
+    assert!(crate::sync::lock_or_recover(&rendered).contains(&interrupt_id));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut lag = PendingEventLag::default();
+    assert_eq!(
+        try_send_in_process_event(&tx, event.clone(), None, &mut lag),
+        InProcessEventSend::Enqueued
+    );
+    assert_eq!(
+        try_send_in_process_event(&tx, event.clone(), None, &mut lag),
+        InProcessEventSend::DroppedFull
+    );
+    drop(_rx);
+    assert_eq!(
+        try_send_in_process_event(&tx, event, None, &mut lag),
+        InProcessEventSend::Closed
+    );
+}
+
+#[tokio::test]
+async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_the_event() {
+    let ctx = test_ctx();
+    let (session_tx, session_rx) = tokio::sync::broadcast::channel(8);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let old_rendered = Arc::new(StdMutex::new(HashSet::new()));
+    let new_rendered = Arc::new(StdMutex::new(HashSet::new()));
+    let session_id = Uuid::new_v4();
+    let task = tokio::spawn(run_client_event_forwarder(
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        ctx.subscribe_global(),
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+    event_cmd_tx
+        .send(ClientEventCommand::Attach {
+            session_id,
+            rx: session_rx,
+            rendered_interrupts: old_rendered.clone(),
+        })
+        .await
+        .unwrap();
+
+    let non_rendering_id = Uuid::new_v4();
+    session_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id,
+            text: non_rendering_id.to_string(),
+        }))
+        .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "non-interrupt socket event").await,
+        Body::Event {
+            event: proto::Event::Notice { .. }
+        }
+    ));
+    assert!(crate::sync::lock_or_recover(&old_rendered).is_empty());
+
+    let old_interrupt_id = Uuid::new_v4();
+    let old_event = proto::Event::InterruptRaised {
+        session_id,
+        interrupt_id: old_interrupt_id,
+        agent: "builder".into(),
+        description: "old attachment".into(),
+        question: None,
+        questions: None,
+        pending_count: 1,
+        reason: proto::InterruptRaiseReason::Initial,
+    };
+    session_tx.send(test_event_envelope(old_event)).unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "old attachment interrupt").await,
+        Body::Event { event: proto::Event::InterruptRaised { interrupt_id, .. } }
+            if interrupt_id == old_interrupt_id
+    ));
+    assert!(crate::sync::lock_or_recover(&old_rendered).contains(&old_interrupt_id));
+
+    let new_session_rx = session_tx.subscribe();
+    event_cmd_tx.send(ClientEventCommand::Detach).await.unwrap();
+    event_cmd_tx
+        .send(ClientEventCommand::Attach {
+            session_id,
+            rx: new_session_rx,
+            rendered_interrupts: new_rendered.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    let new_interrupt_id = Uuid::new_v4();
+    session_tx
+        .send(test_event_envelope(proto::Event::InterruptRaised {
+            session_id,
+            interrupt_id: new_interrupt_id,
+            agent: "builder".into(),
+            description: "new attachment".into(),
+            question: None,
+            questions: None,
+            pending_count: 1,
+            reason: proto::InterruptRaiseReason::Initial,
+        }))
+        .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "new attachment interrupt").await,
+        Body::Event { event: proto::Event::InterruptRaised { interrupt_id, .. } }
+            if interrupt_id == new_interrupt_id
+    ));
+    assert!(!crate::sync::lock_or_recover(&new_rendered).contains(&old_interrupt_id));
+    assert!(crate::sync::lock_or_recover(&new_rendered).contains(&new_interrupt_id));
+
+    drop(event_cmd_tx);
+    task.await.unwrap();
+
+    // A failed socket handoff must not mint rendering provenance. Closing the
+    // real writer queue makes the production forwarder take its send-failure
+    // branch before the mark call.
+    let (session_tx, session_rx) = tokio::sync::broadcast::channel(1);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(1);
+    let (executor_tx, _executor_rx) = mpsc::channel(1);
+    let (writer_tx, writer_rx) = mpsc::channel(1);
+    drop(writer_rx);
+    let failed_rendered = Arc::new(StdMutex::new(HashSet::new()));
+    let failed_id = Uuid::new_v4();
+    let failed_task = tokio::spawn(run_client_event_forwarder(
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        ctx.subscribe_global(),
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+    event_cmd_tx
+        .send(ClientEventCommand::Attach {
+            session_id,
+            rx: session_rx,
+            rendered_interrupts: failed_rendered.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    session_tx
+        .send(test_event_envelope(proto::Event::InterruptRaised {
+            session_id,
+            interrupt_id: failed_id,
+            agent: "builder".into(),
+            description: "failed handoff".into(),
+            question: None,
+            questions: None,
+            pending_count: 1,
+            reason: proto::InterruptRaiseReason::Initial,
+        }))
+        .unwrap();
+    failed_task.await.unwrap();
+    assert!(!crate::sync::lock_or_recover(&failed_rendered).contains(&failed_id));
+}
+
+#[derive(Clone)]
+struct ProvenanceTestIo {
+    fail_write: bool,
+    written: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl tokio::io::AsyncRead for ProvenanceTestIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tokio::io::AsyncWrite for ProvenanceTestIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.fail_write {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected post-enqueue write failure",
+            )));
+        }
+        crate::sync::lock_or_recover(&self.written).extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn socket_interrupt_provenance_requires_actual_proto_write_success() {
+    for fail_write in [false, true] {
+        let interrupt_id = Uuid::new_v4();
+        let event = proto::Event::InterruptRaised {
+            session_id: Uuid::new_v4(),
+            interrupt_id,
+            agent: "builder".into(),
+            description: "actual writer outcome".into(),
+            question: None,
+            questions: None,
+            pending_count: 1,
+            reason: proto::InterruptRaiseReason::Initial,
+        };
+        let rendered = Arc::new(StdMutex::new(HashSet::new()));
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let stream = ProvenanceTestIo {
+            fail_write,
+            written: written.clone(),
+        };
+        let (_reader, writer) = ProtoStream::new(stream).into_split();
+        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let writer_task = tokio::spawn(run_client_writer(writer, writer_rx));
+
+        let delivered =
+            send_socket_event_and_mark_rendered(&writer_tx, Some(&rendered), event).await;
+        drop(writer_tx);
+        writer_task.await.unwrap();
+
+        assert_eq!(delivered, !fail_write);
+        assert_eq!(
+            crate::sync::lock_or_recover(&rendered).contains(&interrupt_id),
+            !fail_write,
+            "rendered provenance must follow the actual ProtoWriteHalf::send result"
+        );
+        assert_eq!(
+            crate::sync::lock_or_recover(&written).is_empty(),
+            fail_write,
+            "the successful case must cross the real encoder/write seam"
+        );
+    }
+}
+
+async fn seed_governed_network_interrupt(db: &Db, session_id: Uuid) -> Uuid {
+    let agent = match db.session_root_agent(session_id).await.unwrap() {
+        Some(agent) => agent,
+        None => {
+            let created = db
+                .create_agent_instance(
+                    crate::db::agent_tree_decisions::NewAgentInstance {
+                        session_id,
+                        parent_agent_instance_id: None,
+                        task_delegation_job_id: None,
+                        task_delegation_child_uuid: None,
+                        resolved_profile_snapshot_id: None,
+                        workspace_ref: None,
+                        auto_answer_enabled: false,
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            match db
+                .transition_agent_instance(
+                    session_id,
+                    created.agent_instance_id,
+                    created.revision,
+                    crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                    "{}",
+                    2,
+                )
+                .await
+                .unwrap()
+            {
+                crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => {
+                    agent
+                }
+                outcome => panic!("unexpected root transition: {outcome:?}"),
+            }
+        }
+    };
+    let question = proto::InterruptQuestionSet {
+        questions: vec![proto::InterruptQuestion::Single {
+            prompt: "Approve exact Monty request?".into(),
+            options: vec![proto::InterruptOption {
+                id: "approve_once".into(),
+                label: "Approve once".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        }],
+    };
+    let input = serde_json::json!({
+        "wire_input": {
+            "method": "POST",
+            "url": "https://api.example.test/v1/items?limit=2",
+            "headers": {"content-type": "application/json"},
+            "body": "{}",
+            "destination": "api.example.test",
+        },
+        "candidate_effects": [{"selection": "approve", "execute": {"wire_input": {
+            "method": "POST",
+            "url": "https://api.example.test/v1/items?limit=2",
+            "headers": {"content-type": "application/json"},
+            "body": "{}",
+            "destination": "api.example.test",
+        }}}],
+    });
+    let operation =
+        crate::agent_tree::HostApprovalOperation::new("monty_network_egress", input).unwrap();
+    let interrupt_id = db
+        .raise_interrupt_questions_with_agent_instance_and_payload(
+            session_id,
+            "builder",
+            Some(agent.agent_instance_id),
+            "Monty POST request",
+            &question,
+            None,
+        )
+        .await
+        .unwrap();
+    db.reserve_host_approval_final_operation(
+        session_id,
+        agent.agent_instance_id,
+        operation.operation_id,
+        operation.operation_kind.clone(),
+        operation.canonical_input_json.clone(),
+        operation.input_digest.clone(),
+        crate::agent_tree::HostApprovalAuthority::trusted_host().into_db(),
+        3,
+    )
+    .await
+    .unwrap();
+    crate::agent_tree::AgentTreeLifecycle::new(db.clone())
+        .request_decision_for_interrupt(
+            session_id,
+            crate::agent_tree::NewDecisionContract::user_question_interrupt(
+                agent.agent_instance_id,
+                agent.revision,
+                &question,
+                None,
+            )
+            .unwrap()
+            .with_host_approval_subject(
+                operation,
+                crate::agent_tree::HostApprovalAuthority::trusted_host(),
+            ),
+            interrupt_id,
+            3,
+        )
+        .await
+        .unwrap();
+    interrupt_id
+}
+
+#[tokio::test]
+async fn resolve_interrupt_dispatch_threads_only_the_rendering_live_attachment_permit() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    state.attached.as_mut().unwrap()._interactive_guard =
+        Some(handle.register_interactive_client());
+    let interrupt_id = seed_governed_network_interrupt(&ctx.db, session_id).await;
+    crate::sync::lock_or_recover(&state.attached.as_ref().unwrap().rendered_interrupts)
+        .insert(interrupt_id);
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let response = dispatch::handle_serialized_request(
+        Request::ResolveInterrupt {
+            interrupt_id,
+            response: proto::ResolveResponse::Single {
+                selected_id: "approve_once".into(),
+            },
+        },
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::Ack));
+    assert!(matches!(
+        work_rx.recv().await.unwrap(),
+        SessionWork::ResolveInterrupt {
+            interrupt_id: delivered,
+            governed_network_attachment: Some(_),
+            ..
+        } if delivered == interrupt_id
+    ));
+
+    let not_rendered = seed_governed_network_interrupt(&ctx.db, session_id).await;
+    let error = dispatch::handle_serialized_request(
+        Request::ResolveInterrupt {
+            interrupt_id: not_rendered,
+            response: proto::ResolveResponse::Cancel,
+        },
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+    )
+    .await
+    .expect_err("a different non-rendered governed interrupt is denied");
+    assert_eq!(error.code, ErrorCode::Authorization);
+
+    let old_rendered = state.attached.as_ref().unwrap().rendered_interrupts.clone();
+    state.attached.as_mut().unwrap()._interactive_guard = None;
+    state.attached.as_mut().unwrap()._interactive_guard =
+        Some(handle.register_interactive_client());
+    state.attached.as_mut().unwrap().rendered_interrupts = Arc::new(StdMutex::new(HashSet::new()));
+    assert!(crate::sync::lock_or_recover(&old_rendered).contains(&interrupt_id));
+    let recycled_error = dispatch::handle_serialized_request(
+        Request::ResolveInterrupt {
+            interrupt_id,
+            response: proto::ResolveResponse::Cancel,
+        },
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+    )
+    .await
+    .expect_err("a replacement attachment cannot reuse the old render identity");
+    assert_eq!(recycled_error.code, ErrorCode::Authorization);
+    assert!(work_rx.try_recv().is_err());
+}

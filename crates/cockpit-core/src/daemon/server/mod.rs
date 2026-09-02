@@ -5100,6 +5100,26 @@ struct AttachedSession {
     /// count so the loop guard reverts to headless behavior. `None` for a
     /// non-interactive attach (e.g. `cockpit run`'s event pump).
     _interactive_guard: Option<crate::daemon::session_worker::InteractiveClientGuard>,
+    /// Interrupt ids actually forwarded to this attachment. Owner-network
+    /// configuration answers are accepted only from this exact live
+    /// interactive attachment, not merely any session writer.
+    rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
+}
+
+fn mark_rendered_interrupt(rendered: &Arc<StdMutex<HashSet<Uuid>>>, event: &proto::Event) {
+    if let proto::Event::InterruptRaised { interrupt_id, .. } = event {
+        crate::sync::lock_or_recover(rendered).insert(*interrupt_id);
+    }
+}
+
+fn mark_rendered_interrupt_if_forwarded(
+    rendered: &Arc<StdMutex<HashSet<Uuid>>>,
+    event: &proto::Event,
+    forwarded: bool,
+) {
+    if forwarded {
+        mark_rendered_interrupt(rendered, event);
+    }
 }
 
 #[derive(Default)]
@@ -5180,18 +5200,18 @@ async fn run_in_process_client(
                 global = global_rx.recv() => {
                     match global {
                         Ok(envelope) => {
-                            if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
+                            if matches!(try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag), InProcessEventSend::Closed) {
                                 break 'client;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(missed = n, "in-process client global event stream lagged");
                             pending_lag.record_many(n, None);
-                            if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
+                            if matches!(try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag), InProcessEventSend::Closed) {
                                 break 'client;
                             }
                             if let Some(event) = ctx.drain_state_event()
-                                && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
+                                && matches!(try_send_in_process_event(&event_tx, event, None, &mut pending_lag), InProcessEventSend::Closed)
                             {
                                 break 'client;
                             }
@@ -5206,12 +5226,23 @@ async fn run_in_process_client(
                                 .attached
                                 .as_ref()
                                 .map(|attached| attached.handle.session_id);
-                            if !try_send_in_process_event(
+                            let event = envelope.event;
+                            let delivered = try_send_in_process_event(
                                 &event_tx,
-                                envelope.event,
+                                event.clone(),
                                 session_id,
                                 &mut pending_lag,
-                            ) {
+                            );
+                            if matches!(delivered, InProcessEventSend::Enqueued)
+                                && let Some(attached) = state.attached.as_ref()
+                            {
+                                mark_rendered_interrupt_if_forwarded(
+                                    &attached.rendered_interrupts,
+                                    &event,
+                                    true,
+                                );
+                            }
+                            if matches!(delivered, InProcessEventSend::Closed) {
                                 break 'client;
                             }
                         }
@@ -5275,12 +5306,22 @@ async fn run_in_process_client(
                             .as_ref()
                             .map(|attached| attached.handle.session_id);
                         for event in std::mem::take(&mut state.pending_replay) {
-                            if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
+                            let delivered = try_send_in_process_event(&event_tx, event.clone(), session_id, &mut pending_lag);
+                            if matches!(delivered, InProcessEventSend::Enqueued)
+                                && let Some(attached) = state.attached.as_ref()
+                            {
+                                mark_rendered_interrupt_if_forwarded(
+                                    &attached.rendered_interrupts,
+                                    &event,
+                                    true,
+                                );
+                            }
+                            if matches!(delivered, InProcessEventSend::Closed) {
                                 break 'client;
                             }
                         }
                         if let Some(event) = ctx.drain_state_event()
-                            && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
+                            && matches!(try_send_in_process_event(&event_tx, event, None, &mut pending_lag), InProcessEventSend::Closed)
                         {
                             break 'client;
                         }
@@ -5359,20 +5400,27 @@ impl PendingEventLag {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InProcessEventSend {
+    Enqueued,
+    DroppedFull,
+    Closed,
+}
+
 fn try_send_in_process_event(
     event_tx: &mpsc::Sender<proto::Event>,
     event: proto::Event,
     session_id: Option<Uuid>,
     pending_lag: &mut PendingEventLag,
-) -> bool {
+) -> InProcessEventSend {
     match event_tx.try_send(event) {
-        Ok(()) => true,
+        Ok(()) => InProcessEventSend::Enqueued,
         Err(mpsc::error::TrySendError::Full(event)) => {
             tracing::warn!(?event, "in-process client event queue full; dropping event");
             pending_lag.record_drop(session_id);
-            true
+            InProcessEventSend::DroppedFull
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(_)) => InProcessEventSend::Closed,
     }
 }
 
@@ -5602,7 +5650,11 @@ enum ClientWriterMessage {
 }
 
 enum ClientEventCommand {
-    Attach { session_id: Uuid, rx: EventReceiver },
+    Attach {
+        session_id: Uuid,
+        rx: EventReceiver,
+        rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
+    },
     Detach,
 }
 
@@ -5632,6 +5684,27 @@ async fn send_writer_envelope_with_ack(
         return false;
     }
     matches!(ack_rx.await, Ok(Ok(())))
+}
+
+async fn send_socket_event_and_mark_rendered(
+    writer_tx: &mpsc::Sender<ClientWriterMessage>,
+    rendered: Option<&Arc<StdMutex<HashSet<Uuid>>>>,
+    event: proto::Event,
+) -> bool {
+    let needs_delivery_proof = matches!(event, proto::Event::InterruptRaised { .. });
+    let envelope = Envelope::event(event.clone());
+    let sent = if needs_delivery_proof {
+        // Queue admission is not delivery: only the writer owns the actual
+        // ProtoWriteHalf::send result. Its ack also closes without success if
+        // the writer fails, is aborted during shutdown, or drops the request.
+        send_writer_envelope_with_ack(writer_tx, envelope).await
+    } else {
+        send_writer_envelope(writer_tx, envelope).await
+    };
+    if let Some(rendered) = rendered {
+        mark_rendered_interrupt_if_forwarded(rendered, &event, sent);
+    }
+    sent
 }
 
 async fn run_client_reader<R>(
@@ -5754,6 +5827,7 @@ async fn run_client_event_forwarder(
 ) {
     let mut session_event_rx: Option<EventReceiver> = None;
     let mut session_id: Option<Uuid> = None;
+    let mut rendered_interrupts: Option<Arc<StdMutex<HashSet<Uuid>>>> = None;
     loop {
         let session_branch = async {
             match session_event_rx.as_mut() {
@@ -5766,13 +5840,15 @@ async fn run_client_event_forwarder(
             biased;
             cmd = event_cmd_rx.recv() => {
                 match cmd {
-                    Some(ClientEventCommand::Attach { session_id: id, rx }) => {
+                    Some(ClientEventCommand::Attach { session_id: id, rx, rendered_interrupts: rendered }) => {
                         session_id = Some(id);
                         session_event_rx = Some(rx);
+                        rendered_interrupts = Some(rendered);
                     }
                     Some(ClientEventCommand::Detach) => {
                         session_id = None;
                         session_event_rx = None;
+                        rendered_interrupts = None;
                     }
                     None => return,
                 }
@@ -5828,7 +5904,13 @@ async fn run_client_event_forwarder(
                         // recomputes and broadcasts the global plan-status
                         // state once per interrupt event; this per-client fan-
                         // out path only forwards the interrupt itself.
-                        if !send_writer_envelope(&writer_tx, Envelope::event(event)).await {
+                        if !send_socket_event_and_mark_rendered(
+                            &writer_tx,
+                            rendered_interrupts.as_ref(),
+                            event,
+                        )
+                        .await
+                        {
                             return;
                         }
                     }
@@ -5846,6 +5928,7 @@ async fn run_client_event_forwarder(
                     Some(Err(broadcast::error::RecvError::Closed)) => {
                         session_id = None;
                         session_event_rx = None;
+                        rendered_interrupts = None;
                         let _ = executor_tx.send(ClientExecutorInput::SessionEventsClosed).await;
                     }
                     None => unreachable!("session_branch is pending when not attached"),
@@ -6110,7 +6193,11 @@ async fn handle_envelope(
                     let Some(event) = scrub_replay_event_for_principal(shared, event) else {
                         continue;
                     };
-                    if !send_writer_envelope(writer_tx, Envelope::event(event)).await {
+                    let rendered = state
+                        .attached
+                        .as_ref()
+                        .map(|attached| &attached.rendered_interrupts);
+                    if !send_socket_event_and_mark_rendered(writer_tx, rendered, event).await {
                         tracing::debug!("client disconnected during attach replay");
                         return Ok(());
                     }
@@ -6124,8 +6211,17 @@ async fn handle_envelope(
                         .as_ref()
                         .map(|attached| attached.handle.session_id);
                     if let Some(session_id) = session_id {
+                        let rendered_interrupts = state
+                            .attached
+                            .as_ref()
+                            .map(|attached| attached.rendered_interrupts.clone())
+                            .expect("attached response retains attachment state");
                         let _ = event_cmd_tx
-                            .send(ClientEventCommand::Attach { session_id, rx })
+                            .send(ClientEventCommand::Attach {
+                                session_id,
+                                rx,
+                                rendered_interrupts,
+                            })
                             .await;
                     }
                 }

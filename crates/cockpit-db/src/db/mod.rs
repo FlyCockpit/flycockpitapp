@@ -72,6 +72,7 @@ pub mod local_operation_receipts;
 pub mod locks;
 pub mod media_attachments;
 pub mod message_attachments;
+pub mod monty_network;
 pub mod needs_attention;
 #[cfg(feature = "remote")]
 pub mod org_sync;
@@ -436,6 +437,11 @@ pub struct Db {
     /// the shared permit until its tool call returns; a consent mutation takes
     /// the exclusive side before its SQLite write can commit.
     history_scope_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Process-local revocation fence for governed Monty egress. A request
+    /// retains the shared permit from its final policy read through transport
+    /// dispatch; durable policy mutations take the exclusive side before
+    /// their SQLite transaction commits.
+    monty_network_egress_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Shared side of the history-scope revocation fence.
@@ -444,6 +450,14 @@ pub struct Db {
 /// already-authorized history response. Dropping it is the disclosure
 /// linearization point, after which a pending consent revocation may commit.
 pub struct HistoryScopeDisclosurePermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+/// Shared side of the durable Monty-network revocation fence.
+///
+/// The permit is intentionally opaque. Callers retain it from their final
+/// durable-policy check through the actual transport egress boundary.
+pub struct MontyNetworkEgressPermit {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
@@ -640,6 +654,7 @@ impl Db {
             _diagnostic_lock: None,
             read_only: false,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         timer.done();
         Ok(db)
@@ -661,6 +676,7 @@ impl Db {
             _diagnostic_lock: None,
             read_only: false,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
         Ok(db)
     }
@@ -756,6 +772,7 @@ impl Db {
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+            monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -779,6 +796,16 @@ impl Db {
     pub async fn history_scope_disclosure_permit(&self) -> HistoryScopeDisclosurePermit {
         HistoryScopeDisclosurePermit {
             _guard: self.history_scope_gate.clone().read_owned().await,
+        }
+    }
+
+    /// Acquire the shared durable Monty-network egress fence. The permit must
+    /// be held from the final policy check through `RequestBuilder::send`.
+    /// `mutate_monty_network_agent_policy` takes the exclusive side before
+    /// committing any durable policy change.
+    pub async fn monty_network_egress_permit(&self) -> MontyNetworkEgressPermit {
+        MontyNetworkEgressPermit {
+            _guard: self.monty_network_egress_gate.clone().read_owned().await,
         }
     }
 

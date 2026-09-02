@@ -23,16 +23,20 @@ const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 /// Unix process-group membership recorded on a [`ProcessTreeGuard`].
 ///
 /// A numeric pgid is a recycled-identity hazard the moment the original
-/// group can empty. Signal authority is therefore one-shot, and an
-/// unattributable membership (spawned child, never bound) must never be
-/// treated as empty.
+/// group can empty. Signal authority requires a parent-owned attribution
+/// proof: the unreaped leader pin (`waitid` `WNOWAIT`). An unattributable
+/// membership (spawned child, never bound, or pin lost without a successful
+/// SIGKILL) must never be treated as empty and must never be a signal target.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnixGroup {
     /// No child has been assigned. The empty oracle is empty.
     Unbound,
     /// Leader assigned. `signaled` is true after `terminate` has sent
-    /// SIGKILL once; further `terminate` calls must not re-signal.
+    /// SIGKILL once (Ok or ESRCH); further `terminate` calls must not
+    /// re-signal. A failed signal leaves `signaled` false so a later
+    /// attempt may retry only while the unreaped leader pin holds. Losing
+    /// that pin without a successful signal forgets this identity.
     Bound { pgid: libc::pid_t, signaled: bool },
     /// A child ran (or assign failed after spawn) but this guard does not
     /// hold an attributable pgid. Never empty; never a signal target.
@@ -319,15 +323,20 @@ impl ProcessTreeGuard {
     pub fn terminate(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            // A pgid is a bare integer identity. Signal it at most once:
-            // after the original group can empty, the same number may name
-            // an unrelated process group. Re-signaling is a recycled-PID
-            // SIGKILL. Keep the bound identity so the empty oracle can
-            // still observe ESRCH; Drop/retry must not send again.
+            // A pgid is a bare integer identity. Signal it only while this
+            // process still holds the unreaped leader (`waitid` WNOWAIT pin).
+            // Ok/ESRCH consume the one-shot so a later retry cannot target a
+            // recycle; the bound identity is kept so the empty oracle can
+            // still observe ESRCH after the leader is reaped. A failed
+            // signal (EPERM: one un-signable member, the hostile-hook case)
+            // leaves the one-shot open so a later attempt may retry while
+            // that pin holds. Losing the pin without a successful signal
+            // forgets the pgid: Drop/retry must not send `kill(-pgid)`.
             let mut group = self
                 .group
                 .lock()
                 .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
+            forget_unpinned_signal_target(&mut group);
             match *group {
                 UnixGroup::Bound {
                     pgid,
@@ -378,8 +387,8 @@ impl ProcessTreeGuard {
     }
 
     /// Drop signal/query authority without claiming the group empty. Used
-    /// when settlement is Uncertain after SIGKILL: the pgid must not be
-    /// retained for a later recycled-identity kill.
+    /// when settlement is Uncertain after SIGKILL or pin-loss: the pgid
+    /// must not be retained for a later recycled-identity kill.
     #[cfg(unix)]
     pub fn release_signal_authority(&self) {
         let mut group = self
@@ -394,49 +403,51 @@ impl ProcessTreeGuard {
     /// Whether a process-group leader has been assigned to this guard.
     #[cfg(unix)]
     pub fn group_is_bound(&self) -> bool {
-        matches!(
-            *self
-                .group
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            UnixGroup::Bound { .. }
-        )
+        let mut group = self
+            .group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        forget_unpinned_signal_target(&mut group);
+        matches!(*group, UnixGroup::Bound { .. })
     }
 
     /// Whether `terminate` has already sent SIGKILL for the bound identity.
     #[cfg(unix)]
     pub fn group_terminate_signaled(&self) -> bool {
-        matches!(
-            *self
-                .group
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            UnixGroup::Bound { signaled: true, .. }
-        )
+        let mut group = self
+            .group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        forget_unpinned_signal_target(&mut group);
+        matches!(*group, UnixGroup::Bound { signaled: true, .. })
     }
 
-    /// Whether membership cannot be attributed (assign failed, or signal
-    /// authority was dropped without an empty proof).
+    /// Whether membership cannot be attributed (assign failed, pin lost
+    /// without a successful signal, or signal authority was dropped
+    /// without an empty proof).
     #[cfg(unix)]
     pub fn group_is_unattributable(&self) -> bool {
-        matches!(
-            *self
-                .group
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            UnixGroup::Unattributable
-        )
+        let mut group = self
+            .group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        forget_unpinned_signal_target(&mut group);
+        matches!(*group, UnixGroup::Unattributable)
     }
 
     /// Unix empty oracle: `kill(-pgid, 0)` while membership is bound.
     /// Unbound guards are empty. Unattributable membership is not empty.
+    /// A bound identity that has not yet been signaled is forgotten if the
+    /// leader pin is gone, so the oracle never probes a recycled pgid as a
+    /// prelude to a later `kill(-pgid, SIGKILL)`.
     #[cfg(unix)]
     pub fn group_population(&self) -> anyhow::Result<GroupPopulation> {
-        match *self
+        let mut group = self
             .group
             .lock()
-            .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?
-        {
+            .map_err(|_| anyhow::anyhow!("process tree group lock poisoned"))?;
+        forget_unpinned_signal_target(&mut group);
+        match *group {
             UnixGroup::Unbound => Ok(GroupPopulation::Empty),
             UnixGroup::Unattributable => Ok(GroupPopulation::Unattributable),
             UnixGroup::Bound { pgid, .. } => {
@@ -536,32 +547,10 @@ pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid"))?;
     loop {
-        // `siginfo_t` must not survive to the await below: on Darwin it carries
-        // an `si_addr: *mut c_void`, which would make this future non-Send and
-        // break every `#[async_trait]` caller. Confine it to this block so it is
-        // dropped before the suspension point.
-        let exited = {
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `info` points to writable initialized storage. `P_PID`
-            // restricts observation to the exact child identity, and `WNOWAIT`
-            // guarantees the observation cannot release that identity for reuse.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: waitid initialized the SIGCHLD fields in `info`; a zero
-            // PID is the specified WNOHANG result when the child has not exited.
-            let observed_pid = unsafe { info.si_pid() };
-            observed_pid != 0
-        };
-        if exited {
+        // `observe_child_exit_without_reaping` keeps `siginfo_t` off this
+        // future: on Darwin it carries an `si_addr: *mut c_void`, which would
+        // make the future non-Send and break every `#[async_trait]` caller.
+        if observe_child_exit_without_reaping(pid)? {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -571,6 +560,8 @@ pub async fn wait_for_exit_without_reaping(pid: u32) -> std::io::Result<()> {
 #[cfg(unix)]
 impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
+        // `terminate` refuses to signal without a leader pin, so Drop cannot
+        // SIGKILL a recycled pgid after the caller has already reaped.
         let _ = self.terminate();
         self.release_group();
     }
@@ -746,8 +737,20 @@ fn unix_group_signal_target(pgid: i32) -> i32 {
     -pgid
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_GROUP_SIGNAL_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(unix)]
 fn signal_group(pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let errno = TEST_GROUP_SIGNAL_ERRNO.with(|cell| cell.replace(0));
+        if errno != 0 {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+    }
     // SAFETY: `libc::kill` with a negative pid signals the process
     // group; passing a valid pgid (== the leader pid, since callers set
     // `process_group(0)`) is sound.
@@ -762,6 +765,67 @@ fn signal_group(pgid: i32, sig: libc::c_int) -> std::io::Result<()> {
 #[cfg(unix)]
 fn is_esrch(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Parent-owned proof that `pid` still names this process's unreaped child.
+///
+/// `waitid(P_PID, ..., WNOWAIT)` succeeds only for our child; a recycled
+/// PID at the same number is `ECHILD`. `Ok(true)` means the child has
+/// exited and is still a zombie (pin holds). `Ok(false)` means it is still
+/// running (pin holds). `Err` means the identity is no longer ours.
+#[cfg(unix)]
+fn observe_child_exit_without_reaping(pid: libc::pid_t) -> std::io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` points to writable initialized storage. `P_PID`
+        // restricts observation to the exact child identity, and `WNOWAIT`
+        // guarantees the observation cannot release that identity for reuse.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid initialized the SIGCHLD fields in `info`; a zero
+        // PID is the specified WNOHANG result when the child has not exited.
+        let observed_pid = unsafe { info.si_pid() };
+        return Ok(observed_pid != 0);
+    }
+}
+
+/// Whether the bound leader PID is still this process's unreaped child.
+/// That parent relationship is the only attribution proof a numeric pgid
+/// can hold: `kill(-pgid, 0)` after a gap cannot distinguish our group
+/// from a recycled one.
+#[cfg(unix)]
+fn leader_pin_holds(pgid: libc::pid_t) -> bool {
+    observe_child_exit_without_reaping(pgid).is_ok()
+}
+
+/// Forget a bound pgid that can no longer be attributed. A successful
+/// SIGKILL keeps the identity so the empty oracle can still observe ESRCH
+/// after the leader is reaped; an unsignaled identity without a pin must
+/// not remain a signal target.
+#[cfg(unix)]
+fn forget_unpinned_signal_target(group: &mut UnixGroup) {
+    match *group {
+        UnixGroup::Bound {
+            pgid,
+            signaled: false,
+        } if !leader_pin_holds(pgid) => {
+            *group = UnixGroup::Unattributable;
+        }
+        _ => {}
+    }
 }
 
 #[cfg(unix)]
@@ -1265,6 +1329,143 @@ mod tests {
             .terminate()
             .expect("unattributable terminate is a no-op");
         let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    fn inject_next_group_signal_errno(errno: i32) {
+        TEST_GROUP_SIGNAL_ERRNO.with(|cell| cell.set(errno));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_without_signal_forgets_pgid_and_does_not_re_signal() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        guard.assign(&child).expect("bind");
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert_eq!(
+            guard.group_population().expect("population"),
+            GroupPopulation::Unattributable,
+            "reaping the leader without SIGKILL must forget the pgid"
+        );
+        assert!(guard.group_is_unattributable());
+        assert!(!guard.group_is_bound());
+        guard
+            .terminate()
+            .expect("unpinned identity must not be signaled");
+        assert!(
+            !guard.group_terminate_signaled(),
+            "forgotten identity must not consume a one-shot against a recycled pgid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_signal_retries_while_leader_pin_holds() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        guard.assign(&child).expect("bind");
+        inject_next_group_signal_errno(libc::EPERM);
+        assert!(
+            guard.terminate().is_err(),
+            "EPERM must not be treated as a successful one-shot"
+        );
+        assert!(
+            !guard.group_terminate_signaled(),
+            "failed SIGKILL must leave the one-shot open while the pin holds"
+        );
+        assert!(guard.group_is_bound());
+        guard
+            .terminate()
+            .expect("retry is allowed while the unreaped leader pins the pgid");
+        assert!(guard.group_terminate_signaled());
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_signal_then_reap_forgets_pgid() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        guard.assign(&child).expect("bind");
+        inject_next_group_signal_errno(libc::EPERM);
+        assert!(guard.terminate().is_err());
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert_eq!(
+            guard.group_population().expect("population"),
+            GroupPopulation::Unattributable,
+            "EPERM then reap must not keep a stale pgid for the next drain retry"
+        );
+        guard
+            .terminate()
+            .expect("pin-loss after failed signal must not SIGKILL a recycled pgid");
+        assert!(!guard.group_is_bound());
+        assert!(!guard.group_terminate_signaled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_signal_empty_oracle_survives_leader_reap() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let guard = ProcessTreeGuard::allocate().expect("allocate");
+        guard.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        guard.assign(&child).expect("bind");
+        guard.terminate().expect("SIGKILL");
+        let _ = child.wait().await;
+        let mut empty = false;
+        for _ in 0..50 {
+            match guard.group_population().expect("population") {
+                GroupPopulation::Empty => {
+                    empty = true;
+                    break;
+                }
+                GroupPopulation::Populated => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                GroupPopulation::Unattributable => {
+                    panic!("successful SIGKILL must keep the identity for the empty oracle")
+                }
+            }
+        }
+        assert!(empty, "SIGKILL plus reap must drain the process group");
+        assert!(guard.group_terminate_signaled());
     }
 
     #[cfg(unix)]

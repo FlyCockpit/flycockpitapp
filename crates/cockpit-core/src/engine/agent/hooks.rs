@@ -1298,17 +1298,18 @@ async fn spawn_real_hook_child(
         let wait_fut = async {
             // Unix: observe exit without reaping so the leader PID still pins
             // the process-group identity while terminate SIGKILLs the group.
-            // Reap only afterward. Windows Job handles are kernel objects and
-            // do not have this recycled-identity constraint.
+            // Terminate while that pin is held, even if observation fails: a
+            // failed waitid is not permission to reap-then-signal. Reap only
+            // afterward. Windows Job handles are kernel objects and do not
+            // have this recycled-identity constraint. The guard itself also
+            // refuses to signal a Unix pgid without the pin.
             #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                if cockpit_host::process::wait_for_exit_without_reaping(pid)
-                    .await
-                    .is_ok()
-                {
-                    if let Some(tree) = tree {
-                        let _ = tree.terminate();
-                    }
+            {
+                if let Some(pid) = child.id() {
+                    let _ = cockpit_host::process::wait_for_exit_without_reaping(pid).await;
+                }
+                if let Some(tree) = tree {
+                    let _ = tree.terminate();
                 }
             }
             child.wait().await

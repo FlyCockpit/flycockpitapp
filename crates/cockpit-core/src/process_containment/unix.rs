@@ -12,11 +12,14 @@
 //! the same `Proven` label and is the mandated [`ProcessTreeGuard`] ceiling,
 //! not a fabricated heuristic oracle.
 //!
-//! A pgid is a bare integer identity. Signal authority ends at settlement:
-//! `terminate` is one-shot, `ProvenEmpty` reclaims the live guard, and
-//! `Uncertain` after SIGKILL (or a failed bind) forgets the pgid so a later
-//! retry cannot SIGKILL a recycled process group. Adapter memory is the live
-//! map of in-flight leases only.
+//! A pgid is a bare integer identity. Signal authority requires a
+//! parent-owned leader pin (`waitid` WNOWAIT). `terminate` is one-shot after
+//! Ok/ESRCH; a failed signal may retry only while that pin holds. Losing the
+//! pin without a successful SIGKILL forgets the pgid (Unattributable).
+//! `ProvenEmpty` reclaims the live guard, and `Uncertain` after SIGKILL, a
+//! failed bind, or pin-loss forgets the pgid so a later retry cannot SIGKILL
+//! a recycled process group. Adapter memory is the live map of in-flight
+//! leases only.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -375,10 +378,11 @@ impl ContainmentAdapter for UnixProcessTreeAdapter {
             EmptyOutcome::Uncertain { .. } => {
                 #[cfg(unix)]
                 {
-                    // Probe Uncertain (still populated, never SIGKILL'd) keeps
-                    // the live guard so a later terminate can still kill.
-                    // Settlement Uncertain after SIGKILL or a failed bind
-                    // drops pgid authority so retries cannot target a recycle.
+                    // Probe Uncertain (still populated, never SIGKILL'd, leader
+                    // pin held) keeps the live guard so a later terminate can
+                    // still kill. Settlement Uncertain after SIGKILL, a failed
+                    // bind, or pin-loss without a successful signal drops pgid
+                    // authority so retries cannot target a recycle.
                     let drop_authority = {
                         let live = self.live.lock().unwrap();
                         live.get(&handle.key)
@@ -646,6 +650,66 @@ mod unix_settlement_invariants {
         );
         let _ = child.start_kill();
         let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn reap_without_signal_settles_uncertain_and_drops_authority() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated guard");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        tree.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn into the lease group");
+        tree.assign(&child).expect("bind");
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::Uncertain { generation, reason } => {
+                assert_eq!(generation, 1);
+                assert_eq!(reason, PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE);
+            }
+            o => panic!("pin-loss without SIGKILL must not probe a recycled pgid: {o:?}"),
+        }
+        assert_eq!(
+            adapter.live_group_count(),
+            0,
+            "pin-loss without signal must drop signal authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_signal_then_reap_can_still_prove_empty() {
+        let adapter = native_adapter();
+        let allocated = adapter.create_and_spawn(sleeper_request(1)).await.unwrap();
+        let tree = adapter
+            .process_tree_guard(&allocated.handle)
+            .expect("allocated guard");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        tree.apply_spawn_flags(&mut command);
+        let mut child = command.spawn().expect("spawn into the lease group");
+        tree.assign(&child).expect("bind");
+        adapter
+            .terminate(&allocated.handle, 1)
+            .await
+            .expect("SIGKILL");
+        let _ = child.wait().await;
+        match adapter.await_empty(&allocated.handle, 1).await.unwrap() {
+            EmptyOutcome::ProvenEmpty { generation } => assert_eq!(generation, 1),
+            o => panic!("successful SIGKILL must still settle empty after reap: {o:?}"),
+        }
+        assert_eq!(adapter.live_group_count(), 0);
     }
 
     #[tokio::test]

@@ -377,15 +377,26 @@ fn vnext_conversational_model_resolves_through_slot_resolution() {
         ],
         "verification intercept",
     );
-    let generate = file_source(&repo_src().join("engine/verification/generate.rs"));
+    let generate = production_source(&repo_src().join("engine/verification/generate.rs"));
     require_contains(
         &generate,
         &[
             "input.profile_snapshot_id.is_nil()",
-            "input.agent.model.clone()",
+            "input.author_model.clone()",
             "resolve_profile_utility_model",
         ],
         "verification generate",
+    );
+    assert!(
+        !generate.contains("Agent") && !generate.contains("input.agent"),
+        "candidate collection must not regain the raw author Agent capability"
+    );
+
+    let context_callers = collect_symbol_files(&repo_src(), "EffectiveGeneratorContext::new(");
+    assert_eq!(
+        context_callers,
+        vec!["engine/verification/intercept.rs".to_string()],
+        "effective generator custody must be minted only at the intercept seam, found {context_callers:?}"
     );
 
     let slot_callers = collect_symbol_files(&repo_src(), "resolve_vnext_slot_model(");

@@ -123,6 +123,7 @@ impl Model {
             secret_lookup,
             store,
         )
+        .map(|model| model.with_cache_configuration_generation(cfg.resolution_generation))
     }
     /// Build a `Model` from a `"provider:model-id"` reference, erroring on
     /// a missing colon. Thin wrapper over [`Self::for_provider`] for the
@@ -297,6 +298,7 @@ impl Model {
             secret_lookup,
             store,
         )
+        .map(|model| model.with_cache_configuration_generation(cfg.resolution_generation))
     }
 }
 
@@ -672,6 +674,7 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         model: completion,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        cache_configuration_generation: 0,
         #[cfg(not(test))]
         command_credential_generation: resolved.command_credential_generation,
         max_tokens,
@@ -816,6 +819,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         model: chatgpt::ResponsesCompletionModel::new(client, model_id).with_strict_tools(),
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        cache_configuration_generation: 0,
         #[cfg(not(test))]
         command_credential_generation: resolved.command_credential_generation,
         utility_token_limit,
@@ -1026,6 +1030,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         client,
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
+        cache_configuration_generation: 0,
         #[cfg(not(test))]
         command_credential_generation: resolved.command_credential_generation,
         utility_token_limit,

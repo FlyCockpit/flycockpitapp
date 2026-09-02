@@ -35,6 +35,11 @@ const AV_TOOL_CANCEL_GRACE: Duration = Duration::from_secs(30);
 /// production registrations.
 const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("add-package"),
+    // The parent-facing tool is intercepted by `tool_dispatch` and runs the
+    // trusted child through the nested noninteractive driver. The child uses
+    // this dispatcher for each tool call, while `PendingAcquisitionGuard`
+    // owns reservation/audit cleanup if the coordinator future is dropped.
+    ToolTimeoutSafety::nested_dispatch_or_owned_transport("acquire_sealed_value"),
     ToolTimeoutSafety::honors_cancel("bash"),
     ToolTimeoutSafety::abandon_safe("cancel_image_generation_job"),
     ToolTimeoutSafety::abandon_safe("change_impact"),
@@ -86,6 +91,9 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("read_image"),
     ToolTimeoutSafety::abandon_safe("ask_image"),
     ToolTimeoutSafety::abandon_safe("return"),
+    // This is a thin wrapper around `BashTool` using the same `ToolCtx` and
+    // cancellation token. It forwards Bash's process-tree cleanup contract.
+    ToolTimeoutSafety::honors_cancel("run_acquisition_command"),
     ToolTimeoutSafety::abandon_safe("schedule"),
     ToolTimeoutSafety::abandon_safe("search"),
     ToolTimeoutSafety::abandon_safe("seed"),
@@ -1310,6 +1318,13 @@ mod tests {
             TimedTestTool::new("bash", None, Arc::new(AtomicUsize::new(0))).with_honors_cancel();
         assert_eq!(
             policy.cancel_grace(&ordinary),
+            Some(TOOL_ABANDON_HOOK_TIMEOUT)
+        );
+
+        let acquisition_command =
+            crate::tools::trusted_child_acquisition::RunAcquisitionCommandTool;
+        assert_eq!(
+            policy.cancel_grace(&acquisition_command),
             Some(TOOL_ABANDON_HOOK_TIMEOUT)
         );
     }

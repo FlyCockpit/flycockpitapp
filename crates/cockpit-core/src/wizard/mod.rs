@@ -535,20 +535,12 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 write: None,
                 branch: None,
             },
-            StepDescriptor {
-                id: "profile-save",
-                prompt: "Continue to provider setup",
-                help: "The profile is written atomically at this step.",
-                help_hook: None,
-                kind: StepKind::Action {
-                    progress: "Saving your profile…",
-                },
-                default_answer: None,
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: None,
-            },
+            action_step(
+                "profile-save",
+                "Continue to provider setup",
+                "Saving your profile…",
+                None,
+            ),
         ],
     }
 }
@@ -1070,9 +1062,10 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_auth_branch),
             },
             action_step(
-                ProviderWizardStep::Headers,
+                ProviderWizardStep::Headers.source_id(),
                 "Advanced: edit HTTP headers",
                 "Editing provider headers…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::AuthMethod.source_id(),
@@ -1136,24 +1129,28 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(action_to_saving),
             },
             action_step(
-                ProviderWizardStep::CopilotAuth,
+                ProviderWizardStep::CopilotAuth.source_id(),
                 "Configure GitHub authentication",
                 "Configuring GitHub authentication…",
+                Some(action_to_saving),
             ),
             action_step(
-                ProviderWizardStep::GrokOAuth,
+                ProviderWizardStep::GrokOAuth.source_id(),
                 "Sign in to Grok",
                 "Waiting for browser authorization…",
+                Some(action_to_saving),
             ),
             action_step(
-                ProviderWizardStep::CodexOAuth,
+                ProviderWizardStep::CodexOAuth.source_id(),
                 "Sign in to Codex",
                 "Waiting for device authorization…",
+                Some(action_to_saving),
             ),
             action_step(
-                ProviderWizardStep::CopyDetectedEnv,
+                ProviderWizardStep::CopyDetectedEnv.source_id(),
                 "Copy detected environment credential",
                 "Copying detected credential into Cockpit's encrypted vault…",
+                Some(action_to_saving),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Saving.source_id(),
@@ -1170,14 +1167,16 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_after_save_branch),
             },
             action_step(
-                ProviderWizardStep::TestKey,
+                ProviderWizardStep::TestKey.source_id(),
                 "Test key",
                 "Testing provider credentials…",
+                Some(fetching_to_done),
             ),
             action_step(
-                ProviderWizardStep::Fetching,
+                ProviderWizardStep::Fetching.source_id(),
                 "Fetch models",
                 "Fetching /models…",
+                Some(fetching_to_done),
             ),
             StepDescriptor {
                 id: ProviderWizardStep::Done.source_id(),
@@ -1591,16 +1590,18 @@ fn thinking_mode_id(mode: crate::config::providers::ThinkingMode) -> &'static st
     }
 }
 
-/// Provider-wizard action that advances to `saving`, except `Fetching` /
-/// `TestKey` which finish at `done`. Terminal save actions (`profile-save`,
-/// `security-save`, `model-save`) must be last-step descriptors with no branch.
+/// Shared action-step constructor. Provider-wizard actions pass an explicit
+/// branch (`saving` or `done`). Terminal save actions (`profile-save`,
+/// `security-save`, `model-save`) must pass `None` so they finish the wizard
+/// instead of branching into the provider `saving` step.
 fn action_step(
-    step: ProviderWizardStep,
+    id: &'static str,
     prompt: &'static str,
     progress: &'static str,
+    branch: Option<BranchHook>,
 ) -> StepDescriptor {
     StepDescriptor {
-        id: step.source_id(),
+        id,
         prompt,
         help: progress,
         help_hook: None,
@@ -1609,10 +1610,7 @@ fn action_step(
         prefill: None,
         validate: None,
         write: None,
-        branch: Some(match step {
-            ProviderWizardStep::Fetching | ProviderWizardStep::TestKey => fetching_to_done,
-            _ => action_to_saving,
-        }),
+        branch,
     }
 }
 
@@ -2314,6 +2312,36 @@ mod tests {
         assert_eq!(
             model_ref_answer(&run),
             Some(("openai".into(), "manual-model-id".into()))
+        );
+    }
+
+    /// Terminal profile-save must finish the wizard. Branching to a
+    /// provider-wizard `saving` step is a hard submit error and stalls
+    /// first-run at AwaitProfile.
+    #[test]
+    fn onboarding_profile_save_completes_without_saving_step() {
+        let mut live = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        live.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        assert_eq!(live.current_step_id(), Some("profile-save"));
+        live.submit(WizardAnswer::Acknowledged)
+            .expect("profile-save is a terminal action");
+        assert!(live.is_complete());
+        assert_eq!(onboarding_name_answer(&live).as_deref(), Some("Ada"));
+
+        let mut client = WizardRun::new(onboarding_profile_descriptor()).unwrap();
+        client.submit(WizardAnswer::Text("Ada".into())).unwrap();
+        let json = client.answers_json().unwrap();
+        assert!(
+            !json.contains("profile-save"),
+            "the client acknowledges the save only after the daemon reply: {json}"
+        );
+
+        let reconstructed = WizardRun::from_answers_json(onboarding_profile_descriptor(), &json)
+            .expect("daemon reconstruction infers the terminal save acknowledgement");
+        assert!(reconstructed.is_complete());
+        assert_eq!(
+            onboarding_name_answer(&reconstructed).as_deref(),
+            Some("Ada")
         );
     }
 

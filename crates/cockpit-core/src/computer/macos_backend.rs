@@ -1,0 +1,996 @@
+//! macOS physical-desktop capture and CGEvent input backend.
+//!
+//! Perception remains pixel-based. Accessibility is queried separately by the
+//! target-evidence adapter and is never used to choose action coordinates.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use objc2_core_foundation::CGPoint;
+use objc2_core_graphics::{
+    CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent, CGEventField, CGEventFlags,
+    CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMainDisplayID,
+    CGMouseButton, CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess, CGScrollEventUnit,
+};
+
+use super::{
+    CaptureFrame, ComputerActionOutcome, ComputerBackend, ComputerError, DisplayGeometry,
+    DisplayTarget, Easing, Modifiers, MouseButton, NormalizedComputerAction,
+    NormalizedComputerEffect, PixelPoint, PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor,
+    click_repetitions, eased_progress, scale_png,
+};
+use crate::computer::target::BackendKind;
+
+const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
+const MOVE_STEPS: u32 = 12;
+const HOST_INPUT_AUTHORITY: &str = "/Users/Shared/.flycockpit-input-authority-v1.json";
+
+/// Physical macOS desktop backend. Construction performs both TCC preflights;
+/// it never opens a usable backend when Screen Recording or Accessibility /
+/// Input Monitoring access is absent.
+pub(super) struct MacOsComputerBackend {
+    source: objc2_core_foundation::CFRetained<CGEventSource>,
+    geometry: DisplayGeometry,
+    active_console_session: super::platform::MacActiveConsoleSession,
+    outstanding_keys: HashSet<u16>,
+    outstanding_buttons: HashSet<MouseButton>,
+    physical_capability: Option<super::coordinator::PhysicalDispatchCapability>,
+    input_authority: MacHostInputAuthority,
+}
+
+// CoreGraphics' immutable event source is safe to retain behind the backend's
+// unique `&mut self` dispatch seam. objc2 conservatively does not mark every CF
+// wrapper Send/Sync, while the native CGEventSourceRef is thread-safe.
+unsafe impl Send for MacOsComputerBackend {}
+unsafe impl Sync for MacOsComputerBackend {}
+
+#[cfg(not(test))]
+impl super::backend_seal::Sealed for MacOsComputerBackend {}
+
+impl MacOsComputerBackend {
+    pub(super) fn construct(
+        target: DisplayTarget,
+        grant_store: Option<&RealDesktopGrantStore>,
+    ) -> Result<Self, ComputerError> {
+        if target != DisplayTarget::RealDesktop {
+            return Err(ComputerError::UnsupportedPlatform {
+                platform: "macos-virtual-display".to_string(),
+            });
+        }
+        if !grant_store.is_some_and(RealDesktopGrantStore::has_current_machine_grant) {
+            return Err(ComputerError::RealDesktopGrantMissing);
+        }
+        if !Path::new(SCREENCAPTURE).is_file() {
+            return Err(ComputerError::MissingTool {
+                tool: SCREENCAPTURE.to_string(),
+                install_hint: "the system macOS screencapture utility".to_string(),
+            });
+        }
+        if !CGPreflightScreenCaptureAccess() {
+            return Err(permission_error("Screen Recording"));
+        }
+        if !CGPreflightPostEventAccess() {
+            return Err(permission_error("Accessibility or Input Monitoring"));
+        }
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok_or_else(|| {
+            ComputerError::CommandFailed {
+                program: "CGEventSourceCreate".to_string(),
+                detail: "CoreGraphics returned null".to_string(),
+            }
+        })?;
+        let active_console_session =
+            super::platform::MacActiveConsoleSession::capture().map_err(|_| {
+                ComputerError::Refused(
+                    "a stable active macOS console session is required".to_string(),
+                )
+            })?;
+        let input_authority = MacHostInputAuthority::open(&active_console_session)?;
+        Ok(Self {
+            source,
+            geometry: query_geometry()?,
+            active_console_session,
+            physical_capability: None,
+            outstanding_keys: input_authority.state.keys.iter().copied().collect(),
+            outstanding_buttons: input_authority.state.buttons.iter().copied().collect(),
+            input_authority,
+        })
+    }
+
+    fn capture_png(&self, region: Option<PixelRect>) -> Result<Vec<u8>, ComputerError> {
+        let mut command = Command::new(SCREENCAPTURE);
+        command.args(["-x", "-t", "png"]);
+        if let Some(region) = region {
+            let scale = self.geometry.scale_factor.0;
+            command.arg(format!(
+                "-R{},{},{},{}",
+                (f64::from(region.x) / scale).round() as u32,
+                (f64::from(region.y) / scale).round() as u32,
+                (f64::from(region.width) / scale).round() as u32,
+                (f64::from(region.height) / scale).round() as u32,
+            ));
+        } else {
+            // Keep the backend geometry and capture surface identical: the
+            // main physical display, not a changing multi-file screen set.
+            command.arg("-m");
+        }
+        let output = command
+            .arg("-")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| command_error("screencapture", error))?;
+        if !output.status.success() {
+            return Err(ComputerError::CommandFailed {
+                program: "screencapture".to_string(),
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        if !output.stdout.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(ComputerError::CommandFailed {
+                program: "screencapture".to_string(),
+                detail: "capture did not return a PNG".to_string(),
+            });
+        }
+        Ok(output.stdout)
+    }
+
+    fn post_mouse(
+        &mut self,
+        event_type: CGEventType,
+        button: MouseButton,
+        point: CGPoint,
+        flags: CGEventFlags,
+        click_state: i64,
+    ) -> Result<(), ComputerError> {
+        let event =
+            CGEvent::new_mouse_event(Some(&self.source), event_type, point, cg_button(button))
+                .ok_or_else(|| cg_null("CGEventCreateMouseEvent"))?;
+        CGEvent::set_flags(Some(&event), flags);
+        if click_state > 0 {
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::MouseEventClickState,
+                click_state,
+            );
+        }
+        self.post_event(
+            &event,
+            match event_type {
+                CGEventType::LeftMouseDown
+                | CGEventType::RightMouseDown
+                | CGEventType::OtherMouseDown => Some(InputTransition::ButtonDown(button)),
+                CGEventType::LeftMouseUp
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseUp => Some(InputTransition::ButtonUp(button)),
+                _ => None,
+            },
+        )
+    }
+
+    fn cursor(&self) -> Result<CGPoint, ComputerError> {
+        let event = CGEvent::new(Some(&self.source)).ok_or_else(|| cg_null("CGEventCreate"))?;
+        Ok(CGEvent::location(Some(&event)))
+    }
+
+    fn move_cursor(
+        &mut self,
+        target: PixelPoint,
+        duration: Duration,
+        easing: Easing,
+        drag_button: Option<MouseButton>,
+    ) -> Result<(), ComputerError> {
+        let scale = self.geometry.scale_factor.0;
+        let target = CGPoint::new(f64::from(target.x) / scale, f64::from(target.y) / scale);
+        let start = self.cursor()?;
+        let steps = if duration.is_zero() { 1 } else { MOVE_STEPS };
+        let delay = duration / steps;
+        for step in 1..=steps {
+            let progress = eased_progress(f64::from(step) / f64::from(steps), easing);
+            let point = CGPoint::new(
+                start.x + (target.x - start.x) * progress,
+                start.y + (target.y - start.y) * progress,
+            );
+            let event_type = drag_button.map_or(CGEventType::MouseMoved, drag_event_type);
+            self.post_mouse(
+                event_type,
+                drag_button.unwrap_or(MouseButton::Left),
+                point,
+                CGEventFlags::empty(),
+                0,
+            )?;
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
+        Ok(())
+    }
+
+    fn post_key(
+        &mut self,
+        code: u16,
+        down: bool,
+        flags: CGEventFlags,
+    ) -> Result<(), ComputerError> {
+        let event = CGEvent::new_keyboard_event(Some(&self.source), code, down)
+            .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
+        CGEvent::set_flags(Some(&event), flags);
+        self.post_event(
+            &event,
+            Some(if down {
+                InputTransition::KeyDown(code)
+            } else {
+                InputTransition::KeyUp(code)
+            }),
+        )
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), ComputerError> {
+        // CoreGraphics accepts UTF-16 payloads. Chunking avoids undocumented
+        // event-size limits while preserving surrogate pairs.
+        for chunk in utf16_chunks(text) {
+            let down = CGEvent::new_keyboard_event(Some(&self.source), 0, true)
+                .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
+            // SAFETY: `chunk` is alive for the call and supplies exactly len
+            // initialized UniChar values.
+            unsafe {
+                CGEvent::keyboard_set_unicode_string(Some(&down), chunk.len(), chunk.as_ptr());
+            }
+            self.post_event(&down, Some(InputTransition::KeyDown(0)))?;
+            let up = CGEvent::new_keyboard_event(Some(&self.source), 0, false)
+                .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
+            self.post_event(&up, Some(InputTransition::KeyUp(0)))?;
+        }
+        Ok(())
+    }
+
+    fn execute_action(
+        &mut self,
+        action: &NormalizedComputerAction,
+    ) -> Result<ComputerActionOutcome, ComputerError> {
+        match action.effect() {
+            NormalizedComputerEffect::CaptureFull => {
+                Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                    png: self.capture_png(None)?,
+                    geometry: self.geometry.clone(),
+                    region: None,
+                    native_zoom: None,
+                }))
+            }
+            NormalizedComputerEffect::CaptureRegion { rect } => {
+                Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                    png: self.capture_png(Some(*rect))?,
+                    geometry: self.geometry.clone(),
+                    region: Some(*rect),
+                    native_zoom: None,
+                }))
+            }
+            NormalizedComputerEffect::CaptureNativeZoom {
+                rect,
+                scale,
+                output,
+            } => Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                png: scale_png(self.capture_png(Some(*rect))?, *output)?,
+                geometry: self.geometry.clone(),
+                region: Some(*rect),
+                native_zoom: Some(*scale),
+            })),
+            NormalizedComputerEffect::MoveCursor {
+                to,
+                duration,
+                easing,
+            } => {
+                self.move_cursor(*to, *duration, *easing, None)?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::Click {
+                button,
+                count,
+                modifiers,
+            } => {
+                let point = self.cursor()?;
+                let flags = modifier_flags(*modifiers);
+                for click in 1..=click_repetitions(*count) {
+                    self.post_mouse(
+                        mouse_down_type(*button),
+                        *button,
+                        point,
+                        flags,
+                        i64::from(click),
+                    )?;
+                    self.post_mouse(
+                        mouse_up_type(*button),
+                        *button,
+                        point,
+                        flags,
+                        i64::from(click),
+                    )?;
+                }
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::MouseDown { button } => {
+                self.post_mouse(
+                    mouse_down_type(*button),
+                    *button,
+                    self.cursor()?,
+                    CGEventFlags::empty(),
+                    1,
+                )?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::MouseUp { button } => {
+                self.post_mouse(
+                    mouse_up_type(*button),
+                    *button,
+                    self.cursor()?,
+                    CGEventFlags::empty(),
+                    1,
+                )?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::Drag {
+                button,
+                path,
+                modifiers,
+            } => {
+                let first = path[0];
+                self.move_cursor(first.point, first.duration, first.easing, None)?;
+                let flags = modifier_flags(*modifiers);
+                self.post_mouse(mouse_down_type(*button), *button, self.cursor()?, flags, 1)?;
+                for step in path.iter().skip(1) {
+                    self.move_cursor(step.point, step.duration, step.easing, Some(*button))?;
+                }
+                self.post_mouse(mouse_up_type(*button), *button, self.cursor()?, flags, 1)?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::TypeText { text } => {
+                self.type_text(text)?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::KeyChord { chord } => {
+                let mut codes = Vec::with_capacity(chord.keys().len());
+                for key in chord.keys() {
+                    codes.push(key.macos_key_code().ok_or_else(|| {
+                        ComputerError::Refused("unsupported macOS key identity".to_string())
+                    })?);
+                }
+                let flags = flags_for_macos_key_codes(&codes);
+                for code in &codes {
+                    self.post_key(*code, true, flags)?;
+                }
+                for code in codes.iter().rev() {
+                    self.post_key(*code, false, flags)?;
+                }
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::HoldKey { key, duration } => {
+                let code = key.macos_key_code().ok_or_else(|| {
+                    ComputerError::Refused("unsupported macOS key identity".to_string())
+                })?;
+                self.post_key(code, true, flags_for_macos_key_codes(&[code]))?;
+                std::thread::sleep(*duration);
+                self.post_key(code, false, CGEventFlags::empty())?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::Scroll {
+                delta_x,
+                delta_y,
+                modifiers,
+            } => {
+                let event = CGEvent::new_scroll_wheel_event2(
+                    Some(&self.source),
+                    CGScrollEventUnit::Pixel,
+                    2,
+                    -*delta_y,
+                    -*delta_x,
+                    0,
+                )
+                .ok_or_else(|| cg_null("CGEventCreateScrollWheelEvent2"))?;
+                CGEvent::set_flags(Some(&event), modifier_flags(*modifiers));
+                self.post_event(&event, None)?;
+                Ok(ComputerActionOutcome::Completed)
+            }
+            NormalizedComputerEffect::Wait { duration } => {
+                std::thread::sleep(*duration);
+                Ok(ComputerActionOutcome::Waited(*duration))
+            }
+        }
+    }
+
+    /// Sole irreversible CoreGraphics post primitive. Every event, including
+    /// cleanup releases and later-added scroll/Unicode paths, must pass the
+    /// retained active-console-session rebound immediately before posting.
+    fn post_event(
+        &mut self,
+        event: &CGEvent,
+        transition: Option<InputTransition>,
+    ) -> Result<(), ComputerError> {
+        let prepared = transition
+            .map(|transition| self.input_authority.prepare(transition))
+            .transpose()?;
+
+        // `prepare` is the final blocking pre-post operation: it durably marks
+        // ownership uncertain before a down/up transition can reach the host.
+        // Rebind both retained identities after that write, at the last
+        // reversible boundary. Do not insert fallible or blocking work between
+        // these checks and the irreversible post.
+        if self.active_console_session.recheck().is_err() {
+            return self.rollback_known_pre_post_refusal(
+                prepared,
+                ComputerError::Refused(
+                    "macOS active console session changed before CGEvent post".to_string(),
+                ),
+            );
+        }
+        let capability_check = match self.physical_capability.as_ref() {
+            Some(capability) => capability.recheck(BackendKind::RealDesktopMacOs),
+            None => Err(ComputerError::Refused(
+                "macOS physical backend is not coordinator-bound".into(),
+            )),
+        };
+        if let Err(error) = capability_check {
+            return self.rollback_known_pre_post_refusal(prepared, error);
+        }
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+
+        // From the post onward this backend owns the transition even if the
+        // commit write fails. Update process-local cleanup ownership first;
+        // a failed commit deliberately leaves the durable record pending so a
+        // later process cannot guess whether the event reached the host.
+        match transition {
+            Some(InputTransition::KeyDown(code)) => {
+                self.outstanding_keys.insert(code);
+            }
+            Some(InputTransition::KeyUp(code)) => {
+                self.outstanding_keys.remove(&code);
+            }
+            Some(InputTransition::ButtonDown(button)) => {
+                self.outstanding_buttons.insert(button);
+            }
+            Some(InputTransition::ButtonUp(button)) => {
+                self.outstanding_buttons.remove(&button);
+            }
+            None => {}
+        }
+        if transition.is_some() {
+            self.input_authority
+                .commit(&self.outstanding_keys, &self.outstanding_buttons)?;
+        }
+        Ok(())
+    }
+
+    /// A refusal before the raw post is a known non-effect. Restore the exact
+    /// authority snapshot that existed before `prepare`; only failures after
+    /// the post (or a failed rollback write) remain fail-closed as ambiguous.
+    fn rollback_known_pre_post_refusal(
+        &mut self,
+        prepared: Option<MacHostInputState>,
+        refusal: ComputerError,
+    ) -> Result<(), ComputerError> {
+        if let Some(previous) = prepared {
+            self.input_authority
+                .rollback(previous)
+                .map_err(|rollback| {
+                    ComputerError::Refused(format!(
+                        "{refusal}; exact pre-post authority rollback failed: {rollback}"
+                    ))
+                })?;
+        }
+        Err(refusal)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InputTransition {
+    KeyDown(u16),
+    KeyUp(u16),
+    ButtonDown(MouseButton),
+    ButtonUp(MouseButton),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MacHostInputState {
+    version: u32,
+    owner_uid: u32,
+    console_set: u32,
+    audit_session_id: u32,
+    pending: bool,
+    keys: Vec<u16>,
+    buttons: Vec<MouseButton>,
+}
+
+/// Protected host-wide authority for exact Cockpit-owned down transitions.
+/// The first active user exclusively creates this file beneath a root-owned
+/// sticky directory with mode 0600. If another login user, a crash-torn
+/// transition, malformed data, or missing authority makes ownership
+/// unknowable, physical construction fails closed.
+#[derive(Debug)]
+struct MacHostInputAuthority {
+    path: PathBuf,
+    state: MacHostInputState,
+}
+
+impl MacHostInputAuthority {
+    fn open(session: &super::platform::MacActiveConsoleSession) -> Result<Self, ComputerError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let path = PathBuf::from(HOST_INPUT_AUTHORITY);
+        let parent = path
+            .parent()
+            .ok_or_else(|| authority_unavailable("authority path has no parent"))?;
+        let mut parent_options = std::fs::OpenOptions::new();
+        parent_options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let parent_file = parent_options.open(parent).map_err(authority_unavailable)?;
+        let parent_meta = parent_file.metadata().map_err(authority_unavailable)?;
+        let parent_mode = parent_meta.mode();
+        let protected_parent = parent_meta.is_dir()
+            && parent_meta.uid() == 0
+            && (parent_mode & 0o022 == 0
+                || (parent_mode & libc::S_ISVTX as u32 != 0 && parent_mode & 0o002 != 0));
+        if !protected_parent {
+            return Err(authority_unavailable(
+                "authority parent is neither root-owned non-writable nor root-owned sticky",
+            ));
+        }
+        let (owner_uid, console_set, audit_session_id) =
+            session.identity().map_err(authority_unavailable)?;
+        if !path.exists() {
+            let initial = MacHostInputState {
+                version: 1,
+                owner_uid,
+                console_set,
+                audit_session_id,
+                pending: false,
+                keys: Vec::new(),
+                buttons: Vec::new(),
+            };
+            let bytes = serde_json::to_vec(&initial).map_err(authority_unavailable)?;
+            let mut create = std::fs::OpenOptions::new();
+            create
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            match create.open(&path) {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    file.write_all(&bytes).map_err(authority_unavailable)?;
+                    file.sync_all().map_err(authority_unavailable)?;
+                    parent_file.sync_all().map_err(authority_unavailable)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(authority_unavailable(error)),
+            }
+        }
+        let euid = u32::try_from(unsafe { libc::geteuid() }).map_err(authority_unavailable)?;
+        let mut file = open_validated_authority_file(&path, euid)?;
+        let mut bytes = Vec::new();
+        use std::io::Read as _;
+        file.read_to_end(&mut bytes)
+            .map_err(authority_unavailable)?;
+        let state: MacHostInputState =
+            serde_json::from_slice(&bytes).map_err(authority_unavailable)?;
+        if state.version != 1
+            || state.pending
+            || ((state.owner_uid, state.console_set, state.audit_session_id)
+                != (owner_uid, console_set, audit_session_id)
+                && (!state.keys.is_empty() || !state.buttons.is_empty()))
+        {
+            return Err(authority_unavailable(
+                "authority contains uncertain or foreign-session outstanding input",
+            ));
+        }
+        Ok(Self {
+            path,
+            state: MacHostInputState {
+                owner_uid,
+                console_set,
+                audit_session_id,
+                ..state
+            },
+        })
+    }
+
+    fn prepare(
+        &mut self,
+        _transition: InputTransition,
+    ) -> Result<MacHostInputState, ComputerError> {
+        let previous = super::platform::macos::begin_known_pre_post(&mut self.state, |state| {
+            state.pending = true
+        });
+        if let Err(error) = self.store() {
+            self.state = previous;
+            return Err(error);
+        }
+        Ok(previous)
+    }
+
+    fn rollback(&mut self, previous: MacHostInputState) -> Result<(), ComputerError> {
+        super::platform::macos::rollback_known_pre_post(&mut self.state, previous);
+        if let Err(error) = self.store() {
+            // Never let later work treat a failed rollback as known state.
+            self.state.pending = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn commit(
+        &mut self,
+        keys: &HashSet<u16>,
+        buttons: &HashSet<MouseButton>,
+    ) -> Result<(), ComputerError> {
+        self.state.keys = keys.iter().copied().collect();
+        self.state.keys.sort_unstable();
+        self.state.buttons = buttons.iter().copied().collect();
+        self.state.buttons.sort_by_key(|button| match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+        });
+        self.state.pending = false;
+        self.store()
+    }
+
+    fn store(&self) -> Result<(), ComputerError> {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let bytes = serde_json::to_vec(&self.state).map_err(authority_unavailable)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| authority_unavailable("authority path has no parent"))?;
+        let mut parent_options = std::fs::OpenOptions::new();
+        parent_options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let parent_file = parent_options.open(parent).map_err(authority_unavailable)?;
+        let parent_meta = parent_file.metadata().map_err(authority_unavailable)?;
+        let parent_mode = parent_meta.mode();
+        let protected_parent = parent_meta.is_dir()
+            && parent_meta.uid() == 0
+            && (parent_mode & 0o022 == 0
+                || (parent_mode & libc::S_ISVTX as u32 != 0 && parent_mode & 0o002 != 0));
+        if !protected_parent {
+            return Err(authority_unavailable(
+                "authority parent changed protection before update",
+            ));
+        }
+
+        // Validate the currently authoritative inode immediately before the
+        // replacement. Never turn a missing, linked, foreign, or loose-mode
+        // destination into a trusted record merely by overwriting its name.
+        drop(open_validated_authority_file(
+            &self.path,
+            self.state.owner_uid,
+        )?);
+
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| authority_unavailable("authority filename is invalid"))?;
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let mut temp = options.open(&temp_path).map_err(authority_unavailable)?;
+            let meta = temp.metadata().map_err(authority_unavailable)?;
+            if !meta.is_file()
+                || meta.uid() != self.state.owner_uid
+                || meta.mode() & 0o777 != 0o600
+                || meta.nlink() != 1
+            {
+                return Err(authority_unavailable(
+                    "authority temporary file failed ownership validation",
+                ));
+            }
+            temp.write_all(&bytes).map_err(authority_unavailable)?;
+            temp.sync_all().map_err(authority_unavailable)?;
+            std::fs::rename(&temp_path, &self.path).map_err(authority_unavailable)?;
+            parent_file.sync_all().map_err(authority_unavailable)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+}
+
+fn open_validated_authority_file(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<std::fs::File, ComputerError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(authority_unavailable)?;
+    let meta = file.metadata().map_err(authority_unavailable)?;
+    if !meta.is_file()
+        || meta.uid() != expected_uid
+        || meta.mode() & 0o777 != 0o600
+        || meta.nlink() != 1
+    {
+        return Err(authority_unavailable(
+            "authority file is not an active-user-owned, singly-linked 0600 regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn authority_unavailable(error: impl std::fmt::Display) -> ComputerError {
+    ComputerError::Refused(format!(
+        "protected macOS host input authority unavailable; cleanup ownership is unknowable: {error}"
+    ))
+}
+
+#[async_trait]
+impl ComputerBackend for MacOsComputerBackend {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::RealDesktopMacOs
+    }
+
+    async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+        self.geometry = query_geometry()?;
+        Ok(self.geometry.clone())
+    }
+
+    async fn execute_normalized_one(
+        &mut self,
+        action: &NormalizedComputerAction,
+    ) -> Result<ComputerActionOutcome, ComputerError> {
+        self.execute_action(action)
+    }
+
+    fn release_all(&mut self) -> Result<(), ComputerError> {
+        // Release only down transitions successfully posted by this backend.
+        // Synthesizing unrelated key-ups mutates physical user input and is
+        // never a safe substitute for exact ownership accounting.
+        // Reload only after the coordinator has acquired the host-wide lease:
+        // construction may have raced a predecessor's final journal commit.
+        self.input_authority = MacHostInputAuthority::open(&self.active_console_session)?;
+        self.outstanding_keys = self.input_authority.state.keys.iter().copied().collect();
+        self.outstanding_buttons = self.input_authority.state.buttons.iter().copied().collect();
+        let keys: Vec<_> = self.outstanding_keys.iter().copied().collect();
+        for code in keys {
+            self.post_key(code, false, CGEventFlags::empty())?;
+        }
+        let cursor = self.cursor()?;
+        let buttons: Vec<_> = self.outstanding_buttons.iter().copied().collect();
+        for button in buttons {
+            self.post_mouse(
+                mouse_up_type(button),
+                button,
+                cursor,
+                CGEventFlags::empty(),
+                1,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_physical_capability(
+        &mut self,
+        capability: super::coordinator::PhysicalDispatchCapability,
+    ) -> Result<(), ComputerError> {
+        capability.recheck(BackendKind::RealDesktopMacOs)?;
+        self.physical_capability = Some(capability);
+        Ok(())
+    }
+}
+
+fn query_geometry() -> Result<DisplayGeometry, ComputerError> {
+    let display = CGMainDisplayID();
+    let bounds = CGDisplayBounds(display);
+    let mode = CGDisplayCopyDisplayMode(display).ok_or_else(|| ComputerError::CommandFailed {
+        program: "CGDisplayCopyDisplayMode".to_string(),
+        detail: "main display has no current mode".to_string(),
+    })?;
+    let logical_width = CGDisplayMode::width(Some(&mode));
+    let logical_height = CGDisplayMode::height(Some(&mode));
+    let physical_width = CGDisplayMode::pixel_width(Some(&mode));
+    let physical_height = CGDisplayMode::pixel_height(Some(&mode));
+    let scale = physical_width as f64 / logical_width as f64;
+    if logical_width == 0
+        || logical_height == 0
+        || physical_width == 0
+        || physical_height == 0
+        || !scale.is_finite()
+        || scale <= 0.0
+        || bounds.origin.x != 0.0
+        || bounds.origin.y != 0.0
+    {
+        return Err(ComputerError::CommandFailed {
+            program: "CGDisplayCopyDisplayMode".to_string(),
+            detail: "main display returned invalid geometry or a nonzero coordinate origin"
+                .to_string(),
+        });
+    }
+    Ok(DisplayGeometry {
+        physical: PixelSize {
+            width: u32::try_from(physical_width)
+                .map_err(|error| command_error("CoreGraphics", error))?,
+            height: u32::try_from(physical_height)
+                .map_err(|error| command_error("CoreGraphics", error))?,
+        },
+        logical: super::LogicalSize {
+            width: logical_width as f64,
+            height: logical_height as f64,
+        },
+        scale_factor: ScaleFactor(scale),
+    })
+}
+
+/// Split at scalar boundaries, never between a UTF-16 high/low surrogate
+/// pair. `CGEventKeyboardSetUnicodeString` receives each vector atomically.
+fn utf16_chunks(text: &str) -> Vec<Vec<u16>> {
+    const MAX_UNITS: usize = 20;
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(MAX_UNITS);
+    for scalar in text.chars() {
+        let mut encoded = [0_u16; 2];
+        let units = scalar.encode_utf16(&mut encoded);
+        if current.len() + units.len() > MAX_UNITS && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current.reserve(MAX_UNITS);
+        }
+        current.extend_from_slice(units);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn permission_error(permission: &str) -> ComputerError {
+    ComputerError::Refused(format!(
+        "macOS {permission} permission is required for real desktop control"
+    ))
+}
+
+fn command_error(program: &str, error: impl std::fmt::Display) -> ComputerError {
+    ComputerError::CommandFailed {
+        program: program.to_string(),
+        detail: error.to_string(),
+    }
+}
+
+fn cg_null(program: &str) -> ComputerError {
+    command_error(program, "CoreGraphics returned null")
+}
+
+fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {
+    let mut flags = CGEventFlags::empty();
+    if modifiers.shift {
+        flags |= CGEventFlags::MaskShift;
+    }
+    if modifiers.control {
+        flags |= CGEventFlags::MaskControl;
+    }
+    if modifiers.alt {
+        flags |= CGEventFlags::MaskAlternate;
+    }
+    if modifiers.meta {
+        flags |= CGEventFlags::MaskCommand;
+    }
+    flags
+}
+
+fn flags_for_macos_key_codes(codes: &[u16]) -> CGEventFlags {
+    modifier_flags(Modifiers {
+        shift: codes.iter().any(|code| matches!(*code, 0x38 | 0x3c)),
+        control: codes.iter().any(|code| matches!(*code, 0x3b | 0x3e)),
+        alt: codes.iter().any(|code| matches!(*code, 0x3a | 0x3d)),
+        meta: codes.iter().any(|code| matches!(*code, 0x37 | 0x36)),
+    })
+}
+
+fn cg_button(button: MouseButton) -> CGMouseButton {
+    match button {
+        MouseButton::Left => CGMouseButton::Left,
+        MouseButton::Right => CGMouseButton::Right,
+        MouseButton::Middle => CGMouseButton::Center,
+    }
+}
+
+fn mouse_down_type(button: MouseButton) -> CGEventType {
+    match button {
+        MouseButton::Left => CGEventType::LeftMouseDown,
+        MouseButton::Right => CGEventType::RightMouseDown,
+        MouseButton::Middle => CGEventType::OtherMouseDown,
+    }
+}
+
+fn mouse_up_type(button: MouseButton) -> CGEventType {
+    match button {
+        MouseButton::Left => CGEventType::LeftMouseUp,
+        MouseButton::Right => CGEventType::RightMouseUp,
+        MouseButton::Middle => CGEventType::OtherMouseUp,
+    }
+}
+
+fn drag_event_type(button: MouseButton) -> CGEventType {
+    match button {
+        MouseButton::Left => CGEventType::LeftMouseDragged,
+        MouseButton::Right => CGEventType::RightMouseDragged,
+        MouseButton::Middle => CGEventType::OtherMouseDragged,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::computer::KeyCode;
+
+    #[test]
+    fn construction_fails_before_platform_access_without_machine_grant() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let grant = RealDesktopGrantStore::new(temp.path().join("missing-grant"));
+        let result = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant));
+        assert!(matches!(
+            result,
+            Err(ComputerError::RealDesktopGrantMissing)
+        ));
+    }
+
+    #[test]
+    fn key_map_and_modifier_flags_cover_primary_chords() {
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("LEFTMETA").expect("meta")),
+            Some(0x37)
+        );
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("ARROWLEFT").expect("arrow")),
+            Some(0x7b)
+        );
+        assert!(
+            flags_for_macos_key_codes(&[0x37, 0x38])
+                .contains(CGEventFlags::MaskCommand | CGEventFlags::MaskShift)
+        );
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("INSERT").expect("insert")),
+            None
+        );
+    }
+
+    #[test]
+    fn utf16_chunking_keeps_surrogate_pairs_together() {
+        let text = format!("{}🙂tail", "a".repeat(19));
+        let chunks = utf16_chunks(&text);
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), vec![19, 6]);
+        assert_eq!(chunks[1], "🙂tail".encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive macOS login plus Screen Recording and Accessibility grants"]
+    fn constructs_and_captures_real_desktop_when_tcc_granted() {
+        let grant = RealDesktopGrantStore::for_cockpit_data_dir().expect("grant store");
+        let mut backend = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant))
+            .expect("construct macOS backend");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let outcome = runtime
+            .block_on(crate::computer::execute_backend_action(
+                &mut backend,
+                &crate::computer::ComputerAction::CaptureFull,
+            ))
+            .expect("capture main display");
+        let ComputerActionOutcome::Captured(frame) = outcome else {
+            panic!("capture returned a non-capture outcome");
+        };
+        assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(backend.backend_kind(), BackendKind::RealDesktopMacOs);
+    }
+}

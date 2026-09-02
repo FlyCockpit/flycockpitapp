@@ -477,6 +477,46 @@ impl Model {
         .await
     }
 
+    /// Captured completion which reports successful provider stream
+    /// establishment. This remains narrower than a completion: cancellation,
+    /// drain, and dispatch-deadline gates may still refuse a request before
+    /// its stream is constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_captured_with_provider_handoff(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        provider_handoff: &std::sync::atomic::AtomicBool,
+    ) -> Result<(
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system,
+            history,
+            prompt,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            None,
+            false,
+            None,
+            Some(provider_handoff),
+        )
+        .await
+    }
+
     /// Keep-warm's idle deadline is an execution fence, not merely a caller
     /// timeout. It follows every retry to the point where `stream()` may put
     /// bytes on the wire.
@@ -511,6 +551,7 @@ impl Model {
             None,
             false,
             Some(dispatch_deadline),
+            None,
         )
         .await
     }
@@ -573,7 +614,7 @@ impl Model {
         params.detach_inherited_native_computer();
         self.complete_captured_with_pre_drain_mode(
             system, history, prompt, tools, params, agent_name, None, cancel, None, None, true,
-            None,
+            None, None,
         )
         .await
     }
@@ -609,6 +650,7 @@ impl Model {
             pre_drain,
             false,
             None,
+            None,
         )
         .await
     }
@@ -628,6 +670,7 @@ impl Model {
         pre_drain: Option<PreDrainFuture>,
         compact_utility: bool,
         dispatch_deadline: Option<tokio::time::Instant>,
+        provider_handoff: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(
         (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
@@ -657,6 +700,7 @@ impl Model {
             compact_utility,
             None,
             dispatch_deadline,
+            provider_handoff,
         )
         .await
     }
@@ -706,6 +750,7 @@ impl Model {
             compact_utility,
             display,
             None,
+            None,
         )
         .await
     }
@@ -724,6 +769,7 @@ impl Model {
         compact_utility: bool,
         display: Option<crate::engine::model::DisplayAttemptSlot>,
         dispatch_deadline: Option<tokio::time::Instant>,
+        provider_handoff: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(
         (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
@@ -909,6 +955,7 @@ impl Model {
                                     pre_drain.clone(),
                                     display.as_ref(),
                                     dispatch_deadline,
+                                    provider_handoff,
                                 )
                                 .await
                             }
@@ -941,6 +988,7 @@ impl Model {
                                     pre_drain.clone(),
                                     display.as_ref(),
                                     dispatch_deadline,
+                                    provider_handoff,
                                 )
                                 .await
                             }
@@ -1149,6 +1197,7 @@ impl Model {
                         pre_drain.clone(),
                         display.as_ref(),
                         dispatch_deadline,
+                        provider_handoff,
                     )
                     .await
                 };
@@ -1215,6 +1264,7 @@ impl Model {
                         pre_drain.clone(),
                         display.as_ref(),
                         dispatch_deadline,
+                        provider_handoff,
                     )
                     .await
                 };
@@ -2329,6 +2379,7 @@ pub(super) async fn drain_completion_stream<M>(
     pre_drain: Option<PreDrainFuture>,
     display: Option<&crate::engine::model::DisplayAttemptSlot>,
     dispatch_deadline: Option<tokio::time::Instant>,
+    provider_handoff: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<CompleteOut, rig::completion::CompletionError>
 where
     M: rig::completion::CompletionModel,
@@ -2337,9 +2388,9 @@ where
     // during the initial round-trip aborts promptly. The request is now on
     // the wire: record `Dispatched` so a stall before the first token is
     // attributed to the dispatched (not prep) phase.
-    // Polling `request.stream()` can put bytes on the wire before it resolves,
-    // including when it resolves with an error. Advance first so every error
-    // or cancellation from that poll is conservatively post-handoff.
+    // A stream poll can fail during local preparation or transport setup, so
+    // do not report a provider handoff until rig has successfully established
+    // the stream. The bit is an execution observation, not an attempt marker.
     if cancel.is_cancelled() {
         return Err(attempt_cancelled());
     }
@@ -2352,8 +2403,17 @@ where
     if !crate::engine::agent::current_agent_tree_steer_dispatch_permit_is_current().await {
         return Err(attempt_late_user_steer_deferred());
     }
-    let mut stream =
-        dispatch_stream_before_deadline(dispatch_deadline, cancel, || request.stream()).await?;
+    let mut stream = dispatch_stream_before_deadline(dispatch_deadline, cancel, || async {
+        // `dispatch_stream_before_deadline` can win its cancellation arm
+        // before polling this future. Only a successfully constructed stream
+        // proves the request passed the local and transport setup boundary.
+        let stream = request.stream().await?;
+        if let Some(provider_handoff) = provider_handoff {
+            provider_handoff.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(stream)
+    })
+    .await?;
     bump_phase(phase, InferencePhase::Dispatched);
     await_pre_drain_record(pre_drain).await?;
     // Successful-attempt dispatch boundary: construct the display classifier

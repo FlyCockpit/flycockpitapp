@@ -64,10 +64,11 @@ pub(crate) async fn open_native_computer_for_delegation(
     } else {
         None
     };
-    let backend = match crate::computer::VirtualDisplayBackend::construct(
+    let backend_result = crate::computer::coordinator::construct_platform_backend(
         candidate.target,
         grant_store.as_ref(),
-    ) {
+    );
+    let backend = match backend_result {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(error = %error, "native computer backend open failed");
@@ -116,9 +117,45 @@ pub(crate) async fn open_native_computer_for_delegation(
                     ))),
                 )
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "windows")]
             {
-                unreachable!("non-Linux real desktop construction fails closed")
+                let adapter = crate::computer::platform::WindowsTargetEvidenceAdapter::new()
+                    .map_err(|reason| {
+                        anyhow::anyhow!("real desktop target evidence unavailable: {reason:?}")
+                    })?;
+                let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
+                    .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;
+                (
+                    Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::computer::coordinator::HostInputArbiter::new(
+                            Box::new(file_lock),
+                            owner_instance,
+                        ),
+                    ))),
+                )
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let adapter = crate::computer::platform::MacOsTargetEvidenceAdapter::new()
+                    .map_err(|reason| {
+                        anyhow::anyhow!("real desktop target evidence unavailable: {reason:?}")
+                    })?;
+                let file_lock = crate::computer::coordinator::FileAdvisoryLock::new()
+                    .map_err(|error| anyhow::anyhow!("host input arbiter unavailable: {error}"))?;
+                (
+                    Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::computer::coordinator::HostInputArbiter::new(
+                            Box::new(file_lock),
+                            owner_instance,
+                        ),
+                    ))),
+                )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            {
+                unreachable!("unsupported real desktop construction fails closed")
             }
         }
     };
@@ -153,7 +190,7 @@ pub(crate) async fn open_native_computer_for_delegation(
         )),
         handoff_journal,
     };
-    match ComputerActionCoordinator::open(Box::new(backend), params).await {
+    match ComputerActionCoordinator::open(backend, params).await {
         Ok(coordinator) => {
             // Keep capability metadata only. Opened geometry is request-scoped:
             // the live-loop overlay copies it onto a turn-local agent so
@@ -659,9 +696,9 @@ mod tests {
         FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance, ProviderId,
     };
     use crate::computer::{
-        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerBatchReport,
-        ComputerToolContract, DisplayGeometry, DisplayTarget, LogicalSize,
-        NativeComputerCoordinatorConfig, NativeComputerToolConfig, PixelSize, ScaleFactor,
+        ComputerActionOutcome, ComputerBackend, ComputerToolContract, DisplayGeometry,
+        DisplayTarget, LogicalSize, NativeComputerCoordinatorConfig, NativeComputerToolConfig,
+        NormalizedComputerAction, NormalizedComputerEffect, PixelSize, ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::{
@@ -701,18 +738,11 @@ mod tests {
             Ok(self.geometry.clone())
         }
 
-        async fn execute(&mut self, _actions: &[ComputerAction]) -> ComputerBatchReport {
-            ComputerBatchReport {
-                completed: Vec::new(),
-                failure: None,
-            }
-        }
-
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
-            if matches!(action, ComputerAction::CaptureFull) {
+            if matches!(action.effect(), NormalizedComputerEffect::CaptureFull) {
                 Ok(ComputerActionOutcome::Captured(
                     crate::computer::CaptureFrame {
                         png: vec![0x89, 0x50, 0x4e, 0x47],
@@ -748,15 +778,11 @@ mod tests {
             self.inner.geometry().await
         }
 
-        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
-            self.inner.execute(actions).await
-        }
-
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, crate::computer::ComputerError> {
-            self.inner.execute_one(action).await
+            self.inner.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), crate::computer::ComputerError> {

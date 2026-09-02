@@ -463,6 +463,31 @@ impl LiveWireApiState {
 
 pub(crate) type LiveWireApi = Arc<Mutex<LiveWireApiState>>;
 
+/// The configuration snapshot that constructed a concrete cache endpoint.
+/// Provider and model names are user-editable labels, so they are not enough
+/// to carry cache-hit evidence across a live config refresh.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CacheEndpointIdentity {
+    provider: String,
+    model: String,
+    configuration_generation: u64,
+}
+
+impl CacheEndpointIdentity {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            configuration_generation: generation,
+        }
+    }
+}
+
 /// One concrete provider-flavor of completion model. Add variants here
 /// as we wire more providers.
 #[derive(Clone)]
@@ -481,6 +506,8 @@ pub enum Model {
         /// backup fallback (implementation note) exactly,
         /// regardless of any plan-level model override.
         provider_id: String,
+        /// Authoritative provider-config snapshot that built this endpoint.
+        cache_configuration_generation: u64,
         /// Command-credential generation that authenticated this model's
         /// outbound requests. Retained so a 401/403 can be bound to the
         /// credential actually sent rather than whatever is cached later.
@@ -561,6 +588,8 @@ pub enum Model {
         model_id: String,
         /// The configured provider id this model was built from.
         provider_id: String,
+        /// Authoritative provider-config snapshot that built this endpoint.
+        cache_configuration_generation: u64,
         #[cfg(not(test))]
         command_credential_generation: Option<u64>,
         /// Known upper bound for utility `max_tokens`, resolved from model or
@@ -606,6 +635,8 @@ pub enum Model {
         /// on [`Model::OpenAi`] — exact per-`(provider, model)` backup
         /// resolution (implementation note).
         provider_id: String,
+        /// Authoritative provider-config snapshot that built this endpoint.
+        cache_configuration_generation: u64,
         #[cfg(not(test))]
         command_credential_generation: Option<u64>,
         /// Explicit output limit resolved from catalog metadata, a model
@@ -642,6 +673,46 @@ pub enum Model {
 }
 
 impl Model {
+    /// Return the non-recyclable identity that owns prompt-cache evidence.
+    pub(crate) fn cache_endpoint_identity(&self) -> CacheEndpointIdentity {
+        let configuration_generation = match self {
+            Model::OpenAi {
+                cache_configuration_generation,
+                ..
+            }
+            | Model::ChatGpt {
+                cache_configuration_generation,
+                ..
+            }
+            | Model::Anthropic {
+                cache_configuration_generation,
+                ..
+            } => *cache_configuration_generation,
+        };
+        CacheEndpointIdentity {
+            provider: self.provider_id().to_string(),
+            model: self.model_id_ref().to_string(),
+            configuration_generation,
+        }
+    }
+
+    pub(crate) fn with_cache_configuration_generation(mut self, generation: u64) -> Self {
+        match &mut self {
+            Model::OpenAi {
+                cache_configuration_generation,
+                ..
+            }
+            | Model::ChatGpt {
+                cache_configuration_generation,
+                ..
+            }
+            | Model::Anthropic {
+                cache_configuration_generation,
+                ..
+            } => *cache_configuration_generation = generation,
+        }
+        self
+    }
     /// The shared inference-dispatch gate for this model. The single seam
     /// both [`Self::complete_captured`] and [`Self::text_completion`]
     /// consult before any provider round-trip.

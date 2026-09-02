@@ -17,6 +17,12 @@
     },
     "request": "get_workspace_trust"
   },
+  "get_workspace_history_scope": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_history_scope"
+  },
   "mark_app_flag_seen": {
     "params": {
       "expected_version": 7,
@@ -39,6 +45,14 @@
       "project_root": "/tmp/project"
     },
     "request": "set_workspace_trust"
+  },
+  "set_workspace_history_scope": {
+    "params": {
+      "inbound": true,
+      "outbound": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_history_scope"
   },
   "archive_session": {
     "params": {
@@ -600,6 +614,21 @@
     },
     "request": "read_history_page"
   },
+  "read_assistant_inbox": {
+    "params": {
+      "include_delivered": true,
+      "limit": 7,
+      "main_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "read_assistant_inbox"
+  },
+  "acknowledge_assistant_inbox_human_read": {
+    "params": {
+      "inbox_item_ids": ["11111111-1111-4111-8111-111111111111"],
+      "main_session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "acknowledge_assistant_inbox_human_read"
+  },
   "read_session_messages": {
     "params": {
       "before_seq": 7,
@@ -722,6 +751,9 @@
   },
   "restart_if_idle": {
     "request": "restart_if_idle"
+  },
+  "resume_from_compaction": {
+    "request": "resume_from_compaction"
   },
   "resume_paused_work": {
     "params": {
@@ -951,7 +983,7 @@
       "monty_nudge": "monty tools enabled: code",
       "override_json": "{\"tools\":[\"read\",\"code\",\"mcp\"],\"toolTiers\":{\"code\":\"discoverable\"}}",
       "persist_session": true,
-      "prune_after_switch": true
+      "cache_break_acknowledged": true
     },
     "request": "set_tool_surface_override"
   },
@@ -2182,19 +2214,146 @@
     },
     "request": "review_guidance_proposal"
   },
-  "knowledge_dream_status": {
+  "create_code_root_v1": {
+    "request": "create_code_root_v1",
     "params": {
-      "project_root": "/tmp/project",
-      "knowledge_base_id": "kb-1"
-    },
-    "request": "knowledge_dream_status"
+      "workspace_selector": {
+        "path": "/tmp/project"
+      },
+      "logical_client_id": "editor-1",
+      "client_request_id": "create-1",
+      "options": {
+        "no_sandbox": false,
+        "interactive": true,
+        "client_protocol_version": 21,
+        "env_policy": "daemon"
+      }
+    }
   },
-  "run_knowledge_dream": {
+  "attach_existing_code_root_v1": {
+    "request": "attach_existing_code_root_v1",
     "params": {
-      "project_root": "/tmp/project",
-      "knowledge_base_id": null,
-      "no_sandbox": false
-    },
-    "request": "run_knowledge_dream"
+      "root_id": "11111111-1111-4111-8111-111111111111",
+      "capture_generation": 4803839602540817,
+      "logical_client_id": "editor-1",
+      "client_request_id": "attach-1",
+      "options": {
+        "no_sandbox": false,
+        "interactive": true,
+        "client_protocol_version": 21,
+        "env_policy": "daemon"
+      }
+    }
+  },
+  "attach_existing_code_root_with_acp_ingress_v1": {
+    "request": "attach_existing_code_root_with_acp_ingress_v1",
+    "params": {
+      "base": {
+        "root_id": "11111111-1111-4111-8111-111111111111",
+        "capture_generation": 4803839602540817,
+        "logical_client_id": "editor-1",
+        "client_request_id": "acp-attach-1",
+        "options": {
+          "no_sandbox": false,
+          "interactive": true,
+          "client_protocol_version": 21,
+          "env_policy": "daemon"
+        }
+      },
+      "ingress": {
+        "version": 1,
+        "declarations": [],
+        "client_provenance_id": "fixture-editor",
+        "ingress_request_id": "fixture-attach-ingress"
+      }
+    }
+  },
+  "close_acp_code_root_attachment_v1": {
+    "request": "close_acp_code_root_attachment_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_request_id": "acp-close-1"
+    }
+  },
+  "create_code_root_with_acp_ingress_v1": {
+    "request": "create_code_root_with_acp_ingress_v1",
+    "params": {
+      "base": {
+        "workspace_selector": {
+          "path": "/tmp/project"
+        },
+        "logical_client_id": "editor-1",
+        "client_request_id": "acp-create-1",
+        "options": {
+          "no_sandbox": false,
+          "interactive": true,
+          "client_protocol_version": 21,
+          "env_policy": "daemon"
+        }
+      },
+      "ingress": {
+        "version": 1,
+        "declarations": [
+          {
+            "name": "fixture-server",
+            "transport": {
+              "type": "stdio",
+              "command": "fixture-mcp",
+              "args": [],
+              "env": []
+            }
+          }
+        ],
+        "client_provenance_id": "fixture-editor",
+        "ingress_request_id": "fixture-create-ingress"
+      }
+    }
+  },
+  "close_code_root_attachment_v1": {
+    "request": "close_code_root_attachment_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_request_id": "close-1"
+    }
+  },
+  "discover_code_roots_v1": {
+    "request": "discover_code_roots_v1",
+    "params": {
+      "workspace_selector": {
+        "path": "/tmp/project"
+      },
+      "logical_client_id": "editor-1",
+      "limit": 25
+    }
+  },
+  "read_code_root_v1": {
+    "request": "read_code_root_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "read_code_root_deliveries_v1": {
+    "request": "read_code_root_deliveries_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "limit": 25
+    }
+  },
+  "ack_code_root_deliveries_v1": {
+    "request": "ack_code_root_deliveries_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "through": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "client_request_id": "ack-1"
+    }
+  },
+  "resolve_code_root_interrupt_v1": {
+    "request": "resolve_code_root_interrupt_v1",
+    "params": {
+      "attachment_capability": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "client_request_id": "11111111-1111-4111-8111-111111111111",
+      "selected_choice": "allow_once",
+      "attention_id": "22222222-2222-4222-8222-222222222222"
+    }
   }
 }

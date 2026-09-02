@@ -40,6 +40,18 @@ use crate::{
 pub const BUILTIN_SERVER_ID: &str = "cockpit";
 const DEFAULT_CHILD_EVENT_CAP: usize = 50;
 
+#[derive(Debug, Clone)]
+pub struct EffectiveNetworkCapability {
+    pub agent_policy: crate::db::monty_network::MontyNetworkAgentPolicy,
+    pub session_policy: crate::mcp::network::SessionNetworkGrantSnapshot,
+}
+
+impl EffectiveNetworkCapability {
+    pub fn requests_enabled(&self) -> bool {
+        self.agent_policy.requests_enabled
+    }
+}
+
 #[derive(Clone)]
 pub struct HostContext {
     #[allow(dead_code)]
@@ -77,6 +89,19 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// One registry-owned network decision used by package exposure, model
+    /// advertisement, policy mutation, and transport egress.
+    pub async fn effective_network_capability(&self) -> Result<EffectiveNetworkCapability> {
+        self.builtin_registry
+            .effective_network_capability_for(
+                self.session.as_deref(),
+                self.native_tool_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.agent_instance_id),
+            )
+            .await
+    }
+
     pub fn from_tool_ctx(ctx: &ToolCtx) -> Self {
         let child_events = ctx.current_tool_call_id.as_ref().map(|parent_call_id| {
             McpChildEventRecorder::new(
@@ -383,6 +408,35 @@ pub struct McpChildSpan {
     dispatch: McpChildDispatch,
 }
 
+/// A child outcome that has crossed the host-result scrub boundary.
+///
+/// The inner variants are private so recorder callers cannot accidentally pass
+/// a raw `Result<Value, String>` to [`McpChildEventRecorder::finish`]. Sandbox
+/// custody constructs this marker only after scrubbing both variants; this
+/// module uses the private synthetic constructor for recorder-owned cap events.
+#[derive(Debug, Clone)]
+pub(super) struct ScrubbedMcpChildOutcome(ScrubbedMcpChildOutcomeInner);
+
+#[derive(Debug, Clone)]
+enum ScrubbedMcpChildOutcomeInner {
+    Ok(Value),
+    Err(String),
+}
+
+impl ScrubbedMcpChildOutcome {
+    pub(super) fn scrubbed_ok(_proof: super::sandbox::SandboxScrubProof, value: Value) -> Self {
+        Self(ScrubbedMcpChildOutcomeInner::Ok(value))
+    }
+
+    pub(super) fn scrubbed_err(_proof: super::sandbox::SandboxScrubProof, error: String) -> Self {
+        Self(ScrubbedMcpChildOutcomeInner::Err(error))
+    }
+
+    fn synthetic_ok(value: Value) -> Self {
+        Self(ScrubbedMcpChildOutcomeInner::Ok(value))
+    }
+}
+
 #[derive(Clone)]
 pub struct McpChildEventRecorder {
     session: Arc<Session>,
@@ -549,19 +603,19 @@ impl McpChildEventRecorder {
         Some(span)
     }
 
-    pub async fn finish(
+    pub(super) async fn finish(
         &self,
         span: McpChildSpan,
-        outcome: Result<Value, String>,
+        outcome: ScrubbedMcpChildOutcome,
         duration_ms: u64,
     ) {
-        let (output, hard_fail, error) = match outcome {
-            Ok(value) => (
+        let (output, hard_fail, error) = match outcome.0 {
+            ScrubbedMcpChildOutcomeInner::Ok(value) => (
                 serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
                 false,
                 None,
             ),
-            Err(message) => (message.clone(), true, Some(message)),
+            ScrubbedMcpChildOutcomeInner::Err(message) => (message.clone(), true, Some(message)),
         };
         let event_data = self.event_data(&span, Some(&output), error.as_deref(), duration_ms);
 
@@ -659,8 +713,12 @@ impl McpChildEventRecorder {
         };
         let output = format!("{count} further MCP dispatches were not recorded");
         self.emit_start(&span).await;
-        self.finish(span, Ok(serde_json::json!({ "message": output })), 0)
-            .await;
+        self.finish(
+            span,
+            ScrubbedMcpChildOutcome::synthetic_ok(serde_json::json!({ "message": output })),
+            0,
+        )
+        .await;
     }
 
     async fn emit_start(&self, span: &McpChildSpan) {
@@ -878,6 +936,35 @@ pub struct BuiltinRegistry {
 }
 
 impl BuiltinRegistry {
+    pub(crate) async fn effective_network_capability_for(
+        &self,
+        session: Option<&crate::session::Session>,
+        agent_instance_id: Option<Uuid>,
+    ) -> Result<EffectiveNetworkCapability> {
+        // The registry is the capability authority for every host shape. In
+        // particular, scoped metadata/seed forks deliberately have no
+        // ToolCtx, but their registry denial must win over that missing
+        // context so callers cannot mistake construction shape for policy.
+        if let Some(denial) = self.monty_network_denial() {
+            bail!(
+                "{}",
+                denial["message"]
+                    .as_str()
+                    .unwrap_or("scoped network capability denied")
+            );
+        }
+        let session = session.context("governed network requires a live agent context")?;
+        let agent_instance_id =
+            agent_instance_id.context("governed network requires a daemon-owned agent instance")?;
+        Ok(EffectiveNetworkCapability {
+            agent_policy: session
+                .db
+                .monty_network_agent_policy(agent_instance_id)
+                .await?,
+            session_policy: session.monty_session_network_grant_snapshot(),
+        })
+    }
+
     fn new(funcs: Vec<BuiltinFunction>) -> Self {
         let funcs = funcs
             .into_iter()
@@ -943,6 +1030,15 @@ impl BuiltinRegistry {
         self.capability_guard
             .as_ref()
             .and_then(|guard| guard.denial(tool))
+    }
+
+    /// Network uses the same per-fork allowlist as native Monty calls.
+    /// Current scoped catalogs omit `requests`, while foreground registries
+    /// have no guard and defer to the live user-grant policy.
+    pub(crate) fn monty_network_denial(&self) -> Option<Value> {
+        self.capability_guard
+            .as_ref()
+            .and_then(|guard| guard.denial("requests"))
     }
 
     /// The source-tagged effective catalog for an ephemeral metadata fork.
@@ -1867,6 +1963,38 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("the session-rename micro-fork")
                     && message.contains("`set_session_metadata`"))
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_fork_network_denial_precedes_missing_tool_context() {
+        let metadata = HostContext::empty_for_tests()
+            .with_builtin_registry(Arc::new(BuiltinRegistry::metadata_fork()));
+        let metadata_error = metadata.effective_network_capability().await.unwrap_err();
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("the session-rename micro-fork"),
+            "{metadata_error:#}"
+        );
+        assert!(
+            !metadata_error.to_string().contains("live agent context"),
+            "registry denial must win over missing ToolCtx: {metadata_error:#}"
+        );
+
+        let seed = HostContext::empty_for_tests().with_builtin_registry(Arc::new(
+            BuiltinRegistry::seed_reads_fork(Arc::new(std::sync::Mutex::new(None))),
+        ));
+        let seed_error = seed.effective_network_capability().await.unwrap_err();
+        assert!(
+            seed_error
+                .to_string()
+                .contains("the explore seed-selection micro-fork"),
+            "{seed_error:#}"
+        );
+        assert!(
+            !seed_error.to_string().contains("live agent context"),
+            "registry denial must win over missing ToolCtx: {seed_error:#}"
         );
     }
 
@@ -3623,7 +3751,11 @@ mod tests {
         );
         let span = recorder.start(dispatch).await.expect("child span");
         recorder
-            .finish(span, Ok(serde_json::json!({ "result": "ok" })), 5)
+            .finish(
+                span,
+                ScrubbedMcpChildOutcome::synthetic_ok(serde_json::json!({ "result": "ok" })),
+                5,
+            )
             .await;
 
         // The session event journaled the arg literal (shared history row).
@@ -3727,7 +3859,11 @@ mod tests {
         );
         let span = recorder.start(dispatch).await.expect("child span");
         recorder
-            .finish(span, Ok(serde_json::json!({ "result": "ok" })), 5)
+            .finish(
+                span,
+                ScrubbedMcpChildOutcome::synthetic_ok(serde_json::json!({ "result": "ok" })),
+                5,
+            )
             .await;
 
         // Both sides used the PINNED trusted frame, so the arg literal is

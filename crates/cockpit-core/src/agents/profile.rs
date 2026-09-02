@@ -21,7 +21,7 @@ use cockpit_db::db::agent_installations::{
     RedactedModelSlotRequirements, RedactedQuestionPolicy, RedactedRecommendation,
     RedactedVerificationExecutionPlan, RedactedVerificationGenerator,
     RedactedVerificationPredicate, RedactedVerificationRecipe, RedactedVerificationRegion,
-    RedactedVerificationSelector, VerificationEffectiveAction,
+    RedactedVerificationSelector, RedactedVerificationToolCategory, VerificationEffectiveAction,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -30,7 +30,7 @@ use super::{
     AgentDef, AllowedChild, EffectiveQuestionPolicy, ExecutionKind, ModelCapability, ModelLocality,
     ModelRecommendation, ModelSlot, ProhibitedQuestionClass, QuestionOverride, QuestionPolicy,
     ResolverOrder, SelectorPredicate, SlotModelRef, VerificationAction, VerificationBudget,
-    VnextHostPolicy, resolve_question_policy,
+    VerificationCandidateDispatch, VnextHostPolicy, resolve_question_policy,
 };
 
 /// Trusted classification of the installation source.  A definition never
@@ -1736,6 +1736,12 @@ fn snapshot_verification_regions(
                         crate::agents::VerificationMode::Gate => "gate".to_string(),
                         crate::agents::VerificationMode::Revise => "revise".to_string(),
                     },
+                    candidate_dispatch: match region.rule.resolved_candidate_dispatch() {
+                        VerificationCandidateDispatch::Parallel => "parallel".to_string(),
+                        VerificationCandidateDispatch::WarmThenFanout => {
+                            "warm_then_fanout".to_string()
+                        }
+                    },
                     generators: region
                         .rule
                         .generators
@@ -1749,9 +1755,23 @@ fn snapshot_verification_regions(
                                 crate::agents::VerificationRecipe::CleanRoom {
                                     include_linked_files,
                                     last_n_reads,
+                                    tool_categories,
+                                    tool_allowlist,
                                 } => RedactedVerificationRecipe::CleanRoom {
                                     include_linked_files: *include_linked_files,
                                     last_n_reads: *last_n_reads,
+                                    tool_categories: tool_categories
+                                        .iter()
+                                        .map(|category| match category {
+                                            crate::agents::VerificationToolCategory::Reads => {
+                                                RedactedVerificationToolCategory::Reads
+                                            }
+                                            crate::agents::VerificationToolCategory::Exploration => {
+                                                RedactedVerificationToolCategory::Exploration
+                                            }
+                                        })
+                                        .collect(),
+                                    tool_allowlist: tool_allowlist.clone(),
                                 },
                             },
                             max_turns: generator.max_turns,
@@ -2979,7 +2999,7 @@ mod tests {
     #[test]
     fn agent_profile_resolution_verification_first_match_off_and_narrowing_are_pinned_on_reload() {
         let definition = definition(
-            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n      mode: revise\n      onBudgetExceeded: dispatch_original\n      onAdjudicationFailure: refuse\n      generators:\n        - slot: primary\n          recipe:\n            cleanRoom:\n              includeLinkedFiles: true\n              lastNReads: 4\n          maxTurns: 3\n",
+            "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: shell }]\n      action: off\n    - selector:\n        allOf: [{ toolClass: shell }]\n        anyOf: [{ toolId: bash }, { namespace: terminal }]\n      action: verify\n      adjudicatorSlot: primary\n      maxCandidates: 1\n      maxTotalTokens: 20\n      maxEstimatedCostMicrousd: 30\n      maxCollectionMillis: 40\n      mode: revise\n      onBudgetExceeded: dispatch_original\n      onAdjudicationFailure: refuse\n      generators:\n        - slot: primary\n          recipe:\n            cleanRoom:\n              includeLinkedFiles: true\n              lastNReads: 4\n              toolCategories: [exploration]\n              toolAllowlist: [context_pack]\n          maxTurns: 3\n",
         );
         let (catalog, installation_id, digest) = catalog(definition);
         let providers = providers();
@@ -3064,6 +3084,8 @@ mod tests {
             RedactedVerificationRecipe::CleanRoom {
                 include_linked_files: true,
                 last_n_reads: 4,
+                tool_categories: vec![RedactedVerificationToolCategory::Exploration],
+                tool_allowlist: vec!["context_pack".into()],
             }
         );
         let persisted = persisted_snapshot_row(&profile);

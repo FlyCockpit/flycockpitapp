@@ -52,6 +52,39 @@ impl Session {
         enabled
     }
 
+    /// Apply an explicit user action to the process-local session allowlist.
+    pub(crate) async fn mutate_monty_session_network_grants(
+        &self,
+        mutation: crate::mcp::network::SessionNetworkMutation,
+    ) -> anyhow::Result<crate::mcp::network::SessionNetworkGrantSnapshot> {
+        // Do not retain the std::sync::Mutex across an await. The exclusive
+        // gate serializes this mutation against the shared egress permit;
+        // once acquired, only this short in-memory update needs the mutex.
+        let _revocation_fence = self.monty_network_egress_gate.write().await;
+        let mut grants = self
+            .monty_network_grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        grants.apply(mutation)
+    }
+
+    /// Acquire the shared session-grant fence. Governed egress retains this
+    /// permit from its final session-policy read through `RequestBuilder::send`.
+    pub(crate) async fn monty_network_egress_permit(&self) -> MontyNetworkEgressPermit {
+        MontyNetworkEgressPermit {
+            _guard: self.monty_network_egress_gate.clone().read_owned().await,
+        }
+    }
+
+    pub(crate) fn monty_session_network_grant_snapshot(
+        &self,
+    ) -> crate::mcp::network::SessionNetworkGrantSnapshot {
+        self.monty_network_grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot()
+    }
+
     /// Whether explicit sandbox escalation retries are available in this
     /// session. Approval mode still decides how an allowed escalation is gated.
     pub fn sandbox_escalation_enabled(&self) -> bool {
@@ -488,5 +521,59 @@ impl Session {
             .inspect(|_| {
                 *self.active_agent.lock().unwrap() = agent.to_string();
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn session_grant_mutation_waits_for_an_in_flight_egress_permit() {
+        let session = Arc::new(
+            Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                PathBuf::from("/monty-network-fence"),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let permit = session.monty_network_egress_permit().await;
+        let mutating_session = Arc::clone(&session);
+        let mutation = tokio::spawn(async move {
+            mutating_session
+                .mutate_monty_session_network_grants(
+                    crate::mcp::network::SessionNetworkMutation::GrantHost(
+                        crate::db::monty_network::CanonicalNetworkHost::parse("api.example.test")
+                            .unwrap(),
+                    ),
+                )
+                .await
+        });
+        // Tokio's RwLock is fair/write-preferring: once the mutation has
+        // attempted the exclusive fence, later read attempts are blocked even
+        // while this first read permit remains held. Waiting for that state
+        // makes the assertion below fail if the mutation ever stops taking its
+        // write-side revocation fence, instead of merely racing one yield.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if session.monty_network_egress_gate.try_read().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session grant mutation must attempt the write-side egress fence");
+        assert!(
+            !mutation.is_finished(),
+            "session grant mutation committed while egress retained its permit"
+        );
+        drop(permit);
+        mutation.await.unwrap().unwrap();
     }
 }

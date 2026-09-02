@@ -437,9 +437,7 @@ pub enum ProviderWizardStep {
     GrokOAuth,
     CodexOAuth,
     Saving,
-    TestKeyChoice,
     TestKey,
-    TestSkipped,
     Fetching,
     Done,
 }
@@ -459,9 +457,7 @@ impl ProviderWizardStep {
         Self::GrokOAuth,
         Self::CodexOAuth,
         Self::Saving,
-        Self::TestKeyChoice,
         Self::TestKey,
-        Self::TestSkipped,
         Self::Fetching,
         Self::Done,
     ];
@@ -480,9 +476,7 @@ impl ProviderWizardStep {
             Self::GrokOAuth => "grok-oauth",
             Self::CodexOAuth => "codex-oauth",
             Self::Saving => "saving",
-            Self::TestKeyChoice => "test-key-choice",
             Self::TestKey => "test-key",
-            Self::TestSkipped => "test-skipped",
             Self::Fetching => "fetching",
             Self::Done => "done",
         }
@@ -503,9 +497,7 @@ impl ProviderWizardStep {
             "grok-oauth" => Self::GrokOAuth,
             "codex-oauth" => Self::CodexOAuth,
             "saving" => Self::Saving,
-            "test-key-choice" => Self::TestKeyChoice,
             "test-key" => Self::TestKey,
-            "test-skipped" => Self::TestSkipped,
             "fetching" => Self::Fetching,
             "done" => Self::Done,
             _ => panic!("provider wizard descriptor used an unsealed step id `{id}`"),
@@ -1168,48 +1160,11 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 write: None,
                 branch: Some(provider_after_save_branch),
             },
-            StepDescriptor {
-                id: ProviderWizardStep::TestKeyChoice.source_id(),
-                prompt: "Test key now?",
-                help: "Default: test now. Choose skip-test to save without validation.",
-                help_hook: None,
-                kind: StepKind::Select {
-                    options: vec![
-                        SelectOption {
-                            id: "test".into(),
-                            label: "Test key".into(),
-                            description: "Validate credentials now".into(),
-                        },
-                        SelectOption {
-                            id: "skip-test".into(),
-                            label: "Skip test".into(),
-                            description: "Save now and validate on first use".into(),
-                        },
-                    ],
-                },
-                default_answer: Some(WizardAnswer::Select("test".to_string())),
-                prefill: None,
-                validate: Some(validate_select),
-                write: None,
-                branch: Some(provider_test_choice_branch),
-            },
             action_step(
                 ProviderWizardStep::TestKey.source_id(),
                 "Test key",
                 "Testing provider credentials…",
             ),
-            StepDescriptor {
-                id: ProviderWizardStep::TestSkipped.source_id(),
-                prompt: "key saved but unverified — it will be tested on your first message.",
-                help: "Continue to finish provider setup.",
-                help_hook: None,
-                kind: StepKind::Info,
-                default_answer: None,
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: Some(fetching_to_done),
-            },
             action_step(
                 ProviderWizardStep::Fetching.source_id(),
                 "Fetch models",
@@ -2258,18 +2213,11 @@ fn fetching_to_done(_: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
 
 fn provider_after_save_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
     Some(if selected_provider_template(run)?.api_key.is_some() {
-        "test-key-choice"
+        "test-key"
     } else if selected_provider_template(run)?.supports_models_endpoint {
         "fetching"
     } else {
         "done"
-    })
-}
-
-fn provider_test_choice_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
-    Some(match answer {
-        WizardAnswer::Select(value) if value == "skip-test" => "test-skipped",
-        _ => "test-key",
     })
 }
 
@@ -2278,6 +2226,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn api_key_provider_setup_enters_live_validation_without_a_skip_branch() {
+        let mut run = WizardRun::new(provider_descriptor_with_template(Some("openai"))).unwrap();
+        run.submit(WizardAnswer::Select("openai".into())).unwrap();
+        run.return_to(ProviderWizardStep::Saving.source_id())
+            .unwrap();
+        run.submit(WizardAnswer::Acknowledged).unwrap();
+
+        assert_eq!(
+            run.current_step_id(),
+            Some(ProviderWizardStep::TestKey.source_id()),
+            "saving an API-key provider must enter live credential validation"
+        );
+        assert!(
+            !ProviderWizardStep::ALL
+                .iter()
+                .any(|step| step.source_id().contains("skip")),
+            "the provider wizard must not expose an unvalidated completion branch"
+        );
+    }
 
     #[test]
     fn onboarding_model_wizard_accepts_manual_model_id_and_context() {

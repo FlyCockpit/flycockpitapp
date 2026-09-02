@@ -2896,9 +2896,9 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
             fresh.test_page(),
             TestPageRef::Providers(ProvidersPage::Add(state))
                 if state.saved_provider_id.as_deref() == Some("copilot")
-                    && state.fetch.is_none()
-                    && state.is_step("test-key-choice")
-                    && state.error.as_deref() == Some("saved.")
+                    && state.fetch.is_some()
+                    && state.is_step("test-key")
+                    && state.error.as_deref() == Some("saved. Testing key via /models…")
         ));
         let saved = load_provider(&fresh.config_path, "copilot");
         assert_eq!(saved.url, "https://api.githubcopilot.com");
@@ -2906,141 +2906,6 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
             header.name == "Authorization" && header.value == "Bearer $COPILOT_GITHUB_TOKEN"
         }));
     }
-}
-
-#[test]
-fn pointer_add_test_key_choices_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("provider key-test pointer runtime");
-    let _runtime_guard = runtime.enter();
-    use super::super::pointer_actions::{
-        ProvidersAction, SettingsPointerAction, WizardControlId, WizardTestChoice,
-    };
-
-    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
-        let template = templates::template_by_id("anthropic").unwrap();
-        let mut config = ProvidersConfig::default();
-        config
-            .providers
-            .insert("anthropic".into(), ProviderEntry::default());
-        let (tmp, mut dialog) = dialog_with_config(config);
-        let mut state = AddState::new();
-        state.template = Some(template);
-        state.id_field.set(template.id);
-        state.url_field.set(template.url);
-        state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
-        (tmp, dialog)
-    }
-
-    let (_tmp, source) = fixture();
-    let _ = render_provider_rows(&source, 110, 60);
-    let actions = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .filter_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        _,
-                        WizardControlId::TestChoice(_),
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 2, "both test-key choices are rendered");
-    for action in actions {
-        let choice = match &action {
-            SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                _,
-                WizardControlId::TestChoice(choice),
-            )) => *choice,
-            _ => unreachable!(),
-        };
-        let (_tmp, mut fresh) = fixture();
-        click_rendered_provider_action(&mut fresh, &action);
-        match choice {
-            WizardTestChoice::TestKey => assert!(matches!(
-                fresh.test_page(),
-                TestPageRef::Providers(ProvidersPage::Add(state))
-                    if state.fetch.is_some()
-                        && state.error.as_deref() == Some("Testing key via /models…")
-                        && !state.is_step("test-key-choice")
-            )),
-            WizardTestChoice::SkipTest => assert!(matches!(
-                fresh.test_page(),
-                TestPageRef::Providers(ProvidersPage::Add(state))
-                    if state.is_step("test-skipped")
-                        && state.error.as_deref().is_some_and(|message| message.contains("unverified"))
-            )),
-        }
-    }
-}
-
-#[test]
-fn pointer_add_test_skipped_continue_renders_and_dispatches_from_fresh_state() {
-    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
-
-    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
-        let template = templates::template_by_id("anthropic").unwrap();
-        let mut config = ProvidersConfig::default();
-        config
-            .providers
-            .insert("anthropic".into(), ProviderEntry::default());
-        let (tmp, mut dialog) = dialog_with_config(config);
-        let mut state = AddState::new();
-        state.template = Some(template);
-        state.id_field.set(template.id);
-        state.url_field.set(template.url);
-        state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        state.test_choice_cursor = 1;
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("test-skipped"));
-        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
-        (tmp, dialog)
-    }
-
-    let (_tmp, source) = fixture();
-    let _ = render_provider_rows(&source, 110, 60);
-    let action = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .find_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        ProviderWizardStep::TestSkipped,
-                        WizardControlId::TestSkippedContinue,
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .expect("TestSkipped publishes its exact Continue source");
-
-    let (_tmp, mut fresh) = fixture();
-    click_rendered_provider_action(&mut fresh, &action);
-    assert!(matches!(
-        fresh.test_page(),
-        TestPageRef::Providers(ProvidersPage::Add(state))
-            if state.is_step("done")
-                && state.saved_provider_id.as_deref() == Some("anthropic")
-                && state.fetch.is_none()
-                && state.error.as_deref().is_some_and(|message| message.contains("unverified"))
-    ));
 }
 
 #[test]
@@ -3059,12 +2924,8 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
         state.id_field.set(template.id);
         state.url_field.set(template.url);
         state.saved_provider_id = Some("anthropic".into());
-        state.run.return_to("test-key-choice").unwrap();
-        state.test_choice_cursor = 1;
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("test-skipped"));
-        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
-        assert!(state.is_step("done"));
+        state.run.return_to("done").unwrap();
+        state.error = Some("validated credential".into());
         dialog.page = super::super::providers_page(ProvidersPage::Add(state));
         (tmp, dialog)
     }
@@ -3095,7 +2956,7 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
     assert!(matches!(
         fresh.test_page(),
         TestPageRef::Providers(ProvidersPage::List { status, .. })
-            if status.as_deref().is_some_and(|message| message.contains("unverified"))
+            if status.as_deref() == Some("validated credential")
     ));
     assert!(fresh.config.providers.contains_key("anthropic"));
     let _saved = load_provider(&fresh.config_path, "anthropic");

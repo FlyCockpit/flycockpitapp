@@ -5862,7 +5862,7 @@ impl Dialog {
                 let mut s = SettingsDialog::open_from_picker(path, global_root);
                 if s.config.providers.contains_key(provider_id) {
                     let mut add = AddState::new_with_onboarding(true);
-                    add.resume_onboarding_validation(provider_id);
+                    s.resume_onboarding_provider_validation(&mut add, provider_id);
                     s.page = providers_page(ProvidersPage::Add(add));
                 } else {
                     let mut add = AddState::new_with_onboarding(true);

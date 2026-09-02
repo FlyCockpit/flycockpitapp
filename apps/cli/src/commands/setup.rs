@@ -1502,9 +1502,9 @@ mod tests {
                         self.saved = Some((id, entry.url));
                         io.write_line("saved")?;
                     }
-                    "fetching" => {
+                    "fetching" | "test-key" => {
                         self.fetches += 1;
-                        io.write_line("fetched")?;
+                        io.write_line("credential validated")?;
                     }
                     _ => {}
                 }
@@ -1916,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_renderer_runs_provider_wizard() {
-        let mut io = ScriptIo::new(&["openai", "", "", "advanced-headers", "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "advanced-headers"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -1936,20 +1936,13 @@ mod tests {
                 "https://api.openai.com/v1".to_string()
             ))
         );
-        assert_eq!(actions.fetches, 0);
+        assert_eq!(actions.fetches, 1, "the provider credential was validated");
         assert!(io.output.contains("Choose a provider template"));
     }
 
     #[tokio::test]
     async fn terminal_renderer_retries_copy_detected_env_from_auth_method() {
-        let mut io = ScriptIo::new(&[
-            "openai",
-            "",
-            "",
-            "copy-detected-env",
-            "advanced-headers",
-            "skip-test",
-        ]);
+        let mut io = ScriptIo::new(&["openai", "", "", "copy-detected-env", "advanced-headers"]);
         let mut actions = TestActions {
             copy_detected_env_failure: true,
             ..Default::default()
@@ -2000,15 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_renderer_back_navigation() {
-        let mut io = ScriptIo::new(&[
-            "openai",
-            "back",
-            "openai",
-            "",
-            "",
-            "advanced-headers",
-            "skip-test",
-        ]);
+        let mut io = ScriptIo::new(&["openai", "back", "openai", "", "", "advanced-headers"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -2043,19 +2028,18 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
         let secret = "sk-provider-secret-abcdefghijklmnopqrstuvwxyz";
-        let mut io = ScriptIo::new(&["openai", "", "", "", secret, "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "", secret]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
-
-        assert!(run.is_complete());
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty());
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
@@ -2081,20 +2065,18 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
         let secret = "nr-provider-secret-abcdefghijklmnopqrstuvwxyz";
-        // Explicit paste-key + skip-test so we never hit the network.
-        let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret, "skip-test"]);
+        let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .expect("wizard completes");
-
-        assert!(run.is_complete(), "output={}", io.output);
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty(), "output={}", io.output);
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
                 .expect("provider path");
@@ -2117,9 +2099,9 @@ mod tests {
             let state_home = tmp.path().join("state");
             let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
             trust_workspace_via_daemon(tmp.path()).await;
-            let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret, "skip-test"]);
+            let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret]);
             let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
-            let run = tokio::time::timeout(
+            let error = tokio::time::timeout(
                 Duration::from_secs(30),
                 run_terminal_wizard(
                     crate::wizard::provider_descriptor(),
@@ -2130,8 +2112,8 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("paste-key wizard timed out; output={}", io.output))
-            .expect("wizard completes");
-            assert!(run.is_complete(), "output={}", io.output);
+            .expect_err("setup must not finish before the fabricated key validates");
+            assert!(!error.to_string().is_empty(), "output={}", io.output);
             let provider_path =
                 crate::config::providers::provider_file_path_for_config(&config_path, "baseten")
                     .expect("provider path");
@@ -2149,8 +2131,7 @@ mod tests {
             let _env2 =
                 CockpitConfigEnvGuard::set_with_state_async(&config_path2, &state_home2).await;
             trust_workspace_via_daemon(tmp2.path()).await;
-            let mut io2 =
-                ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY", "skip-test"]);
+            let mut io2 = ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY"]);
             let mut actions2 = ProviderSetupActions::new(tmp2.path().to_path_buf());
             tokio::time::timeout(
                 Duration::from_secs(30),
@@ -2163,7 +2144,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("env-var wizard timed out; output={}", io2.output))
-            .expect("env wizard");
+            .expect_err("setup must not finish before the daemon resolves the env var");
             let raw2 = std::fs::read_to_string(
                 crate::config::providers::provider_file_path_for_config(&config_path2, "baseten")
                     .expect("path"),
@@ -2180,24 +2161,17 @@ mod tests {
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
-        let mut io = ScriptIo::new(&[
-            "nous-research",
-            "",
-            "",
-            "env-var",
-            "NOUS_API_KEY",
-            "skip-test",
-        ]);
+        let mut io = ScriptIo::new(&["nous-research", "", "", "env-var", "NOUS_API_KEY"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .expect("wizard completes");
-        assert!(run.is_complete(), "output={}", io.output);
+        .expect_err("setup must not finish before the daemon resolves the env var");
+        assert!(!error.to_string().is_empty(), "output={}", io.output);
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
                 .expect("provider path");
@@ -2218,20 +2192,18 @@ mod tests {
             "",
             "",
             "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
-            "skip-test",
         ]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        let run = run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
-
-        assert!(run.is_complete());
+        .expect_err("setup must not finish before the fabricated key validates");
+        assert!(!error.to_string().is_empty());
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
@@ -2240,10 +2212,7 @@ mod tests {
             "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
         )
         .await;
-        assert!(
-            io.output
-                .contains("key saved but unverified — it will be tested on your first message.")
-        );
+        assert!(io.output.contains("Saved provider `openai`."));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2253,17 +2222,18 @@ mod tests {
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         trust_workspace_via_daemon(tmp.path()).await;
-        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
-        run_terminal_wizard(
+        let error = run_terminal_wizard(
             crate::wizard::provider_descriptor(),
             &mut io,
             &true,
             &mut actions,
         )
         .await
-        .unwrap();
+        .expect_err("setup must not finish before the daemon resolves the env var");
+        assert!(!error.to_string().is_empty());
 
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
@@ -2281,8 +2251,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn wizard_skip_test_shows_unverified() {
-        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
+    async fn wizard_runs_live_validation_before_completion() {
+        let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY"]);
         let mut actions = TestActions::default();
 
         let run = run_terminal_wizard(
@@ -2295,10 +2265,8 @@ mod tests {
         .unwrap();
 
         assert!(run.is_complete());
-        assert!(
-            io.output
-                .contains("key saved but unverified — it will be tested on your first message.")
-        );
+        assert_eq!(actions.fetches, 1, "the live validation action ran once");
+        assert!(io.output.contains("credential validated"));
     }
 
     #[test]

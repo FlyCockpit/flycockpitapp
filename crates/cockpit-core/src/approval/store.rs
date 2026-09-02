@@ -18,12 +18,14 @@
 //! Persistence honors cockpit's existing config discovery
 //! ([`crate::config::dirs`], [`crate::git::find_worktree_root`]) — no new
 //! location scheme. Project/Global are plain JSON files written atomically
-//! (owner-only temp + fsync + rename) under a cross-process lock; Session
-//! lives in SQLite. A corrupt or unreadable `approvals.json` fails closed
-//! (issue #297): the corrupt bytes are quarantined for diagnosis — renamed
-//! aside, never deleted — and approval-dependent decisions are refused
-//! with a repair-oriented error rather than silently dropping every
-//! standing allow/reject entry.
+//! (owner-only temp + fsync + rename + directory fsync) under a
+//! cross-process lock; Session lives in SQLite. A corrupt or unreadable
+//! `approvals.json` fails closed (issue #297): the corrupt bytes are
+//! quarantined for diagnosis — renamed aside, never deleted — and every
+//! read fails closed with a repair-oriented error. That covers the
+//! decision-boundary health gate and every grant/reject lookup alike, so
+//! corruption observed at any point in a decision refuses it, rather than
+//! silently dropping every standing allow/reject entry.
 //!
 //! ## Wrappers are never persisted (priority #1)
 //!
@@ -428,6 +430,11 @@ impl GrantStore {
     /// quarantine copy from an earlier detection is still present (the
     /// store has not been repaired yet), including one left by another
     /// process.
+    ///
+    /// Every lookup below this gate fails closed on its own load too, so
+    /// corruption that lands between the gate and a decision's lookup
+    /// still refuses that decision (no TOCTOU window reads corruption as
+    /// empty approval state).
     pub fn approvals_store_health(&self) -> Result<()> {
         for dir in [
             self.project_approvals_dir.as_deref(),
@@ -437,13 +444,7 @@ impl GrantStore {
         .flatten()
         {
             if let Err(corrupt) = load_approvals(dir) {
-                tracing::error!(
-                    path = %corrupt.path.display(),
-                    preserved = ?corrupt.preserved,
-                    error = %corrupt.error,
-                    "corrupt approvals store detected; refusing approval-dependent actions fail closed"
-                );
-                return Err(anyhow::Error::msg(corrupt.refusal_message()));
+                return Err(approvals_corrupt_error(corrupt));
             }
             if let Some(residue) = find_quarantine_residue(dir) {
                 return Err(anyhow::Error::msg(quarantine_residue_refusal(&residue)));
@@ -457,36 +458,45 @@ impl GrantStore {
     /// grants are never stored, so they never show up here.
     #[cfg(test)]
     pub async fn is_command_granted(&self, key: &ApprovalKey) -> bool {
-        self.command_grant(key).await.is_some()
+        self.command_grant(key)
+            .await
+            .expect("approvals store must be healthy in tests")
+            .is_some()
     }
 
-    pub async fn command_grant(&self, key: &ApprovalKey) -> Option<CommandGrant> {
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a load error is the decision's refusal, never a silent "no grants".
+    pub async fn command_grant(&self, key: &ApprovalKey) -> Result<Option<CommandGrant>> {
+        // The durable files load first so a corrupt/unreadable store fails
+        // this decision closed even when a session grant would have matched:
+        // the lookup and the health check are one fail-closed operation,
+        // never a split "check health, then read as empty".
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let s = key.as_storage_str();
         if let Some(granted_tier) = self.session_command_grant_tier(&s).await {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier,
-            });
+            }));
         }
-        if let Some(granted_tier) = self
-            .project_file()
-            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        if let Some(granted_tier) =
+            project.and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
         {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Project,
                 granted_tier,
-            });
+            }));
         }
-        if let Some(granted_tier) = self
-            .global_file()
-            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        if let Some(granted_tier) =
+            global.and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
         {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Global,
                 granted_tier,
-            });
+            }));
         }
-        None
+        Ok(None)
     }
 
     /// Whether a command key is **rejected** at any applicable scope — the
@@ -494,84 +504,77 @@ impl GrantStore {
     /// without prompting (`DecisionSource::StandingReject`).
     #[cfg(test)]
     pub async fn is_command_rejected(&self, key: &ApprovalKey) -> bool {
-        self.command_reject_scope(key).await.is_some()
+        self.command_reject_scope(key)
+            .await
+            .expect("approvals store must be healthy in tests")
+            .is_some()
     }
 
-    pub async fn command_reject_scope(&self, key: &ApprovalKey) -> Option<Scope> {
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a corrupt file can never read as "no standing rejects".
+    pub async fn command_reject_scope(&self, key: &ApprovalKey) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let s = key.as_storage_str();
         if self
             .session_has(GrantKind::Command, &s, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.commands_reject.contains(&s))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.commands_reject.contains(&s)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.commands_reject.contains(&s))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.commands_reject.contains(&s)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
-    pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Result<Option<Scope>> {
         self.mcp_tool_grant_scope_for_key(&mcp_tool_key(server, tool))
             .await
     }
 
-    pub async fn mcp_tool_grant_scope_for_key(&self, key: &str) -> Option<Scope> {
+    pub async fn mcp_tool_grant_scope_for_key(&self, key: &str) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Allow)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.mcp_tools.contains(key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.mcp_tools.contains(key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.mcp_tools.contains(key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.mcp_tools.contains(key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
-    pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Result<Option<Scope>> {
         self.mcp_tool_reject_scope_for_key(&mcp_tool_key(server, tool))
             .await
     }
 
-    pub async fn mcp_tool_reject_scope_for_key(&self, key: &str) -> Option<Scope> {
+    pub async fn mcp_tool_reject_scope_for_key(&self, key: &str) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.mcp_tools_reject.contains(key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.mcp_tools_reject.contains(key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     /// Scope of the persisted connection grant for one exact server identity.
@@ -581,54 +584,46 @@ impl GrantStore {
         &self,
         server: &str,
         identity: &str,
-    ) -> Option<Scope> {
+    ) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let key = mcp_server_connect_key(server, identity);
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Allow)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|file| file.mcp_tools.contains(&key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|file| file.mcp_tools.contains(&key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|file| file.mcp_tools.contains(&key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|file| file.mcp_tools.contains(&key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     pub async fn mcp_server_connect_reject_scope(
         &self,
         server: &str,
         identity: &str,
-    ) -> Option<Scope> {
+    ) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let key = mcp_server_connect_key(server, identity);
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|file| file.mcp_tools_reject.contains(&key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|file| file.mcp_tools_reject.contains(&key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     pub async fn record_mcp_server_connect(
@@ -696,33 +691,44 @@ impl GrantStore {
     async fn is_path_granted(&self, path: &Path) -> bool {
         self.is_path_granted_for(path, SandboxPathAccess::Read)
             .await
+            .expect("approvals store must be healthy in tests")
     }
 
-    pub async fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
-        self.effective_path_grant_access(path)
-            .await
-            .is_some_and(|access| access >= required)
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a load error is the decision's refusal, never a silent "not granted".
+    pub async fn is_path_granted_for(
+        &self,
+        path: &Path,
+        required: SandboxPathAccess,
+    ) -> Result<bool> {
+        Ok(self
+            .effective_path_grant_access(path)
+            .await?
+            .is_some_and(|access| access >= required))
     }
 
-    pub async fn effective_path_grant_access(&self, path: &Path) -> Option<SandboxPathAccess> {
+    pub async fn effective_path_grant_access(
+        &self,
+        path: &Path,
+    ) -> Result<Option<SandboxPathAccess>> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        if self.path_reject_matches(matches).await {
-            return None;
+        if self.path_reject_matches(matches).await? {
+            return Ok(None);
         }
         let mut access: Option<SandboxPathAccess> = None;
-        for (key, grant_access) in self.path_allow_entries().await {
+        for (key, grant_access) in self.path_allow_entries().await? {
             if path_covers(&key, &candidate) {
                 access = Some(access.map_or(grant_access, |current| current.max(grant_access)));
             }
         }
-        access
+        Ok(access)
     }
 
-    pub async fn effective_path_grants(&self) -> Vec<EffectivePathGrant> {
-        let rejects = self.path_reject_entries().await;
+    pub async fn effective_path_grants(&self) -> Result<Vec<EffectivePathGrant>> {
+        let rejects = self.path_reject_entries().await?;
         let mut by_path: BTreeMap<String, SandboxPathAccess> = BTreeMap::new();
-        for (key, access) in self.path_allow_entries().await {
+        for (key, access) in self.path_allow_entries().await? {
             if rejects
                 .iter()
                 .any(|(reject, _)| paths_overlap(reject, &key))
@@ -751,16 +757,17 @@ impl GrantStore {
                 access: *access,
             });
         }
-        grants
+        Ok(grants)
     }
 
     /// Whether a path is **rejected** at any applicable scope — the allow
     /// path query's mirror (same prefix-match semantics). A standing path
-    /// reject auto-denies the out-of-cwd access without prompting.
-    pub async fn is_path_rejected(&self, path: &Path) -> bool {
+    /// reject auto-denies the out-of-cwd access without prompting. Fail
+    /// closed on a corrupt/unreadable approvals store (issue #297).
+    pub async fn is_path_rejected(&self, path: &Path) -> Result<bool> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        self.path_reject_matches(matches).await
+        Ok(self.path_reject_matches(matches).await?)
     }
 
     /// Record a command-shape **allow** grant at `scope`. Rejects wrappers and
@@ -1099,19 +1106,19 @@ impl GrantStore {
     ///
     /// Order checked: session → project → global. Within a scope a
     /// `reject` and an `accept` cannot coexist (recording one clears the
-    /// other), so the first scope with *any* rule decides.
-    pub async fn loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+    /// other), so the first scope with *any* rule decides. Fail closed on
+    /// a corrupt/unreadable approvals store (issue #297): a corrupt
+    /// persisted loop reject can never read as "no rule" (which would let
+    /// yolo mode auto-accept the repeat).
+    pub async fn loop_rule(&self, signature: &str) -> Result<Option<LoopVerdict>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if let Some(v) = self.session_loop_rule(signature).await {
-            return Some(v);
+            return Ok(Some(v));
         }
-        if let Some(v) = self
-            .project_file()
+        Ok(project
             .and_then(|f| file_loop_rule(&f, signature))
-        {
-            return Some(v);
-        }
-        self.global_file()
-            .and_then(|f| file_loop_rule(&f, signature))
+            .or_else(|| global.and_then(|f| file_loop_rule(&f, signature))))
     }
 
     /// Record a loop-guard rule for `signature` at `scope`. Recording one
@@ -1373,36 +1380,41 @@ impl GrantStore {
             .unwrap_or_default()
     }
 
-    async fn path_allow_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+    async fn path_allow_entries(&self) -> Result<Vec<(String, SandboxPathAccess)>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let mut entries = self.session_path_entries(Verdict::Allow).await;
-        if let Some(file) = self.project_file() {
+        if let Some(file) = project {
             entries.extend(file.paths);
         }
-        if let Some(file) = self.global_file() {
+        if let Some(file) = global {
             entries.extend(file.paths);
         }
-        entries
+        Ok(entries)
     }
 
-    async fn path_reject_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+    async fn path_reject_entries(&self) -> Result<Vec<(String, SandboxPathAccess)>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let mut entries = self.session_path_entries(Verdict::Reject).await;
-        if let Some(file) = self.project_file() {
+        if let Some(file) = project {
             entries.extend(file.paths_reject);
         }
-        if let Some(file) = self.global_file() {
+        if let Some(file) = global {
             entries.extend(file.paths_reject);
         }
-        entries
+        Ok(entries)
     }
 
-    async fn path_reject_matches<F>(&self, matches: F) -> bool
+    async fn path_reject_matches<F>(&self, matches: F) -> Result<bool>
     where
         F: Fn(&str) -> bool,
     {
-        self.path_reject_entries()
-            .await
+        Ok(self
+            .path_reject_entries()
+            .await?
             .iter()
-            .any(|(key, _)| matches(key))
+            .any(|(key, _)| matches(key)))
     }
 
     async fn session_insert(
@@ -1463,38 +1475,30 @@ impl GrantStore {
 
     // ---- project / global scope (JSON files) ------------------------------
 
-    /// Load the project `approvals.json`. A corrupt/unreadable file reads as
-    /// `None` (no grants) after the load quarantined it — conservative, and
-    /// the decision-boundary health gate (or the next decision's) refuses
-    /// with a visible error instead of proceeding on the dropped entries.
-    fn project_file(&self) -> Option<ApprovalsFile> {
-        let dir = self.project_approvals_dir.as_ref()?;
+    /// Load the project `approvals.json`, failing closed (issue #297): a
+    /// corrupt/unreadable store is an error carrying the repair-oriented
+    /// refusal (the load already quarantined the corrupt bytes) — never a
+    /// silent `None` that would drop every standing entry for this
+    /// decision. The decision-boundary health gate and every lookup
+    /// consume the same fail-closed load.
+    fn project_file(&self) -> Result<Option<ApprovalsFile>> {
+        let Some(dir) = self.project_approvals_dir.as_deref() else {
+            return Ok(None);
+        };
         match load_approvals(dir) {
-            Ok(file) => file,
-            Err(corrupt) => {
-                tracing::error!(
-                    path = %corrupt.path.display(),
-                    error = %corrupt.error,
-                    "corrupt project approvals store read; treating as no grants until the health gate refuses"
-                );
-                None
-            }
+            Ok(file) => Ok(file),
+            Err(corrupt) => Err(approvals_corrupt_error(corrupt)),
         }
     }
 
     /// Load the global `approvals.json`, mirroring [`Self::project_file`].
-    fn global_file(&self) -> Option<ApprovalsFile> {
-        let dir = self.global_dir.as_ref()?;
+    fn global_file(&self) -> Result<Option<ApprovalsFile>> {
+        let Some(dir) = self.global_dir.as_deref() else {
+            return Ok(None);
+        };
         match load_approvals(dir) {
-            Ok(file) => file,
-            Err(corrupt) => {
-                tracing::error!(
-                    path = %corrupt.path.display(),
-                    error = %corrupt.error,
-                    "corrupt global approvals store read; treating as no grants until the health gate refuses"
-                );
-                None
-            }
+            Ok(file) => Ok(file),
+            Err(corrupt) => Err(approvals_corrupt_error(corrupt)),
         }
     }
 
@@ -1942,6 +1946,22 @@ fn load_approvals(dir: &Path) -> std::result::Result<Option<ApprovalsFile>, Corr
     }
 }
 
+/// Log and convert a detected corrupt/unreadable approvals store into the
+/// fail-closed refusal error (issue #297). The single logging point for
+/// every approvals-file load failure: the decision-boundary health gate
+/// and every query-time load route through here, so a corrupt store
+/// surfaces as a visible, repair-oriented refusal wherever it is first
+/// read — never as empty approval state.
+fn approvals_corrupt_error(corrupt: CorruptApprovalsStore) -> anyhow::Error {
+    tracing::error!(
+        path = %corrupt.path.display(),
+        preserved = ?corrupt.preserved,
+        error = %corrupt.error,
+        "corrupt approvals store detected; failing the approval decision closed"
+    );
+    anyhow::Error::msg(corrupt.refusal_message())
+}
+
 /// Rename a corrupt approvals file aside so its contents are preserved for
 /// diagnosis — never deleted — and the store path is vacated for repair.
 /// Best-effort and collision-tolerant: on failure the original is left in
@@ -2007,16 +2027,26 @@ fn quarantine_residue_refusal(residue: &Path) -> String {
 
 /// Open a private (owner-only on unix) file for the approvals lock and the
 /// atomic temp file, so neither is ever world-readable.
+///
+/// Creation mode only applies to files this call creates (and umask can
+/// only narrow it); a **pre-existing** file keeps its old permissions. A
+/// stale `approvals.json.tmp` or `approvals.json.lock` left behind by an
+/// earlier crash or a bad umask could therefore be permissive, and
+/// truncating it would carry those permissions into the live store on
+/// rename. Tighten the mode explicitly after opening so an inherited file
+/// is owner-only too (issue #297).
 #[cfg(unix)]
 fn open_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
@@ -2070,9 +2100,28 @@ fn mutate_approvals<R>(
     Ok(value)
 }
 
+/// Durably commit a rename into `dir`: fsync the containing directory so
+/// the new directory entry survives a crash (issue #297). The temp file's
+/// `sync_all` flushes the contents but not the directory entry — without
+/// this, a crash could lose the committed rename, the live approvals
+/// store would vanish, and later decisions would mistake the store for
+/// a healthy first run (missing live files are healthy by design).
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// A directory fsync is not a meaningful operation on non-unix platforms;
+/// the atomic write relies on the rename's own ordering guarantees there.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Write `file` to `<dir>/approvals.json` atomically (owner-only temp file +
-/// fsync + rename) so a crash mid-write can't corrupt the store and the
-/// file is never world-readable. Called with the approvals lock held.
+/// fsync + rename + directory fsync) so a crash mid-write can't corrupt
+/// the store, a crash after the rename can't lose it, and the file is
+/// never world-readable. Called with the approvals lock held.
 fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
     let path = dir.join(APPROVALS_FILE);
     let tmp = dir.join(format!("{APPROVALS_FILE}.tmp"));
@@ -2085,6 +2134,7 @@ fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
             .with_context(|| format!("writing {}", tmp.display()))?;
     }
     std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
 }
 
@@ -2316,7 +2366,7 @@ mod tests {
 
         assert!(store.is_command_granted(&info.key).await);
         assert_eq!(
-            store.command_grant(&info.key).await,
+            store.command_grant(&info.key).await.unwrap(),
             Some(CommandGrant {
                 scope: Scope::Project,
                 granted_tier: RiskTier::Mutating,
@@ -2334,7 +2384,7 @@ mod tests {
         let cancelled = store.record_command(&info, RiskTier::Ordinary, Scope::Session);
         drop(cancelled);
 
-        assert_eq!(store.command_grant(&info.key).await, None);
+        assert_eq!(store.command_grant(&info.key).await.unwrap(), None);
         assert!(!store.is_command_granted(&info.key).await);
 
         store
@@ -2363,10 +2413,10 @@ mod tests {
             store.command_grant(&info.key),
         );
 
-        assert_eq!(first, Some(Scope::Session));
-        assert_eq!(second, Some(Scope::Session));
+        assert_eq!(first.unwrap(), Some(Scope::Session));
+        assert_eq!(second.unwrap(), Some(Scope::Session));
         assert!(third);
-        assert_eq!(grant, None);
+        assert_eq!(grant.unwrap(), None);
     }
 
     fn column_type(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<String> {
@@ -2414,7 +2464,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.command_grant(&info.key).await,
+            store.command_grant(&info.key).await.unwrap(),
             Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier: RiskTier::Destructive,
@@ -2464,7 +2514,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(store.command_grant(&info.key).await, None);
+        assert_eq!(store.command_grant(&info.key).await.unwrap(), None);
         assert!(!store.is_command_granted(&info.key).await);
     }
 
@@ -2482,7 +2532,7 @@ mod tests {
         info.risk.tier = RiskTier::Destructive;
 
         assert_eq!(
-            store.command_reject_scope(&info.key).await,
+            store.command_reject_scope(&info.key).await.unwrap(),
             Some(Scope::Session)
         );
     }
@@ -2768,11 +2818,13 @@ mod tests {
                 store
                     .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::Read)
                     .await
+                    .unwrap()
             );
             assert!(
                 !store
                     .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::ReadWrite)
-                    .await,
+                    .await
+                    .unwrap(),
                 "read grant must not satisfy read-write at {scope:?}"
             );
 
@@ -2820,6 +2872,7 @@ mod tests {
                 store
                     .mcp_tool_grant_scope("external", "search/query")
                     .await
+                    .unwrap()
                     .is_none()
             );
             store
@@ -2827,7 +2880,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                store.mcp_tool_grant_scope("external", "search/query").await,
+                store
+                    .mcp_tool_grant_scope("external", "search/query")
+                    .await
+                    .unwrap(),
                 Some(scope),
                 "scope {scope:?}"
             );
@@ -2835,6 +2891,7 @@ mod tests {
                 store
                     .mcp_tool_grant_scope("external/search", "query")
                     .await
+                    .unwrap()
                     .is_none(),
                 "escaped key must not collide with a different server/tool split"
             );
@@ -2882,7 +2939,8 @@ mod tests {
             assert_eq!(
                 reloaded
                     .mcp_tool_grant_scope("external", "search/query")
-                    .await,
+                    .await
+                    .unwrap(),
                 Some(scope),
                 "reload {scope:?}"
             );
@@ -2919,7 +2977,7 @@ mod tests {
             .await
             .unwrap();
 
-        let grants = store.effective_path_grants().await;
+        let grants = store.effective_path_grants().await.unwrap();
         assert!(grants.iter().any(|grant| {
             grant.path == read_dir && grant.access == SandboxPathAccess::ReadWrite
         }));
@@ -3121,11 +3179,11 @@ mod tests {
             let global = tempfile::tempdir().unwrap();
             let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
             let dir = tmp.path().join("secret");
-            assert!(!store.is_path_rejected(&dir.join("k.txt")).await);
+            assert!(!store.is_path_rejected(&dir.join("k.txt")).await.unwrap());
             store.record_path_reject(&dir, scope).await.unwrap();
             // A file under the rejected dir is covered (prefix match).
             assert!(
-                store.is_path_rejected(&dir.join("k.txt")).await,
+                store.is_path_rejected(&dir.join("k.txt")).await.unwrap(),
                 "scope {scope:?}"
             );
             assert!(
@@ -3195,7 +3253,7 @@ mod tests {
             .record_path_reject(&dir, Scope::Session)
             .await
             .unwrap();
-        assert!(store.is_path_rejected(&dir.join("x")).await);
+        assert!(store.is_path_rejected(&dir.join("x")).await.unwrap());
         assert!(
             !store.is_path_granted(&dir.join("x")).await,
             "reject cleared allow"
@@ -3207,7 +3265,7 @@ mod tests {
             .unwrap();
         assert!(store.is_path_granted(&dir.join("x")).await);
         assert!(
-            !store.is_path_rejected(&dir.join("x")).await,
+            !store.is_path_rejected(&dir.join("x")).await.unwrap(),
             "allow cleared reject"
         );
     }
@@ -3223,7 +3281,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search").await,
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Project)
         );
 
@@ -3232,13 +3293,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_reject_scope("external", "search").await,
+            store
+                .mcp_tool_reject_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Session)
         );
         assert!(
             store
                 .mcp_tool_grant_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
 
@@ -3247,13 +3312,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search").await,
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Global)
         );
         assert!(
             store
                 .mcp_tool_reject_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -3327,7 +3396,7 @@ mod tests {
             store.record_path_reject(&p, Scope::Once).await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(!store.is_path_rejected(&p).await);
+        assert!(!store.is_path_rejected(&p).await.unwrap());
     }
 
     #[tokio::test]
@@ -3406,19 +3475,25 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
-        assert!(store.loop_rule(&sig).await.is_none());
+        assert!(store.loop_rule(&sig).await.unwrap().is_none());
         store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Reject)
+        );
         // Recording the opposite verdict at the same scope flips it (no
         // contradictory pair persists).
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3442,7 +3517,10 @@ mod tests {
         );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
-        assert_eq!(reloaded.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            reloaded.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3463,7 +3541,10 @@ mod tests {
             .await
             .unwrap();
         // Session (reject) wins over project (accept).
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Reject)
+        );
     }
 
     #[tokio::test]
@@ -3481,7 +3562,10 @@ mod tests {
             .await
             .unwrap();
         // Project (accept) wins over global (reject).
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3496,7 +3580,7 @@ mod tests {
                 .await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(store.loop_rule(&sig).await.is_none());
+        assert!(store.loop_rule(&sig).await.unwrap().is_none());
     }
 
     // ---- management API (`/permissions`) ---------------------------------
@@ -3752,6 +3836,7 @@ mod tests {
             store
                 .mcp_tool_grant_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -3787,7 +3872,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.command_reject_scope(&info.key).await,
+            store.command_reject_scope(&info.key).await.unwrap(),
             Some(Scope::Project)
         );
 
@@ -3823,9 +3908,72 @@ mod tests {
 
         // The standing reject is honored again.
         assert_eq!(
-            store.command_reject_scope(&info.key).await,
+            store.command_reject_scope(&info.key).await.unwrap(),
             Some(Scope::Project)
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_store_fails_the_lookup_itself_closed() {
+        // Issue #297: the health check and the authorization lookup are one
+        // fail-closed operation. A store that goes corrupt between a
+        // decision-boundary health gate and the decision's own lookup must
+        // fail that decision at the lookup — never be consumed as empty
+        // approval state (which would silently drop the standing reject).
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("rm", Some("-rf"), false);
+        store
+            .record_command_reject(&info, Scope::Project)
+            .await
+            .unwrap();
+
+        // Corrupt the persisted store (the TOCTOU window: this lands after
+        // any earlier health check passed). Each detection quarantines the
+        // corrupt copy aside, so the bytes are re-written before probing
+        // each query surface.
+        let dir = test_project_dir(&store).to_path_buf();
+        let store_path = dir.join(APPROVALS_FILE);
+        let corrupt_bytes = b"{\"commands_reject\": ".as_slice();
+        let re_corrupt = || std::fs::write(&store_path, corrupt_bytes).unwrap();
+
+        // The lookup itself refuses with the repair-oriented error — no
+        // separate health check is required for the decision to see the
+        // corruption.
+        re_corrupt();
+        let err = match store.command_reject_scope(&info.key).await {
+            Ok(scope) => panic!("corrupt store must fail the lookup closed, got {scope:?}"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("approvals.json"), "{err}");
+
+        // The same fail-closed read holds for every other file-backed
+        // query surface.
+        let loop_sig = GrantStore::loop_signature("bash", &serde_json::json!({"command": "ls"}));
+        re_corrupt();
+        assert!(store.loop_rule(&loop_sig).await.is_err());
+        re_corrupt();
+        assert!(
+            store
+                .is_path_granted_for(&tmp.path().join("x"), SandboxPathAccess::Read)
+                .await
+                .is_err()
+        );
+        re_corrupt();
+        assert!(
+            store
+                .mcp_tool_reject_scope("external", "search")
+                .await
+                .is_err()
+        );
+
+        // The corrupt bytes were preserved for diagnosis — renamed aside,
+        // never deleted — and the active store path is vacated.
+        assert!(!store_path.exists());
+        let residue = find_quarantine_residue(&dir).expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
     }
 
     #[tokio::test]
@@ -3880,10 +4028,50 @@ mod tests {
         assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
     }
 
+    /// Child-probe writer id for the cross-process lock test: the parent
+    /// re-executes this test binary as a separate child process with this
+    /// variable (and the dir variable below) set, and the probe performs
+    /// one locked read-modify-write cycle before returning.
+    const APPROVALS_LOCK_PROBE_WRITER: &str = "COCKPIT_TEST_APPROVALS_LOCK_WRITER";
+    /// Child-probe approvals dir for the cross-process lock test.
+    const APPROVALS_LOCK_PROBE_DIR: &str = "COCKPIT_TEST_APPROVALS_LOCK_DIR";
+
     #[test]
     fn approvals_writes_are_serialized_and_owner_private() {
+        // Child-probe mode: run one locked read-modify-write cycle and
+        // return. This keeps the serialization test on the real
+        // cross-process boundary (issue #297) instead of only the
+        // intra-process one: a regression that keeps threads serialized
+        // but loses inter-process exclusion fails the parent's assertions.
+        if let (Ok(writer), Ok(dir)) = (
+            std::env::var(APPROVALS_LOCK_PROBE_WRITER),
+            std::env::var(APPROVALS_LOCK_PROBE_DIR),
+        ) {
+            mutate_approvals(Path::new(&dir), move |file| {
+                file.commands_reject.insert(format!("key-{writer}"));
+                (true, ())
+            })
+            .expect("probe approvals write");
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join(APPROVALS_FILE);
+
+        // Pre-existing permissive temp/lock files, as a stale file from an
+        // earlier crash or a bad umask would leave behind: the writer must
+        // tighten them instead of truncating the permissive temp and
+        // renaming it into the live store (issue #297).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = dir.path().join(format!("{APPROVALS_FILE}.tmp"));
+            std::fs::write(&tmp, b"stale").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+            let lock = dir.path().join(APPROVALS_LOCK_FILE);
+            std::fs::write(&lock, b"").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
 
         // Seed one entry.
         mutate_approvals(dir.path(), |file| {
@@ -3893,24 +4081,33 @@ mod tests {
         .unwrap();
 
         // Concurrent read-modify-write cycles must serialize under the
-        // cross-process lock: every writer's entry survives.
-        let mut handles = Vec::new();
-        for writer in 0..8u32 {
-            let dir = dir.path().to_path_buf();
-            handles.push(std::thread::spawn(move || {
-                mutate_approvals(&dir, move |file| {
-                    file.commands_reject.insert(format!("key-{writer}"));
-                    (true, ())
-                })
-                .unwrap();
-            }));
+        // cross-process lock: every writer's entry survives. The writers
+        // are real child processes (the probe mode above) spawned
+        // together, so the lock is exercised across overlapping
+        // processes — a regression that keeps threads serialized but
+        // loses inter-process exclusion clobbers entries here.
+        const WRITERS: u32 = 8;
+        let exe = std::env::current_exe().unwrap();
+        let test_name = "cockpit_core::approval::store::tests::approvals_writes_are_serialized_and_owner_private";
+        let mut children = Vec::new();
+        for writer in 0..WRITERS {
+            let child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg(test_name)
+                .env(APPROVALS_LOCK_PROBE_WRITER, writer.to_string())
+                .env(APPROVALS_LOCK_PROBE_DIR, dir.path().as_os_str())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawning approvals writer probe");
+            children.push(child);
         }
-        for handle in handles {
-            handle.join().unwrap();
+        for (writer, mut child) in children.into_iter().enumerate() {
+            let status = child.wait().expect("waiting for approvals writer probe");
+            assert!(status.success(), "writer {writer} failed");
         }
 
         let file = load_approvals(dir.path()).unwrap().unwrap();
-        for writer in 0..8u32 {
+        for writer in 0..WRITERS {
             assert!(
                 file.commands_reject.contains(&format!("key-{writer}")),
                 "writer {writer}'s entry was clobbered"
@@ -3919,7 +4116,8 @@ mod tests {
         assert!(file.commands_reject.contains("seed"));
         assert!(store_path.exists());
 
-        // The store file and the lock file are never world-readable.
+        // The store file and the lock file are never world-readable —
+        // including when they started as pre-existing permissive files.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -3947,8 +4145,11 @@ mod tests {
             .record_loop_rule(&sig_a, LoopVerdict::Accept, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig_a).await, Some(LoopVerdict::Accept));
-        assert!(store.loop_rule(&sig_b).await.is_none());
+        assert_eq!(
+            store.loop_rule(&sig_a).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
+        assert!(store.loop_rule(&sig_b).await.unwrap().is_none());
     }
 
     // ---- live approval-policy reload (approval-policy-live-reload) --------
@@ -4282,17 +4483,25 @@ mod mcp_server_connect_grant_tests {
         assert_eq!(
             store
                 .mcp_server_connect_grant_scope("server", original)
-                .await,
+                .await
+                .unwrap(),
             Some(Scope::Project)
         );
         assert_eq!(
             store
                 .mcp_server_connect_grant_scope("server", changed)
-                .await,
+                .await
+                .unwrap(),
             None
         );
         // A server-connect grant cannot become an external tool grant.
-        assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
+        assert_eq!(
+            store
+                .mcp_tool_grant_scope("server", original)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
 

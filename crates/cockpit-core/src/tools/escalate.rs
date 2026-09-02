@@ -248,7 +248,7 @@ async fn approval_for_escalation(
             let standing_reject = if let Some(approver) = ctx.approver.as_ref() {
                 approver
                     .command_standing_reject_scope(command)
-                    .await
+                    .await?
                     .map(|scope| (approver, scope))
             } else {
                 None
@@ -287,7 +287,7 @@ async fn prompt_user(
     let Some(approver) = ctx.approver.as_ref() else {
         return Ok(EscalationApproval::Deny);
     };
-    if let Some(scope) = approver.command_standing_reject_scope(command).await {
+    if let Some(scope) = approver.command_standing_reject_scope(command).await? {
         approver
             .record_standing_reject_decision("bash", command, scope)
             .await;
@@ -459,7 +459,8 @@ mod tests {
             !approver
                 .store()
                 .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
-                .await,
+                .await
+                .unwrap(),
             "yolo must not record grants"
         );
 
@@ -482,7 +483,8 @@ mod tests {
             approver
                 .store()
                 .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
-                .await,
+                .await
+                .unwrap(),
             "manual human grant records path"
         );
 

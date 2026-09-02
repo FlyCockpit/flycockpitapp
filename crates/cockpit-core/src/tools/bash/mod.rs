@@ -559,7 +559,7 @@ async fn call_bash_inner(
 
     let escalation_preauthorized_scope =
         if ctx.write_scope.is_none() && ctx.workspace_lease.is_none() {
-            command_escalation_preauthorized(ctx, command).await
+            command_escalation_preauthorized(ctx, command).await?
         } else {
             None
         };
@@ -610,7 +610,7 @@ async fn call_bash_inner(
         ),
         ctx,
     )
-    .await;
+    .await?;
     let resource_plan = build_resource_plan(
         declared_resources,
         &extended_config.resource_scheduler,
@@ -1722,7 +1722,7 @@ fn availability_notice_reason(
 async fn command_resource_plan_with_user_grants(
     mut plan: crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
-) -> crate::tools::command_resource_profiles::CommandResourcePlan {
+) -> Result<crate::tools::command_resource_profiles::CommandResourcePlan> {
     if let Some(scope) = ctx.write_scope.as_ref() {
         plan.allow_paths
             .push(crate::tools::shell_sandbox::ExtraSandboxPath {
@@ -1732,13 +1732,17 @@ async fn command_resource_plan_with_user_grants(
             });
     }
     let Some(approver) = ctx.approver.as_ref() else {
-        return plan;
+        return Ok(plan);
     };
+    // Issue #297 fail-closed store health: the sandbox plan is built from
+    // the approval store's path grants, so a corrupt/unreadable store
+    // refuses the bash call with the repair-oriented error instead of
+    // silently planning around dropped grants/rejects.
     plan.allow_paths.extend(
         approver
             .store()
             .effective_path_grants()
-            .await
+            .await?
             .into_iter()
             .map(|grant| crate::tools::shell_sandbox::ExtraSandboxPath {
                 kind: "user_grant".to_string(),
@@ -1746,35 +1750,42 @@ async fn command_resource_plan_with_user_grants(
                 access: grant.access,
             }),
     );
-    plan
+    Ok(plan)
 }
 
 /// Whether *every* simple command in `command` already has a qualifying
 /// command grant. A grant never skips the sandbox; it only preauthorizes the
 /// unconfined rerun when a confined failure produces a trusted escalation
 /// offer. A wrapper, an ungranted command, or no approver all return `None`.
-/// Pure store reads — never prompts here.
+/// Pure store reads — never prompts here. Fails closed on a corrupt
+/// approvals store (issue #297): the caller refuses the bash call with the
+/// repair-oriented error instead of treating a corrupt store as ungranted.
 async fn command_escalation_preauthorized(
     ctx: &ToolCtx,
     command: &str,
-) -> Option<crate::approval::store::Scope> {
-    let approver = ctx.approver.as_ref()?;
+) -> Result<Option<crate::approval::store::Scope>> {
+    let Some(approver) = ctx.approver.as_ref() else {
+        return Ok(None);
+    };
     let classification = crate::approval::classify::classify(command);
     let simple = classification.simple_commands();
     if simple.is_empty() || classification.has_wrapper() {
         // Empty / unparseable / no simple commands, or any wrapper → not
         // preauthorized (a wrapper is never persistable).
-        return None;
+        return Ok(None);
     }
     let mut narrowest = crate::approval::store::Scope::Global;
     for info in simple {
-        let scope =
-            crate::approval::command_grant_scope_allowed_by_policy(approver.store(), info).await?;
+        let Some(scope) =
+            crate::approval::command_grant_scope_allowed_by_policy(approver.store(), info).await?
+        else {
+            return Ok(None);
+        };
         if scope.rank() < narrowest.rank() {
             narrowest = scope;
         }
     }
-    Some(narrowest)
+    Ok(Some(narrowest))
 }
 
 async fn defensive_human_escalation_offer(

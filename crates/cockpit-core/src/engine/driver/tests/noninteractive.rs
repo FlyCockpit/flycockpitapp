@@ -1170,10 +1170,12 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
     let mut granted = false;
     for _ in 0..200 {
         if provider.request_count() >= 1
-            && probe_rt.block_on(approver.store().is_path_granted_for(
-                &scope,
-                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-            ))
+            && probe_rt
+                .block_on(approver.store().is_path_granted_for(
+                    &scope,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                ))
+                .unwrap()
         {
             granted = true;
             break;
@@ -2848,10 +2850,12 @@ fn single_delegation_runs_under_pinned_generation_across_refresh() {
     let mut dispatched_and_granted = false;
     for _ in 0..200 {
         if provider.request_count() >= 1
-            && probe_rt.block_on(approver.store().is_path_granted_for(
-                &scope,
-                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-            ))
+            && probe_rt
+                .block_on(approver.store().is_path_granted_for(
+                    &scope,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                ))
+                .unwrap()
         {
             dispatched_and_granted = true;
             break;
@@ -4706,7 +4710,8 @@ async fn delegated_build_failure_dispatches_nothing() {
                 &scope,
                 crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
             )
-            .await,
+            .await
+            .unwrap(),
         "no write-scope grant on a fail-closed preflight"
     );
 
@@ -5209,7 +5214,8 @@ async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
                 &scope,
                 crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
             )
-            .await,
+            .await
+            .unwrap(),
         "preflight must not pregrant the write scope"
     );
 
@@ -5490,7 +5496,8 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
                     &scope,
                     crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
                 )
-                .await,
+                .await
+                .unwrap(),
             "the deferred write scope must not be pregranted while the predecessor is blocked"
         );
         let blocked_events = session.db.list_session_events(session.id).await.unwrap();

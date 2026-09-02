@@ -488,8 +488,8 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_api_key_field_renders_and_dispatches_from_fresh_state();
     pointer_add_env_var_field_renders_and_dispatches_from_fresh_state();
     pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state();
-    pointer_add_test_key_choices_render_and_dispatch_from_fresh_state();
-    pointer_add_test_skipped_continue_renders_and_dispatches_from_fresh_state();
+    pointer_add_test_key_waiting_surface_has_no_validation_bypass_action();
+    onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline();
     pointer_add_done_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
@@ -2906,6 +2906,41 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
             header.name == "Authorization" && header.value == "Bearer $COPILOT_GITHUB_TOKEN"
         }));
     }
+}
+
+#[test]
+fn pointer_add_test_key_waiting_surface_has_no_validation_bypass_action() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+
+    let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+    let mut state = AddState::new_with_onboarding(true);
+    state.saved_provider_id = Some("anthropic".into());
+    state
+        .run
+        .return_to(ProviderWizardStep::TestKey.source_id())
+        .expect("provider validation step exists");
+    dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+
+    let _ = render_provider_rows(&dialog, 110, 60);
+    assert!(
+        !dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                matches!(
+                    &target.action,
+                    super::super::shell::SettingsPointerAction::Page(
+                        SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            ProviderWizardStep::TestKey,
+                            _,
+                        )),
+                    )
+                )
+            }),
+        "live credential validation must not publish a clickable bypass action"
+    );
 }
 
 #[test]

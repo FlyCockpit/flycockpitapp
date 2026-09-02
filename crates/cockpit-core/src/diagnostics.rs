@@ -2343,7 +2343,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn doctor_network_check_injects_a_store_for_dynamic_provider_auth() {
-        let _env = crate::test_env::isolated_cockpit_home_async().await;
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let store = crate::credentials::CredentialStore::open_default().expect("credential store");
         let mut cfg = network_cfg("http://127.0.0.1:9/v1".to_string());
         let provider = cfg.providers.get_mut("zai-test").expect("test provider");

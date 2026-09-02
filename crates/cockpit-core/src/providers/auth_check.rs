@@ -72,9 +72,9 @@ pub async fn check_provider_auth_with_store(
         }
         None => {
             if entry.auth_command.is_some() || entry.oauth.is_some() {
-                anyhow::bail!(
+                return Err(AuthCheckError::Other(format!(
                     "provider `{provider_id}` configured authentication requires an injected credential store"
-                );
+                )));
             }
             models_fetch::resolve_provider_request_with_env(provider_id, entry, |name| {
                 env_lookup(name)
@@ -371,7 +371,7 @@ mod tests {
         const OVERLAY_ONLY_KEY: &str = "AUTH_CHECK_OVERLAY_ONLY_KEY";
         const OVERLAY_ONLY_VALUE: &str = "sk-overlay-only";
 
-        let env = crate::test_env::isolated_cockpit_home_async().await;
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         env.remove_var(OVERLAY_ONLY_KEY);
         let (base, request_rx) =
             one_shot_server_capturing_request(StatusCode::OK, r#"{"data":[{"id":"gpt-test"}]}"#)

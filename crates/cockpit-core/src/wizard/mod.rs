@@ -443,7 +443,7 @@ pub enum ProviderWizardStep {
 }
 
 impl ProviderWizardStep {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 16] = [
         Self::Template,
         Self::WireApi,
         Self::ProviderId,

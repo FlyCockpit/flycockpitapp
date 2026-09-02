@@ -15,6 +15,11 @@ name: CLI CI
       - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Supply-chain gates (issue #306): advisory/license/ban policy and the
+      # CI-wired guardrail scripts must re-run when their config changes.
+      - "deny.toml"
+      - "scripts/check-production-secret-opens.sh"
+      - "scripts/check-unsafe-safety-comments.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -27,6 +32,11 @@ name: CLI CI
       - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Supply-chain gates (issue #306): advisory/license/ban policy and the
+      # CI-wired guardrail scripts must re-run when their config changes.
+      - "deny.toml"
+      - "scripts/check-production-secret-opens.sh"
+      - "scripts/check-unsafe-safety-comments.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   workflow_dispatch:
@@ -145,6 +155,16 @@ jobs:
       - name: Check Code-root constructor inventory
         run: bash scripts/check-code-root-constructors.sh
 
+      # Vault-open guardrail (issue #306): no CI job or hook ran this before;
+      # it is now part of the serialized Rust gate on every leg.
+      - name: Check production-path secret opens
+        run: bash scripts/check-production-secret-opens.sh
+
+      # SAFETY-comment ratchet (issue #306): the undocumented-unsafe-site count
+      # may not grow past the ceiling recorded in the script.
+      - name: Check unsafe SAFETY comment ratchet
+        run: bash scripts/check-unsafe-safety-comments.sh
+
       - name: Doc tests
         run: cargo test --locked --workspace --exclude tenant-authority --doc
 
@@ -166,6 +186,42 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  supply-chain:
+    name: Cargo audit + deny
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Prebuilt, checksum-verified binaries from GitHub Releases; versions
+      # pinned and bumped deliberately (issue #306).
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+
+      # Fails on any RUSTSEC advisory affecting the locked graph except the
+      # time-bounded, audited exceptions (owner decision 2026-09-01, issue
+      # #306). The --ignore IDs mirror deny.toml [advisories].ignore, which
+      # holds the full reasoning and review-by dates; keep them in lockstep.
+      - name: cargo audit
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2023-0089
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2026-0176
+          --ignore RUSTSEC-2026-0177
+
+      # Advisory, license, ban, and source policy against the whole locked
+      # graph. New advisories outside the deny.toml exceptions, off-allowlist
+      # licenses, yanked crates outside ignore_yanked, any OpenSSL/native-TLS
+      # outside the pinned firecrawl stack, and unknown registries or git
+      # sources all fail (issue #306).
+      - name: cargo deny
+        run: cargo deny --config deny.toml check advisories bans licenses sources
 
   grok-subscription:
     name: SuperGrok subscription feature

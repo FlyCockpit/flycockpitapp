@@ -185,11 +185,19 @@ tree-sitter-go = { workspace = true }
 tree-sitter-c = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 rayon = { workspace = true }
-firecrawl = "2"
+# Pinned, audited exception (owner decision 2026-09-01, issue #306): KEEP
+# firecrawl exact-pinned here. It drags a second reqwest 0.12 + OpenSSL/native-TLS
+# stack into the otherwise rustls-only binary; the exception is documented and
+# contained in deny.toml ([advisories]/[bans]). Do not widen this pin without
+# re-auditing that stack and updating deny.toml in the same change.
+firecrawl = "=2.12.1"
 jsonc-parser = { workspace = true }
 # Generated SVG trust boundary. Exact direct pins; both run without optional
 # default features so parser/sanitizer behavior cannot drift through features.
-quick-xml = { version = "=0.39.4", default-features = false }
+# quick-xml 0.41.0 is the first release fixing RUSTSEC-2026-0194 (quadratic
+# duplicate-attribute check) and RUSTSEC-2026-0195 (unbounded namespace
+# allocation); both advisories affect 0.39.x, which parsed model-generated SVG.
+quick-xml = { version = "=0.41.0", default-features = false }
 svg-hush = { version = "=0.9.6", default-features = false }
 
 # Native secure key store: keyring-core on every target; exactly one native

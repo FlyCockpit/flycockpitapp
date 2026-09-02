@@ -740,10 +740,13 @@ impl<'ast> Visit<'ast> for CoreGraphicsPostAudit {
 fn physical_backend_irreversible_primitive_inventory() {
     let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mac = std::fs::read_to_string(core.join("computer/macos_backend.rs")).unwrap();
+    let windows =
+        std::fs::read_to_string(core.join("computer/platform/windows_native.rs")).unwrap();
     let computer = std::fs::read_to_string(core.join("computer/mod.rs")).unwrap();
     let coordinator = std::fs::read_to_string(core.join("computer/coordinator.rs")).unwrap();
     let computer_syntax = syn::parse_file(&computer).expect("parse computer module");
     let mac_syntax = syn::parse_file(&mac).expect("parse mac backend");
+    let windows_syntax = syn::parse_file(&windows).expect("parse windows backend");
     let coordinator_syntax = syn::parse_file(&coordinator).expect("parse coordinator");
     let backend_trait = computer_syntax
         .items
@@ -761,6 +764,7 @@ fn physical_backend_irreversible_primitive_inventory() {
     for (syntax, name) in [
         (&computer_syntax, "VirtualDisplayBackend"),
         (&mac_syntax, "MacOsComputerBackend"),
+        (&windows_syntax, "WindowsDesktopBackend"),
     ] {
         let structure = syntax
             .items
@@ -869,6 +873,7 @@ fn physical_backend_irreversible_primitive_inventory() {
     assert!(!driver_calls.0.iter().any(|call| {
         call.ends_with("VirtualDisplayBackend::construct")
             || call.ends_with("MacOsComputerBackend::construct")
+            || call.ends_with("WindowsDesktopBackend::construct")
     }));
 }
 

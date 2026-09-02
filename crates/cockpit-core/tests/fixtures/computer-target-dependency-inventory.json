@@ -14,7 +14,16 @@
         "libc"
       ],
       "objc2-color-sync": ["std", "ColorSyncDevice"],
-      "objc2-core-foundation": ["std", "CFArray", "CFDictionary", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"],
+      "objc2-core-foundation": [
+        "std",
+        "CFArray",
+        "CFDictionary",
+        "CFFileDescriptor",
+        "CFNumber",
+        "CFRunLoop",
+        "CFString",
+        "CFUUID"
+      ],
       "objc2-core-graphics": [
         "std",
         "CGDirectDisplay",

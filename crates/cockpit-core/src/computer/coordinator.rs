@@ -44,6 +44,8 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+use super::NormalizedComputerAction;
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
     MediaReservationHandle, ObservationId, ProviderMediaVariant, SanitizedComputerFrame,
@@ -62,7 +64,8 @@ use super::{
     Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
     ComputerActionOutcome, ComputerBackend, ComputerBatchReport, ComputerError, ComputerFailure,
     ComputerToolContract, DisplayGeometry, NativeComputerWire, OpenAiComputerAction,
-    parse_anthropic_20250124_action, parse_anthropic_20251124_action, parse_openai_computer_call,
+    execute_backend_action, execute_backend_batch, parse_anthropic_20250124_action,
+    parse_anthropic_20251124_action, parse_openai_computer_call,
 };
 
 /// Sole production physical/virtual backend construction factory. Physical
@@ -77,7 +80,16 @@ pub(crate) fn construct_platform_backend(
         return super::macos_backend::MacOsComputerBackend::construct(target, grant_store)
             .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if target == super::DisplayTarget::RealDesktop {
+            return super::platform::WindowsDesktopBackend::construct(target, grant_store)
+                .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>);
+        }
+        return super::VirtualDisplayBackend::construct(target, grant_store)
+            .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         super::VirtualDisplayBackend::construct(target, grant_store)
             .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>)
@@ -188,10 +200,10 @@ impl HostLeaseToken {
 }
 
 /// Bind an approval to the exact canonical action list without storing a
-/// potentially sensitive typed-text payload.  `ComputerAction` is the
-/// post-parser, post-normalization representation that reaches dispatch, so
-/// this digest changes for action kind, coordinates, key chords, text, and
-/// batch order alike.
+/// potentially sensitive typed-text payload. `ComputerAction` is the
+/// post-parser canonical representation authorized before geometry-dependent
+/// normalization, so this digest changes for action kind, coordinates,
+/// canonical key identities, text, and batch order alike.
 fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> String {
     fn bytes(digest: &mut Sha256, value: &[u8]) {
         digest.update((value.len() as u64).to_be_bytes());
@@ -322,9 +334,9 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
             }
             ComputerAction::KeyChord { chord } => {
                 digest.update([9]);
-                digest.update((chord.keys.len() as u64).to_be_bytes());
-                for key in &chord.keys {
-                    bytes(&mut digest, key.as_bytes());
+                digest.update((chord.keys().len() as u64).to_be_bytes());
+                for key in chord.keys() {
+                    bytes(&mut digest, key.as_str().as_bytes());
                 }
             }
             ComputerAction::HoldKey {
@@ -332,7 +344,7 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
                 duration: action_duration,
             } => {
                 digest.update([10]);
-                bytes(&mut digest, key.as_bytes());
+                bytes(&mut digest, key.as_str().as_bytes());
                 duration(&mut digest, *action_duration);
             }
             ComputerAction::Scroll {
@@ -358,6 +370,13 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn canonicalization_failure(index: usize, error: ComputerError) -> CoordinatedOutcome {
+    CoordinatedOutcome::Failed {
+        failure: ComputerFailure { index, error },
+        screenshot: None,
+    }
 }
 
 /// The target identifiers themselves are host secrets.  The approval only
@@ -1072,19 +1091,20 @@ impl HostInputArbiter {
         self.try_acquire_with_key(target_key, target_key, delegation)
     }
 
-    /// Acquire an X11 lease. Evidence remains monitor-sensitive, but xdotool
-    /// injection is global to the X server/session and therefore shares one
-    /// arbitration key across its RandR outputs.
-    fn try_acquire_x11(
+    /// Acquire an input-session lease. Evidence remains monitor-sensitive, but
+    /// the injection API is global to the named desktop session and therefore
+    /// shares one arbitration key across every physical display it can drive.
+    fn try_acquire_input_session(
         &mut self,
         target_key: &PhysicalTargetKey,
+        namespace: &'static [u8],
         delegation: DelegationId,
     ) -> AcquireResult {
         let arbitration_key = PhysicalTargetKey::new(
             target_key.host_installation_id,
             target_key.platform_session_or_seat_id,
             crate::computer::host_identity::domain_hash(
-                b"cockpit.x11.input-arbiter.v1",
+                namespace,
                 &[&target_key.platform_session_or_seat_id],
             ),
         );
@@ -1483,9 +1503,19 @@ async fn acquire_host_lease(
         let acquired = {
             let mut arbiter = lock_poison_safe(arbiter);
             match backend_kind {
-                BackendKind::RealDesktopX11 => {
-                    arbiter.try_acquire_x11(physical_key, delegation.clone())
-                }
+                BackendKind::RealDesktopX11 => arbiter.try_acquire_input_session(
+                    physical_key,
+                    b"cockpit.x11.input-arbiter.v1",
+                    delegation.clone(),
+                ),
+                // SendInput controls session-global keyboard, pointer, focus,
+                // and absolute virtual-desktop coordinates. A monitor-specific
+                // evidence key must therefore not partition its host lease.
+                BackendKind::RealDesktopWindows => arbiter.try_acquire_input_session(
+                    physical_key,
+                    b"cockpit.windows.input-arbiter.v1",
+                    delegation.clone(),
+                ),
                 BackendKind::RealDesktopMacOs => {
                     arbiter.try_acquire_macos(physical_key, delegation.clone())
                 }
@@ -3515,7 +3545,8 @@ impl ComputerActionCoordinator {
             .insert(call_id.to_string(), DispatchState::Dispatching);
 
         // Execute through the backend.
-        let report: ComputerBatchReport = self.backend.execute(actions).await;
+        let report: ComputerBatchReport =
+            execute_backend_batch(self.backend.as_mut(), actions).await;
         let cleanup_failure = self.neutralize_input_under_host_lease().err();
         if let Some(error) = &cleanup_failure {
             // Input neutralization failed after backend dispatch. Fence this
@@ -3706,10 +3737,12 @@ impl ComputerActionCoordinator {
         &mut self,
         call_id: &str,
     ) -> (Option<SanitizedComputerFrame>, Option<LiveComputerFrame>) {
-        let capture = match self.backend.execute_one(&ComputerAction::CaptureFull).await {
-            Ok(c) => c,
-            Err(_) => return (None, None),
-        };
+        let capture =
+            match execute_backend_action(self.backend.as_mut(), &ComputerAction::CaptureFull).await
+            {
+                Ok(c) => c,
+                Err(_) => return (None, None),
+            };
         // A host lease or target can become stale while CaptureFull is
         // awaiting. Discard both the live frame and its durable projection on
         // that race; the already-completed input is never retried.
@@ -4249,10 +4282,13 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
-        let backend_actions = actions
-            .iter()
-            .flat_map(OpenAiComputerAction::to_backend_actions)
-            .collect();
+        let mut backend_actions = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            match action.to_backend_actions() {
+                Ok(actions) => backend_actions.extend(actions),
+                Err(error) => return canonicalization_failure(index, error),
+            }
+        }
         self.execute_actions_unscoped(
             call_id,
             backend_actions,
@@ -4454,12 +4490,17 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
-        self.execute_actions_unscoped(
-            call_id,
-            action.to_backend_actions(),
-            "anthropic_20251124_call".to_string(),
-        )
-        .await
+        match action.to_backend_actions() {
+            Ok(actions) => {
+                self.execute_actions_unscoped(
+                    call_id,
+                    actions,
+                    "anthropic_20251124_call".to_string(),
+                )
+                .await
+            }
+            Err(error) => canonicalization_failure(0, error),
+        }
     }
 
     /// Execute an Anthropic 2025-01-24 computer call through the coordinator.
@@ -4491,12 +4532,17 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
-        self.execute_actions_unscoped(
-            call_id,
-            action.to_backend_actions(),
-            "anthropic_20250124_call".to_string(),
-        )
-        .await
+        match action.to_backend_actions() {
+            Ok(actions) => {
+                self.execute_actions_unscoped(
+                    call_id,
+                    actions,
+                    "anthropic_20250124_call".to_string(),
+                )
+                .await
+            }
+            Err(error) => canonicalization_failure(0, error),
+        }
     }
 
     /// Cancel an action before dispatch. Cancellation before the dispatching
@@ -5249,11 +5295,11 @@ mod tests {
         sample_physical_evidence,
     };
     use super::super::{
-        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ClickCount,
-        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
-        ComputerToolContract, CoordinateSpace, DisplayGeometry, Easing, FakeBackend, KeyChord,
-        LogicalSize, Modifiers, MouseButton, OpenAiComputerAction, PixelSize, Point,
-        ProviderPointerButton, Rect, ScaleFactor,
+        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, CanonicalKeyChord,
+        ClickCount, ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
+        ComputerToolContract, CoordinateSpace, DisplayGeometry, Easing, FakeBackend, KeyCode,
+        LogicalSize, Modifiers, MouseButton, NormalizedComputerAction, OpenAiComputerAction,
+        PixelSize, Point, ProviderPointerButton, Rect, ScaleFactor,
     };
     use super::*;
     use std::sync::Arc;
@@ -5346,11 +5392,11 @@ mod tests {
             self.0.geometry().await
         }
 
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, ComputerError> {
-            self.0.execute_one(action).await
+            self.0.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), ComputerError> {
@@ -5376,11 +5422,11 @@ mod tests {
             self.inner.geometry().await
         }
 
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, ComputerError> {
-            self.inner.execute_one(action).await
+            self.inner.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), ComputerError> {
@@ -5404,11 +5450,11 @@ mod tests {
             self.0.geometry().await
         }
 
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, ComputerError> {
-            self.0.execute_one(action).await
+            self.0.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), ComputerError> {
@@ -5618,6 +5664,19 @@ mod tests {
             canonical_computer_action_payload_digest(&reordered),
             "batch order is authority-bearing at dispatch"
         );
+    }
+
+    #[test]
+    fn canonical_meta_aliases_have_one_approval_digest() {
+        let digest_for = |alias| {
+            canonical_computer_action_payload_digest(&[ComputerAction::KeyChord {
+                chord: CanonicalKeyChord::new(vec![KeyCode::parse(alias).unwrap()]).unwrap(),
+            }])
+        };
+        let expected = digest_for("LEFTMETA");
+        for alias in ["META", "WIN", "SUPER"] {
+            assert_eq!(digest_for(alias), expected, "alias {alias}");
+        }
     }
 
     #[test]
@@ -6028,7 +6087,7 @@ mod tests {
     }
 
     #[test]
-    fn x11_arbiter_serializes_monitors_and_screen_suffixes_but_other_backends_do_not() {
+    fn session_input_arbiters_serialize_monitors_but_other_backends_do_not() {
         let os_lock = InMemoryOsAdvisoryLock::new();
         let mut arbiter_a =
             HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
@@ -6052,15 +6111,42 @@ mod tests {
             "DISPLAY screen suffixes must share the X server input-arbiter namespace"
         );
 
-        let token_a = match arbiter_a
-            .try_acquire_x11(&monitor_a, DelegationId("x11-monitor-a".to_string()))
-        {
+        let token_a = match arbiter_a.try_acquire_input_session(
+            &monitor_a,
+            b"cockpit.x11.input-arbiter.v1",
+            DelegationId("x11-monitor-a".to_string()),
+        ) {
             AcquireResult::Acquired(token) => token,
             other => panic!("first X11 monitor should acquire, got {other:?}"),
         };
         assert_eq!(token_a.target_key, monitor_a);
         assert!(matches!(
-            arbiter_b.try_acquire_x11(&monitor_b, DelegationId("x11-monitor-b".to_string()),),
+            arbiter_b.try_acquire_input_session(
+                &monitor_b,
+                b"cockpit.x11.input-arbiter.v1",
+                DelegationId("x11-monitor-b".to_string()),
+            ),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
+
+        let windows_lock = InMemoryOsAdvisoryLock::new();
+        let mut windows_arbiter_a =
+            HostInputArbiter::new(Box::new(windows_lock.shared_clone()), OwnerInstance(3));
+        let mut windows_arbiter_b = HostInputArbiter::new(Box::new(windows_lock), OwnerInstance(4));
+        assert!(matches!(
+            windows_arbiter_a.try_acquire_input_session(
+                &monitor_a,
+                b"cockpit.windows.input-arbiter.v1",
+                DelegationId("windows-monitor-a".to_string()),
+            ),
+            AcquireResult::Acquired(_)
+        ));
+        assert!(matches!(
+            windows_arbiter_b.try_acquire_input_session(
+                &monitor_b,
+                b"cockpit.windows.input-arbiter.v1",
+                DelegationId("windows-monitor-b".to_string()),
+            ),
             AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
         ));
 
@@ -7036,6 +7122,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_canonicalization_failure_preserves_provider_action_index() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_coordinator_params(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let actions = vec![
+            OpenAiComputerAction::Screenshot,
+            OpenAiComputerAction::KeyChord(super::super::KeyChord { keys: Vec::new() }),
+        ];
+
+        let outcome = coordinator
+            .execute_openai_call("call-invalid-later-action", &actions)
+            .await;
+        match outcome {
+            CoordinatedOutcome::Failed {
+                failure,
+                screenshot,
+            } => {
+                assert_eq!(failure.index, 1);
+                assert!(screenshot.is_none());
+            }
+            other => panic!("expected canonicalization failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn computer_native_host_lock_loss_invalidates() {
         let os_lock = InMemoryOsAdvisoryLock::new();
         let shared_os = os_lock.shared_clone();
@@ -7973,13 +8086,13 @@ mod tests {
             self.inner.geometry().await
         }
 
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, ComputerError> {
             self.input_actions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.execute_one(action).await
+            self.inner.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), ComputerError> {
@@ -8671,15 +8784,13 @@ mod tests {
             ),
             (
                 ComputerAction::KeyChord {
-                    chord: KeyChord {
-                        keys: vec!["Enter".to_string()],
-                    },
+                    chord: CanonicalKeyChord::new(vec![KeyCode::parse("Enter").unwrap()]).unwrap(),
                 },
                 ActionRiskClass::StateChanging,
             ),
             (
                 ComputerAction::HoldKey {
-                    key: "Shift".to_string(),
+                    key: KeyCode::parse("Shift").unwrap(),
                     duration: Duration::from_millis(100),
                 },
                 ActionRiskClass::StateChanging,
@@ -8980,13 +9091,13 @@ mod tests {
             async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
                 self.inner.geometry().await
             }
-            async fn execute_one(
+            async fn execute_normalized_one(
                 &mut self,
-                action: &ComputerAction,
+                action: &NormalizedComputerAction,
             ) -> Result<ComputerActionOutcome, ComputerError> {
                 self.call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.inner.execute_one(action).await
+                self.inner.execute_normalized_one(action).await
             }
             fn release_all(&mut self) -> Result<(), ComputerError> {
                 self.inner.release_all()
@@ -9715,8 +9826,8 @@ mod tests {
             .find("DispatchState::Dispatching")
             .expect("Dispatching commit in dispatch_backend_batch");
         let execute = body
-            .find("self.backend.execute(actions)")
-            .expect("backend.execute in dispatch_backend_batch");
+            .find("execute_backend_batch(self.backend.as_mut(), actions)")
+            .expect("normalized backend handoff in dispatch_backend_batch");
         assert!(
             pre < dispatching,
             "pre_handoff_check must run before Dispatching is committed"
@@ -9971,16 +10082,12 @@ mod tests {
             self.inner.geometry().await
         }
 
-        async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
-            self.events.lock().expect("event log").push("execute");
-            self.inner.execute(actions).await
-        }
-
-        async fn execute_one(
+        async fn execute_normalized_one(
             &mut self,
-            action: &ComputerAction,
+            action: &NormalizedComputerAction,
         ) -> Result<ComputerActionOutcome, ComputerError> {
-            self.inner.execute_one(action).await
+            self.events.lock().expect("event log").push("execute");
+            self.inner.execute_normalized_one(action).await
         }
 
         fn release_all(&mut self) -> Result<(), ComputerError> {

@@ -17,11 +17,10 @@ use objc2_core_graphics::{
 };
 
 use super::{
-    CaptureFrame, ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
-    DisplayGeometry, DisplayTarget, Easing, Modifiers, MouseButton, PixelPoint, PixelRect,
-    PixelSize, RealDesktopGrantStore, ScaleFactor, checked_action_duration, checked_point,
-    checked_rect, checked_scroll_delta, checked_zoom_scale, click_repetitions, eased_progress,
-    scale_png,
+    CaptureFrame, ComputerActionOutcome, ComputerBackend, ComputerError, DisplayGeometry,
+    DisplayTarget, Easing, Modifiers, MouseButton, NormalizedComputerAction,
+    NormalizedComputerEffect, PixelPoint, PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor,
+    click_repetitions, eased_progress, scale_png,
 };
 use crate::computer::target::BackendKind;
 
@@ -249,49 +248,44 @@ impl MacOsComputerBackend {
 
     fn execute_action(
         &mut self,
-        action: &ComputerAction,
+        action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
-        match action {
-            ComputerAction::CaptureFull => Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                png: self.capture_png(None)?,
-                geometry: self.geometry.clone(),
-                region: None,
-                native_zoom: None,
-            })),
-            ComputerAction::CaptureRegion { rect } => {
-                let region = checked_rect(*rect, &self.geometry)?;
+        match action.effect() {
+            NormalizedComputerEffect::CaptureFull => {
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                    png: self.capture_png(Some(region))?,
+                    png: self.capture_png(None)?,
                     geometry: self.geometry.clone(),
-                    region: Some(region),
+                    region: None,
                     native_zoom: None,
                 }))
             }
-            ComputerAction::CaptureNativeZoom { rect, scale } => {
-                let region = checked_rect(*rect, &self.geometry)?;
-                let scale = checked_zoom_scale(*scale)?;
+            NormalizedComputerEffect::CaptureRegion { rect } => {
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
-                    png: scale_png(self.capture_png(Some(region))?, scale)?,
+                    png: self.capture_png(Some(*rect))?,
                     geometry: self.geometry.clone(),
-                    region: Some(region),
-                    native_zoom: Some(scale),
+                    region: Some(*rect),
+                    native_zoom: None,
                 }))
             }
-            ComputerAction::MoveCursor {
+            NormalizedComputerEffect::CaptureNativeZoom {
+                rect,
+                scale,
+                output,
+            } => Ok(ComputerActionOutcome::Captured(CaptureFrame {
+                png: scale_png(self.capture_png(Some(*rect))?, *output)?,
+                geometry: self.geometry.clone(),
+                region: Some(*rect),
+                native_zoom: Some(*scale),
+            })),
+            NormalizedComputerEffect::MoveCursor {
                 to,
                 duration,
                 easing,
             } => {
-                checked_action_duration(*duration)?;
-                self.move_cursor(
-                    checked_point(*to, &self.geometry)?,
-                    *duration,
-                    *easing,
-                    None,
-                )?;
+                self.move_cursor(*to, *duration, *easing, None)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Click {
+            NormalizedComputerEffect::Click {
                 button,
                 count,
                 modifiers,
@@ -316,7 +310,7 @@ impl MacOsComputerBackend {
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::MouseDown { button } => {
+            NormalizedComputerEffect::MouseDown { button } => {
                 self.post_mouse(
                     mouse_down_type(*button),
                     *button,
@@ -326,7 +320,7 @@ impl MacOsComputerBackend {
                 )?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::MouseUp { button } => {
+            NormalizedComputerEffect::MouseUp { button } => {
                 self.post_mouse(
                     mouse_up_type(*button),
                     *button,
@@ -336,51 +330,33 @@ impl MacOsComputerBackend {
                 )?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Drag {
+            NormalizedComputerEffect::Drag {
                 button,
                 path,
                 modifiers,
             } => {
-                let Some(first) = path.first() else {
-                    return Err(ComputerError::InvalidCoordinates(
-                        "drag path must contain at least one point".to_string(),
-                    ));
-                };
-                for step in path {
-                    checked_action_duration(step.duration)?;
-                    checked_point(step.point, &self.geometry)?;
-                }
-                self.move_cursor(
-                    checked_point(first.point, &self.geometry)?,
-                    first.duration,
-                    first.easing,
-                    None,
-                )?;
+                let first = path[0];
+                self.move_cursor(first.point, first.duration, first.easing, None)?;
                 let flags = modifier_flags(*modifiers);
                 self.post_mouse(mouse_down_type(*button), *button, self.cursor()?, flags, 1)?;
                 for step in path.iter().skip(1) {
-                    self.move_cursor(
-                        checked_point(step.point, &self.geometry)?,
-                        step.duration,
-                        step.easing,
-                        Some(*button),
-                    )?;
+                    self.move_cursor(step.point, step.duration, step.easing, Some(*button))?;
                 }
                 self.post_mouse(mouse_up_type(*button), *button, self.cursor()?, flags, 1)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::TypeText { text } => {
+            NormalizedComputerEffect::TypeText { text } => {
                 self.type_text(text)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::KeyChord { chord } => {
-                let mut codes = Vec::with_capacity(chord.keys.len());
-                for key in &chord.keys {
-                    codes.push(key_code(key).ok_or_else(|| {
-                        ComputerError::Refused(format!("unsupported macOS key `{key}`"))
+            NormalizedComputerEffect::KeyChord { chord } => {
+                let mut codes = Vec::with_capacity(chord.keys().len());
+                for key in chord.keys() {
+                    codes.push(key.macos_key_code().ok_or_else(|| {
+                        ComputerError::Refused("unsupported macOS key identity".to_string())
                     })?);
                 }
-                let flags = flags_for_keys(&chord.keys);
+                let flags = flags_for_macos_key_codes(&codes);
                 for code in &codes {
                     self.post_key(*code, true, flags)?;
                 }
@@ -389,23 +365,20 @@ impl MacOsComputerBackend {
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::HoldKey { key, duration } => {
-                checked_action_duration(*duration)?;
-                let code = key_code(key).ok_or_else(|| {
-                    ComputerError::Refused(format!("unsupported macOS key `{key}`"))
+            NormalizedComputerEffect::HoldKey { key, duration } => {
+                let code = key.macos_key_code().ok_or_else(|| {
+                    ComputerError::Refused("unsupported macOS key identity".to_string())
                 })?;
-                self.post_key(code, true, flags_for_keys(std::slice::from_ref(key)))?;
+                self.post_key(code, true, flags_for_macos_key_codes(&[code]))?;
                 std::thread::sleep(*duration);
                 self.post_key(code, false, CGEventFlags::empty())?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Scroll {
+            NormalizedComputerEffect::Scroll {
                 delta_x,
                 delta_y,
                 modifiers,
             } => {
-                checked_scroll_delta(*delta_x)?;
-                checked_scroll_delta(*delta_y)?;
                 let event = CGEvent::new_scroll_wheel_event2(
                     Some(&self.source),
                     CGScrollEventUnit::Pixel,
@@ -419,8 +392,7 @@ impl MacOsComputerBackend {
                 self.post_event(&event, None)?;
                 Ok(ComputerActionOutcome::Completed)
             }
-            ComputerAction::Wait { duration } => {
-                checked_action_duration(*duration)?;
+            NormalizedComputerEffect::Wait { duration } => {
                 std::thread::sleep(*duration);
                 Ok(ComputerActionOutcome::Waited(*duration))
             }
@@ -776,9 +748,9 @@ impl ComputerBackend for MacOsComputerBackend {
         Ok(self.geometry.clone())
     }
 
-    async fn execute_one(
+    async fn execute_normalized_one(
         &mut self,
-        action: &ComputerAction,
+        action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
         self.execute_action(action)
     }
@@ -917,18 +889,12 @@ fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {
     flags
 }
 
-fn flags_for_keys(keys: &[String]) -> CGEventFlags {
+fn flags_for_macos_key_codes(codes: &[u16]) -> CGEventFlags {
     modifier_flags(Modifiers {
-        shift: keys.iter().any(|key| key.eq_ignore_ascii_case("shift")),
-        control: keys
-            .iter()
-            .any(|key| key.eq_ignore_ascii_case("control") || key.eq_ignore_ascii_case("ctrl")),
-        alt: keys
-            .iter()
-            .any(|key| key.eq_ignore_ascii_case("alt") || key.eq_ignore_ascii_case("option")),
-        meta: keys
-            .iter()
-            .any(|key| key.eq_ignore_ascii_case("meta") || key.eq_ignore_ascii_case("command")),
+        shift: codes.iter().any(|code| matches!(*code, 0x38 | 0x3c)),
+        control: codes.iter().any(|code| matches!(*code, 0x3b | 0x3e)),
+        alt: codes.iter().any(|code| matches!(*code, 0x3a | 0x3d)),
+        meta: codes.iter().any(|code| matches!(*code, 0x37 | 0x36)),
     })
 }
 
@@ -964,107 +930,10 @@ fn drag_event_type(button: MouseButton) -> CGEventType {
     }
 }
 
-/// US ANSI virtual-key map used for command chords. Literal text does not use
-/// this table; it is injected with CGEvent's UTF-16 API.
-fn key_code(key: &str) -> Option<u16> {
-    let normalized = key.to_ascii_lowercase();
-    Some(match normalized.as_str() {
-        "a" => 0x00,
-        "s" => 0x01,
-        "d" => 0x02,
-        "f" => 0x03,
-        "h" => 0x04,
-        "g" => 0x05,
-        "z" => 0x06,
-        "x" => 0x07,
-        "c" => 0x08,
-        "v" => 0x09,
-        "b" => 0x0b,
-        "q" => 0x0c,
-        "w" => 0x0d,
-        "e" => 0x0e,
-        "r" => 0x0f,
-        "y" => 0x10,
-        "t" => 0x11,
-        "1" => 0x12,
-        "2" => 0x13,
-        "3" => 0x14,
-        "4" => 0x15,
-        "6" => 0x16,
-        "5" => 0x17,
-        "=" => 0x18,
-        "9" => 0x19,
-        "7" => 0x1a,
-        "-" => 0x1b,
-        "8" => 0x1c,
-        "0" => 0x1d,
-        "]" => 0x1e,
-        "o" => 0x1f,
-        "u" => 0x20,
-        "[" => 0x21,
-        "i" => 0x22,
-        "p" => 0x23,
-        "l" => 0x25,
-        "j" => 0x26,
-        "'" => 0x27,
-        "k" => 0x28,
-        ";" => 0x29,
-        "\\" => 0x2a,
-        "," => 0x2b,
-        "/" => 0x2c,
-        "n" => 0x2d,
-        "m" => 0x2e,
-        "." => 0x2f,
-        "tab" => 0x30,
-        "space" => 0x31,
-        "`" => 0x32,
-        "backspace" | "delete" => 0x33,
-        "escape" | "esc" => 0x35,
-        "command" | "meta" => 0x37,
-        "shift" => 0x38,
-        "capslock" => 0x39,
-        "option" | "alt" => 0x3a,
-        "control" | "ctrl" => 0x3b,
-        "enter" | "return" => 0x24,
-        "f17" => 0x40,
-        "volumeup" => 0x48,
-        "volumedown" => 0x49,
-        "mute" => 0x4a,
-        "f18" => 0x4f,
-        "f19" => 0x50,
-        "f20" => 0x5a,
-        "f5" => 0x60,
-        "f6" => 0x61,
-        "f7" => 0x62,
-        "f3" => 0x63,
-        "f8" => 0x64,
-        "f9" => 0x65,
-        "f11" => 0x67,
-        "f13" => 0x69,
-        "f16" => 0x6a,
-        "f14" => 0x6b,
-        "f10" => 0x6d,
-        "f12" => 0x6f,
-        "f15" => 0x71,
-        "home" => 0x73,
-        "pageup" => 0x74,
-        "forwarddelete" => 0x75,
-        "f4" => 0x76,
-        "end" => 0x77,
-        "f2" => 0x78,
-        "pagedown" => 0x79,
-        "f1" => 0x7a,
-        "left" | "arrowleft" => 0x7b,
-        "right" | "arrowright" => 0x7c,
-        "down" | "arrowdown" => 0x7d,
-        "up" | "arrowup" => 0x7e,
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::computer::KeyCode;
 
     #[test]
     fn construction_fails_before_platform_access_without_machine_grant() {
@@ -1079,13 +948,22 @@ mod tests {
 
     #[test]
     fn key_map_and_modifier_flags_cover_primary_chords() {
-        assert_eq!(key_code("Command"), Some(0x37));
-        assert_eq!(key_code("ArrowLeft"), Some(0x7b));
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("LEFTMETA").expect("meta")),
+            Some(0x37)
+        );
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("ARROWLEFT").expect("arrow")),
+            Some(0x7b)
+        );
         assert!(
-            flags_for_keys(&["Command".into(), "Shift".into()])
+            flags_for_macos_key_codes(&[0x37, 0x38])
                 .contains(CGEventFlags::MaskCommand | CGEventFlags::MaskShift)
         );
-        assert_eq!(key_code("not-a-key"), None);
+        assert_eq!(
+            crate::computer::translate_macos_key(&KeyCode::parse("INSERT").expect("insert")),
+            None
+        );
     }
 
     #[test]
@@ -1104,7 +982,10 @@ mod tests {
             .expect("construct macOS backend");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let outcome = runtime
-            .block_on(backend.execute_one(&ComputerAction::CaptureFull))
+            .block_on(crate::computer::execute_backend_action(
+                &mut backend,
+                &crate::computer::ComputerAction::CaptureFull,
+            ))
             .expect("capture main display");
         let ComputerActionOutcome::Captured(frame) = outcome else {
             panic!("capture returned a non-capture outcome");

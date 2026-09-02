@@ -50,11 +50,12 @@ use super::frame::{
     ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
     openai_transient_computer_output,
 };
+use super::host_identity::HostInstallationId;
 use super::observation::{
     GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
 };
 use super::target::{
-    BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
+    BackendKind, FieldEvidence, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
     TargetUnavailableReason,
 };
 use super::{
@@ -63,6 +64,25 @@ use super::{
     ComputerToolContract, DisplayGeometry, NativeComputerWire, OpenAiComputerAction,
     parse_anthropic_20250124_action, parse_anthropic_20251124_action, parse_openai_computer_call,
 };
+
+/// Sole production physical/virtual backend construction factory. Physical
+/// instances returned here remain inert until `open` binds the evidence-backed
+/// host-lease capability below.
+pub(crate) fn construct_platform_backend(
+    target: super::DisplayTarget,
+    grant_store: Option<&super::RealDesktopGrantStore>,
+) -> Result<Box<dyn ComputerBackend>, ComputerError> {
+    #[cfg(target_os = "macos")]
+    {
+        return super::macos_backend::MacOsComputerBackend::construct(target, grant_store)
+            .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        super::VirtualDisplayBackend::construct(target, grant_store)
+            .map(|backend| Box::new(backend) as Box<dyn ComputerBackend>)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Host input arbiter: process-local FIFO + OS-level advisory lock
@@ -103,6 +123,56 @@ pub struct HostLeaseToken {
     pub generation: LeaseGeneration,
     pub owner_instance: OwnerInstance,
     pub delegation: DelegationId,
+}
+
+/// Unforgeable coordinator-issued authority for one evidence-bound physical
+/// backend. It owns no lease; each use synchronously proves the arbiter still
+/// owns the exact token, so a retained backend cannot dispatch after lock loss
+/// or coordinator teardown.
+#[derive(Clone)]
+pub struct PhysicalDispatchCapability {
+    backend_kind: BackendKind,
+    token: HostLeaseToken,
+    arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
+}
+
+impl std::fmt::Debug for PhysicalDispatchCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhysicalDispatchCapability")
+            .field("backend_kind", &self.backend_kind)
+            .field("generation", &self.token.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PhysicalDispatchCapability {
+    fn issue(
+        backend_kind: BackendKind,
+        token: &HostLeaseToken,
+        arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
+    ) -> Self {
+        Self {
+            backend_kind,
+            token: token.clone(),
+            arbiter,
+        }
+    }
+
+    pub(crate) fn recheck(&self, backend_kind: BackendKind) -> Result<(), ComputerError> {
+        if self.backend_kind != backend_kind {
+            return Err(ComputerError::Refused(
+                "physical dispatch capability backend mismatch".into(),
+            ));
+        }
+        let arbiter = lock_poison_safe(&self.arbiter);
+        let valid = arbiter.is_lease_valid(&self.token) && !arbiter.detect_lock_loss(&self.token);
+        if !valid {
+            return Err(ComputerError::Refused(
+                "physical dispatch capability is no longer live".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HostLeaseToken {
@@ -427,15 +497,14 @@ impl std::error::Error for HostLockError {}
 /// Production OS-level advisory lock: one lock file per [`PhysicalTargetKey`]
 /// under the private Cockpit data root.
 ///
-/// On Unix each key maps to a `0o600`, no-symlink-follow lock file on which an
-/// exclusive, non-blocking `flock(LOCK_EX | LOCK_NB)` is taken and **held for
-/// the lease lifetime** — the owning [`std::fs::File`] descriptor lives in
-/// [`FileAdvisoryLock::held`], so the kernel lock is released exactly when the
-/// arbiter releases (drops the fd). Because `flock` locks attach to the open
-/// file *description*, two independent `FileAdvisoryLock` instances that each
-/// `open` the same path obtain separate descriptions and therefore genuinely
-/// contend — even inside a single process — which is precisely the harness the
-/// FIFO/contention tests rely on.
+/// On macOS, all CGEvent injection locks the root-owned root-directory vnode:
+/// no login user can replace that object, and `flock` therefore serializes the
+/// one host-wide HID sink across users. Other Unix targets map each physical
+/// key to a `0o600`, no-symlink-follow lock file. In both cases an exclusive,
+/// non-blocking `flock(LOCK_EX | LOCK_NB)` is **held for the lease lifetime**
+/// by the [`std::fs::File`] in [`FileAdvisoryLock::held`], so descriptor drop
+/// releases it. Separate `FileAdvisoryLock` instances open separate file
+/// descriptions and genuinely contend, including within one process.
 ///
 /// On Windows the persistent lock file is opened with a zero share mode. The
 /// kernel rejects competing opens while the handle is live and closes the
@@ -445,6 +514,10 @@ impl std::error::Error for HostLockError {}
 pub struct FileAdvisoryLock {
     /// Directory that holds the per-key lock files.
     root: std::path::PathBuf,
+    /// macOS HID injection is host-wide. Its lock is taken on the root-owned
+    /// root-directory vnode rather than a user-creatable path, so every login
+    /// contends on one non-replaceable kernel lock object.
+    macos_global_hid_lock: bool,
     /// Locks currently held by this instance, keyed by the arbiter key string.
     /// The value owns the live descriptor/handle; dropping it releases the OS
     /// lock.
@@ -467,11 +540,24 @@ impl std::fmt::Debug for FileAdvisoryLock {
 }
 
 impl FileAdvisoryLock {
-    /// Open a production lock rooted at the private Cockpit data directory.
+    /// Open a production lock. macOS HID injection locks the root-owned host
+    /// root directory; all other backends retain the private per-user Cockpit
+    /// root and per-target lock files.
     pub fn new() -> Result<Self, HostLockError> {
-        let root = crate::config::resolve::cockpit_data_dir()
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        Self::with_root(root)
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(Self {
+                root: std::path::PathBuf::from("/"),
+                macos_global_hid_lock: true,
+                held: HashMap::new(),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let root = crate::config::resolve::cockpit_data_dir()
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            Self::with_root(root)
+        }
     }
 
     /// Open a lock rooted at an explicit directory. Tests inject a private
@@ -481,6 +567,7 @@ impl FileAdvisoryLock {
         ensure_lock_root(&root)?;
         Ok(Self {
             root,
+            macos_global_hid_lock: false,
             held: HashMap::new(),
         })
     }
@@ -489,6 +576,9 @@ impl FileAdvisoryLock {
     /// string so that any two instances contending on the same key resolve to
     /// the same file, while staying filesystem-safe and bounded in length.
     fn lock_path(&self, key: &PhysicalTargetKey) -> std::path::PathBuf {
+        if self.macos_global_hid_lock {
+            return self.root.clone();
+        }
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         HostInputArbiter::key_string(key).hash(&mut hasher);
@@ -532,49 +622,70 @@ fn ensure_lock_root(root: &std::path::Path) -> Result<(), HostLockError> {
 /// process or another open description in this process), or `Err(LockFileIo)`
 /// on any other I/O failure.
 #[cfg(unix)]
-fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    path: &std::path::Path,
+    macos_global_hid_lock: bool,
+) -> Result<std::fs::File, HostLockError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if macos_global_hid_lock {
+        // `flock` locks the opened vnode, including a directory vnode. `/` is
+        // root-owned, cannot be unlinked or replaced by a login user, and is
+        // the same object for every macOS login. Read-only access is enough
+        // for an advisory flock; no user-writable lock file participates.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    } else {
+        options
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
         .open(path)
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-
-    // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
-    // file may carry broader permissions or a foreign owner. Verify and tighten
-    // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
-    // taking the lock; fail closed on anything we cannot make owner-private.
     let meta = file
         .metadata()
         .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-    if !meta.file_type().is_file() {
-        return Err(HostLockError::LockFileIo(
-            "lock path is not a regular file".to_string(),
-        ));
-    }
-    // SAFETY: `geteuid` is always safe.
-    let euid = unsafe { libc::geteuid() };
-    if meta.uid() != euid {
-        return Err(HostLockError::LockFileIo(
-            "lock file owned by another user".to_string(),
-        ));
-    }
-    if meta.mode() & 0o777 != 0o600 {
-        // `File::set_permissions` is `fchmod` on the held fd.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        let remeta = file
-            .metadata()
-            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
-        if remeta.mode() & 0o777 != 0o600 {
+    if macos_global_hid_lock {
+        if !meta.file_type().is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
             return Err(HostLockError::LockFileIo(
-                "could not tighten lock file to 0o600".to_string(),
+                "macOS global HID lock object is not a root-owned non-writable directory"
+                    .to_string(),
             ));
+        }
+    } else {
+        if !meta.file_type().is_file() {
+            return Err(HostLockError::LockFileIo(
+                "lock path is not a regular file".to_string(),
+            ));
+        }
+        // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
+        // file may carry broader permissions or a foreign owner. Verify and tighten
+        // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
+        // taking the lock; fail closed on anything we cannot make owner-private.
+        // SAFETY: `geteuid` is always safe.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(HostLockError::LockFileIo(
+                "lock file owned by another user".to_string(),
+            ));
+        }
+        if meta.mode() & 0o777 != 0o600 {
+            // `File::set_permissions` is `fchmod` on the held fd.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            let remeta = file
+                .metadata()
+                .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+            if remeta.mode() & 0o777 != 0o600 {
+                return Err(HostLockError::LockFileIo(
+                    "could not tighten lock file to 0o600".to_string(),
+                ));
+            }
         }
     }
 
@@ -592,7 +703,10 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
 }
 
 #[cfg(windows)]
-fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    path: &std::path::Path,
+    _macos_global_hid_lock: bool,
+) -> Result<std::fs::File, HostLockError> {
     use std::os::windows::fs::OpenOptionsExt as _;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
@@ -629,7 +743,10 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn os_lock_file(_path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+fn os_lock_file(
+    _path: &std::path::Path,
+    _macos_global_hid_lock: bool,
+) -> Result<std::fs::File, HostLockError> {
     Err(HostLockError::LockFileIo(
         "host input advisory locks are unsupported on this platform".to_string(),
     ))
@@ -644,7 +761,7 @@ impl OsAdvisoryLock for FileAdvisoryLock {
             return Ok(());
         }
         let path = self.lock_path(key);
-        let file = os_lock_file(&path)?;
+        let file = os_lock_file(&path, self.macos_global_hid_lock)?;
         self.held.insert(key_str, HeldFileLock { _file: file });
         Ok(())
     }
@@ -756,6 +873,15 @@ struct ArbiterWaiter {
     /// minted token here; the owning [`WaitHandle::await_token`] receives it.
     /// `None` once the token (or a failure) has been delivered.
     sender: Option<oneshot::Sender<Result<HostLeaseToken, WaitFailed>>>,
+    /// Token installed for this waiter but not yet acknowledged by its task.
+    /// The wait handle reclaims this exact token if cancellation lands after
+    /// delivery succeeds and before the await resumes.
+    /// Zero until promotion, otherwise the delivered lease generation. The
+    /// remaining token fields are immutable waiter fields, so this atomic is
+    /// sufficient for exact-token reclamation without a second mutex. This is
+    /// deliberately lock-free: arbiter operations must never nest an arbiter
+    /// mutex with a waiter acknowledgement mutex in the opposite order.
+    delivered_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Why an awaited FIFO promotion failed.
@@ -793,9 +919,12 @@ pub struct WaitHandle {
     id: WaiterId,
     target_key: PhysicalTargetKey,
     arbitration_key: PhysicalTargetKey,
+    owner_instance: OwnerInstance,
     delegation: DelegationId,
     receiver: oneshot::Receiver<Result<HostLeaseToken, WaitFailed>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    delivered_generation: Arc<std::sync::atomic::AtomicU64>,
+    reclaimer: Option<std::sync::Weak<std::sync::Mutex<HostInputArbiter>>>,
     completed: bool,
 }
 
@@ -810,6 +939,10 @@ impl WaitHandle {
             // removed (cancelled/abandoned) without a promotion.
             Err(_) => Err(WaitFailed::Cancelled),
         };
+        // Receiving acknowledges ownership. There is no await between this
+        // transfer and the caller's RAII acquisition guard construction.
+        self.delivered_generation
+            .store(0, std::sync::atomic::Ordering::Release);
         self.completed = true;
         result
     }
@@ -830,6 +963,23 @@ impl Drop for WaitHandle {
         if !self.completed {
             self.cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
+            let generation = self
+                .delivered_generation
+                .swap(0, std::sync::atomic::Ordering::AcqRel);
+            if let Some(arbiter) = self.reclaimer.as_ref().and_then(std::sync::Weak::upgrade)
+                && generation != 0
+            {
+                let token = HostLeaseToken {
+                    target_key: self.target_key,
+                    arbitration_key: self.arbitration_key,
+                    generation: LeaseGeneration(generation),
+                    owner_instance: self.owner_instance,
+                    delegation: self.delegation.clone(),
+                };
+                // Exact-token release prevents an abandoned delivery from
+                // releasing a replacement generation that won the key later.
+                lock_poison_safe(&arbiter).release(&token);
+            }
         }
     }
 }
@@ -941,6 +1091,28 @@ impl HostInputArbiter {
         self.try_acquire_with_key(target_key, &arbitration_key, delegation)
     }
 
+    /// Acquire a macOS physical-input lease. CGEvent posts reach the host-wide
+    /// HID event tap, not a process audit session or one display. Every
+    /// Cockpit injector on this host must therefore contend on one key.
+    fn try_acquire_macos(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        delegation: DelegationId,
+    ) -> AcquireResult {
+        let arbitration_key = PhysicalTargetKey::new(
+            HostInstallationId([0; 32]),
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.macos.global-hid.session.v1",
+                &[],
+            ),
+            crate::computer::host_identity::domain_hash(
+                b"cockpit.macos.global-hid.display.v1",
+                &[],
+            ),
+        );
+        self.try_acquire_with_key(target_key, &arbitration_key, delegation)
+    }
+
     fn try_acquire_with_key(
         &mut self,
         target_key: &PhysicalTargetKey,
@@ -968,6 +1140,7 @@ impl HostInputArbiter {
             };
             let (sender, receiver) = oneshot::channel();
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let delivered_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
             self.queues
                 .entry(key_str.clone())
                 .or_default()
@@ -979,14 +1152,18 @@ impl HostInputArbiter {
                     delegation: delegation.clone(),
                     cancelled: Arc::clone(&cancelled),
                     sender: Some(sender),
+                    delivered_generation: Arc::clone(&delivered_generation),
                 });
             return AcquireResult::Queued(WaitHandle {
                 id: waiter_id,
                 target_key: *target_key,
                 arbitration_key: *arbitration_key,
+                owner_instance: self.owner_instance,
                 delegation,
                 receiver,
                 cancelled,
+                delivered_generation,
+                reclaimer: None,
                 completed: false,
             });
         }
@@ -1026,7 +1203,7 @@ impl HostInputArbiter {
 
         // Verify this is the current holder.
         let is_current = match self.current_lease.get(&key_str) {
-            Some(current) => current.generation == token.generation,
+            Some(current) => current == token,
             None => false,
         };
         if !is_current {
@@ -1071,16 +1248,27 @@ impl HostInputArbiter {
                         // rather than install an unowned ghost lease, and try
                         // the next waiter.
                         match waiter.sender.take() {
-                            Some(sender) => match sender.send(Ok(new_token.clone())) {
-                                Ok(()) => {
-                                    self.current_lease.insert(key_str, new_token);
-                                    return true;
+                            Some(sender) => {
+                                self.current_lease
+                                    .insert(key_str.clone(), new_token.clone());
+                                waiter.delivered_generation.store(
+                                    new_token.generation.0,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                                match sender.send(Ok(new_token)) {
+                                    Ok(()) => {
+                                        return true;
+                                    }
+                                    Err(_) => {
+                                        waiter
+                                            .delivered_generation
+                                            .store(0, std::sync::atomic::Ordering::Release);
+                                        self.current_lease.remove(&key_str);
+                                        self.os_lock.release(&target_key);
+                                        continue;
+                                    }
                                 }
-                                Err(_) => {
-                                    self.os_lock.release(&target_key);
-                                    continue;
-                                }
-                            },
+                            }
                             None => {
                                 self.os_lock.release(&target_key);
                                 continue;
@@ -1220,20 +1408,45 @@ impl HostInputArbiter {
     /// Simulate owner death: release all leases held by the given owner
     /// instance. This is how a crashed process's leases are cleaned up.
     pub fn release_for_owner(&mut self, owner: OwnerInstance) -> usize {
-        let mut released = 0;
-        let keys_to_release: Vec<(String, PhysicalTargetKey)> = self
+        // A dead owner's queued work must be failed before releasing its
+        // holder; promoting it would install authority that no live task can
+        // safely own. Other-owner waiters (for injected/multi-owner arbiters)
+        // remain FIFO-eligible for the normal release path below.
+        for waiters in self.queues.values_mut() {
+            let mut retained = Vec::with_capacity(waiters.len());
+            for mut waiter in waiters.drain(..) {
+                if waiter.owner_instance == owner {
+                    waiter
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(sender) = waiter.sender.take() {
+                        let _ = sender.send(Err(WaitFailed::Invalidated));
+                    }
+                } else {
+                    retained.push(waiter);
+                }
+            }
+            *waiters = retained;
+        }
+        self.queues.retain(|_, waiters| !waiters.is_empty());
+        let leases_to_release: Vec<HostLeaseToken> = self
             .current_lease
             .iter()
             .filter(|(_, token)| token.owner_instance == owner)
-            .map(|(k, t)| (k.clone(), t.arbitration_key))
+            .map(|(_, token)| token.clone())
             .collect();
-        for (key_str, target_key) in keys_to_release {
-            self.os_lock.release(&target_key);
-            self.current_lease.remove(&key_str);
-            released += 1;
+        let mut released = 0;
+        for token in leases_to_release {
+            released += usize::from(self.release(&token));
         }
         released
     }
+}
+
+fn lock_poison_safe_plain<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Lock the shared host-arbiter mutex, recovering the guard if the mutex was
@@ -1263,27 +1476,40 @@ async fn acquire_host_lease(
     physical_key: &PhysicalTargetKey,
     backend_kind: BackendKind,
     delegation: DelegationId,
-) -> Result<HostLeaseToken, CoordinatorOpenError> {
+) -> Result<AcquiredHostLease, CoordinatorOpenError> {
     const CONTENTION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
     loop {
         let acquired = {
             let mut arbiter = lock_poison_safe(arbiter);
-            if backend_kind == BackendKind::RealDesktopX11 {
-                arbiter.try_acquire_x11(physical_key, delegation.clone())
-            } else {
-                arbiter.try_acquire(physical_key, delegation.clone())
+            match backend_kind {
+                BackendKind::RealDesktopX11 => {
+                    arbiter.try_acquire_x11(physical_key, delegation.clone())
+                }
+                BackendKind::RealDesktopMacOs => {
+                    arbiter.try_acquire_macos(physical_key, delegation.clone())
+                }
+                _ => arbiter.try_acquire(physical_key, delegation.clone()),
             }
         };
         match acquired {
-            AcquireResult::Acquired(token) => return Ok(token),
-            AcquireResult::Queued(handle) => {
-                return handle.await_token().await.map_err(|failure| match failure {
-                    WaitFailed::OsLockFailed(error) => CoordinatorOpenError::HostLockFailed(error),
-                    WaitFailed::Cancelled | WaitFailed::Invalidated => {
-                        CoordinatorOpenError::HostLockFailed(HostLockError::LockLost)
-                    }
-                });
+            AcquireResult::Acquired(token) => {
+                return Ok(AcquiredHostLease::new(token, Arc::clone(arbiter)));
+            }
+            AcquireResult::Queued(mut handle) => {
+                handle.reclaimer = Some(Arc::downgrade(arbiter));
+                let token = handle
+                    .await_token()
+                    .await
+                    .map_err(|failure| match failure {
+                        WaitFailed::OsLockFailed(error) => {
+                            CoordinatorOpenError::HostLockFailed(error)
+                        }
+                        WaitFailed::Cancelled | WaitFailed::Invalidated => {
+                            CoordinatorOpenError::HostLockFailed(HostLockError::LockLost)
+                        }
+                    })?;
+                return Ok(AcquiredHostLease::new(token, Arc::clone(arbiter)));
             }
             AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess) => {
                 tokio::time::sleep(CONTENTION_POLL).await;
@@ -1293,6 +1519,59 @@ async fn acquire_host_lease(
             }
         }
     }
+}
+
+/// Owns a freshly acquired logical/OS lease until a fully constructed
+/// coordinator accepts it. Cancellation at any later await or error return
+/// releases the exact generation instead of stranding host input authority.
+struct AcquiredHostLease {
+    token: HostLeaseToken,
+    arbiter: Arc<std::sync::Mutex<HostInputArbiter>>,
+    armed: bool,
+}
+
+impl AcquiredHostLease {
+    fn new(token: HostLeaseToken, arbiter: Arc<std::sync::Mutex<HostInputArbiter>>) -> Self {
+        Self {
+            token,
+            arbiter,
+            armed: true,
+        }
+    }
+
+    fn token(&self) -> &HostLeaseToken {
+        &self.token
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AcquiredHostLease {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_poison_safe(&self.arbiter).release(&self.token);
+        }
+    }
+}
+
+/// macOS currently composes its backend against the main display. Compare the
+/// independently sampled backend geometry with AX/CoreGraphics target evidence
+/// before taking a lease, so a display reconfiguration cannot bind one surface
+/// for capture/coordinates and another for authorization.
+fn macos_evidence_matches_backend_geometry(
+    evidence: &TargetIdentityEvidence,
+    geometry: &DisplayGeometry,
+) -> bool {
+    let FieldEvidence::Available { value, .. } = &evidence.desktop_geometry else {
+        return false;
+    };
+    value.x == 0
+        && value.y == 0
+        && value.width == geometry.physical.width
+        && value.height == geometry.physical.height
+        && value.scale.to_bits() == geometry.scale_factor.0.to_bits()
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,7 +3057,7 @@ impl ComputerActionCoordinator {
     /// Open a coordinator with the given backend and parameters. Obtains
     /// backend-reported geometry and target evidence, acquires the host input
     /// arbiter where applicable, and records the immutable display generation.
-    pub async fn open(
+    pub(crate) async fn open(
         mut backend: Box<dyn ComputerBackend>,
         params: CoordinatorParams,
     ) -> Result<Self, CoordinatorOpenError> {
@@ -2812,6 +3091,7 @@ impl ComputerActionCoordinator {
         let mut focus_generation = TargetGeneration(0);
         let mut backend_kind = declared_backend_kind;
         let mut host_lease: Option<HostLeaseToken> = None;
+        let mut acquired_host_lease: Option<AcquiredHostLease> = None;
         let mut virtual_display_uuid: Option<[u8; 16]> = None;
 
         // Take ownership of the target adapter before using it.
@@ -2847,6 +3127,13 @@ impl ComputerActionCoordinator {
             }
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
+                    if backend_kind == BackendKind::RealDesktopMacOs
+                        && !macos_evidence_matches_backend_geometry(&evidence, &geometry)
+                    {
+                        return Err(CoordinatorOpenError::PhysicalCompositionMissing(
+                            "matching macOS backend and target display geometry",
+                        ));
+                    }
                     focus_generation = TargetGeneration(evidence.focus_generation);
                     // Pin the virtual display identity for lease scoping. For
                     // physical targets this stays `None` (they scope by host
@@ -2869,15 +3156,15 @@ impl ComputerActionCoordinator {
                                 "a FileAdvisoryLock-backed host lease",
                             ),
                         )?;
-                        host_lease = Some(
-                            acquire_host_lease(
-                                arbiter,
-                                &physical_key,
-                                backend_kind,
-                                params.delegation_id.clone(),
-                            )
-                            .await?,
-                        );
+                        let acquired = acquire_host_lease(
+                            arbiter,
+                            &physical_key,
+                            backend_kind,
+                            params.delegation_id.clone(),
+                        )
+                        .await?;
+                        host_lease = Some(acquired.token().clone());
+                        acquired_host_lease = Some(acquired);
                     }
                 }
                 Err(reason) => {
@@ -2893,6 +3180,28 @@ impl ComputerActionCoordinator {
             return Err(CoordinatorOpenError::PhysicalCompositionMissing(
                 "physical target evidence",
             ));
+        }
+
+        // The coordinator is the only production issuer. Construction alone
+        // leaves a physical backend inert; bind it only after evidence has
+        // selected the target and the corresponding host lock is held.
+        if backend_kind != BackendKind::VirtualDisplay {
+            let token =
+                host_lease
+                    .as_ref()
+                    .ok_or(CoordinatorOpenError::PhysicalCompositionMissing(
+                        "a live physical host lease",
+                    ))?;
+            let arbiter = params.host_arbiter.as_ref().ok_or(
+                CoordinatorOpenError::PhysicalCompositionMissing("a physical host arbiter"),
+            )?;
+            backend
+                .bind_physical_capability(PhysicalDispatchCapability::issue(
+                    backend_kind,
+                    token,
+                    Arc::clone(arbiter),
+                ))
+                .map_err(CoordinatorOpenError::BackendInputCleanup)?;
         }
 
         let mut coordinator = Self {
@@ -2926,6 +3235,15 @@ impl ComputerActionCoordinator {
             handoff_journal: params.handoff_journal,
             batch_item_outcomes: Vec::new(),
         };
+
+        // Ownership crosses exactly once, immediately when the coordinator is
+        // fully constructed. From here on its Drop path is the sole rollback
+        // authority. In particular, if initial neutralization fails and Drop
+        // fences the lease until process exit, the acquisition guard must not
+        // subsequently release that same generation and undo the fence.
+        if let Some(acquired) = &mut acquired_host_lease {
+            acquired.disarm();
+        }
 
         // A coordinator that recovers a physical lease after a crashed or
         // replaced predecessor must start from neutral input state. This runs
@@ -4273,6 +4591,10 @@ impl ComputerActionCoordinator {
         {
             lock_poison_safe(arbiter).release(&token);
         }
+        // Successful terminal cleanup transfers/revokes ownership. Neither a
+        // later lifecycle callback nor Drop may touch the backend's shared
+        // durable input journal after this handoff.
+        self.input_cleanup_permitted = false;
         Ok(())
     }
 
@@ -4301,7 +4623,7 @@ impl ComputerActionCoordinator {
                 arbiter.is_lease_valid(token) && !arbiter.detect_lock_loss(token)
             }
             (Some(_), None) => false,
-            (None, _) => true,
+            (None, _) => self.backend_kind == BackendKind::VirtualDisplay,
         };
         if !has_exclusive_host_lease {
             self.abandon_host_lease_without_input();
@@ -4317,7 +4639,7 @@ impl ComputerActionCoordinator {
     /// The logical lease is process-local bookkeeping, so releasing it does
     /// not inject input and lets a local waiter compete for a fresh OS lease.
     /// Cleanup remains forbidden for this stale coordinator; a successful new
-    /// owner reloads and clears the backend's durable held-key journal first.
+    /// owner neutralizes input under its newly acquired lease before use.
     fn abandon_host_lease_without_input(&mut self) {
         self.input_cleanup_permitted = false;
         if let Some(token) = self.host_lease.take()
@@ -5067,6 +5389,35 @@ mod tests {
         }
     }
 
+    /// Physical backend whose durable neutralization cannot be confirmed.
+    /// Open must leave its acquired lease fenced rather than handing the
+    /// uncertain input state to another owner.
+    struct CleanupFailingPhysicalBackend(FakeBackend);
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for CleanupFailingPhysicalBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::RealDesktopX11
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.0.geometry().await
+        }
+
+        async fn execute_one(
+            &mut self,
+            action: &ComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            self.0.execute_one(action).await
+        }
+
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            Err(ComputerError::Refused(
+                "injected durable neutralization failure".to_string(),
+            ))
+        }
+    }
+
     /// Real durable sinks used by physical-coordinator unit fixtures. Keeping
     /// these in one owned fixture prevents physical tests from bypassing the
     /// production open contract with memory/no-op shims.
@@ -5719,6 +6070,35 @@ mod tests {
     }
 
     #[test]
+    fn macos_arbiter_serializes_all_displays_in_one_login_session() {
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let mut arbiter_a =
+            HostInputArbiter::new(Box::new(os_lock.shared_clone()), OwnerInstance(1));
+        let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(2));
+        let display_a = physical_key();
+        let mut display_b = display_a;
+        display_b.physical_display_id = [99; 32];
+        // Audit sessions do not partition the global HID event tap.
+        display_b.platform_session_or_seat_id = [98; 32];
+        // A separately installed Cockpit instance (for example, a different
+        // macOS login user) must still contend for the one HID event tap.
+        display_b.host_installation_id = HostInstallationId([77; 32]);
+
+        let token_a = match arbiter_a
+            .try_acquire_macos(&display_a, DelegationId("macos-display-a".to_string()))
+        {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("first macOS display should acquire, got {other:?}"),
+        };
+        assert_eq!(token_a.target_key, display_a);
+        assert_ne!(token_a.arbitration_key, display_a);
+        assert!(matches!(
+            arbiter_b.try_acquire_macos(&display_b, DelegationId("macos-display-b".to_string()),),
+            AcquireResult::OsLockFailed(HostLockError::ContendedByOtherProcess)
+        ));
+    }
+
+    #[test]
     fn computer_native_host_arbiter_generations_not_reused() {
         let os_lock = Box::new(InMemoryOsAdvisoryLock::new());
         let mut arbiter = HostInputArbiter::new(os_lock, OwnerInstance(1));
@@ -5768,6 +6148,127 @@ mod tests {
         // The token is now invalid.
         assert!(!arbiter.is_lease_valid(&token));
         let _ = token; // suppress unused warning
+    }
+
+    #[test]
+    fn owner_death_fails_dead_owner_waiter_instead_of_stranding_it() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let key = physical_key();
+        let holder = match lock_poison_safe(&arbiter)
+            .try_acquire(&key, DelegationId("holder".to_string()))
+        {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("holder acquisition failed: {other:?}"),
+        };
+        let mut waiter = match lock_poison_safe(&arbiter)
+            .try_acquire(&key, DelegationId("waiter".to_string()))
+        {
+            AcquireResult::Queued(handle) => handle,
+            other => panic!("waiter did not queue: {other:?}"),
+        };
+        assert_eq!(
+            lock_poison_safe(&arbiter).release_for_owner(holder.owner_instance),
+            1
+        );
+        let failure = waiter
+            .receiver
+            .try_recv()
+            .expect("waiter resolved")
+            .expect_err("dead owner's waiter must fail");
+        waiter.completed = true;
+        assert_eq!(failure, WaitFailed::Invalidated);
+        assert!(!lock_poison_safe(&arbiter).is_held(&key));
+        assert_eq!(lock_poison_safe(&arbiter).waiter_count(&key), 0);
+    }
+
+    #[test]
+    fn cancelled_after_successful_delivery_reclaims_exact_promoted_lease() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let key = physical_key();
+        let holder = match lock_poison_safe(&arbiter)
+            .try_acquire(&key, DelegationId("holder".to_string()))
+        {
+            AcquireResult::Acquired(token) => token,
+            other => panic!("holder acquisition failed: {other:?}"),
+        };
+        let mut abandoned = match lock_poison_safe(&arbiter)
+            .try_acquire(&key, DelegationId("abandoned".to_string()))
+        {
+            AcquireResult::Queued(handle) => handle,
+            other => panic!("waiter did not queue: {other:?}"),
+        };
+        abandoned.reclaimer = Some(Arc::downgrade(&arbiter));
+
+        assert!(lock_poison_safe(&arbiter).release(&holder));
+        assert!(lock_poison_safe(&arbiter).is_held(&key));
+        // Do not poll/ack the already-delivered token: task cancellation drops
+        // the wait future in precisely the post-send/pre-resume interval.
+        drop(abandoned);
+        assert!(!lock_poison_safe(&arbiter).is_held(&key));
+        assert!(matches!(
+            lock_poison_safe(&arbiter).try_acquire(&key, DelegationId("replacement".to_string())),
+            AcquireResult::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn waiter_delivery_ack_and_arbiter_release_interleave_without_lock_cycle() {
+        use std::sync::{Barrier, mpsc};
+
+        // Promotion and abandonment formerly nested the arbiter and delivery
+        // mutexes in opposite orders. Drive those operations concurrently;
+        // the lock-free delivery generation must let both finish and reclaim
+        // either possible promotion outcome without a ghost lease.
+        for iteration in 0..64 {
+            let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+                Box::new(InMemoryOsAdvisoryLock::new()),
+                OwnerInstance(1),
+            )));
+            let key = physical_key();
+            let holder = match lock_poison_safe(&arbiter)
+                .try_acquire(&key, DelegationId(format!("holder-{iteration}")))
+            {
+                AcquireResult::Acquired(token) => token,
+                other => panic!("holder acquisition failed: {other:?}"),
+            };
+            let mut waiter = match lock_poison_safe(&arbiter)
+                .try_acquire(&key, DelegationId(format!("waiter-{iteration}")))
+            {
+                AcquireResult::Queued(handle) => handle,
+                other => panic!("waiter was not queued: {other:?}"),
+            };
+            waiter.reclaimer = Some(Arc::downgrade(&arbiter));
+
+            let barrier = Arc::new(Barrier::new(3));
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let release_arbiter = arbiter.clone();
+            let release_barrier = barrier.clone();
+            let release_finished = finished_tx.clone();
+            std::thread::spawn(move || {
+                release_barrier.wait();
+                lock_poison_safe(&release_arbiter).release(&holder);
+                release_finished.send(()).ok();
+            });
+            let drop_barrier = barrier.clone();
+            std::thread::spawn(move || {
+                drop_barrier.wait();
+                drop(waiter);
+                finished_tx.send(()).ok();
+            });
+            barrier.wait();
+            for _ in 0..2 {
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("promotion and cancellation must not deadlock");
+            }
+            assert!(!lock_poison_safe(&arbiter).is_held(&key));
+        }
     }
 
     #[test]
@@ -7004,6 +7505,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidated_owner_cannot_cleanup_shared_input_after_handoff_and_reentry() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let sinks = PhysicalTestSinks::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut first = ComputerActionCoordinator::open(
+            Box::new(CleanupRecordingPhysicalBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
+            sinks.params(
+                authorizer.clone(),
+                ComputerApprovalTier::Yolo,
+                arbiter.clone(),
+            ),
+        )
+        .await
+        .expect("first open");
+        events.lock().unwrap().clear();
+
+        first.invalidate(TargetUnavailableReason::StaleTarget);
+        assert_eq!(*events.lock().unwrap(), vec!["cleanup"]);
+
+        let mut second_params =
+            sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+        second_params.delegation_id = DelegationId("replacement".to_string());
+        let second = ComputerActionCoordinator::open(
+            Box::new(CleanupRecordingPhysicalBackend {
+                inner: FakeBackend::new(),
+                events: events.clone(),
+            }),
+            second_params,
+        )
+        .await
+        .expect("replacement open");
+        assert_eq!(*events.lock().unwrap(), vec!["cleanup", "cleanup"]);
+
+        // Re-entry through another terminal callback and then Drop must not
+        // touch the journal/backend now owned by the replacement generation.
+        first.mark_backend_dead();
+        drop(first);
+        assert_eq!(*events.lock().unwrap(), vec!["cleanup", "cleanup"]);
+        drop(second);
+    }
+
+    #[tokio::test]
     async fn computer_physical_open_store_rehydrate_failure_never_holds_host_lease() {
         let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
             Box::new(InMemoryOsAdvisoryLock::new()),
@@ -7025,6 +7576,33 @@ mod tests {
         assert!(
             !arbiter.lock().unwrap().is_held(&physical_key()),
             "store rehydrate failure must occur before host lease acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_physical_open_cleanup_failure_keeps_coordinator_fence_owned() {
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(InMemoryOsAdvisoryLock::new()),
+            OwnerInstance(1),
+        )));
+        let sinks = PhysicalTestSinks::new();
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = sinks.params(authorizer, ComputerApprovalTier::Yolo, arbiter.clone());
+
+        let result = ComputerActionCoordinator::open(
+            Box::new(CleanupFailingPhysicalBackend(FakeBackend::new())),
+            params,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CoordinatorOpenError::BackendInputCleanup(_))
+        ));
+        assert!(
+            arbiter.lock().unwrap().is_held(&physical_key()),
+            "coordinator Drop must retain the failed-cleanup fence; the acquisition guard must already be disarmed"
         );
     }
 

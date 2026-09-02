@@ -2,6 +2,7 @@
   "direct_features": {
     "aarch64-apple-darwin": {
       "block2": ["std"],
+      "libc": [],
       "mach2": [],
       "objc2-app-kit": ["std", "NSRunningApplication", "NSWorkspace"],
       "objc2-application-services": [
@@ -13,13 +14,17 @@
         "libc"
       ],
       "objc2-color-sync": ["std", "ColorSyncDevice"],
-      "objc2-core-foundation": ["std", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString"],
+      "objc2-core-foundation": ["std", "CFArray", "CFDictionary", "CFFileDescriptor", "CFNumber", "CFRunLoop", "CFString", "CFUUID"],
       "objc2-core-graphics": [
         "std",
         "CGDirectDisplay",
         "CGDisplayConfiguration",
         "CGError",
+        "CGEvent",
+        "CGEventSource",
+        "CGEventTypes",
         "CGGeometry",
+        "CGRemoteOperation",
         "CGSession",
         "CGWindow",
         "libc"
@@ -49,8 +54,7 @@
     },
     "x86_64-unknown-linux-gnu": {
       "atspi": ["connection", "proxies", "tokio"],
-      "x11rb": ["randr", "render"],
-      "x11rb-protocol": ["randr"]
+      "x11rb": ["randr"]
     }
   },
   "packages_by_platform": {
@@ -838,6 +842,32 @@
         "rust_version": "1.65",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
         "version": "0.2.189"
+      },
+      {
+        "checksum": "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d",
+        "edition": "2021",
+        "features": [
+          "IOSurface",
+          "IOSurfaceAPI",
+          "IOSurfaceBase",
+          "IOSurfaceRef",
+          "IOSurfaceTypes",
+          "ObjC",
+          "alloc",
+          "bitflags",
+          "default",
+          "libc",
+          "objc2",
+          "objc2-core-foundation",
+          "objc2-foundation",
+          "std",
+          "unstable-darwin-objc"
+        ],
+        "license": "Zlib OR Apache-2.0 OR MIT",
+        "name": "objc2-io-surface",
+        "rust_version": "1.71",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.3.2"
       }
     ],
     "x86_64-pc-windows-msvc": [
@@ -1676,6 +1706,46 @@
         "rust_version": "1.77.2",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
         "version": "0.14.0"
+      },
+      {
+        "checksum": "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8",
+        "edition": "2021",
+        "features": [],
+        "license": "Apache-2.0",
+        "name": "gethostname",
+        "rust_version": "1.71",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.1.0"
+      },
+      {
+        "checksum": "6998de05217a084b7578728a9443d04ea4cd80f2a0839b8d78770b76ccd45863",
+        "edition": "2021",
+        "features": [],
+        "license": "MIT",
+        "name": "zbus-lockstep",
+        "rust_version": null,
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.5.2"
+      },
+      {
+        "checksum": "10da05367f3a7b7553c8cdf8fa91aee6b64afebe32b51c95177957efc47ca3a0",
+        "edition": "2021",
+        "features": [],
+        "license": "MIT",
+        "name": "zbus-lockstep-macros",
+        "rust_version": null,
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.5.2"
+      },
+      {
+        "checksum": "d1586c021a01ca0a9216dcd874e546382e156a5cbab5fab6cb5f10087e22682a",
+        "edition": "2024",
+        "features": [],
+        "license": "MIT",
+        "name": "zbus_xml",
+        "rust_version": "1.87",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "5.2.1"
       }
     ]
   }

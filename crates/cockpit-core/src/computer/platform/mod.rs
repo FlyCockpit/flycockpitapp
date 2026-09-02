@@ -9,6 +9,10 @@ pub mod wayland;
 pub mod windows;
 pub mod x11;
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::MacActiveConsoleSession;
+#[cfg(target_os = "macos")]
+pub use macos::MacOsTargetEvidenceAdapter;
 pub use macos::{
     AU_DEFAUDITSID, CgSessionKey, MacAxAttribute, MacAxNotification, MacCallbackGate,
     MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,

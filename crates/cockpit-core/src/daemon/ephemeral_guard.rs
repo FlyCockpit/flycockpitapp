@@ -899,6 +899,7 @@ mod tests {
                     Body::Request {
                         id,
                         request: Request::DaemonStatus,
+                        ..
                     } => id,
                     _ => panic!("expected daemon lifetime confirmation"),
                 }
@@ -1422,6 +1423,7 @@ mod tests {
                     Body::Request {
                         id,
                         request: Request::DaemonStatus,
+                        ..
                     } => id,
                     other => panic!("expected daemon lifetime confirmation, got {other:?}"),
                 },

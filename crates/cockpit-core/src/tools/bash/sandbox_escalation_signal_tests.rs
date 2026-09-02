@@ -45,6 +45,7 @@ fn sandbox_failure_without_trusted_signal_keeps_actionable_result() {
     let body = render_output(
         &outcome,
         false,
+        &crate::redact::RedactionTable::empty(),
         "touch /outside",
         tmp.path(),
         BashOutputAnnotations::default(),

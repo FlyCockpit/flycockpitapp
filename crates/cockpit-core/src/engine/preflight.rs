@@ -655,7 +655,11 @@ async fn rewrite(
     context: &PreflightContext,
 ) -> Option<String> {
     let model_ref = model_ref?;
-    let model = match crate::engine::model::Model::from_ref(providers, model_ref, redact) {
+    let model = match crate::engine::model::Model::from_ref(
+        providers,
+        model_ref,
+        std::sync::Arc::clone(&redact),
+    ) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "preflight: model build failed; failing open");

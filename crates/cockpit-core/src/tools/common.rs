@@ -318,21 +318,25 @@ pub fn read_slice_with_byte_cap(
     // omission edge exactly like the byte-cap edge; a boundary-blind
     // line-limit cut would hand the §7 whole-value scrub a straddling
     // secret's unmatchable PREFIX.
-    let shown: Vec<&str> = if stopped_for_byte_cap || more_lines {
+    let shown: Vec<String> = if stopped_for_byte_cap || more_lines {
         let kept_content = safe_lines[..kept].join("\n");
         let safe = drop_back_margin(redact, &kept_content);
         // Fail-closed: when the elision empties the segment (nothing was
         // kept, or the whole kept span lay inside the unsafe margin), show
         // NO lines — never a fabricated empty `${n}|` row — so `next_offset`
         // stays at the first RETAINED line and paging re-offers rather than
-        // skips.
+        // skips. Own the split lines: `drop_back_margin` borrows
+        // `kept_content`, which does not outlive this branch.
         if safe.is_empty() {
             Vec::new()
         } else {
-            safe.split('\n').collect()
+            safe.split('\n').map(str::to_string).collect()
         }
     } else {
-        safe_lines[..kept].to_vec()
+        safe_lines[..kept]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
     };
 
     let mut numbered = String::with_capacity(len_acc);

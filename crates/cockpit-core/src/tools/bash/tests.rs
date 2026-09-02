@@ -132,7 +132,7 @@ async fn bash_output_secret_straddling_truncation_boundary_is_redacted() {
     );
     std::fs::write(tmp.path().join("big.txt"), &stdout).unwrap();
     let command = "cat big.txt";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     let table = crate::redact::RedactionTable::empty()
         .with_forced_literal(SECRET.to_string(), "bash-straddle-test".to_string())
         .unwrap()

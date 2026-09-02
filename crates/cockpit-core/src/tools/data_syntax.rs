@@ -383,7 +383,11 @@ mod tests {
     #[test]
     fn invalid_note_truncates_on_char_boundaries() {
         let detail = "世".repeat(MAX_DETAIL_CHARS + 1);
-        let note = invalid_note(DataFormat::Yaml, detail);
+        let note = invalid_note(
+            &crate::redact::RedactionTable::empty(),
+            DataFormat::Yaml,
+            detail,
+        );
         let capped = format!("{}…", "世".repeat(MAX_DETAIL_CHARS));
 
         assert!(note.contains(&capped));

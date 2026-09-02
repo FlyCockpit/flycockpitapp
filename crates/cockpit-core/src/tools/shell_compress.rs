@@ -282,8 +282,10 @@ fn middle_truncate_lines(redact: &crate::redact::RedactionTable, lines: Vec<Stri
     let head = &lines[..TRUNCATE_HEAD_LINES];
     let tail = &lines[total - TRUNCATE_TAIL_LINES..];
     let elided = total - TRUNCATE_HEAD_LINES - TRUNCATE_TAIL_LINES;
-    let safe_head = crate::tools::common::drop_back_margin(redact, &head.join("\n"));
-    let safe_tail = crate::tools::common::drop_front_margin(redact, &tail.join("\n"));
+    let head_joined = head.join("\n");
+    let tail_joined = tail.join("\n");
+    let safe_head = crate::tools::common::drop_back_margin(redact, &head_joined);
+    let safe_tail = crate::tools::common::drop_front_margin(redact, &tail_joined);
     format!("{safe_head}\n… {elided} lines elided …\n{safe_tail}")
 }
 
@@ -959,14 +961,10 @@ fn bounded_signal_lines(redact: &crate::redact::RedactionTable, lines: &[String]
     // retained tail's START each abut the elided middle; elide the unsafe
     // margin on each side (joined-line coordinates cover multi-line
     // registered literals straddling either boundary).
-    let head = crate::tools::common::drop_back_margin(
-        redact,
-        &lines[..PRUNE_BOUNDARY_SIGNAL_HEAD].join("\n"),
-    );
-    let tail = crate::tools::common::drop_front_margin(
-        redact,
-        &lines[lines.len() - PRUNE_BOUNDARY_SIGNAL_TAIL..].join("\n"),
-    );
+    let head_joined = lines[..PRUNE_BOUNDARY_SIGNAL_HEAD].join("\n");
+    let tail_joined = lines[lines.len() - PRUNE_BOUNDARY_SIGNAL_TAIL..].join("\n");
+    let head = crate::tools::common::drop_back_margin(redact, &head_joined);
+    let tail = crate::tools::common::drop_front_margin(redact, &tail_joined);
     format!("{head}\n… {omitted} diagnostic lines elided …\n{tail}")
 }
 
@@ -1179,7 +1177,7 @@ mod tests {
     #[test]
     fn strips_ansi_color_codes() {
         let input = "\x1b[31mError: boom\x1b[0m\n\x1b[1;32mok\x1b[0m";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         assert!(!out.contains('\x1b'));
         assert!(out.contains("Error: boom"));
         assert!(out.contains("ok"));
@@ -1189,7 +1187,7 @@ mod tests {
     fn strips_osc_hyperlink_sequences() {
         // OSC 8 hyperlink wrapping: ESC ] 8 ; ; url BEL text ESC ] 8 ; ; BEL
         let input = "\x1b]8;;https://example.com\x07link text\x1b]8;;\x07";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         assert!(!out.contains('\x1b'));
         assert!(out.contains("link text"));
         assert!(!out.contains("example.com") || out.contains("link text"));
@@ -1198,7 +1196,7 @@ mod tests {
     #[test]
     fn collapses_carriage_return_progress_redraw() {
         let input = "Downloading 10%\rDownloading 50%\rDownloading 100%";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         // Only the final segment survives; the intermediate redraws are gone.
         assert!(out.contains("Downloading 100%"));
         assert!(!out.contains("10%"));
@@ -1208,7 +1206,7 @@ mod tests {
     #[test]
     fn drops_spinner_only_lines_keeps_text() {
         let input = "⠋\n⠙\n⠹\nHello! How can I help you today?";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         assert_eq!(out, "Hello! How can I help you today?");
     }
 
@@ -1216,14 +1214,14 @@ mod tests {
     fn spinner_with_real_text_is_kept() {
         // A spinner glyph followed by real text (esp. an error) must survive.
         let input = "⠋ Building error[E0382]: borrow of moved value";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         assert!(out.contains("error[E0382]"));
     }
 
     #[test]
     fn dedups_consecutive_identical_lines_with_count() {
         let input = "retrying\nretrying\nretrying\ndone";
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
         assert!(out.contains("retrying  [×3]"), "got: {out}");
         assert!(out.contains("done"));
         // The repeated text appears once (plus the count), not three times.
@@ -1237,7 +1235,7 @@ mod tests {
             lines.push(format!("line {i}"));
         }
         let input = lines.join("\n");
-        let out = generic_filter(&input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), &input);
         // Head present.
         assert!(out.contains("line 0"));
         assert!(out.contains("line 1"));
@@ -1268,7 +1266,7 @@ mod tests {
         ]);
         lines.extend((0..260).map(|i| format!("tail noise {i}")));
 
-        let out = generic_filter(&lines.join("\n"));
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), &lines.join("\n"));
 
         assert!(out.contains("Traceback (most recent call last):"), "{out}");
         assert!(out.contains("ValueError: first failure"), "{out}");
@@ -1292,7 +1290,7 @@ Traceback (most recent call last):
   File \"last.py\", line 3, in <module>
 LastError: boom";
 
-        let out = generic_filter(input);
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), input);
 
         assert!(out.contains("first.py"), "{out}");
         assert!(out.contains("last.py"), "{out}");
@@ -1308,7 +1306,7 @@ LastError: boom";
         }
         lines.push("RuntimeError: tail survives".to_string());
 
-        let out = generic_filter(&lines.join("\n"));
+        let out = generic_filter(&crate::redact::RedactionTable::empty(), &lines.join("\n"));
 
         assert!(out.contains("f0.py"), "{out}");
         assert!(out.contains("f89.py"), "{out}");
@@ -1320,7 +1318,10 @@ LastError: boom";
     #[test]
     fn no_truncation_under_the_line_threshold() {
         let input = "a\nb\nc";
-        assert_eq!(generic_filter(input), "a\nb\nc");
+        assert_eq!(
+            generic_filter(&crate::redact::RedactionTable::empty(), input),
+            "a\nb\nc"
+        );
     }
 
     // ── recognize / first_program ───────────────────────────────────────
@@ -1479,7 +1480,9 @@ LastError: boom";
         }
         let body = lines.join("\n");
 
-        let out = prune_boundary_condense("cargo test", &body).expect("condensed");
+        let out =
+            prune_boundary_condense(&crate::redact::RedactionTable::empty(), "cargo test", &body)
+                .expect("condensed");
 
         assert!(out.len() < body.len());
         assert!(out.contains("[deterministic shell condensation]"));
@@ -1492,7 +1495,14 @@ LastError: boom";
 
     #[test]
     fn prune_boundary_condense_leaves_short_output_unchanged() {
-        assert!(prune_boundary_condense("cargo test", "ok\n").is_none());
+        assert!(
+            prune_boundary_condense(
+                &crate::redact::RedactionTable::empty(),
+                "cargo test",
+                "ok\n"
+            )
+            .is_none()
+        );
     }
 
     // ── Per-command family strategies: noise stripped + signal preserved ──
@@ -1790,7 +1800,10 @@ failed to solve: process \"/bin/sh -c make\" did not complete successfully: exit
             compress_stream(&crate::redact::RedactionTable::empty(), "cargo build", ""),
             ""
         );
-        assert_eq!(generic_filter(""), "");
+        assert_eq!(
+            generic_filter(&crate::redact::RedactionTable::empty(), ""),
+            ""
+        );
     }
     // A multi-line registered literal spanning a dropped-noise/kept-line
     // boundary leaves a PARTIAL the downstream whole-value scrub cannot

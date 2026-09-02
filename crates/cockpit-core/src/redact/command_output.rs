@@ -73,6 +73,12 @@
 //! ordinary words (`information`, `well-known-compound`) — position and
 //! charset composition are non-gates because they carry no signal either
 //! way, while sub-20 length carries positive counter-signal.
+//! Escaped quotes are honored wherever a quote acts as a delimiter
+//! (quoted assignment values, quoted JSON members, quoted colon-pair
+//! keys): an embedded `\"` is value text, never the closing delimiter, so
+//! `API_TOKEN="ab\"cd"` and `{"API_TOKEN":"ab\"cd"}` are redacted whole —
+//! every parser resolves its closing quote through one shared
+//! escape-aware index, never a naive next-quote scan.
 //! Multi-line XML element values and multi-line quoted shell
 //! strings are passed through untouched rather than guessed at (the value
 //! cannot be delimited by shape); PEM and YAML block scalars are the two
@@ -309,8 +315,9 @@ fn is_xml_tag_name(tag: &str) -> bool {
 /// assignments inline (`TOKEN=… ./run.sh`, `echo "DB_PASSWORD=*"`). A
 /// boundary char (line start, whitespace, quote, backtick, `?`, `&`, `;`,
 /// `/`, or `-`) must sit before the key, so prose and markup fragments are
-/// not reinterpreted as keys. Quoted values lose their quotes; keys and
-/// surroundings survive.
+/// not reinterpreted as keys. Quoted values (escaped quotes honored — an
+/// embedded `\"` is value text, never the closing delimiter) lose their
+/// quotes; keys and surroundings survive.
 fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
     if !content.contains('=') {
         return content.to_string();
@@ -352,9 +359,13 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
         let query_context =
             key_start > 0 && matches!(bytes[key_start - 1], b'?' | b'&' | b';' | b'/');
         // When the key sits inside a quoted shell string (`echo "KEY=…"`),
-        // the value ends at that string's closing quote.
+        // the value ends at that string's closing quote. A quote that is
+        // itself escaped (`\"`) is a literal quote, not a string opener:
+        // the shared escape-aware index decides, because a naive byte
+        // check would hunt a closing quote that does not exist and drop
+        // the whole assignment (leaking a bare value).
         let opening_quote = match key_start.checked_sub(1).and_then(|idx| bytes.get(idx)) {
-            Some(&q @ (b'"' | b'\'')) => Some(q),
+            Some(&q @ (b'"' | b'\'')) if quotes.is_delimiter(q, key_start - 1) => Some(q),
             _ => None,
         };
         let mut redacted: Option<(usize, usize)> = None;
@@ -383,7 +394,8 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
 
 /// The value span `(start, end)` of an assignment whose `=` ends at
 /// `after_eq - 1`: leading whitespace is skipped, a value that opens with a
-/// quote runs to its closing quote (the span includes both quotes), a value
+/// quote runs to its first *unescaped* closing quote — an embedded `\"` is
+/// value text, never a delimiter (the span includes both quotes), a value
 /// whose key sat inside a quoted shell string (`opening_quote`) runs to
 /// that string's closing quote (the quote itself stays outside the span),
 /// and a bare value runs to the next whitespace or — in URL context — the
@@ -426,25 +438,27 @@ fn assignment_value_span(
 /// *anywhere* on the line, which is what compact (`{"k":"v"}`) and
 /// multi-member (`{"a":"b","SecretKey":"v"}`) JSON requires. Quote style is
 /// preserved; a JSON trailing comma sits outside the value and survives.
-/// Quote pairing is naive (escaped quotes are not honored — the same
-/// fidelity as every other parser here, and the failure mode is
-/// under-classification of a mangled key, never a leak of a well-formed
-/// member).
+/// Escaped quotes are honored (issue #279 cycle 5): pairing walks unescaped
+/// delimiters only, so a well-formed member whose value embeds a literal
+/// quote (`{"API_TOKEN":"ab\"cd"}`) is redacted whole instead of closing at
+/// the escaped quote and leaking the value's remainder.
 fn scrub_secret_shaped_quoted_members(content: &str, placeholder: &str) -> String {
     let double = scrub_quoted_members_of_kind(content, placeholder, '"');
     scrub_quoted_members_of_kind(&double, placeholder, '\'')
 }
 
 /// One quote kind of [`scrub_secret_shaped_quoted_members`]: walk same-kind
-/// quote pairs (open, close) in order; when the quoted string is a
-/// secret-shaped key, the separator between it and the next quote is a
-/// single colon with optional surrounding whitespace, and the string after
-/// that separator is a scrubbable value, replace the value.
+/// unescaped quote pairs (open, close) in order — via [`QuoteIndex`], so an
+/// escaped quote is value text, never a delimiter; when the quoted string
+/// is a secret-shaped key, the separator between it and the next quote is
+/// a single colon with optional surrounding whitespace, and the string
+/// after that separator is a scrubbable value, replace the value.
 fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) -> String {
     if !content.contains(':') {
         return content.to_string();
     }
-    let positions: Vec<usize> = content.match_indices(kind).map(|(idx, _)| idx).collect();
+    let quotes = QuoteIndex::collect(content);
+    let positions = quotes.positions_of(kind);
     let mut out = String::with_capacity(content.len());
     let mut copied = 0;
     let mut k = 0;
@@ -480,7 +494,11 @@ fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) ->
 /// the rebuild. Quoted-key members anywhere on the line are handled by
 /// [`scrub_secret_shaped_quoted_members`]; this parser's unique coverage is
 /// the bare unquoted key at line start (plain YAML), including one leading
-/// YAML list marker (`- key: value`).
+/// YAML list marker (`- key: value`). A quoted value anchors to the end of
+/// the (comma-stripped) line rather than pairing quotes — YAML's doubled
+/// `''` single-quote escape makes next-quote pairing ambiguous — so
+/// escaped quotes inside the value are covered as value text, and a line
+/// whose quotes do not balance passes through untouched.
 fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
     if !content.contains(':') {
         return content.to_string();
@@ -501,12 +519,17 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
         }
     }
     // Key: JSON-style quoted, or a bare token running to the `:` (with
-    // optional spacing before the separator: `auth-token : value`).
-    let (key, after_key) = if let Some(rest) = head.strip_prefix('"') {
-        let Some(close_rel) = rest.find('"') else {
+    // optional spacing before the separator: `auth-token : value`). The
+    // quoted key's closing quote resolves through the shared escape-aware
+    // index, so an escaped quote inside the key cannot shift the pair
+    // (keys carrying quote characters stay unclassifiable either way, but
+    // delimiter resolution is not allowed to be naive anywhere).
+    let quotes = QuoteIndex::collect(content);
+    let (key, after_key) = if head.starts_with('"') {
+        let Some(close) = quotes.next_of(b'"', head_off + 1) else {
             return content.to_string();
         };
-        (&head[1..1 + close_rel], head_off + 1 + close_rel + 1)
+        (&content[head_off + 1..close], close + 1)
     } else {
         let Some(sep_rel) = head.find(':') else {
             return content.to_string();
@@ -908,6 +931,15 @@ fn is_bare_key_char(b: u8) -> bool {
 /// Per-line index of quote characters: collected in one linear scan, looked
 /// up by binary search. Replaces the per-assignment suffix scans for
 /// closing quotes, which made a line full of unclosed quotes quadratic.
+///
+/// Delimiter fidelity (issue #279 cycle 5): a quote preceded by an odd
+/// number of consecutive backslashes is escaped — a literal quote inside
+/// the delimited value (`\"` in JSON and shell double quotes, `\'` in
+/// single-quote styles) — and is never recorded as a delimiter; an even
+/// backslash run is escaped backslashes followed by a real closing quote.
+/// Every parser here that resolves a quote delimiter goes through this
+/// index, so none can close a value at an escaped quote and leak its
+/// remainder.
 struct QuoteIndex {
     double: Vec<usize>,
     single: Vec<usize>,
@@ -917,25 +949,50 @@ impl QuoteIndex {
     fn collect(content: &str) -> Self {
         let mut double = Vec::new();
         let mut single = Vec::new();
+        // Length of the run of consecutive backslashes ending at the last
+        // scanned byte; any other byte (quotes included) resets it.
+        let mut backslash_run = 0usize;
         for (idx, ch) in content.char_indices() {
             match ch {
-                '"' => double.push(idx),
-                '\'' => single.push(idx),
-                _ => {}
+                '\\' => backslash_run += 1,
+                '"' | '\'' => {
+                    if backslash_run % 2 == 0 {
+                        if ch == '"' {
+                            double.push(idx);
+                        } else {
+                            single.push(idx);
+                        }
+                    }
+                    backslash_run = 0;
+                }
+                _ => backslash_run = 0,
             }
         }
         Self { double, single }
     }
 
-    /// The first quote of `kind` (`"` or `'`) at or after `from`.
-    fn next_of(&self, kind: u8, from: usize) -> Option<usize> {
-        let positions = if kind == b'"' {
+    /// All unescaped `kind` quote positions, in order (the pairing pass
+    /// walks these as (open, close) pairs).
+    fn positions_of(&self, kind: char) -> &[usize] {
+        if kind == '"' {
             &self.double
         } else {
             &self.single
-        };
+        }
+    }
+
+    /// The first quote of `kind` (`"` or `'`) at or after `from`.
+    fn next_of(&self, kind: u8, from: usize) -> Option<usize> {
+        let positions = self.positions_of(kind as char);
         let idx = positions.partition_point(|&p| p < from);
         positions.get(idx).copied()
+    }
+
+    /// Whether the quote of `kind` at byte offset `at` is an unescaped
+    /// delimiter (an escaped quote is a literal quote, not an opener).
+    fn is_delimiter(&self, kind: u8, at: usize) -> bool {
+        let positions = self.positions_of(kind as char);
+        positions.binary_search(&at).is_ok()
     }
 }
 
@@ -1125,6 +1182,58 @@ mod tests {
                 "{\"a\":1,\"api_token\":\"novel-json-token-445566\",\"b\":2}"
             ),
             "{\"a\":1,\"api_token\":\"[ph]\",\"b\":2}"
+        );
+    }
+
+    #[test]
+    fn escaped_quote_in_quoted_value_is_value_text_not_delimiter() {
+        // Issue #279 cycle 5: an escaped quote (`\"`) inside a quoted value
+        // is value text, never the closing delimiter. Both the quoted
+        // assignment parser and the quoted-member pairing used to close the
+        // span at the escaped quote and leak the value's remainder
+        // (`SECRET"`), which is invisible to the keyless pass below its
+        // 20-character floor.
+        let table = table_with_placeholder(PH);
+        // Quoted assignment value.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("API_TOKEN=\"abcd\\\"SECRET\""),
+            "API_TOKEN=[ph]"
+        );
+        // Compact JSON member.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("{\"API_TOKEN\":\"abcd\\\"SECRET\"}"),
+            "{\"API_TOKEN\":\"[ph]\"}"
+        );
+        // Single-quoted member (relaxed JSON / `\'`-escaping styles).
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("{'api_token':'abcd\\'SECRET'}"),
+            "{'api_token':'[ph]'}"
+        );
+        // An escaped backslash before the quote does not escape the quote:
+        // the following quote is the real delimiter, and the text after it
+        // is not part of the value.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("GITHUB_TOKEN=\"ab\\\\\" trailing"),
+            "GITHUB_TOKEN=[ph] trailing"
+        );
+        // An assignment inside a quoted shell echo whose value embeds
+        // escaped quotes: the enclosing string's real close delimits.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("echo \"DB_PASSWORD=abc\\\"def\\\"ghi\""),
+            "echo \"DB_PASSWORD=[ph]\""
+        );
+        // Line-anchored colon pair: the quoted value anchors to the line
+        // end, so the escaped quote inside is covered without pairing.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("password: \"abcd\\\"SECRET\""),
+            "password: \"[ph]\""
+        );
+        // An escaped quote before the key is a literal quote, not a string
+        // opener: the value stays bare-scoped instead of being dropped for
+        // lack of a closing quote (which used to leak the bare value).
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("echo \\\"DB_PASSWORD=novelsecret123456"),
+            "echo \\\"DB_PASSWORD=[ph]"
         );
     }
 

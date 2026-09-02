@@ -37,6 +37,45 @@ async fn dispatch_loop_start_and_cancel() {
     assert!(!driver.schedule.has_loop());
 }
 
+/// Stop-all (the `cockpit run` Ctrl+C / TUI "Stop all" path) must fire the
+/// session-work child on a live loop so in-flight inference aborts, then
+/// drop the registry row. `CancelTurn` must leave that token live.
+#[tokio::test]
+async fn stop_all_cancels_scheduled_loop_token_and_registry() {
+    let (mut driver, _tmp) = test_driver(8);
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "loop.start",
+            "args": { "interval": 60, "prompt": "poll", "limit": 2, "keep_in_context": false }
+        }))
+        .await
+        .unwrap();
+    let job_id = out
+        .split('`')
+        .nth(1)
+        .expect("job id in backticks")
+        .to_string();
+    let token = driver
+        .schedule
+        .job_cancel_token(&job_id)
+        .expect("forked loop has a session-work child token");
+    assert!(!token.is_cancelled());
+
+    driver.cancel_handle().cancel_turn();
+    assert!(
+        !token.is_cancelled(),
+        "CancelTurn must not stop scheduled loops"
+    );
+
+    driver.cancel_handle().cancel_all_session_work();
+    driver.schedule.cancel_all();
+    assert!(
+        token.is_cancelled(),
+        "Stop must cancel the loop's inference token"
+    );
+    assert!(!driver.schedule.has_loop());
+}
+
 /// End-to-end gate (implementation note): a
 /// `loop.start` whose `interval` AND `limit` are JSON strings (the
 /// observed weak-model failure, session `ezhcf7`) must SUCCEED — both

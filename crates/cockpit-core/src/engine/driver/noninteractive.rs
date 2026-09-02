@@ -2623,13 +2623,10 @@ impl Driver {
             let child_tx = tx.clone();
             let child_task_call_id = task_call_id.clone();
             runs.push(async move {
+                let child_cancel = child_runner.session_work_cancel.child();
                 let outcome = child_runner
-                    .execute_single_noninteractive_task(
-                        child.task,
-                        &child_tx,
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .await?;
+                    .execute_single_noninteractive_task(child.task, &child_tx, child_cancel)
+                    .await?;
                 anyhow::ensure!(
                     !activation_gate.is_aborted(),
                     "recovered batch activation was aborted before its resume claim was consumed"
@@ -2744,12 +2741,9 @@ impl Driver {
             task_call_id.clone(),
             BackgroundNoninteractiveJob::spawn(workspace_leases, async move {
                 let _permits = permits;
+                let cancel = runner.session_work_cancel.child();
                 let result = runner
-                    .execute_single_noninteractive_task(
-                        task,
-                        &tx_for_task,
-                        tokio_util::sync::CancellationToken::new(),
-                    )
+                    .execute_single_noninteractive_task(task, &tx_for_task, cancel)
                     .await;
                 // A failed claim acknowledges no recovered work.  Suppress the
                 // ordinary completion/failure finalizer so an activation abort
@@ -10326,6 +10320,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
     loop_guard_threshold: u32,
     deferred_log: crate::engine::deferred::DeferredLog,
     tx: &mpsc::Sender<TurnEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
     interrupt_id: uuid::Uuid,
     payload: crate::db::needs_attention::InterruptParkPayload,
     response: crate::daemon::proto::ResolveResponse,
@@ -10379,7 +10374,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         cwd: cwd.to_path_buf(),
         redact: redact.clone(),
         interrupts: interrupts.clone(),
-        cancel: tokio_util::sync::CancellationToken::new(),
+        cancel: cancel.clone(),
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
         image_generation_dispatch: session.image_generation_dispatch(),
@@ -11215,6 +11210,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                         loop_guard_threshold,
                         deferred_log.clone(),
                         &child_tx,
+                        &cancel,
                         interrupt_id,
                         *payload,
                         response,
@@ -11488,6 +11484,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                         loop_guard_threshold,
                         deferred_log.clone(),
                         &child_tx,
+                        &cancel,
                         interrupt_id,
                         *payload,
                         response,

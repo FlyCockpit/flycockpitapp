@@ -297,6 +297,7 @@ pub fn spawn(
         redact,
         turn_tx,
         event_tx,
+        cancel,
     }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
     let ring: Arc<Mutex<BoundedOutputRing>> =
@@ -323,6 +324,7 @@ pub fn spawn(
             turn_tx,
             event_tx.clone(),
             kill_rx,
+            cancel,
         ),
         event_tx,
         job_id,
@@ -340,6 +342,9 @@ pub struct BackgroundSpawn {
     pub redact: Arc<RedactionTable>,
     pub turn_tx: mpsc::Sender<TurnEvent>,
     pub event_tx: mpsc::Sender<ScheduleEvent>,
+    /// Session-work child token. Stop fires this so the runner kills the
+    /// subprocess even if `kill()` races with task abort.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 fn spawn_guarded_background<F>(
@@ -504,7 +509,21 @@ async fn run_background(
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
+    if cancel.is_cancelled() {
+        let _ = event_tx
+            .send(ScheduleEvent::Completed {
+                job_id,
+                label: label.clone(),
+                kind: ScheduleKind::Background,
+                result: format!("background `{label}` was cancelled"),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await;
+        return;
+    }
     let mut cmd = match build_background_command(&command, &cwd, &launch).await {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -565,6 +584,17 @@ async fn run_background(
 
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => {
+                killed = true;
+                let pid = child.id();
+                cockpit_host::process::terminate_group_async(
+                    &mut child,
+                    pid,
+                    Duration::from_millis(200),
+                )
+                .await;
+                break;
+            }
             // Kill request from the authority / `background.cancel`.
             changed = kill_rx.changed(), if !kill_watch_closed => {
                 match changed {
@@ -831,6 +861,28 @@ mod tests {
         turn_tx: mpsc::Sender<TurnEvent>,
         event_tx: mpsc::Sender<ScheduleEvent>,
     ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        spawn_test_job_with_cancel(
+            label,
+            command,
+            cwd,
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    fn spawn_test_job_with_cancel(
+        label: &str,
+        command: &str,
+        cwd: std::path::PathBuf,
+        launch: BackgroundLaunch,
+        redact: Arc<RedactionTable>,
+        turn_tx: mpsc::Sender<TurnEvent>,
+        event_tx: mpsc::Sender<ScheduleEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
         spawn(BackgroundSpawn {
             job_id: "job-1".to_string(),
             label: label.to_string(),
@@ -840,6 +892,7 @@ mod tests {
             redact,
             turn_tx,
             event_tx,
+            cancel,
         })
     }
 
@@ -1379,6 +1432,50 @@ mod tests {
         let completed = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
             .await
             .expect("cancel should complete the job")
+            .unwrap();
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(!failed, "a cancelled scheduled task isn't a failure");
+                assert!(result.contains("cancelled"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_cancel_token_kills_running_shell() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, _task) = spawn_test_job_with_cancel(
+            "slow",
+            "printf 'progress one\\nprogress two\\n'; sleep 30",
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact.clone(),
+            turn_tx,
+            event_tx,
+            cancel.clone(),
+        );
+
+        let mut waited = 0;
+        loop {
+            let t = handle.tail(40, &redact);
+            if t.contains("progress two") {
+                break;
+            }
+            assert!(waited < 100, "lines never appeared in tail: {t}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+
+        cancel.cancel();
+        let completed = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("session Stop must complete the background shell")
             .unwrap();
         match completed {
             ScheduleEvent::Completed { result, failed, .. } => {

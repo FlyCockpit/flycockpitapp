@@ -53,6 +53,9 @@ pub struct SwarmRunCtx {
     /// Driver command channel — the runner posts a child's own
     /// `spawn` back to main (the single authority) here.
     pub cmd_tx: mpsc::Sender<ScheduleCommand>,
+    /// Session-work child token. Stop cancels in-flight child inference
+    /// rather than leaving the provider request running after task abort.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -162,7 +165,22 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         turn_tx,
         event_tx,
         cmd_tx,
+        cancel,
     } = run;
+
+    if cancel.is_cancelled() {
+        let _ = event_tx
+            .send(ScheduleEvent::Completed {
+                job_id,
+                label: label.clone(),
+                kind: ScheduleKind::Swarm,
+                result: format!("swarm `{label}` cancelled"),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await;
+        return;
+    }
 
     // Announce the child START to the driver as this task's FIRST action, on the
     // same channel and by the same task that sends its terminal `Completed`
@@ -213,7 +231,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         None
     };
 
-    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx).await;
+    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx, &cancel).await;
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -246,6 +264,19 @@ pub async fn run_swarm(run: SwarmRunCtx) {
                     .await;
             }
             text
+        }
+        Err(e) if crate::engine::model::is_cancelled(&e) || cancel.is_cancelled() => {
+            let _ = event_tx
+                .send(ScheduleEvent::Completed {
+                    job_id,
+                    label: label.clone(),
+                    kind: ScheduleKind::Swarm,
+                    result: format!("swarm `{label}` cancelled"),
+                    failed: false,
+                    requests: Vec::new(),
+                })
+                .await;
+            return;
         }
         Err(e) => {
             // A failure bypasses the loop gate; the driver fires the terminal
@@ -289,6 +320,7 @@ async fn run_swarm_loop(
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let SwarmChild {
         agent,
@@ -306,12 +338,12 @@ async fn run_swarm_loop(
     let mut next_prompt = Message::user(brief);
 
     // A background swarm child is a leaf with no human on the other end:
-    // a detached interrupt hub + a fresh cancel token satisfy `turn`'s
-    // signature (same rationale as the loop-fork runner). No approver →
+    // a detached interrupt hub satisfies `turn`'s signature (same rationale
+    // as the loop-fork runner). Cancellation is the session-work child the
+    // authority minted — TUI Ctrl+C does not fire it, Stop does. No approver →
     // native tools skip the boundary prompt (never deny); the loop guard is
     // inert without one.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-    let cancel = tokio_util::sync::CancellationToken::new();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     // This detached child owns its `subagentStop` continuation budget for its
@@ -360,6 +392,13 @@ async fn run_swarm_loop(
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
+        if cancel.is_cancelled() {
+            return Err(anyhow::Error::new(
+                crate::engine::model::InferenceCancelled {
+                    phase: crate::engine::model::InferencePhase::Prep,
+                },
+            ));
+        }
         // Keep the continuation owned until its exact paired terminal row has
         // committed. A persist failure must leave the plan in
         // `pending_scheduled_turn` rather than dropping it via `take` on the
@@ -1272,7 +1311,14 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            run_swarm_loop("job-test", &spec, &ctx, &turn_tx, &cmd_tx),
+            run_swarm_loop(
+                "job-test",
+                &spec,
+                &ctx,
+                &turn_tx,
+                &cmd_tx,
+                &tokio_util::sync::CancellationToken::new(),
+            ),
         )
         .await
         .expect("the swarm loop must finish against the local endpoint");
@@ -1461,6 +1507,7 @@ mod tests {
                 turn_tx,
                 event_tx,
                 cmd_tx,
+                cancel: tokio_util::sync::CancellationToken::new(),
             }),
         )
         .await

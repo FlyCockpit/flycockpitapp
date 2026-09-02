@@ -41,6 +41,7 @@ pub mod authority;
 pub(crate) mod background;
 mod loop_runner;
 pub mod schemas;
+mod session_cancel;
 pub mod spec;
 mod swarm;
 pub mod tandem;
@@ -49,6 +50,7 @@ pub mod tandem;
 mod repair_tests;
 
 pub use authority::{ScheduleAuthority, ScheduleCommand, ScheduleEvent};
+pub use session_cancel::SessionWorkCancel;
 pub use spec::{
     ScheduleAction, ScheduleKind, loop_start_message, parse_background_cancel,
     parse_background_start, parse_background_tail, parse_loop_cancel, parse_loop_start,

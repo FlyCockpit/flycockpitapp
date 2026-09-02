@@ -11635,6 +11635,12 @@ pub(super) async fn run_worker(
                         }
                     ) {
                         cancel_handle.cancel_turn();
+                    } else if matches!(work, SessionWork::CancelAll) {
+                        // Stop-all: cancel the session-work root (loops, swarm
+                        // children, background shells, background delegates)
+                        // plus the live turn slot, then the schedule authority
+                        // aborts/kills the registered jobs below.
+                        cancel_handle.cancel_all_session_work();
                     } else {
                         cancel_handle.cancel_noninteractive();
                     }

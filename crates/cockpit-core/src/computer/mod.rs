@@ -26,9 +26,6 @@ pub mod outcome_store;
 pub mod platform;
 pub mod target;
 
-#[cfg(target_os = "macos")]
-pub use macos_backend::MacOsComputerBackend;
-
 #[cfg(test)]
 mod target_tests;
 
@@ -268,8 +265,12 @@ impl std::error::Error for ComputerError {}
 /// are uniquely mutated via `&mut self`; Sync here is the auto-trait bound for
 /// that stack, not concurrent method invocation.
 #[async_trait]
-pub trait ComputerBackend: Send + Sync {
+pub trait ComputerBackend: backend_seal::Sealed + Send + Sync {
     fn backend_kind(&self) -> target::BackendKind;
+    #[cfg(target_os = "linux")]
+    fn real_x11_display(&self) -> Option<&str> {
+        None
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     async fn execute_one(
         &mut self,
@@ -283,6 +284,28 @@ pub trait ComputerBackend: Send + Sync {
     /// every relevant key/button release and report a failure rather than
     /// silently handing the lease to another owner with uncertain input state.
     fn release_all(&mut self) -> Result<(), ComputerError>;
+
+    /// Production physical backends are inert until the coordinator binds
+    /// the exact live host lease acquired from target evidence. Test doubles
+    /// and virtual backends retain the default no-op contract.
+    fn bind_physical_capability(
+        &mut self,
+        _capability: coordinator::PhysicalDispatchCapability,
+    ) -> Result<(), ComputerError> {
+        if self.backend_kind() == target::BackendKind::VirtualDisplay {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            // Hermetic physical-kind fixtures contain no OS injection seam;
+            // production implementations must explicitly consume the permit.
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        Err(ComputerError::Refused(
+            "physical backend does not consume coordinator capability".into(),
+        ))
+    }
 
     async fn execute(&mut self, actions: &[ComputerAction]) -> ComputerBatchReport {
         let mut completed = Vec::new();
@@ -302,6 +325,14 @@ pub trait ComputerBackend: Send + Sync {
             failure: None,
         }
     }
+}
+
+mod backend_seal {
+    pub trait Sealed {}
+
+    // Unit-test fakes are crate-owned and have no physical injection primitive.
+    #[cfg(test)]
+    impl<T> Sealed for T {}
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +379,9 @@ impl Default for FakeBackend {
         Self::new()
     }
 }
+
+#[cfg(not(test))]
+impl backend_seal::Sealed for FakeBackend {}
 
 #[async_trait]
 impl ComputerBackend for FakeBackend {
@@ -428,7 +462,7 @@ impl RealDesktopGrantStore {
     }
 }
 
-pub struct VirtualDisplayBackend {
+pub(crate) struct VirtualDisplayBackend {
     display: String,
     backend_kind: target::BackendKind,
     /// `Child` is `Send` but not `Sync`. The mutex exists so the backend (and
@@ -441,11 +475,13 @@ pub struct VirtualDisplayBackend {
     /// this to a private journal so a replacement daemon can neutralize an
     /// arbitrary key left behind by a failed `keyup`.
     held_keys: Vec<String>,
+    held_buttons: Vec<u8>,
     held_key_journal: HeldKeyJournal,
     /// Private, owner-only directory under the Cockpit data root that contains
     /// any transient capture temp files. Never `$TMPDIR`. See
     /// [`private_capture_root`].
     capture_root: PathBuf,
+    physical_capability: Option<coordinator::PhysicalDispatchCapability>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +501,13 @@ struct HeldKeyJournal {
     path: Option<PathBuf>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HeldInputState {
+    pending: bool,
+    keys: Vec<String>,
+    buttons: Vec<u8>,
+}
+
 impl HeldKeyJournal {
     #[cfg(target_os = "linux")]
     fn for_real_x11(display: &str) -> Result<Self, ComputerError> {
@@ -482,39 +525,47 @@ impl HeldKeyJournal {
         })
     }
 
-    fn load(&self) -> Result<Vec<String>, ComputerError> {
+    fn load(&self) -> Result<HeldInputState, ComputerError> {
         let Some(path) = &self.path else {
-            return Ok(Vec::new());
+            return Ok(HeldInputState::default());
         };
         let Some(bytes) = cockpit_host::private_fs::read_private_file(path, "computer held-key")
             .map_err(input_journal_error)?
         else {
-            return Ok(Vec::new());
+            return Ok(HeldInputState::default());
         };
-        let keys = serde_json::from_slice::<Vec<String>>(&bytes).map_err(|_| {
+        let state = serde_json::from_slice::<HeldInputState>(&bytes).map_err(|_| {
             ComputerError::CommandFailed {
                 program: "computer input-state journal".to_string(),
                 detail: "held-key journal is malformed".to_string(),
             }
         })?;
-        if keys.iter().any(|key| key.is_empty()) {
+        if state.pending
+            || state.keys.iter().any(|key| key.is_empty())
+            || state.buttons.iter().any(|button| !(1..=3).contains(button))
+        {
             return Err(ComputerError::CommandFailed {
                 program: "computer input-state journal".to_string(),
-                detail: "held-key journal contains an empty key".to_string(),
+                detail: "input-state journal is uncertain or malformed".to_string(),
             });
         }
-        Ok(keys)
+        Ok(state)
     }
 
-    fn store(&self, keys: &[String]) -> Result<(), ComputerError> {
+    fn store(&self, keys: &[String], buttons: &[u8], pending: bool) -> Result<(), ComputerError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if keys.is_empty() {
+        if keys.is_empty() && buttons.is_empty() && !pending {
             return cockpit_host::private_fs::delete_private_file(path)
                 .map_err(input_journal_error);
         }
-        let bytes = serde_json::to_vec(keys).map_err(|error| ComputerError::CommandFailed {
+        let bytes = serde_json::to_vec(&HeldInputState {
+            pending,
+            keys: keys.to_vec(),
+            buttons: buttons.to_vec(),
+        })
+        .map_err(|error| ComputerError::CommandFailed {
             program: "computer input-state journal".to_string(),
             detail: error.to_string(),
         })?;
@@ -556,7 +607,7 @@ impl CaptureTool {
 }
 
 impl VirtualDisplayBackend {
-    pub fn construct(
+    fn construct(
         target: DisplayTarget,
         grant_store: Option<&RealDesktopGrantStore>,
     ) -> Result<Self, ComputerError> {
@@ -574,7 +625,7 @@ impl VirtualDisplayBackend {
     /// Exact X11 display capability opened by a real-desktop backend. Driver
     /// composition uses this value instead of re-reading a mutable environment.
     #[cfg(target_os = "linux")]
-    pub fn real_x11_display(&self) -> Option<&str> {
+    pub(crate) fn real_x11_display(&self) -> Option<&str> {
         (self.backend_kind == target::BackendKind::RealDesktopX11).then_some(&self.display)
     }
 
@@ -598,7 +649,7 @@ impl VirtualDisplayBackend {
         let capture = require_capture_tool()?;
         let capture_root = private_capture_root()?;
         let held_key_journal = HeldKeyJournal::for_real_x11(&display)?;
-        let held_keys = held_key_journal.load()?;
+        let held = held_key_journal.load()?;
         let geometry = query_x11_display_geometry(&xdotool, &display)?;
         Ok(Self {
             display,
@@ -606,9 +657,11 @@ impl VirtualDisplayBackend {
             xvfb: Mutex::new(None),
             geometry,
             tools: LinuxTools { xdotool, capture },
-            held_keys,
+            held_keys: held.keys,
+            held_buttons: held.buttons,
             held_key_journal,
             capture_root,
+            physical_capability: None,
         })
     }
 
@@ -664,8 +717,10 @@ impl VirtualDisplayBackend {
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
+            held_buttons: Vec::new(),
             held_key_journal: HeldKeyJournal::default(),
             capture_root,
+            physical_capability: None,
         })
     }
 
@@ -676,6 +731,14 @@ impl VirtualDisplayBackend {
 
     #[cfg(target_os = "linux")]
     fn run_xdotool_output(&self, args: &[OsString]) -> Result<std::process::Output, ComputerError> {
+        if self.backend_kind == target::BackendKind::RealDesktopX11 {
+            self.physical_capability
+                .as_ref()
+                .ok_or_else(|| {
+                    ComputerError::Refused("physical backend is not coordinator-bound".into())
+                })?
+                .recheck(self.backend_kind)?;
+        }
         let output = Command::new(&self.tools.xdotool)
             .env("DISPLAY", &self.display)
             .args(args)
@@ -715,27 +778,36 @@ impl VirtualDisplayBackend {
     /// constructed. This is called only during terminal neutralization, which
     /// the coordinator performs while it holds the physical host lease.
     fn reload_held_keys(&mut self) -> Result<(), ComputerError> {
-        for key in self.held_key_journal.load()? {
+        let state = self.held_key_journal.load()?;
+        for key in state.keys {
             if !self.held_keys.contains(&key) {
                 self.held_keys.push(key);
+            }
+        }
+        for button in state.buttons {
+            if !self.held_buttons.contains(&button) {
+                self.held_buttons.push(button);
             }
         }
         Ok(())
     }
 
-    /// Persist intent before emitting `keydown`: if the external process
-    /// reports an ambiguous failure or the daemon dies, recovery must prefer a
-    /// harmless extra `keyup` over forgetting a potentially pressed key.
+    /// Persist a pending transition before emitting `keydown`. Recovery never
+    /// guesses across that boundary: a crash before the known-state commit
+    /// leaves `pending` and causes the next opener to fail closed.
     fn remember_held_key(&mut self, key: String) -> Result<(), ComputerError> {
         if self.held_keys.contains(&key) {
             // Re-publish even for a repeated key: a prior recovery attempt may
             // have loaded the key before its journal was removed, and keydown
             // must never proceed without a durable recovery record.
-            return self.held_key_journal.store(&self.held_keys);
+            return self
+                .held_key_journal
+                .store(&self.held_keys, &self.held_buttons, true);
         }
         let mut keys = self.held_keys.clone();
         keys.push(key);
-        self.held_key_journal.store(&keys)?;
+        self.held_key_journal
+            .store(&keys, &self.held_buttons, true)?;
         self.held_keys = keys;
         Ok(())
     }
@@ -750,11 +822,73 @@ impl VirtualDisplayBackend {
             .filter(|held| held.as_str() != key)
             .cloned()
             .collect::<Vec<_>>();
-        self.held_key_journal.store(&keys)?;
+        self.held_key_journal
+            .store(&keys, &self.held_buttons, false)?;
         self.held_keys = keys;
         Ok(())
     }
+
+    fn remember_held_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
+        let button = mouse_button_number(button);
+        if !self.held_buttons.contains(&button) {
+            let mut buttons = self.held_buttons.clone();
+            buttons.push(button);
+            self.held_key_journal
+                .store(&self.held_keys, &buttons, true)?;
+            self.held_buttons = buttons;
+        }
+        Ok(())
+    }
+
+    fn forget_held_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
+        let button = mouse_button_number(button);
+        let buttons = self
+            .held_buttons
+            .iter()
+            .copied()
+            .filter(|held| *held != button)
+            .collect::<Vec<_>>();
+        self.held_key_journal
+            .store(&self.held_keys, &buttons, false)?;
+        self.held_buttons = buttons;
+        Ok(())
+    }
+
+    fn prepare_current_input_transition(&self) -> Result<(), ComputerError> {
+        self.held_key_journal
+            .store(&self.held_keys, &self.held_buttons, true)
+    }
+
+    fn commit_known_input_state(&self) -> Result<(), ComputerError> {
+        self.held_key_journal
+            .store(&self.held_keys, &self.held_buttons, false)
+    }
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxReleaseTransition {
+    Key(String),
+    Button(u8),
+}
+
+/// Run recovery transitions in strict journal order. Once a prepared OS
+/// release or its durable commit fails, the journal is ambiguous and no later
+/// transition may run: a later successful commit would otherwise clear the
+/// earlier `pending` marker and falsely claim that host input is known.
+#[cfg(target_os = "linux")]
+fn run_linux_release_state_machine(
+    transitions: impl IntoIterator<Item = LinuxReleaseTransition>,
+    mut release: impl FnMut(LinuxReleaseTransition) -> Result<(), ComputerError>,
+) -> Result<(), ComputerError> {
+    for transition in transitions {
+        release(transition)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+impl backend_seal::Sealed for VirtualDisplayBackend {}
 
 #[cfg(target_os = "linux")]
 fn query_x11_display_geometry(
@@ -1176,6 +1310,10 @@ impl ComputerBackend for VirtualDisplayBackend {
     fn backend_kind(&self) -> target::BackendKind {
         self.backend_kind
     }
+    #[cfg(target_os = "linux")]
+    fn real_x11_display(&self) -> Option<&str> {
+        self.real_x11_display()
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         #[cfg(target_os = "linux")]
         if self.backend_kind == target::BackendKind::RealDesktopX11 {
@@ -1188,6 +1326,14 @@ impl ComputerBackend for VirtualDisplayBackend {
         &mut self,
         action: &ComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
+        if self.backend_kind == target::BackendKind::RealDesktopX11 {
+            self.physical_capability
+                .as_ref()
+                .ok_or_else(|| {
+                    ComputerError::Refused("physical backend is not coordinator-bound".into())
+                })?
+                .recheck(self.backend_kind)?;
+        }
         execute_virtual_action(self, action)
     }
 
@@ -1198,44 +1344,51 @@ impl ComputerBackend for VirtualDisplayBackend {
             // predecessor's final failed `keyup`. Reload under the host lease
             // so that late durable state is never missed during recovery.
             self.reload_held_keys()?;
-            let held_keys = self.held_keys.clone();
-            let mut first_error = None;
-            for key in held_keys {
-                match self.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)]) {
-                    Ok(()) => {
-                        if let Err(error) = self.forget_held_key(&key)
-                            && first_error.is_none()
-                        {
-                            first_error = Some(error);
-                        }
+            let transitions = self
+                .held_keys
+                .clone()
+                .into_iter()
+                .map(LinuxReleaseTransition::Key)
+                .chain(
+                    self.held_buttons
+                        .clone()
+                        .into_iter()
+                        .map(LinuxReleaseTransition::Button),
+                )
+                .collect::<Vec<_>>();
+            run_linux_release_state_machine(transitions, |transition| {
+                self.prepare_current_input_transition()?;
+                match transition {
+                    LinuxReleaseTransition::Key(key) => {
+                        self.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)])?;
+                        self.forget_held_key(&key)
                     }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
+                    LinuxReleaseTransition::Button(button) => {
+                        self.run_xdotool(&[
+                            OsString::from("mouseup"),
+                            OsString::from(button.to_string()),
+                        ])?;
+                        self.held_buttons.retain(|held| *held != button);
+                        self.held_key_journal
+                            .store(&self.held_keys, &self.held_buttons, false)
+                    }
                 }
-            }
-            for key in ["Shift", "Control", "Alt", "Super_L"] {
-                if let Err(error) = self.run_xdotool(&[
-                    OsString::from("keyup"),
-                    OsString::from("--clearmodifiers"),
-                    OsString::from(key),
-                ]) && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-            }
-            for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-                if let Err(error) = self.run_xdotool(&[
-                    OsString::from("mouseup"),
-                    OsString::from(mouse_button_number(button).to_string()),
-                ]) && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-            }
-            if let Some(error) = first_error {
-                return Err(error);
-            }
+            })?;
         }
+        Ok(())
+    }
+
+    fn bind_physical_capability(
+        &mut self,
+        capability: coordinator::PhysicalDispatchCapability,
+    ) -> Result<(), ComputerError> {
+        if self.backend_kind != target::BackendKind::RealDesktopX11 {
+            return Err(ComputerError::Refused(
+                "cannot bind a physical capability to a virtual backend".into(),
+            ));
+        }
+        capability.recheck(self.backend_kind)?;
+        self.physical_capability = Some(capability);
         Ok(())
     }
 }
@@ -1302,26 +1455,32 @@ fn execute_virtual_action(
         } => {
             run_modifiers(backend, *modifiers, true)?;
             for _ in 0..click_repetitions(*count) {
+                backend.prepare_current_input_transition()?;
                 backend.run_xdotool(&[
                     OsString::from("click"),
                     OsString::from(mouse_button_number(*button).to_string()),
                 ])?;
+                backend.commit_known_input_state()?;
             }
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::MouseDown { button } => {
+            backend.remember_held_button(*button)?;
             backend.run_xdotool(&[
                 OsString::from("mousedown"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
+            backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::MouseUp { button } => {
+            backend.prepare_current_input_transition()?;
             backend.run_xdotool(&[
                 OsString::from("mouseup"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
+            backend.forget_held_button(*button)?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::Drag {
@@ -1346,33 +1505,43 @@ fn execute_virtual_action(
             let (first, first_duration, first_easing) = checked_path[0];
             move_cursor_with_timing(backend, first, first_duration, first_easing)?;
             run_modifiers(backend, *modifiers, true)?;
+            backend.remember_held_button(*button)?;
             backend.run_xdotool(&[
                 OsString::from("mousedown"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
+            backend.commit_known_input_state()?;
             for (point, duration, easing) in checked_path.into_iter().skip(1) {
                 move_cursor_with_timing(backend, point, duration, easing)?;
             }
+            backend.prepare_current_input_transition()?;
             backend.run_xdotool(&[
                 OsString::from("mouseup"),
                 OsString::from(mouse_button_number(*button).to_string()),
             ])?;
+            backend.forget_held_button(*button)?;
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::TypeText { text } => {
+            backend.prepare_current_input_transition()?;
             backend.run_xdotool(&[OsString::from("type"), OsString::from(text)])?;
+            backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::KeyChord { chord } => {
+            backend.prepare_current_input_transition()?;
             backend.run_xdotool(&[OsString::from("key"), OsString::from(chord.keys.join("+"))])?;
+            backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
         ComputerAction::HoldKey { key, duration } => {
             checked_action_duration(*duration)?;
             backend.remember_held_key(key.clone())?;
             backend.run_xdotool(&[OsString::from("keydown"), OsString::from(key)])?;
+            backend.commit_known_input_state()?;
             std::thread::sleep(*duration);
+            backend.prepare_current_input_transition()?;
             backend.run_xdotool(&[OsString::from("keyup"), OsString::from(key)])?;
             backend.forget_held_key(key)?;
             Ok(ComputerActionOutcome::Completed)
@@ -1387,11 +1556,15 @@ fn execute_virtual_action(
             run_modifiers(backend, *modifiers, true)?;
             let vertical = if *delta_y < 0 { "5" } else { "4" };
             for _ in 0..delta_y.unsigned_abs() {
+                backend.prepare_current_input_transition()?;
                 backend.run_xdotool(&[OsString::from("click"), OsString::from(vertical)])?;
+                backend.commit_known_input_state()?;
             }
             let horizontal = if *delta_x < 0 { "7" } else { "6" };
             for _ in 0..delta_x.unsigned_abs() {
+                backend.prepare_current_input_transition()?;
                 backend.run_xdotool(&[OsString::from("click"), OsString::from(horizontal)])?;
+                backend.commit_known_input_state()?;
             }
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
@@ -1541,7 +1714,7 @@ fn execute_virtual_action(
 
 #[cfg(target_os = "linux")]
 fn run_modifiers(
-    backend: &VirtualDisplayBackend,
+    backend: &mut VirtualDisplayBackend,
     modifiers: Modifiers,
     down: bool,
 ) -> Result<(), ComputerError> {
@@ -1553,7 +1726,17 @@ fn run_modifiers(
         (modifiers.meta, "Super_L"),
     ] {
         if enabled {
+            if down {
+                backend.remember_held_key(key.to_string())?;
+            } else {
+                backend.prepare_current_input_transition()?;
+            }
             backend.run_xdotool(&[OsString::from(verb), OsString::from(key)])?;
+            if down {
+                backend.commit_known_input_state()?;
+            } else {
+                backend.forget_held_key(key)?;
+            }
         }
     }
     Ok(())
@@ -3421,6 +3604,28 @@ mod capture_containment_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_release_state_machine_stops_before_later_commit_after_ambiguous_mouseup() {
+        let transitions = vec![
+            LinuxReleaseTransition::Button(1),
+            LinuxReleaseTransition::Button(2),
+        ];
+        let mut attempted = Vec::new();
+        let result = run_linux_release_state_machine(transitions, |transition| {
+            attempted.push(transition.clone());
+            if transition == LinuxReleaseTransition::Button(1) {
+                return Err(ComputerError::CommandFailed {
+                    program: "injected mouseup".to_string(),
+                    detail: "ambiguous".to_string(),
+                });
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempted, vec![LinuxReleaseTransition::Button(1)]);
+    }
     use tempfile::TempDir;
 
     fn test_geometry() -> DisplayGeometry {
@@ -3445,25 +3650,43 @@ mod tests {
         };
 
         journal
-            .store(&["F13".to_string(), "a".to_string()])
+            .store(&["F13".to_string(), "a".to_string()], &[1], false)
             .expect("persist held keys before keydown");
         assert_eq!(
             journal.load().expect("reload held keys"),
-            vec!["F13".to_string(), "a".to_string()]
+            HeldInputState {
+                pending: false,
+                keys: vec!["F13".to_string(), "a".to_string()],
+                buttons: vec![1],
+            }
         );
 
         // A partial cleanup may remove only the keys whose keyup succeeded;
         // the remainder is what a retry or replacement daemon must see.
         journal
-            .store(&["a".to_string()])
+            .store(&["a".to_string()], &[], false)
             .expect("retain failed keyup key");
         assert_eq!(
             journal.load().expect("reload failed keyup key"),
-            vec!["a".to_string()]
+            HeldInputState {
+                pending: false,
+                keys: vec!["a".to_string()],
+                buttons: vec![],
+            }
         );
 
-        journal.store(&[]).expect("clear after successful keyup");
-        assert!(journal.load().expect("empty journal").is_empty());
+        journal
+            .store(&[], &[], false)
+            .expect("clear after successful keyup");
+        assert_eq!(
+            journal.load().expect("empty journal"),
+            HeldInputState::default()
+        );
+
+        journal
+            .store(&["F13".to_string()], &[], true)
+            .expect("persist ambiguous transition");
+        assert!(journal.load().is_err(), "pending state must fail closed");
     }
 
     #[cfg(target_os = "linux")]

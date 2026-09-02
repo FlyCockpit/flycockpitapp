@@ -10,6 +10,23 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::computer::host_identity::domain_hash;
 
+/// Snapshot an authority record before its durable pre-post pending mark.
+/// Generic so the rollback state machine is testable on non-macOS builders;
+/// the macOS backend supplies its private journal record type.
+pub(super) fn begin_known_pre_post<T: Clone>(
+    state: &mut T,
+    mark_pending: impl FnOnce(&mut T),
+) -> T {
+    let previous = state.clone();
+    mark_pending(state);
+    previous
+}
+
+/// Restore the byte-for-byte logical authority state captured before prepare.
+pub(super) fn rollback_known_pre_post<T>(state: &mut T, previous: T) {
+    *state = previous;
+}
+
 #[cfg(target_os = "macos")]
 use crate::computer::host_identity::{
     HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
@@ -1481,6 +1498,44 @@ fn validate_current_login_session(
         .map_err(|_| TargetUnavailableReason::SessionInactive)
 }
 
+/// Reboundable proof of the active macOS console session used by the
+/// host-wide CGEvent sink. The backend retains one of these for its complete
+/// lifetime and rechecks it at the irreversible post primitive; evidence
+/// captured only at coordinator handoff is insufficient because a multi-event
+/// action may span a fast-user-switch transition.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub(crate) struct MacActiveConsoleSession {
+    login: CgSessionSnapshot,
+    audit_session_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl MacActiveConsoleSession {
+    pub(crate) fn capture() -> Result<Self, TargetUnavailableReason> {
+        Ok(Self {
+            login: current_active_login_session()?,
+            audit_session_id: current_audit_session_id()?,
+        })
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), TargetUnavailableReason> {
+        validate_current_login_session(&self.login)?;
+        if current_audit_session_id()? != self.audit_session_id {
+            return Err(TargetUnavailableReason::SessionInactive);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn identity(&self) -> Result<(u32, u32, u32), TargetUnavailableReason> {
+        let effective_uid = u32::try_from(unsafe { libc::geteuid() })
+            .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+        let (owner_uid, console_set) = validate_cg_session(&self.login, effective_uid, None)
+            .map_err(|_| TargetUnavailableReason::SessionInactive)?;
+        Ok((owner_uid, console_set, self.audit_session_id))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn cg_session_value(
     dictionary: &objc2_core_foundation::CFDictionary,
@@ -1550,6 +1605,32 @@ fn optional_ax_field(value: Option<String>) -> FieldEvidence<String> {
         },
         |value| FieldEvidence::available(value, EvidenceSource::Accessibility),
     )
+}
+
+#[cfg(test)]
+mod authority_transaction_tests {
+    use super::{begin_known_pre_post, rollback_known_pre_post};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AuthorityState {
+        pending: bool,
+        keys: Vec<u16>,
+        generation: u64,
+    }
+
+    #[test]
+    fn known_pre_post_refusal_restores_exact_prior_authority_state() {
+        let expected = AuthorityState {
+            pending: false,
+            keys: vec![12, 44],
+            generation: 9,
+        };
+        let mut state = expected.clone();
+        let previous = begin_known_pre_post(&mut state, |state| state.pending = true);
+        assert!(state.pending);
+        rollback_known_pre_post(&mut state, previous);
+        assert_eq!(state, expected);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

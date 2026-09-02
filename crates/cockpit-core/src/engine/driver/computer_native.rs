@@ -64,12 +64,10 @@ pub(crate) async fn open_native_computer_for_delegation(
     } else {
         None
     };
-    #[cfg(not(target_os = "macos"))]
-    let backend_result =
-        crate::computer::VirtualDisplayBackend::construct(candidate.target, grant_store.as_ref());
-    #[cfg(target_os = "macos")]
-    let backend_result =
-        crate::computer::MacOsComputerBackend::construct(candidate.target, grant_store.as_ref());
+    let backend_result = crate::computer::coordinator::construct_platform_backend(
+        candidate.target,
+        grant_store.as_ref(),
+    );
     let backend = match backend_result {
         Ok(backend) => backend,
         Err(error) => {
@@ -174,7 +172,7 @@ pub(crate) async fn open_native_computer_for_delegation(
         )),
         handoff_journal,
     };
-    match ComputerActionCoordinator::open(Box::new(backend), params).await {
+    match ComputerActionCoordinator::open(backend, params).await {
         Ok(coordinator) => {
             // Keep capability metadata only. Opened geometry is request-scoped:
             // the live-loop overlay copies it onto a turn-local agent so

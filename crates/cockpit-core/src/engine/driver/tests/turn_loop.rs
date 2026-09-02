@@ -1035,7 +1035,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         // never started.
         let deferred = drain_events(&mut rx);
         assert!(
-            !deferled.iter().any(|event| matches!(
+            !deferred.iter().any(|event| matches!(
                 event,
                 TurnEvent::AgentIdle {
                     turn_id: Some(turn_id),

@@ -9172,14 +9172,26 @@ impl Driver {
             return;
         }
         // A retraction settles the submission without ever starting a turn,
-        // so no lifecycle id is in flight. Bind the submission's own settled
-        // identity (its receipt id == queue item id) so a `watch_turn`
-        // watcher holding the acked id resolves on this `AgentIdle` instead
-        // of being stranded behind a timeout — and publish the truthful
-        // non-success reason. `take_idle_reason` would default to
-        // `Completed` here (no pending reason is set), which the settlement
-        // layer would hand to daemon schedulers as a successful run even
-        // though no provider request was ever made (#275).
+        // so it settles under its OWN acked identity (its receipt id == queue
+        // item id): a `watch_turn` watcher holding that id resolves on this
+        // `AgentIdle` instead of being stranded behind a timeout, and the
+        // published reason is the truthful non-success one —
+        // `take_idle_reason` would default to `Completed` here (no pending
+        // reason is set), which the settlement layer would hand to daemon
+        // schedulers as a successful run even though no provider request was
+        // ever made (#275).
+        //
+        // The in-flight lifecycle id is never this submission's: preflight
+        // runs before the turn bind, and sibling callers of
+        // `prepare_queued_user_submission` (steering at a `Continue`
+        // boundary, the post-completion `Done` drain, child-completion
+        // drains) run it while the driving turn still holds
+        // `current_lifecycle_turn_id`. Taking that id here would settle a
+        // watcher on the driving submission with this rejection — failing a
+        // scheduled/Dream run mid-flight, or even after it already earned
+        // `current_lifecycle_turn_completed` — and would silence the driving
+        // turn's own truthful idle at the boundary. Only the idle boundary
+        // publishes the driving turn's settlement (#275).
         let retraction_turn_id = client_submission_ids.first().copied();
         let _ = tx
             .send(TurnEvent::UserMessageRetracted {
@@ -9187,13 +9199,7 @@ impl Driver {
             })
             .await;
         self.emit_context_projection(tx).await;
-        let turn_id = self
-            .current_lifecycle_turn_id
-            .take()
-            .or_else(|| retraction_turn_id.map(|id| id.to_string()));
-        // The taken id's turn never completes; a later pending-only idle
-        // must not inherit a stale completion mark.
-        self.current_lifecycle_turn_completed = false;
+        let turn_id = retraction_turn_id.map(|id| id.to_string());
         let _ = tx
             .send(TurnEvent::AgentIdle {
                 turn_id,

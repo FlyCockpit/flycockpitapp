@@ -756,6 +756,31 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_profile_apply_writes_name_from_client_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CockpitConfigEnvGuard::set(tmp.path());
+        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
+        run.submit(WizardAnswer::Text("Ada".to_string())).unwrap();
+        assert_eq!(run.current_step_id(), Some("profile-save"));
+        let answers_json = run.answers_json().unwrap();
+
+        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
+            tmp.path(),
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            &answers_json,
+        )
+        .expect("daemon apply reconstructs profile-save and writes the name");
+
+        assert!(changed);
+        assert!(!model_file_written);
+        assert_eq!(default_scope, None);
+        let config = ExtendedConfigDoc::load(&global_config_file().unwrap())
+            .unwrap()
+            .config();
+        assert_eq!(config.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
     fn security_wizard_all_defaults_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());

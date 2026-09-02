@@ -5192,11 +5192,17 @@ mod tests {
         for _ in 0..num_readers {
             let db = db.clone();
             handles.push(tokio::spawn(async move {
-                db.read(|conn| {
-                    Ok(conn.query_row("SELECT value FROM after_read_panic", [], |row| row.get(0))?)
-                })
-                .await
-                .unwrap()
+                let value: i64 = db
+                    .read(|conn| {
+                        Ok(
+                            conn.query_row("SELECT value FROM after_read_panic", [], |row| {
+                                row.get(0)
+                            })?,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                value
             }));
         }
         for handle in handles {

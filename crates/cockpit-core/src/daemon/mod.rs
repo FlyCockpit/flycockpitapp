@@ -60,6 +60,7 @@ pub mod leak_reveal_socket;
 pub mod lsp;
 #[cfg(feature = "remote")]
 pub mod org_sync;
+pub(crate) mod owner_capability;
 pub mod principal;
 pub mod proto;
 pub mod registry;
@@ -461,6 +462,68 @@ impl DaemonPaths {
             Some(parent) => parent.join(file_name),
             None => PathBuf::from(file_name),
         }
+    }
+
+    /// Daemon-private owner-capability file: same parent as the control
+    /// socket, basename `{stem}.owner-capability`. Confined children are
+    /// denied this path (and its parent) so they cannot present the token.
+    pub fn owner_capability_path(&self) -> PathBuf {
+        Self::owner_capability_path_for_socket(&self.socket)
+    }
+
+    /// Pure derivation of [`Self::owner_capability_path`]. Shared with the
+    /// socket client so bind and connect never diverge.
+    pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
+        owner_capability_path_for_socket(control_socket)
+    }
+
+    /// Paths a confined child must never reach for this daemon instance:
+    /// the canonical state/runtime dirs plus this instance's socket,
+    /// leak-reveal socket, and owner-capability file.
+    pub fn sandbox_deny_paths(&self) -> Vec<PathBuf> {
+        let mut paths = control_plane_deny_paths();
+        push_unique_deny_path(&mut paths, self.socket.clone());
+        push_unique_deny_path(&mut paths, self.leak_reveal_socket());
+        push_unique_deny_path(&mut paths, self.owner_capability_path());
+        if let Some(parent) = self.socket.parent() {
+            push_unique_deny_path(&mut paths, parent.to_path_buf());
+        }
+        paths
+    }
+}
+
+/// Filesystem roots a confined child must never reach: the daemon state
+/// directory (pid, endpoint, capability file, fallback socket) and the
+/// runtime directory (canonical socket + leak-reveal socket).
+pub fn control_plane_deny_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(state) = state_dir() {
+        paths.push(state);
+    }
+    if let Some(rt) = runtime_dir() {
+        paths.push(rt);
+    }
+    paths
+}
+
+/// Same derivation the daemon and the socket client use for the
+/// owner-capability file. Kept as a free function so `cockpit-client` can
+/// duplicate the spelling without importing this crate.
+pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
+    let stem = control_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cockpit");
+    let file_name = format!("{stem}.owner-capability");
+    match control_socket.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
+fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
     }
 }
 
@@ -2781,6 +2844,14 @@ mod tests {
             paths.leak_reveal_socket(),
             PathBuf::from("/run/user/1000/cockpit/cockpit-leak-reveal.sock")
         );
+        assert_eq!(
+            paths.owner_capability_path(),
+            PathBuf::from("/run/user/1000/cockpit/cockpit.owner-capability")
+        );
+        let denied = paths.sandbox_deny_paths();
+        assert!(denied.contains(&paths.socket));
+        assert!(denied.contains(&paths.leak_reveal_socket()));
+        assert!(denied.contains(&paths.owner_capability_path()));
     }
 
     /// Two ephemeral daemons (distinct control stems) in one runtime dir get

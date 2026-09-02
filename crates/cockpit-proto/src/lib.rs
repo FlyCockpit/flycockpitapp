@@ -1530,18 +1530,91 @@ pub enum RecvFrame {
     },
 }
 
+/// Daemon-private owner capability presented on secret-bearing (`owner_only`)
+/// requests. The token is never logged: `Debug` is a fixed redaction.
+///
+/// Pre-launch mitigation for issue #296. Follow-up #337 replaces this file
+/// token with authenticated per-peer identity (peer-cred/mTLS).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OwnerCapabilityToken(String);
+
+impl OwnerCapabilityToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OwnerCapabilityToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnerCapabilityToken([redacted])")
+    }
+}
+
+#[cfg(test)]
+mod owner_capability_token_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let token = OwnerCapabilityToken::new("super-secret-token");
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "OwnerCapabilityToken([redacted])");
+        assert!(!rendered.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn absent_owner_capability_round_trips_like_legacy_envelopes() {
+        let id = Uuid::nil();
+        let envelope = Envelope::request(id, Request::DaemonStatus);
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert!(json.get("owner_capability").is_none());
+        let decoded: Envelope = serde_json::from_value(json).unwrap();
+        match decoded.body {
+            Body::Request {
+                owner_capability: None,
+                request: Request::DaemonStatus,
+                ..
+            } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
 impl Envelope {
     pub fn request(id: Uuid, request: Request) -> Self {
         Self::request_at(PROTOCOL_VERSION, id, request)
     }
 
     pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
+        Self::request_with_owner_capability_at(v, id, request, None)
+    }
+
+    pub fn request_with_owner_capability(
+        id: Uuid,
+        request: Request,
+        owner_capability: Option<OwnerCapabilityToken>,
+    ) -> Self {
+        Self::request_with_owner_capability_at(PROTOCOL_VERSION, id, request, owner_capability)
+    }
+
+    pub fn request_with_owner_capability_at(
+        v: u32,
+        id: Uuid,
+        request: Request,
+        owner_capability: Option<OwnerCapabilityToken>,
+    ) -> Self {
         Self {
             v,
             body: Body::Request {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability,
                 request,
             },
         }
@@ -1558,6 +1631,7 @@ impl Envelope {
             body: Body::Request {
                 id,
                 operation: Some(operation),
+                owner_capability: None,
                 request,
             },
         }
@@ -1615,6 +1689,11 @@ pub enum Body {
         #[cfg(feature = "remote")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation: Option<RemoteOperationIdentityV1>,
+        /// Daemon-private owner capability. Required for `owner_only` RPCs on
+        /// the Unix-socket path. Absent on in-process connections, which
+        /// already possess the endpoint. Issue #296 / follow-up #337.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_capability: Option<OwnerCapabilityToken>,
         #[serde(flatten)]
         request: Request,
     },
@@ -5714,6 +5793,7 @@ mod forward_open_guard_tests {
                 id: Uuid::new_v4(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::AdmitImageIngress {
                     session_id,
                     source: ImageIngressSourceV1::PrivateTerminalCapability {
@@ -7400,6 +7480,7 @@ mod tests {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::ListSecretInventory {
                     cursor: None,
                     limit: Some(32),
@@ -7465,6 +7546,7 @@ mod tests {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::ListSessions {
                     project_id: None,
                     parent_session_id: None,
@@ -7491,6 +7573,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::ListSessions {
                     project_id: None,
                     parent_session_id: None,
@@ -7506,6 +7589,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::ListSessions {
                     project_id: None,
                     parent_session_id: None,
@@ -7550,6 +7634,7 @@ mod tests {
                     id: Uuid::nil(),
                     #[cfg(feature = "remote")]
                     operation: None,
+                    owner_capability: None,
                     request,
                 })
                 .0,
@@ -7600,6 +7685,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::CancelLeakReveal {
                     capability: LeakRevealToken::new("00".repeat(32)),
                 },
@@ -7612,6 +7698,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::CancelProviderOAuth {
                     client_operation_id: "cancel".into(),
                     begin_client_operation_id: "begin".into(),
@@ -7650,6 +7737,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: default_export,
             })
             .0,
@@ -7666,6 +7754,7 @@ mod tests {
                 id: Uuid::nil(),
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: reader,
             })
             .0,
@@ -7850,6 +7939,7 @@ mod tests {
                     id: Uuid::nil(),
                     #[cfg(feature = "remote")]
                     operation: None,
+                    owner_capability: None,
                     request,
                 })
                 .0,
@@ -8105,6 +8195,7 @@ mod tests {
                     id: Uuid::nil(),
                     #[cfg(feature = "remote")]
                     operation: None,
+                    owner_capability: None,
                     request,
                 })
                 .0,
@@ -8193,6 +8284,7 @@ mod tests {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::GetDoctorSnapshot {
                     project_root: None,
                     no_sandbox: false,
@@ -8223,6 +8315,7 @@ mod tests {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::DocsAsk {
                     question: "how do tasks work?".into(),
                     package: Some("tokio".into()),
@@ -8297,6 +8390,7 @@ mod tests {
                     id: Uuid::nil(),
                     #[cfg(feature = "remote")]
                     operation: None,
+                    owner_capability: None,
                     request,
                 })
                 .0,
@@ -8361,6 +8455,7 @@ mod tests {
                 id,
                 #[cfg(feature = "remote")]
                 operation: None,
+                owner_capability: None,
                 request: Request::ApplySealedOwnerOperation {
                     capability_id: "cap".into(),
                     literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),

@@ -916,7 +916,7 @@ mod tests {
             RecvFrame::Envelope(envelope) => {
                 let Envelope { body, .. } = *envelope;
                 match body {
-                    Body::Request { id, request } => {
+                    Body::Request { id, request, .. } => {
                         assert!(matches!(request, Request::StopDaemon { grace_secs: None }));
                         id
                     }

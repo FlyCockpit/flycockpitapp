@@ -441,6 +441,55 @@ pub fn request_ordering(request: &Request) -> RequestOrdering {
     proto::command!(command_request_ordering_match, request)
 }
 
+macro_rules! command_requires_owner_capability_value {
+    (owner_only) => {
+        true
+    };
+    (public_read) => {
+        false
+    };
+    (session_writer) => {
+        false
+    };
+    (session_reader) => {
+        false
+    };
+    (terminal) => {
+        false
+    };
+    (project_files($project_root:ident)) => {
+        false
+    };
+    (project_read($project_root:ident)) => {
+        false
+    };
+    (session_row_writer($session_id:ident)) => {
+        false
+    };
+    (session_row_reader($session_id:ident)) => {
+        false
+    };
+    (custom($handler:ident)) => {
+        false
+    };
+}
+
+macro_rules! command_requires_owner_capability_match {
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request {
+            $($(#[$row_attr])* $pattern => command_requires_owner_capability_value!($authz $(($authz_arg))?),)+
+        }
+    }};
+}
+
+/// Secret-bearing (`owner_only`) RPCs require the daemon-private owner
+/// capability on the Unix-socket path (issue #296). Follow-up #337 replaces
+/// blanket Owner with authenticated per-peer identity.
+#[allow(unused_variables)]
+pub fn request_requires_owner_capability(request: &Request) -> bool {
+    proto::command!(command_requires_owner_capability_match, request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +748,39 @@ mod tests {
         assert_eq!(tag, "flycockpit:user-1");
         assert!(!principal.is_owner());
         assert!(principal.can_agent_write_project("/workspace/app"));
+    }
+
+    #[test]
+    fn owner_only_requests_require_the_daemon_private_capability() {
+        macro_rules! owner_capability_rows {
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+                vec![$($(#[$row_attr])* ($kind, command_requires_owner_capability_value!($authz $(($authz_arg))?)),)+]
+            }};
+        }
+        let rows = proto::command!(owner_capability_rows);
+        assert!(
+            rows.iter()
+                .any(|(kind, required)| *kind == "put_named_secret" && *required)
+        );
+        assert!(rows.iter().any(|(kind, required)| {
+            *kind == "create_code_root_with_acp_ingress_v1" && *required
+        }));
+        assert!(
+            rows.iter()
+                .any(|(kind, required)| *kind == "daemon_status" && !*required)
+        );
+        let required = rows.iter().filter(|(_, required)| *required).count();
+        assert!(
+            required >= 100,
+            "secret-bearing owner_only rows must stay gated; found {required}"
+        );
+        assert!(request_requires_owner_capability(
+            &Request::PutNamedSecret {
+                name: "k".into(),
+                value: "v".into(),
+            }
+        ));
+        assert!(!request_requires_owner_capability(&Request::DaemonStatus));
     }
 
     #[test]

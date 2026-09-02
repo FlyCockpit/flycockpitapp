@@ -93,6 +93,10 @@ pub struct ExtraSandboxPath {
 pub struct SandboxPolicy {
     pub allow_read_roots: Vec<std::path::PathBuf>,
     pub allow_write_roots: Vec<std::path::PathBuf>,
+    /// Hard denials applied after the allow lists. Zerobox deny takes
+    /// precedence, so these roots stay unreachable even when they sit under
+    /// an allowed parent (cwd, PATH, extra_paths).
+    pub deny_paths: Vec<std::path::PathBuf>,
     pub network_allowed: bool,
 }
 
@@ -212,6 +216,7 @@ fn sandbox_policy_with_visibility_restriction(
     SandboxPolicy {
         allow_read_roots,
         allow_write_roots,
+        deny_paths: crate::daemon::control_plane_deny_paths(),
         network_allowed: true,
     }
 }
@@ -447,7 +452,17 @@ pub async fn build_sandboxed_command_with_visibility_root(
         sandbox = sandbox.allow_write(path.clone());
     }
 
+    // Issue #296: confined children must not reach the daemon control plane
+    // (socket, leak-reveal socket, owner-capability file). Deny takes
+    // precedence over cwd/PATH/extra allow lists. Follow-up #337 replaces
+    // blanket Owner with authenticated per-peer identity.
+    let mut control_denies = policy.deny_paths.clone();
     for path in denied_paths {
+        if !control_denies.iter().any(|existing| existing == path) {
+            control_denies.push(path.clone());
+        }
+    }
+    for path in &control_denies {
         sandbox = sandbox.deny_read(path.clone()).deny_write(path.clone());
     }
     for path in write_denied_paths {
@@ -999,6 +1014,30 @@ mod tests {
     }
 
     #[test]
+    fn confined_policy_denies_daemon_control_plane() {
+        let cwd = tempfile::tempdir().unwrap();
+        let policy = sandbox_policy(
+            cwd.path(),
+            None,
+            &std::collections::HashMap::new(),
+            &[],
+            None,
+        );
+        let denied = crate::daemon::control_plane_deny_paths();
+        assert!(
+            !denied.is_empty(),
+            "daemon control-plane paths must resolve so confined children cannot reach the socket"
+        );
+        for path in &denied {
+            assert!(
+                policy.deny_paths.contains(path),
+                "sandbox policy must deny {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn sandbox_profile_narrows_write_to_scope() {
         let cwd = tempfile::tempdir().unwrap();
         let scope = cwd.path().join("crates/core");
@@ -1011,6 +1050,18 @@ mod tests {
                 .allow_read_roots
                 .contains(&cwd.path().to_path_buf())
         );
+        let denied = crate::daemon::control_plane_deny_paths();
+        assert!(
+            !denied.is_empty(),
+            "daemon control-plane deny paths must resolve"
+        );
+        for path in &denied {
+            assert!(
+                unscoped.deny_paths.contains(path),
+                "confined policy must deny daemon control plane {}",
+                path.display()
+            );
+        }
         assert!(
             unscoped
                 .allow_write_roots

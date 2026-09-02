@@ -7548,6 +7548,15 @@ CREATE TABLE installation_operations (
     CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
 );
 
+-- Cross-authority onboarding publication intent. Config preimages remain in
+-- a daemon-private journal file; this row is the durable recovery owner that
+-- restores those bytes and removes only the installation named by operation.
+CREATE TABLE onboarding_agent_publication_journals (
+    operation_id                 TEXT PRIMARY KEY,
+    backup_path                  TEXT NOT NULL,
+    created_at_unix_ms           INTEGER NOT NULL
+);
+
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,
     operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,

@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 use crate::config::dirs::global_config_file;
 use crate::config::extended::ExtendedConfigDoc;
@@ -43,6 +44,7 @@ pub struct PreparedOnboardingAgent {
 /// The daemon holds the config-publication boundary while this token is live;
 /// it is therefore safe to compensate a later database/install failure without
 /// overwriting an interleaved daemon publisher.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OnboardingConfigRollback {
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
@@ -84,12 +86,71 @@ impl OnboardingConfigRollback {
         }
         Ok(())
     }
+
+    /// Persist exact pre-publication bytes in daemon-private state before the
+    /// installation operation starts. SQLite records only this path and the
+    /// operation identity, never config contents (which can contain refs).
+    pub fn write_durable_journal(&self, operation_id: uuid::Uuid) -> Result<PathBuf> {
+        let root = cockpit_config::config::resolve::cockpit_state_dir()
+            .context("resolving daemon state directory for onboarding journal")?
+            .join("onboarding-agent-publication");
+        cockpit_host::private_fs::ensure_private_dir(&root)
+            .context("securing onboarding publication journal directory")?;
+        let path = root.join(format!("{operation_id}.json"));
+        let bytes = serde_json::to_vec(self).context("serializing onboarding config journal")?;
+        crate::config::config::files::atomic_write(&path, &bytes)
+            .with_context(|| format!("writing onboarding config journal {}", path.display()))?;
+        cockpit_host::private_fs::repair_private_file(&path, "onboarding config journal")
+            .context("securing onboarding config journal")?;
+        Ok(path)
+    }
+
+    pub fn restore_durable_journal(path: &Path) -> Result<()> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading onboarding config journal {}", path.display()))?;
+        let journal: Self =
+            serde_json::from_slice(&bytes).context("decoding onboarding config journal")?;
+        journal.restore()
+    }
+
+    pub fn discard_durable_journal(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow!(error))
+                .with_context(|| format!("removing onboarding config journal {}", path.display())),
+        }
+    }
+}
+
+/// Capture exactly the files that onboarding can publish. This must happen
+/// before installation begins so a process death can always reconcile to
+/// either the complete plan or the previous durable state.
+pub fn capture_onboarding_agent_config(
+    plan: &crate::onboarding_agent::OnboardingAgentPlan,
+) -> Result<OnboardingConfigRollback> {
+    let global_config = global_config_file().context("resolving global agent onboarding config")?;
+    let model_target = crate::config::providers::provider_file_path_for_config(
+        &global_config,
+        &plan.default_model.provider,
+    )
+    .context("resolving onboarding model config")?;
+    OnboardingConfigRollback::capture([global_config, model_target])
 }
 
 pub async fn prepare_onboarding_agent_answers(
     answers_json: &str,
 ) -> Result<PreparedOnboardingAgent> {
-    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
+    let revision = crate::wizard::onboarding_catalog_revision_from_answers_json(answers_json)?;
+    let catalog = if revision == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION {
+        crate::daemon::agent_catalog::ResolvedAgentCatalog {
+            revision,
+            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+            index: crate::daemon::agent_catalog::cached_catalog()?,
+        }
+    } else {
+        crate::daemon::agent_catalog::fetch_catalog_at_revision(&revision).await?
+    };
     prepare_onboarding_agent_answers_for_catalog(answers_json, catalog)
 }
 
@@ -105,13 +166,16 @@ pub fn prepare_onboarding_agent_answers_for_catalog(
     // Discovery is part of the selection authority, not an install-time
     // afterthought.  Reuse this exact resolved catalog for descriptor replay
     // and the eventual pinned lookup so live-only agents remain selectable.
-    let descriptor = crate::wizard::onboarding_agent_descriptor(&providers, &catalog.index);
+    let descriptor = crate::wizard::onboarding_agent_descriptor(
+        &providers,
+        &catalog.index,
+        catalog.revision.clone(),
+    );
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
     let (slug, answers) = crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
-    let entry = catalog
-        .index
-        .entry(&slug)
-        .with_context(|| format!("selected agent `{slug}` is absent from the pinned catalog"))?;
+    let entry = (slug != "third-party")
+        .then(|| catalog.index.entry(&slug))
+        .flatten();
     let plan = crate::onboarding_agent::build_onboarding_agent_plan(entry, answers, &providers)?;
     Ok(PreparedOnboardingAgent { plan, providers })
 }
@@ -254,6 +318,7 @@ pub fn descriptor_for_cwd_with_caps(
         return Some(crate::wizard::onboarding_agent_descriptor(
             &current,
             &catalog.index,
+            catalog.revision,
         ));
     }
     if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {

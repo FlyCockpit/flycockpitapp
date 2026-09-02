@@ -125,6 +125,10 @@ pub struct WizardDescriptor {
     /// screen. Keeping that relationship in the descriptor makes it apply to
     /// both renderers and authoritative answer replay.
     pub(crate) onboarding_agent_models: BTreeMap<String, Vec<SelectOption>>,
+    /// Immutable catalog identity carried with the rendered picker.  It is
+    /// encoded with the answers so authoritative replay fetches this exact
+    /// catalog revision instead of resolving `main` a second time.
+    pub(crate) onboarding_catalog_revision: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -228,11 +232,17 @@ impl WizardRun {
     /// Encode the completed answers for the daemon-owned setup mutation RPC.
     /// Descriptors and hooks never cross the wire.
     pub fn answers_json(&self) -> Result<String> {
-        let answers = self
+        let mut answers = self
             .answers
             .iter()
             .map(|(id, answer)| ((*id).to_string(), answer))
             .collect::<BTreeMap<_, _>>();
+        if let Some(revision) = &self.descriptor.onboarding_catalog_revision {
+            answers.insert(
+                "__onboarding_catalog_revision".to_string(),
+                WizardAnswer::Text(revision.clone()),
+            );
+        }
         serde_json::to_string(&answers).context("serializing wizard answers")
     }
 
@@ -583,6 +593,7 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "name",
@@ -615,6 +626,7 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "background-agents",
@@ -644,9 +656,10 @@ pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
 pub fn onboarding_agent_descriptor(
     providers: &crate::config::providers::ProvidersConfig,
     catalog: &crate::daemon::agent_catalog::AgentCatalogIndex,
+    catalog_revision: String,
 ) -> WizardDescriptor {
     let suggestions = catalog.suggestions_for_models(providers);
-    let agent_options = suggestions
+    let mut agent_options: Vec<SelectOption> = suggestions
         .iter()
         .map(|entry| SelectOption {
             id: entry.catalog.slug.clone().into(),
@@ -655,7 +668,7 @@ pub fn onboarding_agent_descriptor(
         })
         .collect();
     let offerings = crate::daemon::agent_installation::setup_offerings(providers);
-    let onboarding_agent_models = suggestions
+    let mut onboarding_agent_models: BTreeMap<String, Vec<SelectOption>> = suggestions
         .into_iter()
         .filter_map(|entry| {
             let primary = entry.definition.model_slots.get("primary")?;
@@ -676,6 +689,26 @@ pub fn onboarding_agent_descriptor(
             Some((entry.catalog.slug.clone(), options))
         })
         .collect();
+    // A third-party definition cannot be trusted from a catalog preview. The
+    // installer fetches and validates the pinned source before binding; this
+    // list merely lets the user nominate an already-configured model for that
+    // authoritative compatibility check.
+    agent_options.push(SelectOption {
+        id: "third-party".into(),
+        label: "Install a third-party agent".into(),
+        description: "Requires a pinned source and explicit trust confirmation".into(),
+    });
+    onboarding_agent_models.insert(
+        "third-party".to_string(),
+        offerings
+            .iter()
+            .map(|offering| SelectOption {
+                id: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                label: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                description: "Compatibility is verified from the fetched pinned definition".into(),
+            })
+            .collect(),
+    );
     let mut sidecar_options = vec![SelectOption {
         id: "disabled".into(),
         label: "Disable image sidecar".into(),
@@ -722,6 +755,7 @@ pub fn onboarding_agent_descriptor(
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models,
+        onboarding_catalog_revision: Some(catalog_revision),
         steps: vec![
             StepDescriptor {
                 id: "agent",
@@ -735,7 +769,43 @@ pub fn onboarding_agent_descriptor(
                 prefill: None,
                 validate: Some(validate_select),
                 write: None,
-                branch: None,
+                branch: Some(onboarding_agent_branch),
+            },
+            StepDescriptor {
+                id: "third-party-source",
+                prompt: "Pinned third-party agent source",
+                help: "Enter OWNER/REPOSITORY@COMMIT_OR_TAG:path/to/agent.md. A moving branch is not accepted.",
+                help_hook: None,
+                kind: StepKind::Text,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_third_party_source),
+                write: None,
+                branch: Some(|_, _| Some("third-party-warning")),
+            },
+            StepDescriptor {
+                id: "third-party-warning",
+                prompt: "Third-party agent security warning",
+                help: "Third-party agent Markdown is executable policy input. It can steer tool use and delegation. Review the publisher and pinned revision before continuing.",
+                help_hook: None,
+                kind: StepKind::Info,
+                default_answer: None,
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: Some(|_, _| Some("third-party-trust-confirm")),
+            },
+            StepDescriptor {
+                id: "third-party-trust-confirm",
+                prompt: "I trust this third-party publisher and pinned revision.",
+                help: "This confirmation is required separately from model trust.",
+                help_hook: None,
+                kind: StepKind::Confirm,
+                default_answer: None,
+                prefill: None,
+                validate: Some(validate_required_confirmation),
+                write: None,
+                branch: Some(|_, _| Some("model-trust")),
             },
             StepDescriptor {
                 id: "model-trust",
@@ -789,7 +859,7 @@ pub fn onboarding_agent_descriptor(
                 prefill: None,
                 validate: Some(validate_required_confirmation),
                 write: None,
-                branch: None,
+                branch: Some(onboarding_post_model_trust_branch),
             },
             StepDescriptor {
                 id: "tool-configuration",
@@ -825,18 +895,6 @@ pub fn onboarding_agent_descriptor(
                 default_answer: Some(WizardAnswer::ToolSurface(
                     crate::agents::ToolSurfaceSelection::default(),
                 )),
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
-                id: "requests-package",
-                prompt: "Enable the governed Monty `requests` package for this agent?",
-                help: "Off by default. Network policy and the standard-library restrictions still apply independently.",
-                help_hook: None,
-                kind: StepKind::Confirm,
-                default_answer: Some(WizardAnswer::Confirm(false)),
                 prefill: None,
                 validate: None,
                 write: None,
@@ -895,15 +953,45 @@ fn validate_required_confirmation(
     }
 }
 
+fn onboarding_agent_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
+    matches!(answer, WizardAnswer::Select(value) if value == "third-party")
+        .then_some("third-party-source")
+        .or(Some("model-trust"))
+}
+
+fn validate_third_party_source(
+    _: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::Text(locator) = answer else {
+        return Err("third-party source is required".into());
+    };
+    let source = crate::daemon::agent_installation::CanonicalAgentSource::parse(locator)
+        .map_err(|error| error.to_string())?;
+    if source.owner == "FlyCockpit" && source.repository == "agents" {
+        return Err("first-party agents must be selected from the catalog".into());
+    }
+    if source.requested_revision.is_none() {
+        return Err("third-party source must pin a commit or tag".into());
+    }
+    Ok(())
+}
+
 fn onboarding_tool_configuration_branch(
     _: &WizardRun,
     answer: &WizardAnswer,
 ) -> Option<&'static str> {
     match answer {
         WizardAnswer::Select(value) if value == "advanced" => Some("advanced-tools"),
-        WizardAnswer::Select(_) => Some("requests-package"),
+        WizardAnswer::Select(_) => Some("sidecar"),
         _ => None,
     }
+}
+
+fn onboarding_post_model_trust_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'static str> {
+    matches!(run.answer("agent"), Some(WizardAnswer::Select(agent)) if agent == "third-party")
+        .then_some("sidecar")
+        .or(Some("tool-configuration"))
 }
 
 fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
@@ -925,8 +1013,8 @@ pub fn onboarding_agent_answers(
     catalog_revision: String,
 ) -> Result<(String, crate::onboarding_agent::OnboardingAgentAnswers)> {
     use crate::onboarding_agent::{
-        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingMontyPackages,
-        OnboardingSidecarSelection, OnboardingToolConfiguration, OnboardingToolMode,
+        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingSidecarSelection,
+        OnboardingToolConfiguration, OnboardingToolMode,
     };
     let agent = match run.answer("agent") {
         Some(WizardAnswer::Select(value)) => value.clone(),
@@ -943,6 +1031,17 @@ pub fn onboarding_agent_answers(
         run.answer("model-trust-confirm"),
         Some(WizardAnswer::Confirm(true))
     );
+    let third_party_source = (agent == "third-party")
+        .then(|| match run.answer("third-party-source") {
+            Some(WizardAnswer::Text(source)) => Ok(source.clone()),
+            _ => Err(anyhow!("third-party source is required")),
+        })
+        .transpose()?;
+    let third_party_trust_confirmed = !agent.eq("third-party")
+        || matches!(
+            run.answer("third-party-trust-confirm"),
+            Some(WizardAnswer::Confirm(true))
+        );
     let (default_model_provider, default_model) = match run.answer("default-model") {
         Some(WizardAnswer::Select(value)) => value
             .split_once('/')
@@ -950,50 +1049,52 @@ pub fn onboarding_agent_answers(
             .context("default model selection omitted provider or model")?,
         _ => return Err(anyhow!("default model selection is required")),
     };
-    let tools = match run.answer("tool-configuration") {
-        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
-            OnboardingToolConfiguration::AuthorDefaults
-        }
-        Some(WizardAnswer::Select(value)) if value == "advanced" => {
-            let selection = match run.answer("advanced-tools") {
-                Some(WizardAnswer::ToolSurface(selection)) => selection,
-                _ => return Err(anyhow!("advanced tool configuration is required")),
-            };
-            let mut modes = BTreeMap::new();
-            for tool in crate::agents::known_tool_names() {
-                let selected = selection.tools.iter().any(|selected| selected == tool);
-                let tier = if selected {
-                    Some(
-                        selection
-                            .tool_tiers
-                            .get(*tool)
-                            .copied()
-                            .unwrap_or(crate::agents::ToolTier::Enabled),
-                    )
-                } else {
-                    crate::agents::legal_tool_tiers(tool)
-                        .contains(&crate::agents::ToolTier::Disabled)
-                        .then_some(crate::agents::ToolTier::Disabled)
-                };
-                if let Some(tier) = tier {
-                    modes.insert(
-                        (*tool).to_string(),
-                        match tier {
-                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
-                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
-                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
-                        },
-                    );
-                }
+    let tools = if agent == "third-party" {
+        OnboardingToolConfiguration::AuthorDefaults
+    } else {
+        match run.answer("tool-configuration") {
+            Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
+                OnboardingToolConfiguration::AuthorDefaults
             }
-            OnboardingToolConfiguration::Advanced(modes)
+            Some(WizardAnswer::Select(value)) if value == "advanced" => {
+                let selection = match run.answer("advanced-tools") {
+                    Some(WizardAnswer::ToolSurface(selection)) => selection,
+                    _ => return Err(anyhow!("advanced tool configuration is required")),
+                };
+                let mut modes = BTreeMap::new();
+                for tool in crate::agents::known_tool_names() {
+                    let selected = selection.tools.iter().any(|selected| selected == tool);
+                    let tier = if selected {
+                        Some(
+                            selection
+                                .tool_tiers
+                                .get(*tool)
+                                .copied()
+                                .unwrap_or(crate::agents::ToolTier::Enabled),
+                        )
+                    } else {
+                        crate::agents::legal_tool_tiers(tool)
+                            .contains(&crate::agents::ToolTier::Disabled)
+                            .then_some(crate::agents::ToolTier::Disabled)
+                    };
+                    if let Some(tier) = tier {
+                        modes.insert(
+                            (*tool).to_string(),
+                            match tier {
+                                crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
+                                crate::agents::ToolTier::Discoverable => {
+                                    OnboardingToolMode::MontyOnly
+                                }
+                                crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
+                            },
+                        );
+                    }
+                }
+                OnboardingToolConfiguration::Advanced(modes)
+            }
+            _ => return Err(anyhow!("tool configuration selection is required")),
         }
-        _ => return Err(anyhow!("tool configuration selection is required")),
     };
-    let requests = matches!(
-        run.answer("requests-package"),
-        Some(WizardAnswer::Confirm(true))
-    );
     let sidecar = match run.answer("sidecar") {
         Some(WizardAnswer::Select(value)) if value == "disabled" => {
             OnboardingSidecarSelection::Disabled
@@ -1031,8 +1132,9 @@ pub fn onboarding_agent_answers(
             default_model,
             model_trust,
             model_trust_confirmed,
+            third_party_source,
+            third_party_trust_confirmed,
             tools,
-            monty_packages: OnboardingMontyPackages { requests },
             sidecar,
             make_default: matches!(
                 run.answer("make-default"),
@@ -1040,6 +1142,25 @@ pub fn onboarding_agent_answers(
             ),
         },
     ))
+}
+
+/// Extract the descriptor-bound catalog revision before a daemon reconstructs
+/// the wizard. This is deliberately an opaque answer-envelope field: clients
+/// never choose it, and the selected entry is still revalidated against the
+/// exact pinned catalog before any side effect starts.
+pub fn onboarding_catalog_revision_from_answers_json(answers_json: &str) -> Result<String> {
+    let answers: BTreeMap<String, WizardAnswer> =
+        serde_json::from_str(answers_json).context("deserializing wizard answers")?;
+    match answers.get("__onboarding_catalog_revision") {
+        Some(WizardAnswer::Text(revision))
+            if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Ok(revision.clone())
+        }
+        _ => Err(anyhow!(
+            "onboarding agent answers are missing the descriptor catalog revision; reopen the picker"
+        )),
+    }
 }
 
 pub fn onboarding_background_agents_answer(run: &WizardRun) -> Option<bool> {
@@ -1097,6 +1218,7 @@ fn model_descriptor_with_selection_mode(
         write_policy: WritePolicy::CommitAtEnd,
         model_context: Some(model_context),
         onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "provider",
@@ -1493,6 +1615,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         write_policy: WritePolicy::PerStep,
         model_context: None,
         onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: ProviderWizardStep::Template.source_id(),
@@ -1722,6 +1845,7 @@ pub fn security_descriptor_for_config_with_caps(
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models: BTreeMap::new(),
+        onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
                 id: "sandbox",
@@ -2941,6 +3065,7 @@ mod tests {
             write_policy: policy,
             model_context: None,
             onboarding_agent_models: BTreeMap::new(),
+            onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {
                     id: "start",
@@ -3029,6 +3154,7 @@ mod tests {
             write_policy: WritePolicy::CommitAtEnd,
             model_context: None,
             onboarding_agent_models: BTreeMap::new(),
+            onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {
                     id: "value",

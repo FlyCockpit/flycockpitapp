@@ -59,12 +59,6 @@ pub enum OnboardingToolConfiguration {
     Advanced(BTreeMap<String, OnboardingToolMode>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct OnboardingMontyPackages {
-    /// Governed-network `requests` support is per-agent and always starts off.
-    pub requests: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnboardingSidecarSelection {
     Disabled,
@@ -84,8 +78,12 @@ pub struct OnboardingAgentAnswers {
     /// Trust classification is never inherited or inferred during onboarding.
     pub model_trust: OnboardingModelTrust,
     pub model_trust_confirmed: bool,
+    /// A manually supplied third-party source is deliberately separate from
+    /// catalog selection: it must carry an explicit tag/commit and the user
+    /// must pass the warning gate below.
+    pub third_party_source: Option<String>,
+    pub third_party_trust_confirmed: bool,
     pub tools: OnboardingToolConfiguration,
-    pub monty_packages: OnboardingMontyPackages,
     pub sidecar: OnboardingSidecarSelection,
     pub make_default: bool,
 }
@@ -97,9 +95,9 @@ pub struct OnboardingAgentPlan {
     pub default_model: ActiveModelRef,
     pub model_trust: ModelTrust,
     pub tool_surface: ToolSurfaceSelection,
-    pub monty_packages: OnboardingMontyPackages,
     pub sidecar: SidecarSelectionConfig,
     pub make_default: bool,
+    pub third_party_trust_confirmed: bool,
 }
 
 impl OnboardingAgentPlan {
@@ -146,12 +144,6 @@ impl OnboardingAgentPlan {
                         (tool.clone(), tier)
                     })
                     .collect(),
-                monty_packages: self
-                    .monty_packages
-                    .requests
-                    .then(|| "requests".to_string())
-                    .into_iter()
-                    .collect(),
             },
         );
         extended.image_sidecar = self.sidecar.clone();
@@ -160,7 +152,7 @@ impl OnboardingAgentPlan {
 }
 
 pub fn build_onboarding_agent_plan(
-    entry: &AgentCatalogEntry,
+    entry: Option<&AgentCatalogEntry>,
     answers: OnboardingAgentAnswers,
     providers: &ProvidersConfig,
 ) -> Result<OnboardingAgentPlan> {
@@ -172,6 +164,54 @@ pub fn build_onboarding_agent_plan(
         valid_commit_sha(&answers.catalog_revision),
         "agent catalog revision must be an immutable commit SHA"
     );
+    if let Some(source_locator) = answers.third_party_source.as_deref() {
+        let source =
+            crate::daemon::agent_installation::CanonicalAgentSource::parse(source_locator)?;
+        ensure!(
+            !(source.owner == "FlyCockpit" && source.repository == "agents"),
+            "first-party agents must be selected from the signed onboarding catalog"
+        );
+        ensure!(
+            source.requested_revision.is_some(),
+            "third-party onboarding sources must pin a commit or tag"
+        );
+        ensure!(
+            answers.third_party_trust_confirmed,
+            "third-party agent installation requires explicit security confirmation"
+        );
+        let provider = providers
+            .providers
+            .get(&answers.default_model_provider)
+            .context("selected third-party default provider is not configured")?;
+        ensure!(
+            provider
+                .models
+                .iter()
+                .any(|model| model.id == answers.default_model),
+            "selected third-party default model is not configured"
+        );
+        let sidecar = resolve_sidecar_selection(&answers.sidecar, providers)?;
+        return Ok(OnboardingAgentPlan {
+            source_locator: source_locator.to_string(),
+            agent_name: source.agent_name()?.to_string(),
+            default_model: ActiveModelRef {
+                provider: answers.default_model_provider,
+                model: answers.default_model,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            model_trust: answers.model_trust.into(),
+            // The fetched third-party definition remains the authority for
+            // author tiers. It is not safe to invent an advanced surface
+            // before parsing that pinned definition.
+            tool_surface: ToolSurfaceSelection::default(),
+            sidecar,
+            make_default: answers.make_default,
+            third_party_trust_confirmed: true,
+        });
+    }
+    let entry = entry.context("selected onboarding agent is absent from the pinned catalog")?;
     entry
         .definition
         .validate_catalog_definition()
@@ -233,9 +273,9 @@ pub fn build_onboarding_agent_plan(
         },
         model_trust: answers.model_trust.into(),
         tool_surface: ToolSurfaceSelection { tools, tool_tiers },
-        monty_packages: answers.monty_packages,
         sidecar,
         make_default: answers.make_default,
+        third_party_trust_confirmed: false,
     })
 }
 

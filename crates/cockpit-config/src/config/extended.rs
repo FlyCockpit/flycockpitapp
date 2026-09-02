@@ -1205,12 +1205,6 @@ pub struct AgentRuntimeDefaults {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub tool_tiers: BTreeMap<String, AgentRuntimeToolTier>,
-    #[serde(
-        rename = "montyPackages",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub monty_packages: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for DefaultPrimaryAgent {

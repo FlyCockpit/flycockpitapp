@@ -109,6 +109,98 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// An onboarding apply owns only the installation whose UUID is the fresh
+/// inner operation key it minted. Installation may instead return an existing
+/// same-source object; cleanup must never infer ownership from an answer or a
+/// returned receipt identity.
+async fn cleanup_owned_onboarding_installation(
+    ctx: &DaemonContext,
+    operation_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    match ctx
+        .db
+        .delete_agent_installation(operation_id, crate::workspace_lease::now_unix_ms())
+        .await?
+    {
+        cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Tombstoned
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Deleted
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::AlreadyDeleted
+        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::NotFound => Ok(()),
+    }
+}
+
+async fn discard_onboarding_publication_journal(
+    ctx: &DaemonContext,
+    operation_id: uuid::Uuid,
+    backup: &std::path::Path,
+) -> anyhow::Result<()> {
+    let operation = operation_id.to_string();
+    ctx.db
+        .write(move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
+                rusqlite::params![operation],
+            )?;
+            anyhow::ensure!(
+                deleted == 1,
+                "onboarding publication journal disappeared before settlement"
+            );
+            Ok(())
+        })
+        .await?;
+    crate::wizard::OnboardingConfigRollback::discard_durable_journal(backup)
+}
+
+/// Reconcile an interrupted onboarding publication before the daemon accepts
+/// clients. The intent is created before installation, so restoring its exact
+/// config preimage and deleting the operation-named installation exposes none
+/// of an interrupted plan. A missing/corrupt private journal fails closed and
+/// keeps the socket unpublished.
+pub(super) async fn recover_onboarding_agent_publication_journals(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let rows: Vec<(String, String)> = ctx
+        .db
+        .read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT operation_id,backup_path FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
+            )?;
+            Ok(statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    for (operation, backup_path) in rows {
+        let operation_id = uuid::Uuid::parse_str(&operation)
+            .map_err(|error| internal(anyhow::Error::from(error)))?;
+        let backup = std::path::PathBuf::from(backup_path);
+        crate::wizard::OnboardingConfigRollback::restore_durable_journal(&backup)
+            .map_err(internal)?;
+        cleanup_owned_onboarding_installation(ctx, operation_id)
+            .await
+            .map_err(internal)?;
+        let operation_for_delete = operation.clone();
+        ctx.db
+            .write(move |conn| {
+                let deleted = conn.execute(
+                    "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
+                    rusqlite::params![operation_for_delete],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "onboarding publication journal disappeared during recovery"
+                );
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+        crate::wizard::OnboardingConfigRollback::discard_durable_journal(&backup)
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
 /// the proposal scope. Session and persistent rules are keyed by that create
 /// identity, not by the session `active_model`: a computer-capable child
@@ -17277,37 +17369,82 @@ async fn handle_serialized_request_impl(
                     // boundary. Once it is resolved, the config snapshot used
                     // to validate the plan and every config publication share
                     // the daemon-wide serialization gate.
-                    let catalog = crate::daemon::agent_catalog::preferred_catalog()
-                        .await
-                        .map_err(internal)?;
+                    let catalog_revision =
+                        crate::wizard::onboarding_catalog_revision_from_answers_json(&answers_json)
+                            .map_err(internal)?;
+                    // The renderer's catalog revision is an authority input,
+                    // not a hint. A live picker must never silently replay
+                    // against a newer `main` (or a different offline cache).
+                    let catalog = if catalog_revision
+                        == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION
+                    {
+                        crate::daemon::agent_catalog::ResolvedAgentCatalog {
+                            revision: catalog_revision,
+                            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
+                            index: crate::daemon::agent_catalog::cached_catalog()
+                                .map_err(internal)?,
+                        }
+                    } else {
+                        crate::daemon::agent_catalog::fetch_catalog_at_revision(&catalog_revision)
+                            .await
+                            .map_err(internal)?
+                    };
                     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                     let prepared = crate::wizard::prepare_onboarding_agent_answers_for_catalog(
                         &answers_json,
                         catalog,
                     )
                     .map_err(internal)?;
-                    let operation_key = uuid::Uuid::new_v5(
-                        &uuid::Uuid::NAMESPACE_URL,
-                        format!(
-                            "flycockpit:onboarding-agent:v1:{}:{}",
-                            prepared.plan.source_locator, answers_json
-                        )
-                        .as_bytes(),
-                    )
-                    .to_string();
+                    // Each apply attempt owns a fresh installation operation.
+                    // The outer setup RPC supplies its own replay fence; using
+                    // the answers as this inner idempotency key would replay a
+                    // prior installation and let a later failed publication
+                    // delete somebody else's already-successful result.
+                    let operation_key = uuid::Uuid::now_v7().to_string();
+                    let owned_installation_id = uuid::Uuid::parse_str(&operation_key)
+                        .expect("fresh UUID operation key parses");
+                    // Prepare the cross-authority rollback before *any*
+                    // installation side effect. A daemon death at every later
+                    // boundary is recovered before the socket is published.
+                    let _publication_rollback =
+                        crate::wizard::capture_onboarding_agent_config(&prepared.plan)
+                            .map_err(internal)?;
+                    let publication_backup = _publication_rollback
+                        .write_durable_journal(owned_installation_id)
+                        .map_err(internal)?;
+                    let journal_operation = operation_key.clone();
+                    let journal_backup = publication_backup.to_string_lossy().into_owned();
+                    if let Err(error) = ctx
+                        .db
+                        .write(move |conn| {
+                            conn.execute(
+                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,created_at_unix_ms) VALUES(?1,?2,?3)",
+                                rusqlite::params![journal_operation,journal_backup,crate::workspace_lease::now_unix_ms()],
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                    {
+                        let _ = crate::wizard::OnboardingConfigRollback::discard_durable_journal(
+                            &publication_backup,
+                        );
+                        return Err(internal(error));
+                    }
                     let service = ctx.agent_installation_service().map_err(internal)?;
                     let install = service
                         .begin(
                             cockpit_proto::AgentInstallationBeginV1 {
                                 dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
-                                idempotency_key: operation_key,
+                                idempotency_key: operation_key.clone(),
                                 operation: cockpit_proto::AgentInstallationOperationKind::Install,
                                 scope: cockpit_proto::AgentInstallationScopeWire::Global,
                                 workspace_path: None,
                                 source_locator: prepared.plan.source_locator.clone(),
                                 target_installation_id: None,
                                 replace_acknowledged: false,
-                                third_party_trust_confirmed: false,
+                                third_party_trust_confirmed: prepared
+                                    .plan
+                                    .third_party_trust_confirmed,
                                 requested_slot: Some("primary".into()),
                                 roles: Vec::new(),
                                 computer_use: false,
@@ -17333,12 +17470,32 @@ async fn handle_serialized_request_impl(
                                         )
                                         .as_deref()
                                             == Some(prepared.plan.default_model.provider.as_str())
-                                })
-                                .ok_or_else(|| {
-                                    internal(anyhow::anyhow!(
+                                });
+                            let Some(choice) = choice else {
+                                let cleanup = cleanup_owned_onboarding_installation(
+                                    ctx,
+                                    owned_installation_id,
+                                )
+                                .await;
+                                let journal = discard_onboarding_publication_journal(
+                                    ctx,
+                                    owned_installation_id,
+                                    &publication_backup,
+                                )
+                                .await;
+                                return match cleanup {
+                                    Ok(()) if journal.is_ok() => Err(internal(anyhow::anyhow!(
                                         "selected onboarding model is absent from daemon binding choices"
-                                    ))
-                                })?;
+                                    ))),
+                                    Ok(()) => Err(internal(anyhow::anyhow!(
+                                        "selected onboarding model is absent from daemon binding choices; publication journal settlement also failed: {:#}",
+                                        journal.expect_err("checked journal error")
+                                    ))),
+                                    Err(cleanup_error) => Err(internal(anyhow::anyhow!(
+                                        "selected onboarding model is absent from daemon binding choices; owned installation cleanup also failed: {cleanup_error:#}"
+                                    ))),
+                                };
+                            };
                             service
                                 .submit_choice(
                                     cockpit_proto::AgentInstallationSubmitChoiceV1 {
@@ -17363,15 +17520,53 @@ async fn handle_serialized_request_impl(
                         } => uuid::Uuid::parse_str(&installation_id)
                             .map_err(|error| internal(anyhow::Error::from(error)))?,
                         cockpit_proto::AgentInstallationResultV1::Error { error } => {
-                            return Err(internal(anyhow::anyhow!(
-                                "agent onboarding install failed: {}",
-                                error.message
-                            )));
+                            let cleanup =
+                                cleanup_owned_onboarding_installation(ctx, owned_installation_id)
+                                    .await;
+                            let journal = discard_onboarding_publication_journal(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                            )
+                            .await;
+                            return match cleanup {
+                                Ok(()) if journal.is_ok() => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding install failed: {}",
+                                    error.message
+                                ))),
+                                Ok(()) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding install failed: {}; publication journal settlement also failed: {:#}",
+                                    error.message,
+                                    journal.expect_err("checked journal error")
+                                ))),
+                                Err(cleanup_error) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding install failed: {}; owned installation cleanup also failed: {cleanup_error:#}",
+                                    error.message
+                                ))),
+                            };
                         }
                         _ => {
-                            return Err(internal(anyhow::anyhow!(
-                                "agent onboarding did not produce a usable primary binding"
-                            )));
+                            let cleanup =
+                                cleanup_owned_onboarding_installation(ctx, owned_installation_id)
+                                    .await;
+                            let journal = discard_onboarding_publication_journal(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                            )
+                            .await;
+                            return match cleanup {
+                                Ok(()) if journal.is_ok() => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding did not produce a usable primary binding"
+                                ))),
+                                Ok(()) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding did not produce a usable primary binding; publication journal settlement also failed: {:#}",
+                                    journal.expect_err("checked journal error")
+                                ))),
+                                Err(cleanup_error) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding did not produce a usable primary binding; owned installation cleanup also failed: {cleanup_error:#}"
+                                ))),
+                            };
                         }
                     };
                     // Publish config before selecting the DB default. If any
@@ -17383,15 +17578,24 @@ async fn handle_serialized_request_impl(
                     ) {
                         Ok(rollback) => rollback,
                         Err(error) => {
-                            let cleanup = ctx
-                                .db
-                                .delete_agent_installation(
-                                    installed_id,
-                                    crate::workspace_lease::now_unix_ms(),
-                                )
-                                .await;
+                            let cleanup = if installed_id == owned_installation_id {
+                                cleanup_owned_onboarding_installation(ctx, owned_installation_id)
+                                    .await
+                            } else {
+                                Ok(())
+                            };
+                            let journal = discard_onboarding_publication_journal(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                            )
+                            .await;
                             return match cleanup {
-                                Ok(_) => Err(internal(error)),
+                                Ok(_) if journal.is_ok() => Err(internal(error)),
+                                Ok(_) => Err(internal(anyhow::anyhow!(
+                                    "agent onboarding config publication failed ({error:#}); publication journal settlement also failed: {:#}",
+                                    journal.expect_err("checked journal error")
+                                ))),
                                 Err(cleanup_error) => Err(internal(anyhow::anyhow!(
                                     "agent onboarding config publication failed ({error:#}); installation compensation also failed ({cleanup_error:#})"
                                 ))),
@@ -17408,26 +17612,58 @@ async fn handle_serialized_request_impl(
                             .await
                     {
                         let config_rollback = rollback.restore();
-                        let install_rollback = ctx
-                            .db
-                            .delete_agent_installation(
-                                installed_id,
-                                crate::workspace_lease::now_unix_ms(),
-                            )
-                            .await;
-                        return match (config_rollback, install_rollback) {
-                            (Ok(()), Ok(_)) => Err(internal(error)),
-                            (config_rollback, install_rollback) => Err(internal(anyhow::anyhow!(
-                                "agent onboarding default selection failed ({error:#}); config compensation: {}; installation compensation: {}",
-                                config_rollback
-                                    .err()
-                                    .map_or_else(|| "ok".to_string(), |value| format!("{value:#}")),
-                                install_rollback
-                                    .err()
-                                    .map_or_else(|| "ok".to_string(), |value| format!("{value:#}")),
+                        let install_rollback = if installed_id == owned_installation_id {
+                            cleanup_owned_onboarding_installation(ctx, owned_installation_id).await
+                        } else {
+                            Ok(())
+                        };
+                        let journal = discard_onboarding_publication_journal(
+                            ctx,
+                            owned_installation_id,
+                            &publication_backup,
+                        )
+                        .await;
+                        return match (config_rollback, install_rollback, journal) {
+                            (Ok(()), Ok(_), Ok(())) => Err(internal(error)),
+                            (Ok(()), Ok(_), Err(journal_error)) => Err(internal(anyhow::anyhow!(
+                                "agent onboarding default selection failed ({error:#}); publication journal settlement also failed: {journal_error:#}"
                             ))),
+                            (config_rollback, install_rollback, _) => {
+                                Err(internal(anyhow::anyhow!(
+                                    "agent onboarding default selection failed ({error:#}); config compensation: {}; installation compensation: {}",
+                                    config_rollback.err().map_or_else(
+                                        || "ok".to_string(),
+                                        |value| format!("{value:#}")
+                                    ),
+                                    install_rollback.err().map_or_else(
+                                        || "ok".to_string(),
+                                        |value| format!("{value:#}")
+                                    ),
+                                )))
+                            }
                         };
                     }
+                    // A complete publication is visible only after the
+                    // installation, both config files, and optional DB
+                    // default all succeeded. Removing the private backup
+                    // first deliberately fails closed on a crash: the durable
+                    // row still prevents socket publication until reconciled.
+                    crate::wizard::OnboardingConfigRollback::discard_durable_journal(
+                        &publication_backup,
+                    )
+                    .map_err(internal)?;
+                    let settled_operation = operation_key.clone();
+                    ctx.db
+                        .write(move |conn| {
+                            let deleted = conn.execute(
+                                "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
+                                rusqlite::params![settled_operation],
+                            )?;
+                            anyhow::ensure!(deleted == 1, "onboarding publication journal disappeared before settlement");
+                            Ok(())
+                        })
+                        .await
+                        .map_err(internal)?;
                     return Ok(Response::SetupWizardApplied {
                         changed: true,
                         model_file_written: true,

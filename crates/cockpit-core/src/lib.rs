@@ -74,6 +74,7 @@ pub mod redact;
 pub mod remote_daemon_identity_custody;
 #[cfg(feature = "remote")]
 pub mod remote_webrtc_endpoint;
+pub mod resource_limits;
 pub mod sealed;
 pub mod secret_command;
 pub(crate) mod secret_ownership;

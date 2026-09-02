@@ -35,17 +35,27 @@
 //!   `github_pat_`, OpenAI/Anthropic `sk-`, Google `AIza`, Slack `xox?-`,
 //!   AWS `AKIA…` access-key ids, and `eyJ…` JWTs). Position never decides
 //!   secrecy: the same token is classified identically wherever the
-//!   command printed it;
+//!   command printed it. Charset composition never decides secrecy
+//!   either: a digitless password-manager passphrase (the `pass show` of
+//!   an xkcd-style secret), an all-digit key, and a mixed hex key
+//!   classify identically — the digit/letter mix is not a gate. The one
+//!   remaining charset requirement is token-ness, not composition: the
+//!   run must carry at least one alphanumeric character, because every
+//!   credential encodes key material in alphanumerics while
+//!   punctuation-only runs are `----` / `====` separator decor;
 //! - `-----BEGIN … PRIVATE KEY-----` PEM blocks (the whole block becomes
 //!   one placeholder).
 //!
-//! Classification is deliberately shape-based, position-independent, and
-//! fail-closed. Opaque tokens that are *not* secrets — a git SHA from
-//! `` !`git rev-parse HEAD` ``, a UUID, a build target triple, a digest —
-//! are redacted too, wherever they appear on the line: at this boundary
-//! over-redaction costs a placeholder where a hash used to be, while
-//! under-redaction leaks a credential, and the module consistently chooses
-//! the former. Absolute paths (which share base64's `/`) are exempted.
+//! Classification is deliberately shape-based, position- and
+//! composition-independent, and fail-closed. Opaque tokens that are *not*
+//! secrets — a git SHA from `` !`git rev-parse HEAD` ``, a UUID, a build
+//! target triple, a digest, or a ≥20-character compound word / identifier
+//! (`well-known-compound-word`) that shares a digitless passphrase's
+//! shape — are redacted too, wherever they appear on the line: at this
+//! boundary over-redaction costs a placeholder where a hash or a long
+//! word used to be, while under-redaction leaks a credential, and the
+//! module consistently chooses the former. Absolute paths (which share
+//! base64's `/`) are exempted.
 //! Values under the [`NOVEL_SECRET_VALUE_MIN_LEN`] floor stay visible
 //! (ports, counts, `yes`/`no` flags), mirroring the `min_secret_length`
 //! prune in table building — except under [`credential_shaped_key`] keys,
@@ -80,7 +90,8 @@ use super::{
 const NOVEL_SECRET_VALUE_MIN_LEN: usize = 8;
 
 /// Minimum total length for the opaque keyless-credential token rule (the
-/// `gh auth token` / `aws configure get …` shape, wherever it appears).
+/// `gh auth token` / `aws configure get …` / digitless `pass show`
+/// passphrase shape, wherever it appears).
 const KEYLESS_TOKEN_MIN_LEN: usize = 20;
 
 /// Minimum total length for a JWT (`eyJ…` with at least two dots).
@@ -585,21 +596,24 @@ fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, usize)> {
 }
 
 /// Charset of an opaque credential token: base64 / base64url / hex /
-/// AWS-style mixed alnum, plus percent-encoded blobs. No dots — dotted
-/// runs are versions, host names, and file names; JWTs (which need dots)
-/// are caught by the `eyJ` prefix rule instead.
+/// AWS-style mixed alnum, password-manager passphrases (digitless word
+/// runs included — composition is not a gate), plus percent-encoded
+/// blobs. No dots — dotted runs are versions, host names, and file
+/// names; JWTs (which need dots) are caught by the `eyJ` prefix rule
+/// instead.
 fn is_opaque_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-' | '%')
 }
 
 /// Scrub keyless secrets: well-known credential formats anywhere on the
 /// line, then every opaque credential-shaped token anywhere on the line.
-/// The opaque-token rule is position-independent: a token that would be
-/// redacted standing alone — the `gh auth token` / `pass show` output
-/// shape — is redacted embedded in prose (`credential is …`) or inside a
-/// header (`Authorization: Bearer …`) exactly the same. Position never
-/// decides secrecy. See the module docs for the fail-closed stance on
-/// hashes and UUIDs.
+/// The opaque-token rule is position- and composition-independent: a
+/// token that would be redacted standing alone — the `gh auth token` /
+/// `pass show` output shape — is redacted embedded in prose (`credential
+/// is …`) or inside a header (`Authorization: Bearer …`) exactly the
+/// same, and a digitless passphrase classifies exactly like a hex key.
+/// Neither position nor charset mix ever decides secrecy. See the module
+/// docs for the fail-closed stance on hashes and UUIDs.
 fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
     // Known formats first: they delimit multi-part tokens (a JWT's dot
     // segments are not opaque-run characters) that the embedded run pass
@@ -609,20 +623,30 @@ fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
 }
 
 /// `true` when `token` has the shape of a novel keyless credential: an
-/// opaque run of at least [`KEYLESS_TOKEN_MIN_LEN`] characters mixing
-/// letters and digits, with no non-trailing `=` (that is an assignment,
-/// not a bare token; trailing `=` is base64 padding) and not an absolute
-/// path (which shares base64's `/`). The predicate is deliberately
-/// position-independent: the standalone `gh auth token` output, the same
-/// token quoted by `pass show`, and the same token embedded in prose or a
-/// header all classify identically, so no rendering position can make a
-/// credential pass.
+/// opaque run of at least [`KEYLESS_TOKEN_MIN_LEN`] characters carrying
+/// at least one alphanumeric character, with no non-trailing `=` (that
+/// is an assignment, not a bare token; trailing `=` is base64 padding)
+/// and not an absolute path (which shares base64's `/`). Two properties
+/// are deliberate invariants, not heuristics:
+///
+/// - **Position never decides secrecy**: the standalone `gh auth token`
+///   output, the same token quoted by `pass show`, and the same token
+///   embedded in prose or a header all classify identically, so no
+///   rendering position can make a credential pass.
+/// - **Charset composition never decides secrecy**: a digitless
+///   passphrase (`pass show` of an xkcd-style secret), an all-digit key,
+///   and a mixed hex key classify identically — the digit/letter mix
+///   must not be a bypass, exactly as position was not allowed to be
+///   one. The single remaining charset requirement, at least one
+///   alphanumeric, is *token-ness* (every credential encodes key
+///   material in alphanumerics; punctuation-only runs are `----` /
+///   `====` separator decor carrying nothing to leak), a floor of the
+///   same kind as the length minimum, not a composition gate.
 fn is_novel_opaque_credential(token: &str) -> bool {
     token.len() >= KEYLESS_TOKEN_MIN_LEN
         && !token.contains(char::is_whitespace)
         && token.chars().all(is_opaque_token_char)
-        && token.chars().any(|c| c.is_ascii_digit())
-        && token.chars().any(|c| c.is_ascii_alphabetic())
+        && token.chars().any(|c| c.is_ascii_alphanumeric())
         // A non-trailing `=` makes the span an assignment shape, not a
         // bare token (trailing `=` is base64 padding).
         && !token.trim_end_matches('=').contains('=')
@@ -953,6 +977,17 @@ mod tests {
         ["0d1a4b2c8e3f60718293", "a4b5c6d7e8f9a0b1c2d3"].concat()
     }
 
+    // Cycle 3: ordinary keyless password-manager output is digitless (an
+    // xkcd-style passphrase), so these too are assembled from fragments so
+    // the source never contains the contiguous detector-shaped token.
+    fn digitless_passphrase() -> String {
+        ["correct", "horse", "battery", "staple"].concat()
+    }
+
+    fn hyphenated_passphrase() -> String {
+        ["correct-horse", "-battery", "-staple"].concat()
+    }
+
     #[test]
     fn dotenv_style_assignment_is_redacted() {
         let table = table_with_placeholder(PH);
@@ -1199,6 +1234,57 @@ mod tests {
     }
 
     #[test]
+    fn digitless_keyless_passphrase_is_redacted() {
+        // Issue #279 cycle 3: charset composition never decides secrecy.
+        // The ordinary `pass show` output is a digitless passphrase; it
+        // previously passed as "not a credential" for lacking a digit —
+        // the same way mixed tokens previously passed for standing in the
+        // wrong position (cycle 2). Position and composition are both
+        // non-gates now.
+        let table = table_with_placeholder(PH);
+        // The standalone `pass show` output shape.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&digitless_passphrase()),
+            "[ph]"
+        );
+        // Embedded in prose — position-independent.
+        let line = format!("the password is {} ok", digitless_passphrase());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&line),
+            "the password is [ph] ok"
+        );
+        // One layer of quotes (the quoted `pass show` echo shape).
+        let quoted = format!("\"{}\"", digitless_passphrase());
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&quoted),
+            "\"[ph]\""
+        );
+        // Hyphen-separated passphrase (password-manager generator style):
+        // separators are opaque-run characters, so the whole run is the
+        // credential.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets(&hyphenated_passphrase()),
+            "[ph]"
+        );
+    }
+
+    #[test]
+    fn all_digit_keyless_run_is_redacted() {
+        // Composition independence is symmetric: an all-digit ≥20 run —
+        // the account-number / all-digit-password class, the digitless
+        // passphrase's mirror image — classifies exactly like a mixed
+        // hex key. The table builder already made the same call for known
+        // values ("long numeric strings are retained because all-digit
+        // API keys and passwords exist"); the novel-secret boundary
+        // keeps one invariant, not two.
+        let table = table_with_placeholder(PH);
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("31415926535897932384626433832795028"),
+            "[ph]"
+        );
+    }
+
+    #[test]
     fn authorization_header_value_is_redacted_wholesale() {
         // `Authorization` is a credential-bearing key: the whole value —
         // the auth scheme word included — is the secret (`curl -v` echo
@@ -1255,17 +1341,33 @@ mod tests {
     }
 
     #[test]
-    fn embedded_pass_keeps_short_and_digitless_prose_visible() {
-        // The shape floor keeps ordinary prose safe: no digit, or under
-        // the opaque-token floor, means visible.
+    fn short_prose_and_punctuation_decor_stay_visible() {
+        // What still keeps ordinary prose and banners safe now that
+        // composition stopped being a gate (cycle 3): the length floor —
+        // words below the opaque-token floor stay visible, digitless or
+        // not — and the token-ness requirement — punctuation-only
+        // separator runs (`----` / `====` rules) carry no credential
+        // material and stay visible even above the floor. Digitlessness
+        // ALONE can no longer keep a ≥20-character run visible; that
+        // exact gap let `pass show` passphrases through (see the
+        // digitless-passphrase regression tests).
         let table = table_with_placeholder(PH);
         assert_eq!(
-            table.scrub_novel_command_output_secrets("internationalization remains readable"),
-            "internationalization remains readable"
+            table.scrub_novel_command_output_secrets("unmistakably readable output"),
+            "unmistakably readable output"
+        );
+        // 19 characters: one under the keyless floor.
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("well-known-compound stays"),
+            "well-known-compound stays"
         );
         assert_eq!(
-            table.scrub_novel_command_output_secrets("well-known-compound-word stays"),
-            "well-known-compound-word stays"
+            table.scrub_novel_command_output_secrets("----------------------------------------"),
+            "----------------------------------------"
+        );
+        assert_eq!(
+            table.scrub_novel_command_output_secrets("========================================"),
+            "========================================"
         );
     }
 

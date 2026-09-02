@@ -8520,7 +8520,7 @@ async fn handle_serialized_request_impl(
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, Vec::new()))
         }
         Request::EditSealedOwnerDescription {
             record_id,
@@ -18998,7 +18998,7 @@ async fn handle_concurrent_request_impl(
                 .map(sealed_record_row_to_inventory_item)
                 .collect();
             // The funnel clamps the row count to the bounded wire ceiling.
-            Ok(Response::sealed_owner_inventory(items))
+            Ok(Response::sealed_owner_inventory(items, Vec::new()))
         }
         Request::ListSealedActions => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
@@ -29817,6 +29817,7 @@ fn sealed_record_row_to_inventory_item(
         scope_key: row.scope_key,
         active_version: u32::try_from(row.active_version).unwrap_or(0),
         created_at_ms: row.created_at_ms,
+        namespace: proto::SealedOwnerNamespace::OwnerAuthored,
     }
 }
 

@@ -33,6 +33,8 @@ use zeroize::Zeroizing;
 
 use cockpit_core::sealed::identity::SealedScopeKind;
 use cockpit_core::sealed::owner_commands::{SealedActionCommand, SealedCommand};
+#[cfg(test)]
+use cockpit_proto::SealedOwnerNamespace;
 use cockpit_proto::{
     MAX_SENSITIVE_FRAME_BYTES, Request, Response, SealedOwnerInventoryItem, SealedOwnerScopeKind,
     SensitiveWireLiteral,
@@ -370,7 +372,7 @@ pub(crate) fn format_sealed_inventory(items: &[SealedOwnerInventoryItem]) -> Str
 /// response) can never surface a revealed literal through this path.
 pub(crate) fn sealed_response_text(result: Result<Response, String>) -> String {
     match result {
-        Ok(Response::SealedOwnerInventory { items }) => format_sealed_inventory(&items),
+        Ok(Response::SealedOwnerInventory { items, .. }) => format_sealed_inventory(&items),
         Ok(Response::SealedOwnerDescriptionEdited { record_id }) => {
             format!("/sealed: description updated for {record_id}")
         }
@@ -1127,8 +1129,12 @@ mod tests {
             scope_key: "proj-key".to_string(),
             active_version: 3,
             created_at_ms: 1_000,
+            namespace: SealedOwnerNamespace::OwnerAuthored,
         }];
-        let rendered = sealed_response_text(Ok(Response::SealedOwnerInventory { items }));
+        let rendered = sealed_response_text(Ok(Response::SealedOwnerInventory {
+            items,
+            acquisitions: Vec::new(),
+        }));
         assert!(
             rendered.contains("rec-1"),
             "renders safe metadata: {rendered}"

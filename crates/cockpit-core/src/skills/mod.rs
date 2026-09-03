@@ -1078,7 +1078,7 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
     // Shell selection can itself fail closed: an unresolvable system shell
     // on Windows is an inline error marker, never a fallback to an
     // unqualified program name that the session directory could hijack.
-    let invocation = match bang_command_invocation(trimmed) {
+    let mut invocation = match bang_command_invocation(trimmed) {
         Ok(invocation) => invocation,
         Err(error) => {
             return redact.scrub(&format!(

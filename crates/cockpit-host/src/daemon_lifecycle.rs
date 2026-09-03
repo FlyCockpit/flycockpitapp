@@ -492,7 +492,14 @@ fn retire_matching_endpoint(
     Ok(())
 }
 
-#[cfg(unix)]
+/// Retire a verified-stale numeric pid file and its published identity.
+///
+/// The only permitted legacy-metadata retirement: hold `daemon.lifecycle.lock`,
+/// re-read the record, and delete only while it is still `LegacyNumeric(expected_pid)`
+/// and that pid is still `Missing`. A concurrent `reclaim_stale_and_reserve` that
+/// already installed a live receipt is left untouched. Endpoint records are not
+/// owned by a numeric pid file and are not removed here.
+#[cfg(any(unix, windows))]
 pub fn remove_dead_legacy_metadata(
     pid_file: &Path,
     socket: &Path,
@@ -1351,7 +1358,7 @@ mod tests {
         assert_eq!(decoded.receipt, endpoint.receipt);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn dead_legacy_receipt_allows_stale_metadata_cleanup() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1365,6 +1372,47 @@ mod tests {
         assert!(remove_dead_legacy_metadata(&pid_file, &socket, dead_pid).expect("legacy cleanup"));
         assert!(!pid_file.exists());
         assert!(!socket.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn dead_legacy_cleanup_preserves_replaced_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let dead_pid = i32::MAX as u32;
+        let executable = std::env::current_exe().expect("test executable");
+        let replacement =
+            write_pid_file(&pid_file, std::process::id(), &executable).expect("live receipt");
+        std::fs::write(&socket, b"live identity").expect("live identity");
+
+        assert!(
+            !remove_dead_legacy_metadata(&pid_file, &socket, dead_pid)
+                .expect("locked recheck must refuse")
+        );
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+        assert_eq!(std::fs::read_to_string(&socket).unwrap(), "live identity");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_legacy_pid_is_not_retired() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        let pid = std::process::id();
+        std::fs::write(&pid_file, pid.to_string()).expect("legacy pid receipt");
+        std::fs::write(&socket, b"socket").expect("socket");
+
+        assert_eq!(legacy_pid_identity(pid), PidIdentity::Unverified);
+        assert!(
+            !remove_dead_legacy_metadata(&pid_file, &socket, pid).expect("live legacy must remain")
+        );
+        assert!(pid_file.exists());
+        assert!(socket.exists());
     }
 
     #[test]

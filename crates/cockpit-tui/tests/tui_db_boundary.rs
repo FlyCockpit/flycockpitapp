@@ -747,6 +747,8 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         "spawn_detached",
         "spawn_detached_ephemeral",
         "stop_daemon_blocking",
+        "stop_daemon_blocking_unbound",
+        "send_stop_daemon_blocking",
     ];
 
     fn collect_use(
@@ -2776,6 +2778,8 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "reveal_leak_secret_over_socket",
         "registered_in_process_endpoint",
         "stop_daemon_blocking",
+        "stop_daemon_blocking_unbound",
+        "send_stop_daemon_blocking",
     ] {
         let source = format!("macro_rules! hidden {{ () => {{ {name}() }} }}");
         assert!(

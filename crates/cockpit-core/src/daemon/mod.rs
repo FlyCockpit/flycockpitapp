@@ -105,7 +105,7 @@ use anyhow::{Context, Result};
 use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
 #[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
 #[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::split_proc_cmdline;
@@ -2393,7 +2393,7 @@ fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
     match legacy_pid_identity(pid) {
         PidIdentity::Missing => {
@@ -2411,17 +2411,7 @@ fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
 #[cfg(windows)]
 fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
     match record {
-        DaemonPidRecord::LegacyNumeric(pid) => match legacy_pid_identity(pid) {
-            PidIdentity::Missing => {
-                cleanup_receipt_metadata_legacy(paths)?;
-                Ok(false)
-            }
-            PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
-                anyhow::bail!(
-                    "legacy numeric-only daemon PID {pid} is live; refusing unbound numeric signaling"
-                )
-            }
-        },
+        DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
         DaemonPidRecord::Receipt(receipt) => {
             match verify_cockpit_daemon_receipt_identity(&receipt) {
                 PidIdentity::Missing | PidIdentity::NotDaemon => {
@@ -2437,12 +2427,23 @@ fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
                     // (one pending instance) and would skip straight to
                     // TerminateProcess. Once a request is delivered, keep
                     // waiting for the process rather than sending more.
+                    // Each send re-reads the pid file after connect so a
+                    // replacement incarnation that published at `paths.socket`
+                    // never receives a shutdown intended for this receipt.
                     let deadline = std::time::Instant::now() + restart_release_timeout(None);
                     let mut delivered = false;
                     while std::time::Instant::now() < deadline {
+                        if read_daemon_pid_record(&paths.pid_file)
+                            != Some(DaemonPidRecord::Receipt(receipt.clone()))
+                        {
+                            return Ok(true);
+                        }
                         if !delivered {
-                            delivered =
-                                crate::daemon::ephemeral_guard::stop_daemon_blocking(&paths.socket);
+                            delivered = crate::daemon::ephemeral_guard::stop_daemon_blocking(
+                                &paths.socket,
+                                &paths.pid_file,
+                                &receipt,
+                            );
                         }
                         if !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
                             || matches!(
@@ -2465,29 +2466,6 @@ fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn cleanup_receipt_metadata_legacy(paths: &DaemonPaths) -> Result<()> {
-    let endpoint = paths.pid_file.parent().map(endpoint_file_for_state);
-    match std::fs::remove_file(&paths.socket) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("removing stale named-pipe identity"),
-    }
-    if let Some(endpoint) = endpoint {
-        match std::fs::remove_file(&endpoint) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("removing stale endpoint record"),
-        }
-    }
-    match std::fs::remove_file(&paths.pid_file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("removing stale pid file"),
-    }
-    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -3402,12 +3380,18 @@ mod tests {
             assert!(session.is_persisted(), "row is persisted");
         }
 
-        // Explicit administrative stop. Run it off the runtime thread because
-        // this helper uses a blocking Unix socket.
+        // Explicit administrative stop bound to the published receipt. Run it
+        // off the runtime thread because this helper uses a blocking connect.
         let socket = eph.socket.clone();
-        tokio::task::spawn_blocking(move || stop_daemon_blocking(&socket))
-            .await
-            .unwrap();
+        let pid_file = eph.pid_file.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&pid_file) else {
+                panic!("ephemeral daemon did not publish a v2 receipt");
+            };
+            stop_daemon_blocking(&socket, &pid_file, &receipt)
+        })
+        .await
+        .unwrap();
 
         // The daemon must drain and exit — despite the persisted session.
         let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
@@ -3444,7 +3428,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn live_legacy_numeric_pid_fails_closed() {
         let dir = tempfile::tempdir().unwrap();

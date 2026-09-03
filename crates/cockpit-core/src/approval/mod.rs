@@ -2429,6 +2429,14 @@ mod tests {
     /// Like [`resolve_sequence_collecting_questions`], but also captures
     /// each interrupt's persisted description — the body that owner clients
     /// render as its own line of text alongside the prompt.
+    ///
+    /// The resolve itself must go through [`resolve_waiting_interrupt`]:
+    /// the raise path persists the needs-attention row on an `.await`
+    /// *before* registering the hub waiter, so a resolver that fires as
+    /// soon as the row exists can beat `register` and lose the rendezvous —
+    /// `hub.resolve` returns `false` and the lock panics on a correct
+    /// flatten. Only discovery reads the row ungated; its content is
+    /// immutable once persisted.
     fn resolve_sequence_collecting_questions_and_descriptions(
         approver: &Approver,
         ids: &[&'static str],
@@ -2459,11 +2467,15 @@ mod tests {
                 };
                 seen.push(iid);
                 records.push((prompt, description));
-                let response = ResolveResponse::Single {
-                    selected_id: id.to_string(),
-                };
-                db.resolve_interrupt(iid, &response).await.unwrap();
-                assert!(hub.resolve(iid, response));
+                resolve_waiting_interrupt(
+                    &db,
+                    &hub,
+                    iid,
+                    ResolveResponse::Single {
+                        selected_id: id.to_string(),
+                    },
+                )
+                .await;
             }
             records
         })

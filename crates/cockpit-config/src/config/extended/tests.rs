@@ -1315,10 +1315,14 @@ fn loop_guard_threshold_round_trips_through_extended_doc() {
 }
 
 #[test]
-fn max_primary_rounds_defaults_to_unlimited_and_round_trips() {
+fn max_primary_rounds_defaults_to_inherit_not_unlimited() {
     assert_eq!(ExtendedConfig::default().max_primary_rounds, 0);
     let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(parsed.max_primary_rounds, 0);
+    assert_eq!(
+        parsed.resolved_delegation_budget("Build", None).max_rounds,
+        Some(crate::config::delegation_budget::DEFAULT_MAX_ROUNDS)
+    );
 
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
@@ -1332,6 +1336,37 @@ fn max_primary_rounds_defaults_to_unlimited_and_round_trips() {
     assert!(on_disk.contains("\"maxPrimaryRounds\""), "{on_disk}");
     let doc2 = ExtendedConfigDoc::load(&path).unwrap();
     assert_eq!(doc2.config().max_primary_rounds, 3);
+}
+
+#[test]
+fn delegation_budget_round_trips_and_unlimited_is_opt_in() {
+    let parsed: ExtendedConfig = serde_json::from_str(
+        r#"{"delegationBudget":{"maxRounds":"unlimited","agents":{"explore":{"maxRounds":4}}}}"#,
+    )
+    .unwrap();
+    assert!(
+        parsed
+            .resolved_delegation_budget("Build", None)
+            .max_rounds
+            .is_none()
+    );
+    assert_eq!(
+        parsed
+            .resolved_delegation_budget("explore", None)
+            .max_rounds,
+        Some(4)
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.delegation_budget.max_rounds = Some(SpendLimit::Unlimited);
+    doc.write(&cfg).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("\"delegationBudget\""), "{on_disk}");
+    assert!(on_disk.contains("unlimited"), "{on_disk}");
 }
 
 #[test]

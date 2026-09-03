@@ -13043,18 +13043,56 @@ fn oauth_stored_token_debug_and_drop_are_secret_safe() {
 #[test]
 fn authority_recovery_precedes_both_socket_binds() {
     let daemon = include_str!("../mod.rs");
-    let recovery = daemon
+    let boot_attr_end = daemon
+        .find("async fn run_foreground_inner_with_boot_db")
+        .expect("foreground boot must exist");
+    let boot_attr = daemon[boot_attr_end.saturating_sub(80)..boot_attr_end].trim();
+    assert!(
+        boot_attr.contains("#[cfg(any(unix, windows))]"),
+        "foreground boot must compile on Windows; found {boot_attr:?}"
+    );
+    let boot = daemon[boot_attr_end..]
+        .split("#[cfg(not(any(unix, windows)))]")
+        .next()
+        .expect("foreground boot body");
+    let recovery = boot
         .find("server::recover_before_socket_publish(&ctx).await?")
         .expect("foreground boot must await authority recovery");
-    let control_bind = daemon[recovery..]
+    let nearest_cfg = boot[..recovery]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("#[cfg("));
+    assert!(
+        nearest_cfg.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
+        "recovery call must not be unix-only inside windows-compiled boot; found {nearest_cfg:?}"
+    );
+    let control_bind = boot[recovery..]
         .find("bind_private_socket(&paths.socket)")
         .expect("control socket bind must follow recovery");
-    let reveal_bind = daemon[recovery..]
+    let reveal_bind = boot[recovery..]
         .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
         .expect("reveal socket bind must follow recovery");
     assert!(control_bind < reveal_bind);
 
     let server = include_str!("mod.rs");
+    let recover_prefix = server
+        .split("async fn run_boot_housekeeping")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn recover_before_socket_publish")
+                .next()
+        })
+        .expect("attrs between boot housekeeping and recovery");
+    let recover_attr = recover_prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#[cfg("))
+        .last();
+    assert!(
+        recover_attr.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
+        "recover_before_socket_publish is transport-neutral publication-barrier work and must compile on Windows; found {recover_attr:?}"
+    );
     let recovery_body = server
         .split("pub async fn recover_before_socket_publish")
         .nth(1)

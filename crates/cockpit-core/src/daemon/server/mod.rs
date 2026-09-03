@@ -4432,10 +4432,16 @@ async fn run_boot_housekeeping(db: &Db) {
     // gets a chance to run.
 }
 
-/// Complete fail-closed local authority recovery before either daemon socket
-/// is bound. A published socket promises an immediately responsive protocol;
-/// recovery therefore belongs to boot, never the accept loop.
-#[cfg(unix)]
+/// Complete fail-closed local authority recovery before either daemon
+/// endpoint is bound. A published control socket or named pipe promises an
+/// immediately responsive protocol; recovery therefore belongs to boot,
+/// never the accept loop.
+///
+/// This is transport-neutral publication-barrier work. Do not gate it on
+/// `unix`: every platform that can publish an endpoint (`run_foreground_inner`
+/// on Unix or Windows) must compile and run this before bind. Dropping the
+/// call on a new transport would publish without reconciling durable
+/// authority.
 pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // Every file-backed recovery family shares one bounded startup deadline.

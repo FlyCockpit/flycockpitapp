@@ -1450,6 +1450,7 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "subagent_spawned" => SubagentSpawned,
         "subagent_routing" => SubagentRouting,
         "subagent_report" => SubagentReport,
+        "subagent_compacted" => SubagentCompacted,
         "context_pruned" => ContextPruned,
         "session_compacted" => SessionCompacted,
         "permission_decision" => PermissionDecision,

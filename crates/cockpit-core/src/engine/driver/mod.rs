@@ -28,6 +28,7 @@ mod skills_seed;
 mod swap;
 
 use crate::engine::compact_draft::wire_token_total;
+pub(crate) use context_reduction::NoninteractiveAutoCompactOutcome;
 #[cfg(test)]
 use context_reduction::*;
 use context_reduction::{AutoCompactGate, PruneEffectiveness};
@@ -10744,13 +10745,27 @@ impl Driver {
         AUTO_COMPACT_DEFAULT_PCT
     }
 
+    fn effective_frame_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+        frame: Option<&AgentSession>,
+    ) -> u8 {
+        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
+        self.effective_auto_compact_pct(ctx_cfg, policy)
+    }
+
     fn effective_root_auto_compact_pct(
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
     ) -> u8 {
-        let frame = self.stack.first();
-        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
-        self.effective_auto_compact_pct(ctx_cfg, policy)
+        self.effective_frame_auto_compact_pct(ctx_cfg, self.stack.first())
+    }
+
+    fn effective_active_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+    ) -> u8 {
+        self.effective_frame_auto_compact_pct(ctx_cfg, self.stack.last())
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold

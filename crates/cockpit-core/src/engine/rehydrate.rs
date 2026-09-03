@@ -1571,6 +1571,25 @@ pub(crate) fn history_snapshot_from_events_conn(
                     detail,
                 });
             }
+            "subagent_compacted" if visible_lineage(ev) => {
+                snapshot.clear();
+                let handoff = ev
+                    .data
+                    .get("handoff_text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::User {
+                    text: handoff,
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    client_submission_ids: Vec::new(),
+                    ts_ms: ev.ts_ms,
+                    seq: ev.seq,
+                    origin_principal: ev.origin_principal.clone(),
+                });
+            }
             "subagent_spawned" => {
                 let Some(active) = active_subagent else {
                     continue;
@@ -1913,6 +1932,25 @@ fn subagent_history_entries_from_events(
                     seq: ev.seq,
                     summary,
                     detail,
+                });
+            }
+            "subagent_compacted" => {
+                snapshot.clear();
+                let handoff = ev
+                    .data
+                    .get("handoff_text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::User {
+                    text: handoff,
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    client_submission_ids: Vec::new(),
+                    ts_ms: ev.ts_ms,
+                    seq: ev.seq,
+                    origin_principal: ev.origin_principal.clone(),
                 });
             }
             "subagent_spawned" => {

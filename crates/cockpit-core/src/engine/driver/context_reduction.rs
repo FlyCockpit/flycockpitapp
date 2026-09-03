@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::engine::driver) enum NoninteractiveAutoCompactOutcome {
+    NoOp,
+    PrepareFailed,
+    Compacted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::engine::driver) struct BoundaryKey {
     activity_epoch: u64,
@@ -1977,7 +1984,7 @@ impl Driver {
                 &handoff,
                 keep,
                 context_window,
-                self.effective_root_auto_compact_pct(&ctx_cfg),
+                self.effective_active_auto_compact_pct(&ctx_cfg),
             ) {
                 Ok(plan) => plan,
                 Err(error) => return Err(error.into()),
@@ -2226,6 +2233,165 @@ impl Driver {
         #[cfg(test)]
         self.trace_compaction_apply("compact_ready_emitted");
         Ok(())
+    }
+
+    /// Threshold-based autocompaction for noninteractive subagent executors
+    /// (#314). Compacts into a new linked window in the subagent's own
+    /// `(task_call_id, label)` lineage without touching the parent session's
+    /// compaction cadence or foreground history.
+    pub(in crate::engine::driver) async fn maybe_noninteractive_auto_compact(
+        &mut self,
+        history: &mut Vec<Message>,
+        budget: &crate::engine::delegation_budget::BudgetPool,
+        progress_since_compact: &mut bool,
+        steer_target: &super::NoninteractiveSteerTarget,
+        window_index: &mut u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<
+        NoninteractiveAutoCompactOutcome,
+        crate::engine::delegation_budget::CompactLoopExhausted,
+    > {
+        let ctx_cfg = self.resolve_context_config();
+        let context_length = self.active_model_context_length();
+        let Some(metrics) =
+            context_metrics(context_length, self.context_input_tokens(context_length), 0)
+        else {
+            return Ok(NoninteractiveAutoCompactOutcome::NoOp);
+        };
+        let auto_compact_pct = self.effective_active_auto_compact_pct(&ctx_cfg);
+        if metrics.ctx_pct < f64::from(auto_compact_pct) {
+            return Ok(NoninteractiveAutoCompactOutcome::NoOp);
+        }
+        let tokens_after = self.context_input_tokens(context_length).unwrap_or(0);
+        let forward_progress = *progress_since_compact;
+        *progress_since_compact = false;
+        if let Err(error) = budget.record_compaction(tokens_after, forward_progress) {
+            return Err(error);
+        }
+        let saved_history = std::mem::replace(&mut self.stack[0].history, history.clone());
+        let prepared = match self.prepare_compaction_with_source(tx, "auto").await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.stack[0].history = saved_history;
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/compact: {error}; subagent history was left unchanged"),
+                    })
+                    .await;
+                return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
+            }
+        };
+        let outcome = self
+            .apply_subagent_prepared_compaction(prepared, steer_target, window_index, tx)
+            .await;
+        *history = self.stack[0].history.clone();
+        self.stack[0].history = saved_history;
+        outcome
+    }
+
+    async fn apply_subagent_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+        steer_target: &super::NoninteractiveSteerTarget,
+        window_index: &mut u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<
+        NoninteractiveAutoCompactOutcome,
+        crate::engine::delegation_budget::CompactLoopExhausted,
+    > {
+        let actual = prepared_compaction_coverage(&self.stack[0].history);
+        if actual != prepared.coverage {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "/compact: prepared subagent compaction is stale; history was left unchanged"
+                        .to_string(),
+                })
+                .await;
+            return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
+        }
+
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PreCompact,
+            &prepared.source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(prepared.source.as_str()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let predecessor_window_index = *window_index;
+        *window_index = window_index.saturating_add(1);
+        let successor_window_index = *window_index;
+        let compaction_frame = (!prepared.authoring_provider_id.is_empty()
+            && !prepared.authoring_model_id.is_empty())
+        .then_some(crate::session::SessionEventModelFrame {
+            provider_id: &prepared.authoring_provider_id,
+            model_id: &prepared.authoring_model_id,
+            config: &self.config,
+            session_table: self.redact.as_ref(),
+        });
+        let tail_messages = prepared.history[1..].to_vec();
+        let record = crate::session::SubagentCompactionRecord {
+            predecessor_window_index,
+            successor_window_index,
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
+        let lineage = steer_target.lineage();
+        let record_result = crate::session::with_session_event_lineage(
+            Some(lineage),
+            self.session.record_subagent_compacted_with_source(
+                &prepared.agent_name,
+                record,
+                compaction_frame,
+            ),
+        )
+        .await;
+        if let Err(error) = record_result {
+            tracing::warn!(error = %error, "record subagent_compacted event failed");
+        }
+
+        self.stack[0].history = prepared.history.clone();
+
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PostCompact,
+            &prepared.source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(prepared.source.as_str()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let signal = TurnEvent::SubagentCompacted {
+            agent: prepared.agent_name.clone(),
+            task_call_id: steer_target.task_call_id().to_string(),
+            label: steer_target.label().to_string(),
+            source: prepared.source.clone(),
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            window_index: successor_window_index,
+        };
+        let _ = tx.send(signal).await;
+        Ok(NoninteractiveAutoCompactOutcome::Compacted)
     }
 
     pub(in crate::engine::driver) async fn compact_brief_draft(

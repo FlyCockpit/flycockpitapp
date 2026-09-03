@@ -87,6 +87,10 @@ pub enum SessionEventKind {
     SubagentRouting,
     /// A subagent returned its report to the parent.
     SubagentReport,
+    /// A noninteractive subagent autocompacted into a new linked window in its
+    /// own delegation lineage. Data/export only; never enters the parent model
+    /// context.
+    SubagentCompacted,
     /// `/prune` (manual or auto) elided wire-only snapshot bodies.
     ContextPruned,
     /// `/compact` started a fresh successor session (a session boundary).
@@ -178,7 +182,7 @@ pub enum SessionEventKind {
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -190,6 +194,7 @@ impl SessionEventKind {
         Self::SubagentSpawned,
         Self::SubagentRouting,
         Self::SubagentReport,
+        Self::SubagentCompacted,
         Self::ContextPruned,
         Self::SessionCompacted,
         Self::PermissionDecision,
@@ -225,6 +230,7 @@ impl SessionEventKind {
             SessionEventKind::SubagentSpawned => "subagent_spawned",
             SessionEventKind::SubagentRouting => "subagent_routing",
             SessionEventKind::SubagentReport => "subagent_report",
+            SessionEventKind::SubagentCompacted => "subagent_compacted",
             SessionEventKind::ContextPruned => "context_pruned",
             SessionEventKind::SessionCompacted => "session_compacted",
             SessionEventKind::PermissionDecision => "permission_decision",
@@ -2215,6 +2221,7 @@ mod tests {
             "subagent_spawned",
             "subagent_routing",
             "subagent_report",
+            "subagent_compacted",
             "context_pruned",
             "session_compacted",
             "permission_decision",

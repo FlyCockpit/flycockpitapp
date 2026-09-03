@@ -8709,6 +8709,21 @@ impl NoninteractiveSteerTarget {
         self.late_user_steer_continuation_id = continuation_id;
         self
     }
+
+    pub(in crate::engine::driver) fn task_call_id(&self) -> &str {
+        &self.task_call_id
+    }
+
+    pub(in crate::engine::driver) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(in crate::engine::driver) fn lineage(&self) -> crate::session::SessionEventLineage {
+        crate::session::SessionEventLineage {
+            task_call_id: self.task_call_id.clone(),
+            label: self.label.clone(),
+        }
+    }
 }
 
 async fn terminalize_recursive_noninteractive_agent(
@@ -8760,15 +8775,6 @@ async fn terminalize_recursive_noninteractive_agent(
                 tracing::warn!(%error, %agent_instance_id, "terminalizing recursive child lifecycle row failed");
                 return;
             }
-        }
-    }
-}
-
-impl NoninteractiveSteerTarget {
-    fn lineage(&self) -> crate::session::SessionEventLineage {
-        crate::session::SessionEventLineage {
-            task_call_id: self.task_call_id.clone(),
-            label: self.label.clone(),
         }
     }
 }
@@ -11116,6 +11122,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .as_ref()
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
+    let mut subagent_compaction_window_index = 0_u32;
+    let mut progress_since_compact = true;
     'turns: for _ in 0..max_turns {
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the swarm/schedule loops.
@@ -12307,6 +12315,91 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                 history,
                 fallback_decision,
             });
+        }
+        if !parked_replay {
+            let persist_owns_unsettled_started = pending_scheduled_turn
+                .as_ref()
+                .is_some_and(|plan| plan.has_unsettled_started_calls());
+            if !persist_owns_unsettled_started {
+                if session.take_pending_forward_progress() {
+                    progress_since_compact = true;
+                }
+                if let Some(target) = steer_target.as_ref() {
+                    match scheduled_lane_driver
+                        .maybe_noninteractive_auto_compact(
+                            &mut history,
+                            &budget,
+                            &mut progress_since_compact,
+                            target,
+                            &mut subagent_compaction_window_index,
+                            &child_tx,
+                        )
+                        .await
+                    {
+                        Ok(crate::engine::driver::NoninteractiveAutoCompactOutcome::Compacted) => {
+                            let compact_usage = session.take_uncharged_budget_charge();
+                            if !compact_usage.is_empty()
+                                && let Err(exhaustion) = budget.charge(compact_usage)
+                            {
+                                drop(child_tx);
+                                let _ = forwarder.await;
+                                let partial = history
+                                    .iter()
+                                    .rev()
+                                    .find_map(|message| match message {
+                                        Message::Assistant { content, .. } => {
+                                            let text =
+                                                crate::engine::message::extract_text(content);
+                                            (!text.trim().is_empty()).then_some(text)
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                return Ok(NoninteractiveOutcome {
+                                    report:
+                                        crate::engine::delegation_budget::budget_exhausted_report(
+                                            &partial,
+                                            &exhaustion,
+                                        ),
+                                    history,
+                                    fallback_decision,
+                                });
+                            }
+                            next_prompt = Message::user(
+                                "Continue the delegated task using the compacted context above.",
+                            );
+                            continue 'turns;
+                        }
+                        Ok(_) => {}
+                        Err(_exhaustion) => {
+                            drop(child_tx);
+                            let _ = forwarder.await;
+                            let partial = history
+                                .iter()
+                                .rev()
+                                .find_map(|message| match message {
+                                    Message::Assistant { content, .. } => {
+                                        let text = crate::engine::message::extract_text(content);
+                                        (!text.trim().is_empty()).then_some(text)
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            return Ok(NoninteractiveOutcome {
+                                report: if partial.trim().is_empty() {
+                                    "Subagent compact-and-continue blocked after repeated compactions with no forward progress.".to_string()
+                                } else {
+                                    format!(
+                                        "{partial}\n\nSubagent compact-and-continue blocked after repeated compactions with no forward progress."
+                                    )
+                                },
+                                history,
+                                fallback_decision,
+                            });
+                        }
+                    }
+                }
+            }
         }
         match outcome {
             TurnOutcome::Continue => {

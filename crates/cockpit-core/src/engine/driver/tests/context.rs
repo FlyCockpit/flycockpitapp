@@ -2675,6 +2675,55 @@ async fn effective_auto_compact_pct_explicit_override_wins() {
 }
 
 #[tokio::test]
+async fn effective_frame_auto_compact_pct_uses_active_frame_policy() {
+    use crate::config::providers::ContextConfig;
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let cfg = ContextConfig::default();
+    let explore_policy = crate::agents::ContextPolicy {
+        auto_compact_pct: Some(60),
+        inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
+    };
+    let build_policy = crate::agents::ContextPolicy {
+        auto_compact_pct: Some(85),
+        inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
+    };
+    Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(explore_policy);
+    assert_eq!(driver.effective_active_auto_compact_pct(&cfg), 60);
+    driver.stack.push(crate::engine::driver::AgentSession {
+        queue_target: driver.stack[0].queue_target.clone(),
+        agent: {
+            let mut agent = driver.stack[0].agent.as_ref().clone();
+            agent.name = "Build".to_string();
+            agent.context_policy = Some(build_policy);
+            Arc::new(agent)
+        },
+        computer_coordinator: None,
+        computer_contract: None,
+        computer_coordinator_config: None,
+        pending_computer_continuations: Vec::new(),
+        computer_ask_denial: None,
+        agent_instance_id: None,
+        endpoint_generation: None,
+        history: Vec::new(),
+        answering: None,
+        deferred_log: crate::engine::deferred::DeferredLog::new(),
+        fallback_decision: None,
+        recovery_activation: None,
+        late_user_steer_permit: None,
+        _vnext_child_admission: None,
+        parent_budget: None,
+        per_delegation_budget: None,
+        stop_gate: crate::engine::agent::hooks::StopGateState::default(),
+    });
+    assert_eq!(driver.effective_active_auto_compact_pct(&cfg), 85);
+    assert_eq!(driver.effective_root_auto_compact_pct(&cfg), 60);
+}
+
+#[tokio::test]
 async fn auto_compact_fires_at_resolved_line() {
     use crate::config::providers::{CacheMode, ContextConfig};
 

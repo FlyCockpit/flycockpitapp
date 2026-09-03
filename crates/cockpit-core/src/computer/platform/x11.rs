@@ -661,8 +661,9 @@ impl X11TargetEvidenceAdapter {
             TargetUnavailableReason::PartialEvidence,
             Some(EvidenceSource::X11NetActiveWindow),
         );
-        // TODO(a11y perception): AT-SPI roles remain additive evidence; screen
-        // understanding and action targeting continue to use captured pixels.
+        // AT-SPI is not wired. Leave widget role/subrole unavailable so
+        // TypeText fail-closes as Credential (issue #290) rather than
+        // substituting the focused window's WM_CLASS as field context.
         snapshot.accessibility_role = FieldEvidence::unavailable(
             TargetUnavailableReason::PartialEvidence,
             Some(EvidenceSource::AtSpi),

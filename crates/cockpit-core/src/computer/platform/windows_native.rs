@@ -31,13 +31,13 @@ use windows::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationElement};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EDD_GET_DEVICE_INTERFACE_NAME, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsWindow, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsChild,
+    IsWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -846,7 +846,13 @@ impl WindowsTargetEvidenceAdapter {
                 ],
             );
             let display_id = monitor_identity(hwnd)?;
-            let (window_id, uia_role, uia_name) = uia_evidence(hwnd)?;
+            let UiaCapture {
+                fingerprint: uia_fingerprint,
+                name: uia_name,
+            } = uia_evidence(hwnd)?;
+            let window_id = uia_fingerprint.window_runtime_id;
+            let uia_role = uia_fingerprint.role.clone();
+            let uia_subrole = uia_fingerprint.subrole.clone();
             let mut snapshot = empty_unavailable(BackendKind::RealDesktopWindows);
             snapshot.host_installation_id =
                 FieldEvidence::available(self.host, EvidenceSource::WinSessionDesktop);
@@ -885,10 +891,17 @@ impl WindowsTargetEvidenceAdapter {
                 },
                 |role| FieldEvidence::available(role, EvidenceSource::Accessibility),
             );
-            // TODO(a11y perception): UIA remains approval evidence only; pixel capture drives perception and targeting.
-            snapshot.accessibility_subrole = FieldEvidence::unavailable(
-                TargetUnavailableReason::PartialEvidence,
-                Some(EvidenceSource::Accessibility),
+            // TODO(a11y perception): UIA remains approval evidence only; pixel
+            // capture drives perception and targeting. Subrole carries
+            // IsPassword so credential fields are distinguishable from Edit.
+            snapshot.accessibility_subrole = uia_subrole.map_or_else(
+                || {
+                    FieldEvidence::unavailable(
+                        TargetUnavailableReason::PartialEvidence,
+                        Some(EvidenceSource::Accessibility),
+                    )
+                },
+                |subrole| FieldEvidence::available(subrole, EvidenceSource::Accessibility),
             );
             snapshot.title_hint = uia_name.map_or_else(
                 || {
@@ -940,7 +953,10 @@ impl WindowsTargetEvidenceAdapter {
             );
             snapshot.synchronous_recheck = GetForegroundWindow() == hwnd
                 && IsWindow(Some(hwnd)).as_bool()
-                && matches!(uia_window_identity(hwnd), Ok(current) if current == window_id);
+                && matches!(
+                    uia_evidence(hwnd),
+                    Ok(live) if live.fingerprint == uia_fingerprint
+                );
             if !snapshot.synchronous_recheck {
                 return Err(TargetUnavailableReason::QueryMismatch);
             }
@@ -1133,25 +1149,58 @@ impl TargetEvidenceAdapter for WindowsTargetEvidenceAdapter {
     }
 }
 
-unsafe fn uia_evidence(
-    hwnd: HWND,
-) -> Result<([u8; 16], Option<String>, Option<String>), TargetUnavailableReason> {
+struct UiaCapture {
+    fingerprint: super::windows::UiaWidgetFingerprint,
+    name: Option<String>,
+}
+
+unsafe fn uia_evidence(hwnd: HWND) -> Result<UiaCapture, TargetUnavailableReason> {
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let evidence = (|| -> Result<_, TargetUnavailableReason> {
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        let element = unsafe { automation.ElementFromHandle(hwnd) }
+        // Window identity and title stay on the foreground HWND. Widget
+        // role/subrole come from the focused UIA element (issue #290),
+        // never from the window's control type, and only when that element
+        // belongs to this HWND.
+        let window = unsafe { automation.ElementFromHandle(hwnd) }
             .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        let identity = unsafe { uia_runtime_id(&element) }?;
-        let role = unsafe { element.CurrentControlType() }
-            .ok()
-            .map(|value| format!("uia.control_type.{}", value.0));
-        let name = unsafe { element.CurrentName() }
+        let identity = unsafe { uia_runtime_id(&window) }?;
+        let name = unsafe { window.CurrentName() }
             .ok()
             .map(|value| value.to_string())
             .filter(|value| !value.is_empty());
-        Ok((identity, role, name))
+        let fingerprint = match unsafe { automation.GetFocusedElement() } {
+            Ok(focused)
+                if unsafe {
+                    uia_focused_widget_in_window(&automation, &focused, &window, hwnd)
+                } =>
+            {
+                match unsafe { uia_runtime_id(&focused) } {
+                    Ok(focused_id) => {
+                        let control_type = unsafe { focused.CurrentControlType() }
+                            .ok()
+                            .map(|value| value.0);
+                        let password = match unsafe { focused.CurrentIsPassword() } {
+                            Ok(value) => super::windows::UiaPasswordEvidence::from_query(
+                                true,
+                                value.as_bool(),
+                            ),
+                            Err(_) => super::windows::UiaPasswordEvidence::Unknown,
+                        };
+                        let (role, subrole) =
+                            super::windows::uia_focused_widget_roles(control_type, password);
+                        super::windows::UiaWidgetFingerprint::with_bound_widget(
+                            identity, focused_id, role, subrole,
+                        )
+                    }
+                    Err(_) => super::windows::UiaWidgetFingerprint::window_only(identity),
+                }
+            }
+            _ => super::windows::UiaWidgetFingerprint::window_only(identity),
+        };
+        Ok(UiaCapture { fingerprint, name })
     })();
     if initialized {
         unsafe { CoUninitialize() };
@@ -1159,11 +1208,76 @@ unsafe fn uia_evidence(
     evidence
 }
 
+/// True when `focused` is the foreground window or a descendant of it.
+/// Unbound UIA focus (a different top-level window) must not contribute
+/// ordinary-text roles to this snapshot.
+unsafe fn uia_focused_widget_in_window(
+    automation: &IUIAutomation,
+    focused: &IUIAutomationElement,
+    window: &IUIAutomationElement,
+    hwnd: HWND,
+) -> bool {
+    if unsafe { uia_same_element(automation, focused, window) } {
+        return true;
+    }
+    if unsafe { uia_native_handle_belongs_to_foreground(focused, hwnd) } {
+        return true;
+    }
+    let Ok(walker) = (unsafe { automation.RawViewWalker() }) else {
+        return false;
+    };
+    let mut current = focused.clone();
+    for _ in 0..64 {
+        let Ok(parent) = (unsafe { walker.GetParentElement(&current) }) else {
+            break;
+        };
+        if unsafe { uia_same_element(automation, &parent, window) } {
+            return true;
+        }
+        if unsafe { uia_native_handle_belongs_to_foreground(&parent, hwnd) } {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+unsafe fn uia_same_element(
+    automation: &IUIAutomation,
+    left: &IUIAutomationElement,
+    right: &IUIAutomationElement,
+) -> bool {
+    unsafe { automation.CompareElements(left, right) }
+        .ok()
+        .is_some_and(|value| value.as_bool())
+}
+
+unsafe fn uia_native_handle_belongs_to_foreground(
+    element: &IUIAutomationElement,
+    foreground: HWND,
+) -> bool {
+    match unsafe { element.CurrentNativeWindowHandle() } {
+        Ok(native) if !native.is_invalid() => unsafe {
+            hwnd_belongs_to_foreground(native, foreground)
+        },
+        _ => false,
+    }
+}
+
+unsafe fn hwnd_belongs_to_foreground(native: HWND, foreground: HWND) -> bool {
+    let root = unsafe { GetAncestor(native, GA_ROOT) };
+    super::windows::native_hwnd_belongs_to_foreground(
+        native == foreground,
+        unsafe { IsChild(foreground, native) }.as_bool(),
+        !root.is_invalid() && root == foreground,
+    )
+}
+
 /// UI Automation runtime IDs identify a live automation element, unlike an
 /// HWND value which Windows can recycle after destruction. The array belongs
 /// to the caller and is always destroyed after copying its bounded contents.
 unsafe fn uia_runtime_id(
-    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    element: &IUIAutomationElement,
 ) -> Result<[u8; 16], TargetUnavailableReason> {
     struct RuntimeIdArray(*mut windows::Win32::System::Com::SAFEARRAY);
 
@@ -1210,22 +1324,6 @@ unsafe fn uia_runtime_id(
     let mut identity = [0_u8; 16];
     identity.copy_from_slice(&digest[..16]);
     Ok(identity)
-}
-
-unsafe fn uia_window_identity(hwnd: HWND) -> Result<[u8; 16], TargetUnavailableReason> {
-    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-    let result = (|| {
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        let element = unsafe { automation.ElementFromHandle(hwnd) }
-            .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        unsafe { uia_runtime_id(&element) }
-    })();
-    if initialized {
-        unsafe { CoUninitialize() };
-    }
-    result
 }
 
 #[cfg(test)]

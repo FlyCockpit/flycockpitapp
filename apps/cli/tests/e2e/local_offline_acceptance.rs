@@ -233,6 +233,20 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     }
     assert!(policy.is_file(), "settings policy was not persisted");
     assert!(export.is_file(), "redacted session export was not created");
+    // `cockpit import` round-trips `cockpit export`: the archive is pushed as
+    // bounded bulk chunks, verified by the daemon, and restored with fresh
+    // destination session ids (never restoring approval grants).
+    let imported = run(&session, &["import", &export_text]);
+    assert!(
+        imported.status.success(),
+        "import failed: {}",
+        output_text(&imported)
+    );
+    assert!(
+        output_text(&imported).contains("Imported 1 session"),
+        "import did not round-trip the export archive: {}",
+        output_text(&imported)
+    );
     let resumed = run(
         &session,
         &[

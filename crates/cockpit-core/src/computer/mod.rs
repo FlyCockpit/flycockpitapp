@@ -371,6 +371,20 @@ pub enum ComputerAction {
     },
 }
 
+impl ComputerAction {
+    /// True when performing this action injects host input (keyboard, pointer,
+    /// or scroll). Capture and wait do not.
+    pub(crate) fn injects_synthetic_input(&self) -> bool {
+        !matches!(
+            self,
+            Self::CaptureFull
+                | Self::CaptureRegion { .. }
+                | Self::CaptureNativeZoom { .. }
+                | Self::Wait { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComputerActionOutcome {
     Captured(CaptureFrame),
@@ -446,6 +460,18 @@ pub enum NormalizedComputerEffect {
     },
 }
 
+impl NormalizedComputerEffect {
+    pub(crate) fn injects_synthetic_input(&self) -> bool {
+        !matches!(
+            self,
+            Self::CaptureFull
+                | Self::CaptureRegion { .. }
+                | Self::CaptureNativeZoom { .. }
+                | Self::Wait { .. }
+        )
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NormalizedTimedPoint {
@@ -493,6 +519,13 @@ pub enum ComputerError {
     Cancelled,
     CommandFailed { program: String, detail: String },
 }
+
+pub(crate) const EVIDENCED_WINDOW_MISMATCH: &str =
+    "target window no longer matches the evidenced window";
+pub(crate) const SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW: &str =
+    "synthetic input requires an evidenced window";
+pub(crate) const CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW: &str =
+    "backend cannot direct input to the evidenced window";
 
 /// Provider-controlled action durations are intentionally bounded so a
 /// physical-host lease and any pressed key cannot be held indefinitely.
@@ -569,6 +602,34 @@ pub trait ComputerBackend: backend_seal::Sealed + Send + Sync {
             "physical backend does not consume coordinator capability".into(),
         ))
     }
+
+    /// Bind subsequent synthetic input to the evidenced/approved window.
+    ///
+    /// Production backends that cannot direct input to this window must
+    /// return `Err` — never fall back to whatever currently has focus.
+    /// Test doubles accept the bind so coordinator tests can exercise the
+    /// window-identity fence without an OS injection seam.
+    fn bind_evidenced_window(
+        &mut self,
+        window: target::OpaqueWindowId,
+    ) -> Result<(), ComputerError> {
+        let _ = window;
+        #[cfg(test)]
+        {
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        Err(ComputerError::Refused(
+            CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+        ))
+    }
+
+    /// Re-verify that the live target window still matches the evidenced
+    /// window bound for this dispatch. A mismatch aborts remaining batch
+    /// items. Default is a no-op for backends with no bound window.
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        Ok(())
+    }
 }
 
 /// Single-action form of [`execute_backend_batch`].
@@ -610,6 +671,12 @@ pub async fn execute_backend_batch<B: ComputerBackend + ?Sized>(
     };
     let mut completed = Vec::new();
     for (index, action) in normalized.iter().enumerate() {
+        if let Err(error) = backend.recheck_evidenced_window() {
+            return ComputerBatchReport {
+                completed,
+                failure: Some(ComputerFailure { index, error }),
+            };
+        }
         match backend.execute_normalized_one(action).await {
             Ok(outcome) => completed.push(outcome),
             Err(error) => {
@@ -641,6 +708,9 @@ pub struct FakeBackend {
     pub release_count: usize,
     pub fail_at: Option<usize>,
     pub fail_with: ComputerError,
+    pub bound_window: Option<target::OpaqueWindowId>,
+    pub window_rechecks: usize,
+    pub window_recheck_fail_at: Option<usize>,
 }
 
 impl FakeBackend {
@@ -661,6 +731,9 @@ impl FakeBackend {
             release_count: 0,
             fail_at: None,
             fail_with: ComputerError::Refused("fake failure".to_string()),
+            bound_window: None,
+            window_rechecks: 0,
+            window_recheck_fail_at: None,
         }
     }
 
@@ -737,6 +810,25 @@ impl ComputerBackend for FakeBackend {
         self.release_count += 1;
         Ok(())
     }
+
+    fn bind_evidenced_window(
+        &mut self,
+        window: target::OpaqueWindowId,
+    ) -> Result<(), ComputerError> {
+        self.bound_window = Some(window);
+        Ok(())
+    }
+
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        if self.window_recheck_fail_at == Some(self.window_rechecks) {
+            self.window_rechecks += 1;
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        self.window_rechecks += 1;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -789,6 +881,16 @@ pub(crate) struct VirtualDisplayBackend {
     /// [`private_capture_root`].
     capture_root: PathBuf,
     physical_capability: Option<coordinator::PhysicalDispatchCapability>,
+    /// Evidenced window this backend will inject into. Physical X11 stores
+    /// the decoded window id; virtual displays pin `getactivewindow` to the
+    /// evidenced identity and never follow a later focus change.
+    evidenced_injection_window: Option<EvidencedX11Window>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvidencedX11Window {
+    opaque: target::OpaqueWindowId,
+    x11: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +1071,7 @@ impl VirtualDisplayBackend {
             held_key_journal,
             capture_root,
             physical_capability: None,
+            evidenced_injection_window: None,
         })
     }
 
@@ -1028,6 +1131,7 @@ impl VirtualDisplayBackend {
             held_key_journal: HeldKeyJournal::default(),
             capture_root,
             physical_capability: None,
+            evidenced_injection_window: None,
         })
     }
 
@@ -1068,6 +1172,145 @@ impl VirtualDisplayBackend {
                 detail: String::from_utf8_lossy(&output.stderr).to_string(),
             })
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_x11_injection_window(
+        &mut self,
+        window: target::OpaqueWindowId,
+    ) -> Result<(), ComputerError> {
+        if let Some(bound) = self.evidenced_injection_window
+            && bound.opaque == window
+        {
+            return Ok(());
+        }
+        let x11 = if self.backend_kind == target::BackendKind::RealDesktopX11 {
+            crate::computer::platform::x11_window_from_opaque(&window).ok_or_else(|| {
+                ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string())
+            })?
+        } else if let Some(decoded) = crate::computer::platform::x11_window_from_opaque(&window) {
+            decoded
+        } else {
+            // Virtual display evidence uses a UUID, not an X11 id. Pin the
+            // active window on this DISPLAY to that identity and never follow
+            // a later focus change of the same opaque id.
+            self.query_active_x11_window()?
+        };
+        if x11 == 0 {
+            return Err(ComputerError::Refused(
+                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
+        self.evidenced_injection_window = Some(EvidencedX11Window {
+            opaque: window,
+            x11,
+        });
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query_active_x11_window(&self) -> Result<u32, ComputerError> {
+        let output = self.run_xdotool_output(&[OsString::from("getactivewindow")])?;
+        if !output.status.success() {
+            return Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+        let parsed = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: "getactivewindow did not return a window id".to_string(),
+            })?;
+        if parsed == 0 {
+            return Err(ComputerError::Refused(
+                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query_x11_window_geometry(
+        &self,
+        window: u32,
+    ) -> Result<(i32, i32, u32, u32), ComputerError> {
+        let output = self.run_xdotool_output(&[
+            OsString::from("getwindowgeometry"),
+            OsString::from("--shell"),
+            OsString::from(window.to_string()),
+        ])?;
+        if !output.status.success() {
+            return Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut x = None;
+        let mut y = None;
+        let mut width = None;
+        let mut height = None;
+        for line in stdout.lines() {
+            if let Some(value) = line.strip_prefix("X=") {
+                x = value.parse::<i32>().ok();
+            } else if let Some(value) = line.strip_prefix("Y=") {
+                y = value.parse::<i32>().ok();
+            } else if let Some(value) = line.strip_prefix("WIDTH=") {
+                width = value.parse::<u32>().ok();
+            } else if let Some(value) = line.strip_prefix("HEIGHT=") {
+                height = value.parse::<u32>().ok();
+            }
+        }
+        match (x, y, width, height) {
+            (Some(x), Some(y), Some(width), Some(height)) => Ok((x, y, width, height)),
+            _ => Err(ComputerError::CommandFailed {
+                program: "xdotool".to_string(),
+                detail: "getwindowgeometry did not return X/Y/WIDTH/HEIGHT".to_string(),
+            }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_targeted_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
+        match self.evidenced_injection_window {
+            Some(bound) => self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest)),
+            None if self.backend_kind == target::BackendKind::RealDesktopX11 => Err(
+                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string()),
+            ),
+            None => {
+                // Evidence-less virtual displays are DISPLAY-isolated; there
+                // is no evidenced window to address. Physical X11 must not
+                // take this path.
+                let mut args = Vec::with_capacity(1 + rest.len());
+                args.push(OsString::from(command));
+                args.extend_from_slice(rest);
+                self.run_xdotool(&args)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_release_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
+        if let Some(bound) = self.evidenced_injection_window {
+            self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
+        } else {
+            let mut args = Vec::with_capacity(1 + rest.len());
+            args.push(OsString::from(command));
+            args.extend_from_slice(rest);
+            self.run_xdotool(&args)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn window_relative_point(&self, point: PixelPoint) -> Result<PixelPoint, ComputerError> {
+        let Some(bound) = self.evidenced_injection_window else {
+            return Ok(point);
+        };
+        let (origin_x, origin_y, width, height) = self.query_x11_window_geometry(bound.x11)?;
+        pixel_point_in_window(point, origin_x, origin_y, width, height)
     }
 
     #[cfg(target_os = "linux")]
@@ -1753,14 +1996,11 @@ impl ComputerBackend for VirtualDisplayBackend {
                 self.prepare_current_input_transition()?;
                 match transition {
                     LinuxReleaseTransition::Key(key) => {
-                        self.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)])?;
+                        self.run_release_xdotool("keyup", &[OsString::from(&key)])?;
                         self.forget_held_key(&key)
                     }
                     LinuxReleaseTransition::Button(button) => {
-                        self.run_xdotool(&[
-                            OsString::from("mouseup"),
-                            OsString::from(button.to_string()),
-                        ])?;
+                        self.run_release_xdotool("mouseup", &[OsString::from(button.to_string())])?;
                         self.held_buttons.retain(|held| *held != button);
                         self.held_key_journal
                             .store(&self.held_keys, &self.held_buttons, false)
@@ -1782,6 +2022,41 @@ impl ComputerBackend for VirtualDisplayBackend {
         }
         capability.recheck(self.backend_kind)?;
         self.physical_capability = Some(capability);
+        Ok(())
+    }
+
+    fn bind_evidenced_window(
+        &mut self,
+        window: target::OpaqueWindowId,
+    ) -> Result<(), ComputerError> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.bind_x11_injection_window(window);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = window;
+            Err(ComputerError::Refused(
+                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+            ))
+        }
+    }
+
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(bound) = self.evidenced_injection_window else {
+                return Ok(());
+            };
+            let live = self.query_active_x11_window()?;
+            if live != bound.x11 {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
         Ok(())
     }
 }
@@ -1850,10 +2125,10 @@ fn execute_virtual_action(
             run_modifiers(backend, *modifiers, true)?;
             for _ in 0..click_repetitions(*count) {
                 backend.prepare_current_input_transition()?;
-                backend.run_xdotool(&[
-                    OsString::from("click"),
-                    OsString::from(mouse_button_number(*button).to_string()),
-                ])?;
+                backend.run_targeted_xdotool(
+                    "click",
+                    &[OsString::from(mouse_button_number(*button).to_string())],
+                )?;
                 backend.commit_known_input_state()?;
             }
             run_modifiers(backend, *modifiers, false)?;
@@ -1861,19 +2136,19 @@ fn execute_virtual_action(
         }
         NormalizedComputerEffect::MouseDown { button } => {
             backend.remember_held_button(*button)?;
-            backend.run_xdotool(&[
-                OsString::from("mousedown"),
-                OsString::from(mouse_button_number(*button).to_string()),
-            ])?;
+            backend.run_targeted_xdotool(
+                "mousedown",
+                &[OsString::from(mouse_button_number(*button).to_string())],
+            )?;
             backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
         NormalizedComputerEffect::MouseUp { button } => {
             backend.prepare_current_input_transition()?;
-            backend.run_xdotool(&[
-                OsString::from("mouseup"),
-                OsString::from(mouse_button_number(*button).to_string()),
-            ])?;
+            backend.run_targeted_xdotool(
+                "mouseup",
+                &[OsString::from(mouse_button_number(*button).to_string())],
+            )?;
             backend.forget_held_button(*button)?;
             Ok(ComputerActionOutcome::Completed)
         }
@@ -1886,26 +2161,26 @@ fn execute_virtual_action(
             move_cursor_with_timing(backend, first.point, first.duration, first.easing)?;
             run_modifiers(backend, *modifiers, true)?;
             backend.remember_held_button(*button)?;
-            backend.run_xdotool(&[
-                OsString::from("mousedown"),
-                OsString::from(mouse_button_number(*button).to_string()),
-            ])?;
+            backend.run_targeted_xdotool(
+                "mousedown",
+                &[OsString::from(mouse_button_number(*button).to_string())],
+            )?;
             backend.commit_known_input_state()?;
             for step in path.iter().skip(1) {
                 move_cursor_with_timing(backend, step.point, step.duration, step.easing)?;
             }
             backend.prepare_current_input_transition()?;
-            backend.run_xdotool(&[
-                OsString::from("mouseup"),
-                OsString::from(mouse_button_number(*button).to_string()),
-            ])?;
+            backend.run_targeted_xdotool(
+                "mouseup",
+                &[OsString::from(mouse_button_number(*button).to_string())],
+            )?;
             backend.forget_held_button(*button)?;
             run_modifiers(backend, *modifiers, false)?;
             Ok(ComputerActionOutcome::Completed)
         }
         NormalizedComputerEffect::TypeText { text } => {
             backend.prepare_current_input_transition()?;
-            backend.run_xdotool(&[OsString::from("type"), OsString::from(text)])?;
+            backend.run_targeted_xdotool("type", &[OsString::from(text)])?;
             backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
@@ -1917,18 +2192,18 @@ fn execute_virtual_action(
                 .collect::<Vec<_>>()
                 .join("+");
             backend.prepare_current_input_transition()?;
-            backend.run_xdotool(&[OsString::from("key"), OsString::from(chord)])?;
+            backend.run_targeted_xdotool("key", &[OsString::from(chord)])?;
             backend.commit_known_input_state()?;
             Ok(ComputerActionOutcome::Completed)
         }
         NormalizedComputerEffect::HoldKey { key, duration } => {
             let key = key.x11_name().to_string();
             backend.remember_held_key(key.clone())?;
-            backend.run_xdotool(&[OsString::from("keydown"), OsString::from(&key)])?;
+            backend.run_targeted_xdotool("keydown", &[OsString::from(&key)])?;
             backend.commit_known_input_state()?;
             std::thread::sleep(*duration);
             backend.prepare_current_input_transition()?;
-            backend.run_xdotool(&[OsString::from("keyup"), OsString::from(&key)])?;
+            backend.run_targeted_xdotool("keyup", &[OsString::from(&key)])?;
             backend.forget_held_key(&key)?;
             Ok(ComputerActionOutcome::Completed)
         }
@@ -1941,13 +2216,13 @@ fn execute_virtual_action(
             let vertical = if *delta_y < 0 { "5" } else { "4" };
             for _ in 0..delta_y.unsigned_abs() {
                 backend.prepare_current_input_transition()?;
-                backend.run_xdotool(&[OsString::from("click"), OsString::from(vertical)])?;
+                backend.run_targeted_xdotool("click", &[OsString::from(vertical)])?;
                 backend.commit_known_input_state()?;
             }
             let horizontal = if *delta_x < 0 { "7" } else { "6" };
             for _ in 0..delta_x.unsigned_abs() {
                 backend.prepare_current_input_transition()?;
-                backend.run_xdotool(&[OsString::from("click"), OsString::from(horizontal)])?;
+                backend.run_targeted_xdotool("click", &[OsString::from(horizontal)])?;
                 backend.commit_known_input_state()?;
             }
             run_modifiers(backend, *modifiers, false)?;
@@ -2218,11 +2493,56 @@ fn move_cursor_now(
     backend: &VirtualDisplayBackend,
     point: PixelPoint,
 ) -> Result<(), ComputerError> {
-    backend.run_xdotool(&[
-        OsString::from("mousemove"),
-        OsString::from(point.x.to_string()),
-        OsString::from(point.y.to_string()),
-    ])
+    let relative = backend.window_relative_point(point)?;
+    backend.run_targeted_xdotool(
+        "mousemove",
+        &[
+            OsString::from(relative.x.to_string()),
+            OsString::from(relative.y.to_string()),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn xdotool_targeted_args(window: u32, command: &str, rest: &[OsString]) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(3 + rest.len());
+    args.push(OsString::from(command));
+    args.push(OsString::from("--window"));
+    args.push(OsString::from(window.to_string()));
+    args.extend_from_slice(rest);
+    args
+}
+
+#[cfg(test)]
+pub(crate) fn xdotool_targeted_command(window: u32, command: &str, rest: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        command.to_string(),
+        "--window".to_string(),
+        window.to_string(),
+    ];
+    args.extend(rest.iter().map(|part| (*part).to_string()));
+    args
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn pixel_point_in_window(
+    screen: PixelPoint,
+    origin_x: i32,
+    origin_y: i32,
+    width: u32,
+    height: u32,
+) -> Result<PixelPoint, ComputerError> {
+    let x = i64::from(screen.x) - i64::from(origin_x);
+    let y = i64::from(screen.y) - i64::from(origin_y);
+    if x < 0 || y < 0 || x >= i64::from(width) || y >= i64::from(height) {
+        return Err(ComputerError::Refused(
+            "cursor point is outside the evidenced window".to_string(),
+        ));
+    }
+    Ok(PixelPoint {
+        x: x as u32,
+        y: y as u32,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2332,7 +2652,7 @@ fn run_modifiers(
             } else {
                 backend.prepare_current_input_transition()?;
             }
-            backend.run_xdotool(&[OsString::from(verb), OsString::from(key)])?;
+            backend.run_targeted_xdotool(verb, &[OsString::from(key)])?;
             if down {
                 backend.commit_known_input_state()?;
             } else {
@@ -5883,6 +6203,58 @@ mod tests {
         let fail_report = execute_backend_batch(&mut fail, &actions).await;
         assert_eq!(fail_report.failure.unwrap().error, ComputerError::Cancelled);
         assert_eq!(fail.release_count, 0);
+    }
+
+    #[test]
+    fn xdotool_input_is_addressed_to_the_evidenced_window() {
+        assert_eq!(
+            xdotool_targeted_command(0x00ab_cdef, "type", &["hello"]),
+            vec!["type", "--window", "11259375", "hello"]
+        );
+        assert_eq!(
+            xdotool_targeted_command(42, "key", &["Return"]),
+            vec!["key", "--window", "42", "Return"]
+        );
+        assert_eq!(
+            xdotool_targeted_command(7, "click", &["1"]),
+            vec!["click", "--window", "7", "1"]
+        );
+    }
+
+    #[test]
+    fn pixel_point_in_window_converts_screen_coordinates_and_refuses_outside() {
+        let inside = pixel_point_in_window(PixelPoint { x: 110, y: 220 }, 100, 200, 50, 50)
+            .expect("inside the evidenced window");
+        assert_eq!(inside, PixelPoint { x: 10, y: 20 });
+        assert!(pixel_point_in_window(PixelPoint { x: 99, y: 220 }, 100, 200, 50, 50).is_err());
+        assert!(pixel_point_in_window(PixelPoint { x: 150, y: 220 }, 100, 200, 50, 50).is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_backend_batch_aborts_remaining_actions_on_window_recheck() {
+        let mut backend = FakeBackend::new();
+        backend.window_recheck_fail_at = Some(1);
+        let actions = vec![
+            ComputerAction::Wait {
+                duration: Duration::from_millis(1),
+            },
+            ComputerAction::TypeText {
+                text: "one".to_string(),
+            },
+            ComputerAction::TypeText {
+                text: "two".to_string(),
+            },
+        ];
+        let report = execute_backend_batch(&mut backend, &actions).await;
+        assert_eq!(backend.recorded.len(), 1);
+        assert_eq!(
+            report.failure,
+            Some(ComputerFailure {
+                index: 1,
+                error: ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()),
+            })
+        );
+        assert_eq!(report.completed.len(), 1);
     }
 
     #[test]

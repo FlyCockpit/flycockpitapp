@@ -53,9 +53,10 @@ use crate::computer::target::{
 };
 use crate::computer::{
     CaptureFrame, ClickCount, ComputerActionOutcome, ComputerBackend, ComputerError,
-    DisplayGeometry, DisplayTarget, Easing, LogicalSize, Modifiers, MouseButton,
-    NormalizedComputerAction, NormalizedComputerEffect, NormalizedKeyCode, PixelPoint, PixelRect,
-    PixelSize, RealDesktopGrantStore, ScaleFactor,
+    DisplayGeometry, DisplayTarget, EVIDENCED_WINDOW_MISMATCH, Easing, LogicalSize, Modifiers,
+    MouseButton, NormalizedComputerAction, NormalizedComputerEffect, NormalizedKeyCode, PixelPoint,
+    PixelRect, PixelSize, RealDesktopGrantStore, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW,
+    ScaleFactor,
 };
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ pub(crate) struct WindowsDesktopBackend {
     held_input_journal: WindowsHeldInputJournal,
     held_buttons: Vec<MouseButton>,
     physical_capability: Option<crate::computer::coordinator::PhysicalDispatchCapability>,
+    evidenced_window: Option<OpaqueWindowId>,
 }
 
 /// Every keyboard down event is made durable before `SendInput`. Recovery uses
@@ -160,6 +162,7 @@ impl WindowsDesktopBackend {
             held_input_journal,
             held_buttons: Vec::new(),
             physical_capability: None,
+            evidenced_window: None,
         })
     }
 
@@ -170,6 +173,19 @@ impl WindowsDesktopBackend {
                 ComputerError::Refused("physical backend is not coordinator-bound".into())
             })?
             .recheck(BackendKind::RealDesktopWindows)
+    }
+
+    fn require_live_evidenced_window(&self) -> Result<(), ComputerError> {
+        let expected = self.evidenced_window.ok_or_else(|| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })?;
+        let live = foreground_opaque_window_id()?;
+        if live != expected {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn reload_held_keyboard_inputs(&mut self) -> Result<(), ComputerError> {
@@ -400,6 +416,9 @@ impl ComputerBackend for WindowsDesktopBackend {
         action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
         self.require_physical_capability()?;
+        if action.effect().injects_synthetic_input() {
+            self.require_live_evidenced_window()?;
+        }
         match action.effect() {
             NormalizedComputerEffect::CaptureFull => Ok(captured(self, None, None)?),
             NormalizedComputerEffect::CaptureRegion { rect } => {
@@ -567,6 +586,18 @@ impl ComputerBackend for WindowsDesktopBackend {
         capability.recheck(BackendKind::RealDesktopWindows)?;
         self.physical_capability = Some(capability);
         Ok(())
+    }
+
+    fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
+        self.evidenced_window = Some(window);
+        self.require_live_evidenced_window()
+    }
+
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        if self.evidenced_window.is_none() {
+            return Ok(());
+        }
+        self.require_live_evidenced_window()
     }
 }
 
@@ -1152,6 +1183,25 @@ impl TargetEvidenceAdapter for WindowsTargetEvidenceAdapter {
 struct UiaCapture {
     fingerprint: super::windows::UiaWidgetFingerprint,
     name: Option<String>,
+}
+
+fn foreground_opaque_window_id() -> Result<OpaqueWindowId, ComputerError> {
+    // SAFETY: queried HWND is validated before use; UI Automation is initialized
+    // for the duration of `uia_evidence`.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() || !IsWindow(Some(hwnd)).as_bool() {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        let capture = uia_evidence(hwnd).map_err(|_| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })?;
+        Ok(OpaqueWindowId::from_bytes(
+            capture.fingerprint.window_runtime_id,
+        ))
+    }
 }
 
 unsafe fn uia_evidence(hwnd: HWND) -> Result<UiaCapture, TargetUnavailableReason> {

@@ -19,10 +19,11 @@ use objc2_core_graphics::{
 use super::{
     CaptureFrame, ComputerActionOutcome, ComputerBackend, ComputerError, DisplayGeometry,
     DisplayTarget, Easing, Modifiers, MouseButton, NormalizedComputerAction,
-    NormalizedComputerEffect, PixelPoint, PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor,
-    click_repetitions, eased_progress, scale_png,
+    NormalizedComputerEffect, PixelPoint, PixelRect, PixelSize, RealDesktopGrantStore,
+    SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, ScaleFactor, click_repetitions, eased_progress,
+    scale_png,
 };
-use crate::computer::target::BackendKind;
+use crate::computer::target::{BackendKind, OpaqueWindowId};
 
 const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
 const MOVE_STEPS: u32 = 12;
@@ -39,6 +40,7 @@ pub(super) struct MacOsComputerBackend {
     outstanding_buttons: HashSet<MouseButton>,
     physical_capability: Option<super::coordinator::PhysicalDispatchCapability>,
     input_authority: MacHostInputAuthority,
+    evidenced_window: Option<OpaqueWindowId>,
 }
 
 // CoreGraphics' immutable event source is safe to retain behind the backend's
@@ -96,6 +98,7 @@ impl MacOsComputerBackend {
             outstanding_keys: input_authority.state.keys.iter().copied().collect(),
             outstanding_buttons: input_authority.state.buttons.iter().copied().collect(),
             input_authority,
+            evidenced_window: None,
         })
     }
 
@@ -250,10 +253,22 @@ impl MacOsComputerBackend {
         Ok(())
     }
 
+    fn require_evidenced_window(&self) -> Result<(), ComputerError> {
+        if self.evidenced_window.is_none() {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn execute_action(
         &mut self,
         action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
+        if action.effect().injects_synthetic_input() {
+            self.require_evidenced_window()?;
+        }
         match action.effect() {
             NormalizedComputerEffect::CaptureFull => {
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
@@ -793,6 +808,18 @@ impl ComputerBackend for MacOsComputerBackend {
         capability.recheck(BackendKind::RealDesktopMacOs)?;
         self.physical_capability = Some(capability);
         Ok(())
+    }
+
+    fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
+        self.evidenced_window = Some(window);
+        Ok(())
+    }
+
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        if self.evidenced_window.is_none() {
+            return Ok(());
+        }
+        self.require_evidenced_window()
     }
 }
 

@@ -33,5 +33,6 @@ pub(crate) use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdap
 pub use x11::X11TargetEvidenceAdapter;
 pub use x11::{
     EdidValidation, MirrorGroup, RandrOutputSnapshot, X11EvidenceLogic, X11SessionParts,
-    select_mirror_group, validate_edid, x11_physical_display_id, x11_session_or_seat_id,
+    opaque_x11_window_id, select_mirror_group, validate_edid, x11_physical_display_id,
+    x11_session_or_seat_id, x11_window_from_opaque,
 };

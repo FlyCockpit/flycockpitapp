@@ -12,12 +12,34 @@ use crate::computer::host_identity::domain_hash;
 use crate::computer::host_identity::{
     HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
 };
+use crate::computer::target::OpaqueWindowId;
 #[cfg(target_os = "linux")]
 use crate::computer::target::{
-    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
-    RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
-    TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, RedactedHint,
+    StableApplicationId, TargetEvidenceAdapter, TargetGeometry, TargetIdentityEvidence,
+    TargetUnavailableReason, empty_unavailable,
 };
+
+/// Encode an X11 window id into the platform-neutral evidence identity.
+///
+/// X11 window ids are 32-bit; they occupy the first four little-endian bytes
+/// and the remainder is zero. Identities that use the full 16 bytes (virtual
+/// UUIDs, hashed macOS/Windows handles) are not X11 window ids.
+pub fn opaque_x11_window_id(window: u32) -> OpaqueWindowId {
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&window.to_le_bytes());
+    OpaqueWindowId::from_bytes(bytes)
+}
+
+/// Inverse of [`opaque_x11_window_id`]. `None` when the identity is not an
+/// X11 window id, so callers can refuse rather than guess a target.
+pub fn x11_window_from_opaque(id: &OpaqueWindowId) -> Option<u32> {
+    let bytes = id.as_bytes();
+    if bytes[4..].iter().copied().any(|byte| byte != 0) {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes[..4].try_into().ok()?))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X11SessionParts {
@@ -598,8 +620,6 @@ impl X11TargetEvidenceAdapter {
             .and_then(|reply| reply.value32().and_then(|mut values| values.next()));
         let title = x11_text_property(&connection, active_window, b"_NET_WM_NAME");
         let class = x11_text_property(&connection, active_window, b"WM_CLASS");
-        let mut window_bytes = [0_u8; 16];
-        window_bytes[..4].copy_from_slice(&active_window.to_le_bytes());
 
         // Close the synchronous-query bracket: neither focus nor the RandR
         // configuration may have changed while the component fields above
@@ -645,7 +665,7 @@ impl X11TargetEvidenceAdapter {
             EvidenceSource::X11Randr,
         );
         snapshot.focused_window_id = FieldEvidence::available(
-            OpaqueWindowId::from_bytes(window_bytes),
+            opaque_x11_window_id(active_window),
             EvidenceSource::X11NetActiveWindow,
         );
         snapshot.process_id = process_id.map_or_else(
@@ -872,6 +892,23 @@ pub fn authorized_x11rb_present() -> bool {
 pub fn authorized_atspi_present() -> bool {
     let _ = core::mem::size_of::<atspi::AccessibilityConnection>();
     true
+}
+
+#[cfg(test)]
+mod opaque_window_tests {
+    use super::{opaque_x11_window_id, x11_window_from_opaque};
+    use crate::computer::target::OpaqueWindowId;
+
+    #[test]
+    fn x11_window_id_round_trips_and_rejects_non_x11_identities() {
+        let id = opaque_x11_window_id(0x00ab_cdef);
+        assert_eq!(x11_window_from_opaque(&id), Some(0x00ab_cdef));
+        assert_eq!(
+            x11_window_from_opaque(&OpaqueWindowId::from_bytes([0xAA; 16])),
+            None
+        );
+        assert_eq!(x11_window_from_opaque(&opaque_x11_window_id(0)), Some(0));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

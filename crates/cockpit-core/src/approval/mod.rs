@@ -2426,6 +2426,49 @@ mod tests {
         })
     }
 
+    /// Like [`resolve_sequence_collecting_questions`], but also captures
+    /// each interrupt's persisted description — the body that owner clients
+    /// render as its own line of text alongside the prompt.
+    fn resolve_sequence_collecting_questions_and_descriptions(
+        approver: &Approver,
+        ids: &[&'static str],
+    ) -> tokio::task::JoinHandle<Vec<(String, String)>> {
+        let db = approver.db.clone();
+        let session_id = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let ids: Vec<&'static str> = ids.to_vec();
+        tokio::spawn(async move {
+            let mut seen: Vec<uuid::Uuid> = Vec::new();
+            let mut records = Vec::new();
+            for id in ids {
+                let (iid, prompt, description) = loop {
+                    let open = db.list_open_interrupts(session_id).await.unwrap();
+                    if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
+                        let prompt = row
+                            .questions
+                            .as_ref()
+                            .and_then(|set| set.questions.first())
+                            .and_then(|question| match question {
+                                InterruptQuestion::Single { prompt, .. } => Some(prompt.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        break (row.interrupt_id, prompt, row.description.clone());
+                    }
+                    tokio::task::yield_now().await;
+                };
+                seen.push(iid);
+                records.push((prompt, description));
+                let response = ResolveResponse::Single {
+                    selected_id: id.to_string(),
+                };
+                db.resolve_interrupt(iid, &response).await.unwrap();
+                assert!(hub.resolve(iid, response));
+            }
+            records
+        })
+    }
+
     fn computer_action_request<'a>(action_id: &'a str) -> AuthorizationRequest<'a> {
         AuthorizationRequest::ComputerAction {
             session_id: "session-1",
@@ -2728,9 +2771,23 @@ mod tests {
         let questions = resolver.await.unwrap();
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
         let prompt = single_prompt(&questions[0]);
+        // The whole prompt is one visual line: no control character at
+        // all (newline and ANSI included) may survive anywhere in it.
         assert!(
-            !prompt.contains('`') && !prompt.contains('\n'),
-            "typed text must not carry structural characters into the prompt, got: {prompt}"
+            !prompt.chars().any(char::is_control),
+            "no control characters may render, got: {prompt}"
+        );
+        // The prompt's only structural punctuation is engine-owned: the
+        // template itself contributes exactly four backticks (the
+        // action-detail clause and the call-label clause) and the
+        // typed-display wrapper contributes exactly two double quotes.
+        // Any byte beyond those counts is payload that escaped the fence,
+        // so these counts lock the flatten invariant where a bare
+        // `!contains('`')` on the template-owned delimiters never could.
+        assert_eq!(
+            prompt.matches('`').count(),
+            4,
+            "only the engine-owned clause delimiters may appear, got: {prompt}"
         );
         assert_eq!(
             prompt.matches('"').count(),
@@ -2738,9 +2795,58 @@ mod tests {
             "only the typed-display wrapper quotes may appear, got: {prompt}"
         );
         assert!(
+            prompt.contains("finish the note 'rm -rf /' now 'quoted'"),
+            "payload structural punctuation must render as a lookalike, got: {prompt}"
+        );
+        assert!(
             prompt.contains("risk class: state_changing"),
             "the real risk class still renders, got: {prompt}"
         );
+    }
+
+    /// Issue #286: the action id embeds the raw provider call id, which is
+    /// validated only as non-empty, so the id is a third provider-controlled
+    /// fragment and goes through the same flatten fence as typed text: a
+    /// crafted call id must not forge a second line in the prompt or in the
+    /// interrupt body (owner clients render both as standalone text).
+    #[tokio::test]
+    async fn computer_action_prompt_flattens_structural_provider_call_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+        let resolver =
+            resolve_sequence_collecting_questions_and_descriptions(&approver, &[ID_APPROVE_ONCE]);
+        // Newline, backticks, and a double quote: the exact structural
+        // class the one-line fence exists for.
+        let hostile_call_id = "call\n`x`\"y\":0";
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                hostile_call_id,
+                "wait 10ms",
+                None,
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let records = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let (prompt, body) = &records[0];
+        assert_eq!(
+            prompt.matches('`').count(),
+            4,
+            "only the engine-owned clause delimiters may appear, got: {prompt}"
+        );
+        for text in [prompt.as_str(), body.as_str()] {
+            assert!(
+                !text.chars().any(char::is_control),
+                "a hostile provider call id must not forge a second line, got: {text}"
+            );
+            assert!(
+                text.contains("call 'x''y':0"),
+                "the id renders with lookalikes instead of structural punctuation, got: {text}"
+            );
+        }
     }
 
     /// Issue #286: with no redaction table available (a headless approver

@@ -1256,9 +1256,14 @@ impl Approver {
         // Every interpolated fragment is either engine-generated from safe
         // enum data (`action_detail`, `batch_detail`, `backend_kind`,
         // `action_class`, `action_label`) or flattened here: the typed
-        // text and the OS-derived window title hint are the two fragments
-        // a provider or the desktop controls, so they can never carry a
-        // newline, backtick, or quote into the one-line prompt.
+        // text, the OS-derived window title hint, and the action id are
+        // the three fragments a provider or the desktop controls. The
+        // action id embeds the raw provider call id (validated only as
+        // non-empty), so without flattening a crafted id could forge a
+        // second prompt line in every owner client that honors newlines.
+        // The raw id still travels in the structured interrupt metadata,
+        // where JSON escaping contains it; only this display is flattened.
+        let action_id_display = flatten_prompt_fragment(action_id);
         let target_line = match target_window {
             Some(window) => format!(" Target window: {}.", flatten_prompt_fragment(window)),
             None => format!(" Target: {backend_kind} display."),
@@ -1267,7 +1272,7 @@ impl Approver {
             .map(|batch| format!(" Batch: {batch}."))
             .unwrap_or_default();
         let prompt = format!(
-            "Allow computer action `{action_detail}{typed_display}` (risk class: {action_class})?{target_line}{batch_line} (call `{action_label}`, id: {action_id})"
+            "Allow computer action `{action_detail}{typed_display}` (risk class: {action_class})?{target_line}{batch_line} (call `{action_label}`, id: {action_id_display})"
         );
         let question = InterruptQuestion::Single {
             prompt,
@@ -1281,7 +1286,10 @@ impl Approver {
             approval_class: None,
             sandbox_escalation: None,
         };
-        let description = format!("Computer action `{action_detail}` (id: {action_id})");
+        // The description is the interrupt body every owner client renders
+        // as its own line of text, so it carries the same flattened id as
+        // the prompt — never the raw provider call id.
+        let description = format!("Computer action `{action_detail}` (id: {action_id_display})");
         let set = ApprovalOptionSet::new(
             "computer_action_approval",
             [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],

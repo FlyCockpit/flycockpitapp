@@ -1101,7 +1101,7 @@ impl GrantStore {
     }
 
     /// Revoke every live allow grant for one exact session/purpose/digest tuple.
-    pub async fn revoke_media_egress_grant(
+    pub(super) async fn revoke_media_egress_grant(
         &self,
         purpose: &str,
         request_digest: &str,
@@ -1121,6 +1121,38 @@ impl GrantStore {
             )?))
             .await
             .map_err(StoreError::Io)
+    }
+
+    /// Drop every live reject row for one exact session/purpose/digest tuple.
+    pub(super) async fn revoke_media_egress_reject(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<usize, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| Ok(conn.execute(
+                "DELETE FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'reject'",
+                rusqlite::params![session_id, purpose, request_digest],
+            )?))
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Clear every live standing verdict for one exact session/purpose/digest
+    /// tuple so the next authorization re-prompts the human.
+    pub(super) async fn revoke_media_egress_verdict(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        self.revoke_media_egress_grant(purpose, request_digest)
+            .await?;
+        self.revoke_media_egress_reject(purpose, request_digest)
+            .await?;
+        Ok(())
     }
 
     // ---- image-generation grants -----------------------------------------
@@ -6400,6 +6432,7 @@ mod image_generation_grant_tests {
     }
 }
 
+#[cfg(test)]
 mod media_egress_grant_tests {
     use super::*;
 
@@ -6407,7 +6440,7 @@ mod media_egress_grant_tests {
     async fn media_egress_grant_matches_exact_digest_only() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, _sid, project_id) =
-            test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert!(
             !store
@@ -6440,7 +6473,7 @@ mod media_egress_grant_tests {
     async fn media_egress_reject_revoke_and_polarity_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, _sid, project_id) =
-            test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         store
@@ -6479,14 +6512,19 @@ mod media_egress_grant_tests {
 
         assert_eq!(
             store
-                .revoke_media_egress_grant("transcription", digest)
-                .await
-                .unwrap(),
-            1
+                .revoke_media_egress_verdict("transcription", digest)
+                .await,
+            Ok(())
         );
         assert!(
             !store
                 .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_reject_matches("transcription", digest)
                 .await
                 .unwrap()
         );

@@ -1,5 +1,34 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaEgressPromptChoice {
+    Approve,
+    Reject,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaEgressStandingGateChoice {
+    KeepStanding,
+    ForgetAndReprompt,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaEgressStandingVerdict {
+    Allow,
+    Reject,
+}
+
+impl MediaEgressStandingVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 /// Governed-network approvals are exact interactive host decisions. The
 /// durable operation kind and canonical input classify them; no generic grant
 /// class is exposed to noninteractive clients.
@@ -1288,29 +1317,14 @@ impl Approver {
             crate::config::extended::ApprovalMode::Manual
             | crate::config::extended::ApprovalMode::Auto => {
                 if self.media_egress_reject_matches(&facts).await {
-                    let decision = Decision::StandingReject {
-                        scope: Scope::Session,
-                    };
-                    self.record_permission_decision(
-                        "media_egress",
-                        facts.request_digest.as_str(),
-                        &[Scope::Session],
-                        decision,
-                        crate::approval::DecisionSource::StandingReject,
+                    self.raise_media_egress_standing_gate(
+                        &facts,
+                        MediaEgressStandingVerdict::Reject,
                     )
-                    .await;
-                    Ok(decision)
+                    .await
                 } else if self.media_egress_grant_matches(&facts).await {
-                    let decision = Decision::Allow { scope: Scope::Once };
-                    self.record_permission_decision(
-                        "media_egress",
-                        facts.request_digest.as_str(),
-                        &[Scope::Once],
-                        decision,
-                        crate::approval::DecisionSource::AlreadyGranted,
-                    )
-                    .await;
-                    Ok(decision)
+                    self.raise_media_egress_standing_gate(&facts, MediaEgressStandingVerdict::Allow)
+                        .await
                 } else {
                     self.raise_media_egress_prompt(&facts).await
                 }
@@ -1342,7 +1356,9 @@ impl Approver {
     /// without a matching grant). A single approve/deny question carrying only
     /// secret-free facts: provider/model, the media interval, and the digest
     /// prefix. No prompt text, keyword/language strings, credential token, or
-    /// audio bytes are ever disclosed. Approve → allow once; deny/dismiss → deny.
+    /// audio bytes are ever disclosed. Approve → session-standing allow;
+    /// explicit deny → session-standing reject; dismiss/cancel → deny once with
+    /// no persistence.
     async fn raise_media_egress_prompt(
         &self,
         facts: &MediaEgressAuthzFacts<'_>,
@@ -1413,7 +1429,7 @@ impl Approver {
             "timestamps": facts.timestamps,
             "diarization": facts.diarization,
         });
-        let decision = self
+        let outcome = self
             .raise_and_decode(
                 &description,
                 question,
@@ -1434,63 +1450,214 @@ impl Approver {
                     ],
                 }),
                 |response| {
-                    // Dismissal (no selection) denies, fail closed.
                     let Some(id) = decode_option_response(response, &set)? else {
-                        return Ok(Decision::Deny);
+                        return Ok(MediaEgressPromptChoice::Dismissed);
                     };
                     match id {
-                        ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
-                        ApprovalOptionId::Reject => Ok(Decision::Deny),
+                        ApprovalOptionId::ApproveOnce => Ok(MediaEgressPromptChoice::Approve),
+                        ApprovalOptionId::Reject => Ok(MediaEgressPromptChoice::Reject),
                         _ => Err(ForeignOptionId::new(&set, id.as_str())),
                     }
                 },
             )
             .await?;
-        if let Some(session) = self.session.as_deref() {
-            match decision {
-                Decision::Allow { .. } => {
-                    if let Err(error) = self
-                        .store
-                        .record_media_egress_grant(
-                            &session.project_id,
-                            facts.purpose,
-                            facts.request_digest.as_str(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            purpose = facts.purpose,
-                            request_digest = facts.request_digest.as_str(),
-                            "recording media egress grant failed; consent will not stick"
-                        );
+        self.finish_media_egress_prompt(facts, outcome).await
+    }
+
+    /// Lightweight follow-up when a session-standing verdict already exists.
+    /// The full transcription egress prompt is skipped only while the human
+    /// keeps the standing decision; choosing to forget revokes the verdict and
+    /// re-raises the full prompt.
+    async fn raise_media_egress_standing_gate(
+        &self,
+        facts: &MediaEgressAuthzFacts<'_>,
+        standing: MediaEgressStandingVerdict,
+    ) -> Result<Decision> {
+        let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
+        let (status, keep_label) = match standing {
+            MediaEgressStandingVerdict::Allow => ("approved", "Keep session approval"),
+            MediaEgressStandingVerdict::Reject => ("denied", "Keep session denial"),
+        };
+        let prompt = format!(
+            "This exact {} egress request ({}) was previously {status} for this session.",
+            facts.purpose, digest_prefix,
+        );
+        let question = InterruptQuestion::Single {
+            prompt,
+            options: vec![
+                opt(ApprovalOptionId::ApproveOnce, keep_label),
+                opt(
+                    ApprovalOptionId::MoreOptions,
+                    "Forget session decision and decide again",
+                ),
+            ],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let description = format!(
+            "{} egress session verdict ({})",
+            facts.purpose, digest_prefix,
+        );
+        let set = ApprovalOptionSet::new(
+            "media_egress_standing_gate",
+            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::MoreOptions],
+        );
+        let choice = self
+            .raise_and_decode(
+                &description,
+                question,
+                "media_egress_standing_gate",
+                serde_json::json!({
+                    "purpose": facts.purpose,
+                    "request_digest": facts.request_digest.as_str(),
+                    "standing_verdict": standing.as_str(),
+                    "candidate_effects": [
+                        {
+                            "selection": ApprovalOptionId::ApproveOnce.as_str(),
+                            "scope": "session",
+                            "effect": standing.as_str(),
+                        },
+                        {
+                            "selection": ApprovalOptionId::MoreOptions.as_str(),
+                            "scope": "session",
+                            "effect": "revoke",
+                        },
+                    ],
+                }),
+                |response| {
+                    let Some(id) = decode_option_response(response, &set)? else {
+                        return Ok(MediaEgressStandingGateChoice::Dismissed);
+                    };
+                    match id {
+                        ApprovalOptionId::ApproveOnce => {
+                            Ok(MediaEgressStandingGateChoice::KeepStanding)
+                        }
+                        ApprovalOptionId::MoreOptions => {
+                            Ok(MediaEgressStandingGateChoice::ForgetAndReprompt)
+                        }
+                        _ => Err(ForeignOptionId::new(&set, id.as_str())),
                     }
+                },
+            )
+            .await?;
+        match choice {
+            MediaEgressStandingGateChoice::KeepStanding => {
+                let (decision, source) = match standing {
+                    MediaEgressStandingVerdict::Allow => (
+                        Decision::Allow { scope: Scope::Once },
+                        crate::approval::DecisionSource::AlreadyGranted,
+                    ),
+                    MediaEgressStandingVerdict::Reject => (
+                        Decision::StandingReject {
+                            scope: Scope::Session,
+                        },
+                        crate::approval::DecisionSource::StandingReject,
+                    ),
+                };
+                self.record_permission_decision(
+                    "media_egress",
+                    facts.request_digest.as_str(),
+                    &[Scope::Session],
+                    decision,
+                    source,
+                )
+                .await;
+                Ok(decision)
+            }
+            MediaEgressStandingGateChoice::ForgetAndReprompt => {
+                if let Err(error) = self
+                    .store
+                    .revoke_media_egress_verdict(facts.purpose, facts.request_digest.as_str())
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        purpose = facts.purpose,
+                        request_digest = facts.request_digest.as_str(),
+                        "revoking media egress standing verdict failed; gate will re-prompt"
+                    );
                 }
-                Decision::Deny => {
-                    if let Err(error) = self
-                        .store
-                        .record_media_egress_reject(
-                            &session.project_id,
-                            facts.purpose,
-                            facts.request_digest.as_str(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            purpose = facts.purpose,
-                            request_digest = facts.request_digest.as_str(),
-                            "recording media egress reject failed; standing deny will not stick"
-                        );
+                self.raise_media_egress_prompt(facts).await
+            }
+            MediaEgressStandingGateChoice::Dismissed => {
+                let decision = Decision::Deny;
+                self.record_permission_decision(
+                    "media_egress",
+                    facts.request_digest.as_str(),
+                    &[Scope::Once],
+                    decision,
+                    crate::approval::DecisionSource::UserPrompt,
+                )
+                .await;
+                Ok(decision)
+            }
+        }
+    }
+
+    async fn finish_media_egress_prompt(
+        &self,
+        facts: &MediaEgressAuthzFacts<'_>,
+        choice: MediaEgressPromptChoice,
+    ) -> Result<Decision> {
+        let (decision, scopes, persist) = match choice {
+            MediaEgressPromptChoice::Approve => (
+                Decision::Allow { scope: Scope::Once },
+                &[Scope::Session][..],
+                true,
+            ),
+            MediaEgressPromptChoice::Reject => (Decision::Deny, &[Scope::Session][..], true),
+            MediaEgressPromptChoice::Dismissed => (Decision::Deny, &[Scope::Once][..], false),
+        };
+        if persist {
+            if let Some(session) = self.session.as_deref() {
+                match choice {
+                    MediaEgressPromptChoice::Approve => {
+                        if let Err(error) = self
+                            .store
+                            .record_media_egress_grant(
+                                &session.project_id,
+                                facts.purpose,
+                                facts.request_digest.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                purpose = facts.purpose,
+                                request_digest = facts.request_digest.as_str(),
+                                "recording media egress grant failed; consent will not stick"
+                            );
+                        }
                     }
+                    MediaEgressPromptChoice::Reject => {
+                        if let Err(error) = self
+                            .store
+                            .record_media_egress_reject(
+                                &session.project_id,
+                                facts.purpose,
+                                facts.request_digest.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                purpose = facts.purpose,
+                                request_digest = facts.request_digest.as_str(),
+                                "recording media egress reject failed; standing deny will not stick"
+                            );
+                        }
+                    }
+                    MediaEgressPromptChoice::Dismissed => {}
                 }
-                _ => {}
             }
         }
         self.record_permission_decision(
             "media_egress",
             facts.request_digest.as_str(),
-            &[Scope::Once],
+            scopes,
             decision,
             crate::approval::DecisionSource::UserPrompt,
         )

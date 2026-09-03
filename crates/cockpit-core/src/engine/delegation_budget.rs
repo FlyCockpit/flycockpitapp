@@ -9,6 +9,7 @@
 //! dimension `None`), not a bypass. The compact progress guard and retry
 //! pacing live on the same handle and are never lifted.
 
+use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,10 +77,32 @@ impl BudgetCharge {
     pub fn from_usage(usage: TokenUsage) -> Self {
         Self {
             rounds: 0,
-            input_tokens: usage.input_tokens,
+            // `input_tokens` already includes cached reads. Cache-creation
+            // tokens are billed in addition (Anthropic cache writes).
+            input_tokens: usage
+                .input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
             output_tokens: usage.output_tokens,
             cost_microusd: 0,
         }
+    }
+
+    pub fn with_cost(mut self, cost_microusd: u64) -> Self {
+        self.cost_microusd = cost_microusd;
+        self
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+impl AddAssign for BudgetCharge {
+    fn add_assign(&mut self, rhs: Self) {
+        self.rounds = self.rounds.saturating_add(rhs.rounds);
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+        self.cost_microusd = self.cost_microusd.saturating_add(rhs.cost_microusd);
     }
 }
 
@@ -135,10 +158,10 @@ impl BudgetSnapshot {
 }
 
 /// Consecutive no-progress compact-and-continue bound. Always enforced.
+/// Token-count reduction alone is not forward progress.
 #[derive(Debug, Clone)]
 pub struct CompactProgressGuard {
     consecutive_no_progress: u32,
-    last_tokens: Option<u64>,
     max_consecutive: u32,
 }
 
@@ -152,7 +175,6 @@ impl CompactProgressGuard {
     pub fn new(max_consecutive: u32) -> Self {
         Self {
             consecutive_no_progress: 0,
-            last_tokens: None,
             max_consecutive: max_consecutive.max(1),
         }
     }
@@ -161,18 +183,16 @@ impl CompactProgressGuard {
         self.consecutive_no_progress
     }
 
-    /// Record a compaction. `tokens_after` is the post-compact token count.
-    /// `forward_progress` is true when the agent made token/forward progress
-    /// since the previous compaction (new tool results, new assistant work).
-    /// Token-count reduction alone is not forward progress.
+    /// Record a compaction. `tokens_after` is the post-compact token count
+    /// (informational; shrinking context is not forward progress).
+    /// `forward_progress` is true when the agent produced new tool results or
+    /// assistant work since the previous compaction.
     pub fn record(
         &mut self,
-        tokens_after: u64,
+        _tokens_after: u64,
         forward_progress: bool,
     ) -> Result<(), CompactLoopExhausted> {
-        let token_progress = self.last_tokens.is_some_and(|before| tokens_after < before);
-        self.last_tokens = Some(tokens_after);
-        if forward_progress || token_progress {
+        if forward_progress {
             self.consecutive_no_progress = 0;
             return Ok(());
         }
@@ -241,6 +261,48 @@ impl RetryPacingGuard {
     }
 }
 
+/// Cheap cloneable handle to the per-turn retry bound. Inference retry
+/// consults this so a 429 cannot storm across tool rounds, including on
+/// dispatch paths that do not hold a [`BudgetPool`].
+#[derive(Clone)]
+pub struct TurnRetryBudget {
+    inner: Arc<Mutex<RetryPacingGuard>>,
+}
+
+impl TurnRetryBudget {
+    pub fn new(max_retries_per_turn: u32) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RetryPacingGuard::new(max_retries_per_turn))),
+        }
+    }
+
+    pub fn allow_retry(&self) -> bool {
+        lock_or_recover(&self.inner).allow_retry()
+    }
+
+    pub fn reset_turn(&self) {
+        lock_or_recover(&self.inner).reset_turn();
+    }
+
+    pub fn retries_this_turn(&self) -> u32 {
+        lock_or_recover(&self.inner).retries_this_turn()
+    }
+}
+
+impl Default for TurnRetryBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_RETRIES_PER_TURN)
+    }
+}
+
+impl std::fmt::Debug for TurnRetryBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnRetryBudget")
+            .field("retries_this_turn", &self.retries_this_turn())
+            .finish()
+    }
+}
+
 struct SharedLedger {
     ceiling: ResolvedDelegationBudget,
     spent_rounds: u64,
@@ -258,15 +320,18 @@ struct LocalState {
     spent_cost_microusd: u64,
     started_at: Instant,
     compact_guard: CompactProgressGuard,
-    retry_guard: RetryPacingGuard,
 }
 
 /// Hierarchical spend pool. Clone is cheap (shared ledger + per-node local
 /// cap). Swarm children should [`BudgetPool::share`] so they spend one pool.
+/// Liveness guards (compact progress, retry pacing) live beside the spend
+/// ledger: reminting spend does not have to reset them, and retry pacing is
+/// exposable to inference without a pool handle.
 #[derive(Clone)]
 pub struct BudgetPool {
     ledger: Arc<Mutex<SharedLedger>>,
     local: Arc<Mutex<LocalState>>,
+    retry_guard: TurnRetryBudget,
 }
 
 impl BudgetPool {
@@ -289,8 +354,8 @@ impl BudgetPool {
                 spent_cost_microusd: 0,
                 started_at: now,
                 compact_guard: CompactProgressGuard::default(),
-                retry_guard: RetryPacingGuard::default(),
             })),
+            retry_guard: TurnRetryBudget::default(),
         }
     }
 
@@ -313,7 +378,19 @@ impl BudgetPool {
         Self {
             ledger: Arc::clone(&self.ledger),
             local: Arc::clone(&self.local),
+            retry_guard: self.retry_guard.clone(),
         }
+    }
+
+    /// True when `other` charges the same remaining parent ledger.
+    pub fn shares_ledger_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ledger, &other.ledger)
+    }
+
+    /// Turn-scoped retry handle for inference. Always enforced, including
+    /// under unlimited spend.
+    pub fn retry_handle(&self) -> TurnRetryBudget {
+        self.retry_guard.clone()
     }
 
     /// Allot a child slice of the parent's remaining pool. Charges still hit
@@ -334,8 +411,8 @@ impl BudgetPool {
                 spent_cost_microusd: 0,
                 started_at: now,
                 compact_guard: CompactProgressGuard::default(),
-                retry_guard: RetryPacingGuard::default(),
             })),
+            retry_guard: TurnRetryBudget::default(),
         }
     }
 
@@ -473,15 +550,15 @@ impl BudgetPool {
     }
 
     pub fn allow_retry(&self) -> bool {
-        lock_or_recover(&self.local).retry_guard.allow_retry()
+        self.retry_guard.allow_retry()
     }
 
     pub fn reset_retry_turn(&self) {
-        lock_or_recover(&self.local).retry_guard.reset_turn();
+        self.retry_guard.reset_turn();
     }
 
     pub fn retries_this_turn(&self) -> u32 {
-        lock_or_recover(&self.local).retry_guard.retries_this_turn()
+        self.retry_guard.retries_this_turn()
     }
 
     /// Interactive grant: raise the rounds ceiling by `extra` so the user can
@@ -638,12 +715,73 @@ mod tests {
         pool.record_compaction(100, false).unwrap();
         let err = pool.record_compaction(100, false).unwrap_err();
         assert_eq!(err.consecutive, 3);
-        // Forward progress resets the counter.
+        // Forward progress (new assistant/tool work) resets the counter.
         let pool = BudgetPool::unlimited();
         pool.record_compaction(100, false).unwrap();
+        pool.record_compaction(90, true).unwrap();
         pool.record_compaction(90, false).unwrap();
         pool.record_compaction(90, false).unwrap();
-        pool.record_compaction(90, false).unwrap();
+        let err = pool.record_compaction(90, false).unwrap_err();
+        assert_eq!(err.consecutive, 3);
+    }
+
+    #[test]
+    fn token_reduction_alone_is_not_forward_progress() {
+        let pool = BudgetPool::unlimited();
+        pool.record_compaction(100, false).unwrap();
+        pool.record_compaction(50, false).unwrap();
+        let err = pool.record_compaction(10, false).unwrap_err();
+        assert_eq!(err.consecutive, 3);
+    }
+
+    #[test]
+    fn from_usage_includes_cache_creation_and_cost() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 3,
+            cached_input_tokens: 4,
+            cache_creation_input_tokens: 7,
+        };
+        let charge = BudgetCharge::from_usage(usage).with_cost(42);
+        assert_eq!(charge.input_tokens, 17);
+        assert_eq!(charge.output_tokens, 3);
+        assert_eq!(charge.cost_microusd, 42);
+    }
+
+    #[test]
+    fn share_and_allot_keep_one_parent_ledger() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(2),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let child_a = root.allot(ResolvedDelegationBudget::unlimited());
+        let child_b = root.allot(ResolvedDelegationBudget::unlimited());
+        assert!(root.shares_ledger_with(&child_a));
+        assert!(root.shares_ledger_with(&child_b));
+        child_a.charge_round().unwrap();
+        child_b.charge_round().unwrap();
+        assert!(child_a.charge_round().is_err());
+        assert_eq!(root.snapshot().spent.rounds, 2);
+    }
+
+    #[test]
+    fn cost_ceiling_is_enforced() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_cost_microusd: Some(10),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        pool.charge(BudgetCharge {
+            cost_microusd: 10,
+            ..BudgetCharge::default()
+        })
+        .unwrap();
+        let err = pool
+            .charge(BudgetCharge {
+                cost_microusd: 1,
+                ..BudgetCharge::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::Cost);
     }
 
     #[test]

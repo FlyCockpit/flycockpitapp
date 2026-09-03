@@ -641,6 +641,9 @@ async fn run_iteration(
     let per_run = ctx.config.extended().resolved_schedule_run_budget();
     let run_budget = ctx.budget.allot(per_run);
     scheduled_lane_driver.budget = run_budget.clone();
+    scheduled_lane_driver.bind_active_retry_budget();
+    let mut turn_agent = (**agent).clone();
+    turn_agent.bind_retry_budget(&run_budget);
     for _ in 0..MAX_ITERATION_TURNS {
         if let Err(exhaustion) = run_budget.charge_round() {
             return Ok(crate::engine::delegation_budget::budget_exhausted_report(
@@ -649,7 +652,7 @@ async fn run_iteration(
             ));
         }
         let mut outcome = turn(
-            agent,
+            &turn_agent,
             // A loop/job fork runs on the session-root agent's own model. It is
             // outside the per-turn backup-fallback scope (interactive turns +
             // delegated subagents; implementation note), so
@@ -721,6 +724,15 @@ async fn run_iteration(
             }
         }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, history);
+        let usage_charge = session.take_uncharged_budget_charge();
+        if !usage_charge.is_empty()
+            && let Err(exhaustion) = run_budget.charge(usage_charge)
+        {
+            return Ok(crate::engine::delegation_budget::budget_exhausted_report(
+                &collect_final_text(history),
+                &exhaustion,
+            ));
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

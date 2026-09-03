@@ -1112,6 +1112,10 @@ pub struct ModelParams {
     /// the gating prompt is responsible for attaching it only to approved
     /// computer-use subagent turns.
     pub native_computer: Option<crate::computer::NativeComputerToolConfig>,
+    /// Per-turn retry pacing handle. Inference consults this so a 429 cannot
+    /// storm across tool rounds. `None` keeps the per-call attempt cap only
+    /// (tests and utility paths that skip retry).
+    pub retry_budget: Option<crate::engine::delegation_budget::TurnRetryBudget>,
 }
 
 impl ModelParams {

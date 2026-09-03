@@ -48,6 +48,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::delegation_budget::TurnRetryBudget;
 use crate::engine::model::InferenceErrorClass;
 
 /// First backoff interval (before jitter). Doubles each repeated
@@ -611,6 +612,7 @@ where
         probe,
         Some(DEFAULT_MAX_ATTEMPTS),
         recovery_out,
+        None,
         attempt_fn,
     )
     .await
@@ -640,6 +642,72 @@ where
         probe,
         Some(max_attempts.max(1)),
         recovery_out,
+        None,
+        attempt_fn,
+    )
+    .await
+}
+
+/// Like [`with_retry`], honoring a turn-scoped retry bound in addition to
+/// the per-call attempt cap. The turn bound is a liveness guard: unlimited
+/// spend cannot lift it.
+#[allow(clippy::too_many_arguments)]
+pub async fn with_retry_gated<T, F, Fut, P>(
+    agent_name: &str,
+    target: &ReconnectTarget,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    probe: Option<&P>,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
+    attempt_fn: F,
+) -> Result<T, CompletionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    P: ConnectivityProbe,
+{
+    with_retry_inner(
+        agent_name,
+        target,
+        event_tx,
+        cancel,
+        probe,
+        Some(DEFAULT_MAX_ATTEMPTS),
+        recovery_out,
+        retry_budget,
+        attempt_fn,
+    )
+    .await
+}
+
+/// Like [`with_retry_max`], with a turn-scoped retry bound.
+#[allow(clippy::too_many_arguments)]
+pub async fn with_retry_max_gated<T, F, Fut, P>(
+    agent_name: &str,
+    target: &ReconnectTarget,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    probe: Option<&P>,
+    max_attempts: u32,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
+    attempt_fn: F,
+) -> Result<T, CompletionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    P: ConnectivityProbe,
+{
+    with_retry_inner(
+        agent_name,
+        target,
+        event_tx,
+        cancel,
+        probe,
+        Some(max_attempts.max(1)),
+        recovery_out,
+        retry_budget,
         attempt_fn,
     )
     .await
@@ -654,6 +722,7 @@ async fn with_retry_inner<T, F, Fut, P>(
     probe: Option<&P>,
     max_attempts: Option<u32>,
     recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
     mut attempt_fn: F,
 ) -> Result<T, CompletionError>
 where
@@ -706,6 +775,14 @@ where
                 // `overload_retry_used` latch above.
                 if !matches!(decision, RetryDecision::RetryOnce)
                     && max_attempts.is_some_and(|max| failures.saturating_add(1) >= max)
+                {
+                    return Err(err);
+                }
+                // Per-turn retry bound: always enforced, including under
+                // unlimited spend. Overload `RetryOnce` is exempt (same as
+                // the per-call cap) because it self-limits via the latch.
+                if !matches!(decision, RetryDecision::RetryOnce)
+                    && retry_budget.is_some_and(|budget| !budget.allow_retry())
                 {
                     return Err(err);
                 }
@@ -1635,5 +1712,33 @@ mod tests {
             crate::engine::model::ProviderRecoverySignal::Overloaded,
             "an overload at any attempt wins over a later generic error"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_retry_budget_stops_a_429_before_the_per_call_cap() {
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let budget = crate::engine::delegation_budget::TurnRetryBudget::new(2);
+        let target = test_target();
+        let result: Result<u32, _> = with_retry_gated(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            None::<&FakeProbe>,
+            None,
+            Some(&budget),
+            move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_status(429)) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        // Initial attempt + 2 turn-budgeted retries, not DEFAULT_MAX_ATTEMPTS (4).
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!budget.allow_retry());
     }
 }

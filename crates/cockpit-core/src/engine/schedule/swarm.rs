@@ -325,10 +325,11 @@ async fn run_swarm_loop(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let SwarmChild {
-        agent,
+        mut agent,
         custody,
         pinned,
     } = build_swarm_child(spec, ctx)?;
+    agent.bind_retry_budget(&ctx.budget);
     let agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
     let brief = swarm_child_brief(spec, &custody);
@@ -392,6 +393,7 @@ async fn run_swarm_loop(
         scheduled_lane_driver.set_write_scope_source(write_scope);
     }
     scheduled_lane_driver.budget = ctx.budget.clone();
+    scheduled_lane_driver.bind_active_retry_budget();
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
@@ -501,6 +503,15 @@ async fn run_swarm_loop(
             outcome = result?;
         }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
+        let usage_charge = ctx.session.take_uncharged_budget_charge();
+        if !usage_charge.is_empty()
+            && let Err(exhaustion) = ctx.budget.charge(usage_charge)
+        {
+            return Ok(crate::engine::delegation_budget::budget_exhausted_report(
+                &collect_final_text(&history),
+                &exhaustion,
+            ));
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history

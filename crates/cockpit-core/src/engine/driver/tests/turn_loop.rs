@@ -2264,6 +2264,17 @@ fn hierarchical_budget_default_round_ceiling_is_finite() {
     assert!(!resolved.is_unlimited());
 }
 
+#[test]
+fn install_turn_budget_rebinds_schedule_to_the_driver_ledger() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.install_turn_budget();
+    let schedule_budget = driver.schedule.schedule_context_for_tests().budget;
+    assert!(
+        driver.budget.shares_ledger_with(&schedule_budget),
+        "schedule/swarm/goal loops must charge the same parent ledger as the foreground"
+    );
+}
+
 #[tokio::test]
 async fn turn_loop_terminal_inference_failure_ends_turn_cleanly() {
     let provider = ScriptedProvider::builder()

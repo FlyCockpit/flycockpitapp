@@ -470,6 +470,7 @@ async fn scheduler_delegate_probe_is_side_effect_free_until_attempt_admission() 
         task_call_id: "probe-no-consume".to_string(),
         task_provider_item_id: Some("fc-probe".to_string()),
         task_function_call_id: Some("fn-probe".to_string()),
+        budget: None,
     };
 
     let mut task = driver
@@ -717,6 +718,7 @@ fn single_task(
         task_function_call_id: Some(format!("fn-{task_call_id}")),
         execution_surface: None,
         recovery: None,
+        budget: None,
     }
 }
 
@@ -811,6 +813,7 @@ fn batch_entry(
         todo_ids: Vec::new(),
         write_scope: None,
         workspace_lease: None,
+        budget: None,
     }
 }
 

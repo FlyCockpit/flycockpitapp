@@ -71,6 +71,8 @@ pub enum TurnOutcome {
         task_call_id: String,
         task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
+        /// Optional per-delegation spend overlay from `task.budget`.
+        budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
     },
     /// Agent invoked `task` for a *noninteractive* subagent (e.g.
     /// `explore` from `Build`). The driver runs the
@@ -116,6 +118,8 @@ pub enum TurnOutcome {
         task_call_id: String,
         task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
+        /// Optional per-delegation spend overlay from `task.budget`.
+        budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
     },
     SpawnNoninteractiveBatch {
         entries: Vec<BatchTaskEntry>,
@@ -269,6 +273,8 @@ pub struct BatchTaskEntry {
     pub todo_ids: Vec<uuid::Uuid>,
     pub write_scope: Option<String>,
     pub workspace_lease: Option<String>,
+    /// Optional per-delegation spend overlay from `task.budget`.
+    pub budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 }
 
 /// Validate the directed dependency graph carried by a parsed task batch.
@@ -406,6 +412,20 @@ pub(super) fn task_todo_ids(args: &Value) -> Vec<uuid::Uuid> {
         .unwrap_or_default()
 }
 
+pub(super) fn task_budget_spec(
+    args: &Value,
+) -> Result<Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>, String> {
+    let Some(value) = args.get("budget") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|err| format!("invalid `budget`: {err}"))
+}
+
 pub(super) fn task_remaining_depth(args: &Value) -> Result<Option<u32>, String> {
     let Some(value) = args.get("remaining_depth") else {
         return Ok(None);
@@ -437,6 +457,32 @@ pub(super) fn task_refusal(
 
 #[cfg(test)]
 mod handoff_outcome_removal_tests {
+    #[test]
+    fn task_budget_spec_parses_camel_case_overlay() {
+        let spec = super::task_budget_spec(&serde_json::json!({
+            "budget": { "maxRounds": 4, "maxInputTokens": 100 }
+        }))
+        .unwrap()
+        .expect("budget present");
+        assert_eq!(
+            spec.max_rounds,
+            Some(cockpit_config::config::delegation_budget::SpendLimit::Finite(4))
+        );
+        assert_eq!(
+            spec.max_input_tokens,
+            Some(cockpit_config::config::delegation_budget::SpendLimit::Finite(100))
+        );
+        assert!(
+            super::task_budget_spec(&serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::task_budget_spec(&serde_json::json!({ "budget": "unlimited" })).is_err(),
+            "non-object budget must fail closed"
+        );
+    }
+
     /// The dead native handoff tool's structural outcome and helper must not
     /// reappear. Source-level so this fails first while the variant/helper
     /// remain, then passes after deletion. Banned tokens are assembled at

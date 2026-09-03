@@ -421,6 +421,17 @@ pub struct Agent {
     pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
 }
 
+impl Agent {
+    /// Attach the live turn's retry pacing handle so inference consults the
+    /// same per-turn bound as the spend pool.
+    pub(crate) fn bind_retry_budget(
+        &mut self,
+        budget: &crate::engine::delegation_budget::BudgetPool,
+    ) {
+        self.params.retry_budget = Some(budget.retry_handle());
+    }
+}
+
 pub(crate) async fn turn_toolbox(
     agent: &Agent,
     session: &Session,

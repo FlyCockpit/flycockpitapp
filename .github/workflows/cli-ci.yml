@@ -21,6 +21,7 @@ name: CLI CI
       - "scripts/check-production-secret-opens.sh"
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
+      - "scripts/check-feature-gated-test-coverage.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -39,6 +40,7 @@ name: CLI CI
       - "scripts/check-production-secret-opens.sh"
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
+      - "scripts/check-feature-gated-test-coverage.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   # Weekly advisory sweep (issue #306): RustSec advisories and yanks can land
@@ -163,7 +165,13 @@ jobs:
           cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
-        run: cargo nextest run --locked --workspace --exclude tenant-authority --no-default-features
+        run: >
+          cargo nextest run --locked --workspace --exclude tenant-authority
+          --no-default-features
+          --features cockpit-tui/test-support,cockpit-noise/test-entropy,cockpit-db/host-capability-refresh-composition
+
+      - name: Check feature-gated test coverage
+        run: bash scripts/check-feature-gated-test-coverage.sh
 
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
@@ -299,12 +307,15 @@ jobs:
           --features grok-subscription --tests -- -D warnings
 
   # The default `gates` nextest step uses `--no-default-features`, and every
-  # workspace `default` is empty, so `required-features = ["remote"]` integration
-  # tests and `#[cfg(feature = "remote")]` lib tests never run there. Those
-  # targets are the only Rust↔TS lockstep for classification, remote-operation
-  # rows, and the other shared protocol fixtures. Keep the local-v0.1 gate
-  # local-only; this job is the blocking execution of that remote-gated suite.
-  # Live-infra jobs (PKCS#11, coturn) stay workflow_dispatch opt-ins below.
+  # workspace `default` is empty, so `required-features = ["remote"]` /
+  # `["extended"]` integration tests and `#[cfg(feature)]` lib tests never run
+  # there unless the command names them. Keep the local-v0.1 gate local-only
+  # (no `remote`). This job is the blocking execution of every package that
+  # has remote/extended-gated tests. Package-specific `--features pkg/feat`
+  # is required because not every selected crate declares both features.
+  # Live-infra jobs (PKCS#11, coturn) stay workflow_dispatch opt-ins below;
+  # `scripts/check-feature-gated-test-coverage.sh` is the ownership bound
+  # between feature-gated test targets and these executing selections.
   remote-lockstep:
     name: Remote lockstep tests
     needs: runners
@@ -338,17 +349,26 @@ jobs:
 
       # `extended` is required so cfg-gated spend-policy variants stay in the
       # request_variants! set the exhaustive classification test compares.
+      # Package-specific features: tenant-authority has `remote` only,
+      # cockpit-config has `extended` only.
       - name: Test remote-gated lockstep and conformance
         run: >
           cargo nextest run --locked
-          -p cockpit-proto -p cockpit-core
-          --features remote,extended
+          -p cockpit-proto -p cockpit-core -p cockpit-db
+          -p cockpit-tui -p cockpit-cli -p cockpit-config
+          -p tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
 
       - name: Clippy remote-gated test targets
         run: >
           cargo clippy --locked
-          -p cockpit-proto -p cockpit-core
-          --features remote,extended --tests -- -D warnings
+          -p cockpit-proto -p cockpit-core -p cockpit-db
+          -p cockpit-tui -p cockpit-cli -p cockpit-config
+          -p tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
+          --tests -- -D warnings
 
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)

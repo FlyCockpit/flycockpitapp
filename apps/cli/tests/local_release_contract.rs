@@ -133,10 +133,14 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 }
 
 #[test]
-fn remote_lockstep_suite_runs_on_the_blocking_cli_gate() {
+fn feature_gated_tests_are_mapped_to_executing_gates() {
     let ci = source(".github/workflows/cli-ci.yml");
     assert!(
-        ci.contains("cargo nextest run --locked --workspace --exclude tenant-authority --no-default-features"),
+        ci.contains("bash scripts/check-feature-gated-test-coverage.sh"),
+        "the default gate must run the feature-gated test coverage bound"
+    );
+    assert!(
+        ci.contains("--no-default-features"),
         "the default local gate must stay local-only"
     );
     let lockstep = ci
@@ -151,12 +155,6 @@ fn remote_lockstep_suite_runs_on_the_blocking_cli_gate() {
     assert!(
         !lockstep.contains("workflow_dispatch"),
         "remote lockstep must not be a manual opt-in"
-    );
-    assert!(lockstep.contains("-p cockpit-proto"));
-    assert!(lockstep.contains("-p cockpit-core"));
-    assert!(
-        lockstep.contains("--features remote,extended"),
-        "lockstep nextest must enable the remote-gated fixture tests"
     );
     assert!(lockstep.contains("cargo nextest run --locked"));
 }

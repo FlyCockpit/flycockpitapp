@@ -1153,4 +1153,43 @@ mod tests {
             1
         );
     }
+
+    #[tokio::test]
+    async fn accept_persistent_upserts_rules_and_survives_reload() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+            .await
+            .unwrap();
+        let project = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let provider = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let model = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let rule = [1u8, 1, 1];
+        assert!(
+            db.accept_persistent_guidance_proposal(
+                &hex16(1),
+                project,
+                provider,
+                model,
+                vec![rule],
+                4000,
+            )
+            .await
+            .unwrap()
+        );
+        let loaded = db.load_persistent_guidance_rules().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![(project.into(), provider.into(), model.into(), rule)]
+        );
+
+        let replacement = [1u8, 1, 2];
+        db.upsert_persistent_guidance_rule(project, provider, model, replacement, 5000)
+            .await
+            .unwrap();
+        let loaded = db.load_persistent_guidance_rules().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![(project.into(), provider.into(), model.into(), replacement)]
+        );
+    }
 }

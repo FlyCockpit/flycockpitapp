@@ -7985,6 +7985,45 @@ CREATE TABLE guidance_proposal_audit_outbox (
     FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
+-- ---- computer_audit_entries (issue #271) -----------------------------------
+-- Append-only bodies of the daemon-only tamper-evident computer-use audit
+-- chain. The HMAC signing key and signed/checkpointed chain head live in the
+-- machine-local protected secret store, not here. SQLite mutation, reorder,
+-- insertion, or tail deletion is detected by verifying this log against that
+-- sealed head; verification fails closed (no silent re-anchor). Entries never
+-- contain pixels, typed rule values, rationale, OCR, or raw target text.
+--
+-- `sequence` is the chain sequence (1-based). `entry_bytes` is the canonical
+-- 424-byte ComputerAuditEntryV1 encoding. `mac` is HMAC-SHA-256 over that
+-- body. `event_kind` / `proposal_id` / `key_version` are extracted for
+-- indexes and idempotent outbox replay; the body remains authoritative.
+CREATE TABLE computer_audit_entries (
+    sequence     INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    entry_bytes  BLOB    NOT NULL CHECK (typeof(entry_bytes) = 'blob' AND length(entry_bytes) = 424),
+    mac          BLOB    NOT NULL CHECK (typeof(mac) = 'blob' AND length(mac) = 32),
+    event_kind   INTEGER NOT NULL CHECK (event_kind BETWEEN 1 AND 29),
+    proposal_id  BLOB    NOT NULL CHECK (typeof(proposal_id) = 'blob' AND length(proposal_id) = 16),
+    key_version  INTEGER NOT NULL CHECK (key_version >= 1)
+);
+
+-- At most one guidance-proposal audit event per (kind, proposal). Replay of
+-- the durable outbox must not mint a second chain entry.
+CREATE UNIQUE INDEX uq_computer_audit_entries_guidance_proposal
+    ON computer_audit_entries(event_kind, proposal_id)
+    WHERE event_kind IN (20, 21, 22, 23);
+
+CREATE TRIGGER computer_audit_entries_immutable_update
+BEFORE UPDATE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
+
+CREATE TRIGGER computer_audit_entries_immutable_delete
+BEFORE DELETE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
+
 -- Local image-sidecar destination grants are daemon-owned durable authority.
 -- There is intentionally no global scope. Invocation audit rows are added
 -- only with the live provider handoff; an unavailable pipeline must not mint

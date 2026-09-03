@@ -442,6 +442,13 @@ fn prompt_click_count(count: super::ClickCount) -> &'static str {
 /// travels in the dedicated [`computer_typed_text_for_prompt`] field so the
 /// approval seam can redact it, and secret-shaped text is withheld outright.
 pub(crate) fn computer_action_summary(action: &ComputerAction) -> String {
+    computer_action_summary_with_widget(action, None)
+}
+
+pub(crate) fn computer_action_summary_with_widget(
+    action: &ComputerAction,
+    widget: Option<&TargetWidgetContext>,
+) -> String {
     match action {
         ComputerAction::CaptureFull => "capture full screen".to_string(),
         ComputerAction::CaptureRegion { rect } => format!(
@@ -500,8 +507,11 @@ pub(crate) fn computer_action_summary(action: &ComputerAction) -> String {
         ComputerAction::TypeText { text } => {
             // The typed text itself never enters this summary (issue #286):
             // it travels only in the dedicated redaction-bound field, and
-            // secret-shaped text is withheld outright.
-            if ActionRiskClass::classify(action) == ActionRiskClass::CredentialEntry {
+            // secret-shaped text (or text aimed at a known credential
+            // widget) is withheld outright. Missing widget context still
+            // classifies as Credential for dispatch (issue #290) but does
+            // not hide non-secret text from the approval prompt.
+            if type_text_is_withheld(text, widget) {
                 format!(
                     "type text ({} chars, secret-shaped: withheld)",
                     text.chars().count()
@@ -543,13 +553,20 @@ pub(crate) fn computer_action_summary(action: &ComputerAction) -> String {
 /// (issue #286: batches summarize each action). `None` for single-action
 /// batches; typed text appears as a character count only.
 pub(crate) fn computer_batch_summary(actions: &[ComputerAction]) -> Option<String> {
+    computer_batch_summary_with_widget(actions, None)
+}
+
+fn computer_batch_summary_with_widget(
+    actions: &[ComputerAction],
+    widget: Option<&TargetWidgetContext>,
+) -> Option<String> {
     if actions.len() <= 1 {
         return None;
     }
     let mut parts: Vec<String> = actions
         .iter()
         .take(MAX_PROMPT_BATCH_ACTIONS)
-        .map(computer_action_summary)
+        .map(|action| computer_action_summary_with_widget(action, widget))
         .collect();
     if actions.len() > MAX_PROMPT_BATCH_ACTIONS {
         parts.push(format!(
@@ -569,12 +586,28 @@ pub(crate) fn computer_batch_summary(actions: &[ComputerAction]) -> Option<Strin
 /// shapes (`ghp_…`, `sk-…`, JWTs, opaque token runs) or prose naming a
 /// credential — which is never shown in a prompt at all.
 pub(crate) fn computer_typed_text_for_prompt(action: &ComputerAction) -> Option<String> {
+    computer_typed_text_for_prompt_with_widget(action, None)
+}
+
+pub(crate) fn computer_typed_text_for_prompt_with_widget(
+    action: &ComputerAction,
+    widget: Option<&TargetWidgetContext>,
+) -> Option<String> {
     match action {
-        ComputerAction::TypeText { text } if !crate::redact::text_is_secret_shaped(text) => {
+        ComputerAction::TypeText { text } if !type_text_is_withheld(text, widget) => {
             Some(text.clone())
         }
         _ => None,
     }
+}
+
+/// Typed text is withheld from the prompt when it is secret-shaped or when
+/// the focused widget is a known credential field. Missing widget context
+/// still forces a Credential dispatch class (issue #290) but does not hide
+/// non-secret text from the human who is being asked to approve.
+fn type_text_is_withheld(text: &str, widget: Option<&TargetWidgetContext>) -> bool {
+    crate::redact::text_is_secret_shaped(text)
+        || widget.is_some_and(TargetWidgetContext::is_known_credential_field)
 }
 
 /// Prompt-safe summary of the focused target window (issue #286): the
@@ -729,6 +762,33 @@ mod computer_action_prompt_summary_tests {
         assert_eq!(
             computer_typed_text_for_prompt(&plain).as_deref(),
             Some("hello world")
+        );
+
+        // Missing widget context fail-closes dispatch as Credential but does
+        // not hide non-secret typed text from the prompt.
+        assert_eq!(
+            computer_action_summary_with_widget(&plain, None),
+            "type text (11 chars)"
+        );
+        assert_eq!(
+            computer_typed_text_for_prompt_with_widget(&plain, None).as_deref(),
+            Some("hello world")
+        );
+
+        let password_field = TargetWidgetContext::from_roles(Some("AXSecureTextField"), None);
+        assert!(
+            computer_action_summary_with_widget(&plain, Some(&password_field))
+                .contains("secret-shaped: withheld"),
+            "known credential widget withholds typed text even when the payload is not secret-shaped"
+        );
+        assert!(
+            computer_typed_text_for_prompt_with_widget(&plain, Some(&password_field)).is_none()
+        );
+
+        let text_field = TargetWidgetContext::from_roles(Some("AXTextField"), None);
+        assert_eq!(
+            computer_action_summary_with_widget(&plain, Some(&text_field)),
+            "type text (11 chars)"
         );
 
         // Credential words withhold even without a recognizable token
@@ -2168,10 +2228,10 @@ pub struct ComputerActionAuthorization {
     pub batch_index: u32,
     /// Geometry generation from the opened backend.
     pub geometry_generation: GeometryGeneration,
-    /// Action risk class. Recorded for audit/guidance in both tiers. In Ask,
-    /// it also selects the lease policy: destructive and credential actions
-    /// are one-shot (no reusable lease); only identical retry-safe (benign)
-    /// actions may share a short bounded lease.
+    /// Action risk class. Recorded for audit in both tiers. In Ask it gates
+    /// dispatch (issue #290): destructive and credential actions require a
+    /// fresh explicit approval and ignore any existing benign lease; only
+    /// identical retry-safe (benign) actions may share a short bounded lease.
     pub action_class: ActionRiskClass,
     /// Secret-free digest of the canonical action list handed to the backend.
     /// Type-text content is included only as hash input; it is never retained
@@ -2249,6 +2309,8 @@ pub struct FakeComputerAuthorizer {
     pub last_target_evidence_binding_digest: Arc<std::sync::Mutex<String>>,
     /// If set, every call returns this decision (overrides `decisions`).
     pub forced_decision: Option<ComputerAuthorizationDecision>,
+    /// Action risk class from each authorization request, in call order.
+    pub last_action_classes: Arc<std::sync::Mutex<Vec<ActionRiskClass>>>,
 }
 
 impl FakeComputerAuthorizer {
@@ -2259,6 +2321,7 @@ impl FakeComputerAuthorizer {
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
+            last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2271,6 +2334,7 @@ impl FakeComputerAuthorizer {
             forced_decision: Some(ComputerAuthorizationDecision::Deny {
                 reason: reason.into(),
             }),
+            last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2281,6 +2345,7 @@ impl FakeComputerAuthorizer {
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: Some(ComputerAuthorizationDecision::AskBlocked),
+            last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2291,6 +2356,7 @@ impl FakeComputerAuthorizer {
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
+            last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2309,6 +2375,10 @@ impl FakeComputerAuthorizer {
             .unwrap()
             .clone()
     }
+
+    pub fn last_action_classes(&self) -> Vec<ActionRiskClass> {
+        self.last_action_classes.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -2325,6 +2395,10 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
         );
         *self.last_target_evidence_binding_digest.lock().unwrap() =
             request.target_evidence_binding_digest.clone();
+        self.last_action_classes
+            .lock()
+            .unwrap()
+            .push(request.action_class);
         if let Some(forced) = &self.forced_decision {
             return Ok(forced.clone());
         }
@@ -2337,17 +2411,117 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
 }
 
 // ---------------------------------------------------------------------------
-// Action risk classes (audit/guidance; Ask lease reuse policy)
+// Action risk classes (Ask dispatch gate + audit)
 // ---------------------------------------------------------------------------
+
+/// Widget/field identity used to classify action risk (issue #290).
+///
+/// Built from accessibility role and subrole only. Never includes field
+/// contents, typed values already in the widget, or window titles.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TargetWidgetContext {
+    role: Option<String>,
+    subrole: Option<String>,
+}
+
+impl TargetWidgetContext {
+    /// Extract widget identity from a coherent target-evidence snapshot.
+    /// Role and subrole are copied; field contents are never read.
+    pub fn from_evidence(evidence: &TargetIdentityEvidence) -> Self {
+        Self {
+            role: match &evidence.accessibility_role {
+                FieldEvidence::Available { value, .. } => Some(value.clone()),
+                FieldEvidence::Unavailable { .. } => None,
+            },
+            subrole: match &evidence.accessibility_subrole {
+                FieldEvidence::Available { value, .. } => Some(value.clone()),
+                FieldEvidence::Unavailable { .. } => None,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn from_roles(role: Option<&str>, subrole: Option<&str>) -> Self {
+        Self {
+            role: role.map(str::to_string),
+            subrole: subrole.map(str::to_string),
+        }
+    }
+
+    fn is_missing(&self) -> bool {
+        self.role.is_none() && self.subrole.is_none()
+    }
+
+    fn normalized_roles(&self) -> impl Iterator<Item = String> + '_ {
+        [&self.role, &self.subrole]
+            .into_iter()
+            .filter_map(|value| value.as_deref().map(normalize_widget_role))
+            .filter(|value| !value.is_empty())
+    }
+
+    /// True when role or subrole names a password/secure/credential field.
+    fn is_known_credential_field(&self) -> bool {
+        const MARKERS: &[&str] = &[
+            "password",
+            "passwd",
+            "passcode",
+            "passphrase",
+            "secret",
+            "credential",
+            "securetext",
+            "secureedit",
+            "passwordbox",
+            "passwordfield",
+        ];
+        self.normalized_roles()
+            .any(|role| MARKERS.iter().any(|marker| role.contains(marker)))
+    }
+
+    /// True only for an explicit ordinary text-input role with no credential
+    /// marker. Generic roles such as `edit` (Windows UIA covers password
+    /// boxes) and window/group roles are ambiguous.
+    fn is_unambiguous_non_credential_text_field(&self) -> bool {
+        if self.is_missing() || self.is_known_credential_field() {
+            return false;
+        }
+        const ALLOWED: &[&str] = &[
+            "axtextfield",
+            "axtextarea",
+            "textfield",
+            "textarea",
+            "edittext",
+        ];
+        let roles: Vec<String> = self.normalized_roles().collect();
+        !roles.is_empty() && roles.iter().all(|role| ALLOWED.contains(&role.as_str()))
+    }
+}
+
+fn normalize_widget_role(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn typed_text_looks_destructive(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("rm -rf")
+        || lower.contains("delete")
+        || lower.contains("drop ")
+        || lower.contains("format")
+        || lower.contains("truncate")
+}
 
 /// Exhaustive action-class taxonomy for computer-use actions.
 ///
 /// Yolo is complete trust: zero Cockpit human prompts, zero semantic
 /// target/action hard denials, and zero persistent grants. Ask still never
-/// hard-denies from class alone; class only scopes the Ask lease (issue #287):
-/// destructive and credential actions are one approval per action (no lease),
-/// and only identical retry-safe benign actions may share a short bounded
-/// lease. A class never becomes a standing grant.
+/// hard-denies from class alone; class **gates** the Ask dispatch decision
+/// (issue #290): destructive and credential actions require a fresh explicit
+/// approval and ignore any existing benign lease. Only identical retry-safe
+/// benign actions may share a short bounded lease (issue #287). A class never
+/// becomes a standing grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionRiskClass {
     /// Reversible navigation/observation (screenshot, cursor move, scroll).
@@ -2367,11 +2541,28 @@ pub enum ActionRiskClass {
 }
 
 impl ActionRiskClass {
-    /// Classify a canonical [`ComputerAction`] into its risk class.
+    /// Classify a canonical [`ComputerAction`] with no widget context.
     ///
-    /// The mapping never hard-denies in Yolo or Ask. In Ask it selects the
-    /// lease policy (one-shot vs bounded identical retry-safe reuse).
+    /// Missing widget context is fail-closed for text entry: [`TypeText`]
+    /// becomes [`Self::CredentialEntry`] unless the payload is already
+    /// destructive. Prefer [`Self::classify_with_widget`] on the dispatch
+    /// path, where live role/subrole evidence is available.
     pub fn classify(action: &ComputerAction) -> Self {
+        Self::classify_with_widget(action, None)
+    }
+
+    /// Classify `action` using focused widget/field identity.
+    ///
+    /// The mapping never hard-denies in Yolo or Ask. In Ask it **gates**
+    /// dispatch: [`Self::requires_fresh_approval_each_action`] classes ignore
+    /// any existing benign lease and never install one. Credential detection
+    /// uses the focused widget role/subrole plus the shared secret-shape
+    /// detector; it never reads field contents. Missing or ambiguous widget
+    /// context classifies text entry as [`Self::CredentialEntry`].
+    pub fn classify_with_widget(
+        action: &ComputerAction,
+        widget: Option<&TargetWidgetContext>,
+    ) -> Self {
         match action {
             ComputerAction::CaptureFull
             | ComputerAction::CaptureRegion { .. }
@@ -2382,32 +2573,15 @@ impl ActionRiskClass {
             ComputerAction::Click { .. }
             | ComputerAction::MouseDown { .. }
             | ComputerAction::MouseUp { .. }
-            | ComputerAction::Drag { .. }
-            | ComputerAction::KeyChord { .. }
-            | ComputerAction::HoldKey { .. } => Self::StateChanging,
-            ComputerAction::TypeText { text } => {
-                // Heuristic classification: never used for hard denial.
-                // Credential entry reuses the shared secret-shape detector
-                // (novel credential shapes plus credential words) so the
-                // audit class and the prompt disclosure fence
-                // (`computer_typed_text_for_prompt`) agree on what counts as
-                // a credential instead of carrying two divergent keyword
-                // lists. Destructive/credential classes are one-shot Ask
-                // approvals (issue #287); they still never hard-deny.
-                let lower = text.to_ascii_lowercase();
-                if crate::redact::text_is_secret_shaped(text) {
+            | ComputerAction::Drag { .. } => Self::StateChanging,
+            ComputerAction::KeyChord { .. } | ComputerAction::HoldKey { .. } => {
+                if widget.is_some_and(TargetWidgetContext::is_known_credential_field) {
                     Self::CredentialEntry
-                } else if lower.contains("rm -rf")
-                    || lower.contains("delete")
-                    || lower.contains("drop ")
-                    || lower.contains("format")
-                    || lower.contains("truncate")
-                {
-                    Self::Destructive
                 } else {
                     Self::StateChanging
                 }
             }
+            ComputerAction::TypeText { text } => classify_type_text(text, widget),
         }
     }
 
@@ -2454,14 +2628,37 @@ enum AskLeasePolicy {
     Bounded { remaining_uses: u32 },
 }
 
+fn classify_type_text(text: &str, widget: Option<&TargetWidgetContext>) -> ActionRiskClass {
+    // A known credential widget wins over payload heuristics: typing into a
+    // password field is credential entry even when the text looks like a
+    // shell command. Field contents are never consulted.
+    if widget.is_some_and(TargetWidgetContext::is_known_credential_field) {
+        return ActionRiskClass::CredentialEntry;
+    }
+    if crate::redact::text_is_secret_shaped(text) {
+        return ActionRiskClass::CredentialEntry;
+    }
+    if typed_text_looks_destructive(text) {
+        return ActionRiskClass::Destructive;
+    }
+    // Owner policy (issue #290): missing or ambiguous target-widget/field
+    // context classifies TypeText as Credential and requires fresh approval.
+    match widget {
+        Some(context) if context.is_unambiguous_non_credential_text_field() => {
+            ActionRiskClass::StateChanging
+        }
+        _ => ActionRiskClass::CredentialEntry,
+    }
+}
+
 impl AskLeasePolicy {
-    fn for_actions(actions: &[ComputerAction]) -> Self {
+    fn for_actions(actions: &[ComputerAction], widget: Option<&TargetWidgetContext>) -> Self {
         if actions.is_empty() {
             return Self::OneShot;
         }
         let mut all_retry_safe = true;
         for action in actions {
-            let class = ActionRiskClass::classify(action);
+            let class = ActionRiskClass::classify_with_widget(action, widget);
             if class.requires_fresh_approval_each_action() {
                 return Self::OneShot;
             }
@@ -3563,8 +3760,13 @@ pub struct ComputerActionCoordinator {
     /// The Ask delegation lease store (Ask tier only). Yolo creates no
     /// approval grant and uses only the host lease. Ask leases are scoped
     /// to exact payload + live focus and are count-bounded; destructive
-    /// and credential actions install none.
+    /// and credential actions install none. Class is evaluated against
+    /// [`Self::authorized_widget`] on the dispatch path.
     ask_lease_store: AskDelegationLeaseStore,
+    /// Focused widget/field identity adopted from the live snapshot the Ask
+    /// gate accepted (or the open-time capture for Yolo). Used only to
+    /// classify action risk; never includes field contents.
+    authorized_widget: TargetWidgetContext,
     /// Lease keys of in-flight or `AskBlocked` approval waits, keyed by
     /// provider call ID. Lets cancellation revoke a pending-only wait that
     /// bulk lease enumeration would miss. Cleared when the wait installs,
@@ -3907,6 +4109,7 @@ impl ComputerActionCoordinator {
         let mut host_lease: Option<HostLeaseToken> = None;
         let mut acquired_host_lease: Option<AcquiredHostLease> = None;
         let mut virtual_display_uuid: Option<[u8; 16]> = None;
+        let mut authorized_widget = TargetWidgetContext::default();
 
         // Take ownership of the target adapter before using it.
         let mut target_adapter = params.target_adapter;
@@ -3953,6 +4156,7 @@ impl ComputerActionCoordinator {
                     // adopts the live UUID it accepts; physical targets stay
                     // `None` (they scope by host lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
+                    authorized_widget = TargetWidgetContext::from_evidence(&evidence);
                     // Physical opens must take the host lock now and hold it
                     // for the coordinator lifetime. The production physical
                     // composition supplies a FileAdvisoryLock-backed arbiter;
@@ -4038,6 +4242,7 @@ impl ComputerActionCoordinator {
             dispatch_states: HashMap::new(),
             backend_dead: false,
             ask_lease_store: AskDelegationLeaseStore::new(),
+            authorized_widget,
             ask_wait_by_call: HashMap::new(),
             provider_id: params.provider_id,
             model_id: params.model_id,
@@ -4590,7 +4795,8 @@ impl ComputerActionCoordinator {
         }
         // Prompt-level batch summary (issue #286): each per-action approval
         // prompt also summarizes the whole pending batch.
-        let batch_detail = computer_batch_summary(actions);
+        let batch_detail =
+            computer_batch_summary_with_widget(actions, Some(&self.authorized_widget));
         for (batch_index, action) in actions.iter().enumerate() {
             let request = ComputerActionAuthorization {
                 session_id: self.session_id.clone(),
@@ -4606,14 +4812,23 @@ impl ComputerActionCoordinator {
                 batch_index: u32::try_from(batch_index)
                     .map_err(|_| ComputerError::Refused("computer batch is too large".into()))?,
                 geometry_generation: GeometryGeneration(self.observation_generation.0),
-                action_class: ActionRiskClass::classify(action),
+                action_class: ActionRiskClass::classify_with_widget(
+                    action,
+                    Some(&self.authorized_widget),
+                ),
                 action_payload_digest: canonical_computer_action_payload_digest(
                     std::slice::from_ref(action),
                 ),
                 lease_binding_digest: lease_binding_digest.clone(),
                 target_evidence_binding_digest: target_binding_digest.clone(),
-                action_detail: computer_action_summary(action),
-                typed_text: computer_typed_text_for_prompt(action),
+                action_detail: computer_action_summary_with_widget(
+                    action,
+                    Some(&self.authorized_widget),
+                ),
+                typed_text: computer_typed_text_for_prompt_with_widget(
+                    action,
+                    Some(&self.authorized_widget),
+                ),
                 batch_detail: batch_detail.clone(),
                 target_window: target_window.map(str::to_string),
             };
@@ -4660,7 +4875,10 @@ impl ComputerActionCoordinator {
                 "geometry_generation": self.observation_generation.0,
                 "provider_call_id": call_id,
                 "batch_index": batch_index,
-                "action_class": ActionRiskClass::classify(action).label(),
+                "action_class": ActionRiskClass::classify_with_widget(
+                    action,
+                    Some(&self.authorized_widget),
+                ).label(),
                 "has_host_lease": self.host_lease.is_some(),
                 "payload_digest": canonical_computer_action_payload_digest(std::slice::from_ref(action)),
                 "lease_binding_digest": lease_binding_digest,
@@ -4751,8 +4969,10 @@ impl ComputerActionCoordinator {
     /// host-approval effects, journal target digests, and pre-handoff
     /// validation share that identity. Focus-sensitive actions (type/key)
     /// evaluate that same live snapshot before adopt — never an earlier
-    /// coordinator generation. Destructive and credential actions never
-    /// reuse a prior Allow. Neither Ask authority alone nor a host lease
+    /// coordinator generation. Action risk class gates this decision:
+    /// destructive and credential actions (including TypeText with missing
+    /// or ambiguous widget context) never reuse a prior Allow, including a
+    /// live benign lease. Neither Ask authority alone nor a host lease
     /// alone can dispatch.
     ///
     /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
@@ -4780,7 +5000,8 @@ impl ComputerActionCoordinator {
         // install on evidence we cannot read.
         // Capture into locals first so the adapter borrow ends before any
         // `&mut self` fail-closed bookkeeping below.
-        type PreCaptureSnapshot = Result<(u64, Option<[u8; 16]>, Option<String>), ()>;
+        type PreCaptureSnapshot =
+            Result<(u64, Option<[u8; 16]>, Option<String>, TargetWidgetContext), ()>;
         let pre_capture: Option<PreCaptureSnapshot> =
             if let Some(adapter) = self.target_adapter.as_mut() {
                 match adapter.capture_snapshot() {
@@ -4792,23 +5013,32 @@ impl ComputerActionCoordinator {
                         // window id prefix, captured from the same coherent
                         // snapshot the pre-await baseline pins.
                         target_window_summary(&evidence),
+                        // Widget role/subrole only — never field contents
+                        // (issue #290).
+                        TargetWidgetContext::from_evidence(&evidence),
                     ))),
                     Err(_reason) => Some(Err(())),
                 }
             } else {
                 None
             };
-        let (live_focus_generation, live_uuid, prompt_target_window) = match pre_capture {
-            Some(Ok(baseline)) => baseline,
-            Some(Err(())) => {
-                self.dispatch_states
-                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-                return Err(CoordinatedOutcome::Invalidated {
-                    reason: TargetUnavailableReason::StaleTarget,
-                });
-            }
-            None => (self.focus_generation.0, virtual_display_uuid, None),
-        };
+        let (live_focus_generation, live_uuid, prompt_target_window, live_widget) =
+            match pre_capture {
+                Some(Ok(baseline)) => baseline,
+                Some(Err(())) => {
+                    self.dispatch_states
+                        .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                    return Err(CoordinatedOutcome::Invalidated {
+                        reason: TargetUnavailableReason::StaleTarget,
+                    });
+                }
+                None => (
+                    self.focus_generation.0,
+                    virtual_display_uuid,
+                    None,
+                    self.authorized_widget.clone(),
+                ),
+            };
 
         // Focus-sensitive actions evaluate this live snapshot, never the
         // coordinator's previously stored generation. Refuse before adopt,
@@ -4839,12 +5069,13 @@ impl ComputerActionCoordinator {
         // target digests, and `pre_handoff_check` all observe the same
         // object. A later TOCTOU change is still caught by
         // `pre_handoff_check` against this adopted identity.
-        self.adopt_authorized_live_identity(live_focus_generation, live_uuid);
+        self.adopt_authorized_live_identity(live_focus_generation, live_uuid, live_widget);
 
-        let policy = AskLeasePolicy::for_actions(actions);
+        let policy = AskLeasePolicy::for_actions(actions, Some(&self.authorized_widget));
         // Identical retry-safe payloads at this focus may consume one remaining
         // use of a previously installed bounded lease. Destructive/credential
-        // (one-shot) classes never take this path.
+        // (and other one-shot) classes never take this path: class gates
+        // dispatch, so a live benign lease cannot authorize them.
         if policy.allows_reuse() && self.ask_lease_store.try_consume(&lease_key) {
             return Ok(());
         }
@@ -5081,8 +5312,9 @@ impl ComputerActionCoordinator {
     ///
     /// Drift is classified: a lost/replaced host lease (physical path) is a
     /// permanent invalidation ([`LeaseDrift::HostLease`]); a focus-generation
-    /// or virtual-UUID change, or an unverifiable (`Err`) re-capture, is a
-    /// non-sticky discard ([`LeaseDrift::Target`]).
+    /// or virtual-UUID change, an unverifiable (`Err`) re-capture, or a
+    /// risk-class upgrade to a one-shot class (issue #290) is a non-sticky
+    /// discard ([`LeaseDrift::Target`]).
     fn recompute_live_lease_key(
         &mut self,
         host_present_pre_await: bool,
@@ -5098,19 +5330,44 @@ impl ComputerActionCoordinator {
         // Fresh post-await evidence snapshot compared to the authorized
         // live identity adopted before the wait. Unverifiable evidence or a
         // focus-generation / virtual-UUID change is non-sticky target drift.
-        let (live_uuid, live_focus) = if let Some(adapter) = self.target_adapter.as_mut() {
-            match adapter.capture_snapshot() {
-                Ok(evidence) => {
-                    if !self.authorized_live_identity_matches(&evidence) {
-                        return Err(LeaseDrift::Target);
+        let (live_uuid, live_focus, live_widget) =
+            if let Some(adapter) = self.target_adapter.as_mut() {
+                match adapter.capture_snapshot() {
+                    Ok(evidence) => {
+                        if !self.authorized_live_identity_matches(&evidence) {
+                            return Err(LeaseDrift::Target);
+                        }
+                        (
+                            evidence.virtual_display_uuid,
+                            evidence.focus_generation,
+                            TargetWidgetContext::from_evidence(&evidence),
+                        )
                     }
-                    (evidence.virtual_display_uuid, evidence.focus_generation)
+                    Err(_reason) => return Err(LeaseDrift::Target),
                 }
-                Err(_reason) => return Err(LeaseDrift::Target),
+            } else {
+                (
+                    self.virtual_display_uuid,
+                    self.focus_generation.0,
+                    self.authorized_widget.clone(),
+                )
+            };
+
+        // Class upgrade after the human answered is a dispatch gate: a
+        // StateChanging Allow must not cover a live Credential/Destructive
+        // widget (issue #290). A class that stays one-shot (or drops) is
+        // still covered by the Allow the human just gave.
+        for action in actions {
+            let prompted =
+                ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget));
+            let live = ActionRiskClass::classify_with_widget(action, Some(&live_widget));
+            if live.requires_fresh_approval_each_action()
+                && !prompted.requires_fresh_approval_each_action()
+            {
+                return Err(LeaseDrift::Target);
             }
-        } else {
-            (self.virtual_display_uuid, self.focus_generation.0)
-        };
+        }
+        self.authorized_widget = live_widget;
 
         // Rebuild the key from the re-verified live state (including the
         // exact payload digest and live focus). A `None` here means the live
@@ -5745,14 +6002,21 @@ impl ComputerActionCoordinator {
         self.focus_generation
     }
 
-    /// Adopt `live_focus` and `live_uuid` as the currently authorized live
-    /// target identity. Every approval packet, host-approval effect, journal
-    /// target digest, and pre-handoff check reads these fields, so the Ask
-    /// gate must write the complete snapshot it accepted before those
-    /// consumers run. Generation is not a proxy for object identity.
-    fn adopt_authorized_live_identity(&mut self, live_focus: u64, live_uuid: Option<[u8; 16]>) {
+    /// Adopt `live_focus`, `live_uuid`, and widget identity as the currently
+    /// authorized live target. Every approval packet, host-approval effect,
+    /// journal target digest, risk class, and pre-handoff check reads these
+    /// fields, so the Ask gate must write the complete snapshot it accepted
+    /// before those consumers run. Generation is not a proxy for object
+    /// identity. Widget context is role/subrole only — never field contents.
+    fn adopt_authorized_live_identity(
+        &mut self,
+        live_focus: u64,
+        live_uuid: Option<[u8; 16]>,
+        widget: TargetWidgetContext,
+    ) {
         self.focus_generation = TargetGeneration(live_focus);
         self.virtual_display_uuid = live_uuid;
+        self.authorized_widget = widget;
     }
 
     /// True when `evidence` is still the currently authorized live identity.
@@ -6320,8 +6584,9 @@ mod tests {
     use super::super::host_identity::HostInstallationId;
     use super::super::platform::x11::{X11SessionParts, x11_session_or_seat_id};
     use super::super::target::{
-        FakeTargetEvidenceAdapter, TargetEvidenceAdapter, TargetIdentityEvidence,
-        TargetUnavailableReason, empty_unavailable, sample_physical_evidence,
+        BackendKind, EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence,
+        TargetEvidenceAdapter, TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+        sample_physical_evidence,
     };
     use super::super::{
         Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, CanonicalKeyChord,
@@ -6393,6 +6658,13 @@ mod tests {
         let mut evidence = virtual_evidence();
         evidence.focus_generation = 1;
         evidence.adapter_observed_epoch = 1;
+        evidence
+    }
+
+    fn ask_virtual_evidence_with_role(role: &str) -> TargetIdentityEvidence {
+        let mut evidence = ask_virtual_evidence();
+        evidence.accessibility_role =
+            FieldEvidence::available(role.to_string(), EvidenceSource::InjectedTest);
         evidence
     }
 
@@ -9788,7 +10060,8 @@ mod tests {
     }
 
     // =====================================================================
-    // Acceptance criterion 5: computer_action_semantics_advisory
+    // Acceptance criterion 5: computer_action_semantics classifies and
+    // gates Ask dispatch (issue #290). Never hard-denies in Yolo or Ask.
     // =====================================================================
 
     #[test]
@@ -9857,7 +10130,7 @@ mod tests {
                 ComputerAction::TypeText {
                     text: "hello world".to_string(),
                 },
-                ActionRiskClass::StateChanging,
+                ActionRiskClass::CredentialEntry,
             ),
             (
                 ComputerAction::TypeText {
@@ -9914,6 +10187,65 @@ mod tests {
         assert!(ActionRiskClass::CredentialEntry.requires_fresh_approval_each_action());
         assert!(!ActionRiskClass::Reversible.requires_fresh_approval_each_action());
         assert!(!ActionRiskClass::StateChanging.requires_fresh_approval_each_action());
+
+        // Issue #290: widget/field context, never field contents.
+        let benign = ComputerAction::TypeText {
+            text: "hello world".to_string(),
+        };
+        let text_field = TargetWidgetContext::from_roles(Some("AXTextField"), None);
+        let password_field = TargetWidgetContext::from_roles(Some("AXSecureTextField"), None);
+        let ambiguous_edit = TargetWidgetContext::from_roles(Some("edit"), None);
+        let window_role = TargetWidgetContext::from_roles(Some("AXWindow"), None);
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&text_field)),
+            ActionRiskClass::StateChanging,
+            "unambiguous ordinary text field with benign text is StateChanging"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&password_field)),
+            ActionRiskClass::CredentialEntry,
+            "known credential widget classifies TypeText as Credential even for benign text"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&ambiguous_edit)),
+            ActionRiskClass::CredentialEntry,
+            "ambiguous widget context fail-closes as Credential"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&window_role)),
+            ActionRiskClass::CredentialEntry,
+            "window-level role is not field context and fail-closes as Credential"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, None),
+            ActionRiskClass::CredentialEntry,
+            "missing widget context fail-closes as Credential"
+        );
+
+        let destructive = ComputerAction::TypeText {
+            text: "rm -rf /".to_string(),
+        };
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&destructive, Some(&password_field)),
+            ActionRiskClass::CredentialEntry,
+            "known credential widget wins over destructive payload heuristics"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&destructive, None),
+            ActionRiskClass::Destructive
+        );
+
+        let enter = ComputerAction::KeyChord {
+            chord: CanonicalKeyChord::new(vec![KeyCode::parse("Enter").unwrap()]).unwrap(),
+        };
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&enter, Some(&password_field)),
+            ActionRiskClass::CredentialEntry
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&enter, None),
+            ActionRiskClass::StateChanging
+        );
     }
 
     #[tokio::test]
@@ -10854,7 +11186,7 @@ mod tests {
         assert!(!digest_json.contains(sensitive));
         assert!(!digest_json.contains("hunter2"));
 
-        // The action class is CredentialEntry (advisory only, not in the
+        // The action class is CredentialEntry (dispatch-gating, not in the
         // outcome debug).
         let class = ActionRiskClass::classify(&ComputerAction::TypeText {
             text: sensitive.to_string(),
@@ -10919,8 +11251,8 @@ mod tests {
     // Action hardening: computer_action_no_semantic_floor
     // AC7: Submission/purchase/credential/destructive classes add no
     // prompt/deny in Yolo. In Ask they never hard-deny from class alone,
-    // but they do require a fresh Allow (issue #287): they do not reuse a
-    // benign delegation lease.
+    // but they do require a fresh Allow (issues #287/#290): they do not
+    // reuse a benign delegation lease.
     // =====================================================================
 
     #[tokio::test]
@@ -10970,8 +11302,9 @@ mod tests {
 
     #[tokio::test]
     async fn computer_action_ask_lease_reapproves_higher_risk_classes() {
-        // Issue #287: a benign Allow does not lease destructive or credential
-        // follow-ups. Each higher-risk class requires a new authorizer call.
+        // Issues #287/#290: a benign Allow does not lease destructive or
+        // credential follow-ups. Each higher-risk class requires a new
+        // authorizer call even while the screenshot lease is still live.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
@@ -11005,6 +11338,10 @@ mod tests {
             .await;
         assert!(matches!(outcome_d, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![ActionRiskClass::Reversible, ActionRiskClass::Destructive,]
+        );
         // One-shot: the destructive Allow must not install a reusable lease.
         // The screenshot lease may still be present (different payload key).
         let destructive_key = coordinator
@@ -11026,14 +11363,199 @@ mod tests {
             .await;
         assert!(matches!(outcome_c, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer.call_count(), 3);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![
+                ActionRiskClass::Reversible,
+                ActionRiskClass::Destructive,
+                ActionRiskClass::CredentialEntry,
+            ]
+        );
+        // The original benign screenshot lease is still live; it did not
+        // authorize the higher-risk follow-ups.
+        let screenshot_key = coordinator
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &screenshot_backend_actions(),
+                coordinator.focus_generation().0,
+            )
+            .unwrap();
+        assert!(coordinator.ask_lease_store().has_lease(&screenshot_key));
+    }
+
+    #[tokio::test]
+    async fn computer_action_risk_class_gates_missing_widget_type_text() {
+        // Issue #290: TypeText with missing widget/field context is Credential
+        // and forces a new approval even under a live benign screenshot lease.
+        // Field contents are never collected as evidence.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
+        assert!(
+            !adapter.snapshot.accessibility_role.is_available()
+                && !adapter.snapshot.accessibility_subrole.is_available(),
+            "this fixture must not supply widget context"
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-benign-lease", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        let typed = vec![OpenAiComputerAction::TypeText("hello world".to_string())];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-unscoped-type", &typed)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![
+                ActionRiskClass::Reversible,
+                ActionRiskClass::CredentialEntry,
+            ]
+        );
+        assert_eq!(
+            coordinator.ask_lease_store().len(),
+            1,
+            "credential TypeText must not consume or replace the benign lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_action_risk_class_gates_password_field_type_text() {
+        // Issue #290: typing benign text into a known credential widget is
+        // Credential and requires a fresh Allow under a live benign lease.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                ask_virtual_evidence_with_role("AXSecureTextField"),
+            ))),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-shot-before-password", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+
+        let typed = vec![OpenAiComputerAction::TypeText("hello world".to_string())];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-password-type", &typed)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(
+            authorizer.last_action_classes().last().copied(),
+            Some(ActionRiskClass::CredentialEntry)
+        );
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn computer_action_widget_class_upgrade_after_allow_is_drift() {
+        // A StateChanging Allow must not cover a live credential widget that
+        // appeared while the human was answering.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let text_field = ask_virtual_evidence_with_role("AXTextField");
+        let password_field = ask_virtual_evidence_with_role("AXSecureTextField");
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            BackendKind::VirtualDisplay,
+            vec![text_field.clone(), text_field.clone(), password_field],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let typed = vec![OpenAiComputerAction::TypeText("hello world".to_string())];
+        let outcome = coordinator
+            .execute_openai_call("call-widget-upgrade", &typed)
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "class upgrade after Allow must not dispatch, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![ActionRiskClass::StateChanging]
+        );
     }
 
     #[tokio::test]
     async fn computer_ask_lease_state_changing_is_one_shot() {
-        // Typing is not retry-safe: identical StateChanging payloads still
-        // require a fresh Allow and install no lease.
+        // Typing into an unambiguous ordinary text field is StateChanging and
+        // not retry-safe: identical payloads still require a fresh Allow and
+        // install no lease.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                ask_virtual_evidence_with_role("AXTextField"),
+            ))),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
             .expect("coordinator open");
@@ -11045,6 +11567,10 @@ mod tests {
         ));
         assert_eq!(authorizer.call_count(), 1);
         assert_eq!(coordinator.ask_lease_store().len(), 0);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![ActionRiskClass::StateChanging]
+        );
 
         assert!(matches!(
             coordinator.execute_openai_call("call-type-2", &typed).await,
@@ -11052,6 +11578,13 @@ mod tests {
         ));
         assert_eq!(authorizer.call_count(), 2);
         assert_eq!(coordinator.ask_lease_store().len(), 0);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![
+                ActionRiskClass::StateChanging,
+                ActionRiskClass::StateChanging,
+            ]
+        );
     }
 
     #[tokio::test]

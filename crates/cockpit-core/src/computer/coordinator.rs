@@ -37,7 +37,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -2734,9 +2734,48 @@ impl AskDelegationLeaseStore {
         self.leases.len()
     }
 
-    /// Whether the store is empty.
+    /// The number of pending approval waits (for tests/diagnostics).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Pending approval-wait version for `key`, if a wait is in progress.
+    pub fn pending_version(&self, key: &AskLeaseKey) -> Option<u64> {
+        self.pending.get(key).copied()
+    }
+
+    /// Whether the store holds no installed leases.
     pub fn is_empty(&self) -> bool {
         self.leases.is_empty()
+    }
+
+    /// Keys that currently carry installed or pending authorization matching
+    /// `predicate`. Selected independently from each collection so a
+    /// pending-only wait is never invisible to a revocation boundary.
+    fn authorization_keys_matching(
+        &self,
+        predicate: impl Fn(&AskLeaseKey) -> bool,
+    ) -> Vec<AskLeaseKey> {
+        self.leases
+            .keys()
+            .chain(self.pending.keys())
+            .filter(|key| predicate(key))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Remove every installed lease and pending wait whose key matches
+    /// `predicate`. Returns the number of distinct keys revoked.
+    fn revoke_matching(&mut self, predicate: impl Fn(&AskLeaseKey) -> bool) -> usize {
+        let keys = self.authorization_keys_matching(predicate);
+        let count = keys.len();
+        for key in &keys {
+            self.leases.remove(key);
+            self.pending.remove(key);
+        }
+        count
     }
 
     /// Begin an approval wait for the given key. Returns the approval version.
@@ -2835,12 +2874,12 @@ impl AskDelegationLeaseStore {
     /// Record a denial for the given key. Terminates that delegation's
     /// computer path permanently: the `(session_id, delegation_id)` pair is
     /// added to the sticky denied set so no future lease can be begun or
-    /// installed for it. Clears any pending wait and removes any lease.
+    /// installed for it. Clears every pending wait and installed lease for
+    /// that delegation, not only the denied key.
     pub fn record_denial(&mut self, key: &AskLeaseKey) -> AskAuthorizationOutcome {
-        self.pending.remove(key);
-        self.leases.remove(key);
         self.denied_delegations
             .insert((key.session_id.clone(), key.delegation_id.clone()));
+        self.revoke_for_delegation(&key.session_id, &key.delegation_id);
         AskAuthorizationOutcome::Denied {
             reason: "human denied computer action".to_string(),
         }
@@ -2861,93 +2900,65 @@ impl AskDelegationLeaseStore {
         }
     }
 
-    /// Revoke a lease for the given key. Called on delegation terminal state,
-    /// cancel, detach, provider/model change, display/target/host generation
-    /// change, lost OS lock, or daemon restart.
+    /// Revoke installed and pending authorization for the given key. Called
+    /// on delegation terminal state, cancel, detach, provider/model change,
+    /// display/target/host generation change, lost OS lock, or daemon restart.
     ///
-    /// Returns `true` if a lease was revoked.
+    /// Returns `true` if an installed lease or a pending wait was revoked.
     pub fn revoke(&mut self, key: &AskLeaseKey) -> bool {
-        self.pending.remove(key);
-        self.leases.remove(key).is_some()
+        let pending = self.pending.remove(key).is_some();
+        let lease = self.leases.remove(key).is_some();
+        pending || lease
     }
 
-    /// Revoke all leases for a given delegation. Called on delegation
-    /// terminal state, cancel, or detach.
+    /// Revoke all installed leases and pending waits for a given delegation.
+    /// Called on delegation terminal state, cancel, or detach. Keys are
+    /// selected independently from each collection so a pending-only wait
+    /// (for example after `AskBlocked`) cannot survive.
     ///
-    /// Returns the number of leases revoked.
+    /// Returns the number of distinct keys revoked.
     pub fn revoke_for_delegation(
         &mut self,
         session_id: &str,
         delegation_id: &DelegationId,
     ) -> usize {
-        let to_remove: Vec<AskLeaseKey> = self
-            .leases
-            .keys()
-            .filter(|k| k.session_id == session_id && k.delegation_id == *delegation_id)
-            .cloned()
-            .collect();
-        let count = to_remove.len();
-        for key in to_remove {
-            self.leases.remove(&key);
-            self.pending.remove(&key);
-        }
-        count
+        self.revoke_matching(|k| k.session_id == session_id && k.delegation_id == *delegation_id)
     }
 
-    /// Revoke all leases whose host lease generation differs from the given
-    /// current generation. A host lease-generation replacement invalidates
-    /// the Ask lease and requires a new human decision before another action.
+    /// Revoke all installed leases and pending waits whose host lease
+    /// generation differs from the given current generation. A host
+    /// lease-generation replacement invalidates Ask authorization and
+    /// requires a new human decision before another action.
     ///
-    /// Returns the number of leases revoked.
+    /// Returns the number of distinct keys revoked.
     pub fn revoke_on_host_generation_change(
         &mut self,
         target_key: &PhysicalTargetKey,
         current_generation: LeaseGeneration,
     ) -> usize {
-        let to_remove: Vec<AskLeaseKey> = self
-            .leases
-            .keys()
-            .filter(|k| {
-                matches!(&k.target_key, LeaseTargetKey::Physical(pk) if pk == target_key)
-                    && k.host_lease_generation != Some(current_generation)
-            })
-            .cloned()
-            .collect();
-        let count = to_remove.len();
-        for key in to_remove {
-            self.leases.remove(&key);
-            self.pending.remove(&key);
-        }
-        count
+        self.revoke_matching(|k| {
+            matches!(&k.target_key, LeaseTargetKey::Physical(pk) if pk == target_key)
+                && k.host_lease_generation != Some(current_generation)
+        })
     }
 
-    /// Revoke all leases whose display generation differs from the given
-    /// current generation. A display-generation change invalidates the Ask
-    /// lease and requires a new human decision.
+    /// Revoke all installed leases and pending waits whose display
+    /// generation differs from the given current generation. A
+    /// display-generation change invalidates Ask authorization and
+    /// requires a new human decision.
     ///
-    /// Returns the number of leases revoked.
+    /// Returns the number of distinct keys revoked.
     pub fn revoke_on_display_generation_change(
         &mut self,
         session_id: &str,
         delegation_id: &DelegationId,
         current_display_generation: u64,
     ) -> usize {
-        let to_remove: Vec<AskLeaseKey> = self
-            .leases
-            .keys()
-            .filter(|k| {
-                k.session_id == session_id
-                    && k.delegation_id == *delegation_id
-                    && k.display_generation != current_display_generation
-            })
-            .cloned()
-            .collect();
-        let count = to_remove.len();
-        for key in to_remove {
-            self.leases.remove(&key);
-            self.pending.remove(&key);
-        }
-        count
+        self.revoke_matching(|k| {
+            k.session_id == session_id
+                && k.delegation_id == *delegation_id
+                && k.display_generation != current_display_generation
+        })
     }
 
     /// Clear all leases and pending waits. Called on daemon restart: both
@@ -3489,6 +3500,11 @@ pub struct ComputerActionCoordinator {
     /// to exact payload + live focus and are count-bounded; destructive
     /// and credential actions install none.
     ask_lease_store: AskDelegationLeaseStore,
+    /// Lease keys of in-flight or `AskBlocked` approval waits, keyed by
+    /// provider call ID. Lets cancellation revoke a pending-only wait that
+    /// bulk lease enumeration would miss. Cleared when the wait installs,
+    /// is denied, is discarded, or a revocation boundary sweeps the store.
+    ask_wait_by_call: HashMap<String, AskLeaseKey>,
     /// The provider ID for this coordinator's delegation.
     provider_id: ProviderId,
     /// The model ID for this coordinator's delegation.
@@ -3951,6 +3967,7 @@ impl ComputerActionCoordinator {
             dispatch_states: HashMap::new(),
             backend_dead: false,
             ask_lease_store: AskDelegationLeaseStore::new(),
+            ask_wait_by_call: HashMap::new(),
             provider_id: params.provider_id,
             model_id: params.model_id,
             virtual_display_uuid,
@@ -4645,9 +4662,11 @@ impl ComputerActionCoordinator {
     /// snapshot this gate accepts is adopted as the coordinator's authorized
     /// identity before prompting or consuming a lease, so approval metadata,
     /// host-approval effects, journal target digests, and pre-handoff
-    /// validation share that identity. Destructive and credential actions
-    /// never reuse a prior Allow. Neither Ask authority alone nor a host
-    /// lease alone can dispatch.
+    /// validation share that identity. Focus-sensitive actions (type/key)
+    /// evaluate that same live snapshot before adopt — never an earlier
+    /// coordinator generation. Destructive and credential actions never
+    /// reuse a prior Allow. Neither Ask authority alone nor a host lease
+    /// alone can dispatch.
     ///
     /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
     /// blocking/denial case.
@@ -4659,8 +4678,11 @@ impl ComputerActionCoordinator {
         virtual_display_uuid: Option<[u8; 16]>,
     ) -> Result<(), CoordinatedOutcome> {
         // Yolo uses only the host lease and records `agent_discretion`; it
-        // creates no approval grant. No Ask lease is required.
+        // creates no approval grant. No Ask lease is required. Focus-sensitive
+        // actions still evaluate the identity this dispatch accepts (the
+        // open-time pin); they must not skip the gate because Ask is unused.
         if self.tier == ComputerApprovalTier::Yolo {
+            self.refuse_unfocused_dispatch(call_id, actions, self.focus_generation.0)?;
             return Ok(());
         }
 
@@ -4701,6 +4723,12 @@ impl ComputerActionCoordinator {
             None => (self.focus_generation.0, virtual_display_uuid, None),
         };
 
+        // Focus-sensitive actions evaluate this live snapshot, never the
+        // coordinator's previously stored generation. Refuse before adopt,
+        // prompt, or consume so a zero live generation cannot be authorized
+        // and a newly focused window is not rejected on a stale open-time pin.
+        self.refuse_unfocused_dispatch(call_id, actions, live_focus_generation)?;
+
         // Ask tier: require both the Ask delegation lease and the host lease
         // (for physical targets). For virtual displays, only the Ask lease is
         // required (no host lease). The key includes live focus + payload.
@@ -4738,6 +4766,10 @@ impl ComputerActionCoordinator {
 
         // Begin an approval wait and authorize (raises the human prompt).
         let approval_version = self.ask_lease_store.begin_approval_wait(&lease_key);
+        if approval_version != 0 {
+            self.ask_wait_by_call
+                .insert(call_id.to_string(), lease_key.clone());
+        }
 
         // Authorize through the central authorizer (raises the human prompt).
         match self
@@ -4762,6 +4794,7 @@ impl ComputerActionCoordinator {
                                 // safe) classes: this Allow covers only the
                                 // current action. Do not install a lease.
                                 self.ask_lease_store.cancel_pending(&lease_key);
+                                self.forget_ask_wait_for_key(&lease_key);
                                 Ok(())
                             }
                             AskLeasePolicy::Bounded { remaining_uses } => {
@@ -4771,11 +4804,15 @@ impl ComputerActionCoordinator {
                                     remaining_uses,
                                 ) {
                                     AskAuthorizationOutcome::Installed
-                                    | AskAuthorizationOutcome::ReusedExisting => Ok(()),
+                                    | AskAuthorizationOutcome::ReusedExisting => {
+                                        self.forget_ask_wait_for_key(&lease_key);
+                                        Ok(())
+                                    }
                                     AskAuthorizationOutcome::StaleAnswerDiscarded => {
                                         // A newer approval wait superseded this one. The
                                         // answer is discarded; a new decision is
                                         // required before another action.
+                                        self.forget_ask_wait_for_key(&lease_key);
                                         self.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
@@ -4787,6 +4824,7 @@ impl ComputerActionCoordinator {
                                     }
                                     AskAuthorizationOutcome::Denied { reason } => {
                                         self.denied = Some(reason.clone());
+                                        self.ask_wait_by_call.clear();
                                         self.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
@@ -4796,6 +4834,7 @@ impl ComputerActionCoordinator {
                                     }
                                     AskAuthorizationOutcome::CancelledBeforeInstall
                                     | AskAuthorizationOutcome::Pending => {
+                                        self.forget_ask_wait_for_key(&lease_key);
                                         self.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
@@ -4823,6 +4862,7 @@ impl ComputerActionCoordinator {
                         // held, so every later call returns `Invalidated`
                         // without consulting the authorizer again.
                         self.ask_lease_store.cancel_pending(&lease_key);
+                        self.forget_ask_wait_for_key(&lease_key);
                         self.dispatch_states
                             .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                         let outcome = CoordinatedOutcome::Invalidated {
@@ -4844,6 +4884,7 @@ impl ComputerActionCoordinator {
                 // execute_* entry point) and in the store's sticky denied set.
                 self.denied = Some(reason.clone());
                 self.ask_lease_store.record_denial(&lease_key);
+                self.ask_wait_by_call.clear();
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::Denied { reason };
@@ -4852,7 +4893,9 @@ impl ComputerActionCoordinator {
             Ok(ComputerAuthorizationDecision::AskBlocked) => {
                 // The authorizer blocked waiting for a human response. The
                 // action is not dispatched. The pending wait remains so a
-                // subsequent approval can install the lease.
+                // subsequent approval on this exact key can share the wait,
+                // until a revocation boundary (cancel, close, invalidate,
+                // generation change) selects that pending entry directly.
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
@@ -4881,6 +4924,7 @@ impl ComputerActionCoordinator {
         lease_key: &AskLeaseKey,
     ) -> CoordinatedOutcome {
         self.ask_lease_store.cancel_pending(lease_key);
+        self.forget_ask_wait_for_key(lease_key);
         self.dispatch_states
             .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
         let outcome = CoordinatedOutcome::Invalidated {
@@ -4948,9 +4992,9 @@ impl ComputerActionCoordinator {
     }
 
     /// Check if a batch of actions requires a current focus generation.
-    /// TypeText and KeyChord require a current focus generation from the
-    /// planning evidence capture. A zero focus_generation means no evidence
-    /// was captured and type/key actions are rejected.
+    /// TypeText, KeyChord, and HoldKey require a nonzero focus generation on
+    /// the identity this dispatch accepts. A zero generation means no focused
+    /// window is proven and type/key actions are rejected.
     fn requires_focus_generation(actions: &[ComputerAction]) -> bool {
         actions.iter().any(|action| {
             matches!(
@@ -4960,6 +5004,40 @@ impl ComputerActionCoordinator {
                     | ComputerAction::HoldKey { .. }
             )
         })
+    }
+
+    /// Refuse focus-sensitive actions unless `authorized_focus` is a current
+    /// focused window. `authorized_focus` must be the identity this dispatch
+    /// accepts (the live snapshot the Ask gate is about to adopt, or Yolo's
+    /// open-time pin) — never an earlier coordinator snapshot.
+    fn refuse_unfocused_dispatch(
+        &mut self,
+        call_id: &str,
+        actions: &[ComputerAction],
+        authorized_focus: u64,
+    ) -> Result<(), CoordinatedOutcome> {
+        if Self::requires_focus_generation(actions) && authorized_focus == 0 {
+            self.dispatch_states
+                .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+            return Err(CoordinatedOutcome::Invalidated {
+                reason: TargetUnavailableReason::StaleTarget,
+            });
+        }
+        Ok(())
+    }
+
+    fn forget_ask_wait_for_key(&mut self, key: &AskLeaseKey) {
+        self.ask_wait_by_call.retain(|_, tracked| tracked != key);
+    }
+
+    /// Withdraw the pending Ask wait begun for `call_id`, if any. Shared
+    /// waiters on the same key are forgotten together so a late Allow cannot
+    /// install the cancelled version.
+    fn cancel_ask_wait_for_call(&mut self, call_id: &str) {
+        if let Some(key) = self.ask_wait_by_call.remove(call_id) {
+            self.ask_lease_store.cancel_pending(&key);
+            self.forget_ask_wait_for_key(&key);
+        }
     }
 
     /// Check if a batch of actions contains pointer actions (move, click,
@@ -5003,18 +5081,20 @@ impl ComputerActionCoordinator {
         self.revoke_ask_lease_for_delegation() > 0
     }
 
-    /// Revoke all Ask leases for this coordinator's delegation. Called on
-    /// delegation terminal state, cancel, or detach.
+    /// Revoke all Ask leases and pending waits for this coordinator's
+    /// delegation. Called on delegation terminal state, cancel, or detach.
     pub fn revoke_ask_lease_for_delegation(&mut self) -> usize {
+        self.ask_wait_by_call.clear();
         self.ask_lease_store
             .revoke_for_delegation(&self.session_id, &self.delegation_id)
     }
 
     /// Handle host lease-generation replacement. A replaced generation
-    /// invalidates the Ask lease and requires a new human decision before
+    /// invalidates Ask authorization and requires a new human decision before
     /// another action.
     pub fn invalidate_ask_lease_on_host_generation_change(&mut self) -> usize {
         if let Some(token) = &self.host_lease {
+            self.ask_wait_by_call.clear();
             self.ask_lease_store
                 .revoke_on_host_generation_change(&token.target_key, token.generation)
         } else {
@@ -5022,9 +5102,10 @@ impl ComputerActionCoordinator {
         }
     }
 
-    /// Clear all Ask leases (daemon restart). Both Ask and host leases are
-    /// lost; Ask requires a new decision.
+    /// Clear all Ask leases and pending waits (daemon restart). Both Ask and
+    /// host leases are lost; Ask requires a new decision.
     pub fn clear_all_ask_leases(&mut self) {
+        self.ask_wait_by_call.clear();
         self.ask_lease_store.clear_all();
     }
 
@@ -5146,22 +5227,12 @@ impl ComputerActionCoordinator {
                 .await;
         }
 
-        // Focus generation requirement: TypeText and KeyChord require a
-        // current focus generation (focus_generation > 0). A zero focus
-        // generation means no planning evidence capture was done.
-        if Self::requires_focus_generation(&backend_actions) && self.focus_generation.0 == 0 {
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::StaleTarget,
-            };
-            return self
-                .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
-                .await;
-        }
-
         // Lease composition gate: Ask requires both a current Ask delegation
         // lease and the coordinator's current host/virtual input lease. Yolo
         // uses only the host lease and records `agent_discretion`; it creates
-        // no approval grant.
+        // no approval grant. Focus-sensitive actions are gated inside that
+        // path against the identity this dispatch accepts (live Ask snapshot
+        // or Yolo's open-time pin), never a stale coordinator generation.
         if let Err(outcome) = self
             .check_ask_lease_for_dispatch(
                 call_id,
@@ -5323,11 +5394,14 @@ impl ComputerActionCoordinator {
     }
 
     /// Cancel an action before dispatch. Cancellation before the dispatching
-    /// commit means zero input.
+    /// commit means zero input and withdraws any pending Ask wait begun for
+    /// this call so a later re-entry cannot reuse the cancelled approval
+    /// version.
     pub fn cancel_before_dispatch(&mut self, call_id: &str) -> CoordinatedOutcome {
         let current_state = self.dispatch_states.get(call_id).copied();
         match current_state {
             Some(DispatchState::NotDispatched) | None => {
+                self.cancel_ask_wait_for_call(call_id);
                 self.dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
@@ -5356,6 +5430,9 @@ impl ComputerActionCoordinator {
                 }
             }
             Some(DispatchState::CancelledBeforeDispatch) => {
+                // `AskBlocked` records this state while leaving the pending
+                // wait in place. A later cancel must still withdraw it.
+                self.cancel_ask_wait_for_call(call_id);
                 CoordinatedOutcome::CancelledBeforeDispatch
             }
             Some(DispatchState::DispatchUnknown) => CoordinatedOutcome::DispatchUnknown {
@@ -10422,6 +10499,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computer_ask_type_uses_live_focus_not_open_time_zero() {
+        // Open-time generation 0 must not reject a focus-sensitive action
+        // once live evidence proves a focused window. The gate consumes the
+        // identity this dispatch accepts, not the coordinator snapshot.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut unfocused = ask_virtual_evidence();
+        unfocused.focus_generation = 0;
+        let focused = ask_virtual_evidence();
+        let queue = vec![unfocused, focused.clone(), focused.clone(), focused];
+        let adapter = FakeTargetEvidenceAdapter::with_queue(BackendKind::VirtualDisplay, queue);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        assert_eq!(coordinator.focus_generation(), TargetGeneration(0));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-type-live-focus",
+                &[OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "live focus must authorize type, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(authorizer.last_focus_generation(), 1);
+        assert_eq!(coordinator.focus_generation().0, 1);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_type_rejects_live_focus_zero_despite_open_time() {
+        // An open-time nonzero generation must not authorize type/key once
+        // live evidence has no focused window. Refuse before prompt or adopt
+        // so pre-handoff cannot skip a zero adopted generation.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let focused = ask_virtual_evidence();
+        let mut unfocused = ask_virtual_evidence();
+        unfocused.focus_generation = 0;
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            BackendKind::VirtualDisplay,
+            vec![focused, unfocused],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(CountingBackend::new(input_actions.clone())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
+        assert!(coordinator.focus_generation().0 > 0);
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-type-live-unfocused",
+                &[OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "zero live focus must refuse type, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 0, "must not prompt without focus");
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input"
+        );
+        assert!(
+            coordinator.focus_generation().0 > 0,
+            "must not adopt a zero live generation for a refused focus-sensitive action"
+        );
+        assert_eq!(coordinator.ask_lease_store().pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_screenshot_may_adopt_zero_live_focus() {
+        // Non-focus-sensitive actions may still adopt a zero live generation.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let focused = ask_virtual_evidence();
+        let mut unfocused = ask_virtual_evidence();
+        unfocused.focus_generation = 0;
+        let queue = vec![focused, unfocused.clone(), unfocused.clone(), unfocused];
+        let adapter = FakeTargetEvidenceAdapter::with_queue(BackendKind::VirtualDisplay, queue);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        assert!(coordinator.focus_generation().0 > 0);
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-shot-live-unfocused",
+                &[OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "screenshot must not require focus, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(authorizer.last_focus_generation(), 0);
+        assert_eq!(coordinator.focus_generation().0, 0);
+    }
+
+    #[tokio::test]
     async fn computer_action_sensitive_content_absent_from_durable_sinks() {
         // Sensitive typed text may reach the backend but is absent from the
         // CoordinatedOutcome, the sanitized screenshot projection, and the
@@ -11002,6 +11223,187 @@ mod tests {
         assert!(store.try_consume(&key));
         assert!(!store.has_lease(&key));
         assert!(!store.try_consume(&key));
+    }
+
+    #[test]
+    fn computer_ask_lease_store_bulk_revoke_selects_pending_only_keys() {
+        let session = "session-1";
+        let delegation = DelegationId("delegation-1".to_string());
+        let other_delegation = DelegationId("delegation-2".to_string());
+
+        let mut store = AskDelegationLeaseStore::new();
+        let pending_only = fixture_ask_lease_key([0xAA; 16], "payload-pending");
+        let v1 = store.begin_approval_wait(&pending_only);
+        assert_eq!(store.pending_len(), 1);
+        assert_eq!(store.len(), 0);
+        assert!(
+            store.revoke(&pending_only),
+            "pending-only revoke must count"
+        );
+        assert_eq!(store.pending_len(), 0);
+        let v2 = store.begin_approval_wait(&pending_only);
+        assert_ne!(v2, v1, "re-entry after revoke must mint a fresh version");
+
+        let installed = fixture_ask_lease_key([0xAA; 16], "payload-installed");
+        let other = AskLeaseKey {
+            session_id: session.to_string(),
+            delegation_id: other_delegation.clone(),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            target_key: LeaseTargetKey::Virtual([0xAA; 16]),
+            host_lease_generation: None,
+            display_generation: 1,
+            focus_generation: 1,
+            action_payload_digest: "payload-other".to_string(),
+        };
+        let installed_v = store.begin_approval_wait(&installed);
+        assert_eq!(
+            store.install(&installed, installed_v, 1),
+            AskAuthorizationOutcome::Installed
+        );
+        let _ = store.begin_approval_wait(&other);
+        assert_eq!(store.pending_len(), 2);
+        assert_eq!(store.len(), 1);
+
+        let revoked = store.revoke_for_delegation(session, &delegation);
+        assert_eq!(revoked, 2, "installed + pending-only for this delegation");
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.pending_len(), 1);
+        assert!(
+            store.pending_version(&other).is_some(),
+            "pending waits for other delegations must survive"
+        );
+
+        let mut host_pending = fixture_ask_lease_key([0xAA; 16], "payload-host");
+        host_pending.target_key = LeaseTargetKey::Physical(physical_key());
+        host_pending.host_lease_generation = Some(LeaseGeneration(1));
+        let _ = store.begin_approval_wait(&host_pending);
+        assert_eq!(
+            store.revoke_on_host_generation_change(&physical_key(), LeaseGeneration(2)),
+            1
+        );
+        assert_eq!(store.pending_version(&host_pending), None);
+
+        let mut display_pending = fixture_ask_lease_key([0xBB; 16], "payload-display");
+        display_pending.display_generation = 1;
+        let _ = store.begin_approval_wait(&display_pending);
+        assert_eq!(
+            store.revoke_on_display_generation_change(session, &delegation, 2),
+            1
+        );
+        assert_eq!(store.pending_version(&display_pending), None);
+    }
+
+    #[test]
+    fn computer_ask_lease_store_denial_revokes_all_pending_for_delegation() {
+        let mut store = AskDelegationLeaseStore::new();
+        let denied = fixture_ask_lease_key([0xAA; 16], "payload-a");
+        let sibling = fixture_ask_lease_key([0xAA; 16], "payload-b");
+        let _ = store.begin_approval_wait(&denied);
+        let _ = store.begin_approval_wait(&sibling);
+        assert_eq!(store.pending_len(), 2);
+        assert_eq!(
+            store.record_denial(&denied),
+            AskAuthorizationOutcome::Denied {
+                reason: "human denied computer action".to_string(),
+            }
+        );
+        assert_eq!(store.pending_len(), 0);
+        assert_eq!(store.begin_approval_wait(&sibling), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_blocked_cancel_mints_fresh_pending_version() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-block-1", &screenshot)
+                .await,
+            CoordinatedOutcome::CancelledBeforeDispatch
+        ));
+        assert_eq!(coordinator.ask_lease_store().pending_len(), 1);
+        let key = coordinator
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &screenshot_backend_actions(),
+                coordinator.focus_generation().0,
+            )
+            .unwrap();
+        let v1 = coordinator
+            .ask_lease_store()
+            .pending_version(&key)
+            .expect("pending wait after AskBlocked");
+
+        coordinator.cancel_before_dispatch("call-block-1");
+        assert_eq!(
+            coordinator.ask_lease_store().pending_len(),
+            0,
+            "cancel after AskBlocked must withdraw the pending wait"
+        );
+
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-block-2", &screenshot)
+                .await,
+            CoordinatedOutcome::CancelledBeforeDispatch
+        ));
+        let v2 = coordinator
+            .ask_lease_store()
+            .pending_version(&key)
+            .expect("new pending wait after re-entry");
+        assert_ne!(
+            v2, v1,
+            "re-entry must not reuse the cancelled approval version"
+        );
+        assert_eq!(authorizer.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_blocked_bulk_revoke_clears_pending_only_keys() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-shot-block", &[OpenAiComputerAction::Screenshot])
+                .await,
+            CoordinatedOutcome::CancelledBeforeDispatch
+        ));
+        let move_action = vec![OpenAiComputerAction::Move {
+            to: Point {
+                x: 10.0,
+                y: 20.0,
+                space: CoordinateSpace::Physical,
+            },
+        }];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-move-block", &move_action)
+                .await,
+            CoordinatedOutcome::CancelledBeforeDispatch
+        ));
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+        assert_eq!(
+            coordinator.ask_lease_store().pending_len(),
+            2,
+            "distinct blocked payloads must not share one pending key"
+        );
+
+        let revoked = coordinator.revoke_ask_lease_for_delegation();
+        assert_eq!(revoked, 2);
+        assert_eq!(coordinator.ask_lease_store().pending_len(), 0);
+
+        coordinator.close().await.expect("close");
+        assert_eq!(coordinator.ask_lease_store().pending_len(), 0);
     }
 
     // =====================================================================

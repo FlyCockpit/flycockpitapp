@@ -9749,6 +9749,138 @@ mod tests {
             "call-delivered-ctrl-pageup",
         )
         .await;
+        assert_identity_lost_after_chord(
+            &mut coordinator,
+            authorizer.as_ref(),
+            vec!["ctrl", "d"],
+            "call-delivered-ctrl-d",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_delivered_non_enter_hold() {
+        // Issue #289: delivered non-Enter holds are identity-changing; ctrl+c
+        // must not restore commits afterward.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_anthropic_20251124_call(
+                "call-hold-a",
+                &Anthropic20251124ComputerAction::HoldKey {
+                    key: "a".to_string(),
+                    duration: Duration::from_millis(10),
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "non-Enter hold stays usable: {outcome:?}"
+        );
+
+        let authorized_before_enter = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!("a non-Enter hold must leave the receiver unproven, got {other:?}"),
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "the refusal must name the unproven receiver: {:?}",
+            failure.error
+        );
+        assert_eq!(
+            authorizer.call_count(),
+            authorized_before_enter,
+            "the refusal must precede authorization"
+        );
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-after",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => {
+                panic!("ctrl+c must not restore commits after a non-Enter hold, got {other:?}")
+            }
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not rebind an unproven receiver: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_enter_hold_commits_when_identity_preserved() {
+        // Enter holds must still commit through the same choke point as bare Enter.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-enter-hold-type",
+                &vec![OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-enter-hold-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_anthropic_20251124_call(
+                "call-enter-hold",
+                &Anthropic20251124ComputerAction::HoldKey {
+                    key: "enter".to_string(),
+                    duration: Duration::from_millis(10),
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "an Enter hold must commit a proven empty line: {outcome:?}"
+        );
     }
 
     #[tokio::test]

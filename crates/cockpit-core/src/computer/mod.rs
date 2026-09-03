@@ -431,12 +431,30 @@ fn key_is_function(key: &KeyCode) -> bool {
 }
 
 /// Minimal control-family chords that edit the focused receiver's line
-/// without moving keyboard focus. Deliberately excludes multiplexer and
-/// flow-control prefixes (`ctrl+a` GNU screen, `ctrl+b` tmux, `ctrl+z`
-/// suspend, `ctrl+s`/`ctrl+q` flow control, `ctrl+space`/`ctrl+@`) and
-/// any other chord not on this list (issue #289).
+/// without moving keyboard focus (issue #289).
+///
+/// Members and why each is safe:
+/// - `C`: aborts/intruits the foreground line (readline `SIGINT` binding);
+///   does not close the shell tab/pane/window.
+/// - `J`/`M`: line feed/carriage return the terminal treats as Enter on the
+///   same receiver.
+/// - `E`: end-of-line cursor motion (readline).
+/// - `L`: clear screen within the same shell session.
+/// - `U`: kill line backward (readline).
+/// - `W`: delete word backward (readline).
+/// - `R`: reverse-search history within the same shell.
+///
+/// Deliberately excluded:
+/// - `D`: EOF on an empty line exits the shell; every audited terminal
+///   closes the tab/pane/window on shell exit, moving keyboard focus.
+/// - `Z`: suspend (`SIGTSTP`); excluded even though it does not move focus.
+/// - `\`: quit (`SIGQUIT`); not on this list.
+/// - `A`/`B`: GNU screen / tmux multiplexer prefixes.
+/// - `S`/`Q`: XON/XOFF flow control.
+/// - space/`@`: multiplexer/window-manager bindings.
+/// Any other control chord is identity-changing by construction.
 fn control_plain_key_preserves_receiver_identity(plain: &str) -> bool {
-    matches!(plain, "C" | "J" | "M" | "D" | "E" | "L" | "U" | "W" | "R")
+    matches!(plain, "C" | "J" | "M" | "E" | "L" | "U" | "W" | "R")
 }
 
 /// True when one key press stays inside the focused receiver's line
@@ -1169,9 +1187,10 @@ impl TypedInputLineModel {
                 "J" | "M" => self.commit_pending()?,
                 // `ctrl+v` is paste and is refused by the per-action policy;
                 // every other control combination on the preserving allowlist
-                // (`ctrl+w`, `ctrl+d`, ...) edits the line in ways this model
-                // cannot represent; multiplexer prefixes (`ctrl+a`, `ctrl+b`,
-                // ...) are identity-changing and were already unproven above.
+                // (`ctrl+w`, `ctrl+u`, ...) edits the line in ways this model
+                // cannot represent; `ctrl+d` (EOF/shell exit) and multiplexer
+                // prefixes (`ctrl+a`, `ctrl+b`, ...) are identity-changing and
+                // were already unproven above.
                 _ => self.untracked = true,
             }
             return Ok(());
@@ -8316,6 +8335,7 @@ mod tests {
             chord(&["shift", "ARROWLEFT"]),
             chord(&["shift", "ARROWRIGHT"]),
             chord(&["ctrl", "a"]),
+            chord(&["ctrl", "d"]),
             chord(&["shift", "F10"]),
             chord(&["PRINTSCREEN"]),
         ] {
@@ -8388,6 +8408,7 @@ mod tests {
             "ARROWLEFT"
         ])));
         assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "a"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "d"])));
         assert!(!chord_preserves_receiver_identity(&chord(&[
             "shift", "F10"
         ])));
@@ -8399,6 +8420,82 @@ mod tests {
         assert!(chord_preserves_receiver_identity(&chord(&["ARROWLEFT"])));
         assert!(chord_preserves_receiver_identity(&chord(&["enter"])));
         assert!(chord_preserves_receiver_identity(&chord(&["shift", "H"])));
+    }
+
+    #[test]
+    fn typed_line_model_unproves_receiver_on_non_enter_hold() {
+        // Issue #289: every HoldKey except Enter is identity-changing because
+        // auto-repeat makes delivered press counts uncertain.
+        let enter = ComputerAction::KeyChord {
+            chord: chord(&["enter"]),
+        };
+        let cancel = ComputerAction::KeyChord {
+            chord: chord(&["ctrl", "c"]),
+        };
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "# note".to_string(),
+            })
+            .expect("typing dispatches");
+        model
+            .absorb_action(&ComputerAction::HoldKey {
+                key: KeyCode::parse("A").unwrap(),
+                duration: Duration::from_millis(10),
+            })
+            .expect("non-Enter holds still dispatch");
+        let error = model
+            .absorb_action(&enter)
+            .expect_err("a non-Enter hold must leave the receiver unproven");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "the refusal must name the unproven receiver, got {error:?}"
+        );
+        model
+            .absorb_action(&cancel)
+            .expect("ctrl+c still cancels the currently focused line");
+        let error = model
+            .absorb_action(&enter)
+            .expect_err("ctrl+c must not restore commits after a non-Enter hold");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not rebind an unproven receiver, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn typed_line_model_enter_hold_commits_through_choke_point() {
+        // Enter holds must still funnel through commit_pending like bare Enter.
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "hello".to_string(),
+            })
+            .expect("typing dispatches");
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["ctrl", "c"]),
+            })
+            .expect("ctrl+c provably cancels the receiver's line");
+        model
+            .absorb_action(&ComputerAction::HoldKey {
+                key: KeyCode::parse("ENTER").unwrap(),
+                duration: Duration::from_millis(10),
+            })
+            .expect("an Enter hold commits a proven empty line");
+    }
+
+    #[test]
+    fn held_key_preserves_receiver_identity_matches_enter_only() {
+        assert!(held_key_preserves_receiver_identity(
+            &KeyCode::parse("ENTER").unwrap()
+        ));
+        assert!(!held_key_preserves_receiver_identity(
+            &KeyCode::parse("A").unwrap()
+        ));
+        assert!(!held_key_preserves_receiver_identity(
+            &KeyCode::parse("ARROWLEFT").unwrap()
+        ));
     }
 
     #[test]

@@ -218,6 +218,11 @@ pub enum DriverControl {
     Pin {
         text: String,
     },
+    /// Promote a conversation rule into the resolved instructions file.
+    /// Fire-and-ack: the RPC returns immediately; completion arrives as a Notice.
+    PromoteConversationRule {
+        rule_id: uuid::Uuid,
+    },
     /// Explicitly opt into synthetic resume repair for a Responses session
     /// that strict replay opened read-only. The original transcript is not
     /// mutated; only the live root history is populated with the healed replay.
@@ -6514,6 +6519,9 @@ impl Driver {
             }
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);
+            }
+            DriverControl::PromoteConversationRule { rule_id } => {
+                self.do_promote_conversation_rule(rule_id, tx).await;
             }
             DriverControl::RepairResume {
                 root_agent,

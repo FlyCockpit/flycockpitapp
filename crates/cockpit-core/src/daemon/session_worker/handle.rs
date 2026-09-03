@@ -2619,6 +2619,11 @@ pub enum SessionWork {
     Pin {
         text: String,
     },
+    /// Promote a conversation rule into the resolved instructions file via a
+    /// write-scoped builder subagent. Fire-and-ack: completion is a Notice.
+    PromoteConversationRule {
+        rule_id: Uuid,
+    },
     Shutdown {
         pause_for_resume: bool,
     },

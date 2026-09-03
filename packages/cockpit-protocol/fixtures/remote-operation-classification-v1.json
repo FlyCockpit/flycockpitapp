@@ -606,6 +606,91 @@
       "tag": "pinned_message_state"
     },
     {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|rule_id:option<uuid>|text:string|source_trust:option<string>",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        },
+        {
+          "field": "rule_id",
+          "role": "param",
+          "type": "Option<Uuid>"
+        },
+        {
+          "field": "text",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "source_trust",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid|rule_id:Option<Uuid>|text:String|source_trust:Option<String>",
+      "strategy": "sql_transaction",
+      "tag": "set_conversation_rule"
+    },
+    {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|rule_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        },
+        {
+          "field": "rule_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid|rule_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "remove_conversation_rule"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "list_conversation_rules"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|rule_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        },
+        {
+          "field": "rule_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid|rule_id:Uuid",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "promote_conversation_rule"
+    },
+    {
       "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "disposition:string|record_id:option<string>|name:option<string>|description:option<string>|scope_kind:option<string>|scope_key:option<string>",

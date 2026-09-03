@@ -5852,7 +5852,8 @@ fn reject_unstarted_startup_work(work: SessionWork) {
         | SessionWork::CancelAll
         | SessionWork::Prune
         | SessionWork::Compact
-        | SessionWork::Pin { .. } => {}
+        | SessionWork::Pin { .. }
+        | SessionWork::PromoteConversationRule { .. } => {}
     }
 }
 
@@ -13810,6 +13811,21 @@ pub(super) async fn run_worker(
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::Pin { text },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::PromoteConversationRule { rule_id } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::PromoteConversationRule { rule_id },
                         &event_tx,
                         &turn_completions,
                         &redaction,

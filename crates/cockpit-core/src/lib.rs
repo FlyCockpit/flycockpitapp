@@ -26,6 +26,7 @@ pub mod capabilities;
 pub use cockpit_config as config;
 pub mod computer;
 pub mod container;
+pub mod conversation_rules;
 pub mod credentials;
 pub mod daemon;
 pub mod diagnostics;

@@ -438,6 +438,9 @@ fn careful_def() -> AgentDef {
             "harness_invoke",
             "history_search",
             "todo",
+            "set_conversation_rule",
+            "list_conversation_rules",
+            "remove_conversation_rule",
             "webfetch",
             "websearch",
             #[cfg(feature = "extended")]

@@ -1330,6 +1330,27 @@ const requestParamSchemas = {
     })
     .strict(),
   unarchive_session: z.object({ session_id: uuidSchema }).strict(),
+  set_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema.optional(),
+      text: z.string().min(1).max(4000),
+      source_trust: z.enum(["trusted", "untrusted"]).optional(),
+    })
+    .strict(),
+  remove_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema,
+    })
+    .strict(),
+  list_conversation_rules: z.object({ session_id: uuidSchema }).strict(),
+  promote_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema,
+    })
+    .strict(),
   import_session_archive: z
     .object({
       transfer: bulkTransferRefSchema,
@@ -1485,6 +1506,10 @@ const clientRequestVariants = [
   requestVariant("share_session", requestParamSchemas.share_session),
   requestVariant("stats_rollup", requestParamSchemas.stats_rollup),
   requestVariant("unarchive_session", requestParamSchemas.unarchive_session),
+  requestVariant("set_conversation_rule", requestParamSchemas.set_conversation_rule),
+  requestVariant("remove_conversation_rule", requestParamSchemas.remove_conversation_rule),
+  requestVariant("list_conversation_rules", requestParamSchemas.list_conversation_rules),
+  requestVariant("promote_conversation_rule", requestParamSchemas.promote_conversation_rule),
 ] as const;
 
 export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnion(
@@ -3109,6 +3134,22 @@ export type ServerMessage = z.infer<typeof serverMessageSchema>;
 
 export const historyEntrySchema = historyEntryWireSchema;
 export type HistoryEntry = z.infer<typeof historyEntrySchema>;
+
+export const conversationRuleCreatedBySchema = z.enum(["user", "agent"]);
+export type ConversationRuleCreatedBy = z.infer<typeof conversationRuleCreatedBySchema>;
+export const conversationRuleSourceTrustSchema = z.enum(["trusted", "untrusted"]);
+export type ConversationRuleSourceTrust = z.infer<typeof conversationRuleSourceTrustSchema>;
+export const conversationRuleSchema = z
+  .object({
+    rule_id: uuidSchema,
+    lineage_id: uuidSchema,
+    text: z.string().min(1).max(4000),
+    created_by: conversationRuleCreatedBySchema,
+    source_trust: conversationRuleSourceTrustSchema,
+    created_at_unix_ms: safeI64NumberSchema,
+  })
+  .strict();
+export type ConversationRule = z.infer<typeof conversationRuleSchema>;
 
 export const sessionSummarySchema = z
   .object({

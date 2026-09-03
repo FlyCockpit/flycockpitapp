@@ -51,9 +51,9 @@
     }
   ],
   "counts": {
-    "event": 84,
-    "request": 235,
-    "response": 157
+    "event": 86,
+    "request": 287,
+    "response": 201
   },
   "messages": {
     "event": [
@@ -212,6 +212,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "user_message_retracted"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "user_message_removed"
       },
       {
         "class": "bounded_event",
@@ -560,6 +566,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "workspace_trust_reconciliation"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_tree_changed"
       }
     ],
     "request": [
@@ -748,6 +760,30 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "pinned_message_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_conversation_rule"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remove_conversation_rule"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_conversation_rules"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "promote_conversation_rule"
       },
       {
         "class": "bounded_request_response",
@@ -1951,6 +1987,294 @@
       },
       {
         "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "create_code_root_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "attach_existing_code_root_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "close_code_root_attachment_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "create_code_root_with_acp_ingress_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "attach_existing_code_root_with_acp_ingress_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "close_acp_code_root_attachment_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "discover_code_roots_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_code_root_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_code_root_deliveries_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "ack_code_root_deliveries_v1"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "resolve_code_root_interrupt_v1"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "attach_knowledge_base_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "detach_knowledge_base_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "knowledge_dream_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "run_knowledge_dream"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "create_declared_sealed_action"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "cancel_leak_reveal"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_app_flag"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "mark_app_flag_seen"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_storage_report"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "preview_storage_cleanup"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "execute_storage_cleanup"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "save_assistant_definition"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_assistant_inbox"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "acknowledge_assistant_inbox_human_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_agent_tree"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_agent_attention"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resolve_agent_decision"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_session_setup_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_agent_effective_settings"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "apply_agent_session_override"
+      },
+      {
+        "class": "resume_window",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "resume_from_compaction"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "apply_provider_mutation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_agent_inventory"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_agent_edit_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "mutate_agent"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "begin_agent_editor_lease"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "complete_agent_editor_lease"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_agent_editor_lease_settlement"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_extended_config_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_image_sidecar_authority_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "create_image_sidecar_grant"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "revoke_image_sidecar_grant"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "apply_extended_config_patch"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "clean_managed_workspace_lease"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_guidance_proposals"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_guidance_enablement_trace"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "review_guidance_proposal"
+      },
+      {
+        "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "agent_installation_begin"
@@ -2160,6 +2484,24 @@
         "inlinePayloadBound": "paged",
         "lane": "interactive",
         "tag": "pins_with_text"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "conversation_rules"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "conversation_rule_changed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "conversation_rule_removed"
       },
       {
         "class": "bounded_request_response",
@@ -2916,6 +3258,252 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "agent_installation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "knowledge_dream_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "knowledge_dream_runs"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_created"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_attached"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "code_root_attachment_closed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_with_acp_ingress_created"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_with_acp_ingress_attached"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "acp_code_root_attachment_closed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_roots_discovered"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "code_root_deliveries"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "code_root_deliveries_acked"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "code_root_interrupt_resolved"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "assistant_inbox"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "agent_tree_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "agent_attention_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_decision_steered"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "leak_reveal_cancelled"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "provider_mutation_committed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "app_flag"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "app_flag_seen"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "storage_report"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "storage_cleanup_preview"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "storage_cleanup_completed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "primary_assistant_soul_edit_mode"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_definition_saved"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "session_setup_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_effective_settings"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_session_override_outcome"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "extended_config_written"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "extended_config_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "image_sidecar_authority_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_sidecar_grant_mutated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "agent_inventory"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "agent_edit_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_mutated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_editor_lease_begun"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_editor_lease_completed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "guidance_proposals"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "guidance_enablement_trace"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "guidance_proposal_reviewed"
       }
     ]
   },
@@ -3231,6 +3819,126 @@
     {
       "kind": "event",
       "tag": "terminal_clipboard"
+    },
+    {
+      "kind": "request",
+      "tag": "create_code_root_v1"
+    },
+    {
+      "kind": "request",
+      "tag": "attach_existing_code_root_v1"
+    },
+    {
+      "kind": "request",
+      "tag": "create_code_root_with_acp_ingress_v1"
+    },
+    {
+      "kind": "request",
+      "tag": "attach_existing_code_root_with_acp_ingress_v1"
+    },
+    {
+      "kind": "request",
+      "tag": "resolve_code_root_interrupt_v1"
+    },
+    {
+      "kind": "request",
+      "tag": "save_assistant_definition"
+    },
+    {
+      "kind": "request",
+      "tag": "apply_provider_mutation"
+    },
+    {
+      "kind": "request",
+      "tag": "mutate_agent"
+    },
+    {
+      "kind": "request",
+      "tag": "complete_agent_editor_lease"
+    },
+    {
+      "kind": "request",
+      "tag": "apply_extended_config_patch"
+    },
+    {
+      "kind": "response",
+      "tag": "conversation_rules"
+    },
+    {
+      "kind": "response",
+      "tag": "knowledge_dream_runs"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_created"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_attached"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_with_acp_ingress_created"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_with_acp_ingress_attached"
+    },
+    {
+      "kind": "response",
+      "tag": "code_roots_discovered"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_read"
+    },
+    {
+      "kind": "response",
+      "tag": "code_root_deliveries"
+    },
+    {
+      "kind": "response",
+      "tag": "assistant_inbox"
+    },
+    {
+      "kind": "response",
+      "tag": "agent_tree_page"
+    },
+    {
+      "kind": "response",
+      "tag": "agent_attention_page"
+    },
+    {
+      "kind": "response",
+      "tag": "storage_report"
+    },
+    {
+      "kind": "response",
+      "tag": "storage_cleanup_preview"
+    },
+    {
+      "kind": "response",
+      "tag": "session_setup_snapshot"
+    },
+    {
+      "kind": "response",
+      "tag": "extended_config_snapshot"
+    },
+    {
+      "kind": "response",
+      "tag": "image_sidecar_authority_snapshot"
+    },
+    {
+      "kind": "response",
+      "tag": "agent_inventory"
+    },
+    {
+      "kind": "response",
+      "tag": "agent_edit_snapshot"
+    },
+    {
+      "kind": "response",
+      "tag": "guidance_proposals"
     }
   ],
   "unknownMessageTag": "__unknown"

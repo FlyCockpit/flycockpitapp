@@ -71,7 +71,7 @@ impl App {
     /// Open the global DB for a pin operation. `None` (with a transcript
     /// note) when the DB can't be opened — pins degrade gracefully rather
     /// than crash the TUI.
-    fn pins_socket(&mut self) -> Option<cockpit_client::ClientEndpoint> {
+    pub(super) fn pins_socket(&mut self) -> Option<cockpit_client::ClientEndpoint> {
         if self.daemon_connected {
             self.attached_daemon_endpoint()
         } else {
@@ -924,7 +924,7 @@ impl App {
 
     /// True when any modal overlay/pane currently owns the screen — pin
     /// modes don't stack on top of these.
-    fn any_overlay_open(&self) -> bool {
+    pub(super) fn any_overlay_open(&self) -> bool {
         self.dialog.is_active()
             || self.overlay.is_open()
             || self.pane.is_some()
@@ -933,6 +933,7 @@ impl App {
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
             || self.pins_review.is_some()
+            || self.rules_review.is_some()
     }
 }
 

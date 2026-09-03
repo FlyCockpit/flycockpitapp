@@ -3930,6 +3930,41 @@ CREATE TABLE pins (
 
 CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
 
+-- ---- conversation_rules --------------------------------------------------------------
+-- Lineage-scoped advisory directives. They attach to the compaction lineage
+-- root (not an individual window), are injected verbatim into every window
+-- seed, and never summarized. Distinct from `/pin` (user free-text
+-- must-survive messages); there is no silent conversion between them.
+
+CREATE TABLE conversation_rules (
+    rule_id TEXT PRIMARY KEY CHECK (
+        length(rule_id) = 36 AND rule_id = lower(rule_id)
+        AND substr(rule_id, 9, 1) = '-' AND substr(rule_id, 14, 1) = '-'
+        AND substr(rule_id, 19, 1) = '-' AND substr(rule_id, 24, 1) = '-'
+        AND length(replace(rule_id, '-', '')) = 32
+        AND replace(rule_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    -- Compaction lineage root (`sessions.compaction_lineage_root_id`, or
+    -- `session_id` for the first window). Forks mint their own root and
+    -- do not inherit these rows.
+    lineage_id TEXT NOT NULL CHECK (
+        length(lineage_id) = 36 AND lineage_id = lower(lineage_id)
+        AND substr(lineage_id, 9, 1) = '-' AND substr(lineage_id, 14, 1) = '-'
+        AND substr(lineage_id, 19, 1) = '-' AND substr(lineage_id, 24, 1) = '-'
+        AND length(replace(lineage_id, '-', '')) = 32
+        AND replace(lineage_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 4000),
+    created_by TEXT NOT NULL CHECK (created_by IN ('user', 'agent')),
+    source_trust TEXT NOT NULL CHECK (source_trust IN ('trusted', 'untrusted')),
+    created_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (lineage_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+CREATE INDEX conversation_rules_lineage_idx
+    ON conversation_rules (lineage_id, created_at_unix_ms);
+
 -- ---- prune_ledger --------------------------------------------------------------------
 -- Session resume prune-ledger: resuming must be a TRUE CONTINUATION.
 -- `session_events` stays the single source of truth for *content*; this

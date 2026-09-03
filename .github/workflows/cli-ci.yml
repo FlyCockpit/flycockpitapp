@@ -389,6 +389,25 @@ jobs:
           --features
           cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
 
+      # Off-diagonal matrix cells must be clippy-clean too: nextest does not
+      # fail on warnings, and profile-specific dead_code/unused defects only
+      # materialize when exactly one of remote/extended is enabled.
+      - name: Clippy remote-only profile matrix
+        run: >
+          cargo clippy --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
+          --tests -- -D warnings
+
+      - name: Clippy extended-only profile matrix
+        run: >
+          cargo clippy --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
+          --tests -- -D warnings
+
       # `extended` is required so cfg-gated spend-policy variants stay in the
       # request_variants! set the exhaustive classification test compares.
       # Package-specific features: tenant-authority has `remote` only,

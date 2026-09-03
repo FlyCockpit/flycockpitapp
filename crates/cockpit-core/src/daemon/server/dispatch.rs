@@ -22260,16 +22260,17 @@ fn client_operation_id_from_response(
             client_operation_id,
             ..
         }
-        | Response::ImageControlMutated(
-            cockpit_proto::image_control::ImageControlMutationResponseV1 {
-                client_operation_id,
-                ..
-            },
-        )
         | Response::AgentMutated(cockpit_proto::AgentMutationResult {
             client_operation_id,
             ..
         }) => Ok(client_operation_id.clone()),
+        #[cfg(feature = "extended")]
+        Response::ImageControlMutated(
+            cockpit_proto::image_control::ImageControlMutationResponseV1 {
+                client_operation_id,
+                ..
+            },
+        ) => Ok(client_operation_id.clone()),
         _ => Err(internal(anyhow::anyhow!(
             "local operation produced an unbound receipt"
         ))),

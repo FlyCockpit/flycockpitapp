@@ -430,28 +430,35 @@ fn key_is_function(key: &KeyCode) -> bool {
         .is_some_and(|number| (1..=12).contains(&number))
 }
 
-/// Control-family chords that edit the focused receiver's line without
-/// moving keyboard focus to a different receiver (issue #289).
+/// Minimal control-family chords that edit the focused receiver's line
+/// without moving keyboard focus. Deliberately excludes multiplexer and
+/// flow-control prefixes (`ctrl+a` GNU screen, `ctrl+b` tmux, `ctrl+z`
+/// suspend, `ctrl+s`/`ctrl+q` flow control, `ctrl+space`/`ctrl+@`) and
+/// any other chord not on this list (issue #289).
 fn control_plain_key_preserves_receiver_identity(plain: &str) -> bool {
-    matches!(
-        plain,
-        "C" | "J" | "M" | "A" | "D" | "E" | "L" | "U" | "W" | "R"
-    )
+    matches!(plain, "C" | "J" | "M" | "D" | "E" | "L" | "U" | "W" | "R")
 }
 
-/// True when one unmodified (or shift-only) key press stays inside the
-/// focused receiver's line discipline and cannot move keyboard focus to a
-/// different receiver.
+/// True when one key press stays inside the focused receiver's line
+/// discipline and cannot move keyboard focus. Only unmodified navigation
+/// keys, line-editing keys, and plain alphanumerics are allowed; shift
+/// modifies only uppercase letters. Everything else — shift+navigation,
+/// shift+function keys, bare function keys, tab/page keys, lock keys,
+/// PrintScreen/Apps/Menu, Insert/Escape, and alt/meta/super chords — is
+/// identity-changing by construction (issue #289).
 fn single_key_preserves_receiver_identity(key: &KeyCode, shift: bool) -> bool {
     if shift {
-        return !matches!(key.as_str(), "TAB" | "PAGEUP" | "PAGEDOWN");
+        let name = key.as_str();
+        return name.len() == 1
+            && name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric());
     }
     match key.as_str() {
         "ENTER" | "BACKSPACE" | "SPACE" => true,
         "ARROWUP" | "ARROWDOWN" | "ARROWLEFT" | "ARROWRIGHT" => true,
-        "HOME" | "END" | "DELETE" | "INSERT" | "ESCAPE" => true,
-        "PAGEUP" | "PAGEDOWN" => true,
-        "TAB" => false,
+        "HOME" | "END" | "DELETE" => true,
         name if name.len() == 1
             && name
                 .chars()
@@ -460,17 +467,19 @@ fn single_key_preserves_receiver_identity(key: &KeyCode, shift: bool) -> bool {
         {
             true
         }
-        _ => !key_is_function(key),
+        _ => false,
     }
 }
 
-/// Closed set of keyboard chords that cannot move keyboard focus to a
-/// different receiver. Everything else — tab-family chords, page-up/down
-/// with control or shift, alt/meta chords, function keys, window-manager
-/// chords, and multi-modifier combinations — is identity-changing.
-/// Ambiguous delivery of an identity-changing chord must mark the
-/// receiver unproven at least as conservatively as delivered delivery
-/// (issue #289).
+/// Closed positive set of keyboard chords that cannot move keyboard focus
+/// to a different receiver. Membership is explicit: typed text, the
+/// [`control_plain_key_preserves_receiver_identity`] allowlist,
+/// unmodified line-editing keys from [`single_key_preserves_receiver_identity`],
+/// and shift-only uppercase letters. Every other chord — tab-family,
+/// page-up/down, shift+navigation, function keys, alt/meta chords, and
+/// multi-modifier combinations — is identity-changing. Ambiguous delivery
+/// of an identity-changing chord must mark the receiver unproven at least
+/// as conservatively as delivered delivery (issue #289).
 fn chord_preserves_receiver_identity(chord: &CanonicalKeyChord) -> bool {
     let keys = chord.keys();
     let has_control = keys.iter().any(key_is_control);
@@ -710,8 +719,9 @@ const TERMINAL_INPUT_UNTRACKED_REFUSAL: &str = "computer use cannot press Enter 
 /// object, so it cannot restore this state (issue #289 remaining
 /// finding 2).
 const TERMINAL_INPUT_RECEIVER_UNPROVEN_REFUSAL: &str = "computer use cannot press Enter after the receiving object became unproven at launch: \
-     pointer motion, wait, scroll, or capture can change focus, and leftover text may remain in a \
-     previously focused receiver; use the run tool for shell commands instead";
+     pointer motion, wait, scroll, capture, or keyboard chords outside the identity-preserving \
+     set can change focus, and leftover text may remain in a previously focused receiver; use the \
+     run tool for shell commands instead";
 
 /// Upper bound for one `TypeText` action and for the typed-line model's
 /// pending buffer: POSIX `LINE_MAX` (4096). Bounds classifier/parser cost
@@ -1158,9 +1168,10 @@ impl TypedInputLineModel {
                 // terminal line discipline treats as Enter.
                 "J" | "M" => self.commit_pending()?,
                 // `ctrl+v` is paste and is refused by the per-action policy;
-                // every other control combination (`ctrl+a`, `ctrl+w`,
-                // `ctrl+d`, ...) edits the line in ways this model cannot
-                // represent.
+                // every other control combination on the preserving allowlist
+                // (`ctrl+w`, `ctrl+d`, ...) edits the line in ways this model
+                // cannot represent; multiplexer prefixes (`ctrl+a`, `ctrl+b`,
+                // ...) are identity-changing and were already unproven above.
                 _ => self.untracked = true,
             }
             return Ok(());
@@ -7976,14 +7987,14 @@ mod tests {
 
     #[test]
     fn typed_line_model_fails_closed_on_untracked_input() {
-        // Keys whose line effect cannot be modeled (`ctrl+a`) taint the
+        // Keys whose line effect cannot be modeled (`ctrl+w`) taint the
         // line: a later Enter is refused until a provable `ctrl+c` reset.
         let mut model = TypedInputLineModel::default();
         model
             .absorb_action(&ComputerAction::KeyChord {
-                chord: chord(&["ctrl", "a"]),
+                chord: chord(&["ctrl", "w"]),
             })
-            .expect("ctrl+a itself dispatches");
+            .expect("ctrl+w itself dispatches");
         let error = model
             .absorb_action(&ComputerAction::KeyChord {
                 chord: chord(&["enter"]),
@@ -8282,9 +8293,10 @@ mod tests {
 
     #[test]
     fn typed_line_model_unproves_receiver_on_focus_switching_chords() {
-        // Issue #289 remaining finding: tab-family and page-up/down chords
-        // can move keyboard focus. Delivered focus changes leave the
-        // receiver unproven; ctrl+c cannot restore commits.
+        // Issue #289 remaining finding: tab-family, page-up/down, Konsole
+        // shift+arrow tab chords, GNU screen's `ctrl+a` prefix, shift+F10,
+        // and PrintScreen can move keyboard focus. Delivered focus changes
+        // leave the receiver unproven; ctrl+c cannot restore commits.
         let comment = ComputerAction::TypeText {
             text: "# note".to_string(),
         };
@@ -8301,6 +8313,11 @@ mod tests {
             chord(&["ctrl", "shift", "TAB"]),
             chord(&["TAB"]),
             chord(&["alt", "TAB"]),
+            chord(&["shift", "ARROWLEFT"]),
+            chord(&["shift", "ARROWRIGHT"]),
+            chord(&["ctrl", "a"]),
+            chord(&["shift", "F10"]),
+            chord(&["PRINTSCREEN"]),
         ] {
             let mut model = TypedInputLineModel::default();
             model.absorb_action(&comment).expect("typing dispatches");
@@ -8331,9 +8348,8 @@ mod tests {
 
     #[test]
     fn typed_line_model_preserves_receiver_identity_for_line_editing_chords() {
-        // The closed identity-preserving set must not over-reach: arrows
-        // and ordinary line-editing chords stay inside the focused
-        // receiver, so a proven ctrl+c reset still allows benign commits.
+        // The closed identity-preserving set must not over-reach: unmodified
+        // arrows and a proven ctrl+c reset still allow benign commits.
         let mut model = TypedInputLineModel::default();
         model
             .absorb_action(&ComputerAction::TypeText {
@@ -8347,11 +8363,6 @@ mod tests {
                 })
                 .expect("arrow chords still dispatch");
         }
-        model
-            .absorb_action(&ComputerAction::KeyChord {
-                chord: chord(&["ctrl", "a"]),
-            })
-            .expect("ctrl+a still dispatches");
         model
             .absorb_action(&ComputerAction::KeyChord {
                 chord: chord(&["ctrl", "c"]),
@@ -8372,10 +8383,22 @@ mod tests {
         assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "TAB"])));
         assert!(!chord_preserves_receiver_identity(&chord(&["alt", "TAB"])));
         assert!(!chord_preserves_receiver_identity(&chord(&["TAB"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&[
+            "shift",
+            "ARROWLEFT"
+        ])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "a"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&[
+            "shift", "F10"
+        ])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["PRINTSCREEN"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["F10"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["APPS"])));
         assert!(chord_preserves_receiver_identity(&chord(&["ctrl", "c"])));
-        assert!(chord_preserves_receiver_identity(&chord(&["ctrl", "a"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["ctrl", "w"])));
         assert!(chord_preserves_receiver_identity(&chord(&["ARROWLEFT"])));
         assert!(chord_preserves_receiver_identity(&chord(&["enter"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["shift", "H"])));
     }
 
     #[test]

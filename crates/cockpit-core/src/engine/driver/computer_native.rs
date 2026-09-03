@@ -288,6 +288,15 @@ async fn reconcile_native_computer_for_delegation_with_opener(
         return Ok(());
     }
 
+    // Ask authorization is coordinator-owned. Capture sticky denial before
+    // `take`/`close` so a replacement for the same delegation cannot re-open
+    // a path the human already denied. Installed leases and pending waits
+    // die with `close` (fail-closed: the next action re-prompts).
+    let inherited_denial = coordinator
+        .as_ref()
+        .and_then(ComputerActionCoordinator::terminal_denial)
+        .map(str::to_string);
+
     if let Some(mut previous) = coordinator.take() {
         *contract = None;
         *coordinator_config = None;
@@ -330,7 +339,10 @@ async fn reconcile_native_computer_for_delegation_with_opener(
     }
 
     let opened = opener(agent).await?;
-    if let Some(opened) = opened {
+    if let Some(mut opened) = opened {
+        if let Some(reason) = inherited_denial {
+            opened.inherit_terminal_denial(reason);
+        }
         let opened_config = agent
             .params
             .native_computer
@@ -1194,6 +1206,75 @@ mod tests {
                 .expect("replacement coordinator closes");
             assert_eq!(reopened_releases.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_inherits_terminal_ask_denial_onto_replacement() {
+        let initial = NativeComputerToolConfig {
+            contract: ComputerToolContract::OpenAiResponses,
+            target: DisplayTarget::Virtual,
+            require_backend: false,
+            geometry: None,
+            approval_required: false,
+        };
+        let mut agent = test_agent_with_native_geometry(None);
+        agent.params.native_computer = Some(NativeComputerToolConfig {
+            approval_required: true,
+            ..initial.clone()
+        });
+        let original_releases = Arc::new(AtomicUsize::new(0));
+        let reopened_releases = Arc::new(AtomicUsize::new(0));
+        let mut coordinator =
+            Some(make_release_counting_coordinator(Arc::clone(&original_releases)).await);
+        coordinator
+            .as_mut()
+            .expect("original coordinator")
+            .inherit_terminal_denial("policy blocks".to_string());
+        let mut contract = Some(initial.contract);
+        let mut coordinator_config = Some(initial.coordinator_config());
+        let mut pending_continuations = Vec::new();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut opener: Box<
+            dyn for<'a> FnMut(
+                &'a mut Agent,
+            )
+                -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>>,
+        > = Box::new({
+            let opens = Arc::clone(&opens);
+            let reopened_releases = Arc::clone(&reopened_releases);
+            move |agent| {
+                open_release_counting_coordinator(
+                    agent,
+                    Arc::clone(&opens),
+                    Arc::clone(&reopened_releases),
+                )
+            }
+        });
+
+        reconcile_native_computer_for_delegation_with_opener(
+            &mut agent,
+            &mut coordinator,
+            &mut contract,
+            &mut coordinator_config,
+            &mut pending_continuations,
+            &mut opener,
+        )
+        .await
+        .expect("denied coordinator still reconciles");
+
+        let replacement = coordinator.as_ref().expect("replacement coordinator");
+        assert_eq!(
+            replacement.terminal_denial(),
+            Some("policy blocks"),
+            "replacement must inherit the sticky Ask denial"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        coordinator
+            .as_mut()
+            .expect("replacement coordinator")
+            .close()
+            .await
+            .expect("replacement coordinator closes");
     }
 
     fn test_agent_with_native_geometry(

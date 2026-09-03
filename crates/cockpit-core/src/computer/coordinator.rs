@@ -2670,6 +2670,62 @@ enum LeaseDrift {
 /// Leases never persist and cannot be broadened to session/project/global.
 /// Unrelated command/path/MCP/worker/session/project grants never satisfy
 /// Ask — only a matching [`AskLeaseKey`] in this store does.
+///
+/// # Completeness bound (issue #287)
+///
+/// This type is defined only in this module. Production mutation happens
+/// solely through [`ComputerActionCoordinator`]; tests may construct a store
+/// directly. The store holds three pieces of Ask authorization state:
+/// installed leases, pending waits, and sticky denials. Every enter, exit,
+/// revoke, bypass, timeout, shutdown, and re-entry maps onto one of the
+/// mutators below. The coordinator's ownership of the store is exclusive
+/// (`&mut self` on every mutating method; the driver holds
+/// `Option<ComputerActionCoordinator>`, not a shared lock), so those
+/// mutators cannot race with each other.
+///
+/// **Enter** (only [`ComputerActionCoordinator::check_ask_lease_for_dispatch`],
+/// reached from `execute_*` → `execute_actions_unscoped`):
+/// [`Self::try_consume`] (bounded reuse), [`Self::begin_approval_wait`],
+/// [`Self::install`].
+///
+/// **Exit / revoke** (single coordinator funnel
+/// [`ComputerActionCoordinator::revoke_ask_lease_for_delegation`], which
+/// calls [`Self::revoke_for_delegation`] and clears call-id wait ownership):
+/// `close`, `Drop`, `invalidate`, host-lock loss in `check_host_lease`,
+/// `mark_backend_dead` (including post-dispatch cleanup failure), and the
+/// public `revoke_ask_lease*` wrappers. Per-key
+/// [`Self::cancel_pending`] / [`Self::revoke`] withdraw one wait or lease.
+/// [`Self::record_denial`] revokes the whole delegation and sticks the deny.
+///
+/// **Bypass**: Yolo never touches this store. One-shot classes Allow without
+/// [`Self::install`]. Empty/unscopable targets fail closed before a wait.
+///
+/// **Timeout / execute abort / turn cancel**: there is no wall-clock Ask
+/// lease. Abort of the execute future is the timeout path. [`ArmedAskWaitGuard`]
+/// withdraws the pending wait on Drop unless the wait was settled or
+/// explicitly kept (`AskBlocked`). `cancel_before_dispatch` is the explicit
+/// per-call sibling of that Drop (tests and any future production cancel).
+///
+/// **Shutdown / replacement**: `close` revokes then releases the host lease.
+/// `Drop` revokes then releases (so a `take()` without `close`, including
+/// reconcile error, cannot leave Ask authority behind). Production
+/// replacement is `reconcile_native_computer_for_delegation_with_opener`,
+/// which `close`s the previous coordinator and, when it reopens the same
+/// delegation, inherits sticky denial onto the replacement. Daemon restart
+/// drops the process; the store is not durable. [`Self::clear_all`] is the
+/// in-process equivalent used by tests.
+///
+/// **Re-entry**: a matching bounded lease is consumed; an exhausted or
+/// revoked key re-prompts. A cancelled pending version is withdrawn before
+/// re-entry so a new wait mints a new approval version. Sticky denial
+/// refuses begin/install for the rest of this delegation.
+///
+/// **Store helpers that production does not call**:
+/// [`Self::revoke_on_host_generation_change`] and
+/// [`Self::revoke_on_display_generation_change`] are predicate-selective
+/// revokes covered in production by the stronger full-delegation funnel
+/// (`check_host_lease` / `invalidate` kill the coordinator). They remain
+/// for store-level tests.
 #[derive(Debug, Default)]
 pub struct AskDelegationLeaseStore {
     leases: HashMap<AskLeaseKey, AskDelegationLease>,
@@ -2680,10 +2736,11 @@ pub struct AskDelegationLeaseStore {
     next_approval_version: u64,
     /// Terminally denied `(session_id, delegation_id)` pairs. Once a human
     /// denies a delegation's computer path, no lease may be begun or installed
-    /// for it again. This is never cleared by `clear_all`/`revoke_*`: the
-    /// denial lasts the lifetime of the store, and a new delegation gets a new
-    /// coordinator (hence a new store), which is exactly the "until a new
-    /// delegation" contract.
+    /// for it again. This is never cleared by `clear_all`/`revoke_*`. The
+    /// denial lasts until a new delegation: replacing the coordinator for the
+    /// same `(session, delegation)` must call
+    /// [`ComputerActionCoordinator::inherit_terminal_denial`] so a new store
+    /// does not re-open the denied path.
     denied_delegations: std::collections::HashSet<(String, DelegationId)>,
 }
 
@@ -2877,12 +2934,19 @@ impl AskDelegationLeaseStore {
     /// installed for it. Clears every pending wait and installed lease for
     /// that delegation, not only the denied key.
     pub fn record_denial(&mut self, key: &AskLeaseKey) -> AskAuthorizationOutcome {
-        self.denied_delegations
-            .insert((key.session_id.clone(), key.delegation_id.clone()));
-        self.revoke_for_delegation(&key.session_id, &key.delegation_id);
+        self.record_denial_for_delegation(&key.session_id, &key.delegation_id);
         AskAuthorizationOutcome::Denied {
             reason: "human denied computer action".to_string(),
         }
+    }
+
+    /// Stick a terminal denial for `(session_id, delegation_id)` and revoke
+    /// every installed lease and pending wait for that pair. Used by
+    /// [`Self::record_denial`] and by coordinator replacement inherit.
+    pub fn record_denial_for_delegation(&mut self, session_id: &str, delegation_id: &DelegationId) {
+        self.denied_delegations
+            .insert((session_id.to_string(), delegation_id.clone()));
+        self.revoke_for_delegation(session_id, delegation_id);
     }
 
     /// Cancel a pending approval wait before install. The answer is discarded
@@ -3551,6 +3615,12 @@ pub struct ComputerActionCoordinator {
 
 impl Drop for ComputerActionCoordinator {
     fn drop(&mut self) {
+        // Same Ask-authorization funnel as `close`: a `take()` without
+        // `close` (reconcile error, frame drop, task abort) must not leave
+        // installed leases or pending waits observable on a later re-open.
+        // Sticky denial is store-owned and dies with this coordinator; the
+        // replacement path inherits it before this Drop runs.
+        self.revoke_ask_lease_for_delegation();
         self.host_effect_cancel.cancel();
         if let Err(error) = self.release_input_before_host_lease() {
             // A failed neutralization must never be followed by a normal
@@ -4275,20 +4345,11 @@ impl ComputerActionCoordinator {
         let report: ComputerBatchReport =
             execute_backend_batch(self.backend.as_mut(), actions).await;
         let cleanup_failure = self.neutralize_input_under_host_lease().err();
-        if let Some(error) = &cleanup_failure {
+        if cleanup_failure.is_some() {
             // Input neutralization failed after backend dispatch. Fence this
-            // coordinator immediately; retry cleanup while it still owns the
-            // lease, and hand the lease off only if that retry succeeds.
-            self.backend_dead = true;
-            self.host_effect_cancel.cancel();
-            self.revoke_ask_lease_for_delegation();
-            if let Err(retry_error) = self.release_input_before_host_lease() {
-                tracing::error!(
-                    error = %retry_error,
-                    initial_error = %error,
-                    "computer terminal input cleanup failed; retaining host lease"
-                );
-            }
+            // coordinator through the same backend-death funnel as an explicit
+            // `mark_backend_dead` so Ask authorization is revoked once.
+            self.mark_backend_dead();
         }
         let effective_failure = report.failure.clone().or_else(|| {
             cleanup_failure.map(|error| ComputerFailure {
@@ -4653,7 +4714,32 @@ impl ComputerActionCoordinator {
             action_payload_digest: canonical_computer_action_payload_digest(actions),
         })
     }
+}
 
+/// Abort-safe owner of one in-flight Ask approval wait.
+///
+/// Armed after `begin_approval_wait`. Drop withdraws the pending wait and
+/// call-id ownership unless the wait was settled or explicitly kept
+/// (`AskBlocked`). This is the production timeout / turn-cancel / task-abort
+/// path: those events drop the execute future and do not call
+/// `cancel_before_dispatch`.
+struct ArmedAskWaitGuard<'a> {
+    coordinator: &'a mut ComputerActionCoordinator,
+    key: AskLeaseKey,
+    keep_pending: bool,
+}
+
+impl Drop for ArmedAskWaitGuard<'_> {
+    fn drop(&mut self) {
+        if self.keep_pending {
+            return;
+        }
+        self.coordinator.ask_lease_store.cancel_pending(&self.key);
+        self.coordinator.forget_ask_wait_for_key(&self.key);
+    }
+}
+
+impl ComputerActionCoordinator {
     /// Check whether dispatch is authorized for the Ask tier. Dispatch
     /// requires both a current Ask delegation lease (Ask only) and the
     /// coordinator's current host/virtual input lease.
@@ -4767,13 +4853,29 @@ impl ComputerActionCoordinator {
 
         // Begin an approval wait and authorize (raises the human prompt).
         let approval_version = self.ask_lease_store.begin_approval_wait(&lease_key);
-        if approval_version != 0 {
-            self.ask_wait_by_call
-                .insert(call_id.to_string(), lease_key.clone());
+        if approval_version == 0 {
+            // Sticky store denial: do not prompt, do not dispatch.
+            self.dispatch_states
+                .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+            let reason = self
+                .denied
+                .clone()
+                .unwrap_or_else(|| "human denied computer action".to_string());
+            return Err(CoordinatedOutcome::Denied { reason });
         }
+        self.ask_wait_by_call
+            .insert(call_id.to_string(), lease_key.clone());
+        let mut ask_wait = ArmedAskWaitGuard {
+            coordinator: self,
+            key: lease_key.clone(),
+            keep_pending: false,
+        };
 
         // Authorize through the central authorizer (raises the human prompt).
-        match self
+        // All subsequent coordinator access goes through `ask_wait` so Drop
+        // can withdraw the pending wait if this future is aborted.
+        match ask_wait
+            .coordinator
             .authorize_action(
                 call_id,
                 action_label,
@@ -4785,7 +4887,10 @@ impl ComputerActionCoordinator {
             Ok(ComputerAuthorizationDecision::Allow) => {
                 // Re-verify live currency AFTER the human answers Allow and
                 // BEFORE install. Two drift classes have different outcomes.
-                match self.recompute_live_lease_key(host_present_pre_await, actions) {
+                match ask_wait
+                    .coordinator
+                    .recompute_live_lease_key(host_present_pre_await, actions)
+                {
                     Ok(fresh_key) if fresh_key == lease_key => {
                         // Currency verified — the live target, focus, and
                         // payload still match the key this Allow was bound to.
@@ -4794,27 +4899,33 @@ impl ComputerActionCoordinator {
                                 // Destructive/credential (and other non-retry-
                                 // safe) classes: this Allow covers only the
                                 // current action. Do not install a lease.
-                                self.ask_lease_store.cancel_pending(&lease_key);
-                                self.forget_ask_wait_for_key(&lease_key);
+                                ask_wait
+                                    .coordinator
+                                    .ask_lease_store
+                                    .cancel_pending(&lease_key);
+                                ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                ask_wait.keep_pending = true;
                                 Ok(())
                             }
                             AskLeasePolicy::Bounded { remaining_uses } => {
-                                match self.ask_lease_store.install(
+                                match ask_wait.coordinator.ask_lease_store.install(
                                     &lease_key,
                                     approval_version,
                                     remaining_uses,
                                 ) {
                                     AskAuthorizationOutcome::Installed
                                     | AskAuthorizationOutcome::ReusedExisting => {
-                                        self.forget_ask_wait_for_key(&lease_key);
+                                        ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                        ask_wait.keep_pending = true;
                                         Ok(())
                                     }
                                     AskAuthorizationOutcome::StaleAnswerDiscarded => {
                                         // A newer approval wait superseded this one. The
                                         // answer is discarded; a new decision is
                                         // required before another action.
-                                        self.forget_ask_wait_for_key(&lease_key);
-                                        self.dispatch_states.insert(
+                                        ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                        ask_wait.keep_pending = true;
+                                        ask_wait.coordinator.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
                                         );
@@ -4824,9 +4935,10 @@ impl ComputerActionCoordinator {
                                         Err(outcome)
                                     }
                                     AskAuthorizationOutcome::Denied { reason } => {
-                                        self.denied = Some(reason.clone());
-                                        self.ask_wait_by_call.clear();
-                                        self.dispatch_states.insert(
+                                        ask_wait.coordinator.denied = Some(reason.clone());
+                                        ask_wait.coordinator.ask_wait_by_call.clear();
+                                        ask_wait.keep_pending = true;
+                                        ask_wait.coordinator.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
                                         );
@@ -4835,8 +4947,9 @@ impl ComputerActionCoordinator {
                                     }
                                     AskAuthorizationOutcome::CancelledBeforeInstall
                                     | AskAuthorizationOutcome::Pending => {
-                                        self.forget_ask_wait_for_key(&lease_key);
-                                        self.dispatch_states.insert(
+                                        ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                        ask_wait.keep_pending = true;
+                                        ask_wait.coordinator.dispatch_states.insert(
                                             call_id.to_string(),
                                             DispatchState::CancelledBeforeDispatch,
                                         );
@@ -4851,7 +4964,10 @@ impl ComputerActionCoordinator {
                         // The live identity no longer matches the pinned open
                         // display (e.g. the virtual UUID changed while waiting).
                         // Non-sticky discard; the next action re-prompts.
-                        Err(self.discard_answer_nonsticky(call_id, &lease_key))
+                        ask_wait.keep_pending = true;
+                        Err(ask_wait
+                            .coordinator
+                            .discard_answer_nonsticky(call_id, &lease_key))
                     }
                     Err(LeaseDrift::HostLease) => {
                         // The physical host lease was lost or its generation was
@@ -4862,9 +4978,15 @@ impl ComputerActionCoordinator {
                         // cannot restore a physical target that is no longer
                         // held, so every later call returns `Invalidated`
                         // without consulting the authorizer again.
-                        self.ask_lease_store.cancel_pending(&lease_key);
-                        self.forget_ask_wait_for_key(&lease_key);
-                        self.dispatch_states
+                        ask_wait
+                            .coordinator
+                            .ask_lease_store
+                            .cancel_pending(&lease_key);
+                        ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                        ask_wait.keep_pending = true;
+                        ask_wait
+                            .coordinator
+                            .dispatch_states
                             .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                         let outcome = CoordinatedOutcome::Invalidated {
                             reason: TargetUnavailableReason::StaleTarget,
@@ -4875,7 +4997,10 @@ impl ComputerActionCoordinator {
                         // Focus-generation or virtual-UUID drift. Non-sticky
                         // discard; the coordinator stays live and the next
                         // action re-prompts the authorizer.
-                        Err(self.discard_answer_nonsticky(call_id, &lease_key))
+                        ask_wait.keep_pending = true;
+                        Err(ask_wait
+                            .coordinator
+                            .discard_answer_nonsticky(call_id, &lease_key))
                     }
                 }
             }
@@ -4883,10 +5008,16 @@ impl ComputerActionCoordinator {
                 // Denial terminates that delegation's computer path
                 // permanently: record it on the coordinator (checked by every
                 // execute_* entry point) and in the store's sticky denied set.
-                self.denied = Some(reason.clone());
-                self.ask_lease_store.record_denial(&lease_key);
-                self.ask_wait_by_call.clear();
-                self.dispatch_states
+                ask_wait.coordinator.denied = Some(reason.clone());
+                ask_wait
+                    .coordinator
+                    .ask_lease_store
+                    .record_denial(&lease_key);
+                ask_wait.coordinator.ask_wait_by_call.clear();
+                ask_wait.keep_pending = true;
+                ask_wait
+                    .coordinator
+                    .dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::Denied { reason };
                 Err(outcome)
@@ -4896,13 +5027,20 @@ impl ComputerActionCoordinator {
                 // action is not dispatched. The pending wait remains so a
                 // subsequent approval on this exact key can share the wait,
                 // until a revocation boundary (cancel, close, invalidate,
-                // generation change) selects that pending entry directly.
-                self.dispatch_states
+                // generation change, execute abort after this return) selects
+                // that pending entry directly.
+                ask_wait.keep_pending = true;
+                ask_wait
+                    .coordinator
+                    .dispatch_states
                     .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
                 Err(outcome)
             }
             Err(err) => {
+                // Leave `ask_wait` armed: Drop withdraws the pending wait so
+                // an authorizer failure cannot be reused as a live approval
+                // version on re-entry.
                 let outcome = CoordinatedOutcome::Failed {
                     failure: ComputerFailure {
                         index: 0,
@@ -5069,6 +5207,24 @@ impl ComputerActionCoordinator {
     /// The model ID for this coordinator's delegation.
     pub fn model_id(&self) -> &ModelId {
         &self.model_id
+    }
+
+    /// Sticky human-denial reason for this coordinator, if the computer path
+    /// has been terminally denied. Production replacement reads this before
+    /// `close` so the new coordinator can inherit the denial.
+    pub(crate) fn terminal_denial(&self) -> Option<&str> {
+        self.denied.as_deref()
+    }
+
+    /// Re-stick a human denial onto a replacement coordinator for the same
+    /// `(session, delegation)`. Installed leases and pending waits on this
+    /// store are revoked. Subsequent `execute_*` returns `Denied` without
+    /// prompting.
+    pub(crate) fn inherit_terminal_denial(&mut self, reason: String) {
+        self.denied = Some(reason);
+        self.ask_wait_by_call.clear();
+        self.ask_lease_store
+            .record_denial_for_delegation(&self.session_id, &self.delegation_id);
     }
 
     /// Revoke every Ask lease for this coordinator's delegation. Payload-
@@ -11477,6 +11633,141 @@ mod tests {
 
         coordinator.close().await.expect("close");
         assert_eq!(coordinator.ask_lease_store().pending_len(), 0);
+    }
+
+    struct FailingComputerAuthorizer;
+
+    #[async_trait::async_trait]
+    impl ComputerAuthorizer for FailingComputerAuthorizer {
+        async fn authorize(
+            &self,
+            _request: &ComputerActionAuthorization,
+        ) -> Result<ComputerAuthorizationDecision, ComputerError> {
+            Err(ComputerError::Refused("authorizer unavailable".to_string()))
+        }
+    }
+
+    struct HangComputerAuthorizer {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerAuthorizer for HangComputerAuthorizer {
+        async fn authorize(
+            &self,
+            _request: &ComputerActionAuthorization,
+        ) -> Result<ComputerAuthorizationDecision, ComputerError> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("hang authorizer must not complete")
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_ask_authorizer_error_withdraws_pending_wait() {
+        let authorizer: Arc<dyn ComputerAuthorizer> = Arc::new(FailingComputerAuthorizer);
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-fail", &screenshot)
+                .await,
+            CoordinatedOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            coordinator.ask_lease_store().pending_len(),
+            0,
+            "authorizer error must not leave a reusable pending wait"
+        );
+
+        let allow = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_ask_coordinator_params(allow.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-retry", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(allow.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_aborted_execute_withdraws_pending_wait() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authorizer: Arc<dyn ComputerAuthorizer> = Arc::new(HangComputerAuthorizer {
+            started: Arc::clone(&started),
+        });
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        let mut exec = std::pin::pin!(coordinator.execute_openai_call("call-hang", &screenshot));
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            match std::future::Future::poll(exec.as_mut(), &mut cx) {
+                std::task::Poll::Ready(_) => {
+                    panic!("hang authorizer must not complete")
+                }
+                std::task::Poll::Pending => {
+                    if started.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            "abort test must reach the in-flight authorize wait"
+        );
+        drop(exec);
+        assert_eq!(
+            coordinator.ask_lease_store().pending_len(),
+            0,
+            "dropping the execute future must withdraw the pending wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_ask_replacement_inherits_terminal_denial() {
+        let deny = Arc::new(FakeComputerAuthorizer::always_deny("policy blocks"));
+        let params = make_ask_coordinator_params(deny.clone(), "openai", "gpt-5");
+        let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            first.execute_openai_call("call-1", &screenshot).await,
+            CoordinatedOutcome::Denied { .. }
+        ));
+        let reason = first
+            .terminal_denial()
+            .expect("denial recorded")
+            .to_string();
+        first.close().await.expect("close");
+
+        let allow = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_ask_coordinator_params(allow.clone(), "openai", "gpt-5");
+        let mut second = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("replacement coordinator");
+        second.inherit_terminal_denial(reason);
+        assert!(matches!(
+            second.execute_openai_call("call-2", &screenshot).await,
+            CoordinatedOutcome::Denied { .. }
+        ));
+        assert_eq!(allow.call_count(), 0, "inherited denial must not re-prompt");
+        assert_eq!(second.ask_lease_store().pending_len(), 0);
+        assert_eq!(second.ask_lease_store().len(), 0);
     }
 
     // =====================================================================

@@ -472,14 +472,22 @@ fn chord_is_paste(chord: &CanonicalKeyChord) -> bool {
 /// options, any tier above `Ordinary`, and any known command program are
 /// all refused.
 ///
-/// The deliberately kept boundary: an `Ordinary` simple command whose
-/// program name is **unknown to policy** passes, because no text-only
-/// signal distinguishes it from prose ("hello world" parses as the
-/// program `hello`) — the run tool would prompt for it, but deciding
-/// what unknown typed text *means* requires the structured
-/// terminal-model follow-up (issue #289's recorded owner decision to
-/// block rather than route through command approval). No second text
-/// heuristic is added here.
+/// This is the **typing** layer of a two-layer fence (issue #289, review
+/// cycle 2). It refuses text that is *unambiguously* command input, which
+/// is why an `Ordinary` simple command whose program name is unknown to
+/// policy passes: no text-only signal distinguishes it from prose
+/// ("hello world" parses as the program `hello`), and refusing every
+/// parseable word sequence would end typed prose entirely. The one
+/// exception — a program token carrying a path separator — is an
+/// executable-path invocation, not prose, and is refused here (review
+/// cycle 2, finding 1). The **execution** of everything else unknown is
+/// fenced at commit time by [`TypedInputLineModel`]: an Enter that would
+/// submit any line parsing as a runnable command — known program,
+/// unknown program, `./payload`, or a renamed executable — is refused
+/// there, because an unknown executable is still an executable and the
+/// run tool would prompt for it too. A URL-shaped program token is the
+/// one parseable exception at both layers (a path with an empty
+/// component cannot be exec'd), so browser navigation stays usable.
 fn typed_text_is_terminal_command(text: &str) -> bool {
     classification_carries_terminal_command(&crate::approval::classify::classify(text))
         || classification_carries_terminal_command(&crate::approval::classify::classify_bash(text))
@@ -511,6 +519,38 @@ fn classification_carries_terminal_command(
         })
 }
 
+/// Whether a classification is a line a receiving shell would **execute**:
+/// any compound structure or any simple command whose program token is
+/// not a web address, regardless of program knownness. This is the
+/// commit-layer predicate (review cycle 2, finding 1): an unknown
+/// executable is still an executable — `my-company-deployer production`
+/// runs in a terminal even though its name matches no policy table — and
+/// the run tool prompts for unknown programs just like known ones. A
+/// URL-shaped program token (`://`) is the one parseable exception: a
+/// path with an empty component cannot be exec'd, so `https://example.com`
+/// alone executes nothing in a shell and typing it into a browser address
+/// bar stays usable; compound structure around it (pipes, substitutions,
+/// redirects) still refuses. Prose that happens to parse as a command
+/// word sequence is the accepted false positive: refusing costs typing
+/// convenience only, and `ctrl+c` is the proven reset.
+fn classification_parses_as_shell_command(
+    classification: &crate::approval::classify::Classification,
+) -> bool {
+    use crate::approval::classify::Classification;
+    match classification {
+        Classification::Parsed {
+            simple_commands,
+            compound,
+        } => {
+            *compound
+                || simple_commands
+                    .iter()
+                    .any(|command| !command.normalized_program.contains("://"))
+        }
+        _ => false,
+    }
+}
+
 /// Launch-scope refusal reason for a blocked terminal-launch key chord.
 /// Reaches the model verbatim through the failed-action continuation, so
 /// it names the sanctioned alternative.
@@ -520,6 +560,16 @@ const TERMINAL_LAUNCH_CHORD_REFUSAL: &str = "computer use cannot launch terminal
 /// Launch-scope refusal reason for terminal-typed command text.
 const TERMINAL_TYPING_REFUSAL: &str = "computer use cannot type shell commands at launch: typed text classified as a shell command \
      is blocked; use the run tool, which applies command approval and classification, instead";
+
+/// Launch-scope refusal reason for an Enter-class commit of a line that
+/// parses as a runnable shell command. Unknown executables cannot be
+/// told from prose at typing time, so the commit fence refuses every
+/// such parseable line; the reason names the proven reset so a benign
+/// receiver can recover the line, and the run tool as the sanctioned
+/// alternative.
+const TERMINAL_INPUT_COMMIT_REFUSAL: &str = "computer use cannot press Enter on a line that parses as a shell command at launch: \
+     an unknown executable is still an executable, so such lines are refused; press ctrl+c to reset \
+     the line, and use the run tool, which applies command approval and classification, instead";
 
 /// Launch-scope refusal reason for paste-class input (chords and
 /// middle-button/primary-selection paste).
@@ -609,10 +659,13 @@ pub(crate) fn check_terminal_input_policy(action: &ComputerAction) -> Result<(),
 /// less.
 ///
 /// - Every text/chord/hold action is folded into a pending-line buffer
-///   with terminal-faithful semantics: Enter-class keys commit;
-///   `ctrl+c` cancels; an Enter on a line no shell grammar parses is
-///   bash's PS2 continuation, so the buffer is kept and the newline
-///   appended, exactly as the terminal keeps the line open.
+///   with terminal-faithful semantics: Enter-class keys commit; an Enter
+///   on a line that parses as command structure refuses the commit —
+///   known and unknown programs alike (review cycle 2, finding 1: an
+///   unknown executable is still an executable); an Enter on a line no
+///   shell grammar parses is bash's PS2 continuation, so the buffer is
+///   kept and the newline appended, exactly as the terminal keeps the
+///   line open. Only an empty line commits benignly.
 /// - Any action whose effect on the line this model cannot represent
 ///   (arrows, tab completion, `ctrl+w`, `alt+<key>`, held keys with
 ///   auto-repeat, embedded control characters) marks the line
@@ -623,16 +676,29 @@ pub(crate) fn check_terminal_input_policy(action: &ComputerAction) -> Result<(),
 ///   outright by the per-action policy above; this model re-refuses
 ///   them as defense in depth for direct canonical construction.
 ///
+/// **Delivery ownership (review cycle 2, finding 2):** modeled state must
+/// reflect effects known to have reached the receiver. The coordinator
+/// therefore runs this model two-phase: it *simulates* a batch on a
+/// clone to refuse command commits before dispatch, and *folds* only
+/// the delivered prefix afterwards — a denial, cancellation, lease
+/// failure, or mid-batch backend failure never installs an effect that
+/// did not reach the receiver, and the ambiguous boundary item marks
+/// the line untracked instead.
+///
 /// The model spans batches, provider calls, and re-entry within one
-/// delegation (one coordinator owns it). It is not crash-durable: a
-/// daemon replacement mid-line loses the buffer, so a fragment split
-/// across a restart can under-model; the per-action gate still refuses
-/// every fragment that parses alone, and durable line state belongs to
-/// the structured terminal-model follow-up. Two GUI-mediated residuals
-/// stay open until that follow-up: an application paste menu reached
-/// through pointer clicks, and execution through clicking an
-/// application's own buttons — both are pointer effects, not typed text,
-/// and the per-action computer approval already fences every click.
+/// delegation (one coordinator owns it). It is not crash-durable, and a
+/// receiver can predate its coordinator (a real desktop survives
+/// coordinator replacement and daemon restarts), so a coordinator whose
+/// receiver is not provably fresh opens with
+/// [`TypedInputLineModel::untracked`]: a commit is refused until a
+/// proven `ctrl+c` reset, and a command split across a replacement can
+/// never be evaluated against a fragment alone. Durable line state
+/// belongs to the structured terminal-model follow-up. Two GUI-mediated
+/// residuals stay open until that follow-up: an application paste menu
+/// reached through pointer clicks, and execution through clicking an
+/// application's own buttons — both are pointer effects, not typed
+/// text, and the per-action computer approval already fences every
+/// click.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TypedInputLineModel {
     /// Text the receiving line is modeled to hold since the last
@@ -648,9 +714,10 @@ pub(crate) struct TypedInputLineModel {
 enum TypedLineCommit {
     /// The line's contents are unknown: refuse the commit.
     Untracked,
-    /// The line assembles command text the run tool would prompt for:
-    /// refuse the commit (the Enter never dispatches, so the receiver
-    /// keeps the line; so does the model).
+    /// The line parses as command structure a receiving shell would
+    /// execute — known or unknown program alike: refuse the commit (the
+    /// Enter never dispatches, so the receiver keeps the line; so does
+    /// the model).
     Command,
     /// The line executed benignly (or was empty): the receiver answers
     /// with a fresh prompt, so the model starts a new line.
@@ -661,11 +728,36 @@ enum TypedLineCommit {
 }
 
 impl TypedInputLineModel {
+    /// A model for a receiver this coordinator cannot prove holds an
+    /// empty line: every real-desktop receiver predates its coordinator
+    /// (the desktop survives coordinator replacement and daemon
+    /// restarts), so a fresh coordinator on one opens untracked and
+    /// refuses commits until a proven `ctrl+c` reset. A command split
+    /// across a replacement can never be evaluated against the fresh
+    /// coordinator's fragment alone.
+    pub(crate) fn untracked() -> Self {
+        Self {
+            pending: String::new(),
+            untracked: true,
+        }
+    }
+
+    /// Mark the line untracked: an effect whose delivery to the receiver
+    /// is ambiguous (a mid-batch backend failure, for example) must not
+    /// leave the model claiming to know the line.
+    pub(crate) fn mark_untracked(&mut self) {
+        self.untracked = true;
+    }
+
     /// Fold one about-to-dispatch action into the model, refusing the
     /// action itself when dispatching it could let a receiver execute
     /// unclassified text. Folding is all-or-nothing: a refusal leaves
     /// the model unchanged, because the refused action is never
     /// dispatched.
+    ///
+    /// Callers that own delivery truth (the coordinator) run this in two
+    /// phases: simulate on a clone to gate the batch, then fold only the
+    /// delivered prefix after dispatch.
     pub(crate) fn absorb_action(&mut self, action: &ComputerAction) -> Result<(), ComputerError> {
         let mut next = self.clone();
         next.absorb_action_inner(action)?;
@@ -729,20 +821,22 @@ impl TypedInputLineModel {
     }
 
     /// A commit is an Enter-class keypress: the receiver executes the
-    /// assembled line. Refused when the line is untracked or carries
-    /// command text the run tool would prompt for. A parseable-but-benign
-    /// line still *executes* in a terminal, so the buffer starts fresh;
-    /// a line no shell grammar parses is bash's PS2 continuation, so the
-    /// buffer is kept and the newline appended, exactly as the terminal
-    /// keeps the line open.
+    /// assembled line. Refused when the line is untracked or parses as a
+    /// shell command — known program or unknown (a parseable line is
+    /// what a terminal executes; an unknown executable is still an
+    /// executable, and the run tool prompts for it too). A refused
+    /// commit never dispatches, so the receiver keeps the line; so does
+    /// the model. A line no shell grammar parses is bash's PS2
+    /// continuation, so the buffer is kept and the newline appended,
+    /// exactly as the terminal keeps the line open.
     fn commit_pending(&mut self) -> Result<(), ComputerError> {
         match self.commit_classification() {
             TypedLineCommit::Untracked => Err(ComputerError::Refused(
                 TERMINAL_INPUT_UNTRACKED_REFUSAL.to_string(),
             )),
-            TypedLineCommit::Command => {
-                Err(ComputerError::Refused(TERMINAL_TYPING_REFUSAL.to_string()))
-            }
+            TypedLineCommit::Command => Err(ComputerError::Refused(
+                TERMINAL_INPUT_COMMIT_REFUSAL.to_string(),
+            )),
             TypedLineCommit::ExecutedBenign => {
                 self.pending.clear();
                 Ok(())
@@ -757,6 +851,11 @@ impl TypedInputLineModel {
     /// Classify the pending line the way a receiving terminal would answer
     /// an Enter press (both grammars: the receiver is an interactive
     /// shell, a superset of the `sh -c` subset the run tool executes).
+    /// Any line that parses as a runnable command is a `Command` refusal
+    /// regardless of program knownness (review cycle 2, finding 1) — a
+    /// URL-shaped program token (`://`, unexec'd by any shell) excepted;
+    /// only an empty line or one with nothing to run executes benignly
+    /// and only an unparseable line is a PS2 continuation.
     fn commit_classification(&self) -> TypedLineCommit {
         if self.untracked {
             return TypedLineCommit::Untracked;
@@ -766,19 +865,24 @@ impl TypedInputLineModel {
         }
         let sh = crate::approval::classify::classify(&self.pending);
         let bash = crate::approval::classify::classify_bash(&self.pending);
-        if classification_carries_terminal_command(&sh)
-            || classification_carries_terminal_command(&bash)
+        if classification_parses_as_shell_command(&sh)
+            || classification_parses_as_shell_command(&bash)
         {
             return TypedLineCommit::Command;
         }
-        // Parses (or is empty) in either grammar → the receiver executed
-        // the benign line and answers with a fresh prompt.
+        // Nothing runnable: either the classifier decomposed no simple
+        // command (comments, bare assignments, redirect-only lines —
+        // `FOO=bar` defines, it does not execute a program) or the only
+        // program tokens left are URL-shaped, which no shell can exec. In
+        // both cases the receiver consumed the line and answers with a
+        // fresh prompt.
         if matches!(sh, crate::approval::classify::Classification::Parsed { .. })
             || matches!(
                 bash,
                 crate::approval::classify::Classification::Parsed { .. }
             )
             || matches!(sh, crate::approval::classify::Classification::Empty)
+            || matches!(bash, crate::approval::classify::Classification::Empty)
         {
             return TypedLineCommit::ExecutedBenign;
         }
@@ -1174,7 +1278,18 @@ pub trait ComputerBackend: backend_seal::Sealed + Send + Sync {
 }
 
 /// Single-action form of [`execute_backend_batch`].
-pub async fn execute_backend_action<B: ComputerBackend + ?Sized>(
+///
+/// Crate-internal platform plumbing (review cycle 2, finding 3): the
+/// stateful cross-action terminal-input fence lives in
+/// [`TypedInputLineModel`] inside the coordinator, so a handoff that
+/// injects input is sanctioned only through
+/// [`crate::computer::coordinator::ComputerActionCoordinator`]. Keeping
+/// these free functions out of the public API makes that boundary
+/// structural: outside callers cannot spell a command through
+/// character chords one `execute_backend_action` at a time around the
+/// coordinator's model. The in-crate callers are capture-only (capture
+/// actions inject no input) or test scaffolding.
+pub(crate) async fn execute_backend_action<B: ComputerBackend + ?Sized>(
     backend: &mut B,
     action: &ComputerAction,
 ) -> Result<ComputerActionOutcome, ComputerError> {
@@ -1185,7 +1300,13 @@ pub async fn execute_backend_action<B: ComputerBackend + ?Sized>(
 
 /// Coordinator-safe canonical-to-platform handoff. This free function cannot
 /// be overridden by a backend implementation.
-pub async fn execute_backend_batch<B: ComputerBackend + ?Sized>(
+///
+/// Crate-internal platform plumbing for the same reason as
+/// [`execute_backend_action`]: input-injecting dispatch is fenced by the
+/// coordinator's typed-line model, and the mandatory normalization gate
+/// inside this handoff enforces the per-action terminal-input policy as
+/// defense in depth.
+pub(crate) async fn execute_backend_batch<B: ComputerBackend + ?Sized>(
     backend: &mut B,
     actions: &[ComputerAction],
 ) -> ComputerBatchReport {
@@ -7045,6 +7166,14 @@ mod tests {
         // `pip install <pkg>`, and plain `curl <url>` all sit at the
         // classifier's `Ordinary` tier, yet the run tool prompts for every
         // one of them — so typed text carrying them is refused.
+        //
+        // Review cycle 2 (finding 1): a program token carrying a path
+        // separator is an executable-path invocation, not prose, so
+        // unknown executables spelled with paths (`./payload`,
+        // `bin/deploy.sh`, `/usr/local/bin/mytool`) are refused at typing
+        // time too. Bare unknown program names stay typable (they are
+        // indistinguishable from prose) and are fenced at commit time by
+        // the typed-line model.
         for text in [
             "rm -rf /",
             "sudo whoami",
@@ -7060,6 +7189,11 @@ mod tests {
             "pip install attacker-package",
             "echo pwned > ~/.bashrc",
             "ls /etc/shadow",
+            "./payload",
+            "./payload --with arguments",
+            "bin/deploy.sh production",
+            "/usr/local/bin/my-company-deployer production",
+            "~/bin/tool",
         ] {
             assert!(
                 typed_text_is_terminal_command(text),
@@ -7079,16 +7213,20 @@ mod tests {
         // Ordinary prose — including prose that names destructive words or
         // contains an unmatched apostrophe — still passes: it parses as a
         // single unknown "program" or not at all, and the approval seam keeps
-        // its own destructive/credential classification for it. This is the
-        // recorded boundary: an unknown program name is indistinguishable
-        // from prose by any text-only signal, so it stays typable until the
-        // structured terminal-model follow-up.
+        // its own destructive/credential classification for it. A bare
+        // unknown program name is indistinguishable from prose by any
+        // text-only signal, so typing it stays allowed; its execution is
+        // fenced at commit time by the typed-line model (see the
+        // `typed_line_model` tests). URL tokens carry `://` and stay
+        // typable for browser address bars.
         for text in [
             "hello world",
             "delete the draft folder when you are done",
             "don't worry about the format",
             "https://flycockpit.localhost/docs",
             "my super secret password is hunter2",
+            "my-company-deployer production",
+            "see https://example.com/pricing for details",
         ] {
             assert!(
                 !typed_text_is_terminal_command(text),
@@ -7285,20 +7423,97 @@ mod tests {
     }
 
     #[test]
-    fn typed_line_model_accepts_prose_lines_and_caps_the_buffer() {
-        // Prose typing stays usable: unknown-program words and unparseable
-        // text commit at Enter without refusal.
-        let mut model = TypedInputLineModel::default();
+    fn typed_line_model_opens_untracked_for_preexisting_receivers() {
+        // Review cycle 2, finding 4: a receiver that predates its
+        // coordinator (a real desktop surviving coordinator replacement or
+        // a daemon restart) can already hold a line the model never
+        // tracked, so a fresh coordinator opens untracked: typing still
+        // works, commits are refused, and a proven `ctrl+c` reset restores
+        // them. A command split across a replacement can therefore never
+        // be evaluated against the fresh coordinator's fragment alone.
+        let mut model = TypedInputLineModel::untracked();
         model
             .absorb_action(&ComputerAction::TypeText {
-                text: "hello world".to_string(),
+                text: "hello".to_string(),
             })
-            .expect("prose dispatches");
+            .expect("typing into an untracked line still dispatches");
+        let error = model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["enter"]),
+            })
+            .expect_err("an untracked line must not be submitted");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("ctrl+c")),
+            "the refusal must name the reset gesture: {error:?}"
+        );
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["ctrl", "c"]),
+            })
+            .expect("ctrl+c provably cancels the receiver's line");
         model
             .absorb_action(&ComputerAction::KeyChord {
                 chord: chord(&["enter"]),
             })
-            .expect("a prose line commits without refusal");
+            .expect("a provably empty line commits nothing");
+    }
+
+    #[test]
+    fn typed_line_model_refuses_unknown_program_commits_and_caps_the_buffer() {
+        // Review cycle 2, finding 1: prose typing stays usable (an
+        // unknown program name cannot be told from prose at typing
+        // time), but the *commit* fence refuses every line that parses
+        // as a shell command — known or unknown program alike, because
+        // an unknown executable is still an executable and the run tool
+        // prompts for it too. `my-company-deployer production` must not
+        // reach a shell through an Enter.
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "my-company-deployer production".to_string(),
+            })
+            .expect("unknown-program typing stays usable");
+        let error = model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["enter"]),
+            })
+            .expect_err("an unknown-executable line must not be submitted");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("run tool")),
+            "the refusal must name the sanctioned alternative: {error:?}"
+        );
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("ctrl+c")),
+            "the refusal must name the reset gesture: {error:?}"
+        );
+        // The refused Enter never dispatches, so the receiver keeps the
+        // line; so does the model. A proven `ctrl+c` reset restores
+        // commits for benign (empty) lines.
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["ctrl", "c"]),
+            })
+            .expect("ctrl+c provably cancels the receiver's line");
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["enter"]),
+            })
+            .expect("an empty line commits benignly");
+        // A URL-shaped program token is the one parseable exception: a
+        // path with an empty component cannot be exec'd by any shell, so a
+        // bare address typed into a browser address bar still commits
+        // benignly.
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "https://flycockpit.localhost/docs".to_string(),
+            })
+            .expect("a bare URL stays typable");
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["enter"]),
+            })
+            .expect("a URL line executes nothing and commits benignly");
         // The pending buffer is bounded: an over-long assembled line is
         // refused rather than growing without limit.
         let mut model = TypedInputLineModel::default();

@@ -797,11 +797,24 @@ fn program_basename(program: &str) -> &str {
 /// tiers; this table covers the rest of the common shell surface.
 ///
 /// Deliberately broad: a false positive only costs typing convenience
-/// (prose that begins with one of these words is refused), while the
-/// kept boundary — program names **unknown to policy** pass as prose —
-/// is the structured-terminal-model follow-up's to close: no text-only
-/// signal distinguishes an unknown command from prose.
+/// (prose that begins with one of these words is refused). Program names
+/// **unknown to policy** stay typable because no text-only signal
+/// distinguishes an unknown command word from prose — the typed-line
+/// commit fence in `computer/mod.rs` is what refuses their execution.
+/// One unknown name does carry a text-only execution signal: a path
+/// separator, making the word an executable-path invocation
+/// (`./payload`, `bin/deploy.sh`, `/usr/local/bin/mytool`) rather than
+/// prose. Those are refused here at typing time, before any commit.
+/// Tokens carrying a URL scheme separator (`://`) are web addresses a
+/// model types into browsers, not executable paths (and a path with an
+/// empty component cannot be exec'd), so they stay typable.
 pub fn typed_program_is_blocked_command(normalized_program: &str) -> bool {
+    if normalized_program.contains("://") {
+        return false;
+    }
+    if normalized_program.contains('/') || normalized_program.contains('\\') {
+        return true;
+    }
     let base = program_basename(normalized_program);
     TYPED_COMMAND_PROGRAMS.contains(&base)
 }

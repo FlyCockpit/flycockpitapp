@@ -4548,7 +4548,7 @@ pub(super) async fn persist_staged_terminal_removal(
         && let Err(error) = session
             .db
             .terminalize_queued_text_artifact_submissions(
-                session.id,
+                session.live_id(),
                 terminal_receipts,
                 chrono::Utc::now().timestamp_millis(),
             )
@@ -5090,7 +5090,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         .context("reconciling expired oversized text reservations")?;
     let rows = session
         .db
-        .accepted_message_queue(session.id)
+        .accepted_message_queue(session.live_id())
         .await
         .context("loading accepted FCM2 message queue")?;
     let mut replayed = 0usize;
@@ -5106,7 +5106,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
                 )
             })?;
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
-        if canonical.session_id != session.id
+        if canonical.session_id != session.live_id()
             || !canonical.request.attachments.is_empty()
             || canonical.request.origin != proto::UserMessageOrigin::ExternalRoot
         {
@@ -5117,7 +5117,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         // be below 64 KiB, so a restart must reconstruct every live lease.
         let Some(reservation) = session
             .db
-            .reserved_text_artifact_submission(session.id, row.client_submission_id)
+            .reserved_text_artifact_submission(session.live_id(), row.client_submission_id)
             .await?
         else {
             continue;
@@ -5151,7 +5151,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
             if reservation.reservation.run_invocation_bound {
                 session
                 .db
-                .bound_text_artifact_run_invocation(session.id, row.client_submission_id)
+                .bound_text_artifact_run_invocation(session.live_id(), row.client_submission_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!(
                     "bound oversized FCM2 reservation lacks its exact run invocation binding"
@@ -5279,7 +5279,7 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
 
     let rows = session
         .db
-        .accepted_message_queue(session.id)
+        .accepted_message_queue(session.live_id())
         .await
         .context("loading accepted V2 message queue")?;
     let project_text = session
@@ -5295,7 +5295,7 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
                 &row.canonical_message,
             )?;
         anyhow::ensure!(
-            canonical.session_id == session.id,
+            canonical.session_id == session.live_id(),
             "accepted V2 queue row belongs to a different session"
         );
         if canonical.request.text.len() > 64 * 1024 {
@@ -5313,7 +5313,7 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
         );
         let durable_attachments = session
             .db
-            .message_attachment_receipts(session.id, row.client_submission_id)
+            .message_attachment_receipts(session.live_id(), row.client_submission_id)
             .await
             .context("loading accepted V2 attachment receipts")?;
         anyhow::ensure!(
@@ -5340,7 +5340,7 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
             storage
                 .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
                     attachments: canonical.request.attachments.clone(),
-                    session_id: session.id,
+                    session_id: session.live_id(),
                     project_digest: project_digest.clone(),
                     consumer_id: client_submission_id.to_string(),
                     ledger,
@@ -5483,7 +5483,7 @@ async fn commit_remote_queue_mutation(
         reason,
         removed_count,
     };
-    let session_id = session.id;
+    let session_id = session.live_id();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let outcome = session.db.execute_transactional_remote_operation(
         crate::db::remote_attachment_operations::ReserveRemoteOperation {
@@ -10051,7 +10051,7 @@ pub(super) async fn run_worker(
                     let outcome = Box::pin(probe_user_message(
                         &session,
                         &driver_input_queue,
-                        session_id,
+                        session.live_id(),
                         client_submission_id,
                         &wire_fingerprint,
                         origin_principal.as_deref(),
@@ -10066,6 +10066,10 @@ pub(super) async fn run_worker(
                     artifact_admission,
                     respond_to,
                 } => {
+                    // Conversation-scoped receipt/queue/user-message rows follow
+                    // the live window. Spawn identity stays on `session_id` for
+                    // locks, lifecycle, and agent-tree.
+                    let conversation_id = session.live_id();
                     // Inline external-root submissions become accepted at the
                     // queue insert below. Oversized submissions have only a
                     // phase-one reservation here; their activity stays owned
@@ -10112,7 +10116,7 @@ pub(super) async fn run_worker(
                     {
                         match session
                             .db
-                            .message_receipt_status(session_id, admission.operation_id)
+                            .message_receipt_status(conversation_id, admission.operation_id)
                             .await
                         {
                             Ok(Some(status))
@@ -10123,7 +10127,7 @@ pub(super) async fn run_worker(
                             {
                                 match session
                                     .db
-                                    .message_queue_item(session_id, *receipt.id.as_bytes())
+                                    .message_queue_item(conversation_id, *receipt.id.as_bytes())
                                     .await
                                 {
                                     Ok(Some(row)) => Some(row.canonical_message),
@@ -10155,7 +10159,7 @@ pub(super) async fn run_worker(
                             }
                             Ok(None) => match session
                                 .db
-                                .message_queue_item(session_id, *receipt.id.as_bytes())
+                                .message_queue_item(conversation_id, *receipt.id.as_bytes())
                                 .await
                             {
                                 Ok(Some(_)) => {
@@ -10288,7 +10292,7 @@ pub(super) async fn run_worker(
                     if let Some(admission) = artifact_admission.as_mut() {
                         if !replaying_persisted_artifact
                             && let Err(error) = resolve_oversized_artifact_queue_admission(
-                                session_id,
+                                conversation_id,
                                 &submission,
                                 target.clone(),
                                 admission,
@@ -10349,7 +10353,7 @@ pub(super) async fn run_worker(
                             continue;
                         }
                         let canonical = match validate_oversized_artifact_admission(
-                            session_id,
+                            conversation_id,
                             &submission,
                             admission,
                         ) {
@@ -10370,7 +10374,7 @@ pub(super) async fn run_worker(
                         let exact_replay = match session
                             .db
                             .exact_message_replay_outcome(
-                                session_id,
+                                conversation_id,
                                 admission.operation_id,
                                 admission.actor,
                                 *receipt.id.as_bytes(),
@@ -10428,7 +10432,7 @@ pub(super) async fn run_worker(
                             }
                         };
                         let accept_input = crate::db::db::message_attachments::AcceptMessageInput {
-                            session_id,
+                            session_id: conversation_id,
                             operation_id: admission.operation_id,
                             actor: admission.actor,
                             request_hash: admission.request_hash,
@@ -10580,7 +10584,7 @@ pub(super) async fn run_worker(
                     if artifact_admission.is_none() {
                         let terminal_receipt = match session
                             .db
-                            .client_submission_terminal_receipt(session_id, receipt.id)
+                            .client_submission_terminal_receipt(conversation_id, receipt.id)
                             .await
                         {
                             Ok(receipt) => receipt,
@@ -10631,7 +10635,7 @@ pub(super) async fn run_worker(
                     if artifact_admission.is_none() {
                         let durable = match session
                             .db
-                            .client_submission_receipt(session_id, receipt.id)
+                            .client_submission_receipt(conversation_id, receipt.id)
                             .await
                         {
                             Ok(durable) => durable,
@@ -10928,7 +10932,7 @@ pub(super) async fn run_worker(
                     if artifact_admission.is_none() {
                         let durable_receipt = match session
                             .db
-                            .client_submission_receipt(session_id, receipt.id)
+                            .client_submission_receipt(conversation_id, receipt.id)
                             .await
                         {
                             Ok(receipt) => receipt,
@@ -11294,6 +11298,7 @@ pub(super) async fn run_worker(
                             removed_count: u32::from(staged.is_some()),
                         };
                         let now_ms = chrono::Utc::now().timestamp_millis();
+                        let conversation_id = session.live_id();
                         let outcome = session.db.execute_transactional_remote_operation(
                             crate::db::remote_attachment_operations::ReserveRemoteOperation {
                                 logical_attachment_id: &operation.logical_attachment_id,
@@ -11307,7 +11312,7 @@ pub(super) async fn run_worker(
                             move |conn| {
                                 crate::db::Db::terminalize_queued_text_artifact_submissions_conn(
                                     conn,
-                                    session_id,
+                                    conversation_id,
                                     &terminal_receipts,
                                     now_ms,
                                 )?;

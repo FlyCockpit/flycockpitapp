@@ -547,8 +547,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         TurnEvent::InterruptRaised { .. } => vec![],
         TurnEvent::InterruptResolved { .. } => vec![],
         TurnEvent::ScheduleStarted {
-            // The engine stamps the originating session; the worker's own
-            // `session_id` is authoritative for the wire event and equals it.
+            // The engine stamps the live window; the worker's conversion
+            // argument is also `Session::live_id` and equals it.
             session_id: _,
             job_id,
             label,

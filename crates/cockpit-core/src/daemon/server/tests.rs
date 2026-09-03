@@ -34831,6 +34831,56 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
 }
 
 #[tokio::test]
+async fn discard_predecessor_window_stops_the_live_tip_worker() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let parent = Session::insert_row_for_test(
+        &ctx.db,
+        Path::new("/x"),
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .unwrap();
+    let side = ctx
+        .db
+        .create_ephemeral_fork(parent.session_id, None)
+        .await
+        .unwrap();
+    let successor = ctx
+        .db
+        .create_compaction_successor(side.session_id)
+        .await
+        .unwrap();
+    insert_hung_worker(&ctx, successor.session_id);
+
+    let err = handle_request(
+        Request::DiscardSession {
+            session_id: side.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("hung live-tip worker should block predecessor-addressed discard");
+
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(err.message.contains("force-aborted after the bounded"));
+    assert!(
+        ctx.db.get_session(side.session_id).await.unwrap().is_some(),
+        "predecessor row remains when the live worker cannot stop"
+    );
+    assert!(
+        ctx.db
+            .get_session(successor.session_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "live tip remains when the live worker cannot stop"
+    );
+}
+
+#[tokio::test]
 async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();

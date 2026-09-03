@@ -6561,12 +6561,12 @@ impl Driver {
                                     .session
                                     .db
                                     .release_retained_materialized_turn_sources(
-                                        self.session.id,
+                                        self.session.live_id(),
                                         chrono::Utc::now().timestamp_millis(),
                                     )
                                     .await
                                 {
-                                    tracing::warn!(%error, session = %self.session.id,
+                                    tracing::warn!(%error, session = %self.session.live_id(),
                                         "parked tool-media turn source release remains retryable after terminal completion");
                                 }
                                 Ok(ParkedReplayOutcome::Completed)
@@ -8383,7 +8383,7 @@ impl Driver {
                 .session
                 .db
                 .terminate_accepted_message(
-                    self.session.id,
+                    self.session.live_id(),
                     *receipt.id.as_bytes(),
                     attachment_terminal,
                     chrono::Utc::now().timestamp_millis(),
@@ -8678,7 +8678,7 @@ impl Driver {
                     .session
                     .db
                     .materialize_message_submissions(
-                        self.session.id,
+                        self.session.live_id(),
                         submissions,
                         Some(target.agent.clone()),
                         folded.origin_principal.clone(),
@@ -11776,13 +11776,13 @@ impl Driver {
                 .session
                 .db
                 .release_materialized_message_turn_sources(
-                    self.session.id,
+                    self.session.live_id(),
                     submissions,
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await
             {
-                tracing::warn!(%error, session = %self.session.id, "tool-media turn source release remains retryable after terminal completion");
+                tracing::warn!(%error, session = %self.session.live_id(), "tool-media turn source release remains retryable after terminal completion");
             }
         }
         input_rx.finish(&queue_item_ids).await;
@@ -12749,7 +12749,7 @@ impl Driver {
                         .session
                         .db
                         .materialize_message_submissions(
-                            self.session.id,
+                            self.session.live_id(),
                             submissions,
                             Some(active_agent.clone()),
                             origin_principal.clone(),

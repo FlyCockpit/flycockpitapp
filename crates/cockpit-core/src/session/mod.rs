@@ -1226,10 +1226,11 @@ impl Session {
     /// new window without replacing `Arc<Session>`. One live conversation
     /// has exactly this identity for recording, custody, lifecycle,
     /// post-handoff wire events, and conversation-scoped durable rows
-    /// (goals, todos, live-window tool-call lookup, sealed-use,
-    /// fork-parent, delegation payloads, plan docs). Spawn-scoped state
-    /// (locks, containers, agent-tree, image-dispatch, verification
-    /// ledger keyed through `agent_instances`) keeps using [`Self::id`].
+    /// (goals, todos, skill-pairs, message receipts/queue/user-message
+    /// events, live-window tool-call lookup, sealed-use, fork-parent,
+    /// delegation payloads, plan docs). Spawn-scoped state (locks,
+    /// containers, agent-tree, image-dispatch, verification ledger keyed
+    /// through `agent_instances`) keeps using [`Self::id`].
     pub fn live_id(&self) -> Uuid {
         *self
             .live_id

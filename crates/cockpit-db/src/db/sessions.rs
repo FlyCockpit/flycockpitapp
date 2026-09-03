@@ -2465,6 +2465,18 @@ impl Db {
             predecessor.ended_at_unix_ms.is_none(),
             "compaction predecessor {predecessor_session_id} is already ended"
         );
+        let in_flight_receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_submission_receipts
+                  WHERE session_id = ?1 AND state = 'accepted'",
+                [predecessor_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("checking in-flight message receipts before compaction seed")?;
+        ensure!(
+            in_flight_receipts == 0,
+            "compaction successor cannot be seeded while message receipts are still accepted on {predecessor_session_id}"
+        );
         let existing: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions WHERE compaction_predecessor_session_id = ?1",
@@ -2602,6 +2614,16 @@ impl Db {
             params![session_id.to_string(), predecessor_session_id.to_string()],
         )
         .context("moving task delegation payloads onto compaction successor")?;
+        conn.execute(
+            "UPDATE skill_pairs SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving skill pairs onto compaction successor")?;
+        conn.execute(
+            "UPDATE client_submission_terminal_receipts SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving terminal client-submission receipts onto compaction successor")?;
         conn.execute(
             "UPDATE sealed_value_records SET scope_key = ?1 WHERE scope = 'session' AND scope_key = ?2",
             params![session_id.to_string(), predecessor_session_id.to_string()],
@@ -6137,6 +6159,22 @@ mod tests {
         db.create_task_todo(predecessor.session_id, "keep the todo", 1)
             .await
             .unwrap();
+        db.save_skill_pair(predecessor.session_id, "skillslash-live", "Build", false)
+            .await
+            .unwrap();
+        let terminal_id = Uuid::new_v4();
+        db.insert_client_submission_terminal_receipts(
+            predecessor.session_id,
+            vec![crate::db::session_log::ClientSubmissionTerminalReceipt {
+                client_submission_id: terminal_id,
+                fingerprint: "fp".into(),
+                wire_fingerprint: "wfp".into(),
+                origin_principal: None,
+                disposition: crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled,
+            }],
+        )
+        .await
+        .unwrap();
         let successor = db
             .create_compaction_successor(predecessor.session_id)
             .await
@@ -6162,6 +6200,27 @@ mod tests {
         let todos = db.list_task_todos(successor.session_id).await.unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].content, "keep the todo");
+        assert!(
+            db.list_skill_pairs(predecessor.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let pairs = db.list_skill_pairs(successor.session_id).await.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].call_id, "skillslash-live");
+        assert!(
+            db.client_submission_terminal_receipt(predecessor.session_id, terminal_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let terminal = db
+            .client_submission_terminal_receipt(successor.session_id, terminal_id)
+            .await
+            .unwrap()
+            .expect("terminal receipt follows the live window");
+        assert_eq!(terminal.fingerprint, "fp");
     }
 
     #[tokio::test]
@@ -6989,6 +7048,33 @@ mod tests {
         assert!(!updated, "auto-title must refuse an ephemeral row");
         let row = db.get_session(side.session_id).await.unwrap().unwrap();
         assert!(row.title.is_none());
+    }
+
+    #[tokio::test]
+    async fn discard_ephemeral_predecessor_cascades_the_live_tip() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
+        let successor = db
+            .create_compaction_successor(side.session_id)
+            .await
+            .unwrap();
+        assert!(
+            db.discard_ephemeral_session(side.session_id).await.unwrap(),
+            "predecessor-addressed discard of an ephemeral lineage must delete"
+        );
+        assert!(db.get_session(side.session_id).await.unwrap().is_none());
+        assert!(
+            db.get_session(successor.session_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "discard cascade includes the live compaction tip"
+        );
+        assert!(db.get_session(parent.session_id).await.unwrap().is_some());
     }
 
     #[tokio::test]

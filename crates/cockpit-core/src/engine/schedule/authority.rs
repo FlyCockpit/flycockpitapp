@@ -1273,7 +1273,7 @@ impl ScheduleAuthority {
     /// Emit the UI-only `started` signal.
     fn emit_started(&self, job_id: &str, label: &str, kind: ScheduleKind) {
         let _ = self.turn_tx.try_send(TurnEvent::ScheduleStarted {
-            session_id: self.ctx.snapshot().session.id,
+            session_id: self.ctx.snapshot().session.live_id(),
             job_id: job_id.to_string(),
             label: label.to_string(),
             kind: kind.as_str().to_string(),

@@ -1450,6 +1450,7 @@ impl Driver {
                     "resume compaction snapshot is no longer exact".to_string()
                 }
                 PreparedCompactionApplyError::StoreTextArtifacts(error) => error,
+                PreparedCompactionApplyError::SeedSuccessor(error) => error,
             })?;
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PostCompact,

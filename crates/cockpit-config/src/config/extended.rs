@@ -370,9 +370,9 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
 
-    /// Display controlled by the standalone Computer primary. Real desktop is
-    /// the default and remains subject to the machine-local grant; virtual is
-    /// an explicit opt-in and is also suitable as a host fallback.
+    /// Display controlled by the standalone Computer primary. Virtual is the
+    /// safe default; real desktop requires explicit opt-in and remains subject
+    /// to the machine-local grant.
     #[serde(default, skip_serializing_if = "ComputerTarget::is_default")]
     pub computer_target: ComputerTarget,
 

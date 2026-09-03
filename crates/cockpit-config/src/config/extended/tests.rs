@@ -3847,6 +3847,15 @@ fn computer_primary_target_defaults_virtual_and_allows_real_opt_in() {
 
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
+    std::fs::write(&path, b"{}").unwrap();
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(
+        cfg.computer_target,
+        ComputerTarget::Virtual,
+        "omitted computer_target must deserialize to the safe virtual default"
+    );
+
+    let path = tmp.path().join("real_desktop.json");
     std::fs::write(&path, br#"{"computer_target":"real_desktop"}"#).unwrap();
     let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
     assert_eq!(cfg.computer_target, ComputerTarget::RealDesktop);

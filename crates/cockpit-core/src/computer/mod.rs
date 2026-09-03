@@ -3,9 +3,9 @@
 //! This module is the platform action layer only. It exposes no model-facing
 //! tools; later prompts translate provider-native tool schemas into these typed
 //! actions and add approvals/redaction/audit. Delegated workers use a Cockpit-
-//! owned virtual display; the standalone Computer primary defaults to the real
-//! desktop. Real-desktop control is refused unless a machine-local grant file
-//! matches this machine.
+//! owned virtual display; the standalone Computer primary defaults to virtual.
+//! Real-desktop control requires explicit configuration and is refused unless a
+//! machine-local grant file matches this machine.
 //!
 //! Target identity and host-global physical keys live in [`host_identity`] and
 //! [`target`]; platform evidence adapters are under [`platform`].
@@ -2756,17 +2756,31 @@ fn current_machine_fingerprint() -> Option<String> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// A roaming grant file cannot authorize input on another Linux host: the
+/// comparison is bound to the OS-owned `/etc/machine-id` and fails closed if
+/// that value is inaccessible or empty.
+#[cfg(target_os = "linux")]
 fn current_machine_fingerprint() -> Option<String> {
-    fs::read_to_string("/etc/machine-id")
+    // Do not fall back to an environment variable or a shared sentinel: copied
+    // consent files must not authorize a different host.
+    let machine_id = fs::read_to_string("/etc/machine-id")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|value| !value.is_empty())
-        })
+        .filter(|value| !value.is_empty())?;
+    Some(
+        crate::computer::host_identity::domain_hash(
+            b"cockpit.linux.machine-grant.v1",
+            &[machine_id.as_bytes()],
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn current_machine_fingerprint() -> Option<String> {
+    None
 }
 
 pub const COMPUTER_TOOL_GROUP: &str = "computer:*";
@@ -2809,8 +2823,8 @@ pub struct NativeComputerWire {
 pub struct NativeComputerToolConfig {
     pub contract: ComputerToolContract,
     /// Backend target selected by the owning agent. The standalone Computer
-    /// primary defaults to real desktop; delegated computer workers retain
-    /// their isolated virtual display.
+    /// primary defaults to virtual; real desktop requires explicit config.
+    /// Delegated computer workers retain their isolated virtual display.
     pub target: DisplayTarget,
     /// A primary must fail its turn when its requested backend cannot open.
     /// Delegated workers retain the existing optional-capability behavior.

@@ -658,6 +658,24 @@ fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
     scrub_embedded_opaque_tokens(&known, placeholder)
 }
 
+/// `true` when `text` contains a keyless credential shape anywhere — the
+/// same well-known credential formats, AWS access-key ids, JWTs, and
+/// opaque token runs that [`RedactionTable::scrub_novel_command_output_secrets`]
+/// scrubs from command output, evaluated over the whole text with no line
+/// or position dependence. This is the shape half of the approval-prompt
+/// disclosure fence (issue #286): model-controlled typed text that carries
+/// any of these shapes must never render in a human prompt.
+pub(super) fn contains_keyless_credential_shape(text: &str) -> bool {
+    // The sentinel placeholder is one control character. Every shape rule
+    // has a minimum length above one, so the sentinel can never equal a
+    // scrubbed run, and the scrubbers only ever *replace* (never delete or
+    // rewrite) surrounding content. Input therefore differs from scrubbed
+    // output exactly when a shape was replaced, and matches byte-for-byte
+    // when no shape is present.
+    const SENTINEL: &str = "\u{1}";
+    scrub_keyless_credential_tokens(text, SENTINEL) != text
+}
+
 /// `true` when `token` has the shape of a novel keyless credential: an
 /// opaque run of at least [`KEYLESS_TOKEN_MIN_LEN`] characters carrying
 /// at least one alphanumeric character, with no non-trailing `=` (that
@@ -1056,6 +1074,31 @@ mod tests {
 
     fn hyphenated_passphrase() -> String {
         ["correct-horse", "-battery", "-staple"].concat()
+    }
+
+    /// The shape half of the approval-prompt disclosure fence (issue #286):
+    /// the predicate must fire for every shape the scrubber scrubs, in any
+    /// position, and stay quiet for ordinary prose.
+    #[test]
+    fn contains_keyless_credential_shape_matches_scrubber_shapes() {
+        assert!(contains_keyless_credential_shape(&github_pat()));
+        assert!(contains_keyless_credential_shape(&aws_access_key_id()));
+        assert!(contains_keyless_credential_shape(&jwt()));
+        assert!(contains_keyless_credential_shape(&aws_secret_access_key()));
+        assert!(contains_keyless_credential_shape(&digitless_passphrase()));
+        // Embedded in prose, not only standing alone: position never
+        // decides secrecy.
+        assert!(contains_keyless_credential_shape(&format!(
+            "here is my key {} ok",
+            github_pat()
+        )));
+        // Ordinary prose and multi-line text with no credential shape.
+        assert!(!contains_keyless_credential_shape(
+            "hello world, type this into the chat box"
+        ));
+        assert!(!contains_keyless_credential_shape(
+            "line one\nline two\nline three"
+        ));
     }
 
     #[test]

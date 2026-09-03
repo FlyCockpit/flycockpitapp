@@ -383,9 +383,16 @@ pub enum AuthorizationRequest<'a> {
     /// Every canonical computer-use action goes through this exhaustive
     /// central variant. It carries only engine-owned session/delegation/action
     /// IDs, tier, host lease token, target/focus/observation generations, and
-    /// safe metadata. No pixel bytes, raw titles, or provider request payloads
-    /// are carried. Ask pauses on this seam; Yolo emits no human request and
-    /// imposes no semantic action/target denial.
+    /// safe metadata. No pixel bytes or raw titles are carried. The one
+    /// deliberate payload fragment is the typed text of a pending TypeText
+    /// action (issue #286), which travels in memory solely so the approval
+    /// seam can render it after the disclosure fence: secret-shaped text is
+    /// withheld, registered literals are scrubbed against the live redaction
+    /// table, control characters are flattened, and only then is the render
+    /// bounded. The raw text never enters interrupt metadata or a durable
+    /// record; the rendered, redacted copy in the approval prompt is what
+    /// persists with the interrupt. Ask pauses on this seam; Yolo emits no
+    /// human request and imposes no semantic action/target denial.
     ComputerAction {
         session_id: &'a str,
         delegation_id: &'a str,
@@ -419,6 +426,25 @@ pub enum AuthorizationRequest<'a> {
         /// target evidence. Virtual displays have no host lease and therefore
         /// need their own exact authority witness.
         target_evidence_binding_digest: &'a str,
+        /// Human-readable summary of the pending concrete action for the
+        /// approval prompt (issue #286): action kind, coordinates, keys,
+        /// scroll deltas. Typed text is excluded; it travels in `typed_text`.
+        action_detail: &'a str,
+        /// Typed text of a pending TypeText action, rendered in the
+        /// approval prompt only after the disclosure fence at the approval
+        /// seam (secret-shaped withhold, redaction-table scrub, control
+        /// flattening, then bounding). The full, untruncated text travels
+        /// so the seam can scrub before it bounds. `None` for every other
+        /// action kind and for secret-shaped text, which is never shown in
+        /// a prompt.
+        typed_text: Option<&'a str>,
+        /// One bounded line summarizing every action of the batch (issue
+        /// #286), present only for multi-action batches.
+        batch_detail: Option<&'a str>,
+        /// Prompt-safe focused target window summary (redacted title hint
+        /// plus an opaque window id prefix), when target evidence is
+        /// available.
+        target_window: Option<&'a str>,
     },
     /// The single central composite authorization for an image-generation
     /// dispatch. It is the one decision issuer for image generation; the pure
@@ -710,6 +736,10 @@ impl Approver {
                 action_payload_digest,
                 lease_binding_digest,
                 target_evidence_binding_digest,
+                action_detail,
+                typed_text,
+                batch_detail,
+                target_window,
             } => {
                 // The computer-use action coordinator resolves tier before
                 // reaching this seam. "ask" pauses for a human response;
@@ -734,6 +764,10 @@ impl Approver {
                     action_payload_digest,
                     lease_binding_digest,
                     target_evidence_binding_digest,
+                    action_detail,
+                    typed_text,
+                    batch_detail,
+                    target_window,
                 )
                 .await
             }
@@ -2392,6 +2426,61 @@ mod tests {
         })
     }
 
+    /// Like [`resolve_sequence_collecting_questions`], but also captures
+    /// each interrupt's persisted description — the body that owner clients
+    /// render as its own line of text alongside the prompt.
+    ///
+    /// The resolve itself must go through [`resolve_waiting_interrupt`]:
+    /// the raise path persists the needs-attention row on an `.await`
+    /// *before* registering the hub waiter, so a resolver that fires as
+    /// soon as the row exists can beat `register` and lose the rendezvous —
+    /// `hub.resolve` returns `false` and the lock panics on a correct
+    /// flatten. Only discovery reads the row ungated; its content is
+    /// immutable once persisted.
+    fn resolve_sequence_collecting_questions_and_descriptions(
+        approver: &Approver,
+        ids: &[&'static str],
+    ) -> tokio::task::JoinHandle<Vec<(String, String)>> {
+        let db = approver.db.clone();
+        let session_id = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let ids: Vec<&'static str> = ids.to_vec();
+        tokio::spawn(async move {
+            let mut seen: Vec<uuid::Uuid> = Vec::new();
+            let mut records = Vec::new();
+            for id in ids {
+                let (iid, prompt, description) = loop {
+                    let open = db.list_open_interrupts(session_id).await.unwrap();
+                    if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
+                        let prompt = row
+                            .questions
+                            .as_ref()
+                            .and_then(|set| set.questions.first())
+                            .and_then(|question| match question {
+                                InterruptQuestion::Single { prompt, .. } => Some(prompt.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        break (row.interrupt_id, prompt, row.description.clone());
+                    }
+                    tokio::task::yield_now().await;
+                };
+                seen.push(iid);
+                records.push((prompt, description));
+                resolve_waiting_interrupt(
+                    &db,
+                    &hub,
+                    iid,
+                    ResolveResponse::Single {
+                        selected_id: id.to_string(),
+                    },
+                )
+                .await;
+            }
+            records
+        })
+    }
+
     fn computer_action_request<'a>(action_id: &'a str) -> AuthorizationRequest<'a> {
         AuthorizationRequest::ComputerAction {
             session_id: "session-1",
@@ -2410,6 +2499,10 @@ mod tests {
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
             target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail: "wait 10ms",
+            typed_text: None,
+            batch_detail: None,
+            target_window: None,
         }
     }
 
@@ -2446,6 +2539,391 @@ mod tests {
         };
         let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
         assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
+    }
+
+    /// A computer-action request carrying the prompt-level facts of issue
+    /// #286: concrete action detail, typed text, batch summary, target
+    /// window, and risk class.
+    fn computer_action_request_with_prompt_detail<'a>(
+        action_id: &'a str,
+        action_detail: &'a str,
+        typed_text: Option<&'a str>,
+        batch_detail: Option<&'a str>,
+        target_window: Option<&'a str>,
+        action_class: &'a str,
+    ) -> AuthorizationRequest<'a> {
+        AuthorizationRequest::ComputerAction {
+            session_id: "session-1",
+            delegation_id: "delegation-1",
+            action_id,
+            tier: "ask",
+            action_label: "openai_call:2",
+            backend_kind: "virtual_display",
+            focus_generation: 1,
+            observation_generation: 1,
+            has_host_lease: false,
+            provider_call_id: action_id,
+            batch_index: 0,
+            geometry_generation: 1,
+            action_class,
+            action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            lease_binding_digest: None,
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail,
+            typed_text,
+            batch_detail,
+            target_window,
+        }
+    }
+
+    fn single_prompt(question: &InterruptQuestion) -> &str {
+        let InterruptQuestion::Single { prompt, .. } = question else {
+            panic!("expected a single-question computer-action interrupt");
+        };
+        prompt
+    }
+
+    /// Issue #286: the Ask-tier computer-action prompt must render the
+    /// concrete pending action, the resolved target window, the risk class,
+    /// and a per-action summary for multi-action batches — never just an
+    /// opaque `openai_call:N` label.
+    #[tokio::test]
+    async fn computer_action_prompt_shows_detail_window_and_risk_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "click left single at (512, 384)",
+                None,
+                Some("click left single at (512, 384); type text (11 chars)"),
+                Some("Term… (window 0a1b2c3d4e5f6070…)"),
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("click left single at (512, 384)"),
+            "prompt must render the concrete pending action detail, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("risk class: state_changing"),
+            "prompt must render the computed action risk class, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Target window: Term… (window 0a1b2c3d4e5f6070…)"),
+            "prompt must render the resolved target window, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Batch: click left single at (512, 384); type text (11 chars)"),
+            "multi-action batches must summarize each action, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: typed text renders in the prompt only after scrubbing
+    /// through the live redaction table; a table-known secret never appears.
+    /// The fixture is deliberately below the `sk-` shape-detector floor, so
+    /// this exercises the table half of the fence only — the novel-shape
+    /// half is covered by
+    /// `computer_action_prompt_withholds_novel_secret_shaped_typed_text`.
+    #[tokio::test]
+    async fn computer_action_prompt_scrubs_secret_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(
+            tmp.path(),
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal("sk-live-abc123".to_string(), "$test:forced".to_string())
+                .unwrap(),
+        );
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "type text (21 chars)",
+                Some("deploy key sk-live-abc123"),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            !prompt.contains("sk-live-abc123"),
+            "a table-known secret must be redacted in the prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("deploy key"),
+            "non-secret typed text survives redaction, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: novel secret-shaped typed text — a credential the live
+    /// redaction table has no entry for and that names no credential word —
+    /// is withheld outright at the approval seam, in the live-session shape
+    /// (`Approver::new_for_session` with an empty table: a first-time
+    /// secret). The coordinator withholds these before the text travels; this
+    /// asserts the seam's own fence so the invariant cannot depend on the far
+    /// side of the in-memory boundary.
+    #[tokio::test]
+    async fn computer_action_prompt_withholds_novel_secret_shaped_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Assembled from fragments so the source never contains a
+        // contiguous detector-shaped token for the CI secret scanner.
+        let novel_shapes = [
+            ["ghp", "_", "16CharMinimumTokenAbCdEfGhIjKlMn"].concat(),
+            ["sk-live-", "0123456789abcdefghijklmnopqrstuv"].concat(),
+        ];
+        for novel in &novel_shapes {
+            let approver =
+                approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+            let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+            let action_detail = format!("type text ({} chars)", novel.chars().count());
+            let decision = approver
+                .authorize(computer_action_request_with_prompt_detail(
+                    "call-1",
+                    &action_detail,
+                    Some(novel.as_str()),
+                    None,
+                    None,
+                    "state_changing",
+                ))
+                .await
+                .unwrap();
+            let questions = resolver.await.unwrap();
+            assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+            let prompt = single_prompt(&questions[0]);
+            assert!(
+                !prompt.contains(novel.as_str()),
+                "novel secret-shaped typed text must never render in the prompt, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("[text withheld: secret-shaped]"),
+                "the secret-shaped withhold marker must render instead, got: {prompt}"
+            );
+        }
+    }
+
+    /// Issue #286: scrubbing happens BEFORE the render bound. A registered
+    /// secret longer than the bound used to leak its surviving prefix (the
+    /// truncated fragment no longer literal-matches the table entry); the
+    /// seam must scrub the full text first and only then bound the render.
+    #[tokio::test]
+    async fn computer_action_prompt_scrubs_before_bounding_long_registered_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately not detector-shaped (spaces and punctuation break the
+        // opaque runs, no credential words): only the table entry redacts
+        // it, and it is longer than the 200-character render bound.
+        let long_secret = "a quiet, unhurried table-known value. "
+            .repeat(7)
+            .trim_end()
+            .to_string();
+        let typed_text = format!("see note: {long_secret}");
+        let approver = approver_with_redaction(
+            tmp.path(),
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(long_secret, "$test:forced".to_string())
+                .unwrap(),
+        );
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let action_detail = format!("type text ({} chars)", typed_text.chars().count());
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                &action_detail,
+                Some(&typed_text),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("see note:"),
+            "non-secret text around the secret survives, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("unhurried"),
+            "no prefix of a registered secret may survive the render bound, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: the provider chooses the typed text, so structural
+    /// punctuation (backticks, quotes, newlines, control characters) is
+    /// flattened before interpolation — the payload can never visually
+    /// terminate the action clause or forge a second prompt line.
+    #[tokio::test]
+    async fn computer_action_prompt_flattens_structural_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+        let payload =
+            "finish the note `rm -rf /` now \"quoted\" and\n forged (risk class: destructive)?";
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let action_detail = format!("type text ({} chars)", payload.chars().count());
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                &action_detail,
+                Some(payload),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        // The whole prompt is one visual line: no control character at
+        // all (newline and ANSI included) may survive anywhere in it.
+        assert!(
+            !prompt.chars().any(char::is_control),
+            "no control characters may render, got: {prompt}"
+        );
+        // The prompt's only structural punctuation is engine-owned: the
+        // template itself contributes exactly four backticks (the
+        // action-detail clause and the call-label clause) and the
+        // typed-display wrapper contributes exactly two double quotes.
+        // Any byte beyond those counts is payload that escaped the fence,
+        // so these counts lock the flatten invariant where a bare
+        // `!contains('`')` on the template-owned delimiters never could.
+        assert_eq!(
+            prompt.matches('`').count(),
+            4,
+            "only the engine-owned clause delimiters may appear, got: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches('"').count(),
+            2,
+            "only the typed-display wrapper quotes may appear, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("finish the note 'rm -rf /' now 'quoted'"),
+            "payload structural punctuation must render as a lookalike, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("risk class: state_changing"),
+            "the real risk class still renders, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: the action id embeds the raw provider call id, which is
+    /// validated only as non-empty, so the id is a third provider-controlled
+    /// fragment and goes through the same flatten fence as typed text: a
+    /// crafted call id must not forge a second line in the prompt or in the
+    /// interrupt body (owner clients render both as standalone text).
+    #[tokio::test]
+    async fn computer_action_prompt_flattens_structural_provider_call_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+        let resolver =
+            resolve_sequence_collecting_questions_and_descriptions(&approver, &[ID_APPROVE_ONCE]);
+        // Newline, backticks, and a double quote: the exact structural
+        // class the one-line fence exists for.
+        let hostile_call_id = "call\n`x`\"y\":0";
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                hostile_call_id,
+                "wait 10ms",
+                None,
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let records = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let (prompt, body) = &records[0];
+        assert_eq!(
+            prompt.matches('`').count(),
+            4,
+            "only the engine-owned clause delimiters may appear, got: {prompt}"
+        );
+        for text in [prompt.as_str(), body.as_str()] {
+            assert!(
+                !text.chars().any(char::is_control),
+                "a hostile provider call id must not forge a second line, got: {text}"
+            );
+            assert!(
+                text.contains("call 'x''y':0"),
+                "the id renders with lookalikes instead of structural punctuation, got: {text}"
+            );
+        }
+    }
+
+    /// Issue #286: with no redaction table available (a headless approver
+    /// built without a session), typed text is withheld rather than shown
+    /// unredacted.
+    #[tokio::test]
+    async fn computer_action_prompt_withholds_typed_text_without_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "type text (5 chars)",
+                Some("super private note"),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("[text withheld: no redaction table]"),
+            "typed text must be withheld without a redaction table, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("super private note"),
+            "unredacted typed text must never render, got: {prompt}"
+        );
+    }
+
+    /// Build an approver whose redaction slot carries the given table (the
+    /// live session approver shape, `Approver::new_for_session`).
+    fn approver_with_redaction(
+        cwd: &std::path::Path,
+        table: crate::redact::RedactionTable,
+    ) -> Approver {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                cwd.to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
+        let hub = Arc::new(InterruptHub::detached());
+        Approver::new_for_session(
+            store,
+            db,
+            session,
+            Arc::new(std::sync::RwLock::new(Arc::new(table))),
+            "builder",
+            hub,
+        )
     }
 
     /// Build an approver whose shared session is in a specific global approval
@@ -2506,6 +2984,10 @@ mod tests {
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
             target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail: "wait 10ms",
+            typed_text: None,
+            batch_detail: None,
+            target_window: None,
         }
     }
 

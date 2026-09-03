@@ -13730,7 +13730,7 @@ async fn set_workspace_trust_narrowing_to_ignore_config_stops_attached_worker() 
         .expect("attached worker")
         .handle
         .clone();
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     // Register the same handle which backs the attached client state.  The
     // trust RPC deliberately finds live workers through the registry, so a
     // detached receiver fixture would only exercise the no-live-worker path.
@@ -13857,7 +13857,7 @@ async fn set_workspace_trust_grant_reprojects_attached_worker_without_stopping_i
         .expect("attached worker")
         .handle
         .clone();
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     let replacements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = replacements.clone();
     let worker = tokio::spawn(async move {
@@ -13971,7 +13971,7 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
     .expect("trust transition succeeds");
     assert!(matches!(response, Response::WorkspaceTrustSet { .. }));
     ctx.registry
-        .interrupt_and_stop(handle.session_id)
+        .interrupt_and_stop(handle.session_id())
         .await
         .expect("test worker stops cleanly");
 }
@@ -16518,7 +16518,6 @@ async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
     let table = table_for("stale-secret");
     let mut stale = (*state.shared_snapshot()).clone();
     stale.attached = Some(SharedAttachedSession {
-        session_id: state.attached.as_ref().unwrap().handle.session_id,
         project_root: state.attached.as_ref().unwrap().handle.project_root.clone(),
         workspace_identity: state.attached.as_ref().unwrap().workspace_identity.clone(),
         handle: state.attached.as_ref().unwrap().handle.clone(),
@@ -30777,7 +30776,7 @@ async fn inventory_bundle(
     ctx: &std::sync::Arc<DaemonContext>,
     selected_agent: &str,
 ) -> Response {
-    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+    let session_id = state.attached.as_ref().unwrap().handle.session_id();
     let project_root = state
         .attached
         .as_ref()
@@ -31590,7 +31589,7 @@ async fn set_default_model_recovers_cleanup_after_durable_receipt_before_cleanup
         .expect("attached session")
         .handle
         .clone();
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     let mut event_rx = handle.subscribe();
     let refresh_handle = handle.clone();
     let refresh = tokio::spawn(async move {
@@ -32147,7 +32146,7 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
         .expect("attached session")
         .handle
         .clone();
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     let mut event_rx = handle.subscribe();
     let refresh_handle = handle.clone();
     let refresh = tokio::spawn(async move {
@@ -32339,7 +32338,7 @@ async fn modes_session_setup_set_default_model_recovers_sealed_a_after_pre_recei
         .expect("attached session")
         .handle
         .clone();
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     let mut event_rx = handle.subscribe();
     // Recovery routes its durable handoff through the registry's live worker,
     // while this test owns the matching lightweight receiver.
@@ -33001,7 +33000,7 @@ async fn daemon_inventory_per_agent_skills() {
     assert_eq!(plan_agent, "Plan");
     // Unknown agent does not reveal a global catalog.
     let project_root = tmp.path().to_string_lossy().into_owned();
-    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+    let session_id = state.attached.as_ref().unwrap().handle.session_id();
     let err = handle_request(
         Request::GetInventoryBundle {
             project_root,
@@ -33219,7 +33218,7 @@ async fn daemon_inventory_typed_errors_never_empty_success() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let project_root = tmp.path().to_string_lossy().into_owned();
-    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+    let session_id = state.attached.as_ref().unwrap().handle.session_id();
 
     let err = handle_request(
         Request::GetInventoryBundle {

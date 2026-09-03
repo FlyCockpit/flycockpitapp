@@ -5447,7 +5447,7 @@ impl Driver {
         match self
             .session
             .db
-            .acknowledge_interrupted_turns(self.session.id)
+            .acknowledge_interrupted_turns(self.session.live_id())
             .await
         {
             Ok(0) => {}
@@ -10205,7 +10205,7 @@ impl Driver {
                 };
                 let job = crate::daemon::proto::ScheduledJobCreate {
                     id: crate::keep_warm::format_job_id(
-                        self.session.id,
+                        self.session.live_id(),
                         cache_send_identity,
                         schedule.after_secs,
                         schedule.idle_window_secs,

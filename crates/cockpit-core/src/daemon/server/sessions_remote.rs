@@ -319,7 +319,7 @@ pub(super) async fn discard_session(
         if state
             .attached
             .as_ref()
-            .is_some_and(|att| att.handle.session_id == session_id)
+            .is_some_and(|att| att.handle.session_id() == session_id)
         {
             state.attached = None;
         }
@@ -346,7 +346,7 @@ pub(super) async fn discard_session(
     if state
         .attached
         .as_ref()
-        .is_some_and(|att| att.handle.session_id == session_id)
+        .is_some_and(|att| att.handle.session_id() == session_id)
     {
         state.attached = None;
     }

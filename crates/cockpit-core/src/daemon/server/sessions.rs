@@ -362,7 +362,7 @@ pub(super) async fn discard_session(
     // Detach this client from the session it's discarding so the daemon
     // doesn't keep streaming a torn-down worker's events at it.
     if let Some(att) = &state.attached
-        && att.handle.session_id == session_id
+        && att.handle.session_id() == session_id
     {
         state.attached = None;
     }

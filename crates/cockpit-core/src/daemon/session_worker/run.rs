@@ -12134,9 +12134,10 @@ pub(super) async fn run_worker(
                     // remains held across every durable read and settlement
                     // below. Detach cannot invalidate the proven handoff, and
                     // a later attachment cannot mint the same permit.
+                    let live_session_id = session.live_id();
                     let governed_network_operation = match session
                         .db
-                        .interrupt_governed_network_operation_kind(session_id, interrupt_id)
+                        .interrupt_governed_network_operation_kind(live_session_id, interrupt_id)
                         .await
                     {
                         Ok(classified) => classified,
@@ -12149,7 +12150,7 @@ pub(super) async fn run_worker(
                     if governed_network_operation.is_some()
                         && !governed_network_attachment
                             .as_ref()
-                            .is_some_and(|permit| permit.belongs_to(session_id))
+                            .is_some_and(|permit| permit.belongs_to(live_session_id))
                     {
                         tracing::warn!(%interrupt_id, "rejecting governed network answer without its rendering attachment permit");
                         interrupts.emit_queue_state().await;

@@ -146,7 +146,7 @@ impl Tool for HistorySearchTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::history_scope::require_recall_permission(ctx)?;
-        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
+        crate::tools::history_scope::require_session_access(ctx, ctx.session.live_id()).await?;
         // Keep consent stable across discovery, target-redaction union, and
         // output construction. Revocations acquire the exclusive side first.
         let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
@@ -196,7 +196,7 @@ impl Tool for HistorySearchTool {
                 let session = ctx
                     .session
                     .db
-                    .get_session(ctx.session.id)
+                    .get_session(ctx.session.live_id())
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
                     .ok_or_else(|| invalid_input("current session no longer exists"))?;
@@ -236,7 +236,7 @@ impl Tool for HistorySearchTool {
                     .db
                     .search_current_artifact_candidates_for_trust(
                         query,
-                        ctx.session.id,
+                        ctx.session.live_id(),
                         limit,
                         trust,
                     )
@@ -250,7 +250,7 @@ impl Tool for HistorySearchTool {
                 let mut out = format!("Current artifact matches for `{query}`:\n");
                 for hit in hits {
                     let snippet =
-                        redact_target_text(ctx, ctx.session.id, hit.snippet.trim()).await?;
+                        redact_target_text(ctx, ctx.session.live_id(), hit.snippet.trim()).await?;
                     out.push_str(&format!(
                         "cockpit://session/{}/artifacts/{}\n    {}\n",
                         ctx.session.short_id(),
@@ -265,7 +265,7 @@ impl Tool for HistorySearchTool {
                 let lineage = ctx
                     .session
                     .db
-                    .compaction_lineage_sessions(ctx.session.id)
+                    .compaction_lineage_sessions(ctx.session.live_id())
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
                 let hits = ctx
@@ -316,7 +316,7 @@ impl Tool for HistorySearchTool {
                         .search_candidates_in_sessions_for_trust(
                             query,
                             &session_ids,
-                            Some(ctx.session.id),
+                            Some(ctx.session.live_id()),
                             since,
                             limit,
                             trust,
@@ -333,7 +333,7 @@ impl Tool for HistorySearchTool {
                             .search_permitted_candidates_for_trust(
                                 query,
                                 &ctx.session.project_id,
-                                Some(ctx.session.id),
+                                Some(ctx.session.live_id()),
                                 since,
                                 limit,
                                 trust,
@@ -345,7 +345,7 @@ impl Tool for HistorySearchTool {
                             .search_candidates_for_trust(
                                 query,
                                 project_id,
-                                Some(ctx.session.id),
+                                Some(ctx.session.live_id()),
                                 since,
                                 limit,
                                 trust,

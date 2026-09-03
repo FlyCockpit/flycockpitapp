@@ -543,7 +543,7 @@ async fn persist_and_broadcast_default_model_update_receipt(
         .map(|authority| {
             cockpit_config::config::effective_default::RetainedDefaultReceiptProof::new(
                 default_update_id,
-                handle.session_id,
+                handle.session_id(),
                 authority.clone(),
                 &outcome_json,
             )
@@ -553,7 +553,7 @@ async fn persist_and_broadcast_default_model_update_receipt(
     match ctx
         .db
         .record_default_model_update_receipt(
-            handle.session_id,
+            handle.session_id(),
             default_update_id,
             crate::db::session_log::DefaultModelUpdateReceipt {
                 outcome_json,
@@ -781,7 +781,7 @@ async fn recover_retained_defaults_for_attached_worker(
     .context("joining retained effective-default recovery")??;
     let (mut recovered, mut finalization, receipt_validation) = recovery.into_parts();
     if let Some(receipt_validation) = receipt_validation {
-        if receipt_validation.proof().session_id() != handle.session_id {
+        if receipt_validation.proof().session_id() != handle.session_id() {
             anyhow::bail!(
                 "retained receipt-emitted journal belongs to a different session; leaving it pending"
             );
@@ -804,7 +804,7 @@ async fn recover_retained_defaults_for_attached_worker(
     }
     if recovered
         .iter()
-        .any(|transaction| transaction.correlation.session_id() != handle.session_id)
+        .any(|transaction| transaction.correlation.session_id() != handle.session_id())
     {
         anyhow::bail!(
             "retained effective-default journal belongs to a different session; leaving it pending"
@@ -905,7 +905,7 @@ async fn recover_retained_defaults_for_attached_worker(
     if let Some(finalization) = finalization.take() {
         let proof = retained_receipt_proof_from_ledger(
             ctx,
-            handle.session_id,
+            handle.session_id(),
             receipt_update_id,
             &authority,
         )
@@ -2972,7 +2972,7 @@ async fn stop_worker_for_trust_transition(
     for attempt in 0..WORKSPACE_TRUST_STOP_ATTEMPTS {
         let still_owned = ctx
             .registry
-            .live_handle(handle.session_id)
+            .live_handle_matching_worker(handle)
             .is_some_and(|live| live.same_worker_as(handle))
             && handle.trust_transition_matches(transition);
         if !still_owned {
@@ -2984,7 +2984,7 @@ async fn stop_worker_for_trust_transition(
                 let Some(backoff) = WORKSPACE_TRUST_STOP_BACKOFF.get(attempt) else {
                     tracing::error!(
                         %error,
-                        session_id = %handle.session_id,
+                        session_id = %handle.session_id(),
                         revision = transition.revision,
                         reason,
                         "workspace-trust reconciliation could not stop this worker; it stays fail-closed until the daemon restarts"
@@ -2997,7 +2997,7 @@ async fn stop_worker_for_trust_transition(
                 };
                 tracing::warn!(
                     %error,
-                    session_id = %handle.session_id,
+                    session_id = %handle.session_id(),
                     revision = transition.revision,
                     reason,
                     attempt,
@@ -3374,7 +3374,7 @@ async fn handle_send_user_message_v2(
             message: error.to_string(),
         })?;
     let attached = require_attached(state)?;
-    let session_id = attached.handle.session_id;
+    let session_id = attached.handle.session_id();
     if validated.session_locator != session_id.to_string() {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -4040,7 +4040,7 @@ async fn handle_send_user_message(
                 .to_owned(),
         });
     }
-    let session_id = require_attached(state)?.handle.session_id;
+    let session_id = require_attached(state)?.handle.session_id();
     let handle = require_attached(state)?.handle.clone();
     let origin_principal = state.principal.tag();
     // A text-only oversized source switches to FCM2 before any receipt or
@@ -4538,7 +4538,7 @@ async fn handle_send_user_message_bulk(
             message: "user-message origin must be external_root".to_owned(),
         });
     }
-    let session_id = require_attached(state)?.handle.session_id;
+    let session_id = require_attached(state)?.handle.session_id();
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
     #[cfg(not(feature = "remote"))]
@@ -6380,7 +6380,7 @@ async fn handle_serialized_request_impl(
             let recovering_root_id = match create_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
-                        attached.handle.session_id != result.attachment.root_id.0
+                        !attached.handle.owns_session_id(result.attachment.root_id.0)
                     }) {
                         let options = request.options.clone();
                         let principal = state.principal.clone();
@@ -6561,7 +6561,7 @@ async fn handle_serialized_request_impl(
             match attach_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
-                        attached.handle.session_id != result.attachment.root_id.0
+                        !attached.handle.owns_session_id(result.attachment.root_id.0)
                     }) {
                         let options = request.options.clone();
                         let principal = state.principal.clone();
@@ -6790,7 +6790,7 @@ async fn handle_serialized_request_impl(
                     service.release_catalog(root_id.0, &request.attachment_capability);
                 }
                 if state.attached.as_ref().is_none_or(|attached| {
-                    attached.handle.session_id != root_id.0
+                    !attached.handle.owns_session_id(root_id.0)
                         || attached.code_root_capability.as_ref()
                             != Some(&request.attachment_capability)
                 }) {
@@ -6802,7 +6802,7 @@ async fn handle_serialized_request_impl(
                 state
                     .attached
                     .as_ref()
-                    .is_some_and(|attached| attached.handle.session_id == root_id.0)
+                    .is_some_and(|attached| attached.handle.owns_session_id(root_id.0))
             );
             drain_client_attachment_ownership(state, ctx, "Code-root attachment close").await?;
             Ok(Response::CodeRootAttachmentClosed(outcome))
@@ -6872,7 +6872,7 @@ async fn handle_serialized_request_impl(
                 .map_err(code_root_contract_error)?
                 .clone();
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             let root = code_root_read_snapshot(ctx, attached, record.root_id).await?;
             Ok(Response::CodeRootRead(proto::ReadCodeRootV1Result { root }))
         }
@@ -6883,7 +6883,7 @@ async fn handle_serialized_request_impl(
                 .map_err(code_root_contract_error)?
                 .clone();
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             // Deliveries are captured at the worker's durable transition
             // seam. Reading is a pure replay operation: it must never create
             // new history/attention records or turn a poll timestamp into the
@@ -7010,7 +7010,7 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             let attention_id =
                 Uuid::parse_str(request.attention_id.as_str()).map_err(|_| ErrorPayload {
                     code: ErrorCode::BadRequest,
@@ -7747,7 +7747,7 @@ async fn handle_serialized_request_impl(
                 ).await.map_err(internal)?;
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((response, changed)) => {
-                        if changed && let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                        if changed && let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id() == session_id) {
                             att.handle.broadcast_notice("paused work resumed; pending approvals will use the normal prompt flow".to_string());
                         }
                         Ok(response)
@@ -7766,7 +7766,7 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             if changed
                 && let Some(att) = state.attached.as_ref()
-                && att.handle.session_id == session_id
+                && att.handle.session_id() == session_id
             {
                 att.handle.broadcast_notice(
                     "paused work resumed; pending approvals will use the normal prompt flow"
@@ -7815,7 +7815,7 @@ async fn handle_serialized_request_impl(
                             if let Err(error) = ctx.registry.locks().suspend_session(session_id).await {
                                 tracing::warn!(%error, %session_id, "releasing cancelled paused work locks failed");
                             }
-                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id() == session_id) {
                                 att.handle.broadcast_notice("paused work cancelled; the session is waiting for new input".to_string());
                             }
                         }
@@ -7838,7 +7838,7 @@ async fn handle_serialized_request_impl(
                     tracing::warn!(error = %e, %session_id, "releasing cancelled paused work locks failed");
                 }
                 if let Some(att) = state.attached.as_ref()
-                    && att.handle.session_id == session_id
+                    && att.handle.session_id() == session_id
                 {
                     att.handle.broadcast_notice(
                         "paused work cancelled; the session is waiting for new input".to_string(),
@@ -7850,7 +7850,7 @@ async fn handle_serialized_request_impl(
 
         Request::RepairResume { session_id } => {
             let att = require_attached(state)?;
-            if att.handle.session_id != session_id {
+            if att.handle.session_id() != session_id {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "repair_resume session_id does not match the attached session".into(),
@@ -9206,12 +9206,12 @@ async fn handle_serialized_request_impl(
                             // session for being busy, which is precisely the
                             // failure mode a grant must not have.
                             tracing::info!(
-                                session_id = %handle.session_id,
+                                session_id = %handle.session_id(),
                                 revision = transition.revision,
                                 generation = refresh.result.applied_generation,
                                 "workspace trust published; live application completes at this session's next turn boundary"
                             );
-                            live_application_pending.push(handle.session_id);
+                            live_application_pending.push(handle.session_id());
                         }
                     }
                     Err(_) => refresh_failed.push((handle.clone(), transition.clone())),
@@ -10441,7 +10441,7 @@ async fn handle_serialized_request_impl(
             }
             Ok(Response::AssistantSessionCreated {
                 session: proto::AssistantSessionCreated {
-                    session_id: handle.session_id,
+                    session_id: handle.session_id(),
                     short_id: handle.short_id(),
                     project_root: handle.project_root.display().to_string(),
                     project_id: handle.project_id(),
@@ -10535,7 +10535,7 @@ async fn handle_serialized_request_impl(
         } => {
             let owner =
                 if transfer.mime_class == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque {
-                    let session_id = require_attached(state)?.handle.session_id;
+                    let session_id = require_attached(state)?.handle.session_id();
                     #[cfg(feature = "remote")]
                     {
                         Some(bulk_user_message_transfer_owner(
@@ -10899,7 +10899,7 @@ async fn handle_serialized_request_impl(
             expected_session_id,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             let approval_mode = attached.handle.approval_mode();
             let session = attached.handle.session();
@@ -10932,7 +10932,7 @@ async fn handle_serialized_request_impl(
             invocation_id,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             crate::daemon::image_sidecar_authority::create_grant(
                 ctx,
@@ -10962,7 +10962,7 @@ async fn handle_serialized_request_impl(
             expected_version,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             crate::daemon::image_sidecar_authority::revoke_grant(
                 ctx,
@@ -11522,7 +11522,7 @@ async fn handle_serialized_request_impl(
             let session_id = state
                 .attached
                 .as_ref()
-                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id());
             let response = state.terminal_host.open(
                 state.terminal_context.clone(),
                 session_id,
@@ -11551,7 +11551,7 @@ async fn handle_serialized_request_impl(
             let session_id = state
                 .attached
                 .as_ref()
-                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id());
             let response = state.terminal_host.attach(
                 state.terminal_context.clone(),
                 session_id,
@@ -11729,7 +11729,7 @@ async fn handle_serialized_request_impl(
             let att = require_attached(state)?;
             let governed_network_operation = ctx
                 .db
-                .interrupt_governed_network_operation_kind(att.handle.session_id, interrupt_id)
+                .interrupt_governed_network_operation_kind(att.handle.session_id(), interrupt_id)
                 .await
                 .map_err(internal)?;
             let governed_network_attachment = if governed_network_operation.is_some() {
@@ -11922,11 +11922,11 @@ async fn handle_serialized_request_impl(
             limit,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let page = ctx
                 .db
                 .agent_lineage_page(
-                    session_id,
+                    tree_session_id,
                     root_agent_instance_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
@@ -11946,11 +11946,11 @@ async fn handle_serialized_request_impl(
             limit,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let page = ctx
                 .db
                 .decision_attention_page(
-                    session_id,
+                    tree_session_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
                 )
@@ -11969,7 +11969,7 @@ async fn handle_serialized_request_impl(
             answer,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             attached
                 .handle
@@ -11987,7 +11987,7 @@ async fn handle_serialized_request_impl(
                 .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
             let decision = ctx
                 .db
-                .decision_request(session_id, decision_request_id)
+                .decision_request(tree_session_id, decision_request_id)
                 .await
                 .map_err(internal)?
                 .context("resolved agent decision disappeared")
@@ -12527,7 +12527,7 @@ async fn handle_serialized_request_impl(
             // and reacquires only for its short Phase-3 authority fence.
             let mut config_publication_guard = Some(CONFIG_PUBLICATION_RPC_LOCK.lock().await);
             let trust_policy = attached_trust_policy_fenced_to_worker(ctx, att).await?;
-            let session_id = att.handle.session_id;
+            let session_id = att.handle.session_id();
             // A caller retrying after a daemon crash receives the one durable
             // terminal result instead of starting a second config mutation.
             // Recovery below still runs first so an already-recorded receipt
@@ -13437,7 +13437,7 @@ async fn handle_serialized_request_impl(
             // failure, and a committed replay returns below without dispatch.
             #[cfg(feature = "remote")]
             let remote_response = if let Some(operation) = remote_operation {
-                let session_id = att.handle.session_id;
+                let session_id = att.handle.session_id();
                 let request = Request::SetAgent { name: name.clone() };
                 let params = request
                     .canonical_remote_operation_params_v1()
@@ -13594,7 +13594,7 @@ async fn handle_serialized_request_impl(
                 if let Some(response) = remote_response.as_ref() {
                     tracing::warn!(
                         %error,
-                        session_id = %att.handle.session_id,
+                        session_id = %att.handle.session_id(),
                         "committed remote SetAgent could not reach its worker; durable selection will converge on recovery"
                     );
                     return Ok(response.clone());
@@ -13613,7 +13613,7 @@ async fn handle_serialized_request_impl(
                     // turn the committed Ack into an error that invites retry.
                     tracing::warn!(
                         ?error,
-                        session_id = %att.handle.session_id,
+                        session_id = %att.handle.session_id(),
                         "committed remote SetAgent live convergence deferred to recovery"
                     );
                 }
@@ -18122,7 +18122,7 @@ async fn handle_serialized_request_impl(
             let mut proposals = service.pending_proposals(
                 |scope| {
                     guidance_scope_matches_attached_session(
-                        attached.handle.session_id,
+                        attached.handle.session_id(),
                         &attached.handle.project_root,
                         scope,
                     )
@@ -18143,7 +18143,7 @@ async fn handle_serialized_request_impl(
                 };
                 proposal.persistent_acceptance_allowed = guidance_scope_current_and_persistable(
                     &snapshot,
-                    attached.handle.session_id,
+                    attached.handle.session_id(),
                     &attached.handle.project_root,
                     &scope,
                     config_generation,
@@ -18198,7 +18198,7 @@ async fn handle_serialized_request_impl(
                 .proposal_scope_by_id(*proposal_id.as_bytes())
                 .ok_or_else(|| bad_request("guidance proposal is no longer pending"))?;
             if !guidance_scope_matches_attached_session(
-                attached.handle.session_id,
+                attached.handle.session_id(),
                 &attached.handle.project_root,
                 &scope,
             ) {
@@ -18219,7 +18219,7 @@ async fn handle_serialized_request_impl(
                     .ok_or_else(|| bad_request("guidance proposal receipt is missing"))?;
                 if !guidance_scope_current_and_persistable(
                     &snapshot,
-                    attached.handle.session_id,
+                    attached.handle.session_id(),
                     &attached.handle.project_root,
                     &scope,
                     config_generation,
@@ -18322,7 +18322,7 @@ async fn handle_serialized_request_impl(
             let receipt = recovery
                 .recover(
                     request,
-                    att.handle.session_id,
+                    att.handle.session_id(),
                     project_digest,
                     None,
                     chrono::Utc::now().timestamp_millis(),
@@ -18358,7 +18358,7 @@ async fn handle_serialized_request_impl(
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
             if request.owner_principal_digest != owner
-                || request.session_id != attached.handle.session_id
+                || request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
@@ -18416,7 +18416,7 @@ async fn handle_serialized_request_impl(
             if request.schema_version != 1
                 || request.kind != "retainHttpsMedia"
                 || request.owner_principal_digest != owner
-                || request.session_id != attached.handle.session_id
+                || request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
@@ -18470,7 +18470,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
@@ -18512,7 +18512,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
                 || request.preview_checksum.len() != 64
                 || request
@@ -18622,7 +18622,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != project_digest
                 || request.actor_role != expected_role
                 || request.actor_principal_digest
@@ -18696,7 +18696,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.mutation.actor_role != role
                 || request.mutation.actor_principal_digest
@@ -18760,7 +18760,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -18824,7 +18824,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -18878,7 +18878,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != digest
             {
                 return Err(unavailable());
@@ -18935,7 +18935,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -19766,11 +19766,12 @@ async fn handle_concurrent_request_impl(
             limit,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
             let page = ctx
                 .db
                 .agent_lineage_page(
-                    session_id,
+                    tree_session_id,
                     root_agent_instance_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
@@ -19789,11 +19790,12 @@ async fn handle_concurrent_request_impl(
             limit,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
             let page = ctx
                 .db
                 .decision_attention_page(
-                    session_id,
+                    tree_session_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
                 )
@@ -19811,14 +19813,9 @@ async fn handle_concurrent_request_impl(
             answer,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
-            let handle = ctx
-                .registry
-                .live_handle(session_id)
-                .ok_or_else(|| ErrorPayload {
-                    code: ErrorCode::UnknownSession,
-                    message: "attached session worker is unavailable".into(),
-                })?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
+            let handle = attached.handle().clone();
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
                 .send_work(SessionWork::ResolveAgentDecision {
@@ -19835,7 +19832,7 @@ async fn handle_concurrent_request_impl(
                 .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
             let decision = ctx
                 .db
-                .decision_request(session_id, decision_request_id)
+                .decision_request(tree_session_id, decision_request_id)
                 .await
                 .map_err(internal)?
                 .context("resolved agent decision disappeared")
@@ -27459,7 +27456,7 @@ pub(super) async fn get_inventory_bundle(
     // invert it. Holding both makes policy and provider projection one view.
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.handle.session_id != session_id {
+    if att.handle.session_id() != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27586,7 +27583,7 @@ async fn get_session_setup_snapshot_under_publication(
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.handle.session_id != session_id {
+    if att.handle.session_id() != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27793,11 +27790,11 @@ pub(super) async fn get_agent_effective_settings(
     let att = require_attached(state)?;
     let _projection = att.handle.read_config_publication().await;
     attached_trust_policy_fenced_to_worker(ctx, att).await?;
-    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let tree_session_id = ensure_agent_tree_attached_session(session_id, &att.handle)?;
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
         ctx,
-        session_id,
+        tree_session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
@@ -27830,7 +27827,7 @@ async fn get_agent_effective_settings_shared(
             message: "workspace trust is being reconciled; retry the settings request".into(),
         });
     }
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27839,7 +27836,7 @@ async fn get_agent_effective_settings_shared(
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
         ctx,
-        session_id,
+        att.handle().worker_session_id(),
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
@@ -27983,20 +27980,21 @@ pub(super) async fn apply_agent_session_override(
     let att = require_attached(state)?;
     let _projection = att.handle.read_config_publication().await;
     attached_trust_policy_fenced_to_worker(ctx, att).await?;
-    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let tree_session_id = ensure_agent_tree_attached_session(session_id, &att.handle)?;
     let config = att.handle.config_snapshot();
     let mut node_ctx = build_node_override_context(
         ctx,
-        session_id,
+        tree_session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
     .await?;
     if node_ctx.is_none() {
-        materialize_reserved_root_for_override(ctx, att, session_id, agent_instance_id).await?;
+        materialize_reserved_root_for_override(ctx, att, tree_session_id, agent_instance_id)
+            .await?;
         node_ctx = build_node_override_context(
             ctx,
-            session_id,
+            tree_session_id,
             agent_instance_id,
             config.extended.sandbox.default_mode,
         )
@@ -28030,7 +28028,7 @@ pub(super) async fn apply_agent_session_override(
             resolve_model_override_field(
                 ctx,
                 att,
-                session_id,
+                tree_session_id,
                 node_ctx.installation_id.as_deref(),
                 &node_ctx.model_bindings,
                 &node_ctx.child_model_bindings,
@@ -28057,7 +28055,7 @@ pub(super) async fn apply_agent_session_override(
     let outcome = ctx
         .db
         .apply_agent_session_override(
-            session_id,
+            tree_session_id,
             agent_instance_id,
             expected_override_revision as i64,
             stored_field,
@@ -28155,7 +28153,7 @@ pub(super) async fn get_inventory_bundle_shared(
     let att = require_shared_attached(shared)?;
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -28241,7 +28239,7 @@ async fn get_session_setup_snapshot_shared(
     let att = require_shared_attached(shared)?;
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -29214,7 +29212,7 @@ pub(super) async fn attach(
             .bind_created_root(
                 &pending.logical_client_id,
                 &pending.client_request_id,
-                proto::CodeRootIdV1(handle.session_id),
+                proto::CodeRootIdV1(handle.session_id()),
             )
             .map_err(code_root_contract_error)?;
     }
@@ -29227,7 +29225,7 @@ pub(super) async fn attach(
     // required to recover/refresh/receipt them. A failure remains pending and
     // does not make an otherwise valid attachment disappear.
     if let Err(error) = recover_retained_defaults_for_attached_worker(ctx, &handle).await {
-        tracing::warn!(%error, session_id = %handle.session_id, "retained default-model recovery remains pending after attach");
+        tracing::warn!(%error, session_id = %handle.session_id(), "retained default-model recovery remains pending after attach");
     }
     // The worker exists now, so any *ambient* transaction this attach
     // converged can be delivered as a correlated terminal result.
@@ -29275,7 +29273,7 @@ pub(super) async fn attach(
     } else {
         None
     };
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     // Reuse the worker's attach-time root proof.  Capturing a fresh proof here
     // would permit an A→B→A swap between worker construction and client
     // attachment, leaving setup authorization bound to A while the worker had
@@ -31310,10 +31308,10 @@ fn agent_tree_cursor_from_wire(
 
 fn ensure_agent_tree_attached_session(
     requested_session_id: Uuid,
-    attached_session_id: Uuid,
-) -> std::result::Result<(), ErrorPayload> {
-    if requested_session_id == attached_session_id {
-        return Ok(());
+    attached: &crate::daemon::session_worker::SessionWorkerHandle,
+) -> std::result::Result<Uuid, ErrorPayload> {
+    if attached.owns_session_id(requested_session_id) {
+        return Ok(attached.worker_session_id());
     }
     Err(ErrorPayload {
         code: ErrorCode::UnknownSession,

@@ -139,6 +139,24 @@ impl Session {
         Ok(updated)
     }
 
+    /// Agent-invoked title write. The live window's `user_renamed` and
+    /// `ephemeral` bits are the write-time fence: a user's manual rename on
+    /// the successor cannot be overwritten from a predecessor-row guard.
+    pub fn set_agent_session_title(&self, title: &str) -> Result<bool> {
+        let session_id = self.live_id();
+        let title_for_db = title.to_string();
+        let updated = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::set_agent_session_title_conn(conn, session_id, &title_for_db)
+            })
+            .context("setting agent session title")?;
+        if updated {
+            *self.title.lock().unwrap() = Some(title.to_string());
+        }
+        Ok(updated)
+    }
+
     /// Apply an explicitly user-requested generated title (`/rename` with no
     /// argument). Unlike scheduled auto-titles, this clears the manual-title
     /// guard because the user asked the utility model to replace the current

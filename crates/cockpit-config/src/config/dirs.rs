@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 
 /// The single per-layer config filename. Holds layer-wide provider metadata
@@ -100,17 +101,20 @@ pub fn global_config_file() -> anyhow::Result<PathBuf> {
 }
 
 /// Actionable error when a write would have to create the missing global
-/// Cockpit config directory. File-write helpers never create that directory
-/// as a side effect; only [`ensure_global_config_dir`] may.
+/// Cockpit config directory. File-write helpers, approval stores, and
+/// other side-effect mkdir sites never create that directory; only
+/// [`ensure_global_config_dir`] may.
 pub const MISSING_GLOBAL_CONFIG_DIR_MESSAGE: &str = "ephemeral daemons cannot create the global Cockpit config directory; start a persistent daemon before onboarding";
 
 /// Ensure the canonical global directory exists and can accept writes.
 ///
-/// This has no workspace-trust dependency. Persistent daemon boot calls it
-/// before publishing its socket; read-only commands intentionally do not.
-/// Onboarding-capable owners that skipped that boot gate may still create
-/// the directory lazily on the first authorized user-level write, which
-/// must call this function rather than relying on a file-write helper.
+/// This has no workspace-trust dependency. It is the only production
+/// creator of the global layer. Authorized callers:
+/// persistent daemon boot (before publishing the socket), the first
+/// authorized user-level write (`ensure_authorized_global_layer`),
+/// onboarding wizard apply, CLI first-run onboarding persist, and an
+/// explicit config-layer scaffold ([`ensure_config_layer_dir`]).
+/// Read-only commands and every other mkdir helper must not create it.
 pub fn ensure_global_config_dir() -> anyhow::Result<PathBuf> {
     let path = global_config_dir()?;
     crate::config::files::ensure_private_writable_dir(&path)?;
@@ -127,6 +131,45 @@ pub fn path_is_under_missing_global_config_dir(path: &Path) -> bool {
         return false;
     };
     !global.is_dir() && cockpit_host::path_containment::contained_under(&global, path)
+}
+
+/// Fail closed when `path` is the missing global config directory or a
+/// file inside it. The global layer is created only by
+/// [`ensure_global_config_dir`].
+pub fn refuse_missing_global_config_dir(path: &Path) -> anyhow::Result<()> {
+    if path_is_under_missing_global_config_dir(path) {
+        anyhow::bail!("{}", MISSING_GLOBAL_CONFIG_DIR_MESSAGE);
+    }
+    Ok(())
+}
+
+/// Create `dir` and parents unless `dir` is the missing global config
+/// directory (or lives under it).
+///
+/// Side-effect mkdir sites — approval locks, file-write helpers, mutation
+/// locks — must use this instead of raw `create_dir_all` so an
+/// ephemeral/diagnostic owner cannot materialize `~/.config/cockpit`.
+/// Authorized creators call [`ensure_global_config_dir`] or
+/// [`ensure_config_layer_dir`].
+pub fn create_dir_all_except_missing_global(dir: &Path) -> anyhow::Result<()> {
+    refuse_missing_global_config_dir(dir)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(())
+}
+
+/// Create `dir` as an explicit config-layer scaffold.
+///
+/// If `dir` is the canonical global config directory, this goes through
+/// [`ensure_global_config_dir`] (0700 + writability probe). Any other
+/// layer is created with [`create_dir_all_except_missing_global`], which
+/// still refuses to scaffold a missing global layer as a side effect of
+/// creating a nested path such as `providers/`.
+pub fn ensure_config_layer_dir(dir: &Path) -> anyhow::Result<()> {
+    if is_global_config_dir(dir).unwrap_or(false) {
+        ensure_global_config_dir()?;
+        return Ok(());
+    }
+    create_dir_all_except_missing_global(dir)
 }
 
 /// True when `path` names the canonical global config directory.
@@ -460,7 +503,7 @@ pub fn local_config_dir_for(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// Create `dir` (and parents) and write a minimal `config.json` if one
 /// isn't already present. Returns the path of the config file.
 pub fn scaffold_config_dir(dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    ensure_config_layer_dir(dir).map_err(|error| std::io::Error::other(error.to_string()))?;
     let config_path = dir.join(CONFIG_FILE);
     if !config_path.exists() {
         let default = "{\n  \"agents\": {},\n  \"tools\": {}\n}\n";
@@ -1077,6 +1120,66 @@ mod tests {
         assert_eq!(created, global);
         assert!(global.is_dir());
         crate::config::files::ensure_config_parent_dir(&config_file).unwrap();
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn side_effect_mkdir_refuses_a_missing_global_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = tmp.path().join("home/.config/cockpit");
+        let nested = global.join("providers");
+        assert!(!global.is_dir());
+
+        let error = create_dir_all_except_missing_global(&global).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "missing global layer must fail closed: {error:#}"
+        );
+        let nested_error = create_dir_all_except_missing_global(&nested).unwrap_err();
+        assert!(
+            nested_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "a nested path must not scaffold the missing global layer: {nested_error:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "create_dir_all_except_missing_global must not create the global config directory"
+        );
+
+        let other = tmp.path().join("elsewhere");
+        create_dir_all_except_missing_global(&other).unwrap();
+        assert!(other.is_dir(), "non-global mkdir must still succeed");
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn explicit_scaffold_creates_the_missing_global_layer_through_the_funnel() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = tmp.path().join("home/.config/cockpit");
+        assert!(!global.is_dir());
+
+        ensure_config_layer_dir(&global).unwrap();
+        assert!(global.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&global).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "authorized global-layer create must apply owner-only permissions"
+            );
+        }
+
+        let project = tmp.path().join("workspace/.cockpit");
+        ensure_config_layer_dir(&project).unwrap();
+        assert!(project.is_dir());
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

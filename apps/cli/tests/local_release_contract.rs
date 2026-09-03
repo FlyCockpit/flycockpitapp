@@ -133,6 +133,35 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 }
 
 #[test]
+fn remote_lockstep_suite_runs_on_the_blocking_cli_gate() {
+    let ci = source(".github/workflows/cli-ci.yml");
+    assert!(
+        ci.contains("cargo nextest run --locked --workspace --exclude tenant-authority --no-default-features"),
+        "the default local gate must stay local-only"
+    );
+    let lockstep = ci
+        .split("\n  remote-lockstep:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  daemon-custody-pkcs11-softhsm:\n").next())
+        .expect("cli-ci.yml must contain a blocking remote-lockstep job");
+    assert!(
+        !lockstep.contains("continue-on-error:"),
+        "remote lockstep must fail the PR/push gate"
+    );
+    assert!(
+        !lockstep.contains("workflow_dispatch"),
+        "remote lockstep must not be a manual opt-in"
+    );
+    assert!(lockstep.contains("-p cockpit-proto"));
+    assert!(lockstep.contains("-p cockpit-core"));
+    assert!(
+        lockstep.contains("--features remote,extended"),
+        "lockstep nextest must enable the remote-gated fixture tests"
+    );
+    assert!(lockstep.contains("cargo nextest run --locked"));
+}
+
+#[test]
 fn official_release_never_enables_optional_cargo_features() {
     let release = source(".github/workflows/release.yml");
     let policy = source("scripts/check-official-release-feature-policy.sh");

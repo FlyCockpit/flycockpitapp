@@ -3771,3 +3771,200 @@ fn computer_primary_target_defaults_real_and_allows_virtual_opt_in() {
     let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
     assert_eq!(cfg.computer_target, ComputerTarget::Virtual);
 }
+
+// ---------------------------------------------------------------------------
+// Typed round-trip deserialize path (issue #299)
+//
+// The hand-maintained per-section parse list in `config_with_warnings`
+// silently dropped `daemon`, `retention`, and `dream_model`, so documented
+// settings were inert. The loader now decodes through the real
+// `ExtendedConfig` type in one shot (with a per-section recovery pass for
+// malformed documents), and the tests below keep the coverage structural: a
+// section the typed path does not recognize must fail a test here.
+// ---------------------------------------------------------------------------
+
+fn doc_from_raw(raw: Value) -> ExtendedConfigDoc {
+    ExtendedConfigDoc {
+        path: PathBuf::from("<typed round-trip test>"),
+        raw,
+        origin: ConfigLayerOrigin::LocalTrusted,
+    }
+}
+
+#[test]
+fn daemon_retention_and_dream_model_take_effect_from_config() {
+    // The three sections the audit found silently dropped by the old parse
+    // list. Each must take effect through the typed decode path, both when
+    // read from a document and after a full write/reload round trip.
+    let doc = doc_from_raw(serde_json::json!({
+        "daemon": {
+            "uploads": {
+                "per_client_uploads": 2,
+                "global_uploads": 8,
+                "per_upload_bytes": 1024,
+                "global_bytes": 8192
+            },
+            "background_agents": false
+        },
+        "retention": {
+            "transcript_window_days": 90,
+            "raw_wire_window_days": 14,
+            "terminal_evidence_window_days": 60,
+            "session_window_days": 30,
+            "sweep_interval_hours": 12,
+            "vacuum_min_deletions": 10,
+            "vacuum_interval_days": 2
+        },
+        "dream_model": "anthropic:claude-opus-4-7"
+    }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(cfg.daemon.uploads.per_client_uploads, 2);
+    assert_eq!(cfg.daemon.uploads.global_uploads, 8);
+    assert_eq!(cfg.daemon.uploads.per_upload_bytes, 1024);
+    assert_eq!(cfg.daemon.uploads.global_bytes, 8192);
+    assert!(!cfg.daemon.background_agents);
+    assert_eq!(cfg.retention.transcript_window_days, 90);
+    assert_eq!(cfg.retention.raw_wire_window_days, 14);
+    assert_eq!(cfg.retention.terminal_evidence_window_days, 60);
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert_eq!(cfg.retention.sweep_interval_hours, 12);
+    assert_eq!(cfg.retention.vacuum_min_deletions, 10);
+    assert_eq!(cfg.retention.vacuum_interval_days, 2);
+    assert_eq!(
+        cfg.dream_model.as_deref(),
+        Some("anthropic:claude-opus-4-7")
+    );
+
+    // The same sections must survive a full write/reload round trip through
+    // the on-disk document.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut disk_doc = ExtendedConfigDoc::load(&path).unwrap();
+    disk_doc.write(&cfg).unwrap();
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(reloaded.daemon, cfg.daemon);
+    assert_eq!(reloaded.retention, cfg.retention);
+    assert_eq!(reloaded.dream_model, cfg.dream_model);
+}
+
+#[test]
+fn typed_decode_path_recognizes_every_serialized_section() {
+    // Structural completeness guard (issue #299): every top-level section the
+    // `ExtendedConfig` type serializes must be a section the loader
+    // recognizes. Recognition is proven by feeding each section a value
+    // malformed for its declared type and requiring a warning naming the
+    // section — a section the parse path silently drops produces no warning
+    // and fails here. One of the two sentinels is malformed for every real
+    // section shape: struct/bool/number/string/enum sections reject arrays,
+    // list sections reject strings, and the lenient string-decoding sections
+    // (`defaultPrimaryAgent`) reject arrays.
+    let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
+    let sections = default_doc.as_object().expect("serialized default config");
+    assert!(!sections.is_empty());
+    for key in sections.keys() {
+        let sentinels = [
+            Value::Array(Vec::new()),
+            Value::String("__malformed_sentinel__".into()),
+        ];
+        let recognized = sentinels.iter().any(|sentinel| {
+            let mut raw = serde_json::Map::new();
+            raw.insert(key.clone(), sentinel.clone());
+            let doc = doc_from_raw(Value::Object(raw));
+            doc.config_with_warnings()
+                .1
+                .iter()
+                .any(|warning| warning.contains(key.as_str()))
+        });
+        assert!(
+            recognized,
+            "config section `{key}` is not recognized by config_with_warnings; \
+             every serialized section must be honored by the typed decode path"
+        );
+    }
+}
+
+#[test]
+fn typed_decode_path_recognizes_sections_that_serialize_only_when_set() {
+    // `skip_serializing_if` sections are absent from the serialized default,
+    // so the structural guard above cannot see them. Pin each one here with
+    // the same malformed-sentinel probe. When adding a new
+    // serialize-only-when-set section to `ExtendedConfig`, add it to this
+    // list; removing a section from the struct fails this test, so a stale
+    // spelling cannot linger.
+    let pinned = [
+        "name",
+        "packages_directory",
+        "tools",
+        "web",
+        "computer_use",
+        "computer_target",
+        "allow_computer_guidance_proposals",
+        "utility_model",
+        "dream_model",
+        "translation_model",
+        "cheap_code",
+        "smart_code",
+        "reasoning",
+        "auto_title",
+        "skill_injection",
+        "predict_next_message_model",
+        "harness_report_summarization",
+        "compact_model",
+        "btw_model",
+        "embedding_model",
+        "compact_prompt",
+        "sandbox",
+        "goalSupervision",
+        "defaultAgent",
+        "agentRuntimeDefaults",
+        "sealedAcquisitionConsent",
+        "commandResourceProfiles",
+        "intel",
+    ];
+    for key in pinned {
+        let sentinels = [
+            Value::Array(Vec::new()),
+            Value::String("__malformed_sentinel__".into()),
+        ];
+        let recognized = sentinels.iter().any(|sentinel| {
+            let mut raw = serde_json::Map::new();
+            raw.insert(key.to_string(), sentinel.clone());
+            let doc = doc_from_raw(Value::Object(raw));
+            doc.config_with_warnings()
+                .1
+                .iter()
+                .any(|warning| warning.contains(key))
+        });
+        assert!(
+            recognized,
+            "config section `{key}` is not recognized by config_with_warnings; \
+             a serialize-only-when-set section must be honored by the typed \
+             decode path"
+        );
+    }
+}
+
+#[test]
+fn malformed_upper_layer_section_cannot_clobber_lower_layer_setting() {
+    // The old hand-maintained layer-merge sanitization list covered only a
+    // subset of sections, so a malformed upper-layer `retention` reached the
+    // merge and reset the effective window to defaults. The typed
+    // per-section sanitization must remove the malformed key from the upper
+    // layer so the lower layer's setting survives.
+    let home = doc_from_raw(serde_json::json!({
+        "retention": { "session_window_days": 30 }
+    }));
+    let project = doc_from_raw(serde_json::json!({
+        "retention": "not an object"
+    }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[home, project]);
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.contains("retention")),
+        "the lower layer's valid retention must load without warnings: {warnings:?}"
+    );
+}

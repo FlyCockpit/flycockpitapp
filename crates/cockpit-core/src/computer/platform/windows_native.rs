@@ -846,7 +846,7 @@ impl WindowsTargetEvidenceAdapter {
                 ],
             );
             let display_id = monitor_identity(hwnd)?;
-            let (window_id, uia_role, uia_name) = uia_evidence(hwnd)?;
+            let (window_id, uia_role, uia_subrole, uia_name) = uia_evidence(hwnd)?;
             let mut snapshot = empty_unavailable(BackendKind::RealDesktopWindows);
             snapshot.host_installation_id =
                 FieldEvidence::available(self.host, EvidenceSource::WinSessionDesktop);
@@ -885,10 +885,17 @@ impl WindowsTargetEvidenceAdapter {
                 },
                 |role| FieldEvidence::available(role, EvidenceSource::Accessibility),
             );
-            // TODO(a11y perception): UIA remains approval evidence only; pixel capture drives perception and targeting.
-            snapshot.accessibility_subrole = FieldEvidence::unavailable(
-                TargetUnavailableReason::PartialEvidence,
-                Some(EvidenceSource::Accessibility),
+            // TODO(a11y perception): UIA remains approval evidence only; pixel
+            // capture drives perception and targeting. Subrole carries
+            // IsPassword so credential fields are distinguishable from Edit.
+            snapshot.accessibility_subrole = uia_subrole.map_or_else(
+                || {
+                    FieldEvidence::unavailable(
+                        TargetUnavailableReason::PartialEvidence,
+                        Some(EvidenceSource::Accessibility),
+                    )
+                },
+                |subrole| FieldEvidence::available(subrole, EvidenceSource::Accessibility),
             );
             snapshot.title_hint = uia_name.map_or_else(
                 || {
@@ -1135,23 +1142,35 @@ impl TargetEvidenceAdapter for WindowsTargetEvidenceAdapter {
 
 unsafe fn uia_evidence(
     hwnd: HWND,
-) -> Result<([u8; 16], Option<String>, Option<String>), TargetUnavailableReason> {
+) -> Result<([u8; 16], Option<String>, Option<String>, Option<String>), TargetUnavailableReason> {
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let evidence = (|| -> Result<_, TargetUnavailableReason> {
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        let element = unsafe { automation.ElementFromHandle(hwnd) }
+        // Window identity and title stay on the foreground HWND. Widget
+        // role/subrole come from the focused UIA element (issue #290),
+        // never from the window's control type.
+        let window = unsafe { automation.ElementFromHandle(hwnd) }
             .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
-        let identity = unsafe { uia_runtime_id(&element) }?;
-        let role = unsafe { element.CurrentControlType() }
-            .ok()
-            .map(|value| format!("uia.control_type.{}", value.0));
-        let name = unsafe { element.CurrentName() }
+        let identity = unsafe { uia_runtime_id(&window) }?;
+        let name = unsafe { window.CurrentName() }
             .ok()
             .map(|value| value.to_string())
             .filter(|value| !value.is_empty());
-        Ok((identity, role, name))
+        let (role, subrole) = match unsafe { automation.GetFocusedElement() } {
+            Ok(focused) => {
+                let control_type = unsafe { focused.CurrentControlType() }
+                    .ok()
+                    .map(|value| value.0);
+                let is_password = unsafe { focused.CurrentIsPassword() }
+                    .ok()
+                    .is_some_and(|value| value.as_bool());
+                super::windows::uia_focused_widget_roles(control_type, is_password)
+            }
+            Err(_) => (None, None),
+        };
+        Ok((identity, role, subrole, name))
     })();
     if initialized {
         unsafe { CoUninitialize() };

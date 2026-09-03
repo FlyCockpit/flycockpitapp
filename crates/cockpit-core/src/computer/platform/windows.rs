@@ -288,3 +288,66 @@ impl WindowsObservedEpoch {
 
 #[derive(Debug, Default)]
 pub struct WindowsEvidenceLogic;
+
+/// UIA `Edit` control type (`UIA_EditControlTypeId`).
+pub const UIA_EDIT_CONTROL_TYPE_ID: i32 = 50004;
+/// UIA `Document` control type (`UIA_DocumentControlTypeId`).
+pub const UIA_DOCUMENT_CONTROL_TYPE_ID: i32 = 50030;
+
+/// Map a focused UIA control to classifier vocabulary (issue #290).
+///
+/// Window/pane/custom types stay as `uia.control_type.{id}` (ambiguous,
+/// fail-closed as Credential for TypeText). `IsPassword` always wins so
+/// an ordinary Edit control type cannot mask a password box.
+pub fn uia_focused_widget_roles(
+    control_type: Option<i32>,
+    is_password: bool,
+) -> (Option<String>, Option<String>) {
+    if is_password {
+        return (
+            Some("PasswordBox".to_string()),
+            Some("password".to_string()),
+        );
+    }
+    match control_type {
+        Some(UIA_EDIT_CONTROL_TYPE_ID) => (Some("EditText".to_string()), None),
+        Some(UIA_DOCUMENT_CONTROL_TYPE_ID) => (Some("TextArea".to_string()), None),
+        Some(id) => (Some(format!("uia.control_type.{id}")), None),
+        None => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod uia_focused_widget_roles_tests {
+    use super::{UIA_DOCUMENT_CONTROL_TYPE_ID, UIA_EDIT_CONTROL_TYPE_ID, uia_focused_widget_roles};
+
+    #[test]
+    fn password_property_wins_over_edit_control_type() {
+        assert_eq!(
+            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), true),
+            (Some("PasswordBox".into()), Some("password".into()))
+        );
+    }
+
+    #[test]
+    fn ordinary_edit_and_document_map_to_unambiguous_text_roles() {
+        assert_eq!(
+            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), false),
+            (Some("EditText".into()), None)
+        );
+        assert_eq!(
+            uia_focused_widget_roles(Some(UIA_DOCUMENT_CONTROL_TYPE_ID), false),
+            (Some("TextArea".into()), None)
+        );
+    }
+
+    #[test]
+    fn window_and_unknown_types_stay_ambiguous() {
+        // UIA Window = 50032. Must not be treated as a text field.
+        assert_eq!(
+            uia_focused_widget_roles(Some(50032), false),
+            (Some("uia.control_type.50032".into()), None)
+        );
+        assert_eq!(uia_focused_widget_roles(None, false), (None, None));
+    }
+}

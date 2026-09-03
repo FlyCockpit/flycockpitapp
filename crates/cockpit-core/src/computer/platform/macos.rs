@@ -88,6 +88,7 @@ impl CgSessionKey {
 pub enum MacAxAttribute {
     FocusedApplication,
     FocusedWindow,
+    FocusedUIElement,
     Role,
     Subrole,
     Title,
@@ -100,6 +101,7 @@ impl MacAxAttribute {
         match self {
             Self::FocusedApplication => "AXFocusedApplication",
             Self::FocusedWindow => "AXFocusedWindow",
+            Self::FocusedUIElement => "AXFocusedUIElement",
             Self::Role => "AXRole",
             Self::Subrole => "AXSubrole",
             Self::Title => "AXTitle",
@@ -112,6 +114,7 @@ impl MacAxAttribute {
         &[
             Self::FocusedApplication,
             Self::FocusedWindow,
+            Self::FocusedUIElement,
             Self::Role,
             Self::Subrole,
             Self::Title,
@@ -1137,9 +1140,24 @@ impl MacOsTargetEvidenceAdapter {
             unsafe { objc2_color_sync::CGDisplayCreateUUIDFromDisplayID(display_id) };
         let display_uuid_bytes: [u8; 16] = display_uuid.uuid_bytes().into();
 
-        let role = ax_string(&window, MacAxAttribute::Role)?;
-        let subrole = ax_optional_string(&window, MacAxAttribute::Subrole);
         let title = ax_optional_string(&window, MacAxAttribute::Title);
+        // Widget/field identity for risk classification (issue #290): the
+        // focused UI element, never the focused window. A missing focused
+        // control leaves these unavailable so TypeText fail-closes as
+        // Credential rather than treating AXWindow as a text field.
+        let focused_widget = match ax_attribute(&application, MacAxAttribute::FocusedUIElement) {
+            Ok(value) => value.downcast::<AXUIElement>().ok(),
+            Err(TargetUnavailableReason::PermissionDenied) => {
+                return Err(TargetUnavailableReason::PermissionDenied);
+            }
+            Err(_) => None,
+        };
+        let widget_role = focused_widget
+            .as_ref()
+            .and_then(|element| ax_optional_string(element, MacAxAttribute::Role));
+        let widget_subrole = focused_widget
+            .as_ref()
+            .and_then(|element| ax_optional_string(element, MacAxAttribute::Subrole));
         let bundle_id = frontmost.bundleIdentifier().map(|value| value.to_string());
         let app_name = frontmost.localizedName().map(|value| value.to_string());
 
@@ -1182,6 +1200,23 @@ impl MacOsTargetEvidenceAdapter {
             || recheck_size != size
             || recheck_window_number != window_number
         {
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        let recheck_widget =
+            match ax_attribute(&recheck_application, MacAxAttribute::FocusedUIElement) {
+                Ok(value) => value.downcast::<AXUIElement>().ok(),
+                Err(TargetUnavailableReason::PermissionDenied) => {
+                    return Err(TargetUnavailableReason::PermissionDenied);
+                }
+                Err(_) => None,
+            };
+        let recheck_widget_role = recheck_widget
+            .as_ref()
+            .and_then(|element| ax_optional_string(element, MacAxAttribute::Role));
+        let recheck_widget_subrole = recheck_widget
+            .as_ref()
+            .and_then(|element| ax_optional_string(element, MacAxAttribute::Subrole));
+        if recheck_widget_role != widget_role || recheck_widget_subrole != widget_subrole {
             return Err(TargetUnavailableReason::StaleTarget);
         }
 
@@ -1231,10 +1266,11 @@ impl MacOsTargetEvidenceAdapter {
             },
         );
         // TODO(issue #188 follow-up): semantic accessibility-driven
-        // perception remains deferred; these AX fields are target evidence
-        // only, while screenshots remain the model's perception surface.
-        snapshot.accessibility_role = FieldEvidence::available(role, EvidenceSource::Accessibility);
-        snapshot.accessibility_subrole = optional_ax_field(subrole);
+        // perception remains deferred; these AX fields are target-widget
+        // evidence for risk classification only (issue #290), while
+        // screenshots remain the model's perception surface.
+        snapshot.accessibility_role = optional_ax_field(widget_role);
+        snapshot.accessibility_subrole = optional_ax_field(widget_subrole);
         snapshot.title_hint = title.map_or_else(
             || {
                 FieldEvidence::unavailable(
@@ -1702,7 +1738,12 @@ mod macos_gui_tests {
         let snapshot = adapter.capture_snapshot().expect("capture AX evidence");
         assert_eq!(snapshot.backend_kind, BackendKind::RealDesktopMacOs);
         assert!(snapshot.physical_target_key().is_ok());
-        assert!(snapshot.accessibility_role.is_available());
+        // Role is the focused widget, not the window. Window-only focus
+        // leaves this unavailable rather than reporting AXWindow.
+        if let FieldEvidence::Available { value, .. } = &snapshot.accessibility_role {
+            assert_ne!(value.as_str(), "AXWindow");
+            assert_ne!(value.as_str(), "AXApplication");
+        }
         assert!(snapshot.process_id.is_available());
         assert!(snapshot.synchronous_recheck);
     }

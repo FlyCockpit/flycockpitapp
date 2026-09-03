@@ -599,18 +599,15 @@ pub async fn execute_backend_batch<B: ComputerBackend + ?Sized>(
     // Normalize the entire batch before the first platform effect. This
     // guarantees a malformed tail (for example a late drag point) cannot
     // fail after an earlier action has already changed host state.
-    let mut normalized = Vec::with_capacity(actions.len());
-    for (index, action) in actions.iter().enumerate() {
-        match normalize_action(action, &geometry) {
-            Ok(action) => normalized.push(action),
-            Err(error) => {
-                return ComputerBatchReport {
-                    completed: Vec::new(),
-                    failure: Some(ComputerFailure { index, error }),
-                };
-            }
+    let normalized = match normalize_backend_batch(actions, &geometry) {
+        Ok(normalized) => normalized,
+        Err(failure) => {
+            return ComputerBatchReport {
+                completed: Vec::new(),
+                failure: Some(failure),
+            };
         }
-    }
+    };
     let mut completed = Vec::new();
     for (index, action) in normalized.iter().enumerate() {
         match backend.execute_normalized_one(action).await {
@@ -2458,6 +2455,23 @@ fn checked_geometry(geometry: &DisplayGeometry) -> Result<(), ComputerError> {
         ));
     }
     Ok(())
+}
+
+/// Normalize every action against `geometry` before any platform effect.
+/// A malformed tail fails with zero completed items so the coordinator can
+/// refuse the batch before the first handoff.
+pub(crate) fn normalize_backend_batch(
+    actions: &[ComputerAction],
+    geometry: &DisplayGeometry,
+) -> Result<Vec<NormalizedComputerAction>, ComputerFailure> {
+    let mut normalized = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        match normalize_action(action, geometry) {
+            Ok(action) => normalized.push(action),
+            Err(error) => return Err(ComputerFailure { index, error }),
+        }
+    }
+    Ok(normalized)
 }
 
 fn normalize_action(

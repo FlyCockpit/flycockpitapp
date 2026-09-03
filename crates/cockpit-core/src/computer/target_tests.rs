@@ -115,6 +115,10 @@ fn computer_target_platform_evidence() {
         assert!(a.as_static_str().starts_with("AX"));
     }
     assert_eq!(
+        MacAxAttribute::FocusedUIElement.as_static_str(),
+        "AXFocusedUIElement"
+    );
+    assert_eq!(
         MacAxNotification::FocusedWindowChanged.as_static_str(),
         "AXFocusedWindowChanged"
     );

@@ -44,8 +44,6 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-#[cfg(test)]
-use super::NormalizedComputerAction;
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
     MediaReservationHandle, ObservationId, ProviderMediaVariant, SanitizedComputerFrame,
@@ -64,7 +62,7 @@ use super::{
     Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
     ComputerActionOutcome, ComputerBackend, ComputerBatchReport, ComputerError, ComputerFailure,
     ComputerToolContract, DisplayGeometry, NativeComputerWire, OpenAiComputerAction,
-    execute_backend_action, execute_backend_batch, parse_anthropic_20250124_action,
+    execute_backend_action, normalize_backend_batch, parse_anthropic_20250124_action,
     parse_anthropic_20251124_action, parse_openai_computer_call,
 };
 
@@ -2311,6 +2309,8 @@ pub struct FakeComputerAuthorizer {
     pub forced_decision: Option<ComputerAuthorizationDecision>,
     /// Action risk class from each authorization request, in call order.
     pub last_action_classes: Arc<std::sync::Mutex<Vec<ActionRiskClass>>>,
+    /// Typed-text prompt payload from each authorization request, in call order.
+    pub last_typed_texts: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl FakeComputerAuthorizer {
@@ -2322,6 +2322,7 @@ impl FakeComputerAuthorizer {
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
             last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_typed_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2335,6 +2336,7 @@ impl FakeComputerAuthorizer {
                 reason: reason.into(),
             }),
             last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_typed_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2346,6 +2348,7 @@ impl FakeComputerAuthorizer {
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: Some(ComputerAuthorizationDecision::AskBlocked),
             last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_typed_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2357,6 +2360,7 @@ impl FakeComputerAuthorizer {
             last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
             last_action_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_typed_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2379,6 +2383,10 @@ impl FakeComputerAuthorizer {
     pub fn last_action_classes(&self) -> Vec<ActionRiskClass> {
         self.last_action_classes.lock().unwrap().clone()
     }
+
+    pub fn last_typed_texts(&self) -> Vec<Option<String>> {
+        self.last_typed_texts.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -2399,6 +2407,10 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
             .lock()
             .unwrap()
             .push(request.action_class);
+        self.last_typed_texts
+            .lock()
+            .unwrap()
+            .push(request.typed_text.clone());
         if let Some(forced) = &self.forced_decision {
             return Ok(forced.clone());
         }
@@ -2649,6 +2661,19 @@ fn classify_type_text(text: &str, widget: Option<&TargetWidgetContext>) -> Actio
         }
         _ => ActionRiskClass::CredentialEntry,
     }
+}
+
+/// True when live widget evidence would classify `action` as a one-shot
+/// class that `prompted` did not. Window generation is not a proxy for
+/// widget identity: an ordinary field can become a credential field
+/// without changing the focused window.
+fn widget_risk_class_upgraded(
+    action: &ComputerAction,
+    prompted: ActionRiskClass,
+    live_widget: &TargetWidgetContext,
+) -> bool {
+    let live = ActionRiskClass::classify_with_widget(action, Some(live_widget));
+    live.requires_fresh_approval_each_action() && !prompted.requires_fresh_approval_each_action()
 }
 
 impl AskLeasePolicy {
@@ -3767,6 +3792,11 @@ pub struct ComputerActionCoordinator {
     /// gate accepted (or the open-time capture for Yolo). Used only to
     /// classify action risk; never includes field contents.
     authorized_widget: TargetWidgetContext,
+    /// Per-action risk class the human approved (or Yolo classified at
+    /// open-time pin) for the in-flight batch. Later fences compare live
+    /// widget classification against these values, not against a single
+    /// snapshot that later prompts may have overwritten.
+    authorized_action_classes: Vec<ActionRiskClass>,
     /// Lease keys of in-flight or `AskBlocked` approval waits, keyed by
     /// provider call ID. Lets cancellation revoke a pending-only wait that
     /// bulk lease enumeration would miss. Cleared when the wait installs,
@@ -3896,6 +3926,8 @@ impl TargetEvidenceAdapter for VirtualTargetEvidenceAdapter {
     }
 
     fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+        // Virtual displays have no accessibility tree. Role/subrole stay
+        // unavailable so TypeText fail-closes as Credential (issue #290).
         Ok(super::target::sample_virtual_evidence(
             self.display_id,
             self.generation,
@@ -4243,6 +4275,7 @@ impl ComputerActionCoordinator {
             backend_dead: false,
             ask_lease_store: AskDelegationLeaseStore::new(),
             authorized_widget,
+            authorized_action_classes: Vec::new(),
             ask_wait_by_call: HashMap::new(),
             provider_id: params.provider_id,
             model_id: params.model_id,
@@ -4369,28 +4402,98 @@ impl ComputerActionCoordinator {
     /// actions and is compared exactly; a later focused window is not the
     /// identity that was authorized.
     pub fn pre_handoff_check(&mut self) -> Result<(), TargetUnavailableReason> {
+        self.capture_live_evidence_for_handoff().map(|_| ())
+    }
+
+    /// Recapture live evidence and confirm window/UUID identity. Widget
+    /// role/subrole are intentionally omitted from this identity: they are
+    /// compared as a risk-class fence in [`Self::pre_handoff_for_dispatch`].
+    fn capture_live_evidence_for_handoff(
+        &mut self,
+    ) -> Result<Option<TargetIdentityEvidence>, TargetUnavailableReason> {
         if self.invalidated {
             return Err(TargetUnavailableReason::StaleTarget);
         }
         if self.backend_dead {
             return Err(TargetUnavailableReason::SessionInactive);
         }
-        // Re-check host lease.
         if !self.check_host_lease() {
             return Err(TargetUnavailableReason::StaleTarget);
         }
-        // If we have a target adapter, re-capture evidence and check for
-        // drift against the currently authorized live identity.
-        if let Some(adapter) = &mut self.target_adapter {
-            let evidence = adapter.capture_snapshot()?;
-            if !self.authorized_live_identity_matches(&evidence) {
-                // Object identity or focus drifted after the authorized
-                // identity was adopted — gate→dispatch TOCTOU. Invalidate.
-                self.invalidate(TargetUnavailableReason::StaleTarget);
+        let Some(adapter) = self.target_adapter.as_mut() else {
+            return Ok(None);
+        };
+        let evidence = adapter.capture_snapshot()?;
+        if !self.authorized_live_identity_matches(&evidence) {
+            self.invalidate(TargetUnavailableReason::StaleTarget);
+            return Err(TargetUnavailableReason::StaleTarget);
+        }
+        Ok(Some(evidence))
+    }
+
+    /// Final dispatch fence: window/UUID identity plus, in Ask, widget
+    /// risk-class validity for `actions` (a suffix of the approved batch
+    /// starting at `class_offset`). A class upgrade to a one-shot class is
+    /// non-sticky target drift; window/UUID mismatch still hard-invalidates.
+    fn pre_handoff_for_dispatch(
+        &mut self,
+        actions: &[ComputerAction],
+        class_offset: usize,
+    ) -> Result<(), TargetUnavailableReason> {
+        let evidence = self.capture_live_evidence_for_handoff()?;
+        if self.tier != ComputerApprovalTier::Ask {
+            return Ok(());
+        }
+        let Some(evidence) = evidence else {
+            return Ok(());
+        };
+        let live_widget = TargetWidgetContext::from_evidence(&evidence);
+        for (index, action) in actions.iter().enumerate() {
+            let prompted = self
+                .authorized_action_classes
+                .get(class_offset + index)
+                .copied()
+                .unwrap_or_else(|| {
+                    ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget))
+                });
+            if widget_risk_class_upgraded(action, prompted, &live_widget) {
                 return Err(TargetUnavailableReason::StaleTarget);
             }
         }
+        self.authorized_widget = live_widget;
         Ok(())
+    }
+
+    /// Recapture focused widget evidence between authorization awaits.
+    /// Window/UUID drift is sticky; unverifiable evidence is non-sticky.
+    /// Live class is not fenced here: the next prompt uses the live widget.
+    fn refresh_prompt_widget(&mut self) -> Result<(), LeaseDrift> {
+        if self.host_lease.is_some() && !self.check_host_lease() {
+            return Err(LeaseDrift::HostLease);
+        }
+        let Some(adapter) = self.target_adapter.as_mut() else {
+            return Ok(());
+        };
+        match adapter.capture_snapshot() {
+            Ok(evidence) => {
+                if !self.authorized_live_identity_matches(&evidence) {
+                    self.invalidate(TargetUnavailableReason::StaleTarget);
+                    return Err(LeaseDrift::Target);
+                }
+                self.authorized_widget = TargetWidgetContext::from_evidence(&evidence);
+                Ok(())
+            }
+            Err(_) => Err(LeaseDrift::Target),
+        }
+    }
+
+    fn remember_authorized_action_classes(&mut self, actions: &[ComputerAction]) {
+        self.authorized_action_classes = actions
+            .iter()
+            .map(|action| {
+                ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget))
+            })
+            .collect();
     }
 
     /// Execute a batch of backend actions through the coordinator. This is
@@ -4409,8 +4512,8 @@ impl ComputerActionCoordinator {
         // between the check and the irreversible dispatching commit is still
         // pre-handoff (zero input).  The `Dispatching` state is committed
         // only after every pre-handoff gate passes, immediately before the
-        // backend handoff (AC10).
-        if let Err(reason) = self.pre_handoff_check() {
+        // backend handoff (AC10). Widget risk class is part of this fence.
+        if let Err(reason) = self.pre_handoff_for_dispatch(actions, 0) {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
             return ExecuteArtifacts {
@@ -4495,9 +4598,10 @@ impl ComputerActionCoordinator {
             {
                 Ok(ticket) => {
                     // `prepare` is reversible and may await storage. Recheck
-                    // target/lease currency after it returns and before the
-                    // journal's irreversible dispatching transition.
-                    if let Err(reason) = self.pre_handoff_check() {
+                    // target/lease currency and widget risk class after it
+                    // returns and before the journal's irreversible
+                    // dispatching transition.
+                    if let Err(reason) = self.pre_handoff_for_dispatch(actions, 0) {
                         self.dispatch_states
                             .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                         return ExecuteArtifacts {
@@ -4546,9 +4650,50 @@ impl ComputerActionCoordinator {
         self.dispatch_states
             .insert(call_id.to_string(), DispatchState::Dispatching);
 
-        // Execute through the backend.
-        let report: ComputerBatchReport =
-            execute_backend_batch(self.backend.as_mut(), actions).await;
+        // Execute through the backend. Normalize the whole batch first so a
+        // malformed tail cannot fail after an earlier host effect, then
+        // re-fence widget risk class immediately before each item — focus
+        // can move to a credential field without changing window generation.
+        let report: ComputerBatchReport = {
+            match self.backend.geometry().await {
+                Err(error) => ComputerBatchReport {
+                    completed: Vec::new(),
+                    failure: Some(ComputerFailure { index: 0, error }),
+                },
+                Ok(geometry) => match normalize_backend_batch(actions, &geometry) {
+                    Err(failure) => ComputerBatchReport {
+                        completed: Vec::new(),
+                        failure: Some(failure),
+                    },
+                    Ok(normalized) => {
+                        let mut completed = Vec::new();
+                        let mut failure = None;
+                        for (index, action) in normalized.iter().enumerate() {
+                            if let Err(_reason) =
+                                self.pre_handoff_for_dispatch(&actions[index..], index)
+                            {
+                                failure = Some(ComputerFailure {
+                                    index,
+                                    error: ComputerError::Refused(
+                                        "focused widget risk class changed before dispatch"
+                                            .to_string(),
+                                    ),
+                                });
+                                break;
+                            }
+                            match self.backend.as_mut().execute_normalized_one(action).await {
+                                Ok(outcome) => completed.push(outcome),
+                                Err(error) => {
+                                    failure = Some(ComputerFailure { index, error });
+                                    break;
+                                }
+                            }
+                        }
+                        ComputerBatchReport { completed, failure }
+                    }
+                },
+            }
+        };
         let cleanup_failure = self.neutralize_input_under_host_lease().err();
         if cleanup_failure.is_some() {
             // Input neutralization failed after backend dispatch. Fence this
@@ -4773,13 +4918,16 @@ impl ComputerActionCoordinator {
     ///
     /// `target_window` is the prompt-safe focused target window summary
     /// (issue #286) captured with the pre-await evidence baseline.
+    /// Each awaited decision is a re-entry seam: widget evidence is
+    /// recaptured before constructing a later request so class and typed-text
+    /// disclosure match the live field, not the snapshot from the first item.
     async fn authorize_action(
-        &self,
+        &mut self,
         call_id: &str,
         action_label: &str,
         actions: &[ComputerAction],
         target_window: Option<&str>,
-    ) -> Result<ComputerAuthorizationDecision, ComputerError> {
+    ) -> Result<ComputerAuthorizationDecision, CoordinatedOutcome> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         // Bind the currently authorized live target (adopted at the Ask
         // gate, or the open-time pin for Yolo), not a stale open-time copy.
@@ -4789,15 +4937,45 @@ impl ComputerActionCoordinator {
             self.virtual_display_uuid(),
         );
         if actions.is_empty() {
-            return Err(ComputerError::Refused(
-                "empty computer action batch".to_string(),
-            ));
+            return Err(CoordinatedOutcome::Failed {
+                failure: ComputerFailure {
+                    index: 0,
+                    error: ComputerError::Refused("empty computer action batch".to_string()),
+                },
+                screenshot: None,
+            });
         }
+        let mut prompted_classes = Vec::with_capacity(actions.len());
         // Prompt-level batch summary (issue #286): each per-action approval
         // prompt also summarizes the whole pending batch.
-        let batch_detail =
+        let mut batch_detail =
             computer_batch_summary_with_widget(actions, Some(&self.authorized_widget));
         for (batch_index, action) in actions.iter().enumerate() {
+            if batch_index > 0 {
+                if let Err(drift) = self.refresh_prompt_widget() {
+                    self.dispatch_states
+                        .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                    let reason = TargetUnavailableReason::StaleTarget;
+                    return Err(match drift {
+                        LeaseDrift::HostLease | LeaseDrift::Target => {
+                            CoordinatedOutcome::Invalidated { reason }
+                        }
+                    });
+                }
+                batch_detail =
+                    computer_batch_summary_with_widget(actions, Some(&self.authorized_widget));
+            }
+            let action_class =
+                ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget));
+            prompted_classes.push(action_class);
+            let batch_index =
+                u32::try_from(batch_index).map_err(|_| CoordinatedOutcome::Failed {
+                    failure: ComputerFailure {
+                        index: 0,
+                        error: ComputerError::Refused("computer batch is too large".into()),
+                    },
+                    screenshot: None,
+                })?;
             let request = ComputerActionAuthorization {
                 session_id: self.session_id.clone(),
                 delegation_id: self.delegation_id.clone(),
@@ -4809,13 +4987,9 @@ impl ComputerActionCoordinator {
                 action_label: action_label.to_string(),
                 backend_kind: self.backend_kind,
                 provider_call_id: call_id.to_string(),
-                batch_index: u32::try_from(batch_index)
-                    .map_err(|_| ComputerError::Refused("computer batch is too large".into()))?,
+                batch_index,
                 geometry_generation: GeometryGeneration(self.observation_generation.0),
-                action_class: ActionRiskClass::classify_with_widget(
-                    action,
-                    Some(&self.authorized_widget),
-                ),
+                action_class,
                 action_payload_digest: canonical_computer_action_payload_digest(
                     std::slice::from_ref(action),
                 ),
@@ -4832,11 +5006,21 @@ impl ComputerActionCoordinator {
                 batch_detail: batch_detail.clone(),
                 target_window: target_window.map(str::to_string),
             };
-            match self.authorizer.authorize(&request).await? {
-                ComputerAuthorizationDecision::Allow => {}
-                denied => return Ok(denied),
+            match self.authorizer.authorize(&request).await {
+                Ok(ComputerAuthorizationDecision::Allow) => {}
+                Ok(denied) => return Ok(denied),
+                Err(error) => {
+                    return Err(CoordinatedOutcome::Failed {
+                        failure: ComputerFailure {
+                            index: batch_index as usize,
+                            error,
+                        },
+                        screenshot: None,
+                    });
+                }
             }
         }
+        self.authorized_action_classes = prompted_classes;
         Ok(ComputerAuthorizationDecision::Allow)
     }
 
@@ -4990,6 +5174,7 @@ impl ComputerActionCoordinator {
         // open-time pin); they must not skip the gate because Ask is unused.
         if self.tier == ComputerApprovalTier::Yolo {
             self.refuse_unfocused_dispatch(call_id, actions, self.focus_generation.0)?;
+            self.remember_authorized_action_classes(actions);
             return Ok(());
         }
 
@@ -5077,6 +5262,7 @@ impl ComputerActionCoordinator {
         // (and other one-shot) classes never take this path: class gates
         // dispatch, so a live benign lease cannot authorize them.
         if policy.allows_reuse() && self.ask_lease_store.try_consume(&lease_key) {
+            self.remember_authorized_action_classes(actions);
             return Ok(());
         }
 
@@ -5268,17 +5454,10 @@ impl ComputerActionCoordinator {
                 let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
                 Err(outcome)
             }
-            Err(err) => {
+            Err(outcome) => {
                 // Leave `ask_wait` armed: Drop withdraws the pending wait so
-                // an authorizer failure cannot be reused as a live approval
-                // version on re-entry.
-                let outcome = CoordinatedOutcome::Failed {
-                    failure: ComputerFailure {
-                        index: 0,
-                        error: err,
-                    },
-                    screenshot: None,
-                };
+                // an authorizer failure or mid-batch widget/identity drift
+                // cannot be reused as a live approval version on re-entry.
                 Err(outcome)
             }
         }
@@ -5355,15 +5534,19 @@ impl ComputerActionCoordinator {
 
         // Class upgrade after the human answered is a dispatch gate: a
         // StateChanging Allow must not cover a live Credential/Destructive
-        // widget (issue #290). A class that stays one-shot (or drops) is
+        // widget (issue #290). Compare against the per-action class that
+        // was prompted, not a single widget snapshot later prompts may
+        // have overwritten. A class that stays one-shot (or drops) is
         // still covered by the Allow the human just gave.
-        for action in actions {
-            let prompted =
-                ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget));
-            let live = ActionRiskClass::classify_with_widget(action, Some(&live_widget));
-            if live.requires_fresh_approval_each_action()
-                && !prompted.requires_fresh_approval_each_action()
-            {
+        for (index, action) in actions.iter().enumerate() {
+            let prompted = self
+                .authorized_action_classes
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| {
+                    ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget))
+                });
+            if widget_risk_class_upgraded(action, prompted, &live_widget) {
                 return Err(LeaseDrift::Target);
             }
         }
@@ -6024,6 +6207,8 @@ impl ComputerActionCoordinator {
     /// generation zero is a valid identity for non-focus-sensitive actions,
     /// so a later focused window is not the same authorization. Generation
     /// is not a proxy for object identity; the UUID is compared independently.
+    /// Widget role/subrole are not part of this identity: they are fenced
+    /// as a risk-class upgrade in [`Self::pre_handoff_for_dispatch`].
     fn authorized_live_identity_matches(&self, evidence: &TargetIdentityEvidence) -> bool {
         evidence.focus_generation == self.focus_generation.0
             && evidence.virtual_display_uuid == self.virtual_display_uuid
@@ -6703,6 +6888,66 @@ mod tests {
 
         fn observed_focus_epoch(&self) -> u64 {
             self.inner.lock().unwrap().observed_focus_epoch()
+        }
+    }
+
+    /// Backend that switches live widget evidence after the first executed
+    /// item, so intra-batch class-upgrade fences can be driven hermetically.
+    struct WidgetShiftingBackend {
+        inner: FakeBackend,
+        adapter: Arc<std::sync::Mutex<FakeTargetEvidenceAdapter>>,
+        after_first: TargetIdentityEvidence,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for WidgetShiftingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::VirtualDisplay
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute_normalized_one(
+            &mut self,
+            action: &NormalizedComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            let outcome = self.inner.execute_normalized_one(action).await;
+            if self.inner.recorded.len() == 1 {
+                let mut adapter = self.adapter.lock().unwrap();
+                adapter.snapshot = self.after_first.clone();
+                adapter.snapshot_queue.clear();
+            }
+            outcome
+        }
+
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all()
+        }
+    }
+
+    /// Authorizer that switches live widget evidence after the first Allow,
+    /// so later prompts in the same batch recapture a different field.
+    struct WidgetShiftingAuthorizer {
+        inner: FakeComputerAuthorizer,
+        adapter: Arc<std::sync::Mutex<FakeTargetEvidenceAdapter>>,
+        after_first: TargetIdentityEvidence,
+    }
+
+    #[async_trait]
+    impl ComputerAuthorizer for WidgetShiftingAuthorizer {
+        async fn authorize(
+            &self,
+            request: &ComputerActionAuthorization,
+        ) -> Result<ComputerAuthorizationDecision, ComputerError> {
+            let decision = self.inner.authorize(request).await?;
+            if self.inner.call_count() == 1 {
+                let mut adapter = self.adapter.lock().unwrap();
+                adapter.snapshot = self.after_first.clone();
+                adapter.snapshot_queue.clear();
+            }
+            Ok(decision)
         }
     }
 
@@ -10196,10 +10441,16 @@ mod tests {
         let password_field = TargetWidgetContext::from_roles(Some("AXSecureTextField"), None);
         let ambiguous_edit = TargetWidgetContext::from_roles(Some("edit"), None);
         let window_role = TargetWidgetContext::from_roles(Some("AXWindow"), None);
+        let edit_text = TargetWidgetContext::from_roles(Some("EditText"), None);
         assert_eq!(
             ActionRiskClass::classify_with_widget(&benign, Some(&text_field)),
             ActionRiskClass::StateChanging,
             "unambiguous ordinary text field with benign text is StateChanging"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&edit_text)),
+            ActionRiskClass::StateChanging,
+            "Windows ordinary Edit (mapped to EditText) is StateChanging"
         );
         assert_eq!(
             ActionRiskClass::classify_with_widget(&benign, Some(&password_field)),
@@ -11536,6 +11787,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computer_pre_handoff_rejects_widget_class_upgrade() {
+        // After Allow for an ordinary text field, a credential widget at the
+        // final fence (same window generation) must not dispatch.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let text_field = ask_virtual_evidence_with_role("AXTextField");
+        let password_field = ask_virtual_evidence_with_role("AXSecureTextField");
+        assert_eq!(
+            password_field.focus_generation, text_field.focus_generation,
+            "fixture must keep window generation stable"
+        );
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            BackendKind::VirtualDisplay,
+            vec![
+                text_field.clone(),
+                text_field.clone(),
+                text_field,
+                password_field,
+            ],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-widget-handoff",
+                &[OpenAiComputerAction::TypeText("hello world".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "widget class upgrade at handoff must not dispatch, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![ActionRiskClass::StateChanging]
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a widget class upgrade at handoff"
+        );
+        assert!(
+            !coordinator.is_invalidated(),
+            "widget class upgrade is non-sticky target drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_batch_item_widget_class_upgrade_stops_later_actions() {
+        // An earlier batch item can move focus onto a credential field.
+        // Later items must not execute under the class derived from the
+        // prior widget.
+        let text_field = ask_virtual_evidence_with_role("AXTextField");
+        let password_field = ask_virtual_evidence_with_role("AXSecureTextField");
+        let adapter = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            text_field.clone(),
+        )));
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(SharedFakeAdapter {
+                inner: Arc::clone(&adapter),
+            })),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let backend = WidgetShiftingBackend {
+            inner: FakeBackend::new(),
+            adapter: Arc::clone(&adapter),
+            after_first: password_field,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-batch-widget-upgrade",
+                &[
+                    OpenAiComputerAction::TypeText("user".to_string()),
+                    OpenAiComputerAction::TypeText("secret".to_string()),
+                ],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Failed { .. }),
+            "later batch item must stop on widget class upgrade, got {outcome:?}"
+        );
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[
+                BatchItemOutcome::BackendCompleted,
+                BatchItemOutcome::Failed {
+                    error: ComputerError::Refused(
+                        "focused widget risk class changed before dispatch".to_string()
+                    )
+                },
+            ]
+        );
+        assert_eq!(
+            authorizer.last_action_classes(),
+            vec![
+                ActionRiskClass::StateChanging,
+                ActionRiskClass::StateChanging,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_later_batch_approval_recaptures_widget_evidence() {
+        // Each awaited Allow is a re-entry: the next prompt must classify
+        // and redact against the live widget, not the first item's snapshot.
+        let text_field = ask_virtual_evidence_with_role("AXTextField");
+        let password_field = ask_virtual_evidence_with_role("AXSecureTextField");
+        let adapter = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            text_field.clone(),
+        )));
+        let authorizer = Arc::new(WidgetShiftingAuthorizer {
+            inner: FakeComputerAuthorizer::always_allow(),
+            adapter: Arc::clone(&adapter),
+            after_first: password_field,
+        });
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(SharedFakeAdapter {
+                inner: Arc::clone(&adapter),
+            })),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-recapture-prompt",
+                &[
+                    OpenAiComputerAction::TypeText("hello".to_string()),
+                    OpenAiComputerAction::TypeText("world".to_string()),
+                ],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "first action was approved for an ordinary field and must not dispatch into a credential field, got {outcome:?}"
+        );
+        assert_eq!(authorizer.inner.call_count(), 2);
+        assert_eq!(
+            authorizer.inner.last_action_classes(),
+            vec![
+                ActionRiskClass::StateChanging,
+                ActionRiskClass::CredentialEntry,
+            ]
+        );
+        assert_eq!(
+            authorizer.inner.last_typed_texts(),
+            vec![Some("hello".to_string()), None],
+            "later prompt must withhold typed text once the live widget is a credential field"
+        );
+    }
+
+    #[tokio::test]
     async fn computer_ask_lease_state_changing_is_one_shot() {
         // Typing into an unambiguous ordinary text field is StateChanging and
         // not retry-safe: identical payloads still require a fresh Allow and
@@ -12356,21 +12798,28 @@ mod tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
         let pre = body
-            .find("self.pre_handoff_check()")
-            .expect("pre_handoff_check in dispatch_backend_batch");
+            .find("self.pre_handoff_for_dispatch(actions, 0)")
+            .expect("pre_handoff_for_dispatch in dispatch_backend_batch");
         let dispatching = body
             .find("DispatchState::Dispatching")
             .expect("Dispatching commit in dispatch_backend_batch");
         let execute = body
-            .find("execute_backend_batch(self.backend.as_mut(), actions)")
+            .find("self.backend.as_mut().execute_normalized_one(action)")
             .expect("normalized backend handoff in dispatch_backend_batch");
+        let between = body
+            .find("self.pre_handoff_for_dispatch(&actions[index..], index)")
+            .expect("per-item widget class fence in dispatch_backend_batch");
         assert!(
             pre < dispatching,
-            "pre_handoff_check must run before Dispatching is committed"
+            "pre_handoff_for_dispatch must run before Dispatching is committed"
         );
         assert!(
             dispatching < execute,
             "Dispatching must be committed immediately before backend.execute"
+        );
+        assert!(
+            dispatching < between,
+            "widget class must be re-fenced after Dispatching and before each item"
         );
     }
 

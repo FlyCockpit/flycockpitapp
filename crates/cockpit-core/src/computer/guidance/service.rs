@@ -2195,6 +2195,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_keeps_receipt_when_pending_recovery_writes_body_then_fails_confirm() {
+        use crate::computer::audit::{
+            AppendFault, AuditVerifyStatus, GuidanceAuditAppend, TestAuditHarness,
+        };
+        use crate::computer::guidance::RuleKind;
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        let event = GuidanceAuditAppend {
+            kind: AuditEventKind::GuidanceProposalCreated,
+            proposal_id: id16(9),
+            session_id: id16(1),
+            delegation_id: id16(2),
+            canonical_project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+            config_generation: create.enablement.config_generation,
+            rule_kind_bits: RuleKind::ObservationCadence.bit_mask(),
+            disposition: None,
+            scope: None,
+        };
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHeadUnaborted);
+        let err = harness.chain.append_guidance(event).await.unwrap_err();
+        assert!(!err.is_durably_absent(), "{err}");
+
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterRecoverPendingBody);
+        svc.create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let handle = harness.actor.as_ref().unwrap().handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
     async fn create_keeps_receipt_when_insert_is_durable_but_unconfirmed() {
         use crate::computer::audit::{AppendFault, AuditVerifyStatus, TestAuditHarness};
 

@@ -56,6 +56,11 @@ const _: () = {
 /// event — the receipt must stay, and callers must not treat the existing
 /// body as delivery of the request. Pending-head recovery can still commit
 /// an event after [`Self::Unknown`], so those callers must keep the receipt.
+///
+/// [`Self::Absent`] requires proof that this event has no pending head, no
+/// database body, and cannot be recovered into one. A failure while a
+/// pending head is present — including reconstructing the authenticated
+/// body and then failing to confirm the sealed head — is [`Self::Unknown`].
 #[derive(Debug, thiserror::Error)]
 pub enum GuidanceAppendError {
     /// No pending head and no database row were written for this event.
@@ -106,7 +111,9 @@ impl GuidanceAppendError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppendFault {
     AfterPendingHead,
+    AfterPendingHeadUnaborted,
     AfterDatabaseInsert,
+    AfterRecoverPendingBody,
 }
 
 /// Fields for a guidance-proposal audit append. Typed rule values and
@@ -381,30 +388,8 @@ impl ComputerAuditChain {
             match status.status {
                 AuditVerifyStatus::Verified => {}
                 AuditVerifyStatus::PendingRecovery => {
-                    self.recover_pending(inner, &view, &head, &rows)
-                        .await
-                        .map_err(GuidanceAppendError::Absent)?;
-                    view = self
-                        .keys
-                        .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
-                        .await
-                        .context("reloading sealed head after pending recovery")
-                        .map_err(GuidanceAppendError::Absent)?;
-                    head = decode_head(view.payload.as_slice())
-                        .map_err(GuidanceAppendError::Absent)?;
-                    rows = self
-                        .db
-                        .list_computer_audit_entries()
-                        .await
-                        .map_err(GuidanceAppendError::Absent)?;
-                    let status = verify_with(inner, Some(&head), Some(&rows))
-                        .map_err(GuidanceAppendError::Absent)?;
-                    if status.status != AuditVerifyStatus::Verified {
-                        return Err(GuidanceAppendError::absent(anyhow!(
-                            "computer audit chain failed closed: {}",
-                            status.status.as_str()
-                        )));
-                    }
+                    self.confirm_pending_recovery(inner, &mut view, &mut head, &mut rows)
+                        .await?;
                 }
                 other => {
                     return Err(GuidanceAppendError::absent(anyhow!(
@@ -485,7 +470,10 @@ impl ComputerAuditChain {
             match self.cas_head(&view, &pending).await {
                 Ok(pending_view) => view = pending_view,
                 Err(CasOutcome::Conflict) => continue,
-                Err(CasOutcome::Fatal(error)) => return Err(GuidanceAppendError::Absent(error)),
+                // Lost-ack may have written the pending head; recovery can
+                // still commit. Same class as abort_uncommitted_pending
+                // treating a fatal abort CAS as unknown.
+                Err(CasOutcome::Fatal(error)) => return Err(GuidanceAppendError::Unknown(error)),
             }
 
             #[cfg(test)]
@@ -498,6 +486,13 @@ impl ComputerAuditChain {
                         anyhow!("injected fault after pending head"),
                     )
                     .await;
+            }
+
+            #[cfg(test)]
+            if self.take_append_fault(AppendFault::AfterPendingHeadUnaborted) {
+                return Err(GuidanceAppendError::unknown(
+                    "injected fault after pending head without abort",
+                ));
             }
 
             let row = ComputerAuditEntryRow {
@@ -586,6 +581,46 @@ impl ComputerAuditChain {
         }
     }
 
+    /// Promote a `pending_recovery` head to confirmed, then reload verified
+    /// chain state for the rest of this append.
+    ///
+    /// A pending head already exists, and recovery may insert the
+    /// authenticated body before the sealed-head CAS. Every failure from
+    /// this path is [`GuidanceAppendError::Unknown`]: absence is not
+    /// proved, and create-path rollback is not allowed.
+    async fn confirm_pending_recovery(
+        &self,
+        inner: &mut ChainInner,
+        view: &mut SealedStateView,
+        head: &mut ComputerAuditSealedHeadV1,
+        rows: &mut Vec<ComputerAuditEntryRow>,
+    ) -> Result<(), GuidanceAppendError> {
+        self.recover_pending(inner, view, head, rows)
+            .await
+            .map_err(GuidanceAppendError::Unknown)?;
+        *view = self
+            .keys
+            .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
+            .await
+            .context("reloading sealed head after pending recovery")
+            .map_err(GuidanceAppendError::Unknown)?;
+        *head = decode_head(view.payload.as_slice()).map_err(GuidanceAppendError::Unknown)?;
+        *rows = self
+            .db
+            .list_computer_audit_entries()
+            .await
+            .map_err(GuidanceAppendError::Unknown)?;
+        let status =
+            verify_with(inner, Some(head), Some(rows)).map_err(GuidanceAppendError::Unknown)?;
+        if status.status != AuditVerifyStatus::Verified {
+            return Err(GuidanceAppendError::unknown(anyhow!(
+                "computer audit chain failed closed: {}",
+                status.status.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     async fn recover_pending(
         &self,
         inner: &mut ChainInner,
@@ -630,6 +665,13 @@ impl ComputerAuditChain {
             );
         } else {
             bail!("computer audit chain failed closed: sealed_head_behind_database");
+        }
+
+        #[cfg(test)]
+        if self.take_append_fault(AppendFault::AfterRecoverPendingBody) {
+            return Err(anyhow!(
+                "injected fault after reconstructing pending computer audit body"
+            ));
         }
 
         let confirmed = ComputerAuditSealedHeadV1::confirmed_only(
@@ -1498,6 +1540,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn recover_pending_body_then_confirm_failure_is_not_durably_absent() {
+        let harness = TestAuditHarness::new().await;
+        let event = sample_event(AuditEventKind::GuidanceProposalCreated, 1);
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHeadUnaborted);
+        let err = harness
+            .chain
+            .append_guidance(event.clone())
+            .await
+            .unwrap_err();
+        assert!(!err.is_durably_absent(), "{err}");
+        assert!(matches!(err, GuidanceAppendError::Unknown(_)), "{err}");
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterRecoverPendingBody);
+        let err = harness
+            .chain
+            .append_guidance(event.clone())
+            .await
+            .unwrap_err();
+        assert!(!err.is_durably_absent(), "{err}");
+        assert!(matches!(err, GuidanceAppendError::Unknown(_)), "{err}");
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(harness.chain.is_available());
+
+        harness.chain.append_guidance(event).await.unwrap();
+        let result = harness.chain.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+        assert_eq!(result.entry_count, 1);
     }
 
     #[tokio::test]

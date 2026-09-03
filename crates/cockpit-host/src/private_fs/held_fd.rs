@@ -1,7 +1,8 @@
 //! Canonical Unix held-fd filesystem syscalls for the `private_fs` family.
 //!
 //! This module is the SINGLE home for the raw, fd-anchored, no-follow syscalls
-//! (`openat`/`mkdirat`/`fchmod`/`unlinkat`/`linkat`/`renameat2`/`fstatat`) used
+//! (`openat`/`mkdirat`/`fchmod`/`unlinkat`/`linkat`/`renameat2`/`fstatat`,
+//! plus Linux `O_TMPFILE` / `linkat(AT_EMPTY_PATH)` / `RENAME_EXCHANGE`) used
 //! by the `private_fs` primitives and their in-crate consumers — the
 //! external-journal spool directory guards and the held-directory authority
 //! [`crate::private_fs::held_directory`]. Before this
@@ -217,6 +218,96 @@ pub fn linkat(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Anonymous file in the filesystem of `dir_fd` (`O_TMPFILE`). No directory
+/// entry exists until the caller [`linkat_held_inode`]s it; dropping the
+/// returned handle without linking destroys the inode. `mode` is masked by
+/// umask, so a caller wanting an exact mode follows with [`fchmod`].
+///
+/// Do not pass `O_EXCL`: that forbids a later `linkat(AT_EMPTY_PATH)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn openat_tmpfile(dir_fd: RawFd, mode: libc::c_uint) -> io::Result<File> {
+    openat_mode(
+        dir_fd,
+        c".",
+        libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+        mode,
+    )
+}
+
+/// Give a held inode a directory entry beneath `dir_fd` without a source-name
+/// lookup. `linkat(file_fd, "", dir_fd, name, AT_EMPTY_PATH)` names the inode
+/// of `file_fd` directly, so the source cannot be substituted. `linkat` never
+/// replaces: an existing `name` fails with `EEXIST`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn linkat_held_inode(file_fd: RawFd, dir_fd: RawFd, name: &CStr) -> io::Result<()> {
+    linkat(file_fd, c"", dir_fd, name, libc::AT_EMPTY_PATH)
+}
+
+/// Atomic exchange of two names relative to held directory fds. Linux uses
+/// `renameat2(RENAME_EXCHANGE)`; macOS uses `renameatx_np(RENAME_SWAP)`. After
+/// success each name refers to the inode the other name referred to, so a
+/// publisher that just named its held inode can swap it with the live entry
+/// while keeping the previous store as a named file for rollback.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+pub fn rename_exchange(
+    from_dir_fd: RawFd,
+    from: &CStr,
+    to_dir_fd: RawFd,
+    to: &CStr,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: both dir fds are live and both names outlive the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_dir_fd,
+            from.as_ptr(),
+            to_dir_fd,
+            to.as_ptr(),
+            2_u32, // RENAME_EXCHANGE
+        ) as libc::c_int
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: both dir fds are live and both names outlive the call.
+    let result = unsafe {
+        libc::renameatx_np(
+            from_dir_fd,
+            from.as_ptr(),
+            to_dir_fd,
+            to.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Fail closed where the platform has no atomic name-exchange rename.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+pub fn rename_exchange(
+    _from_dir_fd: RawFd,
+    _from: &CStr,
+    _to_dir_fd: RawFd,
+    _to: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange rename is unavailable on this platform",
+    ))
 }
 
 /// `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)` — stat a name beneath the held fd

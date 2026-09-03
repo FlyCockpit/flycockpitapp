@@ -11116,6 +11116,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        // Round reservation before dispatch: same gate as the interactive
+        // driver (`admit_provider_round`) and the swarm/schedule loops.
         if let Err(exhaustion) = budget.charge_round() {
             retain_noninteractive_late_steer_checkpoint(
                 &active_claimed_agent_tree_steers,

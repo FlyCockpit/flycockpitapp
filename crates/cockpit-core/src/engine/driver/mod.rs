@@ -3199,6 +3199,75 @@ impl Driver {
         self.budget.charge(charge)
     }
 
+    /// Reserve one provider round on the live ledger before dispatching
+    /// inference. Interactive roots may extend the ceiling; otherwise
+    /// exhaustion is terminal. `Ok(true)` means dispatch; `Ok(false)` means
+    /// the caller must stop without contacting the provider.
+    ///
+    /// `charge_round` is the reservation (not a peek): descendants share
+    /// this ledger, so check-then-dispatch would race. Swarm, schedule,
+    /// and noninteractive loops call `charge_round` at the same point.
+    async fn admit_provider_round(
+        &mut self,
+        is_root: bool,
+        max_primary_rounds: u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<bool> {
+        match self.budget.charge_round() {
+            Ok(()) => Ok(true),
+            Err(exhaustion) => {
+                if is_root
+                    && max_primary_rounds > 0
+                    && exhaustion.dimension
+                        == crate::engine::delegation_budget::BudgetDimension::Rounds
+                    && self.interrupts.is_interactive_attached()
+                {
+                    if self
+                        .primary_round_ceiling_allows_more(
+                            max_primary_rounds,
+                            max_primary_rounds,
+                            tx,
+                        )
+                        .await?
+                    {
+                        self.budget.extend_rounds(max_primary_rounds);
+                        if let Err(exhaustion) = self.budget.charge_round() {
+                            self.emit_round_admission_failure(&exhaustion, max_primary_rounds, tx)
+                                .await;
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                self.emit_round_admission_failure(&exhaustion, max_primary_rounds, tx)
+                    .await;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn emit_round_admission_failure(
+        &mut self,
+        exhaustion: &crate::engine::delegation_budget::BudgetExhaustion,
+        max_primary_rounds: u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        if !self.interrupts.is_interactive_attached()
+            && exhaustion.dimension == crate::engine::delegation_budget::BudgetDimension::Rounds
+        {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
+                        max_primary_rounds.max(1)
+                    ),
+                })
+                .await;
+        }
+        self.on_budget_exhausted(exhaustion, tx).await;
+    }
+
     pub(in crate::engine::driver) fn record_compact_progress(
         &mut self,
         tokens_after: u64,
@@ -5247,6 +5316,14 @@ impl Driver {
             {
                 return Err(error);
             }
+            if scheduled_turn_result.is_none()
+                && !self
+                    .admit_provider_round(is_root, max_primary_rounds, tx)
+                    .await?
+            {
+                self.acknowledge_interrupted_turns_after_progress().await;
+                return Ok(ParkedReplayOutcome::Completed);
+            }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
@@ -5484,40 +5561,6 @@ impl Driver {
             }
             match outcome {
                 TurnOutcome::Continue => {
-                    if let Err(exhaustion) = self.budget.charge_round() {
-                        if is_root
-                            && max_primary_rounds > 0
-                            && exhaustion.dimension
-                                == crate::engine::delegation_budget::BudgetDimension::Rounds
-                            && self.interrupts.is_interactive_attached()
-                        {
-                            if self
-                                .primary_round_ceiling_allows_more(
-                                    max_primary_rounds,
-                                    max_primary_rounds,
-                                    tx,
-                                )
-                                .await?
-                            {
-                                self.budget.extend_rounds(max_primary_rounds);
-                            } else {
-                                self.acknowledge_interrupted_turns_after_progress().await;
-                                return Ok(ParkedReplayOutcome::Completed);
-                            }
-                        } else {
-                            let _ = tx
-                                .send(TurnEvent::Notice {
-                                    text: format!(
-                                        "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
-                                        max_primary_rounds.max(1)
-                                    ),
-                                })
-                                .await;
-                            self.on_budget_exhausted(&exhaustion, tx).await;
-                            self.acknowledge_interrupted_turns_after_progress().await;
-                            return Ok(ParkedReplayOutcome::Completed);
-                        }
-                    }
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self
@@ -13678,6 +13721,13 @@ impl Driver {
                     }
                 }
             }
+            if scheduled_turn_result.is_none()
+                && !self
+                    .admit_provider_round(is_root, max_primary_rounds, tx)
+                    .await?
+            {
+                return Ok(());
+            }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
@@ -14082,43 +14132,6 @@ impl Driver {
             }
             match outcome {
                 TurnOutcome::Continue => {
-                    if let Err(exhaustion) = self.budget.charge_round() {
-                        if is_root
-                            && max_primary_rounds > 0
-                            && exhaustion.dimension
-                                == crate::engine::delegation_budget::BudgetDimension::Rounds
-                            && self.interrupts.is_interactive_attached()
-                        {
-                            if self
-                                .primary_round_ceiling_allows_more(
-                                    max_primary_rounds,
-                                    max_primary_rounds,
-                                    tx,
-                                )
-                                .await?
-                            {
-                                self.budget.extend_rounds(max_primary_rounds);
-                            } else {
-                                return Ok(());
-                            }
-                        } else {
-                            if !self.interrupts.is_interactive_attached()
-                                && exhaustion.dimension
-                                    == crate::engine::delegation_budget::BudgetDimension::Rounds
-                            {
-                                let _ = tx
-                                    .send(TurnEvent::Notice {
-                                        text: format!(
-                                            "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
-                                            max_primary_rounds.max(1)
-                                        ),
-                                    })
-                                    .await;
-                            }
-                            self.on_budget_exhausted(&exhaustion, tx).await;
-                            return Ok(());
-                        }
-                    }
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self

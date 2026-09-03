@@ -645,6 +645,8 @@ async fn run_iteration(
     let mut turn_agent = (**agent).clone();
     turn_agent.bind_retry_budget(&run_budget);
     for _ in 0..MAX_ITERATION_TURNS {
+        // Round reservation before dispatch: same gate as the interactive
+        // driver (`admit_provider_round`) and the swarm/noninteractive loops.
         if let Err(exhaustion) = run_budget.charge_round() {
             return Ok(crate::engine::delegation_budget::budget_exhausted_report(
                 &collect_final_text(history),

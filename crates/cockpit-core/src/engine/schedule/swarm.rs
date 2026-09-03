@@ -397,6 +397,8 @@ async fn run_swarm_loop(
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
+        // Round reservation before dispatch: same gate as the interactive
+        // driver (`admit_provider_round`) and the schedule/noninteractive loops.
         if let Err(exhaustion) = ctx.budget.charge_round() {
             return Ok(crate::engine::delegation_budget::budget_exhausted_report(
                 &collect_final_text(&history),

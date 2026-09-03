@@ -281,13 +281,31 @@ impl Classification {
 /// Classify a proposed shell-command string. Pure and synchronous —
 /// the standalone-testable core of the subsystem.
 pub fn classify(command: &str) -> Classification {
+    classify_with_grammar(command, true)
+}
+
+/// Classify a string against the **bash** grammar rather than the `sh`
+/// subset. `classify` matches what `bash.rs` executes (`sh -c`); this
+/// variant matches what an *interactive bash terminal* would accept — a
+/// strict superset. Callers that must fail closed on text a real terminal
+/// could run (computer-use terminal-input policy, issue #289) classify
+/// with **both** grammars: bash-only constructs (process substitution,
+/// `[[ ]]`, `coproc`) are `Unparseable` under `classify` alone and would
+/// otherwise pass a gate that only rejects parseable programs.
+pub fn classify_bash(command: &str) -> Classification {
+    classify_with_grammar(command, false)
+}
+
+fn classify_with_grammar(command: &str, sh_mode: bool) -> Classification {
     if command.trim().is_empty() {
         return Classification::Empty;
     }
 
-    // `bash.rs` runs `sh -c <command>`; parse with the matching grammar.
+    // `bash.rs` runs `sh -c <command>`; the `sh_mode` flag selects the
+    // matching grammar (`true`) or the interactive-bash superset
+    // (`false`, see [`classify_bash`]).
     let opts = ParserOptions {
-        sh_mode: true,
+        sh_mode,
         ..ParserOptions::default()
     };
     let mut parser = Parser::new(Cursor::new(command.as_bytes().to_vec()), &opts);
@@ -768,6 +786,161 @@ fn is_privileged_non_persistable(program: &str) -> bool {
 fn program_basename(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
 }
+
+/// Mainstream command program basenames (basename match, so `/usr/bin/curl`
+/// and `curl` agree) whose plain invocations a receiving terminal would
+/// execute even though [`classify`] leaves them at the `Ordinary` tier:
+/// the run tool still prompts for every one of these (grant-or-ask), so
+/// computer-use terminal-input policy (issue #289) refuses typed text
+/// that carries one. Wrappers, privilege-escalators, and the
+/// risk-elevating programs are caught by their own classifier flags and
+/// tiers; this table covers the rest of the common shell surface.
+///
+/// Deliberately broad: a false positive only costs typing convenience
+/// (prose that begins with one of these words is refused), while the
+/// kept boundary — program names **unknown to policy** pass as prose —
+/// is the structured-terminal-model follow-up's to close: no text-only
+/// signal distinguishes an unknown command from prose.
+pub fn typed_program_is_blocked_command(normalized_program: &str) -> bool {
+    let base = program_basename(normalized_program);
+    TYPED_COMMAND_PROGRAMS.contains(&base)
+}
+
+const TYPED_COMMAND_PROGRAMS: &[&str] = &[
+    "alias",
+    "apt",
+    "apt-get",
+    "awk",
+    "base32",
+    "base64",
+    "brew",
+    "bun",
+    "cargo",
+    "cat",
+    "cd",
+    "clang",
+    "clear",
+    "cmake",
+    "cpio",
+    "curl",
+    "cut",
+    "date",
+    "dd",
+    "diff",
+    "dig",
+    "diskutil",
+    "dmesg",
+    "docker",
+    "dotnet",
+    "dpkg",
+    "echo",
+    "export",
+    "fdisk",
+    "ffmpeg",
+    "file",
+    "free",
+    "gcc",
+    "gdb",
+    "gem",
+    "gh",
+    "git",
+    "go",
+    "grep",
+    "gunzip",
+    "gzip",
+    "head",
+    "host",
+    "htop",
+    "ifconfig",
+    "ip",
+    "java",
+    "kubectl",
+    "kill",
+    "killall",
+    "less",
+    "ln",
+    "locate",
+    "ls",
+    "lsof",
+    "mail",
+    "make",
+    "man",
+    "mkdir",
+    "more",
+    "mount",
+    "msg",
+    "mv",
+    "mysql",
+    "nano",
+    "nc",
+    "netstat",
+    "nmap",
+    "node",
+    "npm",
+    "npx",
+    "open",
+    "openssl",
+    "osascript",
+    "passwd",
+    "patch",
+    "ping",
+    "pip",
+    "pip3",
+    "pkg",
+    "powershell",
+    "ps",
+    "psql",
+    "pwd",
+    "python",
+    "python3",
+    "rake",
+    "rm",
+    "rmdir",
+    "rsync",
+    "ruby",
+    "rustup",
+    "scp",
+    "sed",
+    "sha1sum",
+    "sha256sum",
+    "shred",
+    "shutdown",
+    "sleep",
+    "snap",
+    "sort",
+    "sqlite3",
+    "ssh",
+    "su",
+    "system_profiler",
+    "systemctl",
+    "tail",
+    "tar",
+    "tee",
+    "telnet",
+    "top",
+    "touch",
+    "tr",
+    "umount",
+    "uname",
+    "unzip",
+    "useradd",
+    "vi",
+    "vim",
+    "vmstat",
+    "w",
+    "watch",
+    "wc",
+    "wget",
+    "whereis",
+    "which",
+    "whoami",
+    "winget",
+    "xxd",
+    "yes",
+    "yum",
+    "zip",
+    "zypper",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableWord {

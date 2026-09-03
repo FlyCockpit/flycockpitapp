@@ -484,6 +484,7 @@
   },
   "import_session_archive": {
     "params": {
+      "include_sensitive": false,
       "transfer": {
         "mime_class": "archive",
         "sha256": "abababababababababababababababababababababababababababababababab",

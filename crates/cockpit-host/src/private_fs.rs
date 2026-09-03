@@ -69,6 +69,14 @@ pub mod held_directory;
 #[cfg(unix)]
 pub mod held_fd;
 
+/// Canonical Windows held-handle NT primitives (`NtCreateFile` relative
+/// opens, `NtSetInformationFile` rename/disposition, `NtQueryDirectoryFile`
+/// enumeration) — the Windows twin of [`held_fd`] — so the no-reparse,
+/// handle-anchored discipline behind skill mutations is implemented in
+/// exactly one audited place.
+#[cfg(windows)]
+pub mod held_nt;
+
 // ------------------------------------------------------------------------
 // Typed, matchable, fail-closed errors
 // ------------------------------------------------------------------------

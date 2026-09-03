@@ -1137,8 +1137,16 @@ pub enum Request {
     /// The archive never travels inline. `transfer` references a completed
     /// bulk-lane transfer; the daemon reads the bytes from there after the
     /// transfer's digest and length have been verified.
+    ///
+    /// `include_sensitive` is the explicit acknowledgement for an UNREDACTED
+    /// archive (one written by `cockpit export --include-sensitive`), the
+    /// mirror of the export side's single raw opt-in. Fail-closed: absent or
+    /// `false`, the daemon refuses an unredacted archive rather than
+    /// silently restoring raw secret material into destination events.
     ImportSessionArchive {
         transfer: crate::bulk_transfer::BulkTransferRef,
+        #[serde(default)]
+        include_sensitive: bool,
     },
 
     /// Push one chunk of a bulk transfer into daemon-side staging.
@@ -4782,7 +4790,7 @@ macro_rules! command {
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
-            (Request::ImportSessionArchive { transfer }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef", [transfer: $crate::bulk_transfer::BulkTransferRef => param]);
+            (Request::ImportSessionArchive { transfer, include_sensitive }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef|include_sensitive:bool", [transfer: $crate::bulk_transfer::BulkTransferRef => param, include_sensitive: bool => param]);
             // Remote oversized text ingress stages source bytes over the bulk
             // lane before its reference-only FCM2 request. It is scoped to the
             // attached session writer (while local owners retain their normal
@@ -5663,6 +5671,7 @@ mod tests {
                 RemoteBulkMimeClass::Archive,
             )
             .unwrap(),
+            include_sensitive: false,
         };
         assert_eq!(request.wire_tag(), "import_session_archive");
 
@@ -5679,9 +5688,27 @@ mod tests {
 
         let round_tripped: Request = serde_json::from_str(&encoded).unwrap();
         match round_tripped {
-            Request::ImportSessionArchive { transfer } => {
+            Request::ImportSessionArchive {
+                transfer,
+                include_sensitive,
+            } => {
                 assert_eq!(transfer.total_length_value(), 64 * 1024 * 1024);
                 assert_eq!(transfer.mime_class, RemoteBulkMimeClass::Archive);
+                // The raw-archive acknowledgement round-trips and defaults
+                // fail-closed when the field is absent.
+                assert!(!include_sensitive);
+                let mut without_ack: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                without_ack
+                    .pointer_mut("/params")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("request params object")
+                    .remove("include_sensitive");
+                match serde_json::from_value::<Request>(without_ack).unwrap() {
+                    Request::ImportSessionArchive {
+                        include_sensitive, ..
+                    } => assert!(!include_sensitive),
+                    other => panic!("unexpected variant: {}", other.wire_tag()),
+                }
             }
             other => panic!("unexpected variant: {}", other.wire_tag()),
         }

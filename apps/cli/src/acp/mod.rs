@@ -28,7 +28,8 @@ pub(crate) use registry::{
 };
 
 /// ACP host acquisition seam. The settings owner supplies the current
-/// background-agents value; acquisition itself is guaranteed socket-only.
+/// background-agents value; acquisition itself uses the discoverable wire owner
+/// (Unix socket or Windows named-pipe identity).
 pub async fn acquire_ledger_owner(
     background_agents: bool,
 ) -> anyhow::Result<cockpit_client::DaemonClient> {

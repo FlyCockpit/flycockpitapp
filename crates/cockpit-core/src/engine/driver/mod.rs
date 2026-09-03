@@ -1191,8 +1191,12 @@ pub struct Driver {
     /// before the loop starts.
     pub loop_guard_threshold: u32,
     /// Maximum root-agent `Continue` cycles allowed per user message
-    /// before the driver pauses for confirmation. `0` means unlimited.
+    /// before the driver pauses for confirmation. `0` means the hierarchical
+    /// budget's rounds dimension is unlimited (explicit opt-in).
     pub max_primary_rounds: u32,
+    /// Hierarchical spend pool for this driver and every descendant it
+    /// allots. One mechanism: turn loop, spawn, swarm, schedule, compact.
+    pub budget: crate::engine::delegation_budget::BudgetPool,
     delegation_retry_budget_remaining: usize,
     /// Config opt-in for schedule `limit=0` loops. Even when true, an
     /// interactive session approval is still required once per session.
@@ -2262,6 +2266,7 @@ impl Driver {
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
+            budget: self.budget.clone(),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -2322,6 +2327,7 @@ impl Driver {
             time_injection_interval_minutes: self.time_injection_interval_minutes,
             loop_guard_threshold: self.loop_guard_threshold,
             max_primary_rounds: self.max_primary_rounds,
+            budget: self.budget.clone(),
             delegation_retry_budget_remaining: self.delegation_retry_budget_remaining,
             allow_unbounded_schedule_loops: self.allow_unbounded_schedule_loops,
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
@@ -2651,6 +2657,7 @@ impl Driver {
             // is updated through the same setter.
             write_scope: None,
             dream_read_scope: dream_read_scope.clone(),
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
         // The authority needs the engine UI-event channel (`tx`) to emit
         // started/progress/note signals, but `tx` isn't known until
@@ -2713,6 +2720,7 @@ impl Driver {
             time_injection_interval_minutes: 5,
             loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             max_primary_rounds: 0,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
             delegation_retry_budget_remaining: DELEGATION_RETRY_BUDGET_PER_TURN,
             allow_unbounded_schedule_loops: false,
             unbounded_schedule_loops_approved: false,
@@ -3085,6 +3093,38 @@ impl Driver {
         // Read from the turn-pinned config snapshot rather than re-reading disk
         // (`engine-config-snapshot-adoption`).
         self.config.extended().max_primary_rounds
+    }
+
+    fn install_turn_budget(&mut self) {
+        let agent_name = self
+            .stack
+            .last()
+            .map(|frame| frame.agent.name.as_str())
+            .unwrap_or("Build");
+        let resolved = self
+            .config
+            .extended()
+            .resolved_delegation_budget(agent_name, None);
+        self.budget = crate::engine::delegation_budget::BudgetPool::new(resolved);
+        self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);
+        self.budget.reset_retry_turn();
+    }
+
+    async fn on_budget_exhausted(
+        &mut self,
+        exhaustion: &crate::engine::delegation_budget::BudgetExhaustion,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let snapshot = exhaustion.snapshot.render();
+        let _ = tx
+            .send(TurnEvent::Notice {
+                text: format!(
+                    "{}. {snapshot}. Returning the best partial result.",
+                    exhaustion.message()
+                ),
+            })
+            .await;
+        self.pending_idle_reason = Some(crate::engine::IdleReason::BudgetLimited);
     }
 
     async fn refuse_unredacted_send(
@@ -4971,6 +5011,7 @@ impl Driver {
         // boundary (`engine-config-snapshot-adoption`).
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.install_turn_budget();
         self.reset_delegation_retry_budget();
         if let Err(error) = self.refresh_redaction_table_for_turn(tx).await {
             self.mark_bound_turn_refused(Self::redaction_refresh_idle_reason());
@@ -5332,6 +5373,47 @@ impl Driver {
             );
             match outcome {
                 TurnOutcome::Continue => {
+                    if let Some(usage) = self.session.last_usage()
+                        && let Err(exhaustion) = self.budget.charge_usage(usage)
+                    {
+                        self.on_budget_exhausted(&exhaustion, tx).await;
+                        self.acknowledge_interrupted_turns_after_progress().await;
+                        return Ok(ParkedReplayOutcome::Completed);
+                    }
+                    if let Err(exhaustion) = self.budget.charge_round() {
+                        if is_root
+                            && max_primary_rounds > 0
+                            && exhaustion.dimension
+                                == crate::engine::delegation_budget::BudgetDimension::Rounds
+                            && self.interrupts.is_interactive_attached()
+                        {
+                            if self
+                                .primary_round_ceiling_allows_more(
+                                    max_primary_rounds,
+                                    max_primary_rounds,
+                                    tx,
+                                )
+                                .await?
+                            {
+                                self.budget.extend_rounds(max_primary_rounds);
+                            } else {
+                                self.acknowledge_interrupted_turns_after_progress().await;
+                                return Ok(ParkedReplayOutcome::Completed);
+                            }
+                        } else {
+                            let _ = tx
+                                .send(TurnEvent::Notice {
+                                    text: format!(
+                                        "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
+                                        max_primary_rounds.max(1)
+                                    ),
+                                })
+                                .await;
+                            self.on_budget_exhausted(&exhaustion, tx).await;
+                            self.acknowledge_interrupted_turns_after_progress().await;
+                            return Ok(ParkedReplayOutcome::Completed);
+                        }
+                    }
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self
@@ -12132,6 +12214,7 @@ impl Driver {
         // boundary (`engine-config-snapshot-adoption`).
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.install_turn_budget();
         self.reset_delegation_retry_budget();
         if let Err(_error) = self.refresh_redaction_table_for_turn(tx).await {
             // Notice already published by the refresh. Settle this bound
@@ -13889,6 +13972,49 @@ impl Driver {
             );
             match outcome {
                 TurnOutcome::Continue => {
+                    if let Some(usage) = self.session.last_usage()
+                        && let Err(exhaustion) = self.budget.charge_usage(usage)
+                    {
+                        self.on_budget_exhausted(&exhaustion, tx).await;
+                        return Ok(());
+                    }
+                    if let Err(exhaustion) = self.budget.charge_round() {
+                        if is_root
+                            && max_primary_rounds > 0
+                            && exhaustion.dimension
+                                == crate::engine::delegation_budget::BudgetDimension::Rounds
+                            && self.interrupts.is_interactive_attached()
+                        {
+                            if self
+                                .primary_round_ceiling_allows_more(
+                                    max_primary_rounds,
+                                    max_primary_rounds,
+                                    tx,
+                                )
+                                .await?
+                            {
+                                self.budget.extend_rounds(max_primary_rounds);
+                            } else {
+                                return Ok(());
+                            }
+                        } else {
+                            if !self.interrupts.is_interactive_attached()
+                                && exhaustion.dimension
+                                    == crate::engine::delegation_budget::BudgetDimension::Rounds
+                            {
+                                let _ = tx
+                                    .send(TurnEvent::Notice {
+                                        text: format!(
+                                            "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
+                                            max_primary_rounds.max(1)
+                                        ),
+                                    })
+                                    .await;
+                            }
+                            self.on_budget_exhausted(&exhaustion, tx).await;
+                            return Ok(());
+                        }
+                    }
                     if is_root && max_primary_rounds > 0 {
                         primary_rounds_in_chunk = primary_rounds_in_chunk.saturating_add(1);
                         if !self

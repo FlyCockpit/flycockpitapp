@@ -1536,6 +1536,17 @@ impl Driver {
         {
             return false;
         }
+        // Compact-and-continue progress guard: always enforced, including
+        // under an unlimited spend budget. #314 draws from this same surface.
+        let tokens_after = self.context_input_tokens(context_length).unwrap_or(0);
+        if let Err(err) = self.budget.record_compaction(tokens_after, !escalate) {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: err.message(),
+                })
+                .await;
+            return false;
+        }
         self.do_compact_with_source(tx, "auto").await;
         true
     }
@@ -2082,6 +2093,7 @@ impl Driver {
                     .clone(),
                 write_scope: self.write_scope.clone(),
                 dream_read_scope: self.dream_read_scope.clone(),
+                budget: self.budget.clone(),
             },
         );
         #[cfg(test)]

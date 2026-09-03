@@ -70,10 +70,10 @@ pub struct LoopRunCtx {
     pub(crate) iteration_completed_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
-/// Max turns one fork iteration may take before we cut it off (bounds a
-/// runaway iteration; same spirit as the noninteractive per-role turn
-/// caps in `run_noninteractive`).
-const MAX_ITERATION_TURNS: usize = 8;
+/// Safety backstop only: the hierarchical per-run budget is the real
+/// round ceiling. Kept large so an unlimited spend budget is not silently
+/// recapped here.
+const MAX_ITERATION_TURNS: usize = 10_000;
 
 /// Drive an ephemeral-fork loop to termination. Normal loops send one
 /// [`ScheduleEvent::Completed`]; successful idle loops emit one
@@ -638,7 +638,16 @@ async fn run_iteration(
     if let Some(write_scope) = ctx.write_scope.clone() {
         scheduled_lane_driver.set_write_scope_source(write_scope);
     }
+    let per_run = ctx.config.extended().resolved_schedule_run_budget();
+    let run_budget = ctx.budget.allot(per_run);
+    scheduled_lane_driver.budget = run_budget.clone();
     for _ in 0..MAX_ITERATION_TURNS {
+        if let Err(exhaustion) = run_budget.charge_round() {
+            return Ok(crate::engine::delegation_budget::budget_exhausted_report(
+                &collect_final_text(history),
+                &exhaustion,
+            ));
+        }
         let mut outcome = turn(
             agent,
             // A loop/job fork runs on the session-root agent's own model. It is
@@ -1019,6 +1028,7 @@ mod tests {
             config,
             guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
             agent: Arc::new(Agent {
                 name: "builder".into(),
                 system: String::new(),

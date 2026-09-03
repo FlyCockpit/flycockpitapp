@@ -61,7 +61,9 @@ pub struct SwarmRunCtx {
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
 /// fan-out + leaf work, bounded so a stuck child can't spin forever (same
 /// spirit as the noninteractive per-role caps).
-const SWARM_MAX_TURNS: usize = 64;
+/// Safety backstop only: the hierarchical budget is the real round ceiling.
+/// Kept large so an unlimited spend budget is not silently recapped here.
+const SWARM_MAX_TURNS: usize = 10_000;
 
 /// A live delegation: the coordinator that owns it, and the transfer to drain.
 type ActiveDelegation = (
@@ -389,9 +391,16 @@ async fn run_swarm_loop(
     if let Some(write_scope) = ctx.write_scope.clone() {
         scheduled_lane_driver.set_write_scope_source(write_scope);
     }
+    scheduled_lane_driver.budget = ctx.budget.clone();
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     for _ in 0..SWARM_MAX_TURNS {
+        if let Err(exhaustion) = ctx.budget.charge_round() {
+            return Ok(crate::engine::delegation_budget::budget_exhausted_report(
+                &collect_final_text(&history),
+                &exhaustion,
+            ));
+        }
         if cancel.is_cancelled() {
             return Err(anyhow::Error::new(
                 crate::engine::model::InferenceCancelled {
@@ -1306,6 +1315,7 @@ mod tests {
             // is installed. `None` is "no durable write-scope lifecycle", which
             // is the same value the sibling authority test uses.
             write_scope: None,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
 
         let mut spec = spec(1, 3);
@@ -1493,6 +1503,7 @@ mod tests {
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             write_scope: None,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
 
         let mut spec = spec(1, 3);
@@ -1647,6 +1658,7 @@ mod tests {
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent: Arc::new(parent),
             write_scope: None,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
 
         let mut spec = spec(1, 3);
@@ -1781,6 +1793,7 @@ mod tests {
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
             write_scope: None,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
 
         let pinned_with_stop_hook = |matcher: &str| -> SessionConfigHandle {

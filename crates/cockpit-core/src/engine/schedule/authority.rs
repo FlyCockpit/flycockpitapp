@@ -275,6 +275,9 @@ pub struct ScheduleContext {
     pub write_scope: Option<crate::write_scope::WriteScopeSource>,
     pub dream_read_scope:
         std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
+    /// Hierarchical spend pool this job charges. Swarm children share one
+    /// pool; schedule/goal iterations receive a per-run allotment.
+    pub budget: crate::engine::delegation_budget::BudgetPool,
 }
 
 impl ScheduleContext {
@@ -703,11 +706,17 @@ impl ScheduleAuthority {
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
 
         let cancel = self.session_work_cancel.child_for_generation(generation);
+        let mut ctx = self.ctx.snapshot();
+        let child_ceiling = ctx
+            .config
+            .extended()
+            .resolved_delegation_budget(spec.worker.agent_name(), None);
+        ctx.budget = ctx.budget.allot(child_ceiling);
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
             spec,
-            ctx: self.ctx.snapshot(),
+            ctx,
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
@@ -1486,6 +1495,7 @@ mod tests {
             guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
         let authority = ScheduleAuthority::new(
             event_tx,

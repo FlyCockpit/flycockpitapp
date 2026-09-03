@@ -4186,6 +4186,7 @@ impl Driver {
                 recovery.endpoint_collector,
                 recovery.pending_recursive,
                 recovered_seed_reads,
+                Some(self.budget.clone()),
             )
             .await;
             let retire = if let Some(lease) = recovered_workspace_lease.as_ref() {
@@ -5004,6 +5005,7 @@ impl Driver {
                         None,
                         None,
                         seed_reads,
+                        Some(self.budget.clone()),
                     )
                     .await
                     {
@@ -7835,6 +7837,7 @@ impl Driver {
                         None,
                         None,
                         Vec::new(),
+                        Some(driver.budget.clone()),
                     )
                     .await
                     {
@@ -8648,6 +8651,7 @@ pub(crate) async fn run_noninteractive(
         None,
         None,
         Vec::new(),
+        None,
     )
     .await?;
     Ok(out.report)
@@ -9914,6 +9918,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         endpoint_collector,
         snapshot.pending_recursive,
         Vec::new(),
+        None,
     )
     .await
     .map(|outcome| outcome.report)
@@ -10558,6 +10563,7 @@ pub(crate) async fn run_fresh_noninteractive_resumable(
         None,
         None,
         Vec::new(),
+        None,
     )
     .await
 }
@@ -10610,6 +10616,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
     pending_recursive: Option<PendingRecursiveContinuation>,
     seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    parent_budget: Option<crate::engine::delegation_budget::BudgetPool>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
 
@@ -10707,6 +10714,14 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     // delegate candidates from one provider turn each believe they owned the
     // final slot.
     scheduled_lane_driver.vnext_child_admissions = recursive_vnext_admissions.clone();
+    let child_ceiling = config
+        .extended()
+        .resolved_delegation_budget(&agent.name, None);
+    let budget = match parent_budget {
+        Some(parent) => parent.allot(child_ceiling),
+        None => crate::engine::delegation_budget::BudgetPool::new(child_ceiling),
+    };
+    scheduled_lane_driver.budget = budget.clone();
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {
             scheduled_lane_driver.set_guidance_proposal_service(service.clone());
@@ -11070,6 +11085,35 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        if let Err(exhaustion) = budget.charge_round() {
+            retain_noninteractive_late_steer_checkpoint(
+                &active_claimed_agent_tree_steers,
+                std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                    exhaustion.message(),
+                ),
+            );
+            drop(child_tx);
+            let _ = forwarder.await;
+            let partial = history
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        let text = crate::engine::message::extract_text(content);
+                        (!text.trim().is_empty()).then_some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let report =
+                crate::engine::delegation_budget::budget_exhausted_report(&partial, &exhaustion);
+            return Ok(NoninteractiveOutcome {
+                report,
+                history,
+                fallback_decision,
+            });
+        }
         if cancel.is_cancelled() {
             return Err(NoninteractiveRunError::new(
                 anyhow::Error::new(crate::engine::model::InferenceCancelled {
@@ -12780,6 +12824,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                         None,
                         None,
                         seed_reads,
+                        Some(scheduled_lane_driver.budget.clone()),
                     ))
                     .await
                     .map(|outcome| outcome.report)
@@ -13488,6 +13533,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                             None,
                             None,
                             Vec::new(),
+                            Some(scheduled_lane_driver.budget.clone()),
                         ))
                         .await
                         .map(|outcome| outcome.report)

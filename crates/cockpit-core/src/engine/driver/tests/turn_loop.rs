@@ -2253,6 +2253,17 @@ fn turn_loop_max_verification_attempts_guard_terminates_turn() {
     });
 }
 
+#[test]
+fn hierarchical_budget_default_round_ceiling_is_finite() {
+    let cfg = crate::config::extended::ExtendedConfig::default();
+    let resolved = cfg.resolved_delegation_budget("Build", None);
+    assert_eq!(
+        resolved.max_rounds,
+        Some(crate::config::extended::DEFAULT_MAX_ROUNDS)
+    );
+    assert!(!resolved.is_unlimited());
+}
+
 #[tokio::test]
 async fn turn_loop_terminal_inference_failure_ends_turn_cleanly() {
     let provider = ScriptedProvider::builder()

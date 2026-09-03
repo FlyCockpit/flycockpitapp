@@ -4927,6 +4927,7 @@ impl Driver {
             cancel: self.live_or_session_cancel(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: self.session.transcription_dispatch(
                 agent.model.provider_id(),
@@ -5115,6 +5116,7 @@ impl Driver {
             cancel,
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: None,
             deferred_log: self

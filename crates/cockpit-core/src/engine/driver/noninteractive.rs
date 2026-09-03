@@ -10459,6 +10459,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         cancel: cancel.clone(),
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
+        #[cfg(feature = "extended")]
         image_generation_dispatch: session.image_generation_dispatch(),
         transcription_dispatch: None,
         deferred_log,
@@ -11038,6 +11039,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             cancel: cancel.clone(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: session.image_generation_dispatch(),
             transcription_dispatch: None,
             deferred_log: deferred_log.clone(),

@@ -462,6 +462,7 @@ pub enum AuthorizationRequest<'a> {
     /// identity. It carries **no** prompt full text, **no** provider secret,
     /// **no** raw workflow JSON, and **no** reference bytes — those never reach
     /// this seam.
+    #[cfg(feature = "extended")]
     ImageGeneration {
         /// Digest of the immutable plan projection under decision. Identifies
         /// the exact plan without carrying its prompt text or references. The
@@ -605,6 +606,7 @@ pub(super) struct MediaEgressAuthzFacts<'a> {
 /// to [`Approver::approve_image_generation_inner`] so the arm stays a thin
 /// dispatch. Every field mirrors the variant's redacted contract — no prompt
 /// text, provider secret, or workflow bytes.
+#[cfg(feature = "extended")]
 pub(super) struct ImageGenerationAuthzFacts<'a> {
     pub plan_digest: &'a crate::image_generation_agent_tools::PlanDigest,
     pub destination_grant_binding_digest: &'a str,
@@ -773,6 +775,7 @@ impl Approver {
                 )
                 .await
             }
+            #[cfg(feature = "extended")]
             AuthorizationRequest::ImageGeneration {
                 plan_digest,
                 destination_grant_binding_digest,
@@ -3277,6 +3280,7 @@ mod tests {
     // decision (hard gates → pure risk tier → grant seam → approval-mode
     // dispatch) lives only here now.
 
+    #[cfg(feature = "extended")]
     /// An owned scenario whose `request()` yields the borrowing
     /// `AuthorizationRequest::ImageGeneration`. `base()` is an all-hard-gates-pass,
     /// known-cost, single-target request; each test flips exactly one distinguishing
@@ -3378,6 +3382,7 @@ mod tests {
     /// Yolo (all gates pass) but denies when a single hard gate fails — a `_`
     /// catch-all that ignored the payload could not produce both answers, and
     /// the arm cannot be removed without a compile error (the match has no `_`).
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_authorization_request_variant_exhaustive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3405,6 +3410,7 @@ mod tests {
     /// Allow under Yolo with ZERO prompts, but Manual (no grant available)
     /// routes through a human prompt and honors its rejection — the composite
     /// decision, not a second ladder, is what gates.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_bespoke_authorize_generate_image_gone_or_private_pure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3438,6 +3444,7 @@ mod tests {
     /// Deny path: a failed hard gate denies BEFORE any prompt is raised
     /// (fail closed, no provider contact). Distinguishing input: stale
     /// capability with everything else passing.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_yolo_cannot_bypass_stale_capability() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3457,6 +3464,7 @@ mod tests {
 
     /// Destination/location-class gate: a disabled destination denies and
     /// raises no prompt, regardless of the (permissive) approval mode.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_disabled_destination_denies_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3473,6 +3481,7 @@ mod tests {
 
     /// Allow path (Yolo): hard gates pass ⇒ allow with zero prompts and no
     /// grant required.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_yolo_allows_after_hard_gates_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3487,6 +3496,7 @@ mod tests {
 
     /// Ask → allow: Manual with no grant raises exactly one scoped approval
     /// prompt; approving it allows once.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_manual_no_grant_asks_then_allows() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3513,6 +3523,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_manual_scoped_selections_return_exact_scope() {
         for (selected_id, expected_scope) in [
@@ -3535,6 +3546,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_matching_reference_grant_is_not_elevated_as_unmatched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3577,6 +3589,7 @@ mod tests {
     /// Elevated (fanout/outputs/cost beyond Base). `classify_risk` is not a
     /// second Auto decision issuer after a grant that already covers the
     /// request.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_auto_matching_elevated_grant_allows_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3629,6 +3642,7 @@ mod tests {
     }
 
     /// Ask → deny: rejecting the Manual prompt denies.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_manual_no_grant_ask_reject_denies() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3645,6 +3659,7 @@ mod tests {
     /// request, session, AND project spend choices are all Unlimited. Uses
     /// Yolo so the gate is isolated from the human-prompt path, and asserts the
     /// exact boundary: a single Finite choice among three Unlimited denies.
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn image_generation_unknown_cost_requires_all_unlimited() {
         use crate::image_generation_agent_tools::SpendPolicyChoice;

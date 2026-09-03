@@ -568,6 +568,7 @@ pub struct Session {
     booted_root_profile: Mutex<Option<BootedRootProfile>>,
     /// Session-owned image-generation dispatch funnel installed by the daemon
     /// worker before agent turns begin. Isolated/test sessions leave it absent.
+    #[cfg(feature = "extended")]
     image_generation_dispatch:
         Mutex<Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>>>,
     active_sandbox_escalate_eligible: AtomicBool,
@@ -1210,6 +1211,7 @@ pub(crate) fn test_redaction_key_resolver()
 }
 
 impl Session {
+    #[cfg(feature = "extended")]
     pub(crate) fn set_image_generation_dispatch(
         &self,
         service: Arc<crate::image_generation_job::ImageGenerationDispatchService>,
@@ -1217,6 +1219,7 @@ impl Session {
         *crate::sync::lock_or_recover(&self.image_generation_dispatch) = Some(service);
     }
 
+    #[cfg(feature = "extended")]
     pub(crate) fn image_generation_dispatch(
         &self,
     ) -> Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>> {

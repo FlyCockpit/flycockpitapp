@@ -629,13 +629,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(message, redact);
             scrub_resource_scheduler_snapshot(snapshot, redact);
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJob { job } => scrub_scheduled_job_summary(job, redact),
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobs { jobs } => {
             for job in jobs {
                 scrub_scheduled_job_summary(job, redact);
             }
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobRunQueued { id: _ } => {}
         proto::Response::FsList {
             entries,
@@ -1062,13 +1066,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             done: _,
             total: _,
         }
-        // Redacted LOCAL image-control `config_changed` event. Its change set
-        // carries only the `cockpit_proto::image_control` safe projections
-        // (every secret-bearing field — credential_ref/headers/graph_json/
-        // source_url — is dropped at the projection funnel, exactly like the
-        // sibling `ImageControlRead` response above), so there is no free text
-        // to scrub.
-        | proto::Event::ImageControlConfigChanged { event: _ }
         | proto::Event::ContextProjection {
             session_id: _,
             prunable_tokens: _,
@@ -1127,9 +1124,9 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             dropped: _,
         }
         | proto::Event::DaemonDraining { forced: _ }
-        | proto::Event::DaemonLifetimeChanged {
-            ephemeral_owner: _,
-        } => {}
+        | proto::Event::DaemonLifetimeChanged { ephemeral_owner: _ } => {}
+        #[cfg(feature = "extended")]
+        proto::Event::ImageControlConfigChanged { event: _ } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -1234,7 +1231,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             seq: _,
             client_submission_ids: _,
-        } => {},
+        } => {}
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
             text,
@@ -2129,6 +2126,7 @@ fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable)
     scrub_option_string(display_name, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &RedactionTable) {
     let proto::ScheduledJobSummary {
         id: _,
@@ -2161,6 +2159,7 @@ fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &Re
     scrub_option_string(disabled_notice, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_last_result(
     result: &mut proto::ScheduledJobLastResult,
     redact: &RedactionTable,
@@ -4903,16 +4902,22 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup onboarding-agent publication recovery failed")?;
-    let recovered_image_config =
-        image_control_mutations::recover_image_config_mutation_journals(ctx, config_publication)
+    #[cfg(feature = "extended")]
+    {
+        let recovered_image_config =
+            image_control_mutations::recover_image_config_mutation_journals(
+                ctx,
+                config_publication,
+            )
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup image-config mutation journal recovery failed")?;
-    if recovered_image_config > 0 {
-        tracing::info!(
-            count = recovered_image_config,
-            "reconciled committed image configuration before socket publication"
-        );
+        if recovered_image_config > 0 {
+            tracing::info!(
+                count = recovered_image_config,
+                "reconciled committed image configuration before socket publication"
+            );
+        }
     }
     crate::daemon::agent_management::recover_known_workspace_resets(ctx, config_publication)
         .await

@@ -22,6 +22,7 @@ mod namespace;
 mod native_store;
 mod platform;
 mod resolve;
+#[cfg(feature = "extended")]
 mod sealed_ops;
 mod sealed_state;
 mod vault;

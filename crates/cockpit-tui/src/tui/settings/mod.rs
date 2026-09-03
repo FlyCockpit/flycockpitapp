@@ -3117,6 +3117,7 @@ pub struct SettingsCx {
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
+    #[cfg(feature = "extended")]
     completed_image_spend: Option<ImageSpendCompletion>,
     completed_image_sidecar: Vec<SidecarAuthorityCompletion>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
@@ -3240,6 +3241,7 @@ pub struct SettingsCx {
     pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+#[cfg(feature = "extended")]
 enum ImageSpendCompletion {
     Loaded {
         page_instance_id: uuid::Uuid,
@@ -3340,12 +3342,9 @@ impl SettingsCx {
     pub(super) fn queue_image_spend_load(
         &mut self,
         _project_key: String,
-        page_instance_id: uuid::Uuid,
+        _page_instance_id: uuid::Uuid,
     ) {
-        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
-            page_instance_id,
-            message: "image-generation budgets require the extended build profile".into(),
-        });
+        // Image spend settings are unavailable without the extended profile.
     }
 
     #[cfg(feature = "extended")]
@@ -3397,8 +3396,6 @@ impl SettingsCx {
     fn queue_image_spend_save(
         &mut self,
         _project_key: String,
-        _settings: cockpit_config::config::image_spend::ImageSpendSettings,
-        _expected_policy_version: Option<u64>,
         _page_instance_id: uuid::Uuid,
     ) -> Result<(), String> {
         Err("image-generation budgets require the extended build profile".into())
@@ -7054,13 +7051,12 @@ impl SettingsDialog {
                         prompt.setting.descriptor().label
                     ));
                 }
+                #[cfg(feature = "extended")]
                 if let Some(completion) = self.cx.completed_image_spend.take() {
                     let mut completion = Some(completion);
-                    #[cfg(feature = "extended")]
                     if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
                         page.apply_daemon_completion(completion.take().unwrap());
                     }
-                    #[cfg(feature = "extended")]
                     if let Some(completion) = completion
                         && let Some(page) = self
                             .page
@@ -7499,6 +7495,7 @@ impl SettingsDialog {
                 pending_provider_mutation_navigation: None,
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
+                #[cfg(feature = "extended")]
                 completed_image_spend: None,
                 completed_image_sidecar: Vec::new(),
                 pending_shadow_prompt: None,

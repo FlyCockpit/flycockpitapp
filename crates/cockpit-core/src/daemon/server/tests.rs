@@ -4103,7 +4103,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
 }
 
 #[tokio::test]
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
     let ctx = test_ctx();
     ctx.db

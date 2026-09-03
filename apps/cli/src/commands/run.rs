@@ -2018,16 +2018,15 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events (no session_id) — irrelevant to a headless
         // one-shot run, so they're filtered out by the session check.
-        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
+        CaffeinateState { .. }
+        | DaemonDraining { .. }
+        | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
         | HostCapabilitiesChanged { .. }
-        // Project-scoped image-control configuration invalidations have no
-        // session id and are not part of a headless run transcript.
-        | ImageControlConfigChanged { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -2036,6 +2035,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Unknown => {
             return None;
         }
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         #[cfg(feature = "remote")]
         ConnectorStatus { .. } => return None,
     })

@@ -2301,8 +2301,16 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
-            | proto::Event::ImageControlConfigChanged { .. }
     ) || {
+        #[cfg(feature = "extended")]
+        {
+            matches!(event, proto::Event::ImageControlConfigChanged { .. })
+        }
+        #[cfg(not(feature = "extended"))]
+        {
+            false
+        }
+    } || {
         #[cfg(feature = "remote")]
         {
             matches!(event, proto::Event::ConnectorStatus { .. })
@@ -4032,10 +4040,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
-        // Image-control configuration changes are daemon-global: they are
-        // keyed by project, not by an attached chat session.
-        | ImageControlConfigChanged { .. }
+        CaffeinateState { .. }
+        | DaemonDraining { .. }
+        | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -4048,6 +4055,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         }
         | EnvDriftWarning { .. }
         | Unknown => return None,
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         #[cfg(feature = "remote")]
         ConnectorStatus { .. } => return None,
     })
@@ -5089,11 +5098,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             proto::WorkspaceTrustReconciliationState::Applied
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
-        // This daemon-global, project-scoped invalidation has no image-control
-        // TUI state to refresh yet. Consume its safe projection explicitly so
-        // it is neither treated as a session event nor rendered as history.
-        ImageControlConfigChanged { .. }
-        | InterruptRaised { .. }
+        InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
@@ -5102,6 +5107,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
         | Unknown => return None,
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,

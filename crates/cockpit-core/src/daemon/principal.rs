@@ -628,13 +628,22 @@ mod tests {
                 .collect();
         let expected_extended = image_rows
             .into_iter()
-            .chain([
-                "create_scheduled_job",
-                "list_scheduled_jobs",
-                "delete_scheduled_job",
-                "set_scheduled_job_enabled",
-                "run_scheduled_job",
-            ])
+            .chain({
+                #[cfg(feature = "extended")]
+                {
+                    [
+                        "create_scheduled_job",
+                        "list_scheduled_jobs",
+                        "delete_scheduled_job",
+                        "set_scheduled_job_enabled",
+                        "run_scheduled_job",
+                    ]
+                }
+                #[cfg(not(feature = "extended"))]
+                {
+                    [] as [&str; 0]
+                }
+            })
             .collect();
         assert_eq!(classified_extended, expected_extended);
     }
@@ -857,6 +866,7 @@ mod tests {
             "get_inventory_bundle",
             "list_assistants",
             "list_leak_reports",
+            #[cfg(feature = "extended")]
             "list_scheduled_jobs",
             "list_sessions",
             "read_agent_attention",

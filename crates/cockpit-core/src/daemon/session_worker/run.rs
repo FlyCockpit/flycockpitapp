@@ -12840,6 +12840,7 @@ pub(super) async fn run_worker(
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
+                        #[cfg(feature = "extended")]
                         if let Some(service) = session.image_generation_dispatch() {
                             if let Err(error) = service
                                 .reconcile_config(

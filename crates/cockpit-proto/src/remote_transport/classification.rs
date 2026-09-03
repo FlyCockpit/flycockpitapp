@@ -788,26 +788,31 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "create_scheduled_job",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
+    #[cfg(feature = "extended")]
     row(
         "list_scheduled_jobs",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "delete_scheduled_job",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "set_scheduled_job_enabled",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "run_scheduled_job",
         RemoteMessageClass::BoundedRequestResponse,
@@ -1079,91 +1084,109 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "get_image_spend_policy",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "save_image_spend_policy",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_endpoint_list",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_endpoint_get",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_list",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_get",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_workflow_list",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_workflow_get",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_endpoint_create",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_endpoint_update",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_endpoint_delete",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_create",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_update",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_delete",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_target_set_default",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_workflow_upload",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_workflow_bind",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_workflow_delete",
         RemoteMessageClass::BoundedRequestResponse,
@@ -2031,21 +2054,25 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
     ),
+    #[cfg(feature = "extended")]
     row(
         "scheduled_job",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
+    #[cfg(feature = "extended")]
     row(
         "scheduled_jobs",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
     ),
+    #[cfg(feature = "extended")]
     row(
         "scheduled_job_deleted",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "scheduled_job_run_queued",
         RemoteMessageClass::BoundedRequestResponse,
@@ -2313,21 +2340,25 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_spend_policy",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_spend_policy_saved",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_control_read",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_control_mutated",
         RemoteMessageClass::BoundedRequestResponse,
@@ -2756,6 +2787,7 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
+    #[cfg(feature = "extended")]
     row(
         "image_control_config_changed",
         RemoteMessageClass::BoundedEvent,
@@ -3177,6 +3209,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Request, "resolve_interrupt"),
     (RemoteMessageKind::Request, "session_live_status"),
     (RemoteMessageKind::Request, "record_session_note"),
+    #[cfg(feature = "extended")]
     (RemoteMessageKind::Request, "create_scheduled_job"),
     (RemoteMessageKind::Request, "set_tool_surface_override"),
     (RemoteMessageKind::Request, "set_goal_settings_override"),
@@ -3224,7 +3257,9 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Response, "inventory_bundle"),
     (RemoteMessageKind::Response, "resource_snapshot"),
     (RemoteMessageKind::Response, "promote_resource_result"),
+    #[cfg(feature = "extended")]
     (RemoteMessageKind::Response, "scheduled_job"),
+    #[cfg(feature = "extended")]
     (RemoteMessageKind::Response, "scheduled_jobs"),
     (RemoteMessageKind::Response, "git_status"),
     (RemoteMessageKind::Response, "usage_counts"),
@@ -3445,9 +3480,18 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
+        #[cfg(feature = "extended")]
         assert_eq!(REQUEST_CLASSIFICATION.len(), 289);
+        #[cfg(not(feature = "extended"))]
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 266);
+        #[cfg(feature = "extended")]
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 202);
+        #[cfg(not(feature = "extended"))]
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 194);
+        #[cfg(feature = "extended")]
         assert_eq!(EVENT_CLASSIFICATION.len(), 86);
+        #[cfg(not(feature = "extended"))]
+        assert_eq!(EVENT_CLASSIFICATION.len(), 85);
     }
 
     #[test]
@@ -3502,7 +3546,10 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
+        #[cfg(feature = "extended")]
         assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 108);
+        #[cfg(not(feature = "extended"))]
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 105);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

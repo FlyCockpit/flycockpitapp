@@ -49,6 +49,7 @@ mod descriptor;
 pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
+#[cfg(feature = "extended")]
 mod image_generation;
 mod image_sidecar;
 #[cfg(feature = "extended")]
@@ -2955,14 +2956,23 @@ pub(crate) enum TestPageRef<'a> {
     Skills(&'a SkillsPage),
     Mcp(&'a McpPage),
     Lsp(&'a LspPage),
+    #[cfg(feature = "extended")]
     GenerationList(&'a image_generation::GenerationListPage),
+    #[cfg(feature = "extended")]
     EndpointEditor(&'a image_generation::EndpointEditorPage),
+    #[cfg(feature = "extended")]
     TargetEditor(&'a image_generation::TargetEditorPage),
+    #[cfg(feature = "extended")]
     WorkflowEditor(&'a image_generation::WorkflowEditorPage),
+    #[cfg(feature = "extended")]
     BudgetEditor(&'a image_generation::BudgetEditorPage),
+    #[cfg(feature = "extended")]
     GrantList(&'a image_generation::GrantListPage),
+    #[cfg(feature = "extended")]
     JobList(&'a image_generation::JobListPage),
+    #[cfg(feature = "extended")]
     JobDetail(&'a image_generation::JobDetailPage),
+    #[cfg(feature = "extended")]
     LateResultAction(&'a image_generation::LateResultActionPage),
     Sidecar(&'a image_sidecar::SidecarPage),
 }
@@ -2985,14 +2995,23 @@ enum TestPageMut<'a> {
     Skills(&'a mut SkillsPage),
     Mcp(&'a mut McpPage),
     Lsp(&'a mut LspPage),
+    #[cfg(feature = "extended")]
     GenerationList(&'a mut image_generation::GenerationListPage),
+    #[cfg(feature = "extended")]
     EndpointEditor(&'a mut image_generation::EndpointEditorPage),
+    #[cfg(feature = "extended")]
     TargetEditor(&'a mut image_generation::TargetEditorPage),
+    #[cfg(feature = "extended")]
     WorkflowEditor(&'a mut image_generation::WorkflowEditorPage),
+    #[cfg(feature = "extended")]
     BudgetEditor(&'a mut image_generation::BudgetEditorPage),
+    #[cfg(feature = "extended")]
     GrantList(&'a mut image_generation::GrantListPage),
+    #[cfg(feature = "extended")]
     JobList(&'a mut image_generation::JobListPage),
+    #[cfg(feature = "extended")]
     JobDetail(&'a mut image_generation::JobDetailPage),
+    #[cfg(feature = "extended")]
     LateResultAction(&'a mut image_generation::LateResultActionPage),
     Sidecar(&'a mut image_sidecar::SidecarPage),
 }
@@ -3016,14 +3035,23 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            #[cfg(feature = "extended")]
             Self::GenerationList(_) => f.write_str("GenerationList"),
+            #[cfg(feature = "extended")]
             Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            #[cfg(feature = "extended")]
             Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            #[cfg(feature = "extended")]
             Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            #[cfg(feature = "extended")]
             Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            #[cfg(feature = "extended")]
             Self::GrantList(_) => f.write_str("GrantList"),
+            #[cfg(feature = "extended")]
             Self::JobList(_) => f.write_str("JobList"),
+            #[cfg(feature = "extended")]
             Self::JobDetail(_) => f.write_str("JobDetail"),
+            #[cfg(feature = "extended")]
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
             Self::Sidecar(_) => f.write_str("Sidecar"),
         }
@@ -3048,14 +3076,23 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            #[cfg(feature = "extended")]
             Self::GenerationList(_) => f.write_str("GenerationList"),
+            #[cfg(feature = "extended")]
             Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            #[cfg(feature = "extended")]
             Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            #[cfg(feature = "extended")]
             Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            #[cfg(feature = "extended")]
             Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            #[cfg(feature = "extended")]
             Self::GrantList(_) => f.write_str("GrantList"),
+            #[cfg(feature = "extended")]
             Self::JobList(_) => f.write_str("JobList"),
+            #[cfg(feature = "extended")]
             Self::JobDetail(_) => f.write_str("JobDetail"),
+            #[cfg(feature = "extended")]
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
             Self::Sidecar(_) => f.write_str("Sidecar"),
         }
@@ -7023,6 +7060,7 @@ impl SettingsDialog {
                     if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
                         page.apply_daemon_completion(completion.take().unwrap());
                     }
+                    #[cfg(feature = "extended")]
                     if let Some(completion) = completion
                         && let Some(page) = self
                             .page
@@ -7194,49 +7232,59 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<LspPage>() {
             return TestPageRef::Lsp(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::GenerationListPage>()
         {
             return TestPageRef::GenerationList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::EndpointEditorPage>()
         {
             return TestPageRef::EndpointEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::TargetEditorPage>()
         {
             return TestPageRef::TargetEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::WorkflowEditorPage>()
         {
             return TestPageRef::WorkflowEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::BudgetEditorPage>()
         {
             return TestPageRef::BudgetEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::GrantListPage>() {
             return TestPageRef::GrantList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::JobListPage>() {
             return TestPageRef::JobList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::JobDetailPage>() {
             return TestPageRef::JobDetail(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::LateResultActionPage>()
         {
+            #[cfg(feature = "extended")]
             return TestPageRef::LateResultAction(p);
         }
         if let Some(p) = self.page.downcast_ref::<image_sidecar::SidecarPage>() {
@@ -7298,6 +7346,7 @@ impl SettingsDialog {
         if self.page.as_any().is::<LspPage>() {
             return TestPageMut::Lsp(self.page.downcast_mut::<LspPage>().unwrap());
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7309,6 +7358,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7320,6 +7370,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7331,6 +7382,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7342,6 +7394,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7353,6 +7406,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::GrantListPage>() {
             return TestPageMut::GrantList(
                 self.page
@@ -7360,6 +7414,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::JobListPage>() {
             return TestPageMut::JobList(
                 self.page
@@ -7367,6 +7422,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::JobDetailPage>() {
             return TestPageMut::JobDetail(
                 self.page
@@ -7374,6 +7430,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -8470,6 +8527,7 @@ impl SettingsPage for RootPage {
                     }
                     #[cfg(feature = "extended")]
                     "Generation" => Some(image_generation::generation_list_page(
+                        #[cfg(feature = "extended")]
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
                         ),
@@ -8887,6 +8945,7 @@ impl SettingsCx {
     /// is the launch/session project root this dialog is scoped to; remote grant
     /// scopes and ceilings are left empty here and MUST be populated from the
     /// control-plane grant snapshot the day a remote settings surface exists.
+    #[cfg(feature = "extended")]
     pub(super) fn image_generation_session_snapshot(
         &self,
     ) -> image_generation::SessionCapabilitySnapshot {

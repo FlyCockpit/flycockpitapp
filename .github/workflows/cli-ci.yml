@@ -347,6 +347,17 @@ jobs:
       - name: Fetch locked graph
         run: cargo fetch --locked
 
+      # Compile the remote+extended production graph so gated surfaces cannot
+      # rot behind `required-features` test binaries. Package-specific
+      # features: tenant-authority has `remote` only, cockpit-config has
+      # `extended` only, cockpit-cli/extended pulls the TUI/core/db/proto set.
+      - name: Build remote+extended profile matrix
+        run: >
+          cargo build --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,cockpit-client/remote,cockpit-client/extended
+
       # `extended` is required so cfg-gated spend-policy variants stay in the
       # request_variants! set the exhaustive classification test compares.
       # Package-specific features: tenant-authority has `remote` only,
@@ -358,7 +369,7 @@ jobs:
           -p cockpit-tui -p cockpit-cli -p cockpit-config
           -p tenant-authority
           --features
-          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,tenant-authority/remote
 
       - name: Clippy remote-gated test targets
         run: >
@@ -367,7 +378,7 @@ jobs:
           -p cockpit-tui -p cockpit-cli -p cockpit-config
           -p tenant-authority
           --features
-          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,tenant-authority/remote
           --tests -- -D warnings
 
   daemon-custody-pkcs11-softhsm:

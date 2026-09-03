@@ -365,6 +365,7 @@ macro_rules! command_request_product_domain_match {
     (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         #[allow(unreachable_patterns)]
         match $request {
+            #[cfg(feature = "extended")]
             Request::CreateScheduledJob { .. }
             | Request::ListScheduledJobs { .. }
             | Request::DeleteScheduledJob { .. }
@@ -567,21 +568,37 @@ mod tests {
             .filter(|kind| kind.starts_with("image_") || kind.contains("image_spend_policy"))
             .collect();
         let expected_image_rows = std::collections::BTreeSet::from([
+            #[cfg(feature = "extended")]
             "image_endpoint_list",
+            #[cfg(feature = "extended")]
             "image_endpoint_get",
+            #[cfg(feature = "extended")]
             "image_target_list",
+            #[cfg(feature = "extended")]
             "image_target_get",
+            #[cfg(feature = "extended")]
             "image_workflow_list",
+            #[cfg(feature = "extended")]
             "image_workflow_get",
+            #[cfg(feature = "extended")]
             "image_endpoint_create",
+            #[cfg(feature = "extended")]
             "image_endpoint_update",
+            #[cfg(feature = "extended")]
             "image_endpoint_delete",
+            #[cfg(feature = "extended")]
             "image_target_create",
+            #[cfg(feature = "extended")]
             "image_target_update",
+            #[cfg(feature = "extended")]
             "image_target_delete",
+            #[cfg(feature = "extended")]
             "image_target_set_default",
+            #[cfg(feature = "extended")]
             "image_workflow_upload",
+            #[cfg(feature = "extended")]
             "image_workflow_bind",
+            #[cfg(feature = "extended")]
             "image_workflow_delete",
             #[cfg(feature = "extended")]
             "get_image_spend_policy",
@@ -589,6 +606,7 @@ mod tests {
             "save_image_spend_policy",
         ]);
         assert_eq!(image_rows, expected_image_rows);
+        #[cfg(feature = "extended")]
         for scheduler in [
             "create_scheduled_job",
             "list_scheduled_jobs",
@@ -807,11 +825,17 @@ mod tests {
             "get_image_spend_policy",
             "get_agent_effective_settings",
             "get_session_setup_snapshot",
+            #[cfg(feature = "extended")]
             "image_endpoint_list",
+            #[cfg(feature = "extended")]
             "image_endpoint_get",
+            #[cfg(feature = "extended")]
             "image_target_list",
+            #[cfg(feature = "extended")]
             "image_target_get",
+            #[cfg(feature = "extended")]
             "image_workflow_list",
+            #[cfg(feature = "extended")]
             "image_workflow_get",
             "get_provider_catalog_snapshot",
             "get_run_invocation_status",

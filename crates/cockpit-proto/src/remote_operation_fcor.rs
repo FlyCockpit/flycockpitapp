@@ -401,6 +401,7 @@ canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
 // Image-spend policy is a versioned, serde-deny-unknown-fields value owned by
 // cockpit-config. Encode its canonical JSON as one scalar rather than relying
 // on a map iteration order at this protocol boundary.
+#[cfg(feature = "extended")]
 impl CanonicalFcorValueV1 for cockpit_config::config::image_spend::ImageSpendSettings {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         serde_json::to_string(self)
@@ -556,11 +557,13 @@ impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
     }
 }
 
+#[cfg(feature = "extended")]
 canonical_unit_enum16!(crate::MissedRunPolicy, {
     Skip = 1,
     RunOnceOnStart = 2,
 });
 
+#[cfg(feature = "extended")]
 impl CanonicalFcorValueV1 for crate::ScheduledJobSchedule {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         let mut nested = CanonicalParamsV1::new();
@@ -591,6 +594,7 @@ impl CanonicalFcorValueV1 for crate::ScheduledJobSchedule {
     }
 }
 
+#[cfg(feature = "extended")]
 impl CanonicalFcorValueV1 for crate::ScheduledJobPayload {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         let mut nested = CanonicalParamsV1::new();
@@ -614,6 +618,7 @@ impl CanonicalFcorValueV1 for crate::ScheduledJobPayload {
     }
 }
 
+#[cfg(feature = "extended")]
 impl CanonicalFcorValueV1 for crate::ScheduledJobCreate {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         let mut nested = CanonicalParamsV1::new();
@@ -1237,6 +1242,7 @@ mod tests {
             display_name: None,
             relay_choice: None,
         };
+        #[cfg(feature = "extended")]
         let invalid_schedule = crate::ScheduledJobSchedule::Cron {
             expr: "e\u{301}".into(),
         };
@@ -1247,6 +1253,7 @@ mod tests {
             (&invalid_account as &dyn CanonicalFcorValueV1),
             (&invalid_relay as &dyn CanonicalFcorValueV1),
             (&invalid_credential as &dyn CanonicalFcorValueV1),
+            #[cfg(feature = "extended")]
             (&invalid_schedule as &dyn CanonicalFcorValueV1),
             (&invalid_curator as &dyn CanonicalFcorValueV1),
         ] {
@@ -1320,39 +1327,42 @@ mod tests {
         );
         exact(&cockpit_db::wire::ResolveResponse::Cancel, "0005");
 
-        exact(
-            &crate::ScheduledJobSchedule::Cron { expr: "x".into() },
-            "00010000000178",
-        );
-        exact(
-            &crate::ScheduledJobSchedule::Every { seconds: 1 },
-            "00020000000000000001",
-        );
-        exact(
-            &crate::ScheduledJobSchedule::Once { at: -1 },
-            "0003ffffffffffffffff",
-        );
-        exact(
-            &crate::ScheduledJobSchedule::Idle {
-                min_idle_seconds: 1,
-                max_age_seconds: 2,
-            },
-            "000400000000000000010000000000000002",
-        );
-        exact(
-            &crate::ScheduledJobPayload::RunPrompt {
-                assistant: "a".into(),
-                prompt: "p".into(),
-                project_root: "/not-in-params".into(),
-            },
-            "000100000001610000000170",
-        );
-        exact(
-            &crate::ScheduledJobPayload::Callback {
-                subsystem: "s".into(),
-            },
-            "00020000000173",
-        );
+        #[cfg(feature = "extended")]
+        {
+            exact(
+                &crate::ScheduledJobSchedule::Cron { expr: "x".into() },
+                "00010000000178",
+            );
+            exact(
+                &crate::ScheduledJobSchedule::Every { seconds: 1 },
+                "00020000000000000001",
+            );
+            exact(
+                &crate::ScheduledJobSchedule::Once { at: -1 },
+                "0003ffffffffffffffff",
+            );
+            exact(
+                &crate::ScheduledJobSchedule::Idle {
+                    min_idle_seconds: 1,
+                    max_age_seconds: 2,
+                },
+                "000400000000000000010000000000000002",
+            );
+            exact(
+                &crate::ScheduledJobPayload::RunPrompt {
+                    assistant: "a".into(),
+                    prompt: "p".into(),
+                    project_root: "/not-in-params".into(),
+                },
+                "000100000001610000000170",
+            );
+            exact(
+                &crate::ScheduledJobPayload::Callback {
+                    subsystem: "s".into(),
+                },
+                "00020000000173",
+            );
+        }
         exact(&crate::CuratorAction::Status, "0001");
         exact(
             &crate::CuratorAction::Run {
@@ -1411,6 +1421,7 @@ mod tests {
             },
             "0000000e68747470733a2f2f782e7465737400000001690000000174000000017500000001650000",
         );
+        #[cfg(feature = "extended")]
         exact(
             &crate::ScheduledJobCreate {
                 id: "resource-id".into(),
@@ -1703,44 +1714,47 @@ mod tests {
             "attachment_purpose.user_message_image",
             crate::AttachmentPurpose::UserMessageImage
         );
-        check!("missed_run_policy.skip", crate::MissedRunPolicy::Skip);
-        check!(
-            "missed_run_policy.run_once_on_start",
-            crate::MissedRunPolicy::RunOnceOnStart
-        );
-        check_prefix!(
-            "scheduled_job_schedule.cron",
-            crate::ScheduledJobSchedule::Cron { expr: "x".into() }
-        );
-        check_prefix!(
-            "scheduled_job_schedule.every",
-            crate::ScheduledJobSchedule::Every { seconds: 1 }
-        );
-        check_prefix!(
-            "scheduled_job_schedule.once",
-            crate::ScheduledJobSchedule::Once { at: 1 }
-        );
-        check_prefix!(
-            "scheduled_job_schedule.idle",
-            crate::ScheduledJobSchedule::Idle {
-                min_idle_seconds: 1,
-                max_age_seconds: 2
-            }
-        );
-        check_prefix!(
-            "scheduled_job_payload.run_prompt",
-            crate::ScheduledJobPayload::RunPrompt {
-                assistant: "a".into(),
-                prompt: "p".into(),
-                project_root: "/ignored".into()
-            }
-        );
-        check_prefix!(
-            "scheduled_job_payload.callback",
-            crate::ScheduledJobPayload::Callback {
-                subsystem: "s".into()
-            }
-        );
+        #[cfg(feature = "extended")]
+        {
+            check!("missed_run_policy.skip", crate::MissedRunPolicy::Skip);
+            check!(
+                "missed_run_policy.run_once_on_start",
+                crate::MissedRunPolicy::RunOnceOnStart
+            );
+            check_prefix!(
+                "scheduled_job_schedule.cron",
+                crate::ScheduledJobSchedule::Cron { expr: "x".into() }
+            );
+            check_prefix!(
+                "scheduled_job_schedule.every",
+                crate::ScheduledJobSchedule::Every { seconds: 1 }
+            );
+            check_prefix!(
+                "scheduled_job_schedule.once",
+                crate::ScheduledJobSchedule::Once { at: 1 }
+            );
+            check_prefix!(
+                "scheduled_job_schedule.idle",
+                crate::ScheduledJobSchedule::Idle {
+                    min_idle_seconds: 1,
+                    max_age_seconds: 2
+                }
+            );
+            check_prefix!(
+                "scheduled_job_payload.run_prompt",
+                crate::ScheduledJobPayload::RunPrompt {
+                    assistant: "a".into(),
+                    prompt: "p".into(),
+                    project_root: "/ignored".into()
+                }
+            );
+            check_prefix!(
+                "scheduled_job_payload.callback",
+                crate::ScheduledJobPayload::Callback {
+                    subsystem: "s".into()
+                }
+            );
+        }
         check_prefix!("curator_action.status", crate::CuratorAction::Status);
         check_prefix!(
             "curator_action.run",

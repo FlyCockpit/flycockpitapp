@@ -217,6 +217,7 @@ struct Inner {
     /// a newly created session with an in-place lifetime promotion.
     persistent_service_transition: Mutex<()>,
     resource_scheduler: Mutex<Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>>,
+    #[cfg(feature = "extended")]
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
@@ -303,6 +304,7 @@ struct Inner {
     /// normalized into this storage before it reaches the image-job service;
     /// workers never retain a client path in a durable image request.
     media_storage_recovery: Mutex<Option<Arc<crate::media_storage::MediaStorageRecovery>>>,
+    #[cfg(feature = "extended")]
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     /// Daemon-owned installed-agent tree (`<pid-file-parent>/agents`).
     daemon_agents_dir: Mutex<Option<PathBuf>>,
@@ -747,6 +749,7 @@ fn cleanup_worker_on_exit(
     generation: WorkerGeneration,
 ) {
     if let Some(inner) = inner.upgrade() {
+        #[cfg(feature = "extended")]
         inner
             .image_generation_dispatch_registry
             .remove(spawn_session_id);
@@ -784,6 +787,7 @@ impl SessionRegistry {
                     crate::secret_command::CommandSecretCache::with_subprocess_executor(),
                 ),
                 resource_scheduler: Mutex::new(resource_scheduler),
+                #[cfg(feature = "extended")]
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
@@ -809,6 +813,7 @@ impl SessionRegistry {
                     started_at: std::time::Instant::now(),
                 })),
                 media_storage_recovery: Mutex::new(None),
+                #[cfg(feature = "extended")]
                 image_generation_dispatch_registry:
                     crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
                 daemon_agents_dir: Mutex::new(None),
@@ -842,6 +847,7 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.media_storage_recovery) = recovery;
     }
 
+    #[cfg(feature = "extended")]
     pub fn image_generation_dispatch_registry(
         &self,
     ) -> crate::daemon::image_runtime::DaemonImageDispatchRegistry {
@@ -918,10 +924,12 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.global_bus) = Some(tx);
     }
 
+    #[cfg(feature = "extended")]
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
     }
 
+    #[cfg(feature = "extended")]
     pub fn clear_scheduler(&self) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = None;
     }
@@ -1183,6 +1191,7 @@ impl SessionRegistry {
         }
     }
 
+    #[cfg(feature = "extended")]
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
         crate::sync::lock_or_recover(&self.inner.scheduler).clone()
     }
@@ -1190,6 +1199,7 @@ impl SessionRegistry {
     /// Run a daemon-owned keep-warm callback against its original session.
     /// The callback payload is locally minted by the driver; malformed or
     /// stale jobs fail closed and cannot be mistaken for a user submission.
+    #[cfg(feature = "extended")]
     pub async fn run_keep_warm_job(
         &self,
         job: crate::daemon::scheduler::ScheduledJob,
@@ -1226,6 +1236,7 @@ impl SessionRegistry {
             .map_err(anyhow::Error::msg)
     }
 
+    #[cfg(feature = "extended")]
     fn scheduler_source(
         &self,
     ) -> Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>> {
@@ -2495,6 +2506,7 @@ impl SessionRegistry {
             self.inner.lsp.clone(),
             Some(initial_lsp_session_protection),
             crate::sync::lock_or_recover(&self.inner.resource_scheduler).clone(),
+            #[cfg(feature = "extended")]
             self.scheduler_source(),
             self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
@@ -2508,6 +2520,7 @@ impl SessionRegistry {
             image_generation_clock.boot_id,
             image_generation_clock.started_at,
             crate::sync::lock_or_recover(&self.inner.media_storage_recovery).clone(),
+            #[cfg(feature = "extended")]
             self.image_generation_dispatch_registry(),
             {
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
@@ -2571,6 +2584,7 @@ impl SessionRegistry {
                     "compaction successor rekey failed; live worker may be unreachable under the new session id"
                 );
             }
+            #[cfg(feature = "extended")]
             if let (Some(scheduler), Ok(runtime)) =
                 (registry.scheduler(), tokio::runtime::Handle::try_current())
             {
@@ -3570,8 +3584,10 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "extended")]
     struct NoopSchedulerExecutor;
 
+    #[cfg(feature = "extended")]
     #[async_trait]
     impl crate::daemon::scheduler::JobExecutor for NoopSchedulerExecutor {
         async fn execute(&self, _job: crate::daemon::scheduler::ScheduledJob) -> Result<String> {
@@ -3579,8 +3595,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "extended")]
     struct PendingSchedulerSleeper;
 
+    #[cfg(feature = "extended")]
     #[async_trait]
     impl crate::daemon::scheduler::SchedulerSleeper for PendingSchedulerSleeper {
         async fn sleep_until(&self, _now: i64, _wake_at: Option<i64>) {
@@ -3588,6 +3606,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "extended")]
     fn test_scheduler_handle() -> crate::daemon::scheduler::DaemonSchedulerHandle {
         let scheduler = Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
             Db::open_in_memory().expect("scheduler db"),
@@ -3602,6 +3621,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn set_scheduler_round_trips() {
         let reg = test_registry();
@@ -3619,6 +3639,7 @@ mod tests {
         assert!(!Arc::ptr_eq(got.scheduler(), first.scheduler()));
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn late_set_is_visible_to_already_started_workers() {
         let reg = test_registry();
@@ -3634,6 +3655,7 @@ mod tests {
         assert!(Arc::ptr_eq(observed.scheduler(), handle.scheduler()));
     }
 
+    #[cfg(feature = "extended")]
     #[tokio::test]
     async fn worker_receives_scheduler_handle() {
         let reg = test_registry();

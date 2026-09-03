@@ -6102,7 +6102,9 @@ pub(super) async fn run_worker(
     lsp: Arc<crate::daemon::lsp::LspManager>,
     initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
-    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    #[cfg(feature = "extended")] scheduler: Arc<
+        std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
+    >,
     write_scope: crate::write_scope::WriteScopeSource,
     global_bus: Option<EventSender>,
     park_commit: crate::engine::interrupt::ParkCommit,
@@ -6112,6 +6114,7 @@ pub(super) async fn run_worker(
     image_generation_boot_id: uuid::Uuid,
     image_generation_started_at: std::time::Instant,
     media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    #[cfg(feature = "extended")]
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     reserved_root_agent_instance_id: Uuid,
 ) {
@@ -6954,7 +6957,9 @@ pub(super) async fn run_worker(
     // Inline user-message admission is owned by this worker, while oversized
     // admission becomes durable in the driver. Keep a separate scheduler
     // source for the former so its reset can happen before acknowledgement.
+    #[cfg(feature = "extended")]
     let ingress_scheduler = scheduler.clone();
+    #[cfg(feature = "extended")]
     driver.set_daemon_scheduler_source(scheduler);
     driver.set_write_scope_source(write_scope.clone());
     // Durable lifecycle rows foreign-key to `sessions`. A resumed session is
@@ -11179,12 +11184,15 @@ pub(super) async fn run_worker(
                         // timer cannot commit until it can observe this epoch
                         // and the durable scheduler's rebuilt timeline.
                         let _ = idle_activity_tx.send(tokio::time::Instant::now());
-                        let scheduler = ingress_scheduler
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        if let Some(scheduler) = scheduler {
-                            scheduler.record_user_activity_after_acceptance().await;
+                        #[cfg(feature = "extended")]
+                        {
+                            let scheduler = ingress_scheduler
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            if let Some(scheduler) = scheduler {
+                                scheduler.record_user_activity_after_acceptance().await;
+                            }
                         }
                     }
                     let queue: Vec<proto::QueueItem> =

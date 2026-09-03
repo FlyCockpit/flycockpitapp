@@ -1430,6 +1430,7 @@ pub struct Driver {
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     /// Shared daemon scheduler handle cell. The worker installs the registry's
     /// cell rather than a snapshot so late `set_scheduler` calls are visible.
+    #[cfg(feature = "extended")]
     daemon_scheduler:
         Option<Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>>,
     /// Durable write-scope authority cell, installed by the worker. Held as the
@@ -2429,6 +2430,7 @@ impl Driver {
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            #[cfg(feature = "extended")]
             daemon_scheduler: self.daemon_scheduler.clone(),
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
@@ -2819,6 +2821,7 @@ impl Driver {
             approver: None,
             lsp: None,
             resource_scheduler: None,
+            #[cfg(feature = "extended")]
             daemon_scheduler: None,
             write_scope: None,
             dream_read_scope,
@@ -3542,6 +3545,7 @@ impl Driver {
         self.resource_scheduler = Some(scheduler);
     }
 
+    #[cfg(feature = "extended")]
     pub fn set_daemon_scheduler_source(
         &mut self,
         scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
@@ -3563,6 +3567,7 @@ impl Driver {
             .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
     }
 
+    #[cfg(feature = "extended")]
     pub fn daemon_scheduler_handle(
         &self,
     ) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -10456,39 +10461,47 @@ impl Driver {
                 }
             }
             crate::keep_warm::KeepWarmDecision::Schedule(schedule) => {
-                let Some(scheduler) = self.daemon_scheduler_handle() else {
+                #[cfg(not(feature = "extended"))]
+                {
+                    let _ = schedule;
                     tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
                     return;
-                };
-                let Some(cache_send_identity) = self.session.last_send_identity() else {
-                    // An observed cache hit necessarily follows a foreground
-                    // send in production. If that in-memory send marker is
-                    // absent (for example after a worker restart), fail
-                    // closed rather than inventing a later idle origin.
-                    return;
-                };
-                let job = crate::daemon::proto::ScheduledJobCreate {
-                    id: crate::keep_warm::format_job_id(
-                        self.session.live_id(),
-                        cache_send_identity,
-                        schedule.after_secs,
-                        schedule.idle_window_secs,
-                    ),
-                    owner: "system:keep_warm".to_string(),
-                    schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
-                        at: cache_send_identity
-                            .unix_millis
-                            .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
-                            .saturating_add(999)
-                            .div_euclid(1_000),
-                    },
-                    payload: crate::daemon::proto::ScheduledJobPayload::Callback {
-                        subsystem: "keep_warm".to_string(),
-                    },
-                    enabled: true,
-                    missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
-                };
-                match scheduler.create_system_callback_job(job).await {
+                }
+                #[cfg(feature = "extended")]
+                {
+                    let Some(scheduler) = self.daemon_scheduler_handle() else {
+                        tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
+                        return;
+                    };
+                    let Some(cache_send_identity) = self.session.last_send_identity() else {
+                        // An observed cache hit necessarily follows a foreground
+                        // send in production. If that in-memory send marker is
+                        // absent (for example after a worker restart), fail
+                        // closed rather than inventing a later idle origin.
+                        return;
+                    };
+                    let job = crate::daemon::proto::ScheduledJobCreate {
+                        id: crate::keep_warm::format_job_id(
+                            self.session.live_id(),
+                            cache_send_identity,
+                            schedule.after_secs,
+                            schedule.idle_window_secs,
+                        ),
+                        owner: "system:keep_warm".to_string(),
+                        schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
+                            at: cache_send_identity
+                                .unix_millis
+                                .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
+                                .saturating_add(999)
+                                .div_euclid(1_000),
+                        },
+                        payload: crate::daemon::proto::ScheduledJobPayload::Callback {
+                            subsystem: "keep_warm".to_string(),
+                        },
+                        enabled: true,
+                        missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
+                    };
+                    match scheduler.create_system_callback_job(job).await {
                     Ok(_) => {
                         if let Err(error) = self
                             .session
@@ -10516,6 +10529,7 @@ impl Driver {
                     Err(error) => {
                         tracing::warn!(%error, session_id = %self.session.id, "scheduling keep-warm failed");
                     }
+                }
                 }
             }
         }
@@ -12836,6 +12850,7 @@ impl Driver {
                         // same admission interval as ordinary ingress.
                         let idle_activity_gate = self.schedule.idle_activity_gate();
                         let _idle_activity_admission = idle_activity_gate.lock().await;
+                        #[cfg(feature = "extended")]
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity_after_acceptance().await;
                         }

@@ -2078,6 +2078,7 @@ mod tests {
         assert!(result.unwrap_err().is::<RunPreflightFailure>());
     }
 
+    #[cfg(feature = "extended")]
     #[test]
     fn image_control_config_changed_is_filtered_as_daemon_global() {
         let event = proto::Event::ImageControlConfigChanged {

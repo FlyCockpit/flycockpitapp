@@ -7392,24 +7392,27 @@ mod tests {
             "a second attached TUI must stop using its stale ephemeral policy"
         );
 
-        let image_config_changed = proto::Event::ImageControlConfigChanged {
-            event: proto::image_control::ImageControlEventV1::config_changed(
-                "daemon".into(),
-                "project".into(),
-                "/canonical/project".into(),
-                "/canonical/project/config.json".into(),
-                "revision".into(),
-                proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
-                1,
-                proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
-            ),
-        };
-        assert!(event_session(&image_config_changed).is_none());
-        assert!(is_global_event(&image_config_changed));
-        assert!(
-            proto_event_to_turn_event(image_config_changed).is_none(),
-            "image-control config changes are not chat-history events"
-        );
+        #[cfg(feature = "extended")]
+        {
+            let image_config_changed = proto::Event::ImageControlConfigChanged {
+                event: proto::image_control::ImageControlEventV1::config_changed(
+                    "daemon".into(),
+                    "project".into(),
+                    "/canonical/project".into(),
+                    "/canonical/project/config.json".into(),
+                    "revision".into(),
+                    proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+                    1,
+                    proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
+                ),
+            };
+            assert!(event_session(&image_config_changed).is_none());
+            assert!(is_global_event(&image_config_changed));
+            assert!(
+                proto_event_to_turn_event(image_config_changed).is_none(),
+                "image-control config changes are not chat-history events"
+            );
+        }
 
         let meta = cockpit_proto::EnvSnapshotMeta {
             source: cockpit_proto::EnvSnapshotSource::DaemonStart,

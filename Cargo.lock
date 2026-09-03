@@ -1483,7 +1483,7 @@ dependencies = [
 name = "cockpit-noise"
 version = "0.1.0"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "js-sys",
  "proptest",
  "sha2 0.11.0",

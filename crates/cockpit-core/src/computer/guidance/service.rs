@@ -122,6 +122,12 @@ fn guidance_append_is_durably_absent(error: &anyhow::Error) -> bool {
         .unwrap_or(true)
 }
 
+fn guidance_append_is_identity_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GuidanceAppendError>()
+        .is_some_and(GuidanceAppendError::is_identity_mismatch)
+}
+
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     let bytes = decode_hex(s)?;
     if bytes.len() != 32 {
@@ -729,8 +735,9 @@ impl GuidanceProposalService {
     }
 
     /// Retry every audit event left in the durable outbox by an append error
-    /// or daemon crash. Delivery marking is idempotent; the audit writer must
-    /// use the proposal/state identity for append deduplication.
+    /// or daemon crash. Delivery marking is idempotent; append success is
+    /// proof that the authenticated chain body is this reconstructed event,
+    /// not merely that `(event_kind, proposal_id)` is occupied.
     pub async fn flush_audit_outbox(&self, now_unix_ms: i64) -> anyhow::Result<usize> {
         if !self.audit.delivers_immediately() {
             return Ok(0);
@@ -762,6 +769,17 @@ impl GuidanceProposalService {
                         %error,
                         proposal_id = %row.proposal_id,
                         "guidance successor audit waiting for created predecessor"
+                    );
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<GuidanceAppendError>()
+                        .is_some_and(GuidanceAppendError::is_identity_mismatch) =>
+                {
+                    tracing::error!(
+                        %error,
+                        proposal_id = %row.proposal_id,
+                        "guidance audit outbox event does not match the authenticated chain body"
                     );
                 }
                 Err(error) => return Err(error),
@@ -948,6 +966,10 @@ impl GuidanceProposalService {
                     {
                         tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
                     }
+                }
+                Err(audit_error) if guidance_append_is_identity_mismatch(&audit_error) => {
+                    self.pending.release(&key, pid);
+                    return Err(CreateProposalError::Storage(audit_error.to_string()));
                 }
                 Err(audit_error) if guidance_append_is_durably_absent(&audit_error) => {
                     let proposal_id = hex16(&proposal_id);
@@ -1994,6 +2016,94 @@ mod tests {
         let result = writer.chain().verify().await;
         assert_eq!(result.status, AuditVerifyStatus::Verified);
         assert_eq!(result.confirmed_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn flush_does_not_mark_delivered_when_authenticated_event_diverges() {
+        use crate::computer::audit::{ComputerAuditEntryV1, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+
+        // Matching replay after a lost delivery mark is still the same event.
+        let proposal = hex16(&id16(9));
+        let proposal_for_clear = proposal.clone();
+        harness
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE guidance_proposal_audit_outbox
+                     SET delivered_at_unix_ms = NULL
+                     WHERE proposal_id = ?1",
+                    rusqlite::params![proposal_for_clear],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+
+        // Replay window: delivery mark lost, receipt identity mutated.
+        let stolen_session = hex16(&id16(7));
+        let proposal_for_mutate = proposal;
+        harness
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE guidance_proposal_audit_outbox
+                     SET delivered_at_unix_ms = NULL
+                     WHERE proposal_id = ?1",
+                    rusqlite::params![proposal_for_mutate],
+                )?;
+                conn.execute(
+                    "UPDATE guidance_proposal_receipts
+                     SET session_id = ?1
+                     WHERE proposal_id = ?2",
+                    rusqlite::params![stolen_session, proposal_for_mutate],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.flush_audit_outbox(9001).await.unwrap(), 0);
+        assert_eq!(
+            harness
+                .db
+                .pending_guidance_proposal_audits()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let decoded = ComputerAuditEntryV1::decode(&rows[0].entry_bytes).unwrap();
+        assert_eq!(decoded.session_id, id16(1));
+        assert_ne!(decoded.session_id, id16(7));
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
     }
 
     #[tokio::test]

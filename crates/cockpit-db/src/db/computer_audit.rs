@@ -198,6 +198,10 @@ impl Db {
 
     /// Look up a guidance-proposal event by the authenticated
     /// `(kind, proposal_id)` projection of `entry_bytes`.
+    ///
+    /// This uniqueness key locates at most one row. It is not event
+    /// identity: a caller that treats a hit as replay success must compare
+    /// the canonical body (as `insert_computer_audit_entry` does).
     pub async fn computer_audit_guidance_entry(
         &self,
         event_kind: u8,

@@ -8043,8 +8043,9 @@ CREATE TABLE computer_audit_entries (
 );
 
 -- At most one guidance-proposal audit event per authenticated (kind, proposal)
--- taken from entry_bytes. Replay of the durable outbox must not mint a second
--- chain entry. Kinds 20..=23 are X'14'..X'17'.
+-- taken from entry_bytes. The uniqueness key prevents a fork; it is not event
+-- identity. Replay may succeed only when the canonical body is the requested
+-- event. Kinds 20..=23 are X'14'..X'17'.
 CREATE UNIQUE INDEX uq_computer_audit_entries_guidance_proposal
     ON computer_audit_entries(
         substr(entry_bytes, 6, 1),

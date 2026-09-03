@@ -51,8 +51,11 @@ const _: () = {
 /// Outcome of a guidance-chain append that did not commit.
 ///
 /// Create-path rollback of a durable receipt is permitted only for
-/// [`Self::is_durably_absent`]. Pending-head recovery can still commit an
-/// event after [`Self::Unknown`], so those callers must keep the receipt.
+/// [`Self::is_durably_absent`]. [`Self::IdentityMismatch`] means an
+/// authenticated body already occupies the uniqueness key but is not this
+/// event — the receipt must stay, and callers must not treat the existing
+/// body as delivery of the request. Pending-head recovery can still commit
+/// an event after [`Self::Unknown`], so those callers must keep the receipt.
 #[derive(Debug, thiserror::Error)]
 pub enum GuidanceAppendError {
     /// No pending head and no database row were written for this event.
@@ -62,6 +65,12 @@ pub enum GuidanceAppendError {
     /// not yet on the chain. Nothing was written.
     #[error("computer audit append requires a prior guidance_proposal_created event")]
     PredecessorMissing,
+    /// An authenticated body already occupies this guidance uniqueness key
+    /// (`event_kind`, `proposal_id` for replay; created `proposal_id` for a
+    /// successor) but its payload is not the requested event. The uniqueness
+    /// key is not event identity.
+    #[error("computer audit authenticated body does not match the requested guidance event")]
+    IdentityMismatch,
     /// A pending head and/or database row may exist; recovery can still
     /// commit the event.
     #[error("computer audit append failed after a durable write: {0}")]
@@ -77,6 +86,10 @@ impl GuidanceAppendError {
 
     pub fn is_predecessor_missing(&self) -> bool {
         matches!(self, Self::PredecessorMissing)
+    }
+
+    pub fn is_identity_mismatch(&self) -> bool {
+        matches!(self, Self::IdentityMismatch)
     }
 
     fn absent(error: impl Into<anyhow::Error>) -> Self {
@@ -186,12 +199,16 @@ impl ComputerAuditChain {
         }
     }
 
-    /// Append one guidance-proposal event. Idempotent for
-    /// `(event_kind, proposal_id)` so outbox replay cannot fork the chain.
+    /// Append one guidance-proposal event. Idempotent only when an
+    /// authenticated body is the canonical encoding of this event (chain
+    /// position held constant). The `(event_kind, proposal_id)` unique index
+    /// prevents a fork; it is not proof that the requested event is on the
+    /// chain.
     ///
     /// A returned [`GuidanceAppendError`] tells the caller whether the event
-    /// is known to be durably absent (safe to roll back prior work) or may
-    /// still be recovered into a committed chain entry.
+    /// is known to be durably absent (safe to roll back prior work),
+    /// conflicts with an authenticated body, or may still be recovered into
+    /// a committed chain entry.
     pub async fn append_guidance(
         &self,
         event: GuidanceAuditAppend,
@@ -402,19 +419,32 @@ impl ComputerAuditChain {
                 .map(authenticated_entry)
                 .collect::<Result<Vec<_>>>()
                 .map_err(GuidanceAppendError::absent)?;
-            if authenticated.iter().any(|entry| {
+            if let Some(existing) = authenticated.iter().find(|entry| {
                 entry.event_kind == event.kind && entry.proposal_id == event.proposal_id
             }) {
-                return Ok(());
+                return if authenticated_guidance_event_matches(existing, event) {
+                    Ok(())
+                } else {
+                    Err(GuidanceAppendError::IdentityMismatch)
+                };
             }
 
-            if is_guidance_successor(event.kind)
-                && !authenticated.iter().any(|entry| {
+            if is_guidance_successor(event.kind) {
+                match authenticated.iter().find(|entry| {
                     entry.event_kind == AuditEventKind::GuidanceProposalCreated
                         && entry.proposal_id == event.proposal_id
-                })
-            {
-                return Err(GuidanceAppendError::PredecessorMissing);
+                }) {
+                    None => return Err(GuidanceAppendError::PredecessorMissing),
+                    Some(created)
+                        if !authenticated_guidance_event_matches(
+                            created,
+                            &created_predecessor_request(event),
+                        ) =>
+                    {
+                        return Err(GuidanceAppendError::IdentityMismatch);
+                    }
+                    Some(_) => {}
+                }
             }
 
             let sequence = head
@@ -821,6 +851,40 @@ fn corrupt_from_instance(database_instance_id: [u8; 16]) -> AuditVerifyResult {
     }
 }
 
+/// Whether `entry` is the canonical encoding of `event` at this chain
+/// position. Sequence, previous MAC, timestamps, and key version are chain
+/// fields, not event identity; they are taken from `entry` so a replay can
+/// match the body that was actually signed. The uniqueness key
+/// `(event_kind, proposal_id)` is only how the existing row is found.
+fn authenticated_guidance_event_matches(
+    entry: &ComputerAuditEntryV1,
+    event: &GuidanceAuditAppend,
+) -> bool {
+    match build_guidance_entry(
+        event,
+        entry.sequence,
+        entry.previous_mac,
+        entry.key_version,
+        entry.monotonic_nanos,
+        entry.wall_unix_millis,
+    ) {
+        Ok(expected) => expected.encode() == entry.encode(),
+        Err(_) => false,
+    }
+}
+
+/// Project a successor request onto the created event that must already
+/// occupy this `proposal_id`. Disposition and scope are kind-specific;
+/// every other guidance payload field is proposal identity.
+fn created_predecessor_request(event: &GuidanceAuditAppend) -> GuidanceAuditAppend {
+    GuidanceAuditAppend {
+        kind: AuditEventKind::GuidanceProposalCreated,
+        disposition: None,
+        scope: None,
+        ..event.clone()
+    }
+}
+
 fn build_guidance_entry(
     event: &GuidanceAuditAppend,
     sequence: u64,
@@ -1029,6 +1093,18 @@ mod tests {
         assert_eq!(rows[3].event_kind, GUIDANCE_PROPOSAL_REJECTED);
     }
 
+    #[test]
+    fn authenticated_match_is_payload_identity_not_chain_position() {
+        let event = sample_event(AuditEventKind::GuidanceProposalAccepted, 3);
+        let entry = build_guidance_entry(&event, 7, [1u8; 32], 2, 11, 22).unwrap();
+        assert!(authenticated_guidance_event_matches(&entry, &event));
+        let shifted = build_guidance_entry(&event, 8, [2u8; 32], 9, 99, 100).unwrap();
+        assert!(authenticated_guidance_event_matches(&shifted, &event));
+        let mut drifted = event.clone();
+        drifted.session_id[0] ^= 1;
+        assert!(!authenticated_guidance_event_matches(&entry, &drifted));
+    }
+
     #[tokio::test]
     async fn guidance_append_is_idempotent() {
         let harness = TestAuditHarness::new().await;
@@ -1045,6 +1121,142 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn assert_identity_mismatch(err: GuidanceAppendError) {
+        assert!(
+            matches!(err, GuidanceAppendError::IdentityMismatch),
+            "{err}"
+        );
+        assert!(err.is_identity_mismatch(), "{err}");
+        assert!(!err.is_durably_absent(), "{err}");
+        assert!(!err.is_predecessor_missing(), "{err}");
+    }
+
+    fn assert_named_identity_mismatch(name: &str, err: GuidanceAppendError) {
+        assert!(
+            matches!(err, GuidanceAppendError::IdentityMismatch),
+            "{name}: {err}"
+        );
+        assert!(err.is_identity_mismatch(), "{name}: {err}");
+        assert!(!err.is_durably_absent(), "{name}: {err}");
+        assert!(!err.is_predecessor_missing(), "{name}: {err}");
+    }
+
+    #[tokio::test]
+    async fn guidance_append_replay_requires_authenticated_event_identity() {
+        let harness = TestAuditHarness::new().await;
+        let original = sample_event(AuditEventKind::GuidanceProposalCreated, 9);
+        harness
+            .chain
+            .append_guidance(original.clone())
+            .await
+            .unwrap();
+
+        let mut session = original.clone();
+        session.session_id[0] ^= 0xff;
+        let mut delegation = original.clone();
+        delegation.delegation_id[0] ^= 0xff;
+        let mut project = original.clone();
+        project.canonical_project_digest[0] ^= 0xff;
+        let mut provider = original.clone();
+        provider.provider_digest[0] ^= 0xff;
+        let mut model = original.clone();
+        model.model_digest[0] ^= 0xff;
+        let mut generation = original.clone();
+        generation.config_generation = 99;
+        let mut bits = original.clone();
+        bits.rule_kind_bits = 0b0010;
+
+        for (name, mutated) in [
+            ("session_id", session),
+            ("delegation_id", delegation),
+            ("canonical_project_digest", project),
+            ("provider_digest", provider),
+            ("model_digest", model),
+            ("config_generation", generation),
+            ("rule_kind_bits", bits),
+        ] {
+            let err = harness.chain.append_guidance(mutated).await.unwrap_err();
+            assert_named_identity_mismatch(name, err);
+        }
+
+        harness.chain.append_guidance(original).await.unwrap();
+        assert_eq!(harness.chain.verify().await.confirmed_sequence, 1);
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(harness.chain.is_available());
+    }
+
+    #[tokio::test]
+    async fn guidance_append_replay_rejects_disposition_and_scope_mismatch() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap();
+        let accepted = sample_event(AuditEventKind::GuidanceProposalAccepted, 1);
+        harness
+            .chain
+            .append_guidance(accepted.clone())
+            .await
+            .unwrap();
+
+        let mut session_scope = accepted.clone();
+        session_scope.disposition = Some(Disposition::AcceptedSession);
+        session_scope.scope = Some(GuidanceScope::Session);
+        assert_identity_mismatch(
+            harness
+                .chain
+                .append_guidance(session_scope)
+                .await
+                .unwrap_err(),
+        );
+
+        harness.chain.append_guidance(accepted).await.unwrap();
+        assert_eq!(harness.chain.verify().await.confirmed_sequence, 2);
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn successor_append_requires_created_proposal_identity() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap();
+
+        let mut expired = sample_event(AuditEventKind::GuidanceProposalExpired, 1);
+        expired.session_id[0] ^= 0xff;
+        assert_identity_mismatch(harness.chain.append_guidance(expired).await.unwrap_err());
+        assert_eq!(harness.chain.verify().await.confirmed_sequence, 1);
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(harness.chain.is_available());
     }
 
     #[tokio::test]

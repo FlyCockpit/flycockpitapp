@@ -3759,6 +3759,49 @@ async fn archive_is_private() {
     );
 }
 
+// Windows twin of `archive_is_private`: the export write funnels through
+// `private_fs::write_private_export_file`, whose Windows arm enforces the
+// protected owner-only DACL (asserted against real on-disk behaviour in
+// `cockpit-host`); here we prove the end-to-end export still assembles and
+// lands a VALID archive on Windows — the write that used to hard-fail the
+// command outright. Not compiled out: it runs on the Windows gate runner.
+#[cfg(windows)]
+#[tokio::test]
+async fn archive_lands_valid_and_private_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(
+        &db,
+        "p",
+        tmp.path().to_str().expect("temporary path is UTF-8"),
+        "builder",
+    )
+    .await;
+    let target = get_test_session(&db, session.session_id).await;
+    let out = tmp.path().join("export.zip");
+
+    write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .expect("Windows export must succeed");
+
+    // The archive is a real, importable debug bundle, not a stub.
+    let bytes = std::fs::read(&out).expect("export file exists");
+    let manifest = read_zip_entry(&bytes, "manifest.json")
+        .expect("manifest.json must be readable from the archive");
+    assert!(manifest.contains("\"redacted\": true"));
+    assert!(
+        read_zip_entry(&bytes, "events.json").is_some(),
+        "events.json must be present in the archive"
+    );
+}
+
 #[tokio::test]
 async fn redaction_failure_aborts_export() {
     let db = Db::open_in_memory().unwrap();

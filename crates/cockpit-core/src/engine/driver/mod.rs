@@ -3200,13 +3200,16 @@ impl Driver {
     }
 
     /// Reserve one provider round on the live ledger before dispatching
-    /// inference. Interactive roots may extend the ceiling; otherwise
-    /// exhaustion is terminal. `Ok(true)` means dispatch; `Ok(false)` means
-    /// the caller must stop without contacting the provider.
+    /// inference. Interactive roots may extend a **round** ceiling; exhaustion
+    /// on any other dimension is terminal. `Ok(true)` means dispatch;
+    /// `Ok(false)` means the caller must stop without contacting the
+    /// provider.
     ///
-    /// `charge_round` is the reservation (not a peek): descendants share
-    /// this ledger, so check-then-dispatch would race. Swarm, schedule,
-    /// and noninteractive loops call `charge_round` at the same point.
+    /// `charge_round` is the reservation (not a peek) and fails closed if
+    /// any finite spend dimension is already at its ceiling. Descendants
+    /// share this ledger, so check-then-dispatch would race. Swarm,
+    /// schedule, and noninteractive loops call `charge_round` at the same
+    /// point.
     async fn admit_provider_round(
         &mut self,
         is_root: bool,

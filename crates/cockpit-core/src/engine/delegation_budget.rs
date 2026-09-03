@@ -8,8 +8,13 @@
 //! charges that ledger. Unpriced token usage is not free: a finite cost
 //! ceiling rejects it. Round admission is a reservation: production turn
 //! loops must [`BudgetPool::charge_round`] before dispatching a provider
-//! turn. [`BudgetPool::preflight`] peeks whether the next round would be
-//! admitted; it is not a reservation on a shared ledger.
+//! turn. Admission fails closed once **any** finite spend dimension has no
+//! remaining capacity (`spent >= ceiling`), including tokens, cost, output,
+//! and wall-clock — a zero-increment round charge must not dispatch another
+//! provider turn against a met cap. Usage recording ([`BudgetPool::charge`])
+//! still allows landing exactly on a cap so the last admitted turn can book
+//! its tokens and cost. [`BudgetPool::preflight`] peeks the same admission
+//! decision; it is not a reservation on a shared ledger.
 //!
 //! Unlimited is a budget *value* (`ResolvedDelegationBudget` with every
 //! dimension `None`), not a bypass. The compact progress guard and retry
@@ -17,7 +22,7 @@
 
 use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cockpit_config::config::delegation_budget::{
     BudgetSpend, DEFAULT_COMPACT_NO_PROGRESS_LIMIT, DEFAULT_MAX_RETRIES_PER_TURN,
@@ -467,34 +472,20 @@ impl BudgetPool {
     pub fn snapshot(&self) -> BudgetSnapshot {
         let ledger = lock_or_recover(&self.ledger);
         let local = lock_or_recover(&self.local);
-        let elapsed = ledger.started_at.elapsed();
-        let local_elapsed = local.started_at.elapsed();
         BudgetSnapshot {
             ceiling: ledger.ceiling,
             local_ceiling: local.ceiling,
-            spent: BudgetSpend {
-                rounds: ledger.spent_rounds,
-                input_tokens: ledger.spent_input_tokens,
-                output_tokens: ledger.spent_output_tokens,
-                cost_microusd: ledger.spent_cost_microusd,
-                elapsed,
-            },
-            local_spent: BudgetSpend {
-                rounds: local.spent_rounds,
-                input_tokens: local.spent_input_tokens,
-                output_tokens: local.spent_output_tokens,
-                cost_microusd: local.spent_cost_microusd,
-                elapsed: local_elapsed,
-            },
+            spent: spend_of_ledger(&ledger),
+            local_spent: spend_of_local(&local),
             unlimited: ledger.ceiling.is_unlimited() && local.ceiling.is_unlimited(),
         }
     }
 
     /// Peek whether the next provider round would be admitted, without
-    /// recording spend. Production turn loops must still
-    /// [`Self::charge_round`] before dispatch: this is not a reservation,
-    /// and descendants sharing the ledger can spend between peek and
-    /// dispatch.
+    /// recording spend. The peek uses the same all-dimension admission
+    /// gate as [`Self::charge_round`]. Production turn loops must still
+    /// reserve before dispatch: this is not a reservation, and descendants
+    /// sharing the ledger can spend between peek and dispatch.
     pub fn preflight(&self) -> Result<(), BudgetExhaustion> {
         let ledger = lock_or_recover(&self.ledger);
         let local = lock_or_recover(&self.local);
@@ -510,8 +501,9 @@ impl BudgetPool {
     }
 
     /// Reserve one provider round on the live ledger. Call this before
-    /// dispatching inference so an already-met ceiling cannot spend
-    /// tokens or cost on the shared pool.
+    /// dispatching inference so an already-met ceiling on **any** spend
+    /// dimension (rounds, tokens, cost, wall-clock) cannot dispatch
+    /// another provider turn.
     pub fn charge_round(&self) -> Result<(), BudgetExhaustion> {
         self.charge(BudgetCharge::round())
     }
@@ -523,9 +515,12 @@ impl BudgetPool {
         self.charge(BudgetCharge::from_usage(usage))
     }
 
-    /// Admit `charge` against both the shared ledger and this handle's local
-    /// cap. Unpriced token usage (`BudgetCharge::is_unpriced`) is exhaustion
-    /// on any finite cost ceiling; it is not recorded as free.
+    /// Record `charge` against both the shared ledger and this handle's local
+    /// cap. A charge that reserves rounds is provider-turn **admission** and
+    /// fails if any finite dimension is already at its ceiling. A usage
+    /// record (zero rounds) may land exactly on a cap. Unpriced token usage
+    /// ([`BudgetCharge::is_unpriced`]) is exhaustion on any finite cost
+    /// ceiling; it is not recorded as free.
     pub fn charge(&self, charge: BudgetCharge) -> Result<(), BudgetExhaustion> {
         let mut ledger = lock_or_recover(&self.ledger);
         let mut local = lock_or_recover(&self.local);
@@ -605,20 +600,33 @@ impl BudgetPool {
     }
 }
 
-fn projected_spend(
-    spent_rounds: u64,
-    spent_input_tokens: u64,
-    spent_output_tokens: u64,
-    spent_cost_microusd: u64,
-    elapsed: Duration,
-    charge: BudgetCharge,
-) -> BudgetSpend {
+fn spend_of_ledger(ledger: &SharedLedger) -> BudgetSpend {
     BudgetSpend {
-        rounds: spent_rounds.saturating_add(charge.rounds),
-        input_tokens: spent_input_tokens.saturating_add(charge.input_tokens),
-        output_tokens: spent_output_tokens.saturating_add(charge.output_tokens),
-        cost_microusd: spent_cost_microusd.saturating_add(charge.cost_microusd),
-        elapsed,
+        rounds: ledger.spent_rounds,
+        input_tokens: ledger.spent_input_tokens,
+        output_tokens: ledger.spent_output_tokens,
+        cost_microusd: ledger.spent_cost_microusd,
+        elapsed: ledger.started_at.elapsed(),
+    }
+}
+
+fn spend_of_local(local: &LocalState) -> BudgetSpend {
+    BudgetSpend {
+        rounds: local.spent_rounds,
+        input_tokens: local.spent_input_tokens,
+        output_tokens: local.spent_output_tokens,
+        cost_microusd: local.spent_cost_microusd,
+        elapsed: local.started_at.elapsed(),
+    }
+}
+
+fn project_spend(spent: BudgetSpend, charge: BudgetCharge) -> BudgetSpend {
+    BudgetSpend {
+        rounds: spent.rounds.saturating_add(charge.rounds),
+        input_tokens: spent.input_tokens.saturating_add(charge.input_tokens),
+        output_tokens: spent.output_tokens.saturating_add(charge.output_tokens),
+        cost_microusd: spent.cost_microusd.saturating_add(charge.cost_microusd),
+        elapsed: spent.elapsed,
     }
 }
 
@@ -627,30 +635,28 @@ fn reject_charge(
     local: &LocalState,
     charge: BudgetCharge,
 ) -> Option<BudgetDimension> {
-    if let Some(dimension) = would_exceed(
-        ledger.ceiling,
-        projected_spend(
-            ledger.spent_rounds,
-            ledger.spent_input_tokens,
-            ledger.spent_output_tokens,
-            ledger.spent_cost_microusd,
-            ledger.started_at.elapsed(),
-            charge,
-        ),
-    ) {
+    let ledger_spent = spend_of_ledger(ledger);
+    let local_spent = spend_of_local(local);
+
+    // Provider-turn admission (`charge.rounds > 0`) fails closed once any
+    // finite dimension has no remaining capacity, including dimensions this
+    // charge does not increment. Usage recording (zero rounds) still uses
+    // [`would_exceed`] so the last admitted turn can book tokens/cost after
+    // the round reservation has met the round cap. Wall-clock is admit-only:
+    // recording must not drop bookkeeping because time passed during the turn.
+    if charge.rounds > 0 {
+        if let Some(dimension) = dimension_at_or_over_cap(ledger.ceiling, ledger_spent) {
+            return Some(dimension);
+        }
+        if let Some(dimension) = dimension_at_or_over_cap(local.ceiling, local_spent) {
+            return Some(dimension);
+        }
+    }
+
+    if let Some(dimension) = would_exceed(ledger.ceiling, project_spend(ledger_spent, charge)) {
         return Some(dimension);
     }
-    if let Some(dimension) = would_exceed(
-        local.ceiling,
-        projected_spend(
-            local.spent_rounds,
-            local.spent_input_tokens,
-            local.spent_output_tokens,
-            local.spent_cost_microusd,
-            local.started_at.elapsed(),
-            charge,
-        ),
-    ) {
+    if let Some(dimension) = would_exceed(local.ceiling, project_spend(local_spent, charge)) {
         return Some(dimension);
     }
     if charge.unpriced_cost
@@ -661,6 +667,49 @@ fn reject_charge(
     None
 }
 
+/// Remaining capacity is zero: `spent >= ceiling` on a finite dimension.
+/// Used at provider-turn admission, not at usage recording.
+fn dimension_at_or_over_cap(
+    ceiling: ResolvedDelegationBudget,
+    spent: BudgetSpend,
+) -> Option<BudgetDimension> {
+    if ceiling
+        .max_rounds
+        .is_some_and(|max| spent.rounds >= u64::from(max))
+    {
+        return Some(BudgetDimension::Rounds);
+    }
+    if ceiling
+        .max_input_tokens
+        .is_some_and(|max| spent.input_tokens >= max)
+    {
+        return Some(BudgetDimension::InputTokens);
+    }
+    if ceiling
+        .max_output_tokens
+        .is_some_and(|max| spent.output_tokens >= max)
+    {
+        return Some(BudgetDimension::OutputTokens);
+    }
+    if ceiling
+        .max_cost_microusd
+        .is_some_and(|max| spent.cost_microusd >= max)
+    {
+        return Some(BudgetDimension::Cost);
+    }
+    if ceiling
+        .max_wall_clock
+        .is_some_and(|max| spent.elapsed >= max)
+    {
+        return Some(BudgetDimension::WallClock);
+    }
+    None
+}
+
+/// Projected incrementable spend is strictly past a finite ceiling.
+/// Landing exactly on a cap is a successful record; the next admission
+/// fails via [`dimension_at_or_over_cap`]. Wall-clock is not recorded
+/// here — it gates admission only.
 fn would_exceed(ceiling: ResolvedDelegationBudget, spent: BudgetSpend) -> Option<BudgetDimension> {
     if ceiling
         .max_rounds
@@ -685,12 +734,6 @@ fn would_exceed(ceiling: ResolvedDelegationBudget, spent: BudgetSpend) -> Option
         .is_some_and(|max| spent.cost_microusd > max)
     {
         return Some(BudgetDimension::Cost);
-    }
-    if ceiling
-        .max_wall_clock
-        .is_some_and(|max| spent.elapsed > max)
-    {
-        return Some(BudgetDimension::WallClock);
     }
     None
 }
@@ -1099,5 +1142,155 @@ mod tests {
         assert_eq!(err.dimension, BudgetDimension::Cost);
         assert_eq!(pool.snapshot().spent.cost_microusd, 0);
         assert_eq!(pool.snapshot().spent.input_tokens, 0);
+    }
+
+    #[test]
+    fn charge_round_rejects_when_a_non_round_dimension_is_at_cap() {
+        struct Case {
+            ceiling: ResolvedDelegationBudget,
+            fill: BudgetCharge,
+            dimension: BudgetDimension,
+        }
+        let cases = [
+            Case {
+                ceiling: ResolvedDelegationBudget {
+                    max_input_tokens: Some(10),
+                    ..ResolvedDelegationBudget::unlimited()
+                },
+                fill: BudgetCharge {
+                    input_tokens: 10,
+                    ..BudgetCharge::default()
+                },
+                dimension: BudgetDimension::InputTokens,
+            },
+            Case {
+                ceiling: ResolvedDelegationBudget {
+                    max_output_tokens: Some(7),
+                    ..ResolvedDelegationBudget::unlimited()
+                },
+                fill: BudgetCharge {
+                    output_tokens: 7,
+                    ..BudgetCharge::default()
+                },
+                dimension: BudgetDimension::OutputTokens,
+            },
+            Case {
+                ceiling: ResolvedDelegationBudget {
+                    max_cost_microusd: Some(25),
+                    ..ResolvedDelegationBudget::unlimited()
+                },
+                fill: BudgetCharge {
+                    cost_microusd: 25,
+                    ..BudgetCharge::default()
+                },
+                dimension: BudgetDimension::Cost,
+            },
+        ];
+        for case in cases {
+            let pool = BudgetPool::new(case.ceiling);
+            pool.charge(case.fill).unwrap();
+            let err = pool.preflight().unwrap_err();
+            assert_eq!(err.dimension, case.dimension);
+            assert_eq!(
+                pool.snapshot().spent.rounds,
+                0,
+                "preflight must not reserve a round"
+            );
+            let err = pool.charge_round().unwrap_err();
+            assert_eq!(err.dimension, case.dimension);
+            assert_eq!(
+                pool.snapshot().spent.rounds,
+                0,
+                "charge_round must not reserve a round against a met non-round ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_non_round_ceiling_rejects_the_first_round() {
+        let tokens = BudgetPool::new(ResolvedDelegationBudget {
+            max_input_tokens: Some(0),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let err = tokens.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::InputTokens);
+        assert_eq!(tokens.snapshot().spent.rounds, 0);
+
+        let wall = BudgetPool::new(ResolvedDelegationBudget {
+            max_wall_clock: Some(std::time::Duration::ZERO),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let err = wall.preflight().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::WallClock);
+        let err = wall.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::WallClock);
+        assert_eq!(wall.snapshot().spent.rounds, 0);
+    }
+
+    #[test]
+    fn usage_record_after_round_cap_still_books_tokens() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(1),
+            max_input_tokens: Some(100),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        pool.charge_round().unwrap();
+        pool.charge(BudgetCharge {
+            input_tokens: 40,
+            ..BudgetCharge::default()
+        })
+        .unwrap();
+        assert_eq!(pool.snapshot().spent.rounds, 1);
+        assert_eq!(pool.snapshot().spent.input_tokens, 40);
+        let err = pool.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::Rounds);
+        assert_eq!(
+            pool.snapshot().spent.input_tokens,
+            40,
+            "a rejected admission must not drop the already-recorded usage"
+        );
+    }
+
+    #[test]
+    fn usage_record_may_land_exactly_on_a_token_cap() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_input_tokens: Some(10),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        pool.charge_round().unwrap();
+        pool.charge(BudgetCharge {
+            input_tokens: 10,
+            ..BudgetCharge::default()
+        })
+        .unwrap();
+        assert_eq!(pool.snapshot().spent.input_tokens, 10);
+        let err = pool.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::InputTokens);
+        assert_eq!(pool.snapshot().spent.rounds, 1);
+    }
+
+    #[test]
+    fn child_local_token_cap_rejects_admission_without_blocking_parent() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_input_tokens: Some(100),
+            max_rounds: Some(4),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let child = root.allot(ResolvedDelegationBudget {
+            max_input_tokens: Some(5),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        child
+            .charge(BudgetCharge {
+                input_tokens: 5,
+                ..BudgetCharge::default()
+            })
+            .unwrap();
+        let err = child.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::InputTokens);
+        assert_eq!(child.snapshot().spent.rounds, 0);
+        root.charge_round().unwrap();
+        assert_eq!(root.snapshot().spent.rounds, 1);
+        assert_eq!(root.snapshot().spent.input_tokens, 5);
     }
 }

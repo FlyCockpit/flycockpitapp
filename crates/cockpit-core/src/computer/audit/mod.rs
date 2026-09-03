@@ -1723,4 +1723,4 @@ const _: () = {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use chain::{AppendFault, TestAuditHarness};
+pub(crate) use chain::{AppendFault, AppendObserveFault, TestAuditHarness};

@@ -11,6 +11,8 @@
 //! that do not match the authenticated body. There is no silent re-anchor.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -61,6 +63,9 @@ const _: () = {
 /// database body, and cannot be recovered into one. A failure while a
 /// pending head is present — including reconstructing the authenticated
 /// body and then failing to confirm the sealed head — is [`Self::Unknown`].
+/// Retrying after a pending-head or database write cannot use the
+/// pre-write classifier: sealed-head load, decode, listing, and
+/// verification failures no longer prove absence.
 #[derive(Debug, thiserror::Error)]
 pub enum GuidanceAppendError {
     /// No pending head and no database row were written for this event.
@@ -104,6 +109,16 @@ impl GuidanceAppendError {
     fn unknown(error: impl Into<anyhow::Error>) -> Self {
         Self::Unknown(error.into())
     }
+
+    /// Observation and pre-commit failures prove absence only when this
+    /// attempt has not written a pending head or database body.
+    fn from_unproved(durable_write: bool, error: impl Into<anyhow::Error>) -> Self {
+        if durable_write {
+            Self::Unknown(error.into())
+        } else {
+            Self::Absent(error.into())
+        }
+    }
 }
 
 /// Test-only injection points between the three durable append stages.
@@ -113,7 +128,18 @@ pub(crate) enum AppendFault {
     AfterPendingHead,
     AfterPendingHeadUnaborted,
     AfterDatabaseInsert,
+    AfterDatabaseInsertConfirmConflict,
     AfterRecoverPendingBody,
+    FailObserve(AppendObserveFault),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendObserveFault {
+    SealedHeadLoad,
+    DecodeHead,
+    ListEntries,
+    Verify,
 }
 
 /// Fields for a guidance-proposal audit append. Typed rule values and
@@ -147,7 +173,7 @@ pub struct ComputerAuditChain {
     inner: tokio::sync::Mutex<Option<ChainInner>>,
     available: AtomicBool,
     #[cfg(test)]
-    append_fault: std::sync::Mutex<Option<AppendFault>>,
+    append_fault: std::sync::Mutex<VecDeque<AppendFault>>,
 }
 
 impl ComputerAuditChain {
@@ -172,7 +198,7 @@ impl ComputerAuditChain {
             inner: tokio::sync::Mutex::new(None),
             available: AtomicBool::new(false),
             #[cfg(test)]
-            append_fault: std::sync::Mutex::new(None),
+            append_fault: std::sync::Mutex::new(VecDeque::new()),
         };
         chain.bootstrap().await?;
         Ok(chain)
@@ -185,7 +211,7 @@ impl ComputerAuditChain {
             inner: tokio::sync::Mutex::new(None),
             available: AtomicBool::new(false),
             #[cfg(test)]
-            append_fault: std::sync::Mutex::new(None),
+            append_fault: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -254,10 +280,10 @@ impl ComputerAuditChain {
 
     #[cfg(test)]
     pub(crate) fn inject_append_fault(&self, fault: AppendFault) {
-        *self
-            .append_fault
+        self.append_fault
             .lock()
-            .expect("computer audit append fault mutex") = Some(fault);
+            .expect("computer audit append fault mutex")
+            .push_back(fault);
     }
 
     #[cfg(test)]
@@ -266,11 +292,20 @@ impl ComputerAuditChain {
             .append_fault
             .lock()
             .expect("computer audit append fault mutex");
-        if *guard == Some(expected) {
-            *guard = None;
+        if guard.front() == Some(&expected) {
+            guard.pop_front();
             true
         } else {
             false
+        }
+    }
+
+    #[cfg(test)]
+    fn fault_observe<T>(&self, kind: AppendObserveFault, result: Result<T>) -> Result<T> {
+        if self.take_append_fault(AppendFault::FailObserve(kind)) {
+            Err(anyhow!("injected computer audit observe failure: {kind:?}"))
+        } else {
+            result
         }
     }
 
@@ -369,22 +404,32 @@ impl ComputerAuditChain {
         inner: &mut ChainInner,
         event: &GuidanceAuditAppend,
     ) -> Result<(), GuidanceAppendError> {
+        let mut durable_write = false;
         for _ in 0..MAX_CAS_RETRIES {
-            let mut view = self
+            let loaded = self
                 .keys
                 .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
                 .await
-                .context("loading computer audit sealed head")
-                .map_err(GuidanceAppendError::Absent)?;
-            let mut head =
-                decode_head(view.payload.as_slice()).map_err(GuidanceAppendError::Absent)?;
-            let mut rows = self
-                .db
-                .list_computer_audit_entries()
-                .await
-                .map_err(GuidanceAppendError::Absent)?;
-            let status = verify_with(inner, Some(&head), Some(&rows))
-                .map_err(GuidanceAppendError::Absent)?;
+                .context("loading computer audit sealed head");
+            #[cfg(test)]
+            let loaded = self.fault_observe(AppendObserveFault::SealedHeadLoad, loaded);
+            let mut view =
+                loaded.map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
+            let decoded = decode_head(view.payload.as_slice());
+            #[cfg(test)]
+            let decoded = self.fault_observe(AppendObserveFault::DecodeHead, decoded);
+            let mut head = decoded
+                .map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
+            let listed = self.db.list_computer_audit_entries().await;
+            #[cfg(test)]
+            let listed = self.fault_observe(AppendObserveFault::ListEntries, listed);
+            let mut rows =
+                listed.map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
+            let verified = verify_with(inner, Some(&head), Some(&rows));
+            #[cfg(test)]
+            let verified = self.fault_observe(AppendObserveFault::Verify, verified);
+            let status = verified
+                .map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
             match status.status {
                 AuditVerifyStatus::Verified => {}
                 AuditVerifyStatus::PendingRecovery => {
@@ -392,10 +437,10 @@ impl ComputerAuditChain {
                         .await?;
                 }
                 other => {
-                    return Err(GuidanceAppendError::absent(anyhow!(
-                        "computer audit chain failed closed: {}",
-                        other.as_str()
-                    )));
+                    return Err(GuidanceAppendError::from_unproved(
+                        durable_write,
+                        anyhow!("computer audit chain failed closed: {}", other.as_str()),
+                    ));
                 }
             }
 
@@ -403,7 +448,7 @@ impl ComputerAuditChain {
                 .iter()
                 .map(authenticated_entry)
                 .collect::<Result<Vec<_>>>()
-                .map_err(GuidanceAppendError::absent)?;
+                .map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
             if let Some(existing) = authenticated.iter().find(|entry| {
                 entry.event_kind == event.kind && entry.proposal_id == event.proposal_id
             }) {
@@ -433,7 +478,10 @@ impl ComputerAuditChain {
             }
 
             let sequence = head.confirmed_sequence.checked_add(1).ok_or_else(|| {
-                GuidanceAppendError::absent(anyhow!("computer audit sequence overflow"))
+                GuidanceAppendError::from_unproved(
+                    durable_write,
+                    anyhow!("computer audit sequence overflow"),
+                )
             })?;
             let monotonic = next_monotonic(inner.last_monotonic);
             let wall_unix_millis = chrono::Utc::now().timestamp_millis();
@@ -445,13 +493,16 @@ impl ComputerAuditChain {
                 monotonic,
                 wall_unix_millis,
             )
-            .map_err(GuidanceAppendError::Absent)?;
+            .map_err(|error| GuidanceAppendError::from_unproved(durable_write, error))?;
             let entry_bytes = entry.encode();
             let hmac_key = inner
                 .hmac_keys
                 .get(&inner.current_key_version)
                 .ok_or_else(|| {
-                    GuidanceAppendError::absent(anyhow!("computer audit HMAC key missing"))
+                    GuidanceAppendError::from_unproved(
+                        durable_write,
+                        anyhow!("computer audit HMAC key missing"),
+                    )
                 })?;
             let mac = super::entry_mac(hmac_key.as_ref(), &entry_bytes);
 
@@ -469,7 +520,10 @@ impl ComputerAuditChain {
                 inner.database_instance_id,
             );
             match self.cas_head(&view, &pending).await {
-                Ok(pending_view) => view = pending_view,
+                Ok(pending_view) => {
+                    durable_write = true;
+                    view = pending_view;
+                }
                 Err(CasOutcome::Conflict) => continue,
                 // Lost-ack may have written the pending head; recovery can
                 // still commit. Same class as abort_uncommitted_pending
@@ -520,6 +574,14 @@ impl ComputerAuditChain {
                 // The body is durable; pending-head recovery will confirm.
                 inner.last_monotonic = monotonic;
                 return Ok(());
+            }
+
+            #[cfg(test)]
+            if self.take_append_fault(AppendFault::AfterDatabaseInsertConfirmConflict) {
+                // Production equivalent of confirmed-head CAS Conflict
+                // after a durable insert: retry without classifying the
+                // next observe as Absent.
+                continue;
             }
 
             let confirmed = ComputerAuditSealedHeadV1::confirmed_only(
@@ -1629,5 +1691,94 @@ mod tests {
         assert_eq!(result.status, AuditVerifyStatus::Verified);
         assert_eq!(result.confirmed_sequence, 1);
         assert_eq!(result.entry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn observe_failure_before_a_durable_write_is_absent() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::FailObserve(AppendObserveFault::SealedHeadLoad));
+        let err = harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap_err();
+        assert!(err.is_durably_absent(), "{err}");
+        assert!(matches!(err, GuidanceAppendError::Absent(_)), "{err}");
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_conflict_after_insert_recovers_on_retry() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsertConfirmConflict);
+        harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap();
+        let result = harness.chain.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+        assert_eq!(result.entry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_after_insert_conflict_does_not_report_absent_on_observe_failure() {
+        for observe in [
+            AppendObserveFault::SealedHeadLoad,
+            AppendObserveFault::DecodeHead,
+            AppendObserveFault::ListEntries,
+            AppendObserveFault::Verify,
+        ] {
+            let harness = TestAuditHarness::new().await;
+            let event = sample_event(AuditEventKind::GuidanceProposalCreated, 1);
+            harness
+                .chain
+                .inject_append_fault(AppendFault::AfterDatabaseInsertConfirmConflict);
+            harness
+                .chain
+                .inject_append_fault(AppendFault::FailObserve(observe));
+            let err = harness
+                .chain
+                .append_guidance(event.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                !err.is_durably_absent(),
+                "{observe:?} classified as durably absent: {err}"
+            );
+            assert!(
+                matches!(err, GuidanceAppendError::Unknown(_)),
+                "{observe:?}: {err}"
+            );
+            assert_eq!(
+                harness
+                    .db
+                    .list_computer_audit_entries()
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{observe:?} dropped the durable body"
+            );
+            assert!(harness.chain.is_available(), "{observe:?}");
+
+            harness.chain.append_guidance(event).await.unwrap();
+            let result = harness.chain.verify().await;
+            assert_eq!(result.status, AuditVerifyStatus::Verified, "{observe:?}");
+            assert_eq!(result.confirmed_sequence, 1, "{observe:?}");
+            assert_eq!(result.entry_count, 1, "{observe:?}");
+        }
     }
 }

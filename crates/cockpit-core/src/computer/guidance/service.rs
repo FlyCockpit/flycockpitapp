@@ -2300,6 +2300,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_keeps_receipt_when_retry_after_insert_cannot_reobserve() {
+        use crate::computer::audit::{
+            AppendFault, AppendObserveFault, AuditVerifyStatus, TestAuditHarness,
+        };
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsertConfirmConflict);
+        harness
+            .chain
+            .inject_append_fault(AppendFault::FailObserve(AppendObserveFault::SealedHeadLoad));
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        svc.create_proposal(
+            snapshot(&svc, &providers_enabled(), "m", b"proj"),
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let handle = harness.handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
     async fn production_chain_create_accept_reject_verifies() {
         use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
 

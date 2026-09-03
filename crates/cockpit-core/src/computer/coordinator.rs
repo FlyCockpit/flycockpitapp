@@ -11709,7 +11709,9 @@ mod tests {
             .await
             .expect("coordinator open");
         let screenshot = vec![OpenAiComputerAction::Screenshot];
-        let mut exec = std::pin::pin!(coordinator.execute_openai_call("call-hang", &screenshot));
+        // `Box::pin` so `drop(exec)` drops the future; `pin!` would keep it
+        // (and the `&mut coordinator`) until the end of the function.
+        let mut exec = Box::pin(coordinator.execute_openai_call("call-hang", &screenshot));
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
         loop {

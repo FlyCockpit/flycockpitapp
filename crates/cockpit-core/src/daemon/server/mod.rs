@@ -268,6 +268,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::AssistantDeleted { .. }
         | proto::Response::MediaReservationDiagnosis { .. }
         | proto::Response::MediaReservationRepaired { .. }
+        | proto::Response::MediaEgressVerdicts { .. }
         | proto::Response::KnowledgeDreamStatus { .. }
         | proto::Response::KnowledgeDreamRuns { .. }
         | proto::Response::ExitGuardStatus { .. } => {}

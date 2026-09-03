@@ -4923,7 +4923,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
         args.media_availability = MediaToolAvailability::available();
-        for &name in [
+        for &name in &[
             "Build",
             "Plan",
             "explore",

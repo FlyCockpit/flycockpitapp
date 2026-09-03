@@ -1036,11 +1036,11 @@ impl GrantStore {
         let verdict = verdict.to_owned();
         self.db
             .read(move |conn| {
-                conn.query_row(
+                Ok(conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = ?4 AND revoked_at_unix_ms IS NULL)",
                     rusqlite::params![session_id, purpose, request_digest, verdict],
                     |row| row.get(0),
-                )
+                )?)
             })
             .await
             .map_err(StoreError::Io)
@@ -6565,12 +6565,10 @@ mod media_egress_grant_tests {
                 .unwrap()
         );
 
-        assert_eq!(
-            store
-                .revoke_media_egress_verdict("transcription", digest)
-                .await,
-            Ok(())
-        );
+        store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap();
         assert!(
             !store
                 .media_egress_grant_matches("transcription", digest)

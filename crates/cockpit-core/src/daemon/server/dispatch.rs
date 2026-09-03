@@ -17457,6 +17457,9 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let mutation = async {
+                let global_config =
+                    cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+                prepare_user_level_write_target(ctx, &global_config)?;
                 if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
                     // Catalog I/O is deliberately outside the publication
                     // boundary. Once it is resolved, the config snapshot used
@@ -20609,6 +20612,29 @@ fn canonical_user_level_write_target(
     canonical_mcp_target_path(path)
 }
 
+/// Gate, then create the missing global layer when this is an authorized
+/// write. Snapshot/read paths must keep using
+/// [`canonical_user_level_write_target`].
+fn prepare_user_level_write_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    let path = canonical_user_level_write_target(ctx, path)?;
+    super::ensure_authorized_global_layer(&path)?;
+    Ok(path)
+}
+
+/// Journal replay of a durable user-level target. Refuses ephemeral
+/// creation of the missing global layer, then creates it only for
+/// authorized persistent owners. Does not re-canonicalize a stored path.
+fn prepare_user_level_journal_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<(), ErrorPayload> {
+    super::refuse_ephemeral_missing_global_layer(ctx.paths.ephemeral, path)?;
+    super::ensure_authorized_global_layer(path)
+}
+
 /// Use the attached session's authenticated RefreshEnv overlay when one is
 /// available. Detached owner RPCs fall back to the daemon-owned baseline. In
 /// neither case do provider operations consult the daemon process's stale
@@ -22060,7 +22086,7 @@ async fn stage_and_recover_provider_batch(
             .config_write_target_for_provider(&cwd, "default")
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-    let target = canonical_user_level_write_target(ctx, &target)?;
+    let target = prepare_user_level_write_target(ctx, &target)?;
     if target != capability_target {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -22084,7 +22110,7 @@ async fn stage_and_recover_provider_batch(
                     .config_write_target_for_provider(&cwd, provider_id)
             })
             .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-        let provider_target = canonical_user_level_write_target(ctx, &provider_target)?;
+        let provider_target = prepare_user_level_write_target(ctx, &provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
@@ -22663,7 +22689,7 @@ fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<Stri
 fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     let body = serde_json::to_string_pretty(&value)?;
-    cockpit_host::private_fs::ensure_parent_dir_private(path)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path)?;
     cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
 }
 
@@ -24505,6 +24531,7 @@ async fn recover_provider_journal_file_bounded(
         _ => return Err(bad_request("provider config journal has an invalid action")),
     };
     let target = action.target().to_path_buf();
+    prepare_user_level_journal_target(ctx, &target)?;
     let vault = ctx.secret_vault.clone();
     let classify_action = action.clone();
     let classify_vault = vault.clone();
@@ -24594,7 +24621,7 @@ fn classify_provider_journal_file(
             ..
         } => (path, consumed_revision, intended_revision),
     };
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     let doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
     let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
     Ok(if actual == *intended {
@@ -24615,7 +24642,7 @@ fn reconcile_provider_journal_file(
                      intended_revision: &str,
                      desired: Option<crate::config::providers::ProvidersConfig>|
      -> std::result::Result<(), ErrorPayload> {
-        cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+        cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
         let mut doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
         let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
         if actual == intended_revision {
@@ -24998,7 +25025,7 @@ async fn provider_config_save_under_lock(
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-    let config_path = canonical_user_level_write_target(ctx, &config_path)?;
+    let config_path = prepare_user_level_write_target(ctx, &config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
         .providers();
@@ -25320,7 +25347,7 @@ async fn save_mcp_config(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
-    let path = canonical_user_level_write_target(ctx, &path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let authoritative_expected_revision = if let Some(scope) = target_scope {
         let (authorized_path, authorized_revision) =
             capability.mcp_scope_targets.get(scope).ok_or_else(|| {
@@ -25864,7 +25891,7 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
-    cockpit_host::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(&path).map_err(internal)?;
     let commit_path = path.clone();
     let commit_config = config_json_owned.clone();
     let commit_consumed = consumed_revision.clone();
@@ -26724,6 +26751,9 @@ async fn recover_mcp_config_journals_inner(
         );
         let cleanup_only = settlement_phase == "cleanup_pending";
         let path = std::path::PathBuf::from(path);
+        if !cleanup_only {
+            prepare_user_level_journal_target(ctx, &path)?;
+        }
         let reconcile_path = path.clone();
         let reconcile = move || {
             reconcile_mcp_journal_file(
@@ -26788,7 +26818,7 @@ fn reconcile_mcp_journal_file(
     consumed_revision: &str,
     intended_revision: &str,
 ) -> std::result::Result<(), ErrorPayload> {
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     if canonical_mcp_target_path(path)? != path {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -27239,7 +27269,7 @@ fn persist_daemon_provider(
             .config_write_target_for_provider(cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
-    let path = canonical_user_level_write_target(ctx, &path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.providers.insert(provider_id.to_string(), entry);
@@ -27274,7 +27304,7 @@ async fn provider_config_delete_under_lock(
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
-    let path = canonical_user_level_write_target(ctx, &path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let layer = doc.providers();
     // Only a provider actually owned by this layer can be deleted here.  In
@@ -27401,7 +27431,7 @@ fn persist_provider_layer_metadata(
             .config_write_target_for_provider(cwd, "default")
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
-    let path = canonical_user_level_write_target(ctx, &path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.category_defaults = category_defaults;

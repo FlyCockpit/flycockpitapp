@@ -99,16 +99,34 @@ pub fn global_config_file() -> anyhow::Result<PathBuf> {
     Ok(global_config_dir()?.join(CONFIG_FILE))
 }
 
+/// Actionable error when a write would have to create the missing global
+/// Cockpit config directory. File-write helpers never create that directory
+/// as a side effect; only [`ensure_global_config_dir`] may.
+pub const MISSING_GLOBAL_CONFIG_DIR_MESSAGE: &str = "ephemeral daemons cannot create the global Cockpit config directory; start a persistent daemon before onboarding";
+
 /// Ensure the canonical global directory exists and can accept writes.
 ///
 /// This has no workspace-trust dependency. Persistent daemon boot calls it
 /// before publishing its socket; read-only commands intentionally do not.
 /// Onboarding-capable owners that skipped that boot gate may still create
-/// the directory lazily on the first user-level write.
+/// the directory lazily on the first authorized user-level write, which
+/// must call this function rather than relying on a file-write helper.
 pub fn ensure_global_config_dir() -> anyhow::Result<PathBuf> {
     let path = global_config_dir()?;
     crate::config::files::ensure_private_writable_dir(&path)?;
     Ok(path)
+}
+
+/// True when `path` is the canonical global config directory or a file
+/// inside it, and that directory does not currently exist.
+///
+/// File-write helpers must not create this directory. Call
+/// [`ensure_global_config_dir`] from an authorized write funnel instead.
+pub fn path_is_under_missing_global_config_dir(path: &Path) -> bool {
+    let Ok(global) = global_config_dir() else {
+        return false;
+    };
+    !global.is_dir() && cockpit_host::path_containment::contained_under(&global, path)
 }
 
 /// True when `path` names the canonical global config directory.
@@ -1024,6 +1042,41 @@ mod tests {
             !is_global_config_dir(&work).unwrap(),
             "a workspace path is not the global config root"
         );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// File-write helpers must not scaffold a missing global layer. Only
+    /// [`ensure_global_config_dir`] may create it.
+    #[test]
+    fn file_write_helpers_do_not_create_a_missing_global_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = tmp.path().join("home/.config/cockpit");
+        let config_file = global.join(CONFIG_FILE);
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+        assert!(path_is_under_missing_global_config_dir(&global));
+        assert!(path_is_under_missing_global_config_dir(&config_file));
+
+        let error = crate::config::files::ensure_config_parent_dir(&config_file).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "missing global layer must fail closed: {error:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "ensure_config_parent_dir must not create the global config directory"
+        );
+
+        let created = ensure_global_config_dir().unwrap();
+        assert_eq!(created, global);
+        assert!(global.is_dir());
+        crate::config::files::ensure_config_parent_dir(&config_file).unwrap();
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

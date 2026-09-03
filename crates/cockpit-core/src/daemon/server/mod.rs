@@ -2421,18 +2421,27 @@ pub(crate) fn refuse_ephemeral_missing_global_layer(
     if !ephemeral {
         return Ok(());
     }
-    let Ok(global) = cockpit_config::config::dirs::global_config_dir() else {
-        return Ok(());
-    };
-    if global.is_dir() {
-        return Ok(());
-    }
-    if !cockpit_host::path_containment::contained_under(&global, path) {
+    if !cockpit_config::config::dirs::path_is_under_missing_global_config_dir(path) {
         return Ok(());
     }
     Err(bad_request(
-        "ephemeral daemons cannot create the global Cockpit config directory; start a persistent daemon before onboarding",
+        cockpit_config::config::dirs::MISSING_GLOBAL_CONFIG_DIR_MESSAGE,
     ))
+}
+
+/// Create the global config directory when `path` is under that missing
+/// layer. Callers must have already passed
+/// [`refuse_ephemeral_missing_global_layer`]; file-write helpers will not
+/// create the directory themselves.
+pub(crate) fn ensure_authorized_global_layer(path: &Path) -> std::result::Result<(), ErrorPayload> {
+    if !cockpit_config::config::dirs::path_is_under_missing_global_config_dir(path) {
+        return Ok(());
+    }
+    cockpit_config::config::dirs::ensure_global_config_dir().map_err(|error| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: error.to_string(),
+    })?;
+    Ok(())
 }
 
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can

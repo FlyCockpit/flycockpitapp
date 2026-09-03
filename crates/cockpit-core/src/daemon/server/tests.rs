@@ -10597,6 +10597,109 @@ async fn ephemeral_daemon_onboarding_fails_closed_when_global_layer_is_missing()
     );
 }
 
+/// Durable journal replay of a first-write into the missing global layer
+/// must fail closed on an ephemeral daemon and create nothing.
+#[tokio::test]
+async fn ephemeral_provider_journal_replay_does_not_create_the_global_config_dir() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    let target = crate::config::providers::provider_file_path_for_dir(&global, "onboard").unwrap();
+    let consumed = provider_layer_revision_for_test(
+        &ctx,
+        &target,
+        &crate::config::providers::ProvidersConfig::default(),
+    );
+    let mut intended_layer = crate::config::providers::ProvidersConfig::default();
+    intended_layer.providers.insert(
+        "onboard".into(),
+        crate::config::providers::ProviderEntry {
+            url: "https://onboard.example.test/v1".into(),
+            ..Default::default()
+        },
+    );
+    let intended = provider_layer_revision_for_test(&ctx, &target, &intended_layer);
+    let root = workspace.to_string_lossy().into_owned();
+    let journal_id = Uuid::now_v7().to_string();
+    let entry_json =
+        serde_json::to_string(intended_layer.providers.get("onboard").unwrap()).unwrap();
+    {
+        let journal_id = journal_id.clone();
+        let root_owned = root.clone();
+        let config_path = target.to_string_lossy().into_owned();
+        let consumed = consumed.clone();
+        let intended = intended.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO provider_config_journals
+                     (journal_id, project_root, provider_id, action, config_path,
+                      consumed_revision, intended_revision, consumed_config_generation,
+                      intended_config_generation, entry_json,
+                      cleanup_named_json, cleanup_credential_json, created_at)
+                     VALUES (?1, ?2, 'onboard', 'save', ?3,
+                             ?4, ?5, 1, 2, ?6, '[]', '[]', ?7)",
+                    rusqlite::params![
+                        journal_id,
+                        root_owned,
+                        config_path,
+                        consumed,
+                        intended,
+                        entry_json,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    let error = recover_provider_config_journals(&ctx, &root, Some("onboard"))
+        .await
+        .expect_err("ephemeral journal replay must fail closed");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
+        "error must tell the user to start a persistent daemon: {}",
+        error.message
+    );
+    assert!(
+        !global.is_dir(),
+        "ephemeral journal replay must not create the global config directory"
+    );
+}
+
+/// Engine/tool-side `config.json` writers share the mkdir primitive that
+/// cannot create a missing global layer.
+#[test]
+fn engine_global_config_write_does_not_create_the_global_config_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    assert!(
+        !global.is_dir(),
+        "fresh-install fixture must not pre-create the global layer"
+    );
+    let mut doc = crate::config::extended::ExtendedConfigDoc::load(&path).unwrap();
+    let cfg = doc.config();
+    let error = doc.write(&cfg).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+        "engine-style global writes must fail closed: {error:#}"
+    );
+    assert!(
+        !global.is_dir(),
+        "engine/tool writers must not create the global config directory"
+    );
+}
+
 /// MCP add with explicit global scope during onboarding writes mcp.json in
 /// the global layer.
 #[tokio::test]
@@ -10670,7 +10773,7 @@ fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
         "SaveMcpConfig must use the user-level trust fallback"
     );
     assert!(
-        save_mcp.contains("canonical_user_level_write_target"),
+        save_mcp.contains("prepare_user_level_write_target"),
         "SaveMcpConfig must refuse ephemeral creation of the global layer"
     );
     assert!(
@@ -10684,7 +10787,7 @@ fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
         .and_then(|tail| tail.split("async fn save_mcp_config(").next())
         .expect("provider save body");
     assert!(
-        provider_save.contains("canonical_user_level_write_target"),
+        provider_save.contains("prepare_user_level_write_target"),
         "direct provider save must refuse ephemeral creation of the global layer"
     );
     assert!(
@@ -10698,7 +10801,7 @@ fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
         .and_then(|tail| tail.split("async fn provider_config_delete(").next())
         .expect("persist_daemon_provider body");
     assert!(
-        persist_provider.contains("canonical_user_level_write_target"),
+        persist_provider.contains("prepare_user_level_write_target"),
         "model-fetch persistence must refuse ephemeral creation of the global layer"
     );
 
@@ -10711,7 +10814,7 @@ fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
         })
         .expect("persist_provider_layer_metadata body");
     assert!(
-        persist_meta.contains("canonical_user_level_write_target"),
+        persist_meta.contains("prepare_user_level_write_target"),
         "provider metadata persistence must refuse ephemeral creation of the global layer"
     );
 
@@ -10723,6 +10826,66 @@ fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
     assert!(
         begin_mcp.contains("resolve_user_level_trust_policy"),
         "MCP OAuth begin must use the user-level trust fallback"
+    );
+
+    assert!(
+        source.contains("fn prepare_user_level_write_target("),
+        "authorized writes must share one create-after-gate helper"
+    );
+    assert!(
+        source.contains("fn prepare_user_level_journal_target("),
+        "journal replay must share the ephemeral-create-global gate"
+    );
+    assert!(
+        !source.contains("ensure_parent_dir_private"),
+        "daemon config writers must not mkdir through the generic host helper"
+    );
+
+    let snapshot = source
+        .split("async fn provider_catalog_snapshot(")
+        .nth(1)
+        .and_then(|tail| tail.split("fn provider_config_revision(").next())
+        .expect("provider catalog snapshot body");
+    assert!(
+        snapshot.contains("canonical_user_level_write_target"),
+        "catalog reads must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !snapshot.contains("prepare_user_level_write_target"),
+        "catalog reads must not create the global layer"
+    );
+
+    let recover_provider = source
+        .split("async fn recover_provider_journal_file_bounded(")
+        .last()
+        .and_then(|tail| {
+            tail.split("fn settle_journaled_local_success_on_conn(")
+                .next()
+        })
+        .expect("provider journal recovery body");
+    assert!(
+        recover_provider.contains("prepare_user_level_journal_target"),
+        "provider journal replay must refuse ephemeral creation of the global layer"
+    );
+
+    let recover_mcp = source
+        .split("async fn recover_mcp_config_journals_inner(")
+        .last()
+        .and_then(|tail| tail.split("fn reconcile_mcp_journal_file(").next())
+        .expect("MCP journal recovery body");
+    assert!(
+        recover_mcp.contains("prepare_user_level_journal_target"),
+        "MCP journal replay must refuse ephemeral creation of the global layer"
+    );
+
+    let write_mcp = source
+        .split("fn write_mcp_raw_private(")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn provider_models_fetch(").next())
+        .expect("MCP raw writer");
+    assert!(
+        write_mcp.contains("ensure_config_parent_dir"),
+        "MCP file writes must use the config-layer mkdir that cannot create a missing global dir"
     );
 }
 

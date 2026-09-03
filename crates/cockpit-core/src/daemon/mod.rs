@@ -1863,8 +1863,9 @@ async fn run_foreground_inner_with_boot_db(
     // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
     // strictly read-only with respect to this creation path. Onboarding-capable
     // owners that skipped this boot gate still resolve the global layer as a
-    // write target; the first user-level mutation creates the directory
-    // through `ensure_config_parent_dir`.
+    // write target; the first authorized user-level mutation creates the
+    // directory through `ensure_global_config_dir`, never as a side effect of
+    // a file-write helper.
     if !paths.ephemeral {
         crate::config::config::dirs::ensure_global_config_dir()
             .context("creating writable global Cockpit config directory")?;

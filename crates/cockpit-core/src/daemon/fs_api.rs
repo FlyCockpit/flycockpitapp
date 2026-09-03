@@ -310,6 +310,7 @@ pub async fn get_extended_config_snapshot(
 ) -> Result<Response, ErrorPayload> {
     let root = settings_snapshot_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction();
+    let ephemeral = ctx.paths.ephemeral;
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
@@ -324,8 +325,21 @@ pub async fn get_extended_config_snapshot(
                 )));
             }
             for (kind, target) in discovered {
-                let guard =
-                    cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+                crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
+                // A missing global layer is a valid fresh-install read: do
+                // not take the mutation lock, which would otherwise have to
+                // create the directory. Ephemeral owners already failed
+                // closed above.
+                let guard = if cockpit_config::config::dirs::path_is_under_missing_global_config_dir(
+                    &target,
+                ) {
+                    None
+                } else {
+                    Some(
+                        cockpit_config::config::hold_config_mutation_lock(&target)
+                            .map_err(internal)?,
+                    )
+                };
                 let (raw, identity) = read_optional_config(&target)?;
                 if raw.len() > cockpit_proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES {
                     return Err(bad_request(format!(
@@ -720,6 +734,7 @@ pub async fn apply_extended_config_patch(
                     ephemeral,
                     &capability.target,
                 )?;
+                crate::daemon::server::ensure_authorized_global_layer(&capability.target)?;
                 // One apply consumes the complete snapshot group atomically.
                 // This prevents unused sibling layer capabilities from
                 // outliving the authority view against which the patch was
@@ -1489,6 +1504,7 @@ fn save_extended_config_sync(
         return Err(bad_request("extended config target must be config.json"));
     }
     crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
+    crate::daemon::server::ensure_authorized_global_layer(&target)?;
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
     // Only a genuinely-absent file is an empty config. A non-NotFound read error
     // (EACCES/EIO/EMFILE/…, over-cap, non-regular) must NOT be coerced to empty:

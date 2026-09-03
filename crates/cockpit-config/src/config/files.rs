@@ -453,6 +453,14 @@ pub fn ensure_config_parent_dir(path: &Path) -> Result<()> {
         parent
     };
 
+    // The global layer is created only by `ensure_global_config_dir`. A
+    // file write, mutation lock, or journal replay must not scaffold a
+    // missing `~/.config/cockpit` as a side effect — ephemeral/diagnostic
+    // owners rely on that exclusivity.
+    if crate::config::dirs::path_is_under_missing_global_config_dir(config_dir) {
+        anyhow::bail!("{}", crate::config::dirs::MISSING_GLOBAL_CONFIG_DIR_MESSAGE);
+    }
+
     if is_cockpit_owned_config_dir(config_dir) {
         ensure_private_dir(config_dir)?;
         if parent != config_dir {

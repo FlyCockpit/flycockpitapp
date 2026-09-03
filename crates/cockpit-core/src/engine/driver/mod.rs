@@ -218,6 +218,13 @@ pub enum DriverControl {
     Pin {
         text: String,
     },
+    /// Promote a conversation rule into the resolved instructions file.
+    PromoteConversationRule {
+        rule_id: uuid::Uuid,
+        respond_to: tokio::sync::oneshot::Sender<
+            std::result::Result<crate::daemon::proto::Response, String>,
+        >,
+    },
     /// Explicitly opt into synthetic resume repair for a Responses session
     /// that strict replay opened read-only. The original transcript is not
     /// mutated; only the live root history is populated with the healed replay.
@@ -6514,6 +6521,13 @@ impl Driver {
             }
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);
+            }
+            DriverControl::PromoteConversationRule {
+                rule_id,
+                respond_to,
+            } => {
+                let result = self.do_promote_conversation_rule(rule_id, tx).await;
+                let _ = respond_to.send(result);
             }
             DriverControl::RepairResume {
                 root_agent,

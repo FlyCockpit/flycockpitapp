@@ -1544,6 +1544,55 @@ impl Driver {
         self.do_compact_with_source(tx, "manual").await;
     }
 
+    pub(in crate::engine::driver) async fn do_promote_conversation_rule(
+        &mut self,
+        rule_id: uuid::Uuid,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<crate::daemon::proto::Response, String> {
+        let rule = crate::conversation_rules::load_rule_for_session(&self.session, rule_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !rule.active {
+            return Err(format!("conversation rule {rule_id} is not active"));
+        }
+        let target = crate::conversation_rules::resolve_instructions_target(&self.session)
+            .await
+            .map_err(|error| error.to_string())?;
+        let brief = crate::conversation_rules::promote_brief(&rule, &target);
+        let mut args = self.spawn_args(false);
+        args.write_scope = Some(target.write_scope.clone());
+        args.delegated = true;
+        let child = crate::engine::builtin::builder(&args);
+        let report = run_noninteractive(
+            child,
+            brief,
+            self.session.clone(),
+            self.locks.clone(),
+            self.redact.clone(),
+            self.cwd.clone(),
+            self.config.clone(),
+            self.guidance_compiler.clone(),
+            self.interrupts.clone(),
+            self.live_or_session_cancel(),
+            self.approver.clone(),
+            self.resource_scheduler.clone(),
+            self.loop_guard_threshold,
+            24,
+            self.vnext_local_installation_resolver.clone(),
+            None,
+            Some(tx.clone()),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(crate::daemon::proto::Response::ConversationRulePromoted {
+            rule_id,
+            target_path: target.path.display().to_string(),
+            write_scope: target.write_scope.display().to_string(),
+            report,
+        })
+    }
+
     /// Compaction `preCompact` / `postCompact` hook contract (asymmetric BY
     /// DESIGN, matching Claude-Code semantics):
     /// - **PREPARE failure** (assembly/brief/prune) fires NEITHER `preCompact`
@@ -1739,6 +1788,12 @@ impl Driver {
             .await
             .unwrap_or_default();
         let pins = self.session.pinned_messages();
+        let conversation_rules = self
+            .session
+            .db
+            .list_active_conversation_rules(self.session.compaction_lineage_root())
+            .await
+            .unwrap_or_default();
         let active_goal = self
             .session
             .db
@@ -1760,6 +1815,8 @@ impl Driver {
                 )
             });
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
+        appendix.conversation_rules =
+            crate::conversation_rules::compact_appendix_lines(&conversation_rules);
         if let Ok(overview) = self
             .session
             .db

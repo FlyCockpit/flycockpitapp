@@ -824,6 +824,7 @@ mod tests {
             "count_pinned_messages",
             "list_pinned_message_seqs",
             "list_pinned_messages_with_text",
+            "list_conversation_rules",
             "sealed_owner_inventory",
             "list_sealed_actions",
             "pinned_message_state",

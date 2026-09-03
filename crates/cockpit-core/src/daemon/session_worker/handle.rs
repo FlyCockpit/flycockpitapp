@@ -2619,6 +2619,12 @@ pub enum SessionWork {
     Pin {
         text: String,
     },
+    /// Promote a conversation rule into the resolved instructions file via a
+    /// write-scoped builder subagent.
+    PromoteConversationRule {
+        rule_id: Uuid,
+        respond_to: oneshot::Sender<std::result::Result<proto::Response, String>>,
+    },
     Shutdown {
         pause_for_resume: bool,
     },

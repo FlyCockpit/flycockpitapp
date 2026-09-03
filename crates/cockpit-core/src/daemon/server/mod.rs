@@ -779,6 +779,25 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_string(&mut pin.text, redact);
             }
         }
+        proto::Response::ConversationRules { rules } => {
+            for rule in rules {
+                scrub_string(&mut rule.text, redact);
+            }
+        }
+        proto::Response::ConversationRuleChanged { rule } => {
+            scrub_string(&mut rule.text, redact);
+        }
+        proto::Response::ConversationRuleRemoved { removed: _ } => {}
+        proto::Response::ConversationRulePromoted {
+            rule_id: _,
+            target_path,
+            write_scope,
+            report,
+        } => {
+            scrub_string(target_path, redact);
+            scrub_string(write_scope, redact);
+            scrub_string(report, redact);
+        }
         // Sealed-owner sensitive channel responses. The recover-apply success
         // `revealed_literal` is the ONE legitimate remoted plaintext, revealed
         // only to the owner session that minted the capability; it is a

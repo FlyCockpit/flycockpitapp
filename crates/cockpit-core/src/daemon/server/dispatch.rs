@@ -6147,7 +6147,7 @@ async fn handle_serialized_request_impl(
             Ok(Response::Ack)
         }
         Request::PromoteToPersistent => {
-            ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
+            ctx.promote_to_persistent(&state.principal)
                 .map_err(internal)?;
             state.exit_guard_reservation = None;
             Ok(Response::Ack)
@@ -29170,12 +29170,20 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
-    // A durable Assistant owns background work. An already-attached client
-    // (TUI lifecycle, ACP/Zed, CLI) promotes this live owner in place rather
-    // than restarting or failing closed against a busy ephemeral daemon.
+    // A durable Assistant owns background work. Promotion is an owner-only
+    // daemon-global effect: a remote collaborator with an agent-read grant
+    // must not flip lifetime, start persistent services, or disable last-
+    // client teardown. The local owner (TUI, ACP/Zed, CLI) promotes this
+    // live process in place rather than restarting or failing against a
+    // busy ephemeral daemon. A pending exit-guard prompt is settled by
+    // the promotion — persistence is the "run in background" outcome.
     if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.is_ephemeral_lifetime() {
-        ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
-            .map_err(internal)?;
+        if !principal.is_owner() {
+            return Err(authorization_error(
+                "promoting daemon lifetime requires the local owner",
+            ));
+        }
+        ctx.promote_to_persistent(principal).map_err(internal)?;
         state.exit_guard_reservation = None;
     }
     // Terminal results for transactions this attach converged. Delivered

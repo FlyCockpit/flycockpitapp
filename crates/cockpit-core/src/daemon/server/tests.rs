@@ -7967,9 +7967,15 @@ fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
     ctx.persistent_endpoint_publication_failure
         .store(true, std::sync::atomic::Ordering::Release);
 
-    assert!(ctx.promote_to_persistent(None).is_err());
+    assert!(
+        ctx.promote_to_persistent(&ClientPrincipal::owner())
+            .is_err()
+    );
+    // Write fails before activation; rollback must stay a no-op.
+    ctx.deactivate_persistent_services();
     assert!(ctx.is_ephemeral_lifetime());
     assert!(ctx.scheduler().is_none());
+    assert!(ctx.resource_scheduler().is_none());
     assert!(ctx.registry.scheduler().is_none());
     assert!(ctx.registry.resource_scheduler().is_none());
     assert!(ctx.active_media_storage_recovery().is_none());
@@ -7983,25 +7989,43 @@ fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
 }
 
 #[test]
-fn live_exit_guard_reservation_blocks_another_clients_promotion_until_released() {
+fn in_place_promotion_settles_another_clients_exit_guard_reservation() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
     let ctx = test_ctx();
     let mut deciding_client = MutableClientState::detached_for_test();
     ctx.reserve_exit_guard(&mut deciding_client)
         .expect("reserve live exit decision");
+    assert!(ctx.exit_guard_reservation_is_active());
 
+    let changed = ctx
+        .promote_to_persistent(&ClientPrincipal::owner())
+        .expect("owner promotion must not wait on another client's exit prompt");
+    assert!(changed, "first promotion must change lifetime");
+    assert!(!ctx.is_ephemeral_lifetime());
+    assert!(
+        !ctx.exit_guard_reservation_is_active(),
+        "promotion settles the pending exit-guard reservation"
+    );
+}
+
+#[test]
+#[cfg(feature = "remote")]
+fn remote_principal_cannot_promote_daemon_lifetime() {
+    let ctx = test_ctx();
     let error = ctx
-        .promote_to_persistent(None)
-        .expect_err("another client cannot promote during an exit decision");
+        .promote_to_persistent(&remote_principal())
+        .expect_err("non-owner must not flip daemon lifetime");
     assert!(
         error
             .to_string()
-            .contains("another client is deciding how to detach"),
-        "promotion must be fenced until the deciding client resolves or disconnects"
+            .contains("promoting daemon lifetime requires the local owner"),
+        "owner-only promotion must fail closed, got {error}"
     );
-
-    ctx.release_exit_guard_reservation(&mut deciding_client);
-    ctx.require_exit_guard_promotion_owner(None)
-        .expect("releasing the prompt lets another client promote");
+    assert!(ctx.is_ephemeral_lifetime());
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.resource_scheduler().is_none());
 }
 
 #[test]
@@ -8011,19 +8035,27 @@ fn in_place_promotion_is_idempotent_and_holds_the_reaper() {
     env.set_var("XDG_DATA_HOME", data.path());
     let ctx = test_ctx();
     assert!(ctx.is_ephemeral_lifetime());
+    assert!(
+        ctx.paths.ephemeral,
+        "boot-time path marker starts ephemeral"
+    );
 
     let first = ctx
-        .promote_to_persistent(None)
+        .promote_to_persistent(&ClientPrincipal::owner())
         .expect("first promotion publishes persistent lifetime");
     assert!(first, "first promotion must change lifetime");
     assert!(!ctx.is_ephemeral_lifetime());
+    assert!(
+        ctx.paths.ephemeral,
+        "in-place promotion must not rewrite the boot-time path marker"
+    );
     assert_eq!(
         ctx.reap_ephemeral_last_client(),
         super::EphemeralReapDecision::Persistent
     );
 
     let second = ctx
-        .promote_to_persistent(None)
+        .promote_to_persistent(&ClientPrincipal::owner())
         .expect("second promotion is a no-op");
     assert!(!second, "idempotent promotion must not republish");
     assert!(!ctx.is_ephemeral_lifetime());
@@ -8033,22 +8065,143 @@ fn in_place_promotion_is_idempotent_and_holds_the_reaper() {
     );
 }
 
+fn assistant_attach_request(project_root: &Path) -> Request {
+    Request::Attach {
+        session_id: None,
+        since_seq: None,
+        project_root: Some(project_root.to_string_lossy().into_owned()),
+        initial_model: None,
+        no_sandbox: false,
+        interactive: true,
+        session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    }
+}
+
 #[tokio::test]
 async fn already_attached_client_promotes_busy_ephemeral_owner_in_place() {
     let env = crate::test_env::lock_async().await;
     let data = tempfile::tempdir().expect("temporary XDG data directory");
     env.set_var("XDG_DATA_HOME", data.path());
     let ctx = test_ctx();
+    let session_id = insert_busy_test_worker(&ctx).await;
+    let live_before = ctx
+        .registry
+        .live_handle(session_id)
+        .expect("busy worker is live");
+    let socket = ctx.paths.socket.clone();
+    let pid_file = ctx.paths.pid_file.clone();
+    let pid = std::process::id();
+    assert!(ctx.registry.any_agent_running());
+    assert_eq!(live_before.live_status(), (false, true, false));
+
     let mut state = owner_state();
     let response = handle_request(Request::PromoteToPersistent, &mut state, &ctx)
         .await
         .expect("already-attached client can promote without re-acquire");
     assert!(matches!(response, Response::Ack));
     assert!(!ctx.is_ephemeral_lifetime());
+    assert_eq!(ctx.paths.socket, socket);
+    assert_eq!(ctx.paths.pid_file, pid_file);
+    assert_eq!(std::process::id(), pid);
+    let live_after = ctx
+        .registry
+        .live_handle(session_id)
+        .expect("live worker must survive in-place promotion");
+    assert_eq!(live_after.session_id, session_id);
+    assert_eq!(live_after.live_status(), (false, true, false));
+    assert!(ctx.registry.any_agent_running());
     assert_eq!(
         ctx.reap_ephemeral_last_client(),
         super::EphemeralReapDecision::Persistent
     );
+}
+
+#[tokio::test]
+async fn assistant_attach_promotes_busy_owner_while_exit_guard_is_reserved() {
+    let env = crate::test_env::lock_async().await;
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    let session_id = insert_busy_test_worker(&ctx).await;
+    let mut deciding_client = MutableClientState::detached_for_test();
+    ctx.reserve_exit_guard(&mut deciding_client)
+        .expect("reserve live exit decision");
+    assert!(ctx.exit_guard_reservation_is_active());
+
+    let project = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+    let response = handle_request(assistant_attach_request(project.path()), &mut state, &ctx)
+        .await
+        .expect("Assistant attach must promote even while another client holds the exit guard");
+    let Response::Attached {
+        session_id: attached_id,
+        ..
+    } = response
+    else {
+        panic!("expected Attached");
+    };
+    assert!(!ctx.is_ephemeral_lifetime());
+    assert!(
+        !ctx.exit_guard_reservation_is_active(),
+        "Assistant attach promotion settles the exit-guard reservation"
+    );
+    assert!(ctx.registry.live_handle(session_id).is_some());
+    assert!(ctx.registry.live_handle(attached_id).is_some());
+    assert_eq!(
+        ctx.registry.live_status(session_id),
+        Some((false, true, false))
+    );
+    assert_eq!(
+        ctx.reap_ephemeral_last_client(),
+        super::EphemeralReapDecision::Persistent
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn remote_reader_assistant_attach_cannot_promote_ephemeral_owner() {
+    let env = crate::test_env::lock_async().await;
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+        project_root: Some(project.path().to_string_lossy().into_owned()),
+    }]);
+    assert!(ctx.is_ephemeral_lifetime());
+    let error = handle_request(assistant_attach_request(project.path()), &mut state, &ctx)
+        .await
+        .expect_err("non-owner Assistant attach must not promote");
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(
+        error
+            .message
+            .contains("promoting daemon lifetime requires the local owner"),
+        "authz error must name the owner-only promotion gate, got {}",
+        error.message
+    );
+    assert!(ctx.is_ephemeral_lifetime());
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.resource_scheduler().is_none());
 }
 
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
@@ -36118,7 +36271,7 @@ async fn stop_daemon_grace_override_reaches_shutdown_context() {
     assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
 }
 
-async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
+async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) -> Uuid {
     let tmp = tempfile::tempdir().expect("tempdir");
     ctx.db
         .set_workspace_trust(
@@ -36151,6 +36304,7 @@ async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
         std::future::pending::<()>().await;
     });
     ctx.registry.insert_test_worker(handle, join);
+    session.session_id
 }
 
 #[tokio::test]

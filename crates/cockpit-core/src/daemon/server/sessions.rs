@@ -76,8 +76,7 @@ pub(super) fn apply_live_activity_state(
 pub(super) fn resource_scheduler_snapshot(
     ctx: &DaemonContext,
 ) -> crate::engine::resource_scheduler::ResourceSchedulerSnapshot {
-    ctx.registry
-        .resource_scheduler()
+    ctx.resource_scheduler()
         .map(|scheduler| scheduler.snapshot())
         .unwrap_or_else(|| {
             crate::engine::resource_scheduler::ResourceScheduler::disabled().snapshot()
@@ -91,7 +90,7 @@ pub(super) async fn promote_resource_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     use crate::engine::resource_scheduler::ResourcePromoteError;
 
-    let Some(scheduler) = ctx.registry.resource_scheduler() else {
+    let Some(scheduler) = ctx.resource_scheduler() else {
         let snapshot = resource_scheduler_snapshot(ctx);
         return Ok(Response::PromoteResourceResult {
             status: proto::ResourcePromoteStatus::Disabled,

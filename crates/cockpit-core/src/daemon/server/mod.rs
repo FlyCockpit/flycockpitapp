@@ -2451,8 +2451,9 @@ struct PromotedPersistentServices {
 
 /// Fallible persistent-only resources prepared before an ephemeral owner is
 /// published as persistent. Nothing in this bundle is registered with the
-/// daemon or starts a task, so a failed endpoint publication cannot expose a
-/// durable admission path or dispatch external work.
+/// daemon or starts a task. Endpoint publication is the only remaining
+/// fallible step and runs before activation, so a failed write cannot expose
+/// a durable admission path or dispatch external work.
 struct PreparedPersistentServices {
     resource_scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
     media_storage_recovery: Arc<crate::media_storage::MediaStorageRecovery>,
@@ -2745,35 +2746,35 @@ impl DaemonContext {
     }
 
     /// Promote this exact live owner without draining its workers. The endpoint
-    /// record and reaper gate transition together under the restart decision
-    /// lock, so last-client teardown cannot race the user choice.
-    pub(crate) fn promote_to_persistent(
-        &self,
-        exit_guard_reservation: Option<&Arc<()>>,
-    ) -> Result<bool> {
+    /// record is the durable intent; the lifetime flag is the admission edge.
+    /// Both transition under the restart decision lock so last-client teardown
+    /// cannot race the user choice. Promotion is owner-only: weaker-authz
+    /// requests must not reach this effect as a side path.
+    pub(crate) fn promote_to_persistent(&self, principal: &ClientPrincipal) -> Result<bool> {
+        if !principal.is_owner() {
+            anyhow::bail!("promoting daemon lifetime requires the local owner");
+        }
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
-        self.require_exit_guard_promotion_owner(exit_guard_reservation)?;
         if !self.is_ephemeral_lifetime() {
+            self.settle_exit_guard_reservation();
             return Ok(false);
         }
         let services = self.prepare_persistent_services()?;
         let mut persistent_paths = self.paths.clone();
         persistent_paths.ephemeral = false;
         let _service_transition = self.registry.lock_persistent_service_transition();
-        // Install every persistent service authority before publishing the
-        // lifetime or persistent endpoint. `restart_decision` keeps the
-        // reaper and lifetime snapshots outside this transition, and the
-        // synchronous registry setters make the authorities available to
-        // production consumers before either final publication store below.
+        // Durable intent first. Lifetime and service admission stay closed
+        // until the endpoint record commits, so a failed publication cannot
+        // open a persistent write or scheduler path and then revert.
+        self.write_persistent_endpoint_record(&persistent_paths)?;
+        // Install authorities after the record is durable and before the
+        // lifetime store. `restart_decision` fences the reaper; gated
+        // accessors hide the bundle while `is_ephemeral_lifetime()` is still
+        // true. The lifetime store below is the single publication edge.
         self.activate_persistent_services(services);
         self.ephemeral_lifetime.store(false, Ordering::Release);
-        if let Err(error) = self.write_persistent_endpoint_record(&persistent_paths) {
-            self.ephemeral_lifetime.store(true, Ordering::Release);
-            self.deactivate_persistent_services();
-            return Err(error);
-        }
         self.start_persistent_service_tasks();
-        self.clear_exit_guard_reservation(exit_guard_reservation);
+        self.settle_exit_guard_reservation();
         self.broadcast_global(proto::Event::DaemonLifetimeChanged {
             ephemeral_owner: false,
         });
@@ -2798,21 +2799,6 @@ impl DaemonContext {
         Ok(())
     }
 
-    fn require_exit_guard_promotion_owner(
-        &self,
-        client_reservation: Option<&Arc<()>>,
-    ) -> Result<()> {
-        let reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
-        let Some(active) = reservation.upgrade() else {
-            return Ok(());
-        };
-        if client_reservation.is_some_and(|owned| Arc::ptr_eq(owned, &active)) {
-            Ok(())
-        } else {
-            anyhow::bail!("another client is deciding how to detach live ephemeral work");
-        }
-    }
-
     fn clear_exit_guard_reservation(&self, client_reservation: Option<&Arc<()>>) {
         let mut reservation = crate::sync::lock_or_recover(&self.exit_guard_reservation);
         let Some(active) = reservation.upgrade() else {
@@ -2823,10 +2809,24 @@ impl DaemonContext {
         }
     }
 
+    /// Persistence is the "run in background" outcome. A pending exit-guard
+    /// prompt must not veto an owner promotion (Assistant attach, ACP, TUI
+    /// background); settling it drops the exclusive prompt token.
+    fn settle_exit_guard_reservation(&self) {
+        *crate::sync::lock_or_recover(&self.exit_guard_reservation) = Weak::new();
+    }
+
     pub(crate) fn release_exit_guard_reservation(&self, client_state: &mut MutableClientState) {
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
         self.clear_exit_guard_reservation(client_state.exit_guard_reservation.as_ref());
         client_state.exit_guard_reservation = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_guard_reservation_is_active(&self) -> bool {
+        crate::sync::lock_or_recover(&self.exit_guard_reservation)
+            .upgrade()
+            .is_some()
     }
 
     /// Return the currently installed durable scheduler without retaining the
@@ -2841,9 +2841,21 @@ impl DaemonContext {
         crate::sync::lock_or_recover(&self.scheduler).clone()
     }
 
+    /// Runtime resource-scheduler admission. Mirrors [`Self::scheduler`]: the
+    /// registry may hold a prepared handle during promotion, but production
+    /// consumers must not observe it until lifetime is published.
+    pub(crate) fn resource_scheduler(
+        &self,
+    ) -> Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>> {
+        if self.is_ephemeral_lifetime() {
+            return None;
+        }
+        self.registry.resource_scheduler()
+    }
+
     /// Install the durable scheduler with a closed start gate. Its loop opens
-    /// only after endpoint and lifetime publication commit, so a failed
-    /// promotion cannot dispatch durable work.
+    /// only from `start_persistent_service_tasks` after the lifetime store,
+    /// so the scheduler cannot dispatch until admission is published.
     fn install_persistent_scheduler(&self, start_gate: tokio::sync::watch::Receiver<bool>) {
         let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
         if scheduler.is_some() {
@@ -2895,7 +2907,9 @@ impl DaemonContext {
     }
 
     /// Install prepared persistent services while `promote_to_persistent`
-    /// holds `restart_decision`, before endpoint and lifetime publication.
+    /// holds `restart_decision`, after durable endpoint publication and
+    /// before the lifetime store. Gated accessors keep the bundle private
+    /// until that store publishes admission.
     fn activate_persistent_services(&self, services: PreparedPersistentServices) {
         self.registry
             .set_resource_scheduler(Some(services.resource_scheduler));
@@ -2937,9 +2951,10 @@ impl DaemonContext {
         }
     }
 
-    /// Undo a not-yet-published promotion. Endpoint publication is the only
-    /// fallible step after service preparation; no persistent service may
-    /// remain reachable if it fails.
+    /// Inverse of [`Self::activate_persistent_services`]. Production promotion
+    /// writes the endpoint before activation, so the fallible path never
+    /// installs this bundle; the inverse remains for an idempotent rollback
+    /// of a never-published owner.
     fn deactivate_persistent_services(&self) {
         self.registry.set_resource_scheduler(None);
         self.registry.clear_scheduler();

@@ -2839,6 +2839,19 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// List every live session-scoped media-egress verdict for a session.
+    ListMediaEgressVerdicts {
+        session_id: Uuid,
+    },
+
+    /// Clear a remembered media-egress allow or reject for one exact digest so
+    /// the next authorization re-prompts the human.
+    RevokeMediaEgressVerdict {
+        session_id: Uuid,
+        purpose: String,
+        request_digest: String,
+    },
+
     /// Purge every ended session whose end time is before `before`
     /// (unix-epoch seconds).
     PurgeEndedSessions {
@@ -3972,6 +3985,22 @@ impl Request {
                 }
                 validate_owner_identifier("image-sidecar grant", grant_id, 128)?;
             }
+            Self::RevokeMediaEgressVerdict {
+                purpose,
+                request_digest,
+                ..
+            } => {
+                if purpose != "transcription" {
+                    return Err("media egress purpose is invalid".into());
+                }
+                if request_digest.len() != 64
+                    || request_digest
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+                {
+                    return Err("media egress request digest is invalid".into());
+                }
+            }
             Self::ApplyExtendedConfigPatch {
                 client_operation_id,
                 project_root,
@@ -4648,6 +4677,8 @@ macro_rules! request_variants {
             (Request::GetOrgSyncStatus, "get_org_sync_status");
             (Request::ListFailedToolCalls { .. }, "list_failed_tool_calls");
             (Request::GetSessionCompactions { .. }, "get_session_compactions");
+            (Request::ListMediaEgressVerdicts { .. }, "list_media_egress_verdicts");
+            (Request::RevokeMediaEgressVerdict { .. }, "revoke_media_egress_verdict");
             (Request::PurgeEndedSessions { .. }, "purge_ended_sessions");
             (Request::GetAssistant { .. }, "get_assistant");
             (Request::DeleteAssistant { .. }, "delete_assistant");
@@ -5013,6 +5044,8 @@ macro_rules! command {
             (Request::GetOrgSyncStatus, "get_org_sync_status", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::ListFailedToolCalls { since_epoch, tool, model, project_id, include_recovered, limit }, "list_failed_tool_calls", owner_only, none, false, read_only, none, concurrent, none, "since_epoch:i64|tool:Option<String>|model:Option<String>|project_id:Option<String>|include_recovered:bool|limit:u32", [since_epoch: i64 => param, tool: Option<String> => param, model: Option<String> => param, project_id: Option<String> => param, include_recovered: bool => param, limit: u32 => param]);
             (Request::GetSessionCompactions { session_id }, "get_session_compactions", owner_only, none, false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => param]);
+            (Request::ListMediaEgressVerdicts { session_id }, "list_media_egress_verdicts", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::RevokeMediaEgressVerdict { session_id, purpose, request_digest }, "revoke_media_egress_verdict", session_writer, field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|purpose:String|request_digest:String", [session_id: Uuid => session, purpose: String => param, request_digest: String => param]);
             (Request::PurgeEndedSessions { before }, "purge_ended_sessions", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "before:i64", [before: i64 => param]);
             (Request::GetAssistant { name }, "get_assistant", owner_only, none, false, read_only, none, concurrent, none, "name:String", [name: String => param]);
             (Request::DeleteAssistant { client_operation_id, mutation_intent_hash, project_root, name, expected_revision, expected_config_generation }, "delete_assistant", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|name:String|expected_revision:String|expected_config_generation:u64", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, name: String => param, expected_revision: String => param, expected_config_generation: u64 => param]);

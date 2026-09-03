@@ -1384,6 +1384,16 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "list_media_egress_verdicts",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "revoke_media_egress_verdict",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "purge_ended_sessions",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2456,6 +2466,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "media_egress_verdicts",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "ended_sessions_purged",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -3430,8 +3445,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 287);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 201);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 289);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 202);
         assert_eq!(EVENT_CLASSIFICATION.len(), 86);
     }
 

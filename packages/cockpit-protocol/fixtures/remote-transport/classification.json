@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 86,
-    "request": 287,
-    "response": 201
+    "request": 289,
+    "response": 202
   },
   "messages": {
     "event": [
@@ -1947,6 +1947,18 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "list_media_egress_verdicts"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "revoke_media_egress_verdict"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "purge_ended_sessions"
       },
       {
@@ -3210,6 +3222,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "session_compactions"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "media_egress_verdicts"
       },
       {
         "class": "bounded_request_response",

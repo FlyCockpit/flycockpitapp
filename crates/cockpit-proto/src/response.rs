@@ -1310,6 +1310,11 @@ pub enum Response {
         session_id: Uuid,
         compactions_json: String,
     },
+    /// Live session-scoped media-egress verdict rows.
+    MediaEgressVerdicts {
+        session_id: Uuid,
+        verdicts: Vec<crate::media_egress_authority::MediaEgressVerdictV1>,
+    },
     /// Result of purging ended sessions.
     EndedSessionsPurged {
         purged: u32,
@@ -1829,6 +1834,7 @@ macro_rules! response_variants {
             (Response::OrgSyncStatus { .. }, "org_sync_status");
             (Response::FailedToolCalls { .. }, "failed_tool_calls");
             (Response::SessionCompactions { .. }, "session_compactions");
+            (Response::MediaEgressVerdicts { .. }, "media_egress_verdicts");
             (Response::EndedSessionsPurged { .. }, "ended_sessions_purged");
             (Response::Assistant { .. }, "assistant");
             (Response::AssistantDeleted { .. }, "assistant_deleted");

@@ -17953,6 +17953,7 @@ fn dispatch_matrix_class_for_command(
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
+        | ("list_media_egress_verdicts", "session_row_reader", false)
         | ("pinned_message_state", "session_row_reader", false)
         | ("list_conversation_rules", "session_row_reader", false)
         | ("read_assistant_inbox", "session_row_reader", false)
@@ -17962,7 +17963,8 @@ fn dispatch_matrix_class_for_command(
         | ("resolve_agent_decision", "session_row_writer", true)
         | ("apply_agent_session_override", "session_row_writer", true)
         | ("admit_image_ingress", "session_writer", true)
-        | ("discard_image_ingress_draft", "session_row_writer", true) => {
+        | ("discard_image_ingress_draft", "session_row_writer", true)
+        | ("revoke_media_egress_verdict", "session_writer", true) => {
             DispatchMatrixClass::AccessControlled
         }
         (_, _, true) => DispatchMatrixClass::Mutating,
@@ -18952,6 +18954,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
+        | "list_media_egress_verdicts"
         | "pinned_message_state"
         | "pin_message"
         | "unpin_message"
@@ -19208,6 +19211,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_failed_tool_calls"
         | "get_assistant"
         | "get_session_compactions"
+        | "list_media_egress_verdicts"
         | "diagnose_media_reservation"
         | "get_doctor_snapshot"
         | "get_agent_inventory"
@@ -19322,6 +19326,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("resume_paused_work"),
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
+        authz_session_writer("revoke_media_egress_verdict"),
         authz_session_reader("goal_status"),
         authz_session_writer("create_goal"),
         authz_session_writer("set_goal_status"),
@@ -19332,6 +19337,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("count_pinned_messages"),
         authz_session_reader("list_pinned_message_seqs"),
         authz_session_reader("list_pinned_messages_with_text"),
+        authz_session_reader("list_media_egress_verdicts"),
         authz_session_reader("pinned_message_state"),
         authz_session_writer("set_conversation_rule"),
         authz_session_writer("remove_conversation_rule"),
@@ -21849,6 +21855,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             limit: 50,
         },
         "get_session_compactions" => Request::GetSessionCompactions { session_id },
+        "list_media_egress_verdicts" => Request::ListMediaEgressVerdicts { session_id },
+        "revoke_media_egress_verdict" => Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose: "transcription".into(),
+            request_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+        },
         "purge_ended_sessions" => Request::PurgeEndedSessions { before: 0 },
         "get_assistant" => Request::GetAssistant {
             name: "helper-bot".into(),
@@ -27519,6 +27532,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_packages",
         "list_failed_tool_calls",
         "get_session_compactions",
+        "list_media_egress_verdicts",
         "get_storage_report",
         "get_assistant",
         "diagnose_media_reservation",
@@ -29629,6 +29643,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetOrgSyncStatus, kind: "get_org_sync_status", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::ListFailedToolCalls { since_epoch: 0, tool: None, model: None, project_id: None, include_recovered: false, limit: 20 }, kind: "list_failed_tool_calls", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::ListMediaEgressVerdicts { session_id }, kind: "list_media_egress_verdicts", session_id: Some(session_id), audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::RevokeMediaEgressVerdict { session_id, purpose: "transcription".into(), request_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into() }, kind: "revoke_media_egress_verdict", session_id: Some(session_id), audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::DeleteAssistant { client_operation_id: "delete-assistant".into(), mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(&project_root, "delete", "a", "revision", None), project_root: project_root.clone(), name: "a".into(), expected_revision: "revision".into(), expected_config_generation: 7 }, kind: "delete_assistant", session_id: None, audit_path: Some("/repo"), mutating: true },
@@ -29909,6 +29925,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GetOrgSyncStatus,
         ListFailedToolCalls,
         GetSessionCompactions,
+        ListMediaEgressVerdicts,
+        RevokeMediaEgressVerdict,
         PurgeEndedSessions,
         GetAssistant,
         DeleteAssistant,

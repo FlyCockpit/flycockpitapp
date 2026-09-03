@@ -4756,6 +4756,46 @@
       "tag": "get_session_compactions"
     },
     {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "list_media_egress_verdicts"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|purpose:string|request_digest:string",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        },
+        {
+          "field": "purpose",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "request_digest",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid|purpose:String|request_digest:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "revoke_media_egress_verdict"
+    },
+    {
       "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "before:i64",

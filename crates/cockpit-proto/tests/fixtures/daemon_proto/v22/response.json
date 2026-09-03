@@ -2310,6 +2310,13 @@
     },
     "response": "session_compactions"
   },
+  "media_egress_verdicts": {
+    "data": {
+      "session_id": "11111111-2222-4333-8444-555555555555",
+      "verdicts": []
+    },
+    "response": "media_egress_verdicts"
+  },
   "ended_sessions_purged": {
     "data": {
       "purged": 0,

@@ -1041,7 +1041,7 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             name: "ask_image",
             summary: "Ask one bounded question about a single current-session image via a sidecar model.",
             condition: Some(
-                "Routes through the sidecar egress policy; requires typed session attachments.",
+                "Not advertised by default until the image sidecar pipeline has a production constructor.",
             ),
         },
         #[cfg(feature = "extended")]
@@ -1945,16 +1945,12 @@ pub(crate) fn effective_tool_tier(
             _ => crate::agents::ToolTier::Disabled,
         };
     }
-    // `ask_image` rides the broader media class (direct on Build/Plan/explore,
-    // Discoverable on narrow-surface workers).
+    // `ask_image` stays fail-closed until the sidecar pipeline has a production
+    // constructor that can resolve durable attachments from ToolCtx. The tool
+    // remains materializable when explicitly granted, but is not advertised by
+    // default so models are not offered a builtin that always errors.
     if tool == "ask_image" {
-        return match def.name.as_str() {
-            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
-            "Careful" | "builder" | "deepthink" | "Multireview" => {
-                crate::agents::ToolTier::Discoverable
-            }
-            _ => crate::agents::ToolTier::Disabled,
-        };
+        return crate::agents::ToolTier::Disabled;
     }
     if is_assistant && default_assistant_discoverable_tools().contains(&tool) {
         return crate::agents::ToolTier::Discoverable;
@@ -4969,6 +4965,43 @@ pub(crate) mod tests {
         assert!(
             crate::tool_media_authority::availability::MEDIA_TOOL_NAMES.contains(&"read_image")
         );
+    }
+
+    #[test]
+    fn ask_image_is_not_advertised_until_sidecar_constructor_exists() {
+        use crate::{agents::ToolTier, tool_media_authority::MediaToolAvailability};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.media_availability = MediaToolAvailability::available();
+        for &name in &[
+            "Build",
+            "Plan",
+            "explore",
+            "Careful",
+            "builder",
+            "deepthink",
+        ] {
+            let def = crate::agents::embedded_default(name).unwrap();
+            assert_eq!(
+                effective_tool_tier(&def, "ask_image", false),
+                ToolTier::Disabled,
+                "{name} must not advertise ask_image before the sidecar constructor exists"
+            );
+            let agent = agent_from_def(&def, &args).unwrap();
+            assert!(
+                !agent.tools.names().contains(&"ask_image"),
+                "{name} must not materialize ask_image by default"
+            );
+            assert!(
+                !agent
+                    .tools
+                    .discoverable_mcp_tool_names()
+                    .iter()
+                    .any(|tool| tool == "ask_image"),
+                "{name} must not register ask_image as discoverable by default"
+            );
+        }
     }
 
     #[test]

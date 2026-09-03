@@ -3563,6 +3563,35 @@ CREATE UNIQUE INDEX uq_image_generation_grants_match
 CREATE INDEX idx_image_generation_grants_session ON image_generation_grants (session_id);
 CREATE INDEX idx_image_generation_grants_project ON image_generation_grants (project_id, destination_binding_digest);
 
+-- ---- media_egress_grants ------------------------------------------------------
+-- Session-scoped transcription media-egress grants recorded after a human
+-- approves an exact `transcription_request_digest`. A later request matches
+-- only when every bound field is identical — there is no broader standing
+-- envelope and no global scope. `revoked_at_unix_ms` marks a revoked grant so
+-- it can no longer short-circuit a prompt.
+
+CREATE TABLE media_egress_grants (
+    grant_id           TEXT    PRIMARY KEY CHECK (length(CAST(grant_id AS BLOB)) = 36),
+    session_id         TEXT    NOT NULL,
+    project_id         TEXT    NOT NULL CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
+    purpose            TEXT    NOT NULL CHECK (purpose IN ('transcription')),
+    request_digest     TEXT    NOT NULL CHECK (
+        length(request_digest) = 64
+        AND request_digest = lower(request_digest)
+        AND request_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    verdict            TEXT    NOT NULL DEFAULT 'allow'
+        CHECK (verdict IN ('allow', 'reject')),
+    granted_at_unix_ms INTEGER NOT NULL,
+    revoked_at_unix_ms INTEGER,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+CREATE UNIQUE INDEX uq_media_egress_grants_match
+    ON media_egress_grants (session_id, purpose, request_digest, verdict);
+
+CREATE INDEX idx_media_egress_grants_session ON media_egress_grants (session_id);
+
 -- ---- session full-text search (`history_search` / `cockpit://` recall) ------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session title/description, the text of `user_message` /

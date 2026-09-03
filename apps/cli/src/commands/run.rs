@@ -2,7 +2,8 @@
 //!
 //! Lifecycle: attach to a shareable daemon when one is already up; otherwise
 //! this command starts a shared ephemeral daemon for the duration of the run.
-//! That owner can be promoted in place when the user selects background work.
+//! Ctrl+C cancels the agent and exits; it does not promote the owner. TUI
+//! `/exit` still offers in-place background promotion.
 //!
 //! Behavior:
 //!
@@ -160,6 +161,7 @@ async fn resolve_requested_session_via_daemon(
                 project_id: None,
                 parent_session_id: None,
                 assistant_id: None,
+                compaction_lineage_root_id: None,
             })
             .await
             .context("looking up --session via daemon")?
@@ -208,6 +210,7 @@ async fn resolve_requested_session_via_daemon(
             project_id: Some(project_id),
             parent_session_id: None,
             assistant_id: None,
+            compaction_lineage_root_id: None,
         })
         .await
         .context("listing sessions for --continue via daemon")?
@@ -828,24 +831,27 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
     let images: Vec<Vec<u8>> = paths
         .iter()
         .map(|path| {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading attachment {}", path.display()))?;
+            // Bound the read with the same image cap the wire enforces, and
+            // refuse non-regular files before any content is accumulated, so
+            // an oversized or FIFO/device attachment fails here instead of
+            // allocating or blocking the CLI.
+            let bytes =
+                cockpit_host::bounded::read_at_most(path, proto::MAX_SINGLE_IMAGE_BYTES as u64)
+                    .map_err(|error| match error {
+                        cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. } => {
+                            RunUsageError(format!(
+                                "image is too large: {actual} bytes exceeds {limit} byte limit"
+                            ))
+                            .into()
+                        }
+                        other => anyhow::Error::new(other)
+                            .context(format!("reading attachment {}", path.display())),
+                    })?;
             crate::daemon::server::validate_png_attachment_blocking(bytes)
                 .map(|validated| validated.bytes)
                 .map_err(|error| anyhow::anyhow!(error.message))
         })
         .collect::<Result<_>>()?;
-    if let Some(image) = images
-        .iter()
-        .find(|image| image.len() > proto::MAX_SINGLE_IMAGE_BYTES)
-    {
-        return Err(RunUsageError(format!(
-            "image is too large: {} bytes exceeds {} byte limit",
-            image.len(),
-            proto::MAX_SINGLE_IMAGE_BYTES
-        ))
-        .into());
-    }
     let total: usize = images.iter().map(Vec::len).sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(RunUsageError(format!(
@@ -942,7 +948,15 @@ fn build_prompt_from_reader(args: &RunArgs, root: &Path, stdin: &mut impl Read) 
         } else {
             root.join(path)
         };
-        return std::fs::read_to_string(&path)
+        // Bound the read with the message-text cap the daemon's ingress
+        // enforces, so an oversized or non-regular prompt file fails here
+        // instead of allocating or blocking the CLI before any cap runs.
+        let bytes = cockpit_host::bounded::read_at_most(
+            &path,
+            proto::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64,
+        )
+        .with_context(|| format!("reading prompt file {}", path.display()))?;
+        return String::from_utf8(bytes)
             .with_context(|| format!("reading prompt file {}", path.display()));
     }
 
@@ -966,7 +980,7 @@ fn validate_prompt(prompt: &str) -> Result<()> {
 
 pub(crate) async fn pump_events(
     client: &ScopedDaemonClient<'_>,
-    session_id: Uuid,
+    mut session_id: Uuid,
     format: OutputFormat,
     verbose_json: bool,
     approve: &[GrantKind],
@@ -1000,27 +1014,13 @@ pub(crate) async fn pump_events(
                         anyhow::bail!("unexpected daemon exit-state response");
                     };
                     if has_live_work && ephemeral_owner {
-                        match prompt_run_exit_choice(&mut stderr)? {
-                            RunExitChoice::Background => {
-                                client
-                                    .request_ok(Request::PromoteToPersistent)
-                                    .await
-                                    .context("promoting daemon to persistent background owner")?;
-                                writeln!(
-                                    stderr,
-                                    "This session is still running in the background; reattach with cockpit run --session {session_id}"
-                                )?;
-                                return Ok(130);
-                            }
-                            RunExitChoice::StopAll => {
-                                // This is the only interactive path that broadens
-                                // cancellation beyond the current invocation.
-                                client
-                                    .request_ok(Request::CancelAllSessionWork)
-                                    .await
-                                    .context("cancelling all attached session work")?;
-                            }
-                        }
+                        // Ctrl+C on `cockpit run` is stop-all: cancel the agent,
+                        // tear down owned processes, and exit. Backgrounding is
+                        // the TUI `/exit` guard's job, not this command.
+                        client
+                            .request_ok(Request::CancelAllSessionWork)
+                            .await
+                            .context("cancelling all attached session work")?;
                     } else if has_live_work {
                         writeln!(
                             stderr,
@@ -1040,9 +1040,14 @@ pub(crate) async fn pump_events(
         let Some(event) = event else {
             break;
         };
-        // Filter to this session's events.
+        // Filter to this session's events. CompactReady is stamped with the
+        // predecessor so it passes this check; retarget afterwards so later
+        // events (stamped with the successor) are not dropped.
         if event_session(&event) != Some(session_id) {
             continue;
+        }
+        if let proto::Event::CompactReady { new_session_id, .. } = &event {
+            session_id = *new_session_id;
         }
 
         let action = handle_run_event(
@@ -1163,31 +1168,6 @@ pub(crate) async fn pump_events(
         stdout.flush()?;
     }
     Ok(code)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunExitChoice {
-    StopAll,
-    Background,
-}
-
-fn prompt_run_exit_choice(stderr: &mut impl Write) -> Result<RunExitChoice> {
-    if !std::io::stdin().is_terminal() {
-        return Ok(RunExitChoice::StopAll);
-    }
-    writeln!(
-        stderr,
-        "This session is still working. What would you like to do? [s]top all / [b]ackground"
-    )?;
-    stderr.flush()?;
-    let mut choice = String::new();
-    std::io::stdin()
-        .read_line(&mut choice)
-        .context("reading exit choice")?;
-    Ok(match choice.trim().to_ascii_lowercase().as_str() {
-        "b" | "background" | "run in background" => RunExitChoice::Background,
-        _ => RunExitChoice::StopAll,
-    })
 }
 
 /// Map an authoritative terminal lifecycle state after interrupt reconciliation.

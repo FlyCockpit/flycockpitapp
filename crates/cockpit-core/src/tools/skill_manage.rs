@@ -88,7 +88,7 @@ impl Tool for SkillManageTool {
                 .collect::<Vec<_>>(),
         )
         .await?;
-        let prepared = service.prepare(&args).await?;
+        let mut prepared = service.prepare(&args).await?;
         let config_requires_approval = effective_skills.write_approval
             && ctx.skill_write_origin != crate::skills::manage::SkillWriteOrigin::BackgroundReview;
         let approval_required =
@@ -134,8 +134,11 @@ impl Tool for SkillManageTool {
         .await?;
         // `apply_prepared` is synchronous by construction and begins with
         // its selected mutation. Ledger/bookkeeping is intentionally deferred
-        // until that mutation has committed.
-        let result = service.apply_prepared(&prepared)?;
+        // until that mutation has committed. The plan is handed over by
+        // mutable reference: the delete path consumes the retained package
+        // pin exactly at its Windows release point, and a consumed pin makes
+        // any second application fail closed.
+        let result = service.apply_prepared(&mut prepared)?;
         service.record_post_mutation(&prepared, &result).await;
         Ok(ToolOutput::text(result.message))
     }

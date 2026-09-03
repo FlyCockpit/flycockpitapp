@@ -2938,9 +2938,11 @@ enum LeaseDrift {
 /// `Drop` revokes then releases (so a `take()` without `close`, including
 /// reconcile error, cannot leave Ask authority behind). Production
 /// replacement is `reconcile_native_computer_for_delegation_with_opener`,
-/// which `close`s the previous coordinator and, when it reopens the same
-/// delegation, inherits sticky denial onto the replacement. Daemon restart
-/// drops the process; the store is not durable. [`Self::clear_all`] is the
+/// which copies sticky denial into the driver frame before `close`/`Drop`.
+/// That frame slot outlives any particular coordinator instance, so a
+/// failed or deferred replacement still inherits the denial onto a later
+/// successor for the same `(session, delegation)`. Daemon restart drops
+/// the process; the store is not durable. [`Self::clear_all`] is the
 /// in-process equivalent used by tests.
 ///
 /// **Re-entry**: a matching bounded lease is consumed; an exhausted or
@@ -2965,10 +2967,11 @@ pub struct AskDelegationLeaseStore {
     /// Terminally denied `(session_id, delegation_id)` pairs. Once a human
     /// denies a delegation's computer path, no lease may be begun or installed
     /// for it again. This is never cleared by `clear_all`/`revoke_*`. The
-    /// denial lasts until a new delegation: replacing the coordinator for the
-    /// same `(session, delegation)` must call
-    /// [`ComputerActionCoordinator::inherit_terminal_denial`] so a new store
-    /// does not re-open the denied path.
+    /// denial lasts until a new delegation. Replacing the coordinator for the
+    /// same `(session, delegation)` copies the reason into the driver frame
+    /// before `close`/`Drop` and calls
+    /// [`ComputerActionCoordinator::inherit_terminal_denial`] on every
+    /// successor, including after a failed or deferred replacement.
     denied_delegations: std::collections::HashSet<(String, DelegationId)>,
 }
 
@@ -3856,8 +3859,9 @@ impl Drop for ComputerActionCoordinator {
         // Same Ask-authorization funnel as `close`: a `take()` without
         // `close` (reconcile error, frame drop, task abort) must not leave
         // installed leases or pending waits observable on a later re-open.
-        // Sticky denial is store-owned and dies with this coordinator; the
-        // replacement path inherits it before this Drop runs.
+        // Sticky denial on this coordinator dies with Drop; the driver frame
+        // retains a copy so a later replacement can inherit it even if this
+        // Drop ran without an immediate successor.
         self.revoke_ask_lease_for_delegation();
         self.host_effect_cancel.cancel();
         if let Err(error) = self.release_input_before_host_lease() {
@@ -5656,16 +5660,19 @@ impl ComputerActionCoordinator {
     }
 
     /// Sticky human-denial reason for this coordinator, if the computer path
-    /// has been terminally denied. Production replacement reads this before
-    /// `close` so the new coordinator can inherit the denial.
+    /// has been terminally denied. Production replacement copies this into
+    /// the driver frame before `close` so a successor — including one opened
+    /// on a later reconciliation after a failed or deferred replacement —
+    /// can inherit the denial.
     pub(crate) fn terminal_denial(&self) -> Option<&str> {
         self.denied.as_deref()
     }
 
     /// Re-stick a human denial onto a replacement coordinator for the same
-    /// `(session, delegation)`. Installed leases and pending waits on this
-    /// store are revoked. Subsequent `execute_*` returns `Denied` without
-    /// prompting.
+    /// `(session, delegation)`. The driver frame supplies this reason for
+    /// every successor, including after a failed or deferred replacement.
+    /// Installed leases and pending waits on this store are revoked.
+    /// Subsequent `execute_*` returns `Denied` without prompting.
     pub(crate) fn inherit_terminal_denial(&mut self, reason: String) {
         self.denied = Some(reason);
         self.ask_wait_by_call.clear();

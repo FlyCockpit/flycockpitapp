@@ -85,6 +85,9 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
         pin_count: 0,
         assistant_inbox_unread: 0,
         assistant_inbox_latest_source_session_id: None,
+        compaction_predecessor_session_id: None,
+        compaction_lineage_root_id: None,
+        lineage_window_count: 1,
     }
 }
 

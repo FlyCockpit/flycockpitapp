@@ -3,7 +3,7 @@ name = "cockpit-host"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Dependency-minimal host filesystem and process primitives for Cockpit"
+description = "Dependency-minimal host filesystem, process, and named-pipe primitives for Cockpit"
 license = "Apache-2.0"
 repository = "https://github.com/FlyCockpit/flycockpitapp"
 homepage = "https://github.com/FlyCockpit/flycockpitapp"
@@ -11,6 +11,15 @@ publish = false
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Test instrumentation only, never a production edge: exposes the audited
+# DACL-apply test seam (`goal_scratch::apply_test_windows_dacl`) so upper
+# crates' Windows tests can inject a broad ACL and prove the private-verify
+# paths reject it. Mirrors the `test-support` feature convention of
+# `cockpit-core` / `cockpit-config` / `cockpit-db`.
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -21,7 +30,7 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
-    "rt-multi-thread", "macros", "process", "io-util", "time", "sync",
+    "rt-multi-thread", "macros", "process", "io-util", "net", "time", "sync",
 ] }
 uuid = { workspace = true }
 
@@ -32,8 +41,10 @@ libc = { workspace = true }
 windows-sys = { version = "=0.61.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

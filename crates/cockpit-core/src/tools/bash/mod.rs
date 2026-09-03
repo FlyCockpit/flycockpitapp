@@ -1146,7 +1146,12 @@ async fn call_bash_inner(
         }
     };
     if let Some(knowledge_source) = knowledge_source {
-        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
+        // Layered KB boundary (issue #273): the deterministic floor first,
+        // then the utility-model second layer over the floor-clean KB-derived
+        // command output.
+        let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+        crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &knowledge_source, &guard)
+            .await;
     }
     Ok(out)
 }
@@ -3044,6 +3049,9 @@ async fn run_prepared_command(
         } => {
             let bridge = foreground_queue.expect("adoption branch requires queue bridge");
             let job_id = format!("bash-{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+            // The KB utility-model guard is resolved here, at the turn, so the
+            // detached completion task never re-resolves config mid-flight.
+            let utility_guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
             spawn_adopted_shell_completion(
                 child,
                 child_pid,
@@ -3057,6 +3065,7 @@ async fn run_prepared_command(
                 attached_knowledge_read,
                 identity_accounting,
                 ctx.redact.clone(),
+                utility_guard,
             )
             .await;
             return RunOutcome::Backgrounded(job_id);
@@ -3103,6 +3112,7 @@ async fn spawn_adopted_shell_completion(
     attached_knowledge_read: bool,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
+    utility_guard: crate::knowledge::KbUtilityGuard,
 ) {
     let adopted_cancel = cancel.child_token();
     let waiter_cancel = adopted_cancel.clone();
@@ -3169,7 +3179,17 @@ async fn spawn_adopted_shell_completion(
                     }
                 };
                 let outcome = if attached_knowledge_read {
-                    crate::knowledge::fence_knowledge_content_if_needed(&outcome)
+                    // Layered KB boundary (issue #273): the deterministic
+                    // floor first, then the utility-model second layer over
+                    // the floor-clean KB-derived command output. The guard is
+                    // resolved at the adopting call site, before this
+                    // detached completion task leaves the turn.
+                    crate::knowledge::fence_knowledge_with_utility_model(
+                        &outcome,
+                        &outcome,
+                        &utility_guard,
+                    )
+                    .await
                 } else {
                     outcome
                 };

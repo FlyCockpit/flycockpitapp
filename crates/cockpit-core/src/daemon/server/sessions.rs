@@ -7,6 +7,7 @@ pub(super) async fn list_sessions(
     project_id: Option<String>,
     parent_session_id: Option<Uuid>,
     assistant_id: Option<String>,
+    compaction_lineage_root_id: Option<Uuid>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
@@ -21,6 +22,7 @@ pub(super) async fn list_sessions(
                 conn,
                 project_id.as_deref(),
                 parent_session_id,
+                compaction_lineage_root_id,
                 100,
             )
         })
@@ -76,8 +78,7 @@ pub(super) fn apply_live_activity_state(
 pub(super) fn resource_scheduler_snapshot(
     ctx: &DaemonContext,
 ) -> crate::engine::resource_scheduler::ResourceSchedulerSnapshot {
-    ctx.registry
-        .resource_scheduler()
+    ctx.resource_scheduler()
         .map(|scheduler| scheduler.snapshot())
         .unwrap_or_else(|| {
             crate::engine::resource_scheduler::ResourceScheduler::disabled().snapshot()
@@ -91,7 +92,7 @@ pub(super) async fn promote_resource_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     use crate::engine::resource_scheduler::ResourcePromoteError;
 
-    let Some(scheduler) = ctx.registry.resource_scheduler() else {
+    let Some(scheduler) = ctx.resource_scheduler() else {
         let snapshot = resource_scheduler_snapshot(ctx);
         return Ok(Response::PromoteResourceResult {
             status: proto::ResourcePromoteStatus::Disabled,
@@ -347,35 +348,73 @@ pub(super) async fn end_btw_fork(
     Ok(Response::Ack)
 }
 
-/// Discard an ephemeral side-conversation (`/side`): stop its live worker
-/// (cancelling jobs, ending the current turn) then delete its row +
-/// descendant forks. Guarded — a non-ephemeral session is left untouched,
-/// so a stray discard can never drop a persisted session. Idempotent: an
-/// already-gone session acks without error.
+/// Discard an ephemeral side-conversation (`/side`): stop every live worker
+/// in its cascade (cancelling jobs, ending the current turn) then delete
+/// its row + descendant forks and compaction successors. Guarded — a
+/// non-ephemeral session is left untouched, so a stray discard can never
+/// drop a persisted session or stop its worker. Idempotent: an already-gone
+/// session acks without error.
 pub(super) async fn discard_session(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    // Detach this client from the session it's discarding so the daemon
-    // doesn't keep streaming a torn-down worker's events at it.
-    if let Some(att) = &state.attached
-        && att.handle.session_id == session_id
+    // Detach this client from any window of the discarded conversation so
+    // the daemon does not keep streaming a torn-down worker's events at it.
+    detach_if_attached_to_discard_lineage(state, ctx, session_id).await?;
+    // Stop live workers first. Fail closed: if a worker does not stop,
+    // leave the ephemeral session row intact. Idempotent on a replayed
+    // operation. A predecessor-addressed discard still has to stop the
+    // live tip (GOALS §17h) — exact-id stop misses the rekeyed worker.
+    if stop_ephemeral_discard_lineage(ctx, session_id).await? {
+        ctx.db
+            .discard_ephemeral_session(session_id)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(Response::Ack)
+}
+
+/// Detach this connection when it is attached to the requested window or
+/// any other window of the same discard cascade.
+pub(super) async fn detach_if_attached_to_discard_lineage(
+    state: &mut MutableClientState,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    let Some(att) = &state.attached else {
+        return Ok(());
+    };
+    let live = att.handle.session_id();
+    if live == session_id || att.handle.owns_session_id(session_id) {
+        state.attached = None;
+        return Ok(());
+    }
+    if ctx
+        .db
+        .is_in_subtree(session_id, live)
+        .await
+        .map_err(internal)?
     {
         state.attached = None;
     }
-    // Stop the live worker first. Fail closed: if the worker does not stop,
-    // leave the ephemeral session row intact. Idempotent on a replayed
-    // operation.
-    ctx.registry
-        .interrupt_and_stop(session_id)
-        .await
-        .map_err(internal)?;
-    ctx.db
-        .discard_ephemeral_session(session_id)
-        .await
-        .map_err(internal)?;
-    Ok(Response::Ack)
+    Ok(())
+}
+
+/// Stop live workers in an ephemeral discard cascade. Returns whether the
+/// target is an ephemeral row that should proceed to deletion. A stray
+/// discard of a persisted conversation must not stop its worker.
+pub(super) async fn stop_ephemeral_discard_lineage(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<bool, ErrorPayload> {
+    match ctx.db.get_session(session_id).await.map_err(internal)? {
+        Some(row) if row.ephemeral => {
+            stop_subtree(ctx, session_id, true).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) async fn rename_session(
@@ -580,7 +619,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await
@@ -622,10 +661,10 @@ pub(super) async fn archive_session(
 }
 
 /// Stop any live worker for `root` (and, when `cascade`, its whole fork
-/// subtree) before an archive/delete. Best-effort over the candidate ids
-/// the daemon currently has active workers for — there is no DB walk
-/// here because only sessions with a live worker need interrupting, and
-/// the registry already knows those.
+/// and compaction subtree) before an archive/delete/discard. Best-effort
+/// over the candidate ids the daemon currently has active workers for —
+/// there is no DB walk here because only sessions with a live worker need
+/// interrupting, and the registry already knows those.
 pub(super) async fn stop_subtree(
     ctx: &DaemonContext,
     root: Uuid,
@@ -741,8 +780,8 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
 
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
-    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
+) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })
@@ -800,6 +839,9 @@ mod sessions_activity_tests {
             pin_count: 0,
             assistant_inbox_unread: 0,
             assistant_inbox_latest_source_session_id: None,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: None,
+            lineage_window_count: 1,
         }
     }
 

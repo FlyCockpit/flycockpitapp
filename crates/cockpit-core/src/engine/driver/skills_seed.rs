@@ -117,7 +117,7 @@ impl Driver {
         let mut restored: Vec<SkillPair> = self
             .session
             .db
-            .list_skill_pairs(self.session.id)
+            .list_skill_pairs(self.session.live_id())
             .await
             .map(|rows| rows.into_iter().map(SkillPair::from).collect())
             .unwrap_or_else(|e| {
@@ -138,7 +138,7 @@ impl Driver {
                     .session
                     .db
                     .save_skill_pair(
-                        self.session.id,
+                        self.session.live_id(),
                         &pair.call_id,
                         &pair.owner,
                         pair.intentional_steer,
@@ -162,7 +162,7 @@ impl Driver {
         let calls = self
             .session
             .db
-            .list_tool_calls_for_session(self.session.id)
+            .list_tool_calls_for_session(self.session.live_id())
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "loading tool calls for skill-pair reconstruction failed");
@@ -196,7 +196,7 @@ impl Driver {
         if let Err(e) = self
             .session
             .db
-            .delete_skill_pairs(self.session.id, ids)
+            .delete_skill_pairs(self.session.live_id(), ids)
             .await
         {
             tracing::warn!(error = %e, "deleting persisted skill-pair ownership failed");
@@ -590,7 +590,7 @@ impl Driver {
         if let Err(e) = self
             .session
             .db
-            .save_skill_pair(self.session.id, &call_id, &agent.name, false)
+            .save_skill_pair(self.session.live_id(), &call_id, &agent.name, false)
             .await
         {
             tracing::warn!(error = %e, "persisting skill-pair ownership failed");

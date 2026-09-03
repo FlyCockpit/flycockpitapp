@@ -7,6 +7,14 @@
 //!
 //! Runtime decisions combine the running agent's compiled definition grant
 //! with the immutable session profile region and its exact utility bindings.
+//!
+//! Verification ledger rows stay on [`Session::id`] (the worker spawn id),
+//! not [`Session::live_id`]. `verification_operations.session_id` is a
+//! composite foreign key into `agent_instances(agent_instance_id, session_id)`,
+//! and agent-tree storage is spawn-scoped for the worker lifetime — the same
+//! carve-out as [`crate::engine::interrupt::InterruptHub`]. In-process compact
+//! keeps writing the spawn row; a successor resume starts a new worker whose
+//! spawn id is the live window, so new operations land there naturally.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -509,6 +517,8 @@ async fn run_verification(
         generator_count.min(ledger.candidate_count).max(0)
     };
     let original_digest = VerificationDigest::of(assembled.as_bytes());
+    // Spawn-scoped: the ledger is keyed through agent_instances. See the
+    // module-level carve-out. Do not retarget these writes to live_id.
     let pretool_digest = VerificationDigest::of(
         format!(
             "verification-pretool:{}:{}",

@@ -1079,6 +1079,7 @@ const requestParamSchemas = {
       project_id: z.string().nullable().optional(),
       parent_session_id: optionalUuidSchema,
       assistant_id: z.string().nullable().optional(),
+      compaction_lineage_root_id: optionalUuidSchema,
     })
     .strict(),
   read_history_page: z
@@ -1329,7 +1330,35 @@ const requestParamSchemas = {
     })
     .strict(),
   unarchive_session: z.object({ session_id: uuidSchema }).strict(),
-  import_session_archive: z.object({ transfer: bulkTransferRefSchema }).strict(),
+  set_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema.optional(),
+      text: z.string().min(1).max(4000),
+      source_trust: z.enum(["trusted", "untrusted"]).optional(),
+    })
+    .strict(),
+  remove_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema,
+    })
+    .strict(),
+  list_conversation_rules: z.object({ session_id: uuidSchema }).strict(),
+  promote_conversation_rule: z
+    .object({
+      session_id: uuidSchema,
+      rule_id: uuidSchema,
+    })
+    .strict(),
+  import_session_archive: z
+    .object({
+      transfer: bulkTransferRefSchema,
+      // Mirrors the Rust `#[serde(default)]`: absent means the fail-closed
+      // refusal of an unredacted archive.
+      include_sensitive: z.boolean().optional(),
+    })
+    .strict(),
   write_bulk_transfer_chunk: z
     .object({
       transfer: bulkTransferRefSchema,
@@ -1477,6 +1506,10 @@ const clientRequestVariants = [
   requestVariant("share_session", requestParamSchemas.share_session),
   requestVariant("stats_rollup", requestParamSchemas.stats_rollup),
   requestVariant("unarchive_session", requestParamSchemas.unarchive_session),
+  requestVariant("set_conversation_rule", requestParamSchemas.set_conversation_rule),
+  requestVariant("remove_conversation_rule", requestParamSchemas.remove_conversation_rule),
+  requestVariant("list_conversation_rules", requestParamSchemas.list_conversation_rules),
+  requestVariant("promote_conversation_rule", requestParamSchemas.promote_conversation_rule),
 ] as const;
 
 export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnion(
@@ -3102,6 +3135,22 @@ export type ServerMessage = z.infer<typeof serverMessageSchema>;
 export const historyEntrySchema = historyEntryWireSchema;
 export type HistoryEntry = z.infer<typeof historyEntrySchema>;
 
+export const conversationRuleCreatedBySchema = z.enum(["user", "agent"]);
+export type ConversationRuleCreatedBy = z.infer<typeof conversationRuleCreatedBySchema>;
+export const conversationRuleSourceTrustSchema = z.enum(["trusted", "untrusted"]);
+export type ConversationRuleSourceTrust = z.infer<typeof conversationRuleSourceTrustSchema>;
+export const conversationRuleSchema = z
+  .object({
+    rule_id: uuidSchema,
+    lineage_id: uuidSchema,
+    text: z.string().min(1).max(4000),
+    created_by: conversationRuleCreatedBySchema,
+    source_trust: conversationRuleSourceTrustSchema,
+    created_at_unix_ms: safeI64NumberSchema,
+  })
+  .strict();
+export type ConversationRule = z.infer<typeof conversationRuleSchema>;
+
 export const sessionSummarySchema = z
   .object({
     session_id: uuidSchema,
@@ -3120,6 +3169,9 @@ export const sessionSummarySchema = z
     is_assistant_thread: z.boolean(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
+    compaction_predecessor_session_id: optionalUuidSchema,
+    compaction_lineage_root_id: optionalUuidSchema,
+    lineage_window_count: safeU64NumberSchema.optional(),
   })
   .passthrough();
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;

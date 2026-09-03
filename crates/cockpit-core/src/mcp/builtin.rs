@@ -117,7 +117,7 @@ impl HostContext {
         });
         Self {
             db: Some(ctx.session.db.clone()),
-            session_id: Some(ctx.session.id),
+            session_id: Some(ctx.session.live_id()),
             cwd: ctx.cwd.clone(),
             tool_steering: ctx.tool_steering,
             config: ctx.config.clone(),
@@ -156,7 +156,7 @@ impl HostContext {
     ) -> Self {
         Self {
             db: Some(session.db.clone()),
-            session_id: Some(session.id),
+            session_id: Some(session.live_id()),
             cwd,
             tool_steering: crate::agents::ToolSteering::Terse,
             config,
@@ -192,7 +192,7 @@ impl HostContext {
     ) -> Self {
         Self {
             db: Some(session.db.clone()),
-            session_id: Some(session.id),
+            session_id: Some(session.live_id()),
             cwd,
             tool_steering: crate::agents::ToolSteering::Terse,
             config,
@@ -1596,7 +1596,7 @@ fn set_session_metadata_availability(ctx: &HostContext) -> Availability {
         return Availability::unavailable("set_session_metadata requires a live session");
     };
     let Ok(Some(row)) = session.db.blocking_write_for_sync_maintenance({
-        let session_id = session.id;
+        let session_id = session.live_id();
         move |conn| crate::db::Db::get_session_conn(conn, session_id)
     }) else {
         return Availability::unavailable("session metadata is unavailable");
@@ -1717,7 +1717,7 @@ fn rename_session<'a>(
             .context("`cockpit.rename_session` requires a live session")?;
         let row = session
             .db
-            .get_session(session.id)
+            .get_session(session.live_id())
             .await
             .context("loading session before rename")?
             .context("session row is missing")?;
@@ -1734,7 +1734,7 @@ fn rename_session<'a>(
                 "`cockpit.rename_session` is unavailable: session auto-titling is configured; the utility model owns titles"
             );
         }
-        let updated = session.set_explicit_auto_title(name)?;
+        let updated = session.set_agent_session_title(name)?;
         if !updated {
             bail!("`cockpit.rename_session` did not update the session title");
         }
@@ -3476,7 +3476,7 @@ mod tests {
         advance_title_turns(&session, 8);
         let host = HostContext {
             db: Some(session.db.clone()),
-            session_id: Some(session.id),
+            session_id: Some(session.live_id()),
             cwd: tmp.path().to_path_buf(),
             tool_steering: crate::agents::ToolSteering::Terse,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
@@ -3582,7 +3582,7 @@ mod tests {
         );
         let host = HostContext {
             db: Some(session.db.clone()),
-            session_id: Some(session.id),
+            session_id: Some(session.live_id()),
             cwd: tmp.path().to_path_buf(),
             tool_steering: crate::agents::ToolSteering::Terse,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(

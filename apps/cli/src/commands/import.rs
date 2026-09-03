@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 
 use cockpit_client::DaemonClient;
@@ -34,14 +34,14 @@ async fn push_bulk_transfer(
         transfer_id_bytes[0] = 1;
     }
     let transfer_id = transfer_id_from_bytes(transfer_id_bytes)
-        .map_err(|error| anyhow::anyhow!("building transfer id: {error}"))?;
+        .map_err(|error| anyhow!("building transfer id: {error}"))?;
     let transfer = BulkTransferRef::new(
         transfer_id,
         bytes.len() as u64,
         sha256,
         BulkMimeClass::Archive,
     )
-    .map_err(|error| anyhow::anyhow!("import archive rejected: {error}"))?;
+    .map_err(|error| anyhow!("import archive rejected: {error}"))?;
 
     let chunk_size = cockpit_core::daemon::bulk_staging::STAGED_CHUNK_BYTES;
     // A zero-length archive still sends one chunk so the transfer completes.
@@ -59,9 +59,7 @@ async fn push_bulk_transfer(
             .await?
         {
             Response::BulkTransferChunkAccepted { .. } => {}
-            other => anyhow::bail!(
-                "daemon returned unexpected response to bulk transfer chunk: {other:?}"
-            ),
+            other => bail!("daemon returned unexpected response to bulk transfer chunk: {other:?}"),
         }
     }
     Ok(transfer)
@@ -100,7 +98,7 @@ pub async fn run(args: ImportArgs) -> Result<()> {
             cockpit_core::session::import::ImportResult { imported, redacted }
         }
         other => {
-            anyhow::bail!("daemon returned unexpected response to session import: {other:?}")
+            bail!("daemon returned unexpected response to session import: {other:?}")
         }
     };
     if !imported.redacted {

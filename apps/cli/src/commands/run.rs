@@ -851,7 +851,7 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
                 .map(|validated| validated.bytes)
                 .map_err(|error| anyhow::anyhow!(error.message))
         })
-        .collect::<Result<_>>()?();
+        .collect::<Result<_>>()?;
     let total: usize = images.iter().map(Vec::len).sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(RunUsageError(format!(

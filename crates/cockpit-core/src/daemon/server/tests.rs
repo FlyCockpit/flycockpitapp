@@ -26205,6 +26205,7 @@ async fn assert_import_session_archive_malformed() {
         Request::ImportSessionArchive {
             // Never staged: the daemon has no bytes for this reference.
             transfer: archive_transfer_ref(b"not-staged"),
+            include_sensitive: false,
         },
     )
     .await

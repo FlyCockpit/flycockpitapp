@@ -460,6 +460,21 @@ pub enum AsyncActionPayload {
         count: usize,
         pinned_seqs: Vec<i64>,
     },
+    RulesReview {
+        session_id: uuid::Uuid,
+        rules: Vec<cockpit_proto::ConversationRule>,
+    },
+    RuleSet {
+        rule: cockpit_proto::ConversationRule,
+    },
+    RuleRemoved {
+        rule_id: uuid::Uuid,
+        removed: bool,
+    },
+    RulePromoted {
+        target_path: String,
+        report: String,
+    },
     LocalCommand {
         label: String,
         raw_output: String,

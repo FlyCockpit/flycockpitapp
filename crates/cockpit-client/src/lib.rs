@@ -653,11 +653,12 @@ impl DaemonClient {
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
             let initial_events = confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            let owner_capability = exchange_peer_credential(&mut proto, negotiated.version).await?;
             Ok(Self::from_proto_negotiated(
                 proto,
                 negotiated,
                 initial_events,
-                load_owner_capability(socket),
+                owner_capability,
             ))
         }
         #[cfg(not(any(unix, windows)))]
@@ -965,6 +966,67 @@ where
     };
 
     proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+}
+
+/// Exchange a peer-bound credential after lifetime confirmation. Socket peers
+/// must present this token on secret-bearing RPCs (issue #337).
+#[cfg(any(unix, windows))]
+async fn exchange_peer_credential<S>(
+    proto_stream: &mut ProtoStream<S>,
+    version: u32,
+) -> Result<Option<proto::OwnerCapabilityToken>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let id = Uuid::now_v7();
+    proto_stream
+        .send(&Envelope::request_at(
+            version,
+            id,
+            Request::ExchangeLocalPeerCredential,
+        ))
+        .await
+        .context("sending peer credential exchange")?;
+
+    let exchange = async {
+        loop {
+            let frame = proto_stream.recv().await?;
+            let Some(frame) = frame else {
+                return Err(protocol_handshake_error(
+                    "daemon closed before peer credential exchange",
+                ));
+            };
+            match frame {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Response {
+                        id: response_id,
+                        response,
+                    } if response_id == id => match *response {
+                        Response::LocalPeerCredential { token, .. } => return Ok(Some(token)),
+                        _ => {
+                            return Err(protocol_handshake_error(
+                                "daemon returned an invalid peer credential exchange response",
+                            ));
+                        }
+                    },
+                    Body::Error {
+                        id: Some(response_id),
+                        error,
+                    } if response_id == id => return Err(anyhow::Error::new(error)),
+                    _ => {}
+                },
+                RecvFrame::Unknown { .. } | RecvFrame::VersionMismatch { .. } => {
+                    return Err(protocol_handshake_error(
+                        "daemon rejected the peer credential exchange version",
+                    ));
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+        .await
+        .map_err(|_| protocol_handshake_error("peer credential exchange timed out"))?
 }
 
 /// Confirm that a peer which parsed the daemon's hello is an actual client,
@@ -1583,6 +1645,34 @@ mod tests {
             .unwrap();
     }
 
+    async fn complete_wire_connect_handshake<S>(daemon: &mut ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        confirm_client_lifetime(daemon).await;
+        let id = match daemon.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: Request::ExchangeLocalPeerCredential,
+                    ..
+                } => id,
+                other => panic!("expected peer credential exchange, got {other:?}"),
+            },
+            other => panic!("expected peer credential exchange envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(
+                id,
+                Response::LocalPeerCredential {
+                    token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                    role: proto::LocalClientRole::Cli,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn nil_daemon_status_is_known_hello() {
         assert!(is_nil_daemon_status_hello(
@@ -1629,16 +1719,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_connect_loads_owner_capability_for_acp_ingress() {
+    async fn wire_connect_exchanges_peer_credential_for_acp_ingress() {
         let (dir, socket, mut listener) = bind_test_socket();
-        let capability_path = owner_capability_path(&socket);
-        std::fs::write(&capability_path, b"test-owner-capability-token").unwrap();
 
         let server = tokio::spawn(async move {
             let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.capability", proto::PROTOCOL_VERSION).await;
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1658,7 +1746,7 @@ mod tests {
             let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1738,7 +1826,7 @@ mod tests {
             )
             .await;
             daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
             let request_id = match daemon.recv().await.unwrap().unwrap() {
                 proto::RecvFrame::Envelope(env) => match env.body {
                     Body::Request { id, request, .. } => {

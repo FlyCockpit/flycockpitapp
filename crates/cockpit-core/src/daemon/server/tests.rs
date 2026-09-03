@@ -2159,6 +2159,7 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
     let denied = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -2392,6 +2393,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(Some(actor.clone())),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -2428,6 +2430,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(None),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -3450,6 +3453,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4140,6 +4144,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4230,6 +4235,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4410,6 +4416,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let mut first = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333340"),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4417,6 +4424,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let mut second = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333341"),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -5315,6 +5323,7 @@ async fn media_security_recovery_denial_precedes_operation_table() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7312,6 +7321,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7337,6 +7347,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7360,6 +7371,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -8552,6 +8564,7 @@ fn remote_state_with_grants(
             actor_binding: None,
             authorization: crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants),
         }),
+        socket_peer: None,
         has_owner_capability: false,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
@@ -8596,6 +8609,7 @@ fn owner_state_with_instance(client_instance_id: Uuid) -> MutableClientState {
 fn owner_state() -> MutableClientState {
     MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -8663,12 +8677,14 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let ctx = test_ctx();
     let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
+    let peer = test_socket_peer();
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
-        ClientPrincipal::owner(),
+        ClientPrincipal::local_unauthenticated(peer),
         Uuid::new_v4(),
         false,
+        Some(peer),
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -8703,6 +8719,11 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     }
 
     let allowed_id = Uuid::now_v7();
+    let token = ctx.peer_credential_registry.mint(
+        peer,
+        crate::daemon::principal::LocalClientRole::Cli,
+        Vec::new(),
+    );
     client
         .send(&Envelope::request_with_owner_capability(
             allowed_id,
@@ -8710,9 +8731,7 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
                 name: "k".into(),
                 value: "v".into(),
             },
-            Some(proto::OwnerCapabilityToken::new(
-                ctx.owner_capability.token().to_string(),
-            )),
+            Some(proto::OwnerCapabilityToken::new(token.0)),
         ))
         .await
         .expect("send secret RPC with capability");
@@ -8731,6 +8750,31 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
 
     drop(client);
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn unauthenticated_local_socket_peer_is_denied_owner_rpcs() {
+    let ctx = test_ctx();
+    let peer = test_socket_peer();
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::local_unauthenticated(peer),
+        Some(peer),
+        test_terminal_host(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
+    );
+    let error = authorize_request(
+        &Request::PutNamedSecret {
+            name: "k".into(),
+            value: "v".into(),
+        },
+        &state,
+        &ctx,
+    )
+    .await
+    .expect_err("unauthenticated local peer must not call owner-only RPCs");
+    assert_eq!(error.code, ErrorCode::Authorization);
 }
 
 async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
@@ -16715,6 +16759,7 @@ async fn attached_state_with_worker_receiver(
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
+            socket_peer: None,
             has_owner_capability: true,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
@@ -17752,6 +17797,7 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -19609,6 +19655,25 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("release_exit_guard"),
         authz_owner_only("set_primary_assistant_soul_edit_mode"),
     ]
+}
+
+fn test_socket_peer() -> cockpit_host::peer_cred::PeerIdentity {
+    #[cfg(unix)]
+    {
+        cockpit_host::peer_cred::PeerIdentity {
+            pid: std::process::id(),
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        cockpit_host::peer_cred::PeerIdentity {
+            pid: std::process::id(),
+            uid: 0,
+            gid: 0,
+        }
+    }
 }
 
 fn test_stream_pair() -> (
@@ -25451,6 +25516,7 @@ async fn assert_terminal_mutating_happy(kind: &str) {
                 ClientPrincipal::owner(),
                 Uuid::new_v4(),
                 true,
+                None,
             ));
             match recv_body(&mut client).await {
                 Body::Response { id, response } => {
@@ -25529,6 +25595,7 @@ async fn assert_terminal_ingress_mutating_happy(kind: &str) {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     // Consume hello.
     match recv_body(&mut client).await {
@@ -30150,6 +30217,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -30803,6 +30871,7 @@ async fn image_submission_exact_retry_case() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -30942,6 +31011,7 @@ async fn image_submission_exact_retry_case() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -35193,6 +35263,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     drop(client);
     tokio::time::timeout(std::time::Duration::from_secs(2), task)
@@ -35213,6 +35284,7 @@ async fn hello_only_probe_does_not_claim_client_lifetime() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     let mut client = ProtoStream::new(client);
 
@@ -36311,6 +36383,7 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
     let mut parent_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -36395,6 +36468,7 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
     let mut btw_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -38170,6 +38244,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 
@@ -38286,6 +38361,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client =
         ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
@@ -38336,6 +38412,7 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 
@@ -38403,6 +38480,7 @@ async fn unknown_frame_event_is_dropped_and_connection_survives() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 

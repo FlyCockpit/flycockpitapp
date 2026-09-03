@@ -1535,6 +1535,8 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       // Daemon-private owner capability. Optional; required for `owner_only`
       // RPCs on the Unix-socket path. Absent on in-process and remote
       // connections. Mirrors Rust `Body::Request.owner_capability`.
+      // TODO(#337 TS): add `exchange_local_peer_credential` request/response and
+      // peer-bound credential exchange to the TypeScript protocol mirror.
       owner_capability: z.string().optional(),
       ...variant.shape,
     })

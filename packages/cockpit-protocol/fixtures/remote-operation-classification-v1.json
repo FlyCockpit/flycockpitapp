@@ -1291,15 +1291,20 @@
     {
       "class": "transactional_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1",
+      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|include_sensitive:bool",
       "fcorRoles": [
         {
           "field": "transfer",
           "role": "param",
           "type": "crate::bulk_transfer::BulkTransferRef"
+        },
+        {
+          "field": "include_sensitive",
+          "role": "param",
+          "type": "bool"
         }
       ],
-      "fcorSchema": "transfer:crate::bulk_transfer::BulkTransferRef",
+      "fcorSchema": "transfer:crate::bulk_transfer::BulkTransferRef|include_sensitive:bool",
       "strategy": "sql_transaction",
       "tag": "import_session_archive"
     },

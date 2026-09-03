@@ -241,10 +241,27 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         "import failed: {}",
         output_text(&imported)
     );
+    let imported_text = output_text(&imported);
     assert!(
-        output_text(&imported).contains("Imported 1 session"),
-        "import did not round-trip the export archive: {}",
-        output_text(&imported)
+        imported_text.contains("Imported 1 session"),
+        "import did not round-trip the export archive: {imported_text}"
+    );
+    assert!(
+        imported_text.contains("archive content was redacted"),
+        "import must report the archive's redacted provenance: {imported_text}"
+    );
+    // The printed destination id is the usable handle for the restored
+    // session: import mints fresh ids, so the source id is the wrong handle
+    // afterwards. Assert the fresh identity, then prove the restored session
+    // is usable by resuming it.
+    let imported_session_id = imported_text
+        .lines()
+        .find_map(|line| line.trim().parse::<uuid::Uuid>().ok())
+        .expect("import must print the fresh destination session id");
+    assert_ne!(
+        imported_session_id.to_string(),
+        session_id,
+        "import must mint a fresh destination session id, not reuse the source id"
     );
     let resumed = run(
         &session,
@@ -266,6 +283,90 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         }),
         "resumed provider request did not contain the durable prior content"
     );
+    // Resuming the imported destination session replays the restored
+    // transcript, so a missing or unusable import would fail here.
+    let imported_id_text = imported_session_id.to_string();
+    let imported_resume = run(
+        &session,
+        &[
+            "run",
+            "--session",
+            &imported_id_text,
+            "--json",
+            "resume imported session",
+        ],
+    );
+    assert!(
+        imported_resume.status.success(),
+        "resuming the imported session failed: {}",
+        output_text(&imported_resume)
+    );
+    assert!(
+        provider.captured().iter().any(|request| {
+            let body = request.body.to_string();
+            body.contains("durable release prompt")
+                && body.contains("durable release reply")
+                && body.contains("resume imported session")
+        }),
+        "resuming the imported session did not replay the restored transcript"
+    );
+    // The raw export path (`--include-sensitive`) pairs with an explicit raw
+    // import: without the acknowledgement the daemon refuses the unredacted
+    // archive fail-closed; with it the import reports unredacted provenance
+    // and warns, so the redaction-custody drop is never silent.
+    let raw_export = session.project_path().join("session-export-raw.zip");
+    let raw_export_text = raw_export.to_string_lossy().into_owned();
+    let raw = run(
+        &session,
+        &[
+            "export",
+            &session_id,
+            "--output",
+            &raw_export_text,
+            "--include-sensitive",
+        ],
+    );
+    assert!(raw.status.success(), "{}", output_text(&raw));
+    assert!(
+        output_text(&raw).contains("UNREDACTED"),
+        "raw export must print its mandatory warning: {}",
+        output_text(&raw)
+    );
+    let refused = run(&session, &["import", &raw_export_text]);
+    assert!(
+        !refused.status.success(),
+        "unredacted import without --include-sensitive must fail closed: {}",
+        output_text(&refused)
+    );
+    assert!(
+        output_text(&refused).contains("--include-sensitive"),
+        "the refusal must name the acknowledgement it requires: {}",
+        output_text(&refused)
+    );
+    let raw_imported = run(
+        &session,
+        &["import", &raw_export_text, "--include-sensitive"],
+    );
+    assert!(
+        raw_imported.status.success(),
+        "acknowledged unredacted import failed: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("Imported 1 session"),
+        "acknowledged unredacted import did not restore the archive: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("archive content was unredacted"),
+        "raw import must report unredacted provenance: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("UNREDACTED"),
+        "raw import must print its mandatory warning: {}",
+        output_text(&raw_imported)
+    );
     let file = std::fs::File::open(export).unwrap();
     let mut archive = zip::ZipArchive::new(file).unwrap();
     let mut exported = String::new();
@@ -279,6 +380,19 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     assert!(
         !exported.contains(secret),
         "redacted export leaked env-derived secret"
+    );
+    let mut raw_archive = zip::ZipArchive::new(std::fs::File::open(&raw_export).unwrap()).unwrap();
+    let mut raw_exported = String::new();
+    for index in 0..raw_archive.len() {
+        let mut entry = raw_archive.by_index(index).unwrap();
+        if entry.is_file() {
+            let _ = entry.read_to_string(&mut raw_exported);
+        }
+    }
+    assert!(raw_exported.contains("durable release reply"));
+    assert!(
+        raw_exported.contains(secret),
+        "the acknowledged raw export must contain the env-derived secret"
     );
     assert_no_network_attempt(&denied_network);
     assert!(

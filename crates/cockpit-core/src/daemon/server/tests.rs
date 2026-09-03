@@ -21038,6 +21038,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "import_session_archive" => Request::ImportSessionArchive {
             transfer: archive_transfer_ref(b"not-staged"),
+            include_sensitive: false,
         },
         "write_bulk_transfer_chunk" => Request::WriteBulkTransferChunk {
             transfer: archive_transfer_ref(b"chunk"),
@@ -25979,11 +25980,11 @@ async fn assert_auto_title_mutating_malformed() {
     assert!(!row.user_renamed);
 }
 
-fn minimal_import_archive_base64() -> (Uuid, String) {
+fn minimal_import_archive_base64(redacted: bool) -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
         "schema": "cockpit-session-export/4",
-        "redacted": false,
+        "redacted": redacted,
         "target": {
             "project_id": "import-dispatch-test",
             "project_root": "/tmp/import-dispatch-test"
@@ -26130,7 +26131,9 @@ async fn assert_write_bulk_transfer_chunk_malformed() {
 
 async fn assert_import_session_archive_happy() {
     let ctx = test_ctx();
-    let (session_id, archive_base64) = minimal_import_archive_base64();
+    // The default happy path is a redacted archive: it imports without any
+    // raw acknowledgement and reports redacted provenance.
+    let (session_id, archive_base64) = minimal_import_archive_base64(true);
     let archive_bytes = base64::engine::general_purpose::STANDARD
         .decode(archive_base64.as_bytes())
         .expect("fixture archive decodes");
@@ -26138,6 +26141,7 @@ async fn assert_import_session_archive_happy() {
         &ctx,
         Request::ImportSessionArchive {
             transfer: stage_archive_transfer(&archive_bytes),
+            include_sensitive: false,
         },
     )
     .await
@@ -26145,12 +26149,53 @@ async fn assert_import_session_archive_happy() {
     let imported = match response {
         Response::ImportSessionArchive {
             imported,
-            redacted: false,
+            redacted: true,
         } if imported.len() == 1 => imported[0],
         other => panic!("unexpected import response: {other:?}"),
     };
     assert_ne!(imported, session_id);
     assert!(ctx.db.get_session(imported).await.unwrap().is_some());
+
+    // An unredacted archive fails closed without the explicit acknowledgement:
+    // importing it would restore raw secret material without redaction custody.
+    let (raw_source_id, raw_archive_base64) = minimal_import_archive_base64(false);
+    let raw_archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw_archive_base64.as_bytes())
+        .expect("fixture archive decodes");
+    let refusal = dispatch_matrix_request(
+        &ctx,
+        Request::ImportSessionArchive {
+            transfer: stage_archive_transfer(&raw_archive_bytes),
+            include_sensitive: false,
+        },
+    )
+    .await
+    .expect_err("an unredacted archive must require the include-sensitive acknowledgement");
+    assert_eq!(refusal.code, ErrorCode::BadRequest);
+    assert!(
+        refusal.message.contains("--include-sensitive"),
+        "refusal must name the acknowledgement it requires: {}",
+        refusal.message
+    );
+
+    // With the acknowledgement the raw archive imports and reports that its
+    // content is unredacted, so the custody drop is never silent.
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::ImportSessionArchive {
+            transfer: stage_archive_transfer(&raw_archive_bytes),
+            include_sensitive: true,
+        },
+    )
+    .await
+    .expect("acknowledged unredacted archive imports");
+    match response {
+        Response::ImportSessionArchive {
+            imported,
+            redacted: false,
+        } if imported.len() == 1 => assert_ne!(imported[0], raw_source_id),
+        other => panic!("unexpected import response: {other:?}"),
+    }
 }
 
 async fn assert_import_session_archive_malformed() {
@@ -27869,6 +27914,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::ImportSessionArchive {
                 transfer: archive_transfer_ref(b"UEsDB"),
+                include_sensitive: false,
             },
             kind: "import_session_archive",
             session_id: None,

@@ -1330,7 +1330,14 @@ const requestParamSchemas = {
     })
     .strict(),
   unarchive_session: z.object({ session_id: uuidSchema }).strict(),
-  import_session_archive: z.object({ transfer: bulkTransferRefSchema }).strict(),
+  import_session_archive: z
+    .object({
+      transfer: bulkTransferRefSchema,
+      // Mirrors the Rust `#[serde(default)]`: absent means the fail-closed
+      // refusal of an unredacted archive.
+      include_sensitive: z.boolean().optional(),
+    })
+    .strict(),
   write_bulk_transfer_chunk: z
     .object({
       transfer: bulkTransferRefSchema,

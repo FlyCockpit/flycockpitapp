@@ -72,13 +72,28 @@ pub async fn run(args: ImportArgs) -> Result<()> {
         .await
         .context("starting persistent daemon for session import")?;
     let client = daemon.client.clone();
-    let bytes = std::fs::read(&args.file)
-        .with_context(|| format!("reading import archive {}", args.file.display()))?;
+    // Bound the read with the same compressed cap the daemon enforces
+    // (`archive_compressed_bytes` == the bulk-lane transfer limit), and refuse
+    // non-regular files before any content is accumulated: an oversized or
+    // FIFO/device path fails here instead of allocating or blocking the CLI.
+    let limits = cockpit_core::resource_limits::ResourceLimits::defaults();
+    let bytes = cockpit_host::bounded::read_at_most(&args.file, limits.archive_compressed_bytes)
+        .map_err(|error| match error {
+            cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. } => {
+                anyhow!("import archive exceeds the {limit} byte compressed limit ({actual} bytes)")
+            }
+            other => {
+                anyhow!(other).context(format!("reading import archive {}", args.file.display()))
+            }
+        })?;
     // The archive never rides one frame: push it as bounded bulk chunks,
     // then hand the daemon a reference it can verify.
     let transfer = push_bulk_transfer(&client, &bytes).await?;
     let imported = match client
-        .request_ok(Request::ImportSessionArchive { transfer })
+        .request_ok(Request::ImportSessionArchive {
+            transfer,
+            include_sensitive: args.include_sensitive,
+        })
         .await?
     {
         Response::ImportSessionArchive { imported, redacted } => {
@@ -88,8 +103,18 @@ pub async fn run(args: ImportArgs) -> Result<()> {
             anyhow::bail!("daemon returned unexpected response to session import: {other:?}")
         }
     };
+    if !imported.redacted {
+        // Mandatory warning on every raw import, mirroring the export side:
+        // the restored events carry raw secrets whose redaction custody this
+        // machine cannot reconstruct. Emitted to stderr so it is visible even
+        // when stdout is captured by a script.
+        eprintln!("{}", raw_import_stderr_warning());
+    }
+    // The imported ids are the usable handles for the restored sessions:
+    // import always mints fresh destination ids, so the source id is the wrong
+    // handle afterwards. Print one id per line so scripts can consume them.
     println!(
-        "Imported {} session{}{}.",
+        "Imported {} session{}{}:",
         imported.imported.len(),
         if imported.imported.len() == 1 {
             ""
@@ -99,8 +124,24 @@ pub async fn run(args: ImportArgs) -> Result<()> {
         if imported.redacted {
             "; archive content was redacted"
         } else {
-            ""
+            "; archive content was unredacted"
         },
     );
+    for id in &imported.imported {
+        println!("  {id}");
+    }
     Ok(())
+}
+
+/// The mandatory stderr warning printed on every acknowledged unredacted
+/// import. It mirrors the export side's raw warning: the restored sessions
+/// contain raw secret material whose custody cannot be reconstructed here,
+/// and the copy must state that plainly so a user cannot mistake the result
+/// for a normally-redacted restore.
+fn raw_import_stderr_warning() -> String {
+    "warning: `--include-sensitive` imported an UNREDACTED session archive — the restored \
+     sessions contain raw secrets from the exporting machine, and redaction custody for them \
+     cannot be reconstructed on this machine; outbound egress scrubs only secrets still \
+     present in this environment. Handle the restored sessions as sensitive material."
+        .to_owned()
 }

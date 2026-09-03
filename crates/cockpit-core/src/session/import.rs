@@ -39,8 +39,31 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
-pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportResult> {
+/// Import a parsed session archive into `db`.
+///
+/// `include_sensitive` is the explicit raw-custody acknowledgement for an
+/// unredacted archive (`redacted == false`, written by
+/// `cockpit export --include-sensitive`). It is the import-side mirror of the
+/// export side's single raw opt-in, and it is fail-closed: an unredacted
+/// archive restores raw secret material into destination events while the
+/// destination can only install an empty redaction table — the source
+/// machine's secret catalog does not travel with the archive, so redaction
+/// custody for that historical material cannot be reconstructed. Refusing
+/// without an explicit acknowledgement keeps that custody drop from being
+/// silent; with the acknowledgement it is the caller's informed choice.
+pub async fn import_archive(
+    db: &Db,
+    archive: ImportArchive,
+    include_sensitive: bool,
+) -> Result<ImportResult> {
     let mut archive = archive;
+    if !archive.redacted && !include_sensitive {
+        bail!(
+            "unredacted session archive: importing it restores raw secret material into \
+             destination events without redaction custody; pass an explicit \
+             include-sensitive acknowledgement to import it anyway"
+        );
+    }
     stage_blob_backed_import_artifacts(db, &mut archive).await?;
     let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
         anyhow!("opening vault for imported session redaction custody: {error}")
@@ -1544,7 +1567,7 @@ mod tests {
             inference_calls: Vec::new(),
             tool_calls: Vec::new(),
         };
-        import_archive(&db, archive).await.unwrap();
+        import_archive(&db, archive, false).await.unwrap();
         let child_uuid: String = db
             .read(|conn| {
                 let child_uuid = conn.query_row(
@@ -1691,7 +1714,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
         assert_ne!(imported.imported, vec![id]);
         assert!(db.get_session(id).await.unwrap().is_some());
         assert!(
@@ -1728,7 +1751,7 @@ mod tests {
             true,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, false).await.unwrap();
         assert_ne!(imported.imported[0], id);
         let restored = db.get_session(imported.imported[0]).await.unwrap().unwrap();
         assert_eq!(restored.short_id.as_deref(), Some("ab3def"));
@@ -1749,7 +1772,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let error = import_archive(&db, archive).await.unwrap_err();
+        let error = import_archive(&db, archive, true).await.unwrap_err();
         assert!(error.to_string().contains("cyclic"));
         assert!(db.get_session(root).await.unwrap().is_none());
         assert!(db.get_session(cycle).await.unwrap().is_none());
@@ -1807,7 +1830,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(
             events
@@ -1857,7 +1880,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         let hook_rows: Vec<_> = events.iter().filter(|e| e.kind == "hook_run").collect();
         assert_eq!(hook_rows.len(), 1, "exactly one hook_run row restored");
@@ -1881,7 +1904,7 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            import_archive(&db_forbidden, archive).await.is_err(),
+            import_archive(&db_forbidden, archive, true).await.is_err(),
             "hook_run with a field outside the closed audit projection must be rejected"
         );
         assert!(
@@ -1902,7 +1925,9 @@ mod tests {
         let bytes = archive_bytes(vec![session(unknown_id, None)], vec![unknown], false);
         let error = match read_archive_bytes(&bytes) {
             Err(error) => error,
-            Ok(archive) => import_archive(&db_unknown, archive).await.unwrap_err(),
+            Ok(archive) => import_archive(&db_unknown, archive, true)
+                .await
+                .unwrap_err(),
         };
         assert!(
             error.to_string().contains("unsupported import event type"),
@@ -1928,7 +1953,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
         assert_eq!(imported.imported.len(), 2);
         let root_destination_id = imported.imported[0];
         let child_destination_id = imported.imported[1];
@@ -2033,7 +2058,7 @@ mod tests {
         let archive =
             read_archive_bytes(&archive_bytes(vec![without_model], vec![], false)).unwrap();
 
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
         let destination_id = imported.imported[0];
 
         assert_ne!(destination_id, id);
@@ -2105,7 +2130,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        import_archive(&db, archive).await.unwrap();
+        import_archive(&db, archive, true).await.unwrap();
         let violations: Option<String> = db
             .read(|conn| {
                 Ok(conn
@@ -2127,13 +2152,69 @@ mod tests {
             true,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive).await.unwrap();
+        let imported = import_archive(&db, archive, false).await.unwrap();
         assert!(imported.redacted);
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "notice"
             && event.data["source"] == "session_import"
             && event.data["redacted"] == true));
     }
+
+    #[tokio::test]
+    async fn import_refuses_an_unredacted_archive_without_the_explicit_ack() {
+        let db = Db::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let archive =
+            read_archive_bytes(&archive_bytes(vec![session(id, None)], vec![], false)).unwrap();
+        let error = import_archive(&db, archive, false).await.unwrap_err();
+        assert!(
+            error.to_string().contains("unredacted"),
+            "refusal must name the unredacted archive: {error}"
+        );
+        assert!(
+            error.to_string().contains("include-sensitive"),
+            "refusal must name the acknowledgement it requires: {error}"
+        );
+        let sessions: i64 = db
+            .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "a refused unredacted import must leave no destination rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn unredacted_import_with_the_explicit_ack_records_uncustodied_provenance() {
+        // The acknowledgement is the caller's informed choice: custody is still
+        // established fail-closed (an empty table the live scan unions with),
+        // and the durable provenance notice records that the restored content
+        // is unredacted rather than letting the custody drop pass silently.
+        let db = Db::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let archive = read_archive_bytes(&archive_bytes(
+            vec![session(id, None)],
+            vec![event(id, 7)],
+            false,
+        ))
+        .unwrap();
+        let imported = import_archive(&db, archive, true).await.unwrap();
+        assert!(!imported.redacted);
+        let destination_id = imported.imported[0];
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        crate::session::lifecycle::require_redaction_table_json_from_vault(
+            &vault,
+            destination_id,
+            "imported session redaction custody",
+        )
+        .expect("import must establish vault redaction custody for the destination session");
+        let events = db.list_session_events(destination_id).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "notice"
+            && event.data["source"] == "session_import"
+            && event.data["redacted"] == false));
+    }
+
     #[tokio::test]
     async fn import_ignores_approval_grants() {
         let source = Db::open_in_memory().unwrap();
@@ -2164,7 +2245,7 @@ mod tests {
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();
-        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
+        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap(), false)
             .await
             .unwrap();
         let destination_id = imported.imported[0];
@@ -2259,15 +2340,16 @@ mod tests {
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();
-        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
+        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap(), false)
             .await
             .unwrap();
         assert_eq!(imported.imported.len(), 1);
         let destination_id = imported.imported[0];
         assert_ne!(destination_id, source_id);
-        let imported_again = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
-            .await
-            .unwrap();
+        let imported_again =
+            import_archive(&destination, read_archive_bytes(&bytes).unwrap(), false)
+                .await
+                .unwrap();
         assert_eq!(imported_again.imported.len(), 1);
         assert_ne!(imported_again.imported[0], source_id);
         assert_ne!(imported_again.imported[0], destination_id);

@@ -1564,6 +1564,15 @@ pub struct ExportArgs {
 pub struct ImportArgs {
     /// Session export archive (`.zip`) created by `cockpit export`.
     pub file: PathBuf,
+
+    /// EXPLICIT RAW IMPORT ACKNOWLEDGEMENT. Required to import an archive
+    /// written by `cockpit export --include-sensitive`: such an archive
+    /// restores raw secret material into the destination session's events,
+    /// and redaction custody for those source-machine secrets cannot be
+    /// reconstructed on this machine. A stderr warning is printed on every
+    /// use. Without this flag an unredacted archive is refused.
+    #[arg(long)]
+    pub include_sensitive: bool,
 }
 
 /// Scope toggle for `cockpit stats`.

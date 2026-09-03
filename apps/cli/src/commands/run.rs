@@ -831,24 +831,27 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
     let images: Vec<Vec<u8>> = paths
         .iter()
         .map(|path| {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading attachment {}", path.display()))?;
+            // Bound the read with the same image cap the wire enforces, and
+            // refuse non-regular files before any content is accumulated, so
+            // an oversized or FIFO/device attachment fails here instead of
+            // allocating or blocking the CLI.
+            let bytes =
+                cockpit_host::bounded::read_at_most(path, proto::MAX_SINGLE_IMAGE_BYTES as u64)
+                    .map_err(|error| match error {
+                        cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. } => {
+                            RunUsageError(format!(
+                                "image is too large: {actual} bytes exceeds {limit} byte limit"
+                            ))
+                            .into()
+                        }
+                        other => anyhow::Error::new(other)
+                            .context(format!("reading attachment {}", path.display())),
+                    })?;
             crate::daemon::server::validate_png_attachment_blocking(bytes)
                 .map(|validated| validated.bytes)
                 .map_err(|error| anyhow::anyhow!(error.message))
         })
-        .collect::<Result<_>>()?;
-    if let Some(image) = images
-        .iter()
-        .find(|image| image.len() > proto::MAX_SINGLE_IMAGE_BYTES)
-    {
-        return Err(RunUsageError(format!(
-            "image is too large: {} bytes exceeds {} byte limit",
-            image.len(),
-            proto::MAX_SINGLE_IMAGE_BYTES
-        ))
-        .into());
-    }
+        .collect::<Result<_>>()?();
     let total: usize = images.iter().map(Vec::len).sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(RunUsageError(format!(
@@ -945,7 +948,15 @@ fn build_prompt_from_reader(args: &RunArgs, root: &Path, stdin: &mut impl Read) 
         } else {
             root.join(path)
         };
-        return std::fs::read_to_string(&path)
+        // Bound the read with the message-text cap the daemon's ingress
+        // enforces, so an oversized or non-regular prompt file fails here
+        // instead of allocating or blocking the CLI before any cap runs.
+        let bytes = cockpit_host::bounded::read_at_most(
+            &path,
+            proto::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64,
+        )
+        .with_context(|| format!("reading prompt file {}", path.display()))?;
+        return String::from_utf8(bytes)
             .with_context(|| format!("reading prompt file {}", path.display()));
     }
 

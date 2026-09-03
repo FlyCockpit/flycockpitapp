@@ -3251,12 +3251,10 @@ mod tests {
             .await
             .unwrap();
 
-        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
         assert_eq!(
             approver.authorize(scenario.request()).await.unwrap(),
             Decision::Allow { scope: Scope::Once }
         );
-        resolver.await.unwrap();
         assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
@@ -3328,14 +3326,12 @@ mod tests {
             .await
             .unwrap();
 
-        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
         assert_eq!(
             approver.authorize(scenario.request()).await.unwrap(),
             Decision::StandingReject {
                 scope: Scope::Session
             }
         );
-        resolver.await.unwrap();
         assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
@@ -3401,7 +3397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_egress_standing_gate_forget_reprompts() {
+    async fn media_egress_revoked_grant_reprompts() {
         let tmp = tempfile::tempdir().unwrap();
         let approver =
             approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
@@ -3421,8 +3417,13 @@ mod tests {
             )
             .await
             .unwrap();
+        approver
+            .store
+            .revoke_media_egress_verdict("transcription", scenario.request_digest.as_str())
+            .await
+            .unwrap();
 
-        let resolver = resolve_sequence(&approver, &[ID_MORE_OPTIONS, ID_APPROVE_ONCE]);
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
         assert_eq!(
             approver.authorize(scenario.request()).await.unwrap(),
             Decision::Allow { scope: Scope::Once }

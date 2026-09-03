@@ -251,15 +251,14 @@ fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) ->
     // no concepts. The interactive `knowledgeDreamApply` contract requires a
     // non-empty write list, but the sink must still accept that no-op so the
     // run can record its source sessions as dreamed.
+    // The per-apply write count is bounded inside the shared validation, so
+    // the funnel's second-layer scan of every upsert and the bound coincide
+    // (issue #273).
     let writes = if writes.is_empty() {
         writes
     } else {
         validate_knowledge_dream_writes(writes)?
     };
-    ensure!(
-        writes.len() <= super::MAX_KNOWLEDGE_FILES,
-        "dream change set exceeds the knowledge file-count limit"
-    );
     let mut total_bytes = 0_usize;
     for write in &writes {
         ensure!(
@@ -420,7 +419,54 @@ impl DreamEngine {
                 .session
                 .recall_redaction_table_from_base(&redaction, source.session_id)?;
         }
-        let redacted = redact_and_validate_change_set(change_set, &redaction)?;
+        let mut redacted = redact_and_validate_change_set(change_set, &redaction)?;
+        // Utility-model second layer over model-authored orchestrated dream
+        // output (issue #273): the same quarantine the interactive
+        // `knowledgeDreamApply` tool applies, at the single funnel every
+        // dream sink receives its change set through, so no sink (local or
+        // future hosted) can bypass it. The bound and the scan coincide —
+        // every upsert is scanned, and the count is capped first — so no
+        // write position predictably escapes the second layer. A
+        // floor-flagged upsert short-circuits (the shared write validation
+        // in the sink neutralizes it); the marker is retained in the body so
+        // the persisted file re-fences on every later read. A missing or
+        // unavailable model degrades to that floor.
+        ensure!(
+            redacted.upserts.len() <= super::MAX_KNOWLEDGE_DREAM_WRITES,
+            "orchestrated dream change set exceeds the per-apply write bound"
+        );
+        let guard = super::KbUtilityGuard::new(
+            config,
+            providers.clone(),
+            Arc::new(redaction),
+            &self.session.project_root,
+        );
+        for upsert in &mut redacted.upserts {
+            // Scan the exact serialized OKF document the sink will write
+            // (frontmatter included), then retain the quarantine marker in
+            // the body it serializes from.
+            let concept = KnowledgeConcept::dream(
+                upsert.id.clone(),
+                upsert.concept_type.clone(),
+                upsert.title.clone(),
+                upsert.body.clone(),
+                upsert.citations.clone(),
+            );
+            let serialized = super::serialize_concept(&concept);
+            if super::utility_quarantine_finding_for_dream_write(&serialized, &guard)
+                .await
+                .is_some()
+            {
+                tracing::warn!(
+                    concept_id = %upsert.id,
+                    "quarantining orchestrated dream concept flagged by the utility-model injection guard"
+                );
+                upsert.body.push_str("\n\n");
+                upsert
+                    .body
+                    .push_str(super::DREAM_INJECTION_NEUTRALIZED_MARKER);
+            }
+        }
         let sink_outcome = sink.apply(&model, &redacted, cancel).await?;
         if matches!(sink_outcome, KnowledgeDreamGitOutcome::Deferred { .. }) {
             return Ok(DreamRunOutcome::Deferred {

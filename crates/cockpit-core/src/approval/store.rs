@@ -984,6 +984,59 @@ impl GrantStore {
         }
     }
 
+    // ---- media-egress grants ---------------------------------------------
+
+    /// Exact digest lookup for transcription media egress. A matching session
+    /// grant lets Manual/Auto short-circuit without re-prompting the human.
+    pub async fn media_egress_grant_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<bool, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL)",
+                    rusqlite::params![session_id, purpose, request_digest],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    pub(super) async fn record_media_egress_grant(
+        &self,
+        project_id: &str,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO media_egress_grants (grant_id,session_id,project_id,purpose,request_digest,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'allow',?6,NULL)",
+                    rusqlite::params![
+                        uuid::Uuid::now_v7().to_string(),
+                        session_id,
+                        project_id,
+                        purpose,
+                        request_digest,
+                        now_epoch_seconds() * 1000
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
     // ---- image-generation grants -----------------------------------------
 
     /// Dominance lookup for reusable image-generation grants. Session grants
@@ -6257,6 +6310,39 @@ mod image_generation_grant_tests {
                 .image_generation_grant_scope_bounded(&project_id, bounds)
                 .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn media_egress_grant_matches_exact_digest_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_grant_matches(
+                    "transcription",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .await
+                .unwrap()
         );
     }
 }

@@ -3169,6 +3169,142 @@ mod tests {
         );
     }
 
+    struct MediaEgressScenario {
+        request_digest: crate::audio_transcription::authorization::MediaEgressRequestDigest,
+        credential_fingerprint_digest: crate::image_sidecar::CredentialFingerprintDigest,
+    }
+
+    impl MediaEgressScenario {
+        fn base() -> Self {
+            Self {
+                request_digest:
+                    crate::audio_transcription::authorization::MediaEgressRequestDigest::from_raw_for_test(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    ),
+                credential_fingerprint_digest:
+                    crate::image_sidecar::CredentialFingerprintDigest::from_raw_for_test(
+                        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                    ),
+            }
+        }
+
+        fn request(&self) -> AuthorizationRequest<'_> {
+            AuthorizationRequest::MediaEgress {
+                request_digest: &self.request_digest,
+                purpose: "transcription",
+                provider_id: "openai",
+                model_id: "gpt-transcribe",
+                credential_fingerprint_digest: &self.credential_fingerprint_digest,
+                origin: "api.openai.com",
+                resolved_location: "us-east-1",
+                project_digest: "project-digest",
+                session_id: "session-1",
+                attachment_id: "attachment-1",
+                attachment_checksum: "checksum-1",
+                interval_start_us: 0,
+                interval_end_us: 1_000_000,
+                prompt_present: false,
+                keyword_count: 0,
+                language_count: 0,
+                timestamps: "off",
+                diarization: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn media_egress_manual_no_grant_asks_then_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = MediaEgressScenario::base();
+        let questions = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver.authorize(scenario.request()).await.unwrap();
+        let questions = questions.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        assert_eq!(
+            questions.len(),
+            1,
+            "exactly one transcription prompt raised"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_egress_matching_grant_skips_reprompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = MediaEgressScenario::base();
+        let project_id = approver
+            .session
+            .as_deref()
+            .expect("test approver has an attached session")
+            .project_id
+            .clone();
+        approver
+            .store
+            .record_media_egress_grant(
+                &project_id,
+                "transcription",
+                scenario.request_digest.as_str(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
+    }
+
+    #[tokio::test]
+    async fn media_egress_different_digest_still_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = MediaEgressScenario::base();
+        let project_id = approver
+            .session
+            .as_deref()
+            .expect("test approver has an attached session")
+            .project_id
+            .clone();
+        approver
+            .store
+            .record_media_egress_grant(
+                &project_id,
+                "transcription",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .unwrap();
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver.authorize(scenario.request()).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+    }
+
+    #[tokio::test]
+    async fn media_egress_approved_once_persists_matching_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = MediaEgressScenario::base();
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+        resolver.await.unwrap();
+
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
+    }
+
     #[tokio::test]
     async fn authorize_empty_command_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();

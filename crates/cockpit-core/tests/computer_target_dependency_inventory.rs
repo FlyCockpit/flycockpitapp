@@ -643,6 +643,7 @@ impl<'ast> Visit<'ast> for PostBoundaryCallAudit {
         }
         if call.method == "require_live_injection_window"
             || call.method == "require_evidenced_window"
+            || call.method == "require_cleanup_injection_window"
         {
             self.0.push(PostBoundaryCall::WindowRecheck);
         }
@@ -712,10 +713,11 @@ impl<'ast> Visit<'ast> for CoreGraphicsPostAudit {
                     .to_string(),
             );
         }
-        if segments.ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()]) {
+        if segments.ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()])
+            && self.current_function.as_deref() != Some("post_event")
+        {
             self.violations.push(
-                "process-directed CGEvent::post_to_pid is forbidden; CoreGraphics cannot address a window"
-                    .to_string(),
+                "process-directed CGEvent::post_to_pid is forbidden outside post_event".to_string(),
             );
         }
         for identifier in &segments {
@@ -832,7 +834,7 @@ fn physical_backend_irreversible_primitive_inventory() {
     assert!(violations.is_empty(), "{violations:#?}");
     assert!(
         raw_posts.is_empty(),
-        "CoreGraphics has no window-targeted post; every event must refuse rather than post: {raw_posts:?}"
+        "CoreGraphics posts outside post_event: {raw_posts:?}"
     );
     let mut calls = StructuralCallAudit::default();
     calls.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
@@ -843,13 +845,26 @@ fn physical_backend_irreversible_primitive_inventory() {
             calls.0
         );
     }
+    assert!(
+        calls
+            .0
+            .iter()
+            .any(|call| call == "post_to_pid" || call.ends_with("::post_to_pid")),
+        "post_event AST lost required call post_to_pid: {:?}",
+        calls.0
+    );
     let mac_post_src = mac
         .split("fn post_event")
         .nth(1)
         .expect("post_event source");
     assert!(
-        mac_post_src.contains("CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW"),
-        "post_event must refuse: CoreGraphics cannot address the evidenced window"
+        mac_post_src.contains("post_to_pid"),
+        "post_event must deliver to the evidenced process after AX object identity matches"
+    );
+    assert!(
+        mac_post_src.contains("require_live_injection_window")
+            && mac_post_src.contains("require_cleanup_injection_window"),
+        "post_event must re-verify the retained AX window object at delivery"
     );
     let mut post_boundary = PostBoundaryCallAudit::default();
     post_boundary.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
@@ -860,8 +875,12 @@ fn physical_backend_irreversible_primitive_inventory() {
             PostBoundaryCall::CapabilityRecheck,
             PostBoundaryCall::WindowRecheck,
             PostBoundaryCall::WindowRecheck,
+            PostBoundaryCall::RawPost,
+            PostBoundaryCall::WindowRecheck,
+            PostBoundaryCall::WindowRecheck,
         ],
-        "post_event must structurally recheck session, capability, and evidenced window before refusing"
+        "post_event must structurally recheck session, capability, and evidenced AX window before and after post_to_pid: {:?}",
+        post_boundary.0
     );
     assert!(
         calls
@@ -870,12 +889,31 @@ fn physical_backend_irreversible_primitive_inventory() {
             .any(|call| call == "rollback_known_pre_post_refusal"),
         "known pre-post refusals must structurally enter exact rollback"
     );
+    let mut mac_bind = StructuralCallAudit::default();
+    mac_bind.visit_impl_item_fn(impl_method(&mac_syntax, "bind_evidenced_window"));
+    assert!(
+        mac_bind
+            .0
+            .iter()
+            .any(|call| call == "live_focused_macos_injection_target"
+                || call.ends_with("::live_focused_macos_injection_target")),
+        "macOS bind must retain the live AX window object: {:?}",
+        mac_bind.0
+    );
 
     let mut windows_post = StructuralCallAudit::default();
     windows_post.visit_impl_item_fn(impl_method(&windows_syntax, "post_to_target"));
     assert!(
         windows_post.0.iter().any(|call| call == "PostMessageW"),
         "Windows post_to_target must post to the evidenced HWND: {:?}",
+        windows_post.0
+    );
+    assert!(
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "hwnd_identity_prop_is_live"),
+        "Windows post_to_target must re-check the planted HWND identity at delivery: {:?}",
         windows_post.0
     );
     let windows_source = std::fs::read_to_string(core.join("computer/platform/windows_native.rs"))

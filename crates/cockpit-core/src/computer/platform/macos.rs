@@ -962,9 +962,12 @@ impl MacFocusedWindowLifetimeEpoch {
 ///
 /// The witness API is deliberately restricted to thread-safe CF operations:
 /// object-identity comparison and the atomic `CFRetain`/`CFRelease` of the
-/// retained pointer. Accessibility messaging is never routed through it.
+/// retained pointer. Accessibility messaging is never routed through it;
+/// the input backend's liveness check uses [`ax_window_element_is_live`] on
+/// the inner element from the dispatch thread.
 #[cfg(target_os = "macos")]
-struct MacFocusedWindowWitness(
+#[derive(Clone)]
+pub(crate) struct MacFocusedWindowWitness(
     objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
 );
 
@@ -979,8 +982,12 @@ impl MacFocusedWindowWitness {
     /// `CFEqual` object-identity comparison against a freshly acquired AX
     /// element. This is AX's object identity, not a comparison of window
     /// bounds or recyclable window numbers.
-    fn same_element(&self, element: &objc2_application_services::AXUIElement) -> bool {
+    pub(crate) fn same_element(&self, element: &objc2_application_services::AXUIElement) -> bool {
         objc2_core_foundation::CFEqual(Some(self.0.as_ref()), Some(element))
+    }
+
+    pub(crate) fn element(&self) -> &objc2_application_services::AXUIElement {
+        &self.0
     }
 }
 
@@ -1508,10 +1515,17 @@ fn cg_window_number_for_ax_window(
 ///
 /// This is the same AX/CG join the evidence adapter uses for targeting
 /// fields. The adapter additionally mixes the AX lifetime epoch into the
-/// opaque id; the backend compares pid and CGWindowID immediately before
-/// each process-directed post.
+/// opaque id; the backend retains the AX object so a recycled PID/window
+/// number pair cannot match at delivery.
 #[cfg(target_os = "macos")]
-pub(crate) fn live_focused_macos_window() -> Result<MacLiveFocusedWindow, TargetUnavailableReason> {
+pub(crate) struct MacLiveInjectionTarget {
+    pub window: MacLiveFocusedWindow,
+    pub ax: MacFocusedWindowWitness,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn live_focused_macos_injection_target()
+-> Result<MacLiveInjectionTarget, TargetUnavailableReason> {
     use objc2_app_kit::NSWorkspace;
     use objc2_application_services::AXUIElement;
 
@@ -1542,10 +1556,20 @@ pub(crate) fn live_focused_macos_window() -> Result<MacLiveFocusedWindow, Target
     if window_number == 0 {
         return Err(TargetUnavailableReason::FocusIdentityUnavailable);
     }
-    Ok(MacLiveFocusedWindow {
-        pid: frontmost_pid,
-        window_number,
+    Ok(MacLiveInjectionTarget {
+        window: MacLiveFocusedWindow {
+            pid: frontmost_pid,
+            window_number,
+        },
+        ax: MacFocusedWindowWitness::new(window),
     })
+}
+
+/// True when the retained AX window object still answers attribute queries.
+/// A destroyed window (and therefore a recycled PID/window-number pair) fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn ax_window_element_is_live(element: &objc2_application_services::AXUIElement) -> bool {
+    ax_attribute(element, MacAxAttribute::Role).is_ok()
 }
 
 #[cfg(target_os = "macos")]

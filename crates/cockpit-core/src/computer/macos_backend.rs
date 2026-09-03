@@ -24,7 +24,8 @@ use super::{
     click_repetitions, eased_progress, scale_png,
 };
 use crate::computer::platform::{
-    MacLiveFocusedWindow, live_focused_macos_window, macos_injection_target_from_opaque,
+    MacFocusedWindowWitness, MacLiveFocusedWindow, ax_window_element_is_live,
+    live_focused_macos_injection_target, macos_injection_target_from_opaque,
 };
 use crate::computer::target::{BackendKind, OpaqueWindowId};
 
@@ -46,11 +47,12 @@ pub(super) struct MacOsComputerBackend {
     evidenced_window: Option<EvidencedMacWindow>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct EvidencedMacWindow {
     opaque: OpaqueWindowId,
     pid: u32,
     window_number: u32,
+    ax: MacFocusedWindowWitness,
 }
 
 // CoreGraphics' immutable event source is safe to retain behind the backend's
@@ -269,21 +271,32 @@ impl MacOsComputerBackend {
     }
 
     fn require_evidenced_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
-        self.evidenced_window.ok_or_else(|| {
+        self.evidenced_window.clone().ok_or_else(|| {
             ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
         })
     }
 
     fn require_live_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
         let bound = self.require_evidenced_window()?;
-        let live = live_focused_macos_window()
+        let live = live_focused_macos_injection_target()
             .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
-        if live
+        if live.window
             != (MacLiveFocusedWindow {
                 pid: bound.pid,
                 window_number: bound.window_number,
             })
+            || !bound.ax.same_element(live.ax.element())
         {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        Ok(bound)
+    }
+
+    fn require_cleanup_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
+        let bound = self.require_evidenced_window()?;
+        if !ax_window_element_is_live(bound.ax.element()) {
             return Err(ComputerError::Refused(
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
@@ -465,14 +478,15 @@ impl MacOsComputerBackend {
         }
     }
 
-    /// Sole CoreGraphics post primitive. Every event, including cleanup
-    /// releases, must pass the retained active-console-session rebound and the
-    /// evidenced-window check. CoreGraphics can post to a pid or to the session
-    /// HID tap; neither syscall accepts a CGWindowID, so this primitive refuses
-    /// rather than delivering to a sibling window of the evidenced process.
+    /// Sole irreversible CoreGraphics post primitive. Every event, including
+    /// cleanup releases, must pass the retained active-console-session rebound
+    /// and the evidenced AX window-object check immediately before posting.
+    /// CoreGraphics cannot accept a CGWindowID, so delivery is process-directed
+    /// (`post_to_pid`) only after the retained AX object still names the
+    /// evidenced window — a recycled PID/window-number pair compares unequal.
     fn post_event(
         &mut self,
-        _event: &CGEvent,
+        event: &CGEvent,
         transition: Option<InputTransition>,
         require_live_window: bool,
     ) -> Result<(), ComputerError> {
@@ -483,7 +497,8 @@ impl MacOsComputerBackend {
         // `prepare` is the final blocking pre-post operation: it durably marks
         // ownership uncertain before a down/up transition can reach the host.
         // Rebind both retained identities after that write, at the last
-        // reversible boundary.
+        // reversible boundary. Do not insert fallible or blocking work between
+        // these checks and the irreversible post.
         if self.active_console_session.recheck().is_err() {
             return self.rollback_known_pre_post_refusal(
                 prepared,
@@ -501,17 +516,57 @@ impl MacOsComputerBackend {
         if let Err(error) = capability_check {
             return self.rollback_known_pre_post_refusal(prepared, error);
         }
-        if require_live_window {
-            if let Err(error) = self.require_live_injection_window() {
-                return self.rollback_known_pre_post_refusal(prepared, error);
+        let bound = if require_live_window {
+            match self.require_live_injection_window() {
+                Ok(bound) => bound,
+                Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
             }
-        } else if let Err(error) = self.require_evidenced_window() {
-            return self.rollback_known_pre_post_refusal(prepared, error);
+        } else {
+            match self.require_cleanup_injection_window() {
+                Ok(bound) => bound,
+                Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
+            }
         };
-        self.rollback_known_pre_post_refusal(
-            prepared,
-            ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string()),
-        )
+        let pid = match libc::pid_t::try_from(bound.pid) {
+            Ok(pid) => pid,
+            Err(_) => {
+                return self.rollback_known_pre_post_refusal(
+                    prepared,
+                    ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string()),
+                );
+            }
+        };
+        CGEvent::post_to_pid(pid, Some(event));
+
+        // From the post onward this backend owns the transition even if the
+        // commit write fails. Update process-local cleanup ownership first;
+        // a failed commit deliberately leaves the durable record pending so a
+        // later process cannot guess whether the event reached the host.
+        match transition {
+            Some(InputTransition::KeyDown(code)) => {
+                self.outstanding_keys.insert(code);
+            }
+            Some(InputTransition::KeyUp(code)) => {
+                self.outstanding_keys.remove(&code);
+            }
+            Some(InputTransition::ButtonDown(button)) => {
+                self.outstanding_buttons.insert(button);
+            }
+            Some(InputTransition::ButtonUp(button)) => {
+                self.outstanding_buttons.remove(&button);
+            }
+            None => {}
+        }
+        if transition.is_some() {
+            self.input_authority
+                .commit(&self.outstanding_keys, &self.outstanding_buttons)?;
+        }
+        let identity_after = if require_live_window {
+            self.require_live_injection_window()
+        } else {
+            self.require_cleanup_injection_window()
+        };
+        identity_after.map(|_| ())
     }
 
     /// A refusal before the raw post is a known non-effect. Restore the exact
@@ -849,16 +904,29 @@ impl ComputerBackend for MacOsComputerBackend {
     }
 
     fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
-        // Decode so a non-macOS identity is refused for the same reason as a
-        // well-formed one: CoreGraphics cannot address `window_number`.
-        let Some((_pid, _window_number)) = macos_injection_target_from_opaque(&window) else {
+        if let Some(bound) = &self.evidenced_window
+            && bound.opaque == window
+        {
+            return self.require_live_injection_window().map(|_| ());
+        }
+        let (pid, window_number) =
+            macos_injection_target_from_opaque(&window).ok_or_else(|| {
+                ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string())
+            })?;
+        let live = live_focused_macos_injection_target()
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        if live.window != (MacLiveFocusedWindow { pid, window_number }) {
             return Err(ComputerError::Refused(
-                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
-        };
-        Err(ComputerError::Refused(
-            CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
-        ))
+        }
+        self.evidenced_window = Some(EvidencedMacWindow {
+            opaque: window,
+            pid,
+            window_number,
+            ax: live.ax,
+        });
+        self.require_live_injection_window().map(|_| ())
     }
 
     fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {

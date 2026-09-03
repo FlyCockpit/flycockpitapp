@@ -37,10 +37,11 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT, GetAncestor, GetClassNameW, GetClientRect,
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsChild,
-    IsWindow, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    GetForegroundWindow, GetPropW, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    IsChild, IsWindow, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetPropW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -230,6 +231,11 @@ impl WindowsDesktopBackend {
         }
         let live = opaque_id_for_hwnd(hwnd)?;
         if live != bound.opaque {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
             return Err(ComputerError::Refused(
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
@@ -498,25 +504,49 @@ impl WindowsDesktopBackend {
     fn move_cursor(&mut self, point: PixelPoint) -> Result<(), ComputerError> {
         let hwnd = self.require_live_evidenced_window()?;
         let client = self.client_point(hwnd, point, true)?;
-        self.post_to_target(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam_point(client))?;
+        self.post_to_target(WM_MOUSEMOVE, WPARAM(0), lparam_point(client))?;
         self.pointer = point;
         Ok(())
     }
 
-    /// Sole irreversible input primitive. Every keyboard, pointer, and cleanup
-    /// event is posted to the evidenced HWND so delivery cannot retarget a
-    /// newly focused unevidenced window.
+    /// Sole irreversible input primitive. Identity is re-resolved from the
+    /// planted HWND property and UIA runtime id immediately before
+    /// `PostMessageW`; a recycled handle does not carry the evidenced property
+    /// and is refused rather than named.
     fn post_to_target(
         &self,
-        hwnd: HWND,
         msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<(), ComputerError> {
-        // SAFETY: `hwnd` was validated as a live window belonging to the
-        // evidenced UIA identity immediately before this call.
+        let hwnd = self.resolve_injection_hwnd(self.evidenced_window.is_some())?;
+        let bound = self
+            .evidenced_window
+            .or(self.cleanup_window)
+            .ok_or_else(|| {
+                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+            })?;
+        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        // SAFETY: `hwnd` just matched the planted identity property of the
+        // evidenced UIA object. The property is absent on a recycled handle.
         unsafe { PostMessageW(Some(hwnd), msg, wparam, lparam) }
-            .map_err(|_| win32_error("PostMessageW"))
+            .map_err(|_| win32_error("PostMessageW"))?;
+        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        let live = opaque_id_for_hwnd(hwnd)?;
+        if live != bound.opaque {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn client_point(
@@ -560,15 +590,16 @@ impl WindowsDesktopBackend {
         require_inside: bool,
     ) -> Result<(), ComputerError> {
         let client = self.client_point(hwnd, point, require_inside)?;
-        let (msg, keys) = match (button, up) {
-            (MouseButton::Left, false) => (WM_LBUTTONDOWN, 0x0001_usize),
-            (MouseButton::Left, true) => (WM_LBUTTONUP, 0x0001_usize),
-            (MouseButton::Right, false) => (WM_RBUTTONDOWN, 0x0002_usize),
-            (MouseButton::Right, true) => (WM_RBUTTONUP, 0x0002_usize),
-            (MouseButton::Middle, false) => (WM_MBUTTONDOWN, 0x0010_usize),
-            (MouseButton::Middle, true) => (WM_MBUTTONUP, 0x0010_usize),
+        let msg = match (button, up) {
+            (MouseButton::Left, false) => WM_LBUTTONDOWN,
+            (MouseButton::Left, true) => WM_LBUTTONUP,
+            (MouseButton::Right, false) => WM_RBUTTONDOWN,
+            (MouseButton::Right, true) => WM_RBUTTONUP,
+            (MouseButton::Middle, false) => WM_MBUTTONDOWN,
+            (MouseButton::Middle, true) => WM_MBUTTONUP,
         };
-        self.post_to_target(hwnd, msg, WPARAM(keys), lparam_point(client))
+        let keys = mouse_message_keys(&self.held_buttons, button, up);
+        self.post_to_target(msg, WPARAM(keys), lparam_point(client))
     }
 
     fn send_wheel(&self, hwnd: HWND, horizontal: bool, delta: i32) -> Result<(), ComputerError> {
@@ -586,35 +617,25 @@ impl WindowsDesktopBackend {
         } else {
             WM_MOUSEWHEEL
         };
-        self.post_to_target(hwnd, msg, wparam, lparam_point(screen))
+        self.post_to_target(msg, wparam, lparam_point(screen))
     }
 
-    fn send_key(&self, hwnd: HWND, key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
+    fn send_key(&self, _hwnd: HWND, key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
         // SAFETY: MapVirtualKeyW reads only the virtual-key integer.
         let scan = unsafe { MapVirtualKeyW(u32::from(key.key.0), MAPVK_VK_TO_VSC) };
-        let mut lparam = 1_u32;
-        lparam |= (scan & 0xff) << 16;
-        if key.extended {
-            lparam |= 1 << 24;
-        }
-        if up {
-            lparam |= 1 << 30;
-            lparam |= 1 << 31;
-        }
         let msg = if up { WM_KEYUP } else { WM_KEYDOWN };
         self.post_to_target(
-            hwnd,
             msg,
             WPARAM(usize::from(key.key.0)),
-            LPARAM(lparam as isize),
+            LPARAM(key_message_lparam(scan, key.extended, up) as isize),
         )
     }
 
-    fn send_unicode(&self, hwnd: HWND, unit: u16, up: bool) -> Result<(), ComputerError> {
+    fn send_unicode(&self, _hwnd: HWND, unit: u16, up: bool) -> Result<(), ComputerError> {
         if up {
             return Ok(());
         }
-        self.post_to_target(hwnd, WM_CHAR, WPARAM(usize::from(unit)), LPARAM(1))
+        self.post_to_target(WM_CHAR, WPARAM(usize::from(unit)), LPARAM(1))
     }
 }
 
@@ -871,6 +892,8 @@ impl ComputerBackend for WindowsDesktopBackend {
             opaque: window,
             hwnd_bits: hwnd_bits(hwnd),
         });
+        plant_hwnd_identity(hwnd, window)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         self.require_live_evidenced_window().map(|_| ())
     }
 
@@ -957,16 +980,77 @@ fn move_with_timing(
     Ok(())
 }
 
-fn key_event_flags(key: VirtualKeyInput, up: bool) -> KEYBD_EVENT_FLAGS {
-    (if key.extended {
-        KEYEVENTF_EXTENDEDKEY
-    } else {
-        KEYBD_EVENT_FLAGS(0)
-    }) | if up {
-        KEYEVENTF_KEYUP
-    } else {
-        KEYBD_EVENT_FLAGS(0)
+fn key_message_lparam(scan: u32, extended: bool, up: bool) -> u32 {
+    let mut lparam = 1_u32;
+    lparam |= (scan & 0xff) << 16;
+    if extended {
+        lparam |= 1 << 24;
     }
+    if up {
+        lparam |= 1 << 30;
+        lparam |= 1 << 31;
+    }
+    lparam
+}
+
+/// Mouse-message `wParam` is the button state at the event, not the identity
+/// of the button that changed. A `WM_*BUTTONUP` must not report the released
+/// button as still down.
+fn mouse_message_keys(held: &[MouseButton], button: MouseButton, up: bool) -> usize {
+    let mut keys = 0_usize;
+    for held_button in held {
+        if up && *held_button == button {
+            continue;
+        }
+        keys |= mouse_mk_bit(*held_button);
+    }
+    if !up && !held.contains(&button) {
+        keys |= mouse_mk_bit(button);
+    }
+    keys
+}
+
+fn mouse_mk_bit(button: MouseButton) -> usize {
+    match button {
+        MouseButton::Left => MK_LBUTTON.0 as usize,
+        MouseButton::Right => MK_RBUTTON.0 as usize,
+        MouseButton::Middle => MK_MBUTTON.0 as usize,
+    }
+}
+
+fn hwnd_identity_prop_wide(opaque: OpaqueWindowId) -> Vec<u16> {
+    let mut name = String::from("Cockpit.WindowIdentity.");
+    for byte in opaque.as_bytes() {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn hwnd_identity_prop_is_live(hwnd: HWND, opaque: OpaqueWindowId) -> bool {
+    let name = hwnd_identity_prop_wide(opaque);
+    // SAFETY: `name` is a live null-terminated UTF-16 buffer for the call.
+    let value = unsafe { GetPropW(hwnd, PCWSTR(name.as_ptr())) };
+    !value.0.is_null()
+}
+
+fn plant_hwnd_identity(hwnd: HWND, opaque: OpaqueWindowId) -> Result<(), TargetUnavailableReason> {
+    if hwnd_identity_prop_is_live(hwnd, opaque) {
+        return Ok(());
+    }
+    let name = hwnd_identity_prop_wide(opaque);
+    // SAFETY: `name` is a live null-terminated UTF-16 buffer; the HANDLE is a
+    // non-dereferenceable sentinel stored as a window property value.
+    let planted = unsafe {
+        SetPropW(
+            hwnd,
+            PCWSTR(name.as_ptr()),
+            HANDLE(core::ptr::without_provenance_mut(1)),
+        )
+    };
+    if !planted.as_bool() || !hwnd_identity_prop_is_live(hwnd, opaque) {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    Ok(())
 }
 
 fn virtual_key(key: &NormalizedKeyCode) -> VirtualKeyInput {
@@ -1087,6 +1171,7 @@ impl WindowsTargetEvidenceAdapter {
                 name: uia_name,
             } = uia_evidence(hwnd)?;
             let window_id = uia_fingerprint.window_runtime_id;
+            plant_hwnd_identity(hwnd, OpaqueWindowId::from_bytes(window_id))?;
             let uia_role = uia_fingerprint.role.clone();
             let uia_subrole = uia_fingerprint.subrole.clone();
             let mut snapshot = empty_unavailable(BackendKind::RealDesktopWindows);
@@ -1618,10 +1703,45 @@ mod tests {
         ] {
             let input = translated(key);
             assert!(input.extended, "{key}");
-            assert_eq!(key_event_flags(input, true).0, 3, "{key}");
+            let lparam = key_message_lparam(0, input.extended, true);
+            assert_ne!(lparam & (1 << 24), 0, "{key} extended bit");
+            assert_ne!(lparam & (1 << 31), 0, "{key} key-up bit");
         }
         assert!(!translated("enter").extended);
+        assert_eq!(key_message_lparam(0, false, true) & (1 << 24), 0);
         assert!(KeyCode::parse("not-a-key").is_err());
+    }
+
+    #[test]
+    fn mouse_up_wparam_omits_the_released_button() {
+        const MK_LEFT: usize = 0x0001;
+        const MK_RIGHT: usize = 0x0002;
+        const MK_MIDDLE: usize = 0x0010;
+        assert_eq!(mouse_mk_bit(MouseButton::Left), MK_LEFT);
+        assert_eq!(mouse_mk_bit(MouseButton::Right), MK_RIGHT);
+        assert_eq!(mouse_mk_bit(MouseButton::Middle), MK_MIDDLE);
+        assert_eq!(mouse_message_keys(&[], MouseButton::Left, false), MK_LEFT);
+        assert_eq!(mouse_message_keys(&[], MouseButton::Left, true), 0);
+        assert_eq!(
+            mouse_message_keys(&[MouseButton::Left], MouseButton::Left, true),
+            0
+        );
+        assert_eq!(
+            mouse_message_keys(&[MouseButton::Left], MouseButton::Right, false),
+            MK_LEFT | MK_RIGHT
+        );
+        assert_eq!(
+            mouse_message_keys(
+                &[MouseButton::Left, MouseButton::Right],
+                MouseButton::Left,
+                true
+            ),
+            MK_RIGHT
+        );
+        assert_eq!(
+            mouse_message_keys(&[MouseButton::Middle], MouseButton::Middle, true),
+            0
+        );
     }
 
     #[test]

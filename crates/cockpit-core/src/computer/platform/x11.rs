@@ -186,7 +186,7 @@ fn x11_generation_atom(
 }
 
 #[cfg(target_os = "linux")]
-fn x11_read_generation(
+pub(crate) fn x11_read_generation(
     connection: &x11rb::rust_connection::RustConnection,
     window: u32,
 ) -> Result<Option<[u8; X11_WINDOW_GENERATION_LEN]>, TargetUnavailableReason> {

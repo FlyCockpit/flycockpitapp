@@ -1245,44 +1245,59 @@ impl VirtualDisplayBackend {
     }
 
     #[cfg(target_os = "linux")]
-    fn query_x11_window_geometry(
+    fn query_x11_window_geometry(&self) -> Result<(i32, i32, u32, u32), ComputerError> {
+        let bound = self.evidenced_injection_window.ok_or_else(|| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })?;
+        self.with_evidenced_x11_generation(bound, |connection| {
+            x11_window_root_geometry(connection, bound.x11)
+        })
+    }
+
+    /// Irreversible X11 delivery: grab the server, prove the planted
+    /// generation still names `bound`, then send. A recycled XID does not
+    /// carry the token and is refused rather than passed to another process.
+    #[cfg(target_os = "linux")]
+    fn with_evidenced_x11_generation<T>(
         &self,
-        window: u32,
-    ) -> Result<(i32, i32, u32, u32), ComputerError> {
-        let output = self.run_xdotool_output(&[
-            OsString::from("getwindowgeometry"),
-            OsString::from("--shell"),
-            OsString::from(window.to_string()),
-        ])?;
-        if !output.status.success() {
-            return Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut x = None;
-        let mut y = None;
-        let mut width = None;
-        let mut height = None;
-        for line in stdout.lines() {
-            if let Some(value) = line.strip_prefix("X=") {
-                x = value.parse::<i32>().ok();
-            } else if let Some(value) = line.strip_prefix("Y=") {
-                y = value.parse::<i32>().ok();
-            } else if let Some(value) = line.strip_prefix("WIDTH=") {
-                width = value.parse::<u32>().ok();
-            } else if let Some(value) = line.strip_prefix("HEIGHT=") {
-                height = value.parse::<u32>().ok();
+        bound: EvidencedX11Window,
+        f: impl FnOnce(&x11rb::rust_connection::RustConnection) -> Result<T, ComputerError>,
+    ) -> Result<T, ComputerError> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let (connection, _) = x11rb::connect(Some(&self.display)).map_err(x11_delivery_error)?;
+        connection
+            .grab_server()
+            .map_err(x11_delivery_error)?
+            .check()
+            .map_err(x11_delivery_error)?;
+        struct UngrabServer<'a>(&'a x11rb::rust_connection::RustConnection);
+        impl Drop for UngrabServer<'_> {
+            fn drop(&mut self) {
+                use x11rb::protocol::xproto::ConnectionExt as _;
+                let _ = self.0.ungrab_server();
+                let _ = x11rb::connection::Connection::flush(self.0);
             }
         }
-        match (x, y, width, height) {
-            (Some(x), Some(y), Some(width), Some(height)) => Ok((x, y, width, height)),
-            _ => Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: "getwindowgeometry did not return X/Y/WIDTH/HEIGHT".to_string(),
-            }),
+        let _ungrab = UngrabServer(&connection);
+        let live = crate::computer::platform::x11::x11_read_generation(&connection, bound.x11)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?
+            .ok_or_else(|| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        if live != bound.generation {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
         }
+        let result = f(&connection)?;
+        let live = crate::computer::platform::x11::x11_read_generation(&connection, bound.x11)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?
+            .ok_or_else(|| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        if live != bound.generation {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        Ok(result)
     }
 
     #[cfg(target_os = "linux")]
@@ -1292,29 +1307,27 @@ impl VirtualDisplayBackend {
                 SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
             ));
         };
-        self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
+        self.with_evidenced_x11_generation(bound, |connection| {
+            dispatch_x11_window_command(connection, bound.x11, command, rest)
+        })
     }
 
     #[cfg(target_os = "linux")]
     fn run_release_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
         let bound = self.release_injection_window()?;
-        crate::computer::platform::x11_window_generation_is_live(
-            &self.display,
-            bound.x11,
-            &bound.generation,
-        )
-        .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
-        self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
+        self.with_evidenced_x11_generation(bound, |connection| {
+            dispatch_x11_window_command(connection, bound.x11, command, rest)
+        })
     }
 
     #[cfg(target_os = "linux")]
     fn window_relative_point(&self, point: PixelPoint) -> Result<PixelPoint, ComputerError> {
-        let Some(bound) = self.evidenced_injection_window else {
+        let Some(_bound) = self.evidenced_injection_window else {
             return Err(ComputerError::Refused(
                 SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
             ));
         };
-        let (origin_x, origin_y, width, height) = self.query_x11_window_geometry(bound.x11)?;
+        let (origin_x, origin_y, width, height) = self.query_x11_window_geometry()?;
         pixel_point_in_window(point, origin_x, origin_y, width, height)
     }
 
@@ -2538,24 +2551,468 @@ fn move_cursor_now(
 }
 
 #[cfg(target_os = "linux")]
-fn xdotool_targeted_args(window: u32, command: &str, rest: &[OsString]) -> Vec<OsString> {
-    let mut args = Vec::with_capacity(3 + rest.len());
-    args.push(OsString::from(command));
-    args.push(OsString::from("--window"));
-    args.push(OsString::from(window.to_string()));
-    args.extend_from_slice(rest);
-    args
+fn x11_delivery_error(error: impl std::fmt::Display) -> ComputerError {
+    ComputerError::CommandFailed {
+        program: "x11".to_string(),
+        detail: error.to_string(),
+    }
 }
 
-#[cfg(test)]
-pub(crate) fn xdotool_targeted_command(window: u32, command: &str, rest: &[&str]) -> Vec<String> {
-    let mut args = vec![
-        command.to_string(),
-        "--window".to_string(),
-        window.to_string(),
-    ];
-    args.extend(rest.iter().map(|part| (*part).to_string()));
-    args
+#[cfg(target_os = "linux")]
+fn dispatch_x11_window_command(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    command: &str,
+    rest: &[OsString],
+) -> Result<(), ComputerError> {
+    match command {
+        "mousemove" => {
+            let x = parse_x11_u32_arg(rest.first())?;
+            let y = parse_x11_u32_arg(rest.get(1))?;
+            x11_send_motion(connection, window, x, y)
+        }
+        "mousedown" => x11_send_button(connection, window, parse_x11_u8_arg(rest.first())?, false),
+        "mouseup" => x11_send_button(connection, window, parse_x11_u8_arg(rest.first())?, true),
+        "click" => {
+            let button = parse_x11_u8_arg(rest.first())?;
+            x11_send_button(connection, window, button, false)?;
+            x11_send_button(connection, window, button, true)
+        }
+        "keydown" => x11_send_named_key(connection, window, parse_x11_str_arg(rest.first())?, true),
+        "keyup" => x11_send_named_key(connection, window, parse_x11_str_arg(rest.first())?, false),
+        "key" => x11_send_chord(connection, window, parse_x11_str_arg(rest.first())?),
+        "type" => x11_type_text(connection, window, parse_x11_str_arg(rest.first())?),
+        _ => Err(ComputerError::CommandFailed {
+            program: "x11".to_string(),
+            detail: format!("unsupported evidenced-window command {command}"),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_x11_str_arg(arg: Option<&OsString>) -> Result<&str, ComputerError> {
+    arg.and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| x11_delivery_error("missing x11 command argument"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_x11_u32_arg(arg: Option<&OsString>) -> Result<u32, ComputerError> {
+    parse_x11_str_arg(arg)?.parse().map_err(x11_delivery_error)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_x11_u8_arg(arg: Option<&OsString>) -> Result<u8, ComputerError> {
+    parse_x11_str_arg(arg)?.parse().map_err(x11_delivery_error)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_window_root_geometry(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+) -> Result<(i32, i32, u32, u32), ComputerError> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let geometry = connection
+        .get_geometry(window)
+        .map_err(x11_delivery_error)?
+        .reply()
+        .map_err(x11_delivery_error)?;
+    let translated = connection
+        .translate_coordinates(window, geometry.root, 0, 0)
+        .map_err(x11_delivery_error)?
+        .reply()
+        .map_err(x11_delivery_error)?;
+    Ok((
+        i32::from(translated.dst_x),
+        i32::from(translated.dst_y),
+        u32::from(geometry.width),
+        u32::from(geometry.height),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn x11_pointer_location(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+) -> Result<(i16, i16, i16, i16, u32), ComputerError> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let pointer = connection
+        .query_pointer(window)
+        .map_err(x11_delivery_error)?
+        .reply()
+        .map_err(x11_delivery_error)?;
+    Ok((
+        pointer.root_x,
+        pointer.root_y,
+        pointer.win_x,
+        pointer.win_y,
+        pointer.root,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_motion(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    x: u32,
+    y: u32,
+) -> Result<(), ComputerError> {
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, EventMask, MOTION_NOTIFY_EVENT, Motion, MotionNotifyEvent,
+    };
+    let event_x = i16::try_from(x).map_err(x11_delivery_error)?;
+    let event_y = i16::try_from(y).map_err(x11_delivery_error)?;
+    let (origin_x, origin_y, _, _) = x11_window_root_geometry(connection, window)?;
+    let root = x11_pointer_location(connection, window)?.4;
+    let event = MotionNotifyEvent {
+        response_type: MOTION_NOTIFY_EVENT,
+        detail: Motion::NORMAL,
+        sequence: 0,
+        time: 0,
+        root,
+        event: window,
+        child: x11rb::NONE,
+        root_x: i16::try_from(i32::from(event_x) + origin_x).unwrap_or(event_x),
+        root_y: i16::try_from(i32::from(event_y) + origin_y).unwrap_or(event_y),
+        event_x,
+        event_y,
+        state: Default::default(),
+        same_screen: true,
+    };
+    connection
+        .send_event(true, window, EventMask::POINTER_MOTION, event)
+        .map_err(x11_delivery_error)?
+        .check()
+        .map_err(x11_delivery_error)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_button(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    button: u8,
+    up: bool,
+) -> Result<(), ComputerError> {
+    use x11rb::protocol::xproto::{
+        BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ButtonPressEvent, ConnectionExt as _, EventMask,
+    };
+    let (root_x, root_y, event_x, event_y, root) = x11_pointer_location(connection, window)?;
+    let event = ButtonPressEvent {
+        response_type: if up {
+            BUTTON_RELEASE_EVENT
+        } else {
+            BUTTON_PRESS_EVENT
+        },
+        detail: button,
+        sequence: 0,
+        time: 0,
+        root,
+        event: window,
+        child: x11rb::NONE,
+        root_x,
+        root_y,
+        event_x,
+        event_y,
+        state: Default::default(),
+        same_screen: true,
+    };
+    let mask = if up {
+        EventMask::BUTTON_RELEASE
+    } else {
+        EventMask::BUTTON_PRESS
+    };
+    connection
+        .send_event(true, window, mask, event)
+        .map_err(x11_delivery_error)?
+        .check()
+        .map_err(x11_delivery_error)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_named_key(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    name: &str,
+    down: bool,
+) -> Result<(), ComputerError> {
+    let keysym = x11_keysym_from_name(name)
+        .ok_or_else(|| ComputerError::Refused(format!("unsupported x11 key identity {name}")))?;
+    x11_send_keysym(connection, window, keysym, down)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_chord(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    chord: &str,
+) -> Result<(), ComputerError> {
+    let names = chord.split('+').collect::<Vec<_>>();
+    for name in &names {
+        x11_send_named_key(connection, window, name, true)?;
+    }
+    for name in names.iter().rev() {
+        x11_send_named_key(connection, window, name, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn x11_type_text(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    text: &str,
+) -> Result<(), ComputerError> {
+    for character in text.chars() {
+        let keysym = x11_keysym_from_char(character).ok_or_else(|| {
+            ComputerError::Refused(format!(
+                "unsupported x11 typed character U+{:04X}",
+                character as u32
+            ))
+        })?;
+        x11_send_keysym(connection, window, keysym, true)?;
+        x11_send_keysym(connection, window, keysym, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_keysym(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    keysym: u32,
+    down: bool,
+) -> Result<(), ComputerError> {
+    let resolved = x11_keycode_for_keysym(connection, keysym)?;
+    let _restore = resolved.restore.as_ref().map(|original| X11MappingRestore {
+        connection,
+        keycode: resolved.keycode,
+        keysyms_per_keycode: original.keysyms_per_keycode,
+        original: original.keysyms.clone(),
+    });
+    if resolved.shift && down {
+        let shift = x11_keysym_from_name("Shift").ok_or_else(|| {
+            ComputerError::Refused("unsupported x11 key identity Shift".to_string())
+        })?;
+        x11_send_keysym_raw(
+            connection,
+            window,
+            x11_keycode_for_keysym(connection, shift)?.keycode,
+            true,
+        )?;
+    }
+    x11_send_keysym_raw(connection, window, resolved.keycode, down)?;
+    if resolved.shift && !down {
+        let shift = x11_keysym_from_name("Shift").ok_or_else(|| {
+            ComputerError::Refused("unsupported x11 key identity Shift".to_string())
+        })?;
+        x11_send_keysym_raw(
+            connection,
+            window,
+            x11_keycode_for_keysym(connection, shift)?.keycode,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn x11_send_keysym_raw(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    keycode: u8,
+    down: bool,
+) -> Result<(), ComputerError> {
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, KeyPressEvent,
+    };
+    let (root_x, root_y, event_x, event_y, root) = x11_pointer_location(connection, window)?;
+    let event = KeyPressEvent {
+        response_type: if down {
+            KEY_PRESS_EVENT
+        } else {
+            KEY_RELEASE_EVENT
+        },
+        detail: keycode,
+        sequence: 0,
+        time: 0,
+        root,
+        event: window,
+        child: x11rb::NONE,
+        root_x,
+        root_y,
+        event_x,
+        event_y,
+        state: Default::default(),
+        same_screen: true,
+    };
+    let mask = if down {
+        EventMask::KEY_PRESS
+    } else {
+        EventMask::KEY_RELEASE
+    };
+    connection
+        .send_event(true, window, mask, event)
+        .map_err(x11_delivery_error)?
+        .check()
+        .map_err(x11_delivery_error)
+}
+
+#[cfg(target_os = "linux")]
+struct X11ResolvedKeycode {
+    keycode: u8,
+    shift: bool,
+    restore: Option<X11OriginalMapping>,
+}
+
+#[cfg(target_os = "linux")]
+struct X11OriginalMapping {
+    keysyms_per_keycode: u8,
+    keysyms: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn x11_keycode_for_keysym(
+    connection: &x11rb::rust_connection::RustConnection,
+    keysym: u32,
+) -> Result<X11ResolvedKeycode, ComputerError> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let setup = connection.setup();
+    let min_keycode = setup.min_keycode;
+    let count = setup
+        .max_keycode
+        .saturating_sub(min_keycode)
+        .saturating_add(1);
+    let mapping = connection
+        .get_keyboard_mapping(min_keycode, count)
+        .map_err(x11_delivery_error)?
+        .reply()
+        .map_err(x11_delivery_error)?;
+    let per = usize::from(mapping.keysyms_per_keycode.max(1));
+    for (index, keycode) in (min_keycode..=setup.max_keycode).enumerate() {
+        let start = index.saturating_mul(per);
+        let entry = mapping.keysyms.get(start..start + per).unwrap_or(&[]);
+        if entry.first().copied() == Some(keysym) {
+            return Ok(X11ResolvedKeycode {
+                keycode,
+                shift: false,
+                restore: None,
+            });
+        }
+        if entry.get(1).copied() == Some(keysym) {
+            return Ok(X11ResolvedKeycode {
+                keycode,
+                shift: true,
+                restore: None,
+            });
+        }
+    }
+    let spare = setup.max_keycode;
+    let spare_index = usize::from(spare.saturating_sub(min_keycode)).saturating_mul(per);
+    let original = mapping
+        .keysyms
+        .get(spare_index..spare_index + per)
+        .unwrap_or(&[])
+        .to_vec();
+    let mut replacement = vec![0_u32; per.max(1)];
+    replacement[0] = keysym;
+    connection
+        .change_keyboard_mapping(1, spare, mapping.keysyms_per_keycode.max(1), &replacement)
+        .map_err(x11_delivery_error)?
+        .check()
+        .map_err(x11_delivery_error)?;
+    Ok(X11ResolvedKeycode {
+        keycode: spare,
+        shift: false,
+        restore: Some(X11OriginalMapping {
+            keysyms_per_keycode: mapping.keysyms_per_keycode.max(1),
+            keysyms: original,
+        }),
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct X11MappingRestore<'a> {
+    connection: &'a x11rb::rust_connection::RustConnection,
+    keycode: u8,
+    keysyms_per_keycode: u8,
+    original: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for X11MappingRestore<'_> {
+    fn drop(&mut self) {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let _ = self.connection.change_keyboard_mapping(
+            1,
+            self.keycode,
+            self.keysyms_per_keycode,
+            &self.original,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_keysym_from_char(character: char) -> Option<u32> {
+    let code = u32::from(character);
+    if (0x20..=0xff).contains(&code) {
+        Some(code)
+    } else if code > 0xff {
+        Some(0x0100_0000 | code)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_keysym_from_name(name: &str) -> Option<u32> {
+    if name.len() == 1 {
+        return x11_keysym_from_char(name.chars().next()?);
+    }
+    Some(match name {
+        "Return" => 0xff0d,
+        "Tab" => 0xff09,
+        "Escape" => 0xff1b,
+        "BackSpace" => 0xff08,
+        "Delete" => 0xffff,
+        "Insert" => 0xff63,
+        "space" => 0x0020,
+        "Up" => 0xff52,
+        "Down" => 0xff54,
+        "Left" => 0xff51,
+        "Right" => 0xff53,
+        "Home" => 0xff50,
+        "End" => 0xff57,
+        "Page_Up" => 0xff55,
+        "Page_Down" => 0xff56,
+        "Shift" | "Shift_L" => 0xffe1,
+        "Shift_R" => 0xffe2,
+        "Control" | "Control_L" => 0xffe3,
+        "Control_R" => 0xffe4,
+        "Alt" | "Alt_L" => 0xffe9,
+        "Alt_R" => 0xffea,
+        "Super_L" => 0xffeb,
+        "Super_R" => 0xffec,
+        "Caps_Lock" => 0xffe5,
+        "Num_Lock" => 0xff7f,
+        "Scroll_Lock" => 0xff14,
+        "Print" => 0xff61,
+        "Pause" => 0xff13,
+        "Menu" => 0xff67,
+        "F1" => 0xffbe,
+        "F2" => 0xffbf,
+        "F3" => 0xffc0,
+        "F4" => 0xffc1,
+        "F5" => 0xffc2,
+        "F6" => 0xffc3,
+        "F7" => 0xffc4,
+        "F8" => 0xffc5,
+        "F9" => 0xffc6,
+        "F10" => 0xffc7,
+        "F11" => 0xffc8,
+        "F12" => 0xffc9,
+        _ => return None,
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -6279,19 +6736,57 @@ mod tests {
     }
 
     #[test]
-    fn xdotool_input_is_addressed_to_the_evidenced_window() {
-        assert_eq!(
-            xdotool_targeted_command(0x00ab_cdef, "type", &["hello"]),
-            vec!["type", "--window", "11259375", "hello"]
+    fn x11_input_is_addressed_to_the_evidenced_window_object() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn with_evidenced_x11_generation")
+            .expect("with_evidenced_x11_generation");
+        let body = src[start..]
+            .split("\n    fn ")
+            .next()
+            .expect("with_evidenced_x11_generation body");
+        assert!(
+            body.contains("grab_server"),
+            "delivery must freeze the X server around the generation check"
         );
-        assert_eq!(
-            xdotool_targeted_command(42, "key", &["Return"]),
-            vec!["key", "--window", "42", "Return"]
+        assert!(
+            body.contains("x11_read_generation"),
+            "delivery must re-read the planted generation, not trust a prior XID"
         );
-        assert_eq!(
-            xdotool_targeted_command(7, "click", &["1"]),
-            vec!["click", "--window", "7", "1"]
+        assert!(
+            !body.contains("run_xdotool"),
+            "delivery must not pass a recyclable XID to another process"
         );
+        let targeted = src
+            .split("fn run_targeted_xdotool")
+            .nth(1)
+            .expect("run_targeted_xdotool");
+        assert!(
+            targeted.contains("with_evidenced_x11_generation"),
+            "targeted input must enter the generation-held delivery primitive"
+        );
+        let release = src
+            .split("fn run_release_xdotool")
+            .nth(1)
+            .expect("run_release_xdotool");
+        assert!(
+            release.contains("with_evidenced_x11_generation"),
+            "cleanup input must enter the generation-held delivery primitive"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_keysyms_cover_translated_input_names() {
+        assert_eq!(x11_keysym_from_name("Return"), Some(0xff0d));
+        assert_eq!(x11_keysym_from_name("Control"), Some(0xffe3));
+        assert_eq!(x11_keysym_from_name("Shift"), Some(0xffe1));
+        assert_eq!(x11_keysym_from_name("a"), Some(u32::from(b'a')));
+        assert_eq!(
+            x11_keysym_from_char('€'),
+            Some(0x0100_0000 | u32::from('€'))
+        );
+        assert_eq!(x11_keysym_from_name("not-a-key"), None);
     }
 
     #[test]

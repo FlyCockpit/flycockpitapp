@@ -55,8 +55,8 @@ pub use migrate::{
     resume_kek_migrate,
 };
 pub use namespace::{
-    LEAK_REPORT_V1_NAMESPACE, NAMESPACE_MAX_LEN, Namespace, REDACTION_HISTORY_V1_NAMESPACE,
-    SECURE_KEY_SERVICE,
+    COMPUTER_AUDIT_HEAD_V1_NAMESPACE, COMPUTER_AUDIT_V1_NAMESPACE, LEAK_REPORT_V1_NAMESPACE,
+    NAMESPACE_MAX_LEN, Namespace, REDACTION_HISTORY_V1_NAMESPACE, SECURE_KEY_SERVICE,
 };
 pub use resolve::{
     DEFAULT_FIX_COMMAND, EffectiveSecretStore, FirstRunSecretStoreCapabilities,

@@ -4533,14 +4533,41 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
     // every receipt still `created` has unrecoverable memory-only values, so
     // CAS each to `expired_on_restart` with exactly one expired audit append
-    // and no counter re-increment (creation already counted). The audit
-    // writer is stubbed until computer-audit-chain-completion lands.
+    // and no counter re-increment (creation already counted). The tamper-evident
+    // audit chain must be installed first, and the durable outbox flushed,
+    // so `guidance_proposal_created` is on the chain before any expired
+    // successor is appended.
+    if let Some(handle) = ctx.secure_key.clone() {
+        let chain =
+            crate::computer::audit::ComputerAuditChain::open(Arc::new(ctx.db.clone()), handle)
+                .await;
+        let writer = Arc::new(
+            crate::computer::guidance::service::ChainGuidanceAuditWriter::new(Arc::new(chain)),
+        );
+        if !writer.chain().is_available() {
+            tracing::error!(
+                "computer audit chain failed closed; guidance proposals remain unavailable"
+            );
+        }
+        ctx.guidance_proposals
+            .lock()
+            .await
+            .install_audit_writer(writer);
+    } else {
+        tracing::warn!("computer audit chain not installed: secure-key actor is not attached");
+    }
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let guidance_svc = ctx.guidance_proposals.lock().await;
     guidance_svc
         .reload_persistent_rules()
         .await
         .context("loading machine-local persistent guidance rules")?;
+    if let Err(error) = guidance_svc.flush_audit_outbox(now_unix_ms).await {
+        tracing::warn!(
+            %error,
+            "guidance proposal audit outbox flush deferred before restart reconciliation"
+        );
+    }
     let reconciled_guidance = guidance_svc
         .reconcile_on_restart(now_unix_ms)
         .await

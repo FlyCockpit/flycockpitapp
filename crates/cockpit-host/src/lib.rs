@@ -9,6 +9,7 @@ pub mod bounded;
 pub mod daemon_lifecycle;
 pub mod goal_scratch;
 pub mod jitter;
+pub mod named_pipe;
 pub mod path_containment;
 pub mod private_fs;
 pub mod process;

@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +187,7 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn legacy_pid_identity(pid: u32) -> PidIdentity {
     if process_exists(pid) {
         PidIdentity::Unverified
@@ -246,7 +247,7 @@ pub fn write_pid_file(
 /// Atomically reclaim demonstrably stale lifecycle ownership and reserve it
 /// for a new daemon incarnation. Live or unverifiable incumbents are never
 /// replaced. The create-new write occurs before releasing the lifecycle lock.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn reclaim_stale_and_reserve(
     pid_file: &Path,
     socket: &Path,
@@ -284,7 +285,7 @@ pub fn reclaim_stale_and_reserve(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn retire_incumbent_locked(
     pid_file: &Path,
     socket: &Path,
@@ -521,7 +522,10 @@ pub fn remove_dead_legacy_metadata(
 /// argv is a daemon-start invocation. The approved executable is explicit so
 /// production can bind verification to the executable that published the
 /// lifecycle metadata; tests must pass their own test-binary path deliberately.
-#[cfg(unix)]
+///
+/// Windows has no portable argv probe equivalent to `/proc/pid/cmdline`;
+/// identity is the process-start timestamp plus the canonical executable.
+#[cfg(any(unix, windows))]
 pub fn verify_cockpit_daemon_receipt_identity(receipt: &DaemonPidReceipt) -> PidIdentity {
     if !process_exists(receipt.pid) {
         return PidIdentity::Missing;
@@ -537,22 +541,33 @@ pub fn verify_cockpit_daemon_receipt_identity(receipt: &DaemonPidReceipt) -> Pid
         Ok(executable) => executable,
         Err(_) => return PidIdentity::Unverified,
     };
-    let args = match read_process_cmdline(receipt.pid) {
-        Ok(args) => args,
-        Err(_) => return PidIdentity::Unverified,
-    };
-    let daemon_argv = args
-        .windows(2)
-        .any(|pair| pair[0] == "daemon" && pair[1] == "start");
-    if cmdline_is_cockpit_daemon(&args, &executable, &receipt.executable) {
-        PidIdentity::VerifiedDaemon
-    } else if daemon_argv {
-        // A daemon-shaped process whose executable receipt does not bind is
-        // not safe to signal, but neither is it safe to declare stale and
-        // unlink beneath it.
-        PidIdentity::Unverified
-    } else {
-        PidIdentity::NotDaemon
+    #[cfg(unix)]
+    {
+        let args = match read_process_cmdline(receipt.pid) {
+            Ok(args) => args,
+            Err(_) => return PidIdentity::Unverified,
+        };
+        let daemon_argv = args
+            .windows(2)
+            .any(|pair| pair[0] == "daemon" && pair[1] == "start");
+        if cmdline_is_cockpit_daemon(&args, &executable, &receipt.executable) {
+            PidIdentity::VerifiedDaemon
+        } else if daemon_argv {
+            // A daemon-shaped process whose executable receipt does not bind is
+            // not safe to signal, but neither is it safe to declare stale and
+            // unlink beneath it.
+            PidIdentity::Unverified
+        } else {
+            PidIdentity::NotDaemon
+        }
+    }
+    #[cfg(windows)]
+    {
+        if exact_executable_identity(&executable, &receipt.executable) {
+            PidIdentity::VerifiedDaemon
+        } else {
+            PidIdentity::NotDaemon
+        }
     }
 }
 
@@ -723,6 +738,35 @@ fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[cfg(windows)]
+fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+
+    // SAFETY: PROCESS_QUERY_LIMITED_INFORMATION is valid for QueryFullProcessImageNameW.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut wide = vec![0_u16; 32 * 1024];
+    let mut size = wide.len() as u32;
+    // SAFETY: `wide` is a live buffer; `size` is in/out length in characters.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, wide.as_mut_ptr(), &mut size)
+    };
+    // SAFETY: `handle` is the OpenProcess result we still own.
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    wide.truncate(size as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+}
+
 /// Kernel existence probe (`kill(pid, 0)`). Used by restart to wait until a
 /// draining daemon has actually exited and released its exclusive boot lock,
 /// not merely unlinked its pid/socket files.
@@ -742,6 +786,75 @@ pub fn process_exists(pid: u32) -> bool {
         return false;
     }
     !process_is_unreaped_zombie(pid)
+}
+
+#[cfg(windows)]
+pub fn process_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: PROCESS_QUERY_LIMITED_INFORMATION is the documented access for
+    // GetExitCodeProcess; a null/invalid handle means the pid is gone or we
+    // cannot prove it is live, which we treat as released.
+    // SAFETY: PROCESS_QUERY_LIMITED_INFORMATION is valid for GetExitCodeProcess.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut exit_code = 0_u32;
+    // SAFETY: `handle` is a live process handle from OpenProcess.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: `handle` is the OpenProcess result we still own.
+    unsafe { CloseHandle(handle) };
+    ok != 0 && exit_code == STILL_ACTIVE as u32
+}
+
+/// Signal a verified receipt-bound process. Re-checks start identity through
+/// the opened handle so a recycled PID cannot be terminated.
+#[cfg(windows)]
+pub fn terminate_verified_daemon_process(receipt: &DaemonPidReceipt) -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    // SAFETY: access is the documented mask for TerminateProcess + start-identity recheck.
+    let handle = unsafe { OpenProcess(access, 0, receipt.pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        if !process_exists(receipt.pid) {
+            return Ok(());
+        }
+        return Err(error).context("opening daemon process for verified teardown");
+    }
+    let start = match read_process_start_identity(receipt.pid) {
+        Ok(start) => start,
+        Err(error) => {
+            // SAFETY: `handle` is the OpenProcess result we still own.
+            unsafe { CloseHandle(handle) };
+            return Err(error).context("re-checking daemon process-start identity");
+        }
+    };
+    if start != receipt.process_start {
+        // SAFETY: `handle` is the OpenProcess result we still own.
+        unsafe { CloseHandle(handle) };
+        anyhow::bail!("daemon PID was recycled before verified teardown");
+    }
+    // SAFETY: start identity still matches the receipt we opened.
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    let error = (ok == 0).then(std::io::Error::last_os_error);
+    // SAFETY: `handle` is the OpenProcess result we still own.
+    unsafe { CloseHandle(handle) };
+    if let Some(error) = error {
+        if !process_exists(receipt.pid) {
+            return Ok(());
+        }
+        return Err(error).context("terminating verified daemon process");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -900,7 +1013,7 @@ pub fn cmdline_is_cockpit_daemon(
             .any(|pair| pair[0] == "daemon" && pair[1] == "start")
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
     let Ok(observed) = std::fs::canonicalize(observed) else {
         return false;

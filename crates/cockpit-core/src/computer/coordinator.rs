@@ -2149,7 +2149,10 @@ pub struct ComputerActionAuthorization {
     /// Host lease token, if a physical target is involved. Virtual backends
     /// have no host lease.
     pub host_lease: Option<HostLeaseToken>,
-    /// Focus generation from the planning evidence capture.
+    /// Currently authorized live focus (window) generation. The Ask gate
+    /// adopts the snapshot it accepts before building the approval packet,
+    /// so this is the identity the human approved and the identity
+    /// pre-handoff validation must still observe.
     pub focus_generation: TargetGeneration,
     /// Observation generation (display generation) from the opened backend.
     pub observation_generation: ObservationEpoch,
@@ -2235,6 +2238,8 @@ pub struct FakeComputerAuthorizer {
     pub decisions: Vec<ComputerAuthorizationDecision>,
     /// Number of authorize calls made.
     pub call_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Focus generation from the most recent authorization request.
+    pub last_focus_generation: Arc<std::sync::atomic::AtomicU64>,
     /// If set, every call returns this decision (overrides `decisions`).
     pub forced_decision: Option<ComputerAuthorizationDecision>,
 }
@@ -2244,6 +2249,7 @@ impl FakeComputerAuthorizer {
         Self {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forced_decision: None,
         }
     }
@@ -2252,6 +2258,7 @@ impl FakeComputerAuthorizer {
         Self {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forced_decision: Some(ComputerAuthorizationDecision::Deny {
                 reason: reason.into(),
             }),
@@ -2262,6 +2269,7 @@ impl FakeComputerAuthorizer {
         Self {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forced_decision: Some(ComputerAuthorizationDecision::AskBlocked),
         }
     }
@@ -2270,6 +2278,7 @@ impl FakeComputerAuthorizer {
         Self {
             decisions,
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             forced_decision: None,
         }
     }
@@ -2277,16 +2286,25 @@ impl FakeComputerAuthorizer {
     pub fn call_count(&self) -> usize {
         self.call_count.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    pub fn last_focus_generation(&self) -> u64 {
+        self.last_focus_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl ComputerAuthorizer for FakeComputerAuthorizer {
     async fn authorize(
         &self,
-        _request: &ComputerActionAuthorization,
+        request: &ComputerActionAuthorization,
     ) -> Result<ComputerAuthorizationDecision, ComputerError> {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.last_focus_generation.store(
+            request.focus_generation.0,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         if let Some(forced) = &self.forced_decision {
             return Ok(forced.clone());
         }
@@ -3403,8 +3421,7 @@ pub struct ComputerActionCoordinator {
     /// The computer backend (fake in tests, virtual/real in production).
     backend: Box<dyn ComputerBackend>,
     /// The immutable display geometry obtained from the backend at open time.
-    /// Display hotplug/focus generation change after model declaration
-    /// invalidates the coordinator.
+    /// Display hotplug after model declaration invalidates the coordinator.
     geometry: DisplayGeometry,
     /// The target evidence adapter (for physical target keys and focus gen).
     target_adapter: Option<Box<dyn TargetEvidenceAdapter>>,
@@ -3433,7 +3450,11 @@ pub struct ComputerActionCoordinator {
     invalidated: bool,
     /// The observation generation (display generation) from the opened backend.
     observation_generation: ObservationEpoch,
-    /// The focus generation from the planning evidence capture.
+    /// Currently authorized live focus (window) generation. Initialized from
+    /// the open-time planning capture and adopted to the live snapshot the
+    /// Ask gate accepts, so approval metadata, host-approval effects, and
+    /// pre-handoff validation share one authority. A TOCTOU change after
+    /// that adopt still invalidates at [`Self::pre_handoff_check`].
     focus_generation: TargetGeneration,
     /// The backend kind.
     backend_kind: BackendKind,
@@ -4021,8 +4042,10 @@ impl ComputerActionCoordinator {
         true
     }
 
-    /// Pre-handoff target evidence check. Display hotplug/focus generation
-    /// change after model declaration invalidates the coordinator.
+    /// Pre-handoff target evidence check. Live focus must still match the
+    /// currently authorized generation (the identity the Ask gate accepted,
+    /// or the open-time capture for Yolo). Drift here is a TOCTOU after
+    /// authorization and hard-invalidates the coordinator.
     pub fn pre_handoff_check(&mut self) -> Result<(), TargetUnavailableReason> {
         if self.invalidated {
             return Err(TargetUnavailableReason::StaleTarget);
@@ -4034,11 +4057,13 @@ impl ComputerActionCoordinator {
         if !self.check_host_lease() {
             return Err(TargetUnavailableReason::StaleTarget);
         }
-        // If we have a target adapter, re-capture evidence and check for drift.
+        // If we have a target adapter, re-capture evidence and check for
+        // drift against the currently authorized focus identity.
         if let Some(adapter) = &mut self.target_adapter {
             let evidence = adapter.capture_snapshot()?;
             if evidence.focus_generation != self.focus_generation.0 && self.focus_generation.0 > 0 {
-                // Focus generation changed — invalidate.
+                // Focus drifted after the authorized identity was adopted —
+                // gate→dispatch TOCTOU. Invalidate.
                 self.invalidate(TargetUnavailableReason::StaleTarget);
                 return Err(TargetUnavailableReason::StaleTarget);
             }
@@ -4580,9 +4605,12 @@ impl ComputerActionCoordinator {
     /// coordinator's current host/virtual input lease.
     ///
     /// The Ask lease is bound to the exact canonical payload and the live
-    /// focus generation. Destructive and credential actions never reuse a
-    /// prior Allow. Neither Ask authority alone nor a host lease alone can
-    /// dispatch.
+    /// focus generation. The live snapshot this gate accepts is adopted as
+    /// the coordinator's authorized focus identity before prompting or
+    /// consuming a lease, so approval metadata and pre-handoff validation
+    /// share that identity. Destructive and credential actions never reuse
+    /// a prior Allow. Neither Ask authority alone nor a host lease alone
+    /// can dispatch.
     ///
     /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
     /// blocking/denial case.
@@ -4651,6 +4679,14 @@ impl ComputerActionCoordinator {
             };
             return Err(outcome);
         };
+
+        // The live focus identity this gate accepted is the coherent
+        // authority for approval metadata and dispatch validation. Adopt
+        // it before consume/prompt so `authorize_action`,
+        // `concrete_host_approval_effects`, and `pre_handoff_check` all
+        // observe the same generation. A later TOCTOU change is still
+        // caught by `pre_handoff_check` against this adopted identity.
+        self.adopt_authorized_focus_generation(live_focus_generation);
 
         let policy = AskLeasePolicy::for_actions(actions);
         // Identical retry-safe payloads at this focus may consume one remaining
@@ -5440,9 +5476,17 @@ impl ComputerActionCoordinator {
         self.observation_generation
     }
 
-    /// The focus generation from the planning evidence capture.
+    /// Currently authorized live focus (window) generation.
     pub fn focus_generation(&self) -> TargetGeneration {
         self.focus_generation
+    }
+
+    /// Adopt `live` as the currently authorized focus identity. Every
+    /// approval packet, host-approval effect, and pre-handoff check reads
+    /// this field, so the Ask gate must write the live snapshot it accepted
+    /// before those consumers run.
+    fn adopt_authorized_focus_generation(&mut self, live: u64) {
+        self.focus_generation = TargetGeneration(live);
     }
 
     /// The observation verification state machine (starts at Strict; live
@@ -9115,13 +9159,22 @@ mod tests {
         assert_eq!(authorizer.call_count(), 1);
 
         // The NEXT action re-enters the Ask path and re-prompts the authorizer
-        // (call_count increments), proving the discard was non-sticky.
-        let _ = coordinator.execute_openai_call("call-2", &actions).await;
+        // (call_count increments), proving the discard was non-sticky. The
+        // queue is pinned on the drifted snapshot, so this retry authorizes
+        // and dispatches against that live identity.
+        assert!(
+            matches!(
+                coordinator.execute_openai_call("call-2", &actions).await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "retry after a non-sticky focus discard must reach dispatch"
+        );
         assert_eq!(
             authorizer.call_count(),
             2,
             "next action re-prompts after a non-sticky discard"
         );
+        assert!(!coordinator.is_invalidated());
     }
 
     #[tokio::test]
@@ -10688,11 +10741,29 @@ mod tests {
         shared.lock().unwrap().snapshot.focus_generation = 2;
 
         // Live focus is now 2, so the focus-1 lease cannot authorize this
-        // screenshot. A new decision is required.
-        let _ = coordinator
-            .execute_openai_call("call-focus-2", &screenshot)
-            .await;
+        // screenshot. A new decision is required, and that Allow must
+        // still reach dispatch against the adopted live identity.
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call("call-focus-2", &screenshot)
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "reapproval against the live focus must reach dispatch"
+        );
         assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(
+            authorizer.last_focus_generation(),
+            2,
+            "the reapproval packet must bind the live focus, not the open-time pin"
+        );
+        assert!(
+            !coordinator.is_invalidated(),
+            "a reapproved focus change must not permanently invalidate"
+        );
+        assert_eq!(coordinator.focus_generation().0, 2);
+        assert!(coordinator.ask_lease_store().has_lease(&focus_two));
     }
 
     #[test]

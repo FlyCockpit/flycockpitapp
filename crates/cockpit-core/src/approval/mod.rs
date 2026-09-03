@@ -403,7 +403,8 @@ pub enum AuthorizationRequest<'a> {
         action_label: &'a str,
         /// Backend kind diagnostic label.
         backend_kind: &'a str,
-        /// Focus generation from planning evidence.
+        /// Currently authorized live focus (window) generation this approval
+        /// is bound to.
         focus_generation: u64,
         /// Observation/display generation from the opened backend.
         observation_generation: u64,

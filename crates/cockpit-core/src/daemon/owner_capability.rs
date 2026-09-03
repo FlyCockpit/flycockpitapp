@@ -94,7 +94,7 @@ mod tests {
         assert!(!rendered.contains(capability.token()));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn publish_writes_a_private_file_next_to_the_socket() {
         let dir = tempfile::tempdir().unwrap();

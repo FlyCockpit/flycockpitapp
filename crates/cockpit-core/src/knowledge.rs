@@ -7447,10 +7447,17 @@ impl Tool for FreshKnowledgeHistorySearchTool {
         let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 20);
         let freshness =
             retrieve_undreamed_session_hits(&bundles.bundles, &args.query, limit, ctx).await?;
-        Ok(ToolOutput::text(render_fresh_session_retrieval(
-            &freshness,
-            ctx.redact.as_ref(),
-        )))
+        let content = render_fresh_session_retrieval(&freshness, ctx.redact.as_ref());
+        // The deterministic floor has already fenced any flagged citation
+        // inside the renderer; undreamed-session titles and snippets are
+        // untrusted bytes crossing the KB retrieval boundary, so the
+        // floor-clean aggregate also passes the utility-model second layer
+        // before delivery (issue #273), exactly like semantic/structured
+        // search.
+        let guard = KbUtilityGuard::from_tool_ctx(ctx);
+        let content =
+            injection_scan::fence_knowledge_with_utility_model(&content, &content, &guard).await;
+        Ok(ToolOutput::text(content))
     }
 }
 

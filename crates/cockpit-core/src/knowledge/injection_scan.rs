@@ -1,8 +1,8 @@
 //! KB/dream prompt-injection scanning (issue #273).
 //!
 //! Two layers guard every byte that crosses the knowledge boundary (KB reads,
-//! search, grep, glob, outline, background retrieval, auto-inject, dream
-//! sources, and dream writes):
+//! search, fresh-session history recall, grep, glob, outline, background
+//! retrieval, auto-inject, dream sources, and dream writes):
 //!
 //! 1. **The deterministic floor** ([`knowledge_injection_findings`]) — always
 //!    on, no model required. Content is normalized before matching (Unicode

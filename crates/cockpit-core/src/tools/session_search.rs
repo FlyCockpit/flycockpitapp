@@ -46,14 +46,17 @@ pub(crate) fn established_dream_read_scope(
 /// Fence model-visible text derived while a knowledge dream's source-session
 /// scope is active. The scope lock is deliberately read here as well as by the
 /// access checks: a poisoned lock must fail the tool call, never turn an
-/// untrusted source transcript into ordinary prompt text.
-pub(crate) fn fence_dream_read_scope_tool_output_if_needed(
+/// untrusted source transcript into ordinary prompt text. The boundary is
+/// layered (issue #273): deterministic floor first, then the utility-model
+/// second layer over the floor-clean source transcripts.
+pub(crate) async fn fence_dream_read_scope_tool_output_layered(
     ctx: &crate::engine::tool::ToolCtx,
     output: &mut ToolOutput,
     source: &str,
 ) -> Result<()> {
     if established_dream_read_scope(ctx)?.is_some() {
-        crate::knowledge::fence_knowledge_tool_output_if_needed(output, source);
+        let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+        crate::knowledge::fence_knowledge_tool_output_layered(output, source, &guard).await;
     }
     Ok(())
 }
@@ -347,7 +350,7 @@ impl Tool for HistorySearchTool {
             }
         };
         let source = output.content.model_text().to_string();
-        fence_dream_read_scope_tool_output_if_needed(ctx, &mut output, &source)?;
+        fence_dream_read_scope_tool_output_layered(ctx, &mut output, &source).await?;
         Ok(output)
     }
 }

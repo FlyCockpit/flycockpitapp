@@ -159,7 +159,7 @@ impl Tool for SearchTool {
             crate::knowledge::attached_local_knowledge_roots(ctx).await?;
         let denied_knowledge_roots =
             crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
-        let outcome = tokio::task::spawn_blocking(move || {
+        let (outcome, knowledge_source) = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
                 (path == guard_root || path.starts_with(&guard_root))
                     && requested_file.as_ref().is_none_or(|file| path == file)
@@ -168,24 +168,22 @@ impl Tool for SearchTool {
                         .iter()
                         .any(|root| cockpit_host::path_containment::contained_under(root, path))
             })
+            .map(|outcome| {
+                // The rendered `file:line` prefix is KB-derived data too, so
+                // it is scanned with the matching text — plus each matched KB
+                // file's quarantine state, so a quarantined file fences its
+                // line records — before any thinning/truncation artifact is
+                // made available for retrieval.
+                let knowledge_source = crate::knowledge::knowledge_line_record_scan_source(
+                    &outcome.records,
+                    &attached_knowledge_roots,
+                );
+                (outcome, knowledge_source)
+            })
         })
         .await
         .map_err(|e| anyhow::anyhow!("search worker joined: {e}"))??;
         let hit_match_cap = outcome.hit_match_cap;
-        let knowledge_source = outcome
-            .records
-            .iter()
-            .filter(|record| {
-                attached_knowledge_roots.iter().any(|root| {
-                    cockpit_host::path_containment::contained_under(root, &record.source_path)
-                })
-            })
-            // The rendered `file:line` prefix is KB-derived data too; scan it
-            // with the matching text before any thinning/truncation artifact is
-            // made available for retrieval.
-            .map(|record| format!("{}\n{}", record.path, record.text))
-            .collect::<Vec<_>>()
-            .join("\n");
         let body = format_search_records(&outcome);
         // Hint, attached as a clearly separated note (never interleaved with
         // match data), nudging callers toward a directory scope or
@@ -266,7 +264,12 @@ impl Tool for SearchTool {
         if single_file {
             out.content.push_str(SINGLE_FILE_NOTE);
         }
-        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
+        // Layered KB boundary (issue #273): the deterministic floor first,
+        // then the utility-model second layer over the floor-clean KB match
+        // records.
+        let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+        crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &knowledge_source, &guard)
+            .await;
         Ok(out)
     }
 }

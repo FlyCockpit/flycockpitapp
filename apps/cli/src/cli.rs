@@ -212,7 +212,9 @@ pub enum PublicCommand {
     #[command(subcommand, name = "bash-hints")]
     BashHints(BashHintsCommand),
     /// Generate shell completion script.
-    Completion { shell: Shell },
+    Completion {
+        shell: Shell,
+    },
 }
 
 impl From<PublicCli> for Cli {
@@ -240,9 +242,7 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
-                PublicCommand::ProviderCatalogStatus(args) => {
-                    Command::ProviderCatalogStatus(args)
-                }
+                PublicCommand::ProviderCatalogStatus(args) => Command::ProviderCatalogStatus(args),
                 PublicCommand::FetchModels(args) => Command::FetchModels(args),
                 PublicCommand::Jq(args) => Command::Jq(args),
                 PublicCommand::Daemon(args) => Command::Daemon(args),
@@ -2032,7 +2032,9 @@ mod tests {
                 PublicCli::try_parse_from(["cockpit", "skill", "curator", "status"]).unwrap()
             )
             .command,
-            Some(Command::Skill(SkillCommand::Curator(SkillCuratorCommand::Status)))
+            Some(Command::Skill(SkillCommand::Curator(
+                SkillCuratorCommand::Status
+            )))
         ));
         assert!(matches!(
             Cli::from(PublicCli::try_parse_from(["cockpit", "import", "archive.zip"]).unwrap())
@@ -2048,8 +2050,7 @@ mod tests {
             Some(Command::Mcp(McpCommand::List))
         ));
         assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "packages", "list"]).unwrap())
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "packages", "list"]).unwrap()).command,
             Some(Command::Packages(PackagesCommand::List))
         ));
         assert!(matches!(
@@ -2074,8 +2075,7 @@ mod tests {
         // Remote-profile roots are public only in the build that compiles
         // them; the removed stubs parse but stay hidden.
         assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "account", "whoami"]).unwrap())
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "account", "whoami"]).unwrap()).command,
             Some(Command::Account(AccountCommand::Whoami))
         ));
         assert!(matches!(
@@ -2083,13 +2083,11 @@ mod tests {
             Some(Command::Sync(SyncCommand::Status))
         ));
         assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "connect", "status"]).unwrap())
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "connect", "status"]).unwrap()).command,
             Some(Command::Connect(_))
         ));
         assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "login", "--force"]).unwrap())
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "login", "--force"]).unwrap()).command,
             Some(Command::Login(_))
         ));
     }
@@ -2098,8 +2096,7 @@ mod tests {
     #[test]
     fn extended_profile_public_schedule_maps_to_runtime_command() {
         assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "schedule", "list"]).unwrap())
-                .command,
+            Cli::from(PublicCli::try_parse_from(["cockpit", "schedule", "list"]).unwrap()).command,
             Some(Command::Schedule(ScheduleCommand::List(_)))
         ));
     }

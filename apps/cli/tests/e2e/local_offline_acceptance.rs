@@ -13,11 +13,10 @@ fn public_commands() -> Vec<String> {
     let snapshot: serde_json::Value = serde_json::from_str(PUBLIC_SNAPSHOT).unwrap();
     // The snapshot pins the full public surface (roots plus aliases); help
     // output lists canonical roots only, so narrow to those here.
-    let canonical: std::collections::BTreeSet<String> =
-        cockpit_cli::public_v0_1_command()
-            .get_subcommands()
-            .map(|subcommand| subcommand.get_name().to_owned())
-            .collect();
+    let canonical: std::collections::BTreeSet<String> = cockpit_cli::public_v0_1_command()
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_owned())
+        .collect();
     snapshot["commands"]
         .as_array()
         .unwrap()

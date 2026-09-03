@@ -33,6 +33,15 @@
 //! Other non-Unix, non-Windows builds still enforce none of the security
 //! properties — only crash-atomic replacement, which is durability, not a
 //! security claim.
+//!
+//! Session-export writes ([`write_private_export_file`]) additionally gate
+//! on [`PrivateFsPolicy::export_file_discipline_enforced`] and are NOT
+//! Unix-only: on Windows the export writer enforces the same file-level
+//! discipline (reparse refusal at every component, hostile-target refusal,
+//! protected owner-only DACL applied to the staged file before any export
+//! byte is written and re-verified through the written object afterwards,
+//! delete-or-refuse on verify failure) while, like the Unix export funnel,
+//! never tightening the user-chosen output parent directory.
 
 use std::path::Path;
 use std::{ffi::OsStr, path::PathBuf};
@@ -198,6 +207,31 @@ impl PrivateFsPolicy {
             && self.ownership_verified
             && self.link_count_verified
             && self.directory_fsync_available
+    }
+
+    /// Whether this build enforces the private-FILE discipline a session
+    /// export write requires: link-planting refusal at every component,
+    /// ownership verification, hard-link refusal, and enforced owner-only
+    /// permissions on the written file itself (Unix `0600` modes, or the
+    /// live protected owner-only DACL apply/verify on Windows).
+    ///
+    /// This is the witness [`write_private_export_file`] gates on. It is
+    /// deliberately NOT [`Self::enforced()`]: the directory-`fsync` durability
+    /// barrier is Unix-only (Windows has no directory fsync) and is a
+    /// durability property, not a secrecy one — both export writers fsync the
+    /// staged file before the atomic publish. On Windows this still requires
+    /// the four real witnesses whose apply/verify paths are live in
+    /// [`write_private_export_file`]; on any other platform it stays `false`
+    /// and the export write fails closed.
+    pub const fn export_file_discipline_enforced(&self) -> bool {
+        if cfg!(unix) {
+            self.enforced()
+        } else {
+            self.windows_dacl_enforced
+                && self.reparse_rejected
+                && self.ownership_verified
+                && self.link_count_verified
+        }
     }
 }
 
@@ -1541,7 +1575,12 @@ pub fn ensure_output_parent_private(path: &Path) -> Result<(), PrivateFsError> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn ensure_output_parent_private(path: &Path) -> Result<(), PrivateFsError> {
+    ensure_windows_output_parent_private(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn ensure_output_parent_private(path: &Path) -> Result<(), PrivateFsError> {
     std::fs::create_dir_all(path)
         .map_err(|e| PrivateFsError::io(format!("creating {}", path.display()), e))
@@ -2854,30 +2893,154 @@ fn ensure_windows_private_dir(path: &Path) -> Result<(), PrivateFsError> {
     Ok(())
 }
 
+/// Windows twin of the Unix `ensure_output_parent_private` contract for a
+/// **user-chosen output location**: create the parent private (owner-only
+/// DACL, reparse refused at every component) when it does not exist, but
+/// never tighten a directory the user already has — a pre-existing shared
+/// directory keeps its ACL exactly as the user configured it. A pre-existing
+/// path that is a reparse point or not a real directory is refused
+/// (`Containment`) instead of being written through.
+#[cfg(windows)]
+fn ensure_windows_output_parent_private(path: &Path) -> Result<(), PrivateFsError> {
+    use std::path::Component;
+
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: refused, path contains `..`",
+            path.display()
+        )));
+    }
+    refuse_windows_reparse_components(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if windows_metadata_is_reparse(&meta) {
+                return Err(PrivateFsError::Containment(format!(
+                    "directory {}: is a reparse point",
+                    path.display()
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(PrivateFsError::Containment(format!(
+                    "directory {}: not a real directory",
+                    path.display()
+                )));
+            }
+            // Exists and is a real directory: leave the user's ACL untouched.
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_windows_private_dir(path)
+        }
+        Err(error) => Err(PrivateFsError::io(
+            format!("stat {}", path.display()),
+            error,
+        )),
+    }
+}
+
 /// Write a secret-bearing session-export artifact, failing closed on any build
 /// whose platform cannot enforce the private-file security discipline.
 ///
 /// A session export (redacted or, via the explicit local opt-in, raw) always
 /// contains material that must never land world-readable — API keys, tokens,
-/// SSH material, and prompt/response bodies. On a platform where
-/// [`PRIVATE_FS_POLICY`] does not report `enforced()` (the full Unix
-/// discipline, including directory fsync; Windows DACL is a separate
-/// `windows_dacl_enforced` witness), we refuse to write the export rather than
-/// emit a file without the 0600 / ownership / no-follow guarantees. Callers on
-/// such platforms surface the error and produce no output file. On an
-/// enforcing platform this is exactly [`write_private_file`]; the gate is
-/// additive and consumes the single policy witness rather than re-deciding
-/// `cfg!(unix)`. Do not weaken this gate when the Windows DACL witness flips.
+/// SSH material, and prompt/response bodies. The gate consumes the single
+/// truthful witness [`PrivateFsPolicy::export_file_discipline_enforced`] —
+/// owner-only permissions on the written file, ownership verification,
+/// hard-link refusal, and no-follow containment — rather than re-deciding
+/// `cfg!` at the call site. On Unix this is exactly [`write_private_file`]
+/// (the full discipline, including the directory fsync); on Windows it is the
+/// DACL-equivalent export writer, which enforces the same file-level
+/// guarantees through the live protected owner-only DACL apply/verify path
+/// and, like the Unix export funnel, never tightens the user-chosen output
+/// parent directory. On a platform whose policy does not report the witness
+/// we refuse to write the export rather than emit a file without those
+/// guarantees; callers surface the error and produce no output file. Do not
+/// weaken this gate: a platform becomes eligible only by enforcing, reported
+/// through the policy witness, never by editing the gate away.
 pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    if !PRIVATE_FS_POLICY.enforced() {
+    if !PRIVATE_FS_POLICY.export_file_discipline_enforced() {
         anyhow::bail!(
             "refusing to write export `{}`: this build does not enforce private-file \
-             security (0600 permissions, ownership, and no-follow); \
-             `private-fs-windows-parity` closes this gap",
+             security (owner-only permissions, ownership, and no-follow containment)",
             path.display()
         );
     }
-    write_private_file(path, bytes)
+    #[cfg(unix)]
+    {
+        return write_private_file(path, bytes);
+    }
+    #[cfg(windows)]
+    {
+        return write_windows_private_export_file(path, bytes);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unreachable on this platform — the policy witness is `false` above
+        // and already refused — but kept explicit so a future platform must
+        // grow a real writer rather than fall through to an unpoliced write.
+        anyhow::bail!(
+            "no private export writer exists on this platform for `{}`",
+            path.display()
+        );
+    }
+}
+
+/// Windows export writer — the DACL twin of the Unix export write funnel.
+///
+/// Enforces the same file-level discipline the KEK writer does — reparse
+/// refusal at every existing path component, hostile-target refusal (a
+/// reparse point, a non-regular file, or a hard-linked alias at the
+/// destination), a staged temp file that carries the protected owner-only
+/// DACL *before* any export byte is written into it, an atomic replace, and
+/// a finalize pass that re-applies and re-verifies the DACL through the
+/// written object (delete-or-refuse on any verify failure) — while never
+/// touching the parent directory's ACL. A user-chosen export directory is
+/// legitimately shared; like the Unix funnel (which never tightens a `0755`
+/// parent), the export's confidentiality is carried by the file's own
+/// owner-only DACL, not by tightening the directory the user picked.
+#[cfg(windows)]
+fn write_windows_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    refuse_windows_reparse_components(path)?;
+    refuse_windows_hostile_target(path)?;
+
+    let dir = atomic_write_dir(path);
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file for {}", path.display()))?;
+    let staged = (|| -> Result<()> {
+        // Harden the staged file BEFORE any export byte is written: the temp
+        // is created with the directory's default (inherited) DACL, which may
+        // be broader than owner-only.
+        apply_windows_owner_only_dacl(temp.path())?;
+        temp.write_all(bytes)
+            .with_context(|| format!("writing temp file for {}", path.display()))?;
+        temp.as_file_mut()
+            .flush()
+            .with_context(|| format!("flushing temp file for {}", path.display()))?;
+        temp.as_file()
+            .sync_all()
+            .with_context(|| format!("fsync temp file for {}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        return Err(error);
+    }
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    if let Err(error) = finalize_windows_private_file(path) {
+        if let Err(cleanup) = std::fs::remove_file(path) {
+            return Err(PrivateFsError::InsecurePermissions(format!(
+                "{}: post-write verify failed ({error}); leftover export could not be \
+                 deleted ({cleanup})",
+                path.display()
+            ))
+            .into());
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3015,6 +3178,13 @@ mod tests {
             windows_dacl_is_actually_enforced(&file)
         );
         assert_eq!(PRIVATE_FS_POLICY.enforced(), cfg!(unix));
+        // The export write witness: true wherever a real private-export file
+        // writer enforces (Unix full discipline, Windows live DACL apply/verify
+        // arm), false everywhere else.
+        assert_eq!(
+            PRIVATE_FS_POLICY.export_file_discipline_enforced(),
+            cfg!(unix) || cfg!(windows)
+        );
 
         #[cfg(unix)]
         {
@@ -3370,6 +3540,127 @@ mod tests {
                 Err(PrivateFsError::MultiplyLinked(_))
             ),
             "subsequent open of a hard-linked KEK must refuse"
+        );
+    }
+
+    // -- Windows export writes: private file, untouched parent ------------
+
+    // `write_private_export_file` on Windows must enforce the file-level
+    // discipline (owner-only DACL, single link, no reparse, real file) while
+    // leaving the user-chosen output directory's ACL exactly as it was — the
+    // same non-tightening contract the Unix export funnel has.
+    #[cfg(windows)]
+    #[test]
+    fn export_windows_write_is_private_and_never_tightens_parent() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        // A pre-existing user directory keeps its default (inherited) ACL: it
+        // does NOT verify as protected owner-only before or after the export.
+        assert!(
+            crate::goal_scratch::verify_private_dacl(root.path()).is_err(),
+            "the fixture must start as a non-owner-only directory"
+        );
+        ensure_output_parent_private(root.path()).expect("existing parent accepted untouched");
+        assert!(
+            crate::goal_scratch::verify_private_dacl(root.path()).is_err(),
+            "a pre-existing user directory must not be tightened"
+        );
+
+        let target = root.path().join("session-export.zip");
+        write_private_export_file(&target, b"EXPORT-BYTES").expect("export write succeeds");
+        assert_eq!(
+            std::fs::read(&target).expect("read export"),
+            b"EXPORT-BYTES"
+        );
+        verify_windows_private_path(&target, "export")
+            .expect("the written export must verify owner-only and singly-linked");
+        assert!(
+            crate::goal_scratch::verify_private_dacl(root.path()).is_err(),
+            "the shared parent's ACL must still not have been rewritten"
+        );
+
+        // A MISSING parent is created private (owner-only DACL), mirroring
+        // the Unix arm's 0700 create.
+        let created = root.path().join("made-up-export-dir");
+        ensure_output_parent_private(&created).expect("missing parent created private");
+        crate::goal_scratch::verify_private_dacl(&created)
+            .expect("a cockpit-created export parent must be owner-only");
+        let nested = created.join("deep.zip");
+        write_private_export_file(&nested, b"NESTED").expect("write into created parent");
+        verify_windows_private_path(&nested, "export").expect("nested export verifies private");
+    }
+
+    // The Windows export writer refuses the same hostile targets the Unix
+    // funnel does: a reparse point (junction) at the destination or an
+    // ancestor, a non-regular destination, and a hard-linked alias.
+    #[cfg(windows)]
+    #[test]
+    fn export_windows_write_refuses_reparse_directory_and_hard_link_targets() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+
+        // Junction at the destination: refused, nothing written through it.
+        let junction_target = root.path().join("junc.zip");
+        create_windows_junction(&junction_target, &real);
+        let error =
+            write_private_export_file(&junction_target, b"EXPORT").expect_err("reparse target");
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::Containment(_))
+            ),
+            "a reparse-point destination must be Containment, got {error:?}"
+        );
+
+        // Reparse on an ANCESTOR of the destination: refused before writing.
+        let junction_parent = root.path().join("junc-parent");
+        create_windows_junction(&junction_parent, &real);
+        let error = write_private_export_file(&junction_parent.join("export.zip"), b"EXPORT")
+            .expect_err("reparse ancestor");
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::Containment(_))
+            ),
+            "a reparse-point ancestor must be Containment, got {error:?}"
+        );
+        assert!(
+            !real.join("export.zip").exists(),
+            "no export may land through the junction ancestor"
+        );
+
+        // A plain directory at the destination: refused, not written through.
+        let dir_target = root.path().join("dir-target");
+        std::fs::create_dir(&dir_target).unwrap();
+        let error =
+            write_private_export_file(&dir_target, b"EXPORT").expect_err("directory target");
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::Containment(_))
+            ),
+            "a directory destination must be Containment, got {error:?}"
+        );
+
+        // A hard-linked existing destination: refused (the alias could read
+        // the export), and the alias still sees only its own bytes.
+        let linked = root.path().join("linked.zip");
+        write_private_export_file(&linked, b"ORIGINAL").expect("initial export");
+        let alias = root.path().join("alias.zip");
+        std::fs::hard_link(&linked, &alias).expect("create hard link");
+        let error = write_private_export_file(&linked, b"REPLACEMENT").expect_err("nlink>1");
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::MultiplyLinked(_))
+            ),
+            "a hard-linked destination must be MultiplyLinked, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&alias).expect("read alias"),
+            b"ORIGINAL",
+            "the replacement must never have been published through the link"
         );
     }
 

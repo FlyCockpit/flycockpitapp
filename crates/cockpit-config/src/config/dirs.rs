@@ -147,8 +147,11 @@ pub fn refuse_missing_global_config_dir(path: &Path) -> anyhow::Result<()> {
 /// directory (or lives under it).
 ///
 /// Side-effect mkdir sites — approval locks, file-write helpers, mutation
-/// locks — must use this instead of raw `create_dir_all` so an
-/// ephemeral/diagnostic owner cannot materialize `~/.config/cockpit`.
+/// locks, container sandbox Dockerfile materialization — must use this
+/// instead of raw `create_dir_all` so an ephemeral/diagnostic owner cannot
+/// materialize `~/.config/cockpit`. Nested product paths such as
+/// `providers/` and `sandbox/` are included: `create_dir_all` of a
+/// descendant would create the missing global parent at umask-default.
 /// Authorized creators call [`ensure_global_config_dir`] or
 /// [`ensure_config_layer_dir`].
 pub fn create_dir_all_except_missing_global(dir: &Path) -> anyhow::Result<()> {
@@ -1130,6 +1133,7 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
         let global = tmp.path().join("home/.config/cockpit");
         let nested = global.join("providers");
+        let sandbox = global.join("sandbox");
         assert!(!global.is_dir());
 
         let error = create_dir_all_except_missing_global(&global).unwrap_err();
@@ -1145,6 +1149,13 @@ mod tests {
                 .to_string()
                 .contains("ephemeral daemons cannot create the global Cockpit config directory"),
             "a nested path must not scaffold the missing global layer: {nested_error:#}"
+        );
+        let sandbox_error = create_dir_all_except_missing_global(&sandbox).unwrap_err();
+        assert!(
+            sandbox_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "sandbox materialization must not scaffold the missing global layer: {sandbox_error:#}"
         );
         assert!(
             !global.is_dir(),

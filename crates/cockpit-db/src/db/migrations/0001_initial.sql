@@ -8022,22 +8022,35 @@ CREATE TABLE guidance_proposal_audit_outbox (
 --
 -- `sequence` is the chain sequence (1-based). `entry_bytes` is the canonical
 -- 424-byte ComputerAuditEntryV1 encoding. `mac` is HMAC-SHA-256 over that
--- body. `event_kind` / `proposal_id` / `key_version` are extracted for
--- indexes and idempotent outbox replay; the body remains authoritative.
+-- body. `event_kind` / `proposal_id` / `key_version` are projections of that
+-- body for indexes and idempotent outbox replay — never independent identity.
+-- Offsets are 0-indexed ComputerAuditEntryV1 layout (SQLite substr is
+-- 1-indexed): event_kind at byte 5, sequence at bytes 10-17, proposal_id at
+-- 114-129, key_version at 420-423. CHECK plus insert-time proof reject a
+-- row whose columns do not match; uniqueness is on the authenticated body
+-- so an offline column relabel cannot occupy another event's identity.
 CREATE TABLE computer_audit_entries (
     sequence     INTEGER PRIMARY KEY CHECK (sequence >= 1),
     entry_bytes  BLOB    NOT NULL CHECK (typeof(entry_bytes) = 'blob' AND length(entry_bytes) = 424),
     mac          BLOB    NOT NULL CHECK (typeof(mac) = 'blob' AND length(mac) = 32),
     event_kind   INTEGER NOT NULL CHECK (event_kind BETWEEN 1 AND 29),
     proposal_id  BLOB    NOT NULL CHECK (typeof(proposal_id) = 'blob' AND length(proposal_id) = 16),
-    key_version  INTEGER NOT NULL CHECK (key_version >= 1)
+    key_version  INTEGER NOT NULL CHECK (key_version >= 1),
+    CHECK (printf('%016X', sequence) = hex(substr(entry_bytes, 11, 8))),
+    CHECK (printf('%02X', event_kind) = hex(substr(entry_bytes, 6, 1))),
+    CHECK (proposal_id = substr(entry_bytes, 115, 16)),
+    CHECK (printf('%08X', key_version) = hex(substr(entry_bytes, 421, 4)))
 );
 
--- At most one guidance-proposal audit event per (kind, proposal). Replay of
--- the durable outbox must not mint a second chain entry.
+-- At most one guidance-proposal audit event per authenticated (kind, proposal)
+-- taken from entry_bytes. Replay of the durable outbox must not mint a second
+-- chain entry. Kinds 20..=23 are X'14'..X'17'.
 CREATE UNIQUE INDEX uq_computer_audit_entries_guidance_proposal
-    ON computer_audit_entries(event_kind, proposal_id)
-    WHERE event_kind IN (20, 21, 22, 23);
+    ON computer_audit_entries(
+        substr(entry_bytes, 6, 1),
+        substr(entry_bytes, 115, 16)
+    )
+    WHERE substr(entry_bytes, 6, 1) IN (X'14', X'15', X'16', X'17');
 
 CREATE TRIGGER computer_audit_entries_immutable_update
 BEFORE UPDATE ON computer_audit_entries

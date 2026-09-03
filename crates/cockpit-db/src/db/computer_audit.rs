@@ -3,8 +3,8 @@
 //! The HMAC signing key and sealed chain head live in the machine-local
 //! protected secret store. This module stores the ordered 424-byte entries
 //! and their MACs so verification can detect SQLite mutation, reorder,
-//! insertion, and tail deletion. Typed rule values, rationale, pixels, OCR,
-//! and raw target text never enter this table.
+//! insertion, tail deletion, and index-column relabeling. Typed rule values,
+//! rationale, pixels, OCR, and raw target text never enter this table.
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{ErrorCode, OptionalExtension, params};
@@ -18,6 +18,25 @@ pub const COMPUTER_AUDIT_MAC_LEN: usize = 32;
 /// RFC 4122 / proposal-id slot length.
 pub const COMPUTER_AUDIT_ID_LEN: usize = 16;
 
+/// 0-indexed ComputerAuditEntryV1 offsets inside the 424-byte body.
+/// Must stay aligned with `ComputerAuditEntryV1::encode`.
+pub const COMPUTER_AUDIT_EVENT_KIND_OFFSET: usize = 5;
+pub const COMPUTER_AUDIT_SEQUENCE_OFFSET: usize = 10;
+pub const COMPUTER_AUDIT_SEQUENCE_LEN: usize = 8;
+pub const COMPUTER_AUDIT_PROPOSAL_ID_OFFSET: usize = 114;
+pub const COMPUTER_AUDIT_KEY_VERSION_OFFSET: usize = 420;
+pub const COMPUTER_AUDIT_KEY_VERSION_LEN: usize = 4;
+
+const _: () = {
+    assert!(COMPUTER_AUDIT_EVENT_KIND_OFFSET + 1 == 6);
+    assert!(COMPUTER_AUDIT_SEQUENCE_OFFSET + 1 == 11);
+    assert!(COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + 1 == 115);
+    assert!(COMPUTER_AUDIT_KEY_VERSION_OFFSET + 1 == 421);
+    assert!(COMPUTER_AUDIT_SEQUENCE_OFFSET + COMPUTER_AUDIT_SEQUENCE_LEN == 18);
+    assert!(COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + COMPUTER_AUDIT_ID_LEN == 130);
+    assert!(COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN == 424);
+};
+
 /// Guidance-proposal audit kinds (must stay aligned with
 /// `AuditEventKind::{GuidanceProposalCreated, Accepted, Rejected, Expired}`).
 pub const GUIDANCE_PROPOSAL_CREATED: u8 = 20;
@@ -25,8 +44,17 @@ pub const GUIDANCE_PROPOSAL_ACCEPTED: u8 = 21;
 pub const GUIDANCE_PROPOSAL_REJECTED: u8 = 22;
 pub const GUIDANCE_PROPOSAL_EXPIRED: u8 = 23;
 
-/// One stored chain entry. `entry_bytes` is the sole canonical body;
-/// extracted columns exist for indexes and idempotent replay.
+/// Lookup by the authenticated `(kind, proposal_id)` projection of `entry_bytes`.
+const GUIDANCE_BODY_LOOKUP_SQL: &str = concat!(
+    "SELECT sequence, entry_bytes, mac, event_kind, proposal_id, key_version ",
+    "FROM computer_audit_entries WHERE ",
+    "substr(entry_bytes, 6, 1) = ?1 AND substr(entry_bytes, 115, 16) = ?2"
+);
+
+/// One stored chain entry. `entry_bytes` is the sole canonical body.
+/// `sequence`, `event_kind`, `proposal_id`, and `key_version` are projections
+/// of that body for indexes and idempotent replay — never independent
+/// identity. Insert and schema CHECK reject a mismatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerAuditEntryRow {
     pub sequence: u64,
@@ -35,6 +63,42 @@ pub struct ComputerAuditEntryRow {
     pub event_kind: u8,
     pub proposal_id: [u8; COMPUTER_AUDIT_ID_LEN],
     pub key_version: u32,
+}
+
+/// Project the index fields from the canonical body.
+pub fn projected_index_fields(
+    entry_bytes: &[u8; COMPUTER_AUDIT_ENTRY_LEN],
+) -> (u64, u8, [u8; COMPUTER_AUDIT_ID_LEN], u32) {
+    let event_kind = entry_bytes[COMPUTER_AUDIT_EVENT_KIND_OFFSET];
+    let mut seq_bytes = [0u8; COMPUTER_AUDIT_SEQUENCE_LEN];
+    seq_bytes.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_SEQUENCE_OFFSET
+            ..COMPUTER_AUDIT_SEQUENCE_OFFSET + COMPUTER_AUDIT_SEQUENCE_LEN],
+    );
+    let mut proposal_id = [0u8; COMPUTER_AUDIT_ID_LEN];
+    proposal_id.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_PROPOSAL_ID_OFFSET
+            ..COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + COMPUTER_AUDIT_ID_LEN],
+    );
+    let mut key_bytes = [0u8; COMPUTER_AUDIT_KEY_VERSION_LEN];
+    key_bytes.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_KEY_VERSION_OFFSET
+            ..COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN],
+    );
+    (
+        u64::from_be_bytes(seq_bytes),
+        event_kind,
+        proposal_id,
+        u32::from_be_bytes(key_bytes),
+    )
+}
+
+fn index_columns_match_entry_bytes(row: &ComputerAuditEntryRow) -> bool {
+    let (sequence, event_kind, proposal_id, key_version) = projected_index_fields(&row.entry_bytes);
+    row.sequence == sequence
+        && row.event_kind == event_kind
+        && row.proposal_id == proposal_id
+        && row.key_version == key_version
 }
 
 fn blob_array<const N: usize>(bytes: Vec<u8>, field: &str) -> rusqlite::Result<[u8; N]> {
@@ -101,6 +165,9 @@ fn is_guidance_kind(event_kind: u8) -> bool {
 
 impl Db {
     /// Ordered chain bodies, sequence ascending.
+    ///
+    /// Load does not re-prove index-column projections so an offline relabel
+    /// can be classified as chain corruption rather than a read error.
     pub async fn list_computer_audit_entries(&self) -> Result<Vec<ComputerAuditEntryRow>> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -129,7 +196,8 @@ impl Db {
         .await
     }
 
-    /// Look up a guidance-proposal event by `(kind, proposal_id)`.
+    /// Look up a guidance-proposal event by the authenticated
+    /// `(kind, proposal_id)` projection of `entry_bytes`.
     pub async fn computer_audit_guidance_entry(
         &self,
         event_kind: u8,
@@ -139,13 +207,12 @@ impl Db {
             is_guidance_kind(event_kind),
             "computer_audit_guidance_entry requires a guidance-proposal event kind"
         );
+        let kind_blob = [event_kind];
         self.read(move |conn| {
             let row = conn
                 .query_row(
-                    "SELECT sequence, entry_bytes, mac, event_kind, proposal_id, key_version
-                     FROM computer_audit_entries
-                     WHERE event_kind = ?1 AND proposal_id = ?2",
-                    params![i64::from(event_kind), proposal_id.as_slice()],
+                    GUIDANCE_BODY_LOOKUP_SQL,
+                    params![kind_blob.as_slice(), proposal_id.as_slice()],
                     parse_entry_row,
                 )
                 .optional()?;
@@ -160,6 +227,9 @@ impl Db {
     /// `key_version`. Any other constraint (including a sequence clash or a
     /// same-identity row with different bytes) is an error: the chain must
     /// not fork.
+    ///
+    /// Index columns must be the projection of `entry_bytes`. A mismatch is
+    /// refused here so a caller cannot persist an unauthenticated identity.
     pub async fn insert_computer_audit_entry(&self, row: ComputerAuditEntryRow) -> Result<bool> {
         anyhow::ensure!(row.sequence >= 1, "computer audit sequence must be >= 1");
         anyhow::ensure!(
@@ -170,6 +240,11 @@ impl Db {
             row.key_version >= 1,
             "computer audit key_version must be >= 1"
         );
+        anyhow::ensure!(
+            index_columns_match_entry_bytes(&row),
+            "computer audit index columns must match entry_bytes"
+        );
+        let kind_blob = [row.event_kind];
         self.write(move |conn| {
             match conn.execute(
                 "INSERT INTO computer_audit_entries
@@ -191,10 +266,8 @@ impl Db {
                 Err(err) if is_constraint(&err) && is_guidance_kind(row.event_kind) => {
                     let existing = conn
                         .query_row(
-                            "SELECT sequence, entry_bytes, mac, event_kind, proposal_id, key_version
-                             FROM computer_audit_entries
-                             WHERE event_kind = ?1 AND proposal_id = ?2",
-                            params![i64::from(row.event_kind), row.proposal_id.as_slice()],
+                            GUIDANCE_BODY_LOOKUP_SQL,
+                            params![kind_blob.as_slice(), row.proposal_id.as_slice()],
                             parse_entry_row,
                         )
                         .optional()
@@ -224,22 +297,31 @@ mod tests {
     use crate::db::Db;
 
     fn sample(sequence: u64, kind: u8, proposal: u8) -> ComputerAuditEntryRow {
-        let mut entry_bytes = [0u8; COMPUTER_AUDIT_ENTRY_LEN];
-        entry_bytes[0] = sequence as u8;
-        entry_bytes[1] = kind;
-        let mut mac = [0u8; COMPUTER_AUDIT_MAC_LEN];
-        mac[0] = sequence as u8;
-        mac[31] = kind;
         let mut proposal_id = [0u8; COMPUTER_AUDIT_ID_LEN];
         proposal_id[0] = proposal;
         proposal_id[15] = proposal;
+        let key_version = 1u32;
+        let mut entry_bytes = [0u8; COMPUTER_AUDIT_ENTRY_LEN];
+        entry_bytes[COMPUTER_AUDIT_EVENT_KIND_OFFSET] = kind;
+        entry_bytes[COMPUTER_AUDIT_SEQUENCE_OFFSET
+            ..COMPUTER_AUDIT_SEQUENCE_OFFSET + COMPUTER_AUDIT_SEQUENCE_LEN]
+            .copy_from_slice(&sequence.to_be_bytes());
+        entry_bytes[COMPUTER_AUDIT_PROPOSAL_ID_OFFSET
+            ..COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + COMPUTER_AUDIT_ID_LEN]
+            .copy_from_slice(&proposal_id);
+        entry_bytes[COMPUTER_AUDIT_KEY_VERSION_OFFSET
+            ..COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN]
+            .copy_from_slice(&key_version.to_be_bytes());
+        let mut mac = [0u8; COMPUTER_AUDIT_MAC_LEN];
+        mac[0] = sequence as u8;
+        mac[31] = kind;
         ComputerAuditEntryRow {
             sequence,
             entry_bytes,
             mac,
             event_kind: kind,
             proposal_id,
-            key_version: 1,
+            key_version,
         }
     }
 
@@ -303,7 +385,8 @@ mod tests {
         let first = sample(1, GUIDANCE_PROPOSAL_CREATED, 3);
         assert!(db.insert_computer_audit_entry(first.clone()).await.unwrap());
         let mut mismatched = first.clone();
-        mismatched.entry_bytes[10] = 0xff;
+        // Mutate a non-index byte so the unique body identity still collides.
+        mismatched.entry_bytes[50] = 0xff;
         mismatched.mac[1] = 0xff;
         let err = db
             .insert_computer_audit_entry(mismatched)
@@ -332,6 +415,64 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("computer audit insert"), "{err}");
         assert_eq!(db.list_computer_audit_entries().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_index_columns_that_do_not_match_entry_bytes() {
+        let db = Db::open_in_memory().unwrap();
+        let base = sample(1, GUIDANCE_PROPOSAL_CREATED, 3);
+        let mut kind = base.clone();
+        kind.event_kind = GUIDANCE_PROPOSAL_ACCEPTED;
+        let mut proposal = base.clone();
+        proposal.proposal_id[0] = 9;
+        let mut sequence = base.clone();
+        sequence.sequence = 2;
+        let mut key_version = base.clone();
+        key_version.key_version = 2;
+        for (name, row) in [
+            ("event_kind", kind),
+            ("proposal_id", proposal),
+            ("sequence", sequence),
+            ("key_version", key_version),
+        ] {
+            let err = db.insert_computer_audit_entry(row).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("computer audit index columns must match entry_bytes"),
+                "{name}: {err}"
+            );
+        }
+        assert!(db.list_computer_audit_entries().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_raw_insert_whose_columns_do_not_match_entry_bytes() {
+        let db = Db::open_in_memory().unwrap();
+        let row = sample(1, GUIDANCE_PROPOSAL_CREATED, 3);
+        let err = db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO computer_audit_entries
+                         (sequence, entry_bytes, mac, event_kind, proposal_id, key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        row.sequence as i64,
+                        row.entry_bytes.as_slice(),
+                        row.mac.as_slice(),
+                        i64::from(GUIDANCE_PROPOSAL_ACCEPTED),
+                        row.proposal_id.as_slice(),
+                        i64::from(row.key_version),
+                    ],
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK") || err.to_string().contains("constraint"),
+            "{err}"
+        );
+        assert!(db.list_computer_audit_entries().await.unwrap().is_empty());
     }
 
     #[tokio::test]

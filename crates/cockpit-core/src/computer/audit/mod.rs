@@ -1482,6 +1482,8 @@ pub struct AuditVerifyResult {
 
 #[derive(Clone, Debug)]
 pub struct ChainEntry {
+    /// Must equal the sequence encoded in `entry_bytes`; verify fails closed
+    /// on a mismatch.
     pub sequence: u64,
     pub entry_bytes: [u8; ENTRY_LEN],
     pub mac: [u8; 32],
@@ -1551,6 +1553,9 @@ where
             Ok(d) => d,
             Err(_) => return corrupt_result(sealed, last_valid_seq),
         };
+        if decoded.sequence != entry.sequence {
+            return corrupt_result(sealed, last_valid_seq);
+        }
         if decoded.sequence != prev_seq + 1 {
             return corrupt_result(sealed, last_valid_seq);
         }

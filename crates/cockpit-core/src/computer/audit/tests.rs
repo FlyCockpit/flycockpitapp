@@ -760,6 +760,19 @@ fn computer_audit_verify_corrupt_pending_different_bytes() {
 // -- tamper tests --
 
 #[test]
+fn computer_audit_verify_corrupt_sequence_column_mismatch() {
+    let key = test_key();
+    let mut entry1 = make_chain_entry(1, [0u8; 32], 1, &key);
+    entry1.sequence = 99;
+    let entries = vec![entry1.clone()];
+    let head = ComputerAuditSealedHeadV1::confirmed_only(1, 1, entry1.mac, 1, nonzero_uuid(1));
+    let result = verify_chain(Some(&head), Some(&entries), |v| {
+        if v == 1 { Some(key.clone()) } else { None }
+    });
+    assert_eq!(result.status, AuditVerifyStatus::Corrupt);
+}
+
+#[test]
 fn computer_audit_tamper_mutation_detected() {
     let key = test_key();
     let entry1 = make_chain_entry(1, [0u8; 32], 1, &key);

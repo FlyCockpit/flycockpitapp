@@ -7,7 +7,8 @@
 //!   (`computer-audit-head/v1`)
 //! - append-only SQLite bodies (`computer_audit_entries`)
 //!
-//! Verification fails closed on any break. There is no silent re-anchor.
+//! Verification fails closed on any break, including extracted index columns
+//! that do not match the authenticated body. There is no silent re-anchor.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,8 +17,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use cockpit_db::computer_audit::{
-    COMPUTER_AUDIT_ENTRY_LEN, ComputerAuditEntryRow, GUIDANCE_PROPOSAL_ACCEPTED,
-    GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED, GUIDANCE_PROPOSAL_REJECTED,
+    COMPUTER_AUDIT_ENTRY_LEN, COMPUTER_AUDIT_EVENT_KIND_OFFSET, COMPUTER_AUDIT_KEY_VERSION_OFFSET,
+    COMPUTER_AUDIT_PROPOSAL_ID_OFFSET, COMPUTER_AUDIT_SEQUENCE_OFFSET, ComputerAuditEntryRow,
+    GUIDANCE_PROPOSAL_ACCEPTED, GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED,
+    GUIDANCE_PROPOSAL_REJECTED,
 };
 use cockpit_db::installation_identity::InstallationIdentity;
 
@@ -39,6 +42,10 @@ const _: () = {
     assert!(AuditEventKind::GuidanceProposalAccepted as u8 == GUIDANCE_PROPOSAL_ACCEPTED);
     assert!(AuditEventKind::GuidanceProposalRejected as u8 == GUIDANCE_PROPOSAL_REJECTED);
     assert!(AuditEventKind::GuidanceProposalExpired as u8 == GUIDANCE_PROPOSAL_EXPIRED);
+    assert!(COMPUTER_AUDIT_EVENT_KIND_OFFSET == 5);
+    assert!(COMPUTER_AUDIT_SEQUENCE_OFFSET == 10);
+    assert!(COMPUTER_AUDIT_PROPOSAL_ID_OFFSET == 114);
+    assert!(COMPUTER_AUDIT_KEY_VERSION_OFFSET == 420);
 };
 
 /// Outcome of a guidance-chain append that did not commit.
@@ -287,7 +294,9 @@ impl ComputerAuditChain {
 
         let rows = self.db.list_computer_audit_entries().await?;
         for row in &rows {
-            self.ensure_key(&mut hmac_keys, row.key_version).await?;
+            if let Ok(entry) = ComputerAuditEntryV1::decode(&row.entry_bytes) {
+                self.ensure_key(&mut hmac_keys, entry.key_version).await?;
+            }
         }
 
         let last_monotonic = max_monotonic(&rows);
@@ -388,16 +397,21 @@ impl ComputerAuditChain {
                 }
             }
 
-            if rows.iter().any(|row| {
-                row.event_kind == event.kind.as_byte() && row.proposal_id == event.proposal_id
+            let authenticated = rows
+                .iter()
+                .map(authenticated_entry)
+                .collect::<Result<Vec<_>>>()
+                .map_err(GuidanceAppendError::absent)?;
+            if authenticated.iter().any(|entry| {
+                entry.event_kind == event.kind && entry.proposal_id == event.proposal_id
             }) {
                 return Ok(());
             }
 
             if is_guidance_successor(event.kind)
-                && !rows.iter().any(|row| {
-                    row.event_kind == GUIDANCE_PROPOSAL_CREATED
-                        && row.proposal_id == event.proposal_id
+                && !authenticated.iter().any(|entry| {
+                    entry.event_kind == AuditEventKind::GuidanceProposalCreated
+                        && entry.proposal_id == event.proposal_id
                 })
             {
                 return Err(GuidanceAppendError::PredecessorMissing);
@@ -561,7 +575,10 @@ impl ComputerAuditChain {
             "pending audit sequence does not continue the confirmed head"
         );
 
-        let last_seq = rows.last().map(|row| row.sequence).unwrap_or(0);
+        let last_seq = match rows.last() {
+            Some(row) => authenticated_entry(row)?.sequence,
+            None => 0,
+        };
         if last_seq < expected_seq {
             let row = ComputerAuditEntryRow {
                 sequence: pending_entry.sequence,
@@ -735,11 +752,47 @@ fn chain_entries(rows: &[ComputerAuditEntryRow]) -> Vec<ChainEntry> {
         .collect()
 }
 
+/// Decode `entry_bytes` and require every extracted index column to match.
+/// Column divergence is tampering: the body is the sole canonical identity.
+fn authenticated_entry(row: &ComputerAuditEntryRow) -> Result<ComputerAuditEntryV1> {
+    let entry = ComputerAuditEntryV1::decode(&row.entry_bytes)
+        .map_err(|e| anyhow!("computer audit entry decode: {e}"))?;
+    anyhow::ensure!(
+        entry.sequence == row.sequence
+            && entry.event_kind.as_byte() == row.event_kind
+            && entry.proposal_id == row.proposal_id
+            && entry.key_version == row.key_version,
+        "computer audit index columns do not match entry_bytes"
+    );
+    Ok(entry)
+}
+
+fn index_column_mismatch_result(head: Option<&ComputerAuditSealedHeadV1>) -> AuditVerifyResult {
+    match head {
+        Some(head) => AuditVerifyResult {
+            status: AuditVerifyStatus::Corrupt,
+            confirmed_sequence: head.confirmed_sequence,
+            confirmed_mac: head.confirmed_mac,
+            sealed_generation: head.sealed_generation,
+            database_instance_id: head.database_instance_id,
+            entry_count: 0,
+        },
+        None => empty_status(AuditVerifyStatus::Corrupt),
+    }
+}
+
 fn verify_with(
     inner: &ChainInner,
     head: Option<&ComputerAuditSealedHeadV1>,
     rows: Option<&[ComputerAuditEntryRow]>,
 ) -> Result<AuditVerifyResult> {
+    if let Some(rows) = rows {
+        for row in rows {
+            if authenticated_entry(row).is_err() {
+                return Ok(index_column_mismatch_result(head));
+            }
+        }
+    }
     let entries = rows.map(chain_entries);
     Ok(verify_chain(head, entries.as_deref(), |version| {
         inner.hmac_keys.get(&version).map(|key| key.as_ref())
@@ -1015,6 +1068,116 @@ mod tests {
         assert_eq!(result.status, AuditVerifyStatus::Verified);
         assert_eq!(result.confirmed_sequence, 2);
         assert!(reopened.is_available());
+    }
+
+    #[test]
+    fn projected_index_fields_match_canonical_encoding() {
+        let event = sample_event(AuditEventKind::GuidanceProposalAccepted, 7);
+        let entry = build_guidance_entry(&event, 42, [9u8; 32], 3, 100, 200).unwrap();
+        let bytes = entry.encode();
+        let (sequence, kind, proposal_id, key_version) =
+            cockpit_db::computer_audit::projected_index_fields(&bytes);
+        assert_eq!(sequence, 42);
+        assert_eq!(kind, GUIDANCE_PROPOSAL_ACCEPTED);
+        assert_eq!(proposal_id, event.proposal_id);
+        assert_eq!(key_version, 3);
+        assert_eq!(bytes[COMPUTER_AUDIT_EVENT_KIND_OFFSET], kind);
+        assert_eq!(
+            &bytes[COMPUTER_AUDIT_SEQUENCE_OFFSET..18],
+            &42u64.to_be_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_index_column_relabel_fails_closed() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap();
+        let mut stolen = [0u8; 16];
+        stolen[0] = 9;
+        stolen[15] = 9;
+        let tamper = harness
+            .db
+            .write(move |conn| {
+                conn.execute("PRAGMA writable_schema = ON", [])?;
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS computer_audit_entries_immutable_update",
+                    [],
+                )?;
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS computer_audit_entries_immutable_delete",
+                    [],
+                )?;
+                conn.execute(
+                    "CREATE TABLE computer_audit_entries_tamper (
+                        sequence INTEGER PRIMARY KEY,
+                        entry_bytes BLOB NOT NULL,
+                        mac BLOB NOT NULL,
+                        event_kind INTEGER NOT NULL,
+                        proposal_id BLOB NOT NULL,
+                        key_version INTEGER NOT NULL
+                    )",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO computer_audit_entries_tamper
+                     SELECT sequence, entry_bytes, mac, event_kind, proposal_id, key_version
+                     FROM computer_audit_entries",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE computer_audit_entries_tamper
+                     SET event_kind = ?1, proposal_id = ?2
+                     WHERE sequence = 1",
+                    rusqlite::params![i64::from(GUIDANCE_PROPOSAL_CREATED), stolen.as_slice()],
+                )?;
+                conn.execute("DROP TABLE computer_audit_entries", [])?;
+                conn.execute(
+                    "ALTER TABLE computer_audit_entries_tamper RENAME TO computer_audit_entries",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(tamper.is_ok(), "{tamper:?}");
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_kind, GUIDANCE_PROPOSAL_CREATED);
+        assert_eq!(rows[0].proposal_id, stolen);
+        let decoded = ComputerAuditEntryV1::decode(&rows[0].entry_bytes).unwrap();
+        assert_eq!(decoded.event_kind, AuditEventKind::GuidanceProposalCreated);
+        assert_ne!(decoded.proposal_id, stolen);
+
+        let status = harness.chain.verify().await.status;
+        assert_eq!(status, AuditVerifyStatus::Corrupt, "{status:?}");
+
+        let duplicate = harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 9))
+            .await
+            .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("failed closed")
+                || duplicate.to_string().contains("not available")
+                || duplicate.to_string().contains("index columns do not match"),
+            "{duplicate}"
+        );
+        assert!(!harness.chain.is_available());
+
+        let successor = harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalAccepted, 9))
+            .await
+            .unwrap_err();
+        assert!(
+            successor.to_string().contains("failed closed")
+                || successor.to_string().contains("not available")
+                || successor.is_predecessor_missing(),
+            "{successor}"
+        );
     }
 
     #[tokio::test]

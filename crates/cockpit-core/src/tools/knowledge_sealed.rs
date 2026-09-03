@@ -53,7 +53,7 @@ fn scope(ctx: &ToolCtx, trust: SealedProjectTrust) -> SealedUseContext {
         caller_trust: crate::config::providers::ModelTrust::default(),
         project_key: SealedProjectKey::from_canonical(ctx.session.project_id.clone()),
         project_trust: trust,
-        session_id: ctx.session.id,
+        session_id: ctx.session.live_id(),
         session_generation: ctx.config.generation(),
         now_ms: chrono::Utc::now().timestamp_millis(),
     }

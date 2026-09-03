@@ -397,7 +397,7 @@ fn request_owned_graceful_stop(
     {
         anyhow::bail!("daemon receipt changed before owner graceful-stop request");
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         #[cfg(test)]
         if let Some(succeed) = INJECT_OWNER_GRACEFUL_STOP.with(|value| value.replace(None)) {
@@ -418,14 +418,14 @@ fn request_owned_graceful_stop(
             || {},
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (cleanup, expected);
         anyhow::bail!("owner graceful-stop transport is unavailable on this platform")
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn request_owned_graceful_stop_async(
     cleanup: &ProcessCleanup,
     expected: &DaemonPidReceipt,
@@ -649,34 +649,47 @@ fn shutdown_shared(
     }
     drop(phase);
 
-    let result = if let Some(cleanup) = process {
-        let (completed, completion) = std::sync::mpsc::channel();
-        let reap = ProcessReap {
-            cleanup: cleanup.clone(),
-            completed: Some(completed),
-            attempts: 0,
-        };
-        match process_reaper() {
-            Ok(reaper) => match reaper.send(reap) {
-                Ok(()) => completion
-                    .recv()
-                    .context("ephemeral process reaper dropped completion")
-                    .and_then(|result| result),
-                Err(error) => run_cleanup_fallback_until_released(&error.0.cleanup),
-            },
-            Err(error) => {
-                let fallback = run_cleanup_fallback_until_released(&cleanup);
-                match fallback {
-                    Ok(()) => Err(error),
-                    Err(fallback) => Err(anyhow::anyhow!(
-                        "{error}; synchronous exact-child cleanup also failed: {fallback}"
-                    )),
+    let result = match process {
+        Some(cleanup) => {
+            let (completed, completion) = std::sync::mpsc::channel();
+            let reap = ProcessReap {
+                cleanup: cleanup.clone(),
+                completed: Some(completed),
+                attempts: 0,
+            };
+            match process_reaper() {
+                Ok(reaper) => match reaper.send(reap) {
+                    Ok(()) => completion
+                        .recv()
+                        .context("ephemeral process reaper dropped completion")
+                        .and_then(|result| result),
+                    Err(error) => run_cleanup_fallback_until_released(&error.0.cleanup),
+                },
+                Err(error) => {
+                    let fallback = run_cleanup_fallback_until_released(&cleanup);
+                    match fallback {
+                        Ok(()) => Err(error),
+                        Err(fallback) => Err(anyhow::anyhow!(
+                            "{error}; synchronous exact-child cleanup also failed: {fallback}"
+                        )),
+                    }
                 }
             }
         }
-    } else {
-        stop_daemon_blocking(socket);
-        Ok(())
+        None => {
+            // Production guards always own a child. The socket-only constructor
+            // exists for tests; it has no receipt to bind a StopDaemon to.
+            #[cfg(test)]
+            {
+                stop_daemon_blocking_unbound(socket);
+                Ok(())
+            }
+            #[cfg(not(test))]
+            {
+                let _ = socket;
+                anyhow::bail!("ephemeral shutdown without an owned child is not a production path")
+            }
+        }
     };
     publish_cleanup_result(state, result)
 }
@@ -778,16 +791,42 @@ impl Drop for EphemeralDaemonGuard {
     }
 }
 
-/// Best-effort synchronous `StopDaemon`. Connects to the daemon socket with
-/// the blocking std `UnixStream`, writes one NDJSON request, and returns —
-/// usable from synchronous teardown. Any failure (daemon already gone, socket
-/// removed) is swallowed.
-pub(crate) fn stop_daemon_blocking(socket: &Path) {
+/// Best-effort synchronous `StopDaemon` bound to a verified receipt.
+///
+/// Connects with the blocking std transport, then re-reads `pid_file` and
+/// writes the request only while it still names `expected`. A replacement
+/// incarnation that published at the same identity must not receive a
+/// shutdown intended for the previous daemon. This is the same send-time
+/// gate as `request_owned_graceful_stop_async`: the proof is taken after
+/// the connection is open and before any request bytes are written.
+///
+/// Any failure (daemon already gone, socket removed, receipt changed,
+/// transient contention past the connect budget) is swallowed; the return
+/// value reports whether the request bytes were written so callers can retry
+/// instead of skipping to destructive teardown.
+#[cfg(any(windows, test))]
+pub(crate) fn stop_daemon_blocking(
+    socket: &Path,
+    pid_file: &Path,
+    expected: &DaemonPidReceipt,
+) -> bool {
+    send_stop_daemon_blocking(socket, Some((pid_file, expected)))
+}
+
+/// Test-only unbound `StopDaemon`. Socket-only fixtures have no pid receipt
+/// to bind; production callers must use [`stop_daemon_blocking`].
+#[cfg(test)]
+pub(crate) fn stop_daemon_blocking_unbound(socket: &Path) -> bool {
+    send_stop_daemon_blocking(socket, None)
+}
+
+#[cfg(any(windows, test))]
+fn send_stop_daemon_blocking(socket: &Path, expected: Option<(&Path, &DaemonPidReceipt)>) -> bool {
     let Ok(envelope) = serde_json::to_string(&Envelope::request(
         uuid::Uuid::new_v4(),
         Request::StopDaemon { grace_secs: None },
     )) else {
-        return;
+        return false;
     };
     #[cfg(unix)]
     {
@@ -797,9 +836,15 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
         if let Ok(mut stream) = StdUnixStream::connect(socket) {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.write_all(envelope.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
+            if !pid_record_still_names(expected) {
+                return false;
+            }
+            if stream.write_all(envelope.as_bytes()).is_err()
+                || stream.write_all(b"\n").is_err()
+                || stream.flush().is_err()
+            {
+                return false;
+            }
             // Block briefly for the daemon's reply before dropping the
             // connection. Without this, an immediate close races the daemon's
             // per-client task: the daemon sends its hello *first*, and if the
@@ -811,12 +856,49 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
             // discarded — we only need the daemon to have read.
             let mut sink = [0u8; 256];
             let _ = stream.read(&mut sink);
+            return true;
         }
+        false
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (socket, envelope);
+        use std::io::Write as _;
+        use std::time::Duration;
+        if let Ok(pipe) = cockpit_host::named_pipe::read_pipe_identity(socket)
+            && let Ok(mut stream) = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe)
+        {
+            if !pid_record_still_names(expected) {
+                return false;
+            }
+            if stream.write_all(envelope.as_bytes()).is_err()
+                || stream.write_all(b"\n").is_err()
+                || stream.flush().is_err()
+            {
+                return false;
+            }
+            let mut sink = [0u8; 256];
+            let _ = cockpit_host::named_pipe::read_bounded(
+                &stream,
+                &mut sink,
+                Duration::from_millis(500),
+            );
+            return true;
+        }
+        false
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (socket, envelope, expected);
+        false
+    }
+}
+
+#[cfg(any(windows, test))]
+fn pid_record_still_names(expected: Option<(&Path, &DaemonPidReceipt)>) -> bool {
+    let Some((pid_file, expected)) = expected else {
+        return true;
+    };
+    read_daemon_pid_record(pid_file) == Some(DaemonPidRecord::Receipt(expected.clone()))
 }
 
 #[cfg(test)]
@@ -1044,6 +1126,76 @@ mod tests {
             "a booted socket owner must leave StopDaemon to client-presence teardown"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_blocking_sends_when_receipt_still_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pid_file = dir.path().join("daemon.pid");
+        let executable = std::env::current_exe().unwrap();
+        let expected = cockpit_host::daemon_lifecycle::write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &executable,
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(accept_one_line(listener));
+
+        let sent = tokio::task::spawn_blocking(move || {
+            stop_daemon_blocking(&socket, &pid_file, &expected)
+        })
+        .await
+        .unwrap();
+
+        assert!(sent);
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server timed out")
+            .unwrap()
+            .expect("a line arrived");
+        assert!(matches!(
+            parse_request(&line),
+            Request::StopDaemon { grace_secs: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_blocking_does_not_send_after_receipt_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pid_file = dir.path().join("daemon.pid");
+        let executable = std::env::current_exe().unwrap();
+        let expected = cockpit_host::daemon_lifecycle::write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &executable,
+        )
+        .unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        cockpit_host::daemon_lifecycle::write_pid_file(&pid_file, std::process::id(), &executable)
+            .unwrap();
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(accept_one_line(listener));
+
+        let sent = tokio::task::spawn_blocking(move || {
+            stop_daemon_blocking(&socket, &pid_file, &expected)
+        })
+        .await
+        .unwrap();
+
+        assert!(!sent, "replacement receipt must suppress StopDaemon");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), server)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .is_none(),
+            "replacement must not receive StopDaemon"
+        );
     }
 
     #[test]
@@ -1590,5 +1742,98 @@ mod tests {
         assert!(cleanup_exact_process(&cleanup).is_err());
         assert!(!process_child_retained(&cleanup));
         assert!(!paths.pid_file.exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_stop_binding_tests {
+    use super::*;
+    use crate::daemon::proto::Body;
+    use tokio::io::AsyncBufReadExt;
+
+    async fn accept_one_line(
+        mut listener: crate::daemon::windows_pipe::NamedPipeListener,
+    ) -> Option<String> {
+        let stream = listener.accept().await.ok()?;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(n) if n > 0 => Some(line),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_blocking_sends_when_receipt_still_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pid_file = dir.path().join("daemon.pid");
+        let executable = std::env::current_exe().unwrap();
+        let expected = cockpit_host::daemon_lifecycle::write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &executable,
+        )
+        .unwrap();
+        let listener = crate::daemon::windows_pipe::NamedPipeListener::bind(&socket).unwrap();
+        let server = tokio::spawn(accept_one_line(listener));
+
+        let sent = tokio::task::spawn_blocking(move || {
+            stop_daemon_blocking(&socket, &pid_file, &expected)
+        })
+        .await
+        .unwrap();
+
+        assert!(sent);
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server timed out")
+            .unwrap()
+            .expect("a line arrived");
+        let env: Envelope = serde_json::from_str(line.trim_end()).expect("valid envelope");
+        assert!(matches!(
+            env.body,
+            Body::Request {
+                request: Request::StopDaemon { grace_secs: None },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_blocking_does_not_send_after_receipt_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pid_file = dir.path().join("daemon.pid");
+        let executable = std::env::current_exe().unwrap();
+        let expected = cockpit_host::daemon_lifecycle::write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &executable,
+        )
+        .unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        cockpit_host::daemon_lifecycle::write_pid_file(&pid_file, std::process::id(), &executable)
+            .unwrap();
+
+        let listener = crate::daemon::windows_pipe::NamedPipeListener::bind(&socket).unwrap();
+        let server = tokio::spawn(accept_one_line(listener));
+
+        let sent = tokio::task::spawn_blocking(move || {
+            stop_daemon_blocking(&socket, &pid_file, &expected)
+        })
+        .await
+        .unwrap();
+
+        assert!(!sent, "replacement receipt must suppress StopDaemon");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), server)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .is_none(),
+            "replacement must not receive StopDaemon"
+        );
     }
 }

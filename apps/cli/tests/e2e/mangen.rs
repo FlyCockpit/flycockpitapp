@@ -17,9 +17,14 @@ fn mangen_generates_and_hides_hidden() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<std::collections::BTreeSet<_>>();
+    // Every root of the public local profile gets a man page, mirroring the
+    // fixture-pinned surface (canonical roots; nested subcommands also get
+    // pages and are covered by the recursion itself).
     for command in [
+        "acp",
         "ask",
         "run",
+        "invocation",
         "agent",
         "code",
         "assistant",
@@ -28,20 +33,36 @@ fn mangen_generates_and_hides_hidden() {
         "provider",
         "setup",
         "models",
+        "provider-catalog-status",
+        "fetch-models",
+        "jq",
         "daemon",
         "doctor",
         "session",
+        "knowledge",
+        "dream",
+        "skill",
         "trust",
         "export",
+        "import",
+        "stats",
+        "debug",
         "config",
+        "mcp",
+        "packages",
+        "kcl",
         "init",
+        "bash-hints",
+        "completion",
     ] {
         assert!(
             pages.contains(&format!("cockpit-{command}.1")),
             "missing {command} man page"
         );
     }
-    for internal in ["invocation", "mcp", "schedule", "skill", "stats"] {
+    // Roots outside the local profile (opt-in `extended`/`remote` features)
+    // stay out of the public local man pages.
+    for internal in ["schedule", "account", "sync", "connect"] {
         assert!(
             !pages.contains(&format!("cockpit-{internal}.1")),
             "unexpected public {internal} man page"

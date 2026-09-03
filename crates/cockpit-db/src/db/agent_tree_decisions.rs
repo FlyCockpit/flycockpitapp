@@ -2302,16 +2302,20 @@ impl Db {
             let Some(child_uuid) = child_uuid else {
                 return Ok(None);
             };
-            let agent_id: Option<String> = conn
+            let agent_id: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT agent_instance_id FROM agent_instances
-                     WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
-                    params![session_id.to_string(), child_uuid],
-                    |row| row.get(0),
+                    "SELECT agent_instance_id, session_id FROM agent_instances
+                     WHERE task_delegation_child_uuid = ?1",
+                    params![child_uuid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             match agent_id {
-                Some(agent_id) => load_agent(conn, session_id, parse_uuid(agent_id)?),
+                Some((agent_id, instance_session_id)) => load_agent(
+                    conn,
+                    parse_uuid(instance_session_id)?,
+                    parse_uuid(agent_id)?,
+                ),
                 None => Ok(None),
             }
         })
@@ -2336,8 +2340,7 @@ impl Db {
                    JOIN task_delegation_jobs j
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
-                    AND a.agent_instance_id = ?2
-                    AND j.parent_session_id = ?1",
+                    AND a.agent_instance_id = ?2",
                 params![session_id.to_string(), agent_instance_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2367,8 +2370,7 @@ impl Db {
                        JOIN task_delegation_jobs j
                          ON j.task_call_id = c.task_call_id
                       WHERE a.session_id = ?1
-                        AND a.agent_instance_id = ?2
-                        AND j.parent_session_id = ?1",
+                        AND a.agent_instance_id = ?2",
                     params![session_id.to_string(), agent_instance_id.to_string()],
                     |row| row.get(0),
                 )
@@ -2407,7 +2409,6 @@ impl Db {
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
                     AND a.agent_instance_id = ?2
-                    AND j.parent_session_id = ?1
                     AND c.status IN ('running', 'backgrounded', 'paused_pending_tool')",
                 params![session_id.to_string(), agent_instance_id.to_string()],
                 |row| {
@@ -2458,7 +2459,6 @@ impl Db {
                    JOIN task_delegation_jobs j
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
-                    AND j.parent_session_id = ?1
                     AND c.task_call_id = ?2
                     AND c.status IN ('running', 'backgrounded', 'paused_pending_tool')
                   ORDER BY c.label ASC",
@@ -2524,7 +2524,7 @@ impl Db {
             };
             match self
                 .transition_agent_instance(
-                    session_id,
+                    agent.session_id,
                     agent.agent_instance_id,
                     agent.revision,
                     next_state,
@@ -2589,12 +2589,20 @@ impl Db {
                     |row| Ok((parse_uuid(row.get::<_, String>(0)?)?, row.get(1)?)),
                 )
                 .context("task delegation child is not authorized for this session")?;
-            let agent_id: Uuid = conn
+            // Jobs follow the live conversation window; AgentTree rows stay on
+            // the worker spawn id. Resolve the executor by unique child uuid
+            // so compaction successor adoption does not lose the tree.
+            let (agent_id, session_id): (Uuid, Uuid) = conn
                 .query_row(
-                    "SELECT agent_instance_id FROM agent_instances
-                      WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
-                    params![session_id.to_string(), child_uuid.to_string()],
-                    |row| parse_uuid(row.get::<_, String>(0)?),
+                    "SELECT agent_instance_id, session_id FROM agent_instances
+                      WHERE task_delegation_child_uuid = ?1",
+                    params![child_uuid.to_string()],
+                    |row| {
+                        Ok((
+                            parse_uuid(row.get::<_, String>(0)?)?,
+                            parse_uuid(row.get::<_, String>(1)?)?,
+                        ))
+                    },
                 )
                 .context("live task delegation child has no AgentTree executor")?;
 
@@ -3927,7 +3935,6 @@ impl Db {
                         AND EXISTS (
                             SELECT 1 FROM needs_attention n
                              WHERE n.interrupt_id = host_capability_refresh_operations.interrupt_id
-                               AND n.session_id = host_capability_refresh_operations.session_id
                                AND n.decision_request_id IS NOT NULL
                         )
                  )",
@@ -3999,7 +4006,6 @@ impl Db {
                    FROM host_capability_refresh_operations operation
                    JOIN needs_attention attention
                      ON attention.interrupt_id = operation.interrupt_id
-                    AND attention.session_id = operation.session_id
                   WHERE operation.session_id = ?1
                     AND operation.state IN ('completed', 'failed', 'cancelled')
                     AND attention.state = 'executing'
@@ -4559,7 +4565,6 @@ impl Db {
                         AND EXISTS (
                             SELECT 1 FROM needs_attention n
                              WHERE n.interrupt_id = host_capability_refresh_operations.interrupt_id
-                               AND n.session_id = host_capability_refresh_operations.session_id
                                AND n.decision_request_id IS NOT NULL
                         )
                       LIMIT 1",
@@ -4588,7 +4593,6 @@ impl Db {
                     AND NOT EXISTS (
                         SELECT 1 FROM needs_attention n
                          WHERE n.interrupt_id = host_capability_refresh_operations.interrupt_id
-                           AND n.session_id = host_capability_refresh_operations.session_id
                            AND n.decision_request_id IS NOT NULL
                     )",
                 params![now_unix_ms, session_id.to_string()],
@@ -5594,9 +5598,9 @@ impl Db {
                     .query_row(
                         "SELECT agent_instance_id, question_json, questions_json
                            FROM needs_attention
-                          WHERE interrupt_id = ?1 AND session_id = ?2
+                          WHERE interrupt_id = ?1
                             AND state = 'open' AND decision_request_id IS NULL",
-                        params![attention_id.to_string(), input.session_id.to_string()],
+                        params![attention_id.to_string()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?
@@ -5702,14 +5706,13 @@ impl Db {
                 let changed = conn.execute(
                     "UPDATE needs_attention
                      SET decision_request_id = ?1
-                     WHERE interrupt_id = ?2 AND session_id = ?3
-                       AND agent_instance_id = ?4
+                     WHERE interrupt_id = ?2
+                       AND agent_instance_id = ?3
                        AND state = 'open' AND decision_request_id IS NULL
                        AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![
                         decision_request_id.to_string(),
                         attention_id.to_string(),
-                        input.session_id.to_string(),
                         input.agent_instance_id.to_string(),
                     ],
                 )?;
@@ -5782,7 +5785,6 @@ impl Db {
                            FROM host_capability_refresh_operations operation
                            JOIN needs_attention attention
                              ON attention.interrupt_id = operation.interrupt_id
-                            AND attention.session_id = operation.session_id
                             AND attention.agent_instance_id = operation.agent_instance_id
                           WHERE operation.operation_id = ?1
                             AND operation.request_id = ?2
@@ -5936,8 +5938,8 @@ impl Db {
             let decision_id: Option<String> = conn
                 .query_row(
                     "SELECT decision_request_id FROM needs_attention
-                     WHERE session_id = ?1 AND interrupt_id = ?2",
-                    params![session_id.to_string(), interrupt_id.to_string()],
+                     WHERE interrupt_id = ?1",
+                    params![interrupt_id.to_string()],
                     |row| row.get(0),
                 )
                 .optional()?
@@ -5956,16 +5958,16 @@ impl Db {
     /// `ResolveInterrupt` path owns its response schema and wake-up ACK.
     pub async fn interrupt_for_decision_request(
         &self,
-        session_id: Uuid,
+        _session_id: Uuid,
         decision_request_id: Uuid,
     ) -> Result<Option<Uuid>> {
         self.read(move |conn| {
             let interrupt_id: Option<String> = conn
                 .query_row(
                     "SELECT interrupt_id FROM needs_attention
-                     WHERE session_id = ?1 AND decision_request_id = ?2
+                     WHERE decision_request_id = ?1
                        AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
-                    params![session_id.to_string(), decision_request_id.to_string()],
+                    params![decision_request_id.to_string()],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -6104,10 +6106,10 @@ impl Db {
             let predecessor_interrupt_id: Option<String> = conn
                 .query_row(
                     "SELECT interrupt_id FROM needs_attention
-                      WHERE session_id = ?1 AND decision_request_id = ?2
+                      WHERE decision_request_id = ?1
                         AND (question_json IS NOT NULL OR questions_json IS NOT NULL)
                         AND state <> 'resolved'",
-                    params![session_id.to_string(), decision_request_id.to_string()],
+                    params![decision_request_id.to_string()],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -6251,7 +6253,6 @@ impl Db {
                           AND NOT EXISTS (
                               SELECT 1 FROM needs_attention predecessor
                                WHERE predecessor.interrupt_id = candidate.predecessor_interrupt_id
-                                 AND predecessor.session_id = candidate.session_id
                                  AND predecessor.state <> 'resolved'
                           )
                         ORDER BY candidate.created_at_unix_ms, candidate.steer_id
@@ -6281,7 +6282,6 @@ impl Db {
                    AND NOT EXISTS (
                        SELECT 1 FROM needs_attention predecessor
                         WHERE predecessor.interrupt_id = agent_decision_steers.predecessor_interrupt_id
-                          AND predecessor.session_id = agent_decision_steers.session_id
                           AND predecessor.state <> 'resolved'
                    )",
                 // The exact agent-row predicate closes the cancel-vs-claim
@@ -6357,7 +6357,6 @@ impl Db {
                           AND NOT EXISTS (
                               SELECT 1 FROM needs_attention predecessor
                                WHERE predecessor.interrupt_id = candidate.predecessor_interrupt_id
-                                 AND predecessor.session_id = candidate.session_id
                                  AND predecessor.state <> 'resolved'
                           )
                         ORDER BY candidate.accepted_at_unix_ms, candidate.steer_id
@@ -6373,7 +6372,6 @@ impl Db {
                    AND NOT EXISTS (
                        SELECT 1 FROM needs_attention predecessor
                         WHERE predecessor.interrupt_id = agent_decision_steers.predecessor_interrupt_id
-                          AND predecessor.session_id = agent_decision_steers.session_id
                           AND predecessor.state <> 'resolved'
                    )",
                 params![
@@ -7060,12 +7058,10 @@ impl Db {
                         "SELECT question_json, questions_json
                            FROM needs_attention
                           WHERE interrupt_id = ?1
-                            AND session_id = ?2
-                            AND decision_request_id = ?3
+                            AND decision_request_id = ?2
                             AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
                         params![
                             interrupt_id.to_string(),
-                            session_id.to_string(),
                             decision_request_id.to_string(),
                         ],
                         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -7599,7 +7595,6 @@ fn host_approval_operation_has_exact_interrupt(
                 AND decision.session_id = operation.session_id
                JOIN needs_attention interrupt
                  ON interrupt.decision_request_id = decision.decision_request_id
-                AND interrupt.session_id = decision.session_id
               WHERE operation.operation_id = ?1
                 AND operation.session_id = ?2
                 AND operation.agent_instance_id = ?3
@@ -7819,11 +7814,8 @@ fn load_decision(
         .query_row(
             "SELECT agent_instance_id, question_json, questions_json
                FROM needs_attention
-              WHERE session_id = ?1 AND decision_request_id = ?2",
-            params![
-                decision.session_id.to_string(),
-                decision.decision_request_id.to_string()
-            ],
+              WHERE decision_request_id = ?1",
+            params![decision.decision_request_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
@@ -8105,13 +8097,9 @@ fn abort_host_capability_refresh_initialization_conn(
             .query_row(
                 "SELECT decision_request_id
                    FROM needs_attention
-                  WHERE interrupt_id = ?1 AND session_id = ?2
-                    AND agent_instance_id = ?3",
-                params![
-                    raw_interrupt_id.to_string(),
-                    session_id.to_string(),
-                    agent_instance_id.to_string(),
-                ],
+                  WHERE interrupt_id = ?1
+                    AND agent_instance_id = ?2",
+                params![raw_interrupt_id.to_string(), agent_instance_id.to_string(),],
                 |row| row.get(0),
             )
             .optional()?;
@@ -8123,14 +8111,10 @@ fn abort_host_capability_refresh_initialization_conn(
     conn.execute(
         "UPDATE needs_attention
             SET state = 'resolved', resolved_at = ?1, revision = revision + 1
-          WHERE session_id = ?2 AND agent_instance_id = ?3
+          WHERE agent_instance_id = ?2
             AND decision_request_id IS NULL
             AND state IN ('open', 'parked', 'executing', 'interrupted')",
-        params![
-            now_unix_ms,
-            session_id.to_string(),
-            agent_instance_id.to_string()
-        ],
+        params![now_unix_ms, agent_instance_id.to_string()],
     )?;
 
     if !child.state.is_terminal() {
@@ -8710,8 +8694,8 @@ fn resolve_owned_decision_attention(
             "SELECT revision, state,
                     question_json IS NOT NULL OR questions_json IS NOT NULL
              FROM needs_attention
-             WHERE decision_request_id = ?1 AND session_id = ?2 AND state <> 'resolved'",
-            params![decision_request_id.to_string(), session_id.to_string()],
+             WHERE decision_request_id = ?1 AND state <> 'resolved'",
+            params![decision_request_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
@@ -8742,7 +8726,7 @@ fn resolve_owned_decision_attention(
     let changed = conn.execute(
         "UPDATE needs_attention
          SET state = ?1, resolved_at = ?2, response_json = ?3, revision = ?4
-         WHERE decision_request_id = ?5 AND session_id = ?6 AND revision = ?7
+         WHERE decision_request_id = ?5 AND revision = ?6
            AND state <> 'resolved'",
         params![
             next_state,
@@ -8750,7 +8734,6 @@ fn resolve_owned_decision_attention(
             response_json,
             current_revision + 1,
             decision_request_id.to_string(),
-            session_id.to_string(),
             current_revision,
         ],
     )?;

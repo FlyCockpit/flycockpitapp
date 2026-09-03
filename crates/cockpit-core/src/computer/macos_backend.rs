@@ -24,9 +24,11 @@ use super::{
     click_repetitions, eased_progress, scale_png,
 };
 use crate::computer::platform::{
-    MacAddressedInjection, MacFocusedWindowWitness, MacLiveFocusedWindow,
-    address_macos_injection_window, ax_window_element_is_live, live_focused_macos_injection_target,
-    macos_injection_target_from_opaque, restore_macos_injection_target,
+    MacAddressedInjection, MacFocusedWindowWitness, MacLiveFocusedWindow, MacosAxDeliveryError,
+    MacosAxWindowDelivery, address_macos_injection_window, ax_window_element_is_live,
+    deliver_to_authenticated_ax_window, live_focused_macos_injection_target,
+    macos_injection_target_from_opaque, macos_window_identity_from_opaque,
+    restore_macos_injection_target,
 };
 use crate::computer::target::{BackendKind, OpaqueWindowId};
 
@@ -505,11 +507,8 @@ impl MacOsComputerBackend {
 
     /// Sole irreversible CoreGraphics post primitive. Every event, including
     /// cleanup releases, must pass the retained active-console-session rebound
-    /// and then be addressed through the retained AX window object. Pid and
-    /// CGWindowID are read from that live object and authenticated by the
-    /// planted generation; the window number is the event destination, not
-    /// process focus. A stored pid/window-number pair is never the destination
-    /// operand.
+    /// and then be addressed through the retained AX window object.
+    /// [`deliver_to_authenticated_ax_window`] is the object-identity fence.
     fn post_event(
         &mut self,
         event: &CGEvent,
@@ -553,17 +552,29 @@ impl MacOsComputerBackend {
                 Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
             }
         };
-        let addressed = match address_macos_injection_window(&bound.ax, &bound.opaque) {
-            Ok(addressed) => addressed,
-            Err(_) => {
+        let mut delivery = LiveAxDelivery {
+            event,
+            witness: &bound.ax,
+            opaque: &bound.opaque,
+        };
+        match deliver_to_authenticated_ax_window(&mut delivery, bound.opaque) {
+            Ok(()) => {}
+            Err(MacosAxDeliveryError::AmbiguousDelivery) => {
+                return Err(ambiguous_ax_delivery());
+            }
+            Err(MacosAxDeliveryError::MissingWindowLocationSetter) => {
                 return self.rollback_known_pre_post_refusal(
                     prepared,
                     ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string()),
                 );
             }
-        };
-        stamp_event_window_destination(event, addressed);
-        CGEvent::post_to_pid(addressed.pid, Some(event));
+            Err(_) => {
+                return self.rollback_known_pre_post_refusal(
+                    prepared,
+                    ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()),
+                );
+            }
+        }
 
         // From the post onward this backend owns the transition even if the
         // commit write fails. Update process-local cleanup ownership first;
@@ -1095,12 +1106,91 @@ fn cg_null(program: &str) -> ComputerError {
     command_error(program, "CoreGraphics returned null")
 }
 
-/// AppKit routes a process-directed event using this CGEvent field as the
-/// destination CGWindowID (`NSEvent.windowNumber`). Distinct from the public
+/// AppKit's `NSEvent.windowNumber` destination, carried on the CGEvent record
+/// (`CGSEventRecord.window`). Distinct from the public
 /// `kCGMouseEventWindowUnderMousePointer` annotation, which is not a destination.
 const EVENT_DESTINATION_WINDOW_NUMBER: CGEventField = CGEventField(55);
 
-fn stamp_event_window_destination(event: &CGEvent, addressed: MacAddressedInjection) {
+const AMBIGUOUS_AX_WINDOW_DELIVERY: &str = "macOS window-addressed CGEvent post could not re-authenticate the retained AX window; delivery is uncertain";
+
+fn ambiguous_ax_delivery() -> ComputerError {
+    ComputerError::CommandFailed {
+        program: "macos computer backend".to_string(),
+        detail: AMBIGUOUS_AX_WINDOW_DELIVERY.to_string(),
+    }
+}
+
+/// Delivery host whose irreversible post takes the retained AX window as the
+/// operand. Pid and CGWindowID are re-read from that object at post time.
+struct LiveAxDelivery<'a> {
+    event: &'a CGEvent,
+    witness: &'a MacFocusedWindowWitness,
+    opaque: &'a crate::computer::target::OpaqueWindowId,
+}
+
+impl MacosAxWindowDelivery for LiveAxDelivery<'_> {
+    fn ax_is_live(&self) -> bool {
+        ax_window_element_is_live(self.witness.element())
+    }
+
+    fn resolve_from_ax(
+        &self,
+    ) -> Result<
+        (
+            u32,
+            u32,
+            [u8; crate::computer::platform::macos::MACOS_WINDOW_GENERATION_LEN],
+            (f64, f64),
+        ),
+        MacosAxDeliveryError,
+    > {
+        let addressed = address_macos_injection_window(self.witness, self.opaque)
+            .map_err(macos_address_error)?;
+        let (_, _, generation) = macos_window_identity_from_opaque(self.opaque)
+            .ok_or(MacosAxDeliveryError::QueryMismatch)?;
+        let pid = u32::try_from(addressed.pid).map_err(|_| MacosAxDeliveryError::QueryMismatch)?;
+        Ok((
+            pid,
+            addressed.window_number,
+            generation,
+            (addressed.origin.x, addressed.origin.y),
+        ))
+    }
+
+    fn window_location_setter_available(&self) -> bool {
+        cg_event_set_window_location().is_some()
+    }
+
+    fn post_to_held_ax(&mut self) -> Result<(), MacosAxDeliveryError> {
+        let addressed = address_macos_injection_window(self.witness, self.opaque)
+            .map_err(macos_address_error)?;
+        stamp_event_window_destination(self.event, addressed)?;
+        CGEvent::post_to_pid(addressed.pid, Some(self.event));
+        Ok(())
+    }
+}
+
+fn macos_address_error(
+    reason: crate::computer::target::TargetUnavailableReason,
+) -> MacosAxDeliveryError {
+    match reason {
+        crate::computer::target::TargetUnavailableReason::QueryMismatch => {
+            MacosAxDeliveryError::QueryMismatch
+        }
+        crate::computer::target::TargetUnavailableReason::MissingCapability => {
+            MacosAxDeliveryError::MissingWindowLocationSetter
+        }
+        _ => MacosAxDeliveryError::StaleTarget,
+    }
+}
+
+fn stamp_event_window_destination(
+    event: &CGEvent,
+    addressed: MacAddressedInjection,
+) -> Result<(), MacosAxDeliveryError> {
+    let Some(set_location) = cg_event_set_window_location() else {
+        return Err(MacosAxDeliveryError::MissingWindowLocationSetter);
+    };
     CGEvent::set_integer_value_field(
         Some(event),
         CGEventField::EventTargetUnixProcessID,
@@ -1123,11 +1213,10 @@ fn stamp_event_window_destination(event: &CGEvent, addressed: MacAddressedInject
     );
     let screen = CGEvent::location(Some(event));
     let local = CGPoint::new(screen.x - addressed.origin.x, screen.y - addressed.origin.y);
-    if let Some(set_location) = cg_event_set_window_location() {
-        // SAFETY: `event` is a live CGEvent; the private setter writes the
-        // window-local point AppKit uses to route inside `window_number`.
-        unsafe { set_location(std::ptr::from_ref(event).cast(), local) };
-    }
+    // SAFETY: `event` is a live CGEvent; the setter writes the window-local
+    // point AppKit uses to route inside the authenticated window object.
+    unsafe { set_location(std::ptr::from_ref(event).cast(), local) };
+    Ok(())
 }
 
 type CgEventSetWindowLocationFn =

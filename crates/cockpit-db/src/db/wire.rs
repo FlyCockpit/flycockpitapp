@@ -73,6 +73,18 @@ pub struct SessionSummary {
     /// backlink to drill into the source conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_inbox_latest_source_session_id: Option<Uuid>,
+    /// Immediate predecessor window in this conversation's compaction
+    /// lineage. Absent on the first window of a lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_predecessor_session_id: Option<Uuid>,
+    /// Stable conversation id shared by every window in a compaction
+    /// lineage. Forks mint their own root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_lineage_root_id: Option<Uuid>,
+    /// Number of context windows in this conversation lineage. The session
+    /// browser collapses a count greater than 1 into one logical card.
+    #[serde(default)]
+    pub lineage_window_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1293,6 +1293,11 @@ pub struct InterruptHub {
     redaction: Option<SharedRedactionTable>,
     db: Option<crate::db::Db>,
     session_id: Option<Uuid>,
+    /// Live conversation window. When set, durable interrupt rows and
+    /// `InterruptRaised` / queue events follow [`crate::session::Session::live_id`]
+    /// rather than the worker spawn id. Agent-tree tables stay on the spawn
+    /// id passed into [`raise_and_wait_with_agent_tree`].
+    live_session: Option<std::sync::Arc<crate::session::Session>>,
     /// Count of attached *interactive* clients — ones that can answer an
     /// interrupt (the TUI; later the remote dashboard). A `cockpit run`
     /// event pump attaches but cannot answer, so it does not count. The
@@ -1340,6 +1345,30 @@ impl InterruptHub {
         self.park_commit = Some(park_commit);
         self
     }
+
+    /// Bind this hub to the live `Session` so interrupt persist/emit follow
+    /// [`crate::session::Session::live_id`] after compaction successor
+    /// adoption. Agent-tree storage keeps using the worker spawn id.
+    #[must_use]
+    pub fn with_live_session(mut self, session: std::sync::Arc<crate::session::Session>) -> Self {
+        self.live_session = Some(session);
+        self
+    }
+
+    fn owned_session_id(&self) -> Option<Uuid> {
+        if let Some(session) = &self.live_session {
+            Some(session.live_id())
+        } else {
+            self.session_id
+        }
+    }
+
+    /// Conversation-window identity for durable interrupt rows and wire
+    /// events. Falls back to `fallback` for detached/test hubs.
+    fn interrupt_session_id(&self, fallback: Uuid) -> Uuid {
+        self.owned_session_id().unwrap_or(fallback)
+    }
+
     /// Build a hub wired to the worker's client event fan-out, sharing an
     /// externally-owned interactive-client counter so the daemon's attach
     /// lifecycle and the hub read the same cell. The session worker owns
@@ -1359,6 +1388,7 @@ impl InterruptHub {
             redaction: Some(redaction),
             db: Some(db),
             session_id: Some(session_id),
+            live_session: None,
             interactive_clients,
             redaction_table_write_lock: tokio::sync::Mutex::new(()),
             park_commit: None,
@@ -1375,6 +1405,7 @@ impl InterruptHub {
             redaction: None,
             db: None,
             session_id: None,
+            live_session: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
             redaction_table_write_lock: tokio::sync::Mutex::new(()),
             park_commit: None,
@@ -1631,11 +1662,10 @@ impl InterruptHub {
         description: &str,
         questions: InterruptQuestionSet,
     ) {
-        let open = match (&self.db, self.session_id) {
-            (Some(db), Some(owned_session_id)) if owned_session_id == session_id => {
-                db.list_open_interrupts(owned_session_id).await.ok()
-            }
-            _ => None,
+        let session_id = self.interrupt_session_id(session_id);
+        let open = match &self.db {
+            Some(db) => db.list_open_interrupts(session_id).await.ok(),
+            None => None,
         };
         if let Some(open) = &open {
             let active = open.first().map(|row| row.interrupt_id);
@@ -1669,7 +1699,7 @@ impl InterruptHub {
     }
 
     pub async fn emit_active_from_db(&self) {
-        let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
+        let (Some(db), Some(session_id)) = (&self.db, self.owned_session_id()) else {
             return;
         };
         let Ok(open) = db.list_open_interrupts(session_id).await else {
@@ -1710,7 +1740,7 @@ impl InterruptHub {
     }
 
     pub async fn emit_queue_state(&self) {
-        let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
+        let (Some(db), Some(session_id)) = (&self.db, self.owned_session_id()) else {
             return;
         };
         if let Ok(open) = db.list_open_interrupts(session_id).await {
@@ -1723,7 +1753,7 @@ impl InterruptHub {
 
     fn emit_queue_changed(&self, active_interrupt_id: Option<Uuid>, pending_count: usize) {
         if let (Some(events), Some(redaction), Some(session_id)) =
-            (&self.events, &self.redaction, self.session_id)
+            (&self.events, &self.redaction, self.owned_session_id())
         {
             send_current_event(
                 events,
@@ -1745,6 +1775,7 @@ impl InterruptHub {
     /// (replace, not delta); only the allow-set is ever sent. Reuses the same
     /// per-session event fan-out the worker uses for `RedactionState`.
     pub fn emit_gitignore_allow(&self, session_id: Uuid, allow: Vec<String>) {
+        let session_id = self.interrupt_session_id(session_id);
         if let (Some(events), Some(redaction)) = (&self.events, &self.redaction) {
             // `send` errors only when there are no subscribers — fine; an
             // attaching client re-hydrates the set via the attach broadcast.
@@ -2024,6 +2055,7 @@ async fn raise_and_wait_legacy(
     set: InterruptQuestionSet,
     log_label: &str,
 ) -> InterruptOutcome {
+    let session_id = interrupts.interrupt_session_id(session_id);
     if let Some((_interrupt_id, response)) =
         take_matching_pre_resolved_interrupt(None, agent, description, &set)
     {
@@ -2166,6 +2198,11 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     decision_subject: crate::agent_tree::HostDecisionSubject,
     log_label: &str,
 ) -> InterruptOutcome {
+    // Agent-tree tables and host-approval operations stay on the worker
+    // spawn id (`session_id`). Durable interrupt rows and wire events use
+    // the live conversation window so attached clients and the visible
+    // session card keep seeing prompts after compaction.
+    let interrupt_session_id = interrupts.interrupt_session_id(session_id);
     let host_capability_refresh_operation = decision_subject
         .host_capabilities_refresh_operation()
         .copied();
@@ -2362,7 +2399,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
             return raise_and_wait_legacy(
                 db,
                 interrupts,
-                session_id,
+                interrupt_session_id,
                 agent,
                 description,
                 set,
@@ -2379,7 +2416,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                 return raise_and_wait_legacy(
                     db,
                     interrupts,
-                    session_id,
+                    interrupt_session_id,
                     agent,
                     description,
                     set,
@@ -2431,7 +2468,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     let payload = current_interrupt_park_payload();
     let interrupt_id = match db
         .raise_interrupt_questions_with_agent_instance_and_payload(
-            session_id,
+            interrupt_session_id,
             agent,
             Some(agent_instance_id),
             description,
@@ -2606,7 +2643,13 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         }
     };
     interrupts
-        .emit_raised(session_id, interrupt_id, agent, description, set.clone())
+        .emit_raised(
+            interrupt_session_id,
+            interrupt_id,
+            agent,
+            description,
+            set.clone(),
+        )
         .await;
     let outcome = pending.wait().await;
     let InterruptOutcome::Resolved(response) = &outcome else {
@@ -2721,6 +2764,76 @@ mod tests {
             ),
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn post_compact_interrupt_persists_and_emits_under_live_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let spawn_id = session.id;
+        let successor = db.create_compaction_successor(spawn_id).await.unwrap();
+        let successor_short = successor
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor.session_id.to_string());
+        session.adopt_compaction_successor(successor.session_id, successor_short);
+        let live_id = session.live_id();
+        assert_ne!(live_id, spawn_id);
+
+        let (hub, mut events) = attached_hub(db.clone(), spawn_id);
+        let hub = Arc::new(hub.with_live_session(session.clone()));
+        let waiter = tokio::spawn({
+            let db = db.clone();
+            let hub = hub.clone();
+            async move {
+                raise_and_wait(
+                    &db,
+                    &hub,
+                    spawn_id,
+                    "builder",
+                    "post-compact question",
+                    question_set(),
+                    "compact interrupt",
+                )
+                .await
+            }
+        });
+
+        let interrupt_id = loop {
+            let open = db.list_open_interrupts(live_id).await.unwrap();
+            if let Some(row) = open.first() {
+                break row.interrupt_id;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            db.list_open_interrupts(spawn_id).await.unwrap().is_empty(),
+            "durable interrupt must not land on the ended predecessor window"
+        );
+
+        let raised = loop {
+            match events.recv().await {
+                Ok(envelope) => {
+                    if let proto::Event::InterruptRaised { session_id, .. } = envelope.event {
+                        break session_id;
+                    }
+                }
+                Err(_) => panic!("interrupt event channel closed before InterruptRaised"),
+            }
+        };
+        assert_eq!(raised, live_id);
+
+        assert!(hub.resolve(interrupt_id, ResolveResponse::Cancel));
+        waiter.await.unwrap();
     }
 
     async fn running_host_effect_agent() -> (crate::db::Db, Uuid, Uuid, i64) {

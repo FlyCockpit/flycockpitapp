@@ -249,14 +249,16 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
 /// `SetSandbox` must not call this. Writes to the layer `load_for_cwd` reads
 /// (nearest project `.cockpit/config.json`, honoring `COCKPIT_CONFIG`) so a
 /// per-project `/sandbox` toggle takes effect and is not masked by a nearer
-/// project layer; scaffolds a project `.cockpit/` when no layer exists yet.
+/// project layer; scaffolds a project `.cockpit/` when no discovered layer
+/// exists yet. This is workspace-bound: it must not fall back to the global
+/// user-level layer.
 pub(super) fn persist_sandbox_intent(
     project_root: &std::path::Path,
     mode: crate::tools::sandbox_mode::SandboxIntent,
 ) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
+    use crate::config::dirs::{CONFIG_FILE, most_specific_existing_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
-    let target = most_specific_config_write_target(project_root)
+    let target = most_specific_existing_config_write_target(project_root)
         .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut cfg = doc.config();
@@ -307,4 +309,42 @@ pub(super) fn loop_guard_threshold_for(config: &crate::config::extended::Extende
 
 pub(super) fn max_primary_rounds_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
     config.max_primary_rounds
+}
+
+#[cfg(test)]
+mod persist_sandbox_intent_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_install_scaffolds_the_project_layer_not_the_global_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        persist_sandbox_intent(&project, crate::tools::sandbox_mode::SandboxIntent::Off).unwrap();
+
+        let project_config = project
+            .join(".cockpit")
+            .join(crate::config::dirs::CONFIG_FILE);
+        assert!(
+            project_config.exists(),
+            "per-project sandbox intent must scaffold project .cockpit: {}",
+            project_config.display()
+        );
+        assert!(
+            !global.join(crate::config::dirs::CONFIG_FILE).exists(),
+            "per-project sandbox intent must not leak into the global layer"
+        );
+        let wire = std::fs::read_to_string(&project_config).unwrap();
+        assert!(
+            wire.contains("\"off\""),
+            "scaffolded project config must persist the sandbox intent: {wire}"
+        );
+    }
 }

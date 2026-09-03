@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
+use crate::cli::{
+    OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs, SessionMediaEgressCommand,
+};
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, ResolveResponse, Response};
 
@@ -20,6 +22,7 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
             dry_run,
             yes,
         } => purge(&before, dry_run, yes).await,
+        SessionCommand::MediaEgress(cmd) => media_egress(cmd).await,
     }
 }
 
@@ -120,6 +123,7 @@ async fn list(args: SessionListArgs) -> Result<()> {
             project_id: None,
             parent_session_id: None,
             assistant_id: args.assistant.clone(),
+            compaction_lineage_root_id: None,
         })
         .await
         .context("requesting session list from daemon")?
@@ -145,6 +149,80 @@ async fn list(args: SessionListArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn media_egress(cmd: SessionMediaEgressCommand) -> Result<()> {
+    match cmd {
+        SessionMediaEgressCommand::List { session_id, json } => {
+            media_egress_list(&session_id, json).await
+        }
+        SessionMediaEgressCommand::Revoke {
+            session_id,
+            digest,
+            purpose,
+        } => media_egress_revoke(&session_id, &purpose, &digest).await,
+    }
+}
+
+async fn media_egress_list(session: &str, json_mode: bool) -> Result<()> {
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for media-egress list")?;
+    let response = daemon
+        .client
+        .request(Request::ListMediaEgressVerdicts { session_id })
+        .await
+        .context("requesting media-egress verdicts from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected media-egress list: {error}"))?;
+    let Response::MediaEgressVerdicts { verdicts, .. } = response else {
+        bail!("daemon returned unexpected response to media-egress list: {response:?}");
+    };
+    if json_mode {
+        return emit_json(&json!({
+            "session_id": session_id,
+            "verdicts": verdicts,
+        }));
+    }
+    if verdicts.is_empty() {
+        println!("no remembered media-egress verdicts for session {session_id}");
+        return Ok(());
+    }
+    for verdict in verdicts {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            verdict.grant_id,
+            verdict.purpose,
+            verdict.verdict,
+            verdict.request_digest,
+            verdict.granted_at_unix_ms,
+        );
+    }
+    Ok(())
+}
+
+async fn media_egress_revoke(session: &str, purpose: &str, digest: &str) -> Result<()> {
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for media-egress revoke")?;
+    match daemon
+        .client
+        .request(Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose: purpose.to_string(),
+            request_digest: digest.to_string(),
+        })
+        .await
+        .context("requesting media-egress revoke from daemon")?
+    {
+        Ok(Response::Ack) => {
+            println!("revoked remembered media-egress verdict for {digest}");
+            Ok(())
+        }
+        Ok(other) => bail!("daemon returned unexpected response to media-egress revoke: {other:?}"),
+        Err(error) => bail!("{error}"),
+    }
 }
 
 /// Projection of one `session_compacted` event as returned by the daemon's
@@ -407,7 +485,15 @@ fn response_from_args(args: &SessionAnswerArgs) -> Result<ResolveResponse> {
 
 fn parse_answers_json(source: &str) -> Result<ResolveResponse> {
     let body = if Path::new(source).exists() {
-        std::fs::read_to_string(source).with_context(|| format!("reading answers JSON {source}"))?
+        // The answers travel inline in one request frame, so bound the read
+        // at the wire frame cap: an oversized or non-regular answers file
+        // fails here instead of allocating or blocking the CLI.
+        let bytes = cockpit_host::bounded::read_at_most(
+            Path::new(source),
+            crate::daemon::proto::MAX_NDJSON_FRAME_BYTES as u64,
+        )
+        .with_context(|| format!("reading answers JSON {source}"))?;
+        String::from_utf8(bytes).with_context(|| format!("reading answers JSON {source}"))?
     } else {
         source.to_string()
     };

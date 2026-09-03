@@ -136,7 +136,7 @@ impl Tool for GlobTool {
         // and the retained artifact capture elide their omission boundaries
         // under the session table the §7 egress scrub will use.
         let redact = ctx.redact.clone();
-        let out = tokio::task::spawn_blocking(move || {
+        let (mut out, knowledge_source) = tokio::task::spawn_blocking(move || {
             glob_blocking(
                 &set,
                 &walk_root,
@@ -149,6 +149,12 @@ impl Tool for GlobTool {
         })
         .await
         .map_err(|e| anyhow::anyhow!("glob worker joined: {e}"))??;
+        // Layered KB boundary (issue #273): the deterministic floor first,
+        // then the utility-model second layer over the floor-clean KB path
+        // listing.
+        let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+        crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &knowledge_source, &guard)
+            .await;
         Ok(out)
     }
 }
@@ -161,7 +167,7 @@ fn glob_blocking(
     secret_paths: &crate::secret_paths::SecretPathMatcher,
     attached_knowledge_roots: &[std::path::PathBuf],
     denied_knowledge_roots: &[std::path::PathBuf],
-) -> Result<ToolOutput> {
+) -> Result<(ToolOutput, String)> {
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     let mut knowledge_source = String::new();
     let mut count = 0usize;
@@ -218,12 +224,15 @@ fn glob_blocking(
     }
 
     if writer.is_empty() {
-        return Ok(ToolOutput::text("No matching files.".to_string()));
+        return Ok((
+            ToolOutput::text("No matching files.".to_string()),
+            knowledge_source,
+        ));
     }
     let truncated = writer.is_truncated() || hit_cap;
     let capture = writer.text_artifact_capture_redacted(redact);
     let mut body = writer.into_string_redacted(redact);
-    let mut output = if truncated {
+    let output = if truncated {
         body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
         let output = ToolOutput::truncated_text(body);
         match capture {
@@ -233,8 +242,7 @@ fn glob_blocking(
     } else {
         ToolOutput::text(body)
     };
-    crate::knowledge::fence_knowledge_tool_output_if_needed(&mut output, &knowledge_source);
-    Ok(output)
+    Ok((output, knowledge_source))
 }
 
 #[cfg(test)]

@@ -51,6 +51,7 @@ mod render;
 #[cfg(feature = "test-support")]
 pub(crate) mod response_performance_e2e;
 mod resume;
+mod rules;
 mod scrollback_page_in;
 mod session_services;
 mod side_conversation;
@@ -2780,6 +2781,8 @@ pub struct App {
     /// checklist of pinned messages is shown; ↑/↓/j/k jump the transcript
     /// to each pin, `d`/space (check) unpin, esc closes.
     pub(super) pins_review: Option<crate::tui::pins_overlay::PinsReview>,
+    /// Active `/rules` review panel.
+    pub(super) rules_review: Option<crate::tui::rules_overlay::RulesReview>,
     /// Count of pinned messages in this session (`pinned-messages`). Drives
     /// the below-input indicator (hidden at zero). Refreshed from the DB on
     /// every pin/unpin and on attach.
@@ -4003,6 +4006,7 @@ impl App {
             fork_pick: None,
             copy_pick: None,
             pins_review: None,
+            rules_review: None,
             pin_count: 0,
             pin_control_rows: Vec::new(),
             msg_abs_line: std::collections::HashMap::new(),

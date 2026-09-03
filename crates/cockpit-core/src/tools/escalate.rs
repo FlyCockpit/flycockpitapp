@@ -88,7 +88,7 @@ impl Tool for EscalateTool {
         let Some(row) = ctx
             .session
             .db
-            .get_tool_call_by_call_id(ctx.session.id, call_id)
+            .get_tool_call_by_call_id(ctx.session.live_id(), call_id)
             .await?
         else {
             return Err(invalid_input(format!(

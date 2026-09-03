@@ -202,7 +202,13 @@ fn persist_onboarding_stage_at(path: &Path, stage: OnboardingStage) -> Result<()
 
 fn persist_onboarding_state_at(path: &Path, state: OnboardingState) -> Result<()> {
     let parent = path.parent().context("onboarding state has no parent")?;
-    std::fs::create_dir_all(parent).context("creating onboarding state directory")?;
+    // Authorized onboarding persist: the global layer goes through
+    // `ensure_global_config_dir` (0700 + writability probe). Test fixtures
+    // that write outside that layer still get a plain mkdir. This must
+    // happen before the mutation lock, which refuses to create a missing
+    // global parent as a file-write side effect.
+    crate::config::dirs::ensure_config_layer_dir(parent)
+        .context("creating onboarding state directory")?;
     let bytes = serde_json::to_vec_pretty(&state).context("serializing onboarding state")?;
     let _guard = crate::config::hold_config_mutation_lock(&path)?;
     crate::config::write_config_bytes_atomic(&path, &bytes)
@@ -603,6 +609,35 @@ mod tests {
             decoded.provider_pending_validation.as_deref(),
             Some("openai")
         );
+    }
+
+    #[test]
+    fn first_run_onboarding_creates_the_global_layer_through_the_authorized_funnel() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(root.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        assert!(initialize_onboarding_if_first_run().unwrap());
+        assert!(
+            global.is_dir(),
+            "first-run onboarding must create the global layer through the funnel"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&global).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "first-run onboarding must not leave the global layer at umask-default permissions"
+            );
+        }
+        assert_eq!(onboarding_stage(), OnboardingStage::Welcome);
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[test]

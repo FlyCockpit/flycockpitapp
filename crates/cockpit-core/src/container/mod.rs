@@ -486,7 +486,7 @@ pub fn availability_snapshot() -> ContainerAvailability {
 }
 
 pub fn default_config_dir() -> Result<PathBuf> {
-    crate::config::config::resolve::cockpit_config_dir()
+    crate::config::dirs::global_config_dir()
 }
 
 pub fn resolve_dockerfile_for_session(
@@ -544,8 +544,10 @@ pub fn materialize_default_dockerfile(global_config_dir: &Path) -> Result<PathBu
     let path = global_config_dir.join("sandbox").join("Dockerfile");
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            // Side-effect mkdir of `<global>/sandbox`: refuse when that would
+            // create the missing global layer. Only `ensure_global_config_dir`
+            // may materialize `~/.config/cockpit`.
+            crate::config::dirs::create_dir_all_except_missing_global(parent)?;
         }
         std::fs::write(&path, DEFAULT_DOCKERFILE)
             .with_context(|| format!("writing {}", path.display()))?;
@@ -1129,6 +1131,71 @@ mod tests {
         let again = materialize_default_dockerfile(tmp.path()).unwrap();
         assert_eq!(again, path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "FROM scratch\n");
+    }
+
+    #[test]
+    fn materialize_default_dockerfile_does_not_create_a_missing_global_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        let error = materialize_default_dockerfile(&global).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "missing global layer must fail closed: {error:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "materialize_default_dockerfile must not create the global config directory"
+        );
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let resolved = resolve_dockerfile(&project, false, None, None, &global).unwrap_err();
+        assert!(
+            resolved
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "builtin-default Dockerfile fallthrough must fail closed: {resolved:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "resolve_dockerfile fallthrough must not create the global config directory"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn materialize_default_dockerfile_under_an_existing_global_layer_creates_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::ensure_global_config_dir().unwrap();
+
+        let path = materialize_default_dockerfile(&global).unwrap();
+        assert_eq!(path, global.join("sandbox").join("Dockerfile"));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("FROM ubuntu:24.04")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&global).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "sandbox materialization must not loosen the global layer"
+            );
+        }
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     #[test]

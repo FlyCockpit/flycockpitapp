@@ -4657,6 +4657,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
         || outcome.sessions_expiry_skipped_media_barrier > 0
         || outcome.payload_rows_deleted > 0
         || outcome.local_authority_rows_purged > 0
+        || outcome.verification_envelopes_cleaned > 0
         || outcome.vacuumed
     {
         tracing::info!(
@@ -4668,6 +4669,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
             raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
             terminal_evidence_rows_deleted = outcome.terminal_evidence_rows_deleted,
             local_authority_rows_purged = outcome.local_authority_rows_purged,
+            verification_envelopes_cleaned = outcome.verification_envelopes_cleaned,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"
         );

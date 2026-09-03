@@ -1,8 +1,8 @@
 //! Daemon-private owner capability for secret-bearing RPCs.
 //!
-//! Pre-launch mitigation for issue #296: every Unix-socket peer is still
-//! granted `ClientPrincipal::Owner` (the 284-row table stays inert for that
-//! principal). Secret-bearing (`owner_only`) RPCs and ACP stdio ingress
+//! Pre-launch mitigation for issue #296: every wire-transport peer (Unix
+//! socket or Windows named pipe) is still granted `ClientPrincipal::Owner`.
+//! Secret-bearing (`owner_only`) RPCs and ACP stdio ingress
 //! additionally require this process-local token, which lives in a 0600 file
 //! next to the control socket. Confined children are denied that path.
 //!
@@ -94,7 +94,7 @@ mod tests {
         assert!(!rendered.contains(capability.token()));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn publish_writes_a_private_file_next_to_the_socket() {
         let dir = tempfile::tempdir().unwrap();

@@ -2095,7 +2095,7 @@ struct LiveApprovalsBytes {
 fn read_live_approvals_bytes(
     path: &Path,
 ) -> std::result::Result<Option<LiveApprovalsBytes>, ApprovalsLoadError> {
-    let file = match std::fs::File::open(path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -2933,7 +2933,7 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
         use std::io::Write as _;
         if let Err(error) = out.write_all(&json).and_then(|()| out.sync_all()) {
             let write_error =
-                anyhow::Error::from(error).with_context(|| format!("writing {}", tmp.display()));
+                anyhow::Error::from(error).context(format!("writing {}", tmp.display()));
             discard_partial_private_candidate(out, &tmp);
             return Err(write_error);
         }
@@ -2983,7 +2983,7 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
     // The publish act.
     if let Err(error) = std::fs::rename(&tmp, &path) {
         let rename_error =
-            anyhow::Error::from(error).with_context(|| format!("renaming into {}", path.display()));
+            anyhow::Error::from(error).context(format!("renaming into {}", path.display()));
         // The staged entry is still ours here, so clean it up through the
         // same identity guard (a swap in between leaves the replacement
         // untouched, never destroyed).

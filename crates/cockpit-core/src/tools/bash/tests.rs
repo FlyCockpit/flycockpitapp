@@ -1003,7 +1003,8 @@ async fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
         crate::tools::command_resource_profiles::CommandResourcePlan::default(),
         &ctx,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(plan.allow_paths.iter().any(|path| {
         path.kind == "user_grant"
             && path.path == read_dir
@@ -2021,17 +2022,23 @@ async fn command_escalation_preauthorized_returns_scope() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "cargo build --release").await,
+        command_escalation_preauthorized(&ctx, "cargo build --release")
+            .await
+            .unwrap(),
         None
     );
 
     grant_command(&ctx, "cargo build --release", Scope::Session).await;
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "cargo build --release").await,
+        command_escalation_preauthorized(&ctx, "cargo build --release")
+            .await
+            .unwrap(),
         Some(Scope::Session)
     );
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "cargo test").await,
+        command_escalation_preauthorized(&ctx, "cargo test")
+            .await
+            .unwrap(),
         None
     );
 }
@@ -2053,7 +2060,9 @@ async fn risky_grant_above_policy_cap_does_not_preauthorize_escalation() {
         "the stored grant exists"
     );
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "rm foo").await,
+        command_escalation_preauthorized(&ctx, "rm foo")
+            .await
+            .unwrap(),
         None,
         "destructive commands are capped to once by policy"
     );
@@ -2066,21 +2075,29 @@ async fn wrapper_never_preauthorizes_escalation() {
     // A wrapper can't be persisted, so it can never preauthorize the
     // unconfined rerun.
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "bash -c 'echo hi'").await,
+        command_escalation_preauthorized(&ctx, "bash -c 'echo hi'")
+            .await
+            .unwrap(),
         None
     );
     assert_eq!(
-        command_escalation_preauthorized(&ctx, r#"sh -c "printf permission""#).await,
+        command_escalation_preauthorized(&ctx, r#"sh -c "printf permission""#)
+            .await
+            .unwrap(),
         None,
         "quoted shell wrappers must not preauthorize escalation"
     );
     assert_eq!(
-        command_escalation_preauthorized(&ctx, r#"env FOO=bar bash -lc 'printf hi'"#).await,
+        command_escalation_preauthorized(&ctx, r#"env FOO=bar bash -lc 'printf hi'"#)
+            .await
+            .unwrap(),
         None,
         "dynamic env wrappers must not preauthorize escalation"
     );
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "sudo rm x").await,
+        command_escalation_preauthorized(&ctx, "sudo rm x")
+            .await
+            .unwrap(),
         None
     );
 }
@@ -2090,7 +2107,10 @@ async fn no_approver_never_preauthorizes_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = crate::tools::common::test_ctx(tmp.path());
     // No approver -> no grant store to consult.
-    assert_eq!(command_escalation_preauthorized(&ctx, "ls").await, None);
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "ls").await.unwrap(),
+        None
+    );
 }
 
 // ---- Part B: tool_call `sandbox` sub-object across the four states ----
@@ -2129,7 +2149,9 @@ async fn escalation_preauthorized_computed_without_sandbox() {
     grant_command(&ctx, "printf hi", Scope::Session).await;
 
     assert_eq!(
-        command_escalation_preauthorized(&ctx, "printf hi").await,
+        command_escalation_preauthorized(&ctx, "printf hi")
+            .await
+            .unwrap(),
         Some(Scope::Session)
     );
 }

@@ -5676,7 +5676,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn current_machine_fingerprint_fails_closed_without_machine_id() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("missing-machine-id");
+        assert!(!missing.exists());
+        let _path = LinuxMachineIdPathOverrideGuard::point_at(&missing);
+        // Regression guard: any hostname fallback (env, gethostname, /proc, uname) would return Some here.
+        _path.set_var("HOSTNAME", "regression-hostname-fallback-trap");
+        assert_eq!(
+            current_machine_fingerprint(),
+            None,
+            "production binding must not derive fingerprint from ambient identity when machine-id is absent"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn current_linux_fingerprint_matches_reader_seam_from_machine_id() {
+        let _env = crate::test_env::lock();
         let path = std::path::Path::new("/etc/machine-id");
         let machine_id = fs::read_to_string(path).expect("linux test host exposes /etc/machine-id");
         assert_eq!(
@@ -5698,6 +5715,11 @@ mod tests {
         let _path = LinuxMachineIdPathOverrideGuard::point_at(&missing);
         let hostname = "regression-hostname-fallback-trap";
         _path.set_var("HOSTNAME", hostname);
+        assert_eq!(
+            current_machine_fingerprint(),
+            None,
+            "grant integration must observe absent binding before checking stored grant"
+        );
         let trap_grant =
             linux_machine_grant_fingerprint_from_id(hostname).expect("hostname hashes for trap");
         let grant_path = tmp.path().join("real-desktop-grant");
@@ -5712,6 +5734,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn has_current_machine_grant_accepts_matching_linux_fingerprint() {
+        let _env = crate::test_env::lock();
         let machine_id =
             fs::read_to_string("/etc/machine-id").expect("linux test host exposes /etc/machine-id");
         let Some(fingerprint) = linux_machine_grant_fingerprint_from_id(&machine_id) else {

@@ -7598,10 +7598,12 @@ mod tests {
             .expect("coordinator open");
 
         // Simulate an OpenAI Responses output with a computer_call item.
+        // Pointer button presses are refused at launch (review cycle 3,
+        // finding 4), so the dispatched input is a scroll.
         let output = vec![serde_json::json!({
             "type": "computer_call",
             "call_id": "call-1",
-            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left"}
+            "action": {"type": "scroll", "x": 100.0, "y": 200.0, "scroll_x": 0, "scroll_y": 10}
         })];
 
         // Extract through the native seam.
@@ -7737,13 +7739,17 @@ mod tests {
         let mut coordinator = make_coordinator(backend, authorizer).await;
 
         // Simulate an Anthropic 2025-11-24 tool_use named "computer".
+        // Pointer button presses are refused at launch (review cycle 3,
+        // finding 4), so the dispatched input is a scroll.
         let content = vec![serde_json::json!({
             "type": "tool_use",
             "id": "toolu-1",
             "name": "computer",
             "input": {
-                "action": "left_click",
-                "coordinate": [100.0, 200.0]
+                "action": "scroll",
+                "coordinate": [100.0, 200.0],
+                "scroll_direction": "down",
+                "scroll_amount": 3
             }
         })];
 
@@ -7763,7 +7769,7 @@ mod tests {
         assert_eq!(tool_use_id, "toolu-1");
         assert!(matches!(
             action,
-            Anthropic20251124ComputerAction::Click { .. }
+            Anthropic20251124ComputerAction::Scroll { .. }
         ));
 
         let outcome = coordinator
@@ -8773,21 +8779,16 @@ mod tests {
         let backend = Box::new(FakeBackend::new());
         // Ask tier: only the Ask dispatch path invokes the authorizer, so an
         // ask-block outcome can only surface on Ask (production Yolo
-        // short-circuits before the authorizer). Click is not focus-gated.
+        // short-circuits before the authorizer). Pointer button presses
+        // are refused by the terminal-input launch policy (review cycle 3,
+        // finding 4), so the authorization-blocking path is exercised
+        // with benign typed text, which is not focus-gated either.
         let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
         let mut coordinator = ComputerActionCoordinator::open(backend, params)
             .await
             .expect("coordinator open");
 
-        let actions = vec![OpenAiComputerAction::Click {
-            at: Some(Point {
-                x: 10.0,
-                y: 10.0,
-                space: CoordinateSpace::Physical,
-            }),
-            button: ProviderPointerButton::Left,
-            modifiers: Modifiers::default(),
-        }];
+        let actions = vec![OpenAiComputerAction::TypeText("hello world".to_string())];
         let outcome = coordinator
             .execute_openai_call("call-auth-3", &actions)
             .await;
@@ -8923,10 +8924,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_typed_terminal_command_refused_after_pointer_opened_terminal() {
-        // A terminal can also be opened with the pointer (a dock click),
-        // so terminal-typed command text itself must fail closed even when
-        // the batch that opens the terminal contains no blocked chord.
+    async fn computer_pointer_dock_click_refused_before_approval() {
+        // Review cycle 3, finding 4: a terminal can be opened with the
+        // pointer (a dock click), and a click can likewise drive an
+        // application menu's Paste item to inject clipboard content
+        // carrying a self-committing newline. No action-layer signal
+        // distinguishes those presses from any other click, so the
+        // pointer press itself is refused at canonicalization — the
+        // whole call dispatches zero input and never reaches approval.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
         let mut coordinator = make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
@@ -8948,13 +8953,13 @@ mod tests {
             .await;
         let failure = match outcome {
             CoordinatedOutcome::Failed { failure, .. } => failure,
-            other => panic!("terminal-typed command must fail closed, got {other:?}"),
+            other => panic!("pointer dock click must fail closed, got {other:?}"),
         };
-        // The typed command is the second provider action; the whole call
+        // The pointer press is the first provider action; the whole call
         // dispatches zero input because canonicalization fails first.
-        assert_eq!(failure.index, 1);
+        assert_eq!(failure.index, 0);
         match &failure.error {
-            ComputerError::Refused(reason) => assert!(reason.contains("run tool")),
+            ComputerError::Refused(reason) => assert!(reason.contains("mouse button")),
             other => panic!("expected a visible refusal, got {other:?}"),
         }
         assert_eq!(authorizer.call_count(), 0);
@@ -9333,6 +9338,97 @@ mod tests {
         let outcome = coordinator
             .execute_openai_call(
                 "call-fresh-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "a provably reset line commits nothing: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_untracks_after_pointer_motion() {
+        // Review cycle 3, finding 3: the modeled line must describe the
+        // *receiving object*, not merely the coordinator. Pointer motion
+        // can move focus to a different terminal, tab, window, or field
+        // (focus-follows-mouse desktops), leaving text in receiver A
+        // while receiver B takes subsequent keys — so after a move the
+        // line is unclaimable for any specific receiver and a commit is
+        // refused until a proven `ctrl+c`. A benign assignment is used
+        // so the untracking — not the command fence — is what refuses.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-focus-type",
+                &vec![OpenAiComputerAction::TypeText("FOO=bar".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "typing an assignment stays usable: {outcome:?}"
+        );
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-focus-move",
+                &vec![OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 10.0,
+                        y: 10.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "pointer motion stays usable: {outcome:?}"
+        );
+        // The refusal must precede authorization: the Enter commit is
+        // refused by the untracked model before the authorizer is asked,
+        // so its call count does not move.
+        let authorized_before_enter = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-focus-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!("a moved pointer makes the receiving object unknowable, got {other:?}"),
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("ctrl+c")),
+            "the refusal must name the reset gesture: {:?}",
+            failure.error
+        );
+        assert_eq!(
+            authorizer.call_count(),
+            authorized_before_enter,
+            "the refusal must precede authorization"
+        );
+
+        // A proven `ctrl+c` reset restores commits on the empty line.
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-focus-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-focus-fresh-enter",
                 &vec![OpenAiComputerAction::KeyChord(KeyChord {
                     keys: vec!["enter".to_string()],
                 })],
@@ -10024,9 +10120,13 @@ mod tests {
                     space: CoordinateSpace::Physical,
                 },
             },
-            OpenAiComputerAction::Click {
+            // Pointer button presses are refused at launch (review cycle
+            // 3, finding 4); scroll is a pointer input that stays
+            // available, so the batch keeps its three input actions.
+            OpenAiComputerAction::Scroll {
                 at: None,
-                button: ProviderPointerButton::Left,
+                delta_x: 0,
+                delta_y: 10,
                 modifiers: Modifiers {
                     shift: true,
                     ..Modifiers::default()
@@ -10063,7 +10163,11 @@ mod tests {
         let call = serde_json::json!({
             "type": "computer_call",
             "call_id": "call-json",
-            "action": {"type": "click", "x": 100.0, "y": 200.0, "button": "left", "modifiers": {"shift": true}},
+            // Pointer button presses are refused at launch (review cycle
+            // 3, finding 4); scroll is a pointer input that stays
+            // available, so the JSON roundtrip keeps a dispatchable
+            // action.
+            "action": {"type": "scroll", "x": 100.0, "y": 200.0, "scroll_x": 0, "scroll_y": 10, "modifiers": {"shift": true}},
         });
         let (call_id, actions) = parse_openai_computer_call(&call).expect("parse");
 
@@ -11959,11 +12063,14 @@ mod tests {
     // =====================================================================
 
     #[tokio::test]
-    async fn computer_action_pointer_sequence_move_then_click() {
-        // The coordinator dispatches move then click as a batch. The strict
+    async fn computer_action_pointer_sequence_move_then_scroll() {
+        // The coordinator dispatches move then scroll as a batch. The strict
         // pointer sequence is observation -> move -> pointer-confirming
-        // observation -> click -> post-action observation. The coordinator
-        // captures a post-action screenshot (the post-action observation).
+        // observation -> pointer action -> post-action observation. The
+        // coordinator captures a post-action screenshot (the post-action
+        // observation). Pointer *button presses* are refused at launch
+        // (review cycle 3, finding 4), so the pointer action dispatched
+        // after the move is a scroll.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
         let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
@@ -11976,9 +12083,10 @@ mod tests {
                     space: CoordinateSpace::Physical,
                 },
             },
-            OpenAiComputerAction::Click {
+            OpenAiComputerAction::Scroll {
                 at: None,
-                button: ProviderPointerButton::Left,
+                delta_x: 0,
+                delta_y: 10,
                 modifiers: Modifiers::default(),
             },
         ];
@@ -12614,13 +12722,14 @@ mod tests {
         let backend = FakeBackend::new();
         let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
 
-        let actions = vec![OpenAiComputerAction::Click {
+        let actions = vec![OpenAiComputerAction::Scroll {
             at: Some(Point {
                 x: 10.0,
                 y: 10.0,
                 space: CoordinateSpace::Physical,
             }),
-            button: ProviderPointerButton::Left,
+            delta_x: 0,
+            delta_y: 10,
             modifiers: Modifiers::default(),
         }];
         let outcome = coordinator

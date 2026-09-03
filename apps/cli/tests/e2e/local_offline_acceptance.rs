@@ -11,11 +11,19 @@ const PUBLIC_SNAPSHOT: &str = include_str!("../fixtures/public-v0.1-command-snap
 
 fn public_commands() -> Vec<String> {
     let snapshot: serde_json::Value = serde_json::from_str(PUBLIC_SNAPSHOT).unwrap();
+    // The snapshot pins the full public surface (roots plus aliases); help
+    // output lists canonical roots only, so narrow to those here.
+    let canonical: std::collections::BTreeSet<String> =
+        cockpit_cli::public_v0_1_command()
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_owned())
+            .collect();
     snapshot["commands"]
         .as_array()
         .unwrap()
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
+        .filter(|command| canonical.contains(command))
         .collect()
 }
 
@@ -88,17 +96,10 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     for command in &public {
         assert!(help_lists_root(&text, command), "missing {command}: {text}");
     }
-    for hidden in [
-        "account",
-        "sync",
-        "connect",
-        "invocation",
-        "mcp",
-        "schedule",
-        "skill",
-        "stats",
-        "completion",
-    ] {
+    // The local profile compiles only local commands: every root implemented
+    // in this build is public, so the only absent roots are the feature-gated
+    // remote/extended commands.
+    for hidden in ["account", "sync", "connect", "schedule"] {
         assert!(!help_lists_root(&text, hidden), "leaked {hidden}: {text}");
     }
     for allowed in &public {
@@ -109,16 +110,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             output_text(&output)
         );
     }
-    for rejected in [
-        "providers",
-        "auth",
-        "invocation",
-        "mcp",
-        "schedule",
-        "skill",
-        "stats",
-        "completion",
-    ] {
+    for rejected in ["providers", "auth", "schedule"] {
         let output = run(&session, &[rejected, "--help"]);
         assert_eq!(
             output.status.code(),
@@ -127,8 +119,10 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             output_text(&output)
         );
     }
-    let rejected = run(&session, &["completion", "bash"]);
-    assert_eq!(rejected.status.code(), Some(2));
+    // `completion` is public: generating a script from the release binary
+    // succeeds and mirrors the release-asset generator.
+    let generated = run(&session, &["completion", "bash"]);
+    assert!(generated.status.success(), "{}", output_text(&generated));
     let mut completion = Vec::new();
     clap_complete::generate(
         clap_complete::Shell::Bash,
@@ -143,7 +137,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             "completion omitted {command}"
         );
     }
-    for hidden in ["account", "sync", "connect", "mcp", "schedule"] {
+    for hidden in ["account", "sync", "connect", "schedule"] {
         assert!(
             !completion_lists_root(&completion, hidden),
             "completion leaked {hidden}"

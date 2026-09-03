@@ -64,7 +64,8 @@ Completions are explicit release assets. After extracting an archive, copy
 `completions/cockpit.fish` into the completion directory for your shell. Copy
 files from `man/` into a `man1` directory on `MANPATH`. Homebrew performs these
 steps automatically, while the POSIX installer makes a best-effort user-local
-copy. To uninstall a script installation, remove `cockpit` from Cargo's bin
+copy. `cockpit completion <shell>` generates the same scripts on demand from
+an installed binary. To uninstall a script installation, remove `cockpit` from Cargo's bin
 directory and remove only the Cockpit completion and man-page files you copied.
 
 ### External runtimes
@@ -230,7 +231,7 @@ cockpit packages prune --dry-run
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
 | `cockpit assistants list` | List persistent assistants. |
-| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
+| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. Compiled only into internal `remote`-feature builds; absent from the public local binary (see the internal remote profile section below). |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
 | `cockpit models [provider]` | Show the effective default model for new sessions plus its scope, then list locally configured models. |
@@ -246,7 +247,7 @@ cockpit packages prune --dry-run
 | `cockpit session purge --before <YYYY-MM-DD|30d> [--dry-run] [--yes]` | Permanently delete ended sessions before a cutoff; `--dry-run` reports the count only. |
 | `cockpit knowledge attach <kb> <session>` | Attach a session to a knowledge base as dream input consent. |
 | `cockpit dream <kb>\|--all` | Dream one knowledge base or every configured knowledge base. |
-| `cockpit schedule list` | List durable scheduler jobs. |
+| `cockpit schedule list` | List durable scheduler jobs. Compiled only into opt-in `extended`-feature builds; absent from the public local binary. |
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |
 | `cockpit export <session>` | Export a redacted session/fork tree debug bundle. |
@@ -274,8 +275,9 @@ cockpit packages prune --dry-run
 ### Internal remote profile
 
 Account, organization-sync, and relay-control commands are compiled only for
-internal builds using the opt-in Cargo `remote` feature. They are not part of
-the public v0.1 command or compatibility surface. Remote-profile operators use
+internal builds using the opt-in Cargo `remote` feature. They are absent from
+the public v0.1 (local) command surface; a build that enables the `remote`
+feature exposes them as ordinary commands. Remote-profile operators use
 `cockpit account`, `cockpit sync`, and `cockpit connect`; public local installs
 must not depend on those commands or FlyCockpit service reachability.
 

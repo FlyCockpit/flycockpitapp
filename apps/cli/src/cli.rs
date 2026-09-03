@@ -90,12 +90,24 @@ pub struct PublicCli {
     pub command: Option<PublicCommand>,
 }
 
+/// The public command surface.
+///
+/// Every command implemented in the default (local, featureless) build is
+/// public here: the binary parses only this shape, so a variant that exists
+/// only on [`Command`] is unreachable from the command line. Commands that
+/// require an opt-in Cargo feature (`remote`, `extended`) are mirrored under
+/// the same `#[cfg]` gate so each build profile exposes exactly the commands
+/// it compiles. The hidden `login`/`logout`/`whoami` stubs are the one
+/// exception: they parse only to print the split-command pointer.
 #[derive(Debug, Subcommand)]
 pub enum PublicCommand {
     /// Run the local Agent Client Protocol stdio server.
     Acp,
     Ask(AskArgs),
     Run(RunArgs),
+    /// Query or cancel a durable run invocation by client_submission_id.
+    #[command(subcommand)]
+    Invocation(InvocationCommand),
     #[command(subcommand)]
     Agent(AgentCommand),
     /// Start an interactive Code session.
@@ -110,10 +122,19 @@ pub enum PublicCommand {
     /// interactive Assistant-mode entry point.
     #[command(subcommand)]
     Assistants(AssistantCommand),
+    /// Manage the FlyCockpit account used for SaaS sync and relay access.
+    #[cfg(feature = "remote")]
+    #[command(subcommand)]
+    Account(AccountCommand),
     #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
     Setup(SetupArgs),
     Models(ModelsArgs),
+    /// Show last provider model catalog refresh status; does not fetch from the network.
+    #[command(name = "provider-catalog-status")]
+    ProviderCatalogStatus(ProviderCatalogStatusArgs),
+    /// Refresh model lists from every configured provider's /models endpoint.
+    FetchModels(FetchModelsArgs),
     /// Run the bundled jq-compatible JSON query applet.
     #[command(
         trailing_var_arg = true,
@@ -125,19 +146,73 @@ pub enum PublicCommand {
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor(DoctorArgs),
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Run governed knowledge-base synthesis.
+    #[command(subcommand)]
+    Knowledge(KnowledgeCommand),
+    /// Dream one knowledge base, or every configured knowledge base.
+    Dream(DreamArgs),
+    /// Manage durable daemon scheduler jobs.
+    #[cfg(feature = "extended")]
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
+    /// Manage Agent Skills.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+    #[command(subcommand)]
+    Trust(TrustCommand),
+    Export(ExportArgs),
+    /// Import a session export archive created by `cockpit export`.
+    Import(ImportArgs),
+    /// Show token usage and cost statistics.
+    Stats(StatsArgs),
     /// Debug / introspection commands.
     #[command(subcommand)]
     Debug(DebugCommand),
     #[command(subcommand)]
-    Session(SessionCommand),
-    /// Dream one knowledge base, or every configured knowledge base.
-    Dream(DreamArgs),
-    #[command(subcommand)]
-    Trust(TrustCommand),
-    Export(ExportArgs),
-    #[command(subcommand)]
     Config(ConfigCommand),
+    /// Manage MCP servers: add, list, and smoke-test.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+    /// Removed: use `cockpit account login` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
+    #[command(hide = true)]
+    Login(RemovedCommandArgs),
+    /// Removed: use `cockpit account logout` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
+    #[command(hide = true)]
+    Logout,
+    /// Removed: use `cockpit account whoami` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
+    #[command(hide = true)]
+    Whoami,
+    /// Inspect enterprise org-policy synchronization.
+    #[cfg(feature = "remote")]
+    #[command(subcommand)]
+    Sync(SyncCommand),
+    /// Toggle outbound relay access for remote control on this instance; requires `cockpit account login`.
+    #[cfg(feature = "remote")]
+    Connect(ConnectArgs),
+    /// Manage the package registry the `docs` agent reads from.
+    #[command(
+        subcommand,
+        alias = "package",
+        alias = "dependency",
+        alias = "dependencies"
+    )]
+    Packages(PackagesCommand),
+    /// One-way import of packages from a local `kcl` install's registry.
+    #[command(subcommand)]
+    Kcl(KclCommand),
+    /// Explore the project with an agent and write its instructions file
+    /// (default `AGENTS.md`); never touches `config.json`.
     Init(InitArgs),
+    /// Inspect the `bash` post-result hint rules (`engine::bash_hints`).
+    #[command(subcommand, name = "bash-hints")]
+    BashHints(BashHintsCommand),
+    /// Generate shell completion script.
+    Completion { shell: Shell },
 }
 
 impl From<PublicCli> for Cli {
@@ -154,24 +229,52 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Acp => Command::Acp,
                 PublicCommand::Ask(args) => Command::Ask(args),
                 PublicCommand::Run(args) => Command::Run(args),
+                PublicCommand::Invocation(args) => Command::Invocation(args),
                 PublicCommand::Agent(args) => Command::Agent(args),
                 PublicCommand::Code => Command::Code,
                 PublicCommand::Assistant => Command::Assistant,
                 PublicCommand::Computer => Command::Computer,
                 PublicCommand::Assistants(args) => Command::Assistants(args),
+                #[cfg(feature = "remote")]
+                PublicCommand::Account(args) => Command::Account(args),
                 PublicCommand::Provider(args) => Command::Provider(args),
                 PublicCommand::Setup(args) => Command::Setup(args),
                 PublicCommand::Models(args) => Command::Models(args),
+                PublicCommand::ProviderCatalogStatus(args) => {
+                    Command::ProviderCatalogStatus(args)
+                }
+                PublicCommand::FetchModels(args) => Command::FetchModels(args),
                 PublicCommand::Jq(args) => Command::Jq(args),
                 PublicCommand::Daemon(args) => Command::Daemon(args),
                 PublicCommand::Doctor(args) => Command::Doctor(args),
-                PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Session(args) => Command::Session(args),
+                PublicCommand::Knowledge(args) => Command::Knowledge(args),
                 PublicCommand::Dream(args) => Command::Dream(args),
+                #[cfg(feature = "extended")]
+                PublicCommand::Schedule(args) => Command::Schedule(args),
+                PublicCommand::Skill(args) => Command::Skill(args),
                 PublicCommand::Trust(args) => Command::Trust(args),
                 PublicCommand::Export(args) => Command::Export(args),
+                PublicCommand::Import(args) => Command::Import(args),
+                PublicCommand::Stats(args) => Command::Stats(args),
+                PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Config(args) => Command::Config(args),
+                PublicCommand::Mcp(args) => Command::Mcp(args),
+                #[cfg(feature = "remote")]
+                PublicCommand::Login(args) => Command::Login(args),
+                #[cfg(feature = "remote")]
+                PublicCommand::Logout => Command::Logout,
+                #[cfg(feature = "remote")]
+                PublicCommand::Whoami => Command::Whoami,
+                #[cfg(feature = "remote")]
+                PublicCommand::Sync(args) => Command::Sync(args),
+                #[cfg(feature = "remote")]
+                PublicCommand::Connect(args) => Command::Connect(args),
+                PublicCommand::Packages(args) => Command::Packages(args),
+                PublicCommand::Kcl(args) => Command::Kcl(args),
                 PublicCommand::Init(args) => Command::Init(args),
+                PublicCommand::BashHints(args) => Command::BashHints(args),
+                PublicCommand::Completion { shell } => Command::Completion { shell },
             }),
         }
     }
@@ -280,7 +383,7 @@ pub enum Command {
     /// Export a redacted session debug bundle.
     Export(ExportArgs),
 
-    /// Import session data from a JSON file.
+    /// Import a session export archive created by `cockpit export`.
     Import(ImportArgs),
 
     /// Show token usage and cost statistics.
@@ -1459,6 +1562,7 @@ pub struct ExportArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct ImportArgs {
+    /// Session export archive (`.zip`) created by `cockpit export`.
     pub file: PathBuf,
 }
 
@@ -1862,6 +1966,141 @@ mod tests {
             Cli::from(PublicCli::try_parse_from(["cockpit", "assistants", "list"]).unwrap())
                 .command,
             Some(Command::Assistants(AssistantCommand::List))
+        ));
+    }
+
+    #[test]
+    fn public_surface_covers_every_visible_command() {
+        // The release binary parses only `PublicCli`, so a root implemented on
+        // `Command` but absent from the public shape is unreachable from the
+        // command line. In every feature profile the visible internal roots
+        // and the visible public roots must therefore coincide; hidden roots
+        // must be deliberate (removed stubs, internal daemon workers).
+        let visible = |command: clap::Command| -> BTreeSet<String> {
+            command
+                .get_subcommands()
+                .filter(|subcommand| !subcommand.is_hide_set())
+                .map(|subcommand| subcommand.get_name().to_owned())
+                .collect()
+        };
+        let internal = visible(Cli::command());
+        let public = visible(PublicCli::command());
+        assert_eq!(
+            internal, public,
+            "the public surface must exactly mirror the visible command surface"
+        );
+    }
+
+    #[test]
+    fn promoted_public_roots_map_to_runtime_commands() {
+        // One representative invocation per promoted root: the public parser
+        // must deliver the same runtime command the internal shape defines.
+        assert!(matches!(
+            Cli::from(
+                PublicCli::try_parse_from(["cockpit", "invocation", "status", "id"]).unwrap()
+            )
+            .command,
+            Some(Command::Invocation(InvocationCommand::Status(_)))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "provider-catalog-status"]).unwrap())
+                .command,
+            Some(Command::ProviderCatalogStatus(_))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "fetch-models", "openai"]).unwrap())
+                .command,
+            Some(Command::FetchModels(_))
+        ));
+        let session = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            Cli::from(
+                PublicCli::try_parse_from([
+                    "cockpit",
+                    "knowledge",
+                    "attach",
+                    "kb",
+                    session.as_str()
+                ])
+                .unwrap()
+            )
+            .command,
+            Some(Command::Knowledge(KnowledgeCommand::Attach { .. }))
+        ));
+        assert!(matches!(
+            Cli::from(
+                PublicCli::try_parse_from(["cockpit", "skill", "curator", "status"]).unwrap()
+            )
+            .command,
+            Some(Command::Skill(SkillCommand::Curator(SkillCuratorCommand::Status)))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "import", "archive.zip"]).unwrap())
+                .command,
+            Some(Command::Import(ImportArgs { .. }))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "stats"]).unwrap()).command,
+            Some(Command::Stats(_))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "mcp", "list"]).unwrap()).command,
+            Some(Command::Mcp(McpCommand::List))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "packages", "list"]).unwrap())
+                .command,
+            Some(Command::Packages(PackagesCommand::List))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "kcl", "import"]).unwrap()).command,
+            Some(Command::Kcl(KclCommand::Import))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "bash-hints", "list"]).unwrap())
+                .command,
+            Some(Command::BashHints(BashHintsCommand::List))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "completion", "bash"]).unwrap())
+                .command,
+            Some(Command::Completion { .. })
+        ));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_profile_public_roots_map_to_runtime_commands() {
+        // Remote-profile roots are public only in the build that compiles
+        // them; the removed stubs parse but stay hidden.
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "account", "whoami"]).unwrap())
+                .command,
+            Some(Command::Account(AccountCommand::Whoami))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "sync", "status"]).unwrap()).command,
+            Some(Command::Sync(SyncCommand::Status))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "connect", "status"]).unwrap())
+                .command,
+            Some(Command::Connect(_))
+        ));
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "login", "--force"]).unwrap())
+                .command,
+            Some(Command::Login(_))
+        ));
+    }
+
+    #[cfg(feature = "extended")]
+    #[test]
+    fn extended_profile_public_schedule_maps_to_runtime_command() {
+        assert!(matches!(
+            Cli::from(PublicCli::try_parse_from(["cockpit", "schedule", "list"]).unwrap())
+                .command,
+            Some(Command::Schedule(ScheduleCommand::List(_)))
         ));
     }
 

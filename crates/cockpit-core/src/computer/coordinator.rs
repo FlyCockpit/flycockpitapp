@@ -3486,7 +3486,8 @@ pub struct ComputerActionCoordinator {
     /// identity: initialized from the open-time planning capture and adopted
     /// to the live snapshot the Ask gate accepts, so approval metadata,
     /// host-approval effects, and pre-handoff validation share one
-    /// authority. A TOCTOU change after that adopt still invalidates at
+    /// authority. Generation zero is part of that identity and is compared
+    /// exactly. A TOCTOU change after that adopt still invalidates at
     /// [`Self::pre_handoff_check`].
     focus_generation: TargetGeneration,
     /// The backend kind.
@@ -4089,6 +4090,9 @@ impl ComputerActionCoordinator {
     /// Yolo). Drift here is a TOCTOU after authorization and hard-invalidates
     /// the coordinator. Generation is not a proxy for object identity: the
     /// shared focus-generation reducer does not fingerprint the virtual UUID.
+    /// Generation zero is a valid authorized identity for non-focus-sensitive
+    /// actions and is compared exactly; a later focused window is not the
+    /// identity that was authorized.
     pub fn pre_handoff_check(&mut self) -> Result<(), TargetUnavailableReason> {
         if self.invalidated {
             return Err(TargetUnavailableReason::StaleTarget);
@@ -4104,10 +4108,7 @@ impl ComputerActionCoordinator {
         // drift against the currently authorized live identity.
         if let Some(adapter) = &mut self.target_adapter {
             let evidence = adapter.capture_snapshot()?;
-            let generation_drifted =
-                self.focus_generation.0 > 0 && evidence.focus_generation != self.focus_generation.0;
-            let uuid_drifted = evidence.virtual_display_uuid != self.virtual_display_uuid;
-            if generation_drifted || uuid_drifted {
+            if !self.authorized_live_identity_matches(&evidence) {
                 // Object identity or focus drifted after the authorized
                 // identity was adopted — gate→dispatch TOCTOU. Invalidate.
                 self.invalidate(TargetUnavailableReason::StaleTarget);
@@ -4962,9 +4963,7 @@ impl ComputerActionCoordinator {
         let (live_uuid, live_focus) = if let Some(adapter) = self.target_adapter.as_mut() {
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
-                    if evidence.focus_generation != self.focus_generation.0
-                        || evidence.virtual_display_uuid != self.virtual_display_uuid
-                    {
+                    if !self.authorized_live_identity_matches(&evidence) {
                         return Err(LeaseDrift::Target);
                     }
                     (evidence.virtual_display_uuid, evidence.focus_generation)
@@ -5598,6 +5597,16 @@ impl ComputerActionCoordinator {
     fn adopt_authorized_live_identity(&mut self, live_focus: u64, live_uuid: Option<[u8; 16]>) {
         self.focus_generation = TargetGeneration(live_focus);
         self.virtual_display_uuid = live_uuid;
+    }
+
+    /// True when `evidence` is still the currently authorized live identity.
+    /// Focus generation and virtual-display UUID are compared exactly:
+    /// generation zero is a valid identity for non-focus-sensitive actions,
+    /// so a later focused window is not the same authorization. Generation
+    /// is not a proxy for object identity; the UUID is compared independently.
+    fn authorized_live_identity_matches(&self, evidence: &TargetIdentityEvidence) -> bool {
+        evidence.focus_generation == self.focus_generation.0
+            && evidence.virtual_display_uuid == self.virtual_display_uuid
     }
 
     /// The observation verification state machine (starts at Strict; live
@@ -11181,6 +11190,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn computer_pre_handoff_rejects_zero_to_nonzero_generation_with_stable_uuid() {
+        // After Allow for a non-focus-sensitive action bound to generation 0,
+        // a later focused window at the final fence must still hard-invalidate.
+        // Generation zero is a valid authorized identity and is compared
+        // exactly; UUID stability is not a substitute.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let open = ask_virtual_evidence();
+        let mut unfocused = open.clone();
+        unfocused.focus_generation = 0;
+        let mut focused_again = unfocused.clone();
+        focused_again.focus_generation = 1;
+        assert_eq!(
+            focused_again.virtual_display_uuid,
+            unfocused.virtual_display_uuid
+        );
+        // [open, pre-await, post-await, pre-handoff]. Adopt zero at the Ask
+        // gate; only the handoff snapshot focuses.
+        let queue = vec![open, unfocused.clone(), unfocused, focused_again];
+        let adapter = FakeTargetEvidenceAdapter::with_queue(BackendKind::VirtualDisplay, queue);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call("call-zero-gen-handoff", &[OpenAiComputerAction::Screenshot])
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "pre-handoff 0→1 generation drift with a stable UUID must invalidate, got {outcome:?}"
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a generation identity mismatch at handoff"
+        );
+        assert!(coordinator.is_invalidated());
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            authorizer.last_focus_generation(),
+            0,
+            "the Allow was bound to generation zero; the fence must still reject the later focus"
+        );
+        assert_eq!(
+            coordinator.focus_generation().0,
+            0,
+            "invalidation must not adopt the drifted generation"
+        );
+    }
+
     #[test]
     fn computer_ask_lease_store_payload_and_focus_are_distinct_keys() {
         let mut store = AskDelegationLeaseStore::new();
@@ -11651,6 +11724,54 @@ mod tests {
             "zero backend input after a UUID identity mismatch at handoff"
         );
         assert!(coordinator.is_invalidated());
+        assert_eq!(coordinator.virtual_display_uuid(), Some([0xAA; 16]));
+    }
+
+    #[tokio::test]
+    async fn computer_yolo_pre_handoff_rejects_zero_to_nonzero_generation_with_stable_uuid() {
+        // Yolo's authorized identity is the open-time pin. A zero open-time
+        // generation is still compared exactly at the final fence; UUID
+        // stability is not a substitute for a later focused window.
+        let mut open = ask_virtual_evidence();
+        open.focus_generation = 0;
+        let mut drifted = open.clone();
+        drifted.focus_generation = 1;
+        assert_eq!(drifted.virtual_display_uuid, open.virtual_display_uuid);
+        let adapter = FakeTargetEvidenceAdapter::with_queue(open.backend_kind, vec![open, drifted]);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(CountingBackend::new(input_actions.clone())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call("call-yolo-zero-gen", &[OpenAiComputerAction::Screenshot])
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "Yolo must not follow a 0→1 generation change at handoff, got {outcome:?}"
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a generation identity mismatch at handoff"
+        );
+        assert!(coordinator.is_invalidated());
+        assert_eq!(coordinator.focus_generation().0, 0);
         assert_eq!(coordinator.virtual_display_uuid(), Some([0xAA; 16]));
     }
 

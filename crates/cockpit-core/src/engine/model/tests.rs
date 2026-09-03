@@ -6448,6 +6448,7 @@ fn utility_turn_blocking_budget_tighter() {
     for site in [
         UtilityCallSite::SafetyGate,
         UtilityCallSite::InjectionCheck,
+        UtilityCallSite::KnowledgeInjectionScan,
         UtilityCallSite::PreflightRewrite,
         UtilityCallSite::CompactionBrief,
         UtilityCallSite::DelegationShrink,

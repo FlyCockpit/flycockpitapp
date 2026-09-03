@@ -389,7 +389,7 @@ impl Driver {
             ScheduleAction::BackgroundTail => {
                 let parsed = crate::engine::schedule::parse_background_tail(action_args)?;
                 match self.schedule.background_handle(&parsed.job_id) {
-                    Some(handle) => Ok(handle.tail(parsed.lines, &self.redact)),
+                    Some(handle) => Ok(handle.tail(parsed.lines, &self.redact).await),
                     None => Ok(format!("no live background `{}`", parsed.job_id)),
                 }
             }

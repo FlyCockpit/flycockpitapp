@@ -13435,10 +13435,13 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     })
                     .collect::<std::collections::HashMap<_, _>>();
                 let mut runs = futures::stream::FuturesUnordered::new();
+                // Field access inside `async move` would move the Driver.
+                let nested_parent_budget = scheduled_lane_driver.budget.clone();
                 for (idx, entry, child, child_cwd) in prepared {
                     let admission = vnext_admissions
                         .pop()
                         .expect("one vNext admission per prepared child");
+                    let nested_parent_budget = nested_parent_budget.clone();
                     let session = session.clone();
                     let locks = locks.clone();
                     let redact = redact.clone();
@@ -13598,7 +13601,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                             None,
                             None,
                             Vec::new(),
-                            Some(scheduled_lane_driver.budget.clone()),
+                            Some(nested_parent_budget),
                             entry.budget.clone(),
                         ))
                         .await

@@ -403,6 +403,11 @@ impl TargetIdentityEvidence {
 }
 
 /// Checked generation reducer: increments when identity/geometry components change.
+///
+/// Virtual-display object identity (`virtual_display_uuid`) is intentionally
+/// omitted from the fingerprint. Coordinators bind that UUID as a separate
+/// live-identity component; a recycled or unchanged generation must not
+/// authorize a different display.
 #[derive(Debug, Default)]
 pub struct FocusGenerationReducer {
     last: Option<GenerationFingerprint>,

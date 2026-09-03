@@ -10629,6 +10629,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     let mut computer_contract = None;
     let mut computer_coordinator_config = None;
     let mut pending_computer_continuations = Vec::new();
+    let mut computer_ask_denial = None;
     // A resumable vNext child is itself a delegation parent. Keep its direct
     // child admission state for this whole invocation, so a nested batch has
     // the same atomic, live-child accounting as a driver-owned batch.
@@ -11827,6 +11828,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             &mut computer_contract,
             &mut computer_coordinator_config,
             &mut pending_computer_continuations,
+            &mut computer_ask_denial,
         )
         .await
         {

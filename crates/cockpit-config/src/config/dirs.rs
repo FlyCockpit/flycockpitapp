@@ -103,10 +103,41 @@ pub fn global_config_file() -> anyhow::Result<PathBuf> {
 ///
 /// This has no workspace-trust dependency. Persistent daemon boot calls it
 /// before publishing its socket; read-only commands intentionally do not.
+/// Onboarding-capable owners that skipped that boot gate may still create
+/// the directory lazily on the first user-level write.
 pub fn ensure_global_config_dir() -> anyhow::Result<PathBuf> {
     let path = global_config_dir()?;
     crate::config::files::ensure_private_writable_dir(&path)?;
     Ok(path)
+}
+
+/// True when `path` names the canonical global config directory.
+///
+/// Comparison is symlink-aware via the nearest existing ancestor, so a
+/// missing `~/.config/cockpit` cannot fail a read. Resolving the logical
+/// global path itself still errors when the platform config dir cannot be
+/// located (no `$HOME` / XDG).
+pub fn is_global_config_dir(path: &Path) -> anyhow::Result<bool> {
+    let global = global_config_dir()?;
+    Ok(same_logical_path(path, &global))
+}
+
+/// Symlink-safe equality that does not require either path to exist.
+fn same_logical_path(left: &Path, right: &Path) -> bool {
+    match (
+        cockpit_host::path_containment::effective_path(left),
+        cockpit_host::path_containment::effective_path(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Global `providers/<provider-id>.json` write target, independent of whether
+/// the global directory currently exists on disk.
+fn global_provider_write_target(provider_id: &str) -> Option<PathBuf> {
+    let dir = global_config_dir().ok()?;
+    crate::config::providers::provider_file_path_for_dir(&dir, provider_id).ok()
 }
 
 /// All cockpit config directories that exist on disk and apply to `cwd`.
@@ -180,8 +211,11 @@ fn explicit_config_write_allowed(path: &Path) -> bool {
 
 /// `providers/<provider-id>.json` write target for a runtime mutation that
 /// belongs to `provider_id`: the most-specific layer that already defines the
-/// provider, else the most-specific discovered layer. `COCKPIT_CONFIG` is a
-/// single-layer override, so provider files live beside that exact file.
+/// provider, else the most-specific discovered layer, else the canonical
+/// global layer — even when that directory does not yet exist. User-level
+/// config therefore never returns `None` for a valid provider id unless an
+/// explicit `COCKPIT_CONFIG` override forbids the write. `COCKPIT_CONFIG` is
+/// a single-layer override, so provider files live beside that exact file.
 pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option<PathBuf> {
     if crate::config::providers::validate_provider_id_for_filename(provider_id).is_err() {
         return None;
@@ -200,7 +234,8 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
     // nearest project, never an outer sibling-shared one), and `defining` is
     // the nearest layer that already holds the provider file — the one load
     // precedence actually reads. Prefer an existing definition, else fall
-    // back to the nearest writable layer.
+    // back to the nearest writable layer, else the always-writable global
+    // home (independent of `is_dir()` discovery).
     let mut target = None;
     let mut defining = None;
     for dir in config_dirs_most_specific_first(cwd) {
@@ -216,7 +251,9 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
             defining = Some(path);
         }
     }
-    defining.or(target)
+    defining
+        .or(target)
+        .or_else(|| global_provider_write_target(provider_id))
 }
 
 /// Most-specific runtime `config.json` write target for mutations that are not
@@ -234,12 +271,14 @@ pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
 
     // Nearest project layer wins (consistent with load precedence and the
     // gitignore write path); when no project layer applies, fall back to the
-    // most-specific non-project layer — unchanged from the prior behavior.
+    // most-specific non-project layer, else the canonical global layer even
+    // when that directory does not yet exist.
     let dirs = discover_config_dirs(cwd);
     dirs.iter()
         .find(|d| d.kind == ConfigDirKind::Project)
         .or_else(|| dirs.last())
         .map(|d| d.path.join(CONFIG_FILE))
+        .or_else(|| global_config_file().ok())
 }
 
 /// Effective `mcp.json` files for runtime loading, ordered from least
@@ -261,7 +300,8 @@ pub fn mcp_file_layers_for_load(cwd: &Path) -> Vec<(ConfigDirKind, PathBuf)> {
 }
 
 /// Explicit MCP write target for a client-chosen scope. `global` is the
-/// home XDG layer; `workspace` is the nearest project `.cockpit/mcp.json`.
+/// home XDG layer and is returned even when that directory does not yet
+/// exist; `workspace` is the nearest project `.cockpit/mcp.json`.
 pub fn mcp_write_target_for_scope(cwd: &Path, scope: &str) -> Option<PathBuf> {
     match scope {
         "global" => global_config_dir().ok().map(|dir| dir.join(MCP_FILE)),
@@ -910,6 +950,52 @@ mod tests {
             most_specific_config_write_target(&work),
             Some(home.join(".config/cockpit").join(CONFIG_FILE)),
             "no project layer → canonical global layer; legacy home dotfile is ignored"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// User-level write targets must resolve to the canonical global layer
+    /// even when that directory does not exist yet. Read-side discovery keeps
+    /// its `is_dir()` gate, so a fresh install still discovers nothing.
+    #[test]
+    fn user_level_write_targets_do_not_require_the_global_dir_to_exist() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let global = tmp.path().join("home/.config/cockpit");
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        assert_eq!(
+            config_write_target_for_provider(&work, "default"),
+            crate::config::providers::provider_file_path_for_dir(&global, "default").ok(),
+            "provider create/first-write falls back to the global layer path"
+        );
+        assert_eq!(
+            most_specific_config_write_target(&work),
+            Some(global.join(CONFIG_FILE)),
+            "user-level config.json mutations fall back to the global layer path"
+        );
+        assert_eq!(
+            mcp_write_target_for_scope(&work, "global"),
+            Some(global.join(MCP_FILE)),
+            "MCP global scope is the global layer path even when it is absent"
+        );
+        assert!(
+            discover_config_dirs(&work).is_empty(),
+            "read-side discovery must still require the global dir to exist"
+        );
+        assert!(
+            is_global_config_dir(&global).unwrap(),
+            "logical compare must treat the missing global dir as the global root"
+        );
+        assert!(
+            !is_global_config_dir(&work).unwrap(),
+            "a workspace path is not the global config root"
         );
         crate::config::trust::clear_runtime_policy_for_tests();
     }

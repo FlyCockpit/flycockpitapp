@@ -7983,6 +7983,48 @@ fn persistent_layered_test_ctx_with_credential_path(
     )
 }
 
+fn production_test_ctx(ephemeral: bool, credential_path: std::path::PathBuf) -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    Arc::new(
+        DaemonContext::new(
+            db,
+            locks,
+            unique_test_paths(ephemeral),
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::production(),
+        )
+        .with_credential_store_path(credential_path),
+    )
+}
+
+async fn set_workspace_trust_mode(
+    ctx: &DaemonContext,
+    path: &Path,
+    mode: crate::db::workspace_trust::WorkspaceTrustMode,
+) {
+    let normalized = path.canonicalize().unwrap().to_string_lossy().into_owned();
+    ctx.db
+        .write(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized,
+                mode,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .await
+        .unwrap();
+}
+
+fn onboard_provider_entry() -> crate::config::providers::ProviderEntry {
+    crate::config::providers::ProviderEntry {
+        url: "https://example.test/v1".to_string(),
+        name: Some("Onboard".to_string()),
+        ..crate::config::providers::ProviderEntry::default()
+    }
+}
+
 /// The daemon-derived MCP save authority a real `GetProviderCatalogSnapshot`
 /// minted: everything a `SaveMcpConfig` request must echo back.
 struct McpEditAuthority {
@@ -10255,12 +10297,9 @@ async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
     }
 }
 
-/// A catalog snapshot with no provider layer (a fresh install: no config
-/// directory exists anywhere) is still a successful read. No edit capability
-/// is minted — the view's capability/revision pair stays absent and
-/// `layer_id` is empty — but the redacted projection is returned instead of
-/// an error, so read surfaces (settings, `cockpit models`, `cockpit mcp`)
-/// keep working before first configuration.
+/// Stub config sources still omit a write target, so a catalog snapshot is a
+/// successful read without minting an edit capability. Production onboarding
+/// is covered by the tests below.
 #[tokio::test]
 async fn provider_catalog_snapshot_survives_missing_provider_layer() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
@@ -10288,9 +10327,424 @@ async fn provider_catalog_snapshot_survives_missing_provider_layer() {
     else {
         panic!("expected ProviderCatalogSnapshot response");
     };
-    assert_eq!(layer_id, "", "no editable layer may be advertised");
+    assert_eq!(layer_id, "", "stub sources advertise no editable layer");
     assert_eq!(view.mcp_edit_capability, None);
     assert_eq!(view.mcp_revision, None);
+}
+
+struct OnboardingCatalog {
+    snapshot_session_id: String,
+    layer_id: String,
+    base_revision: String,
+    view: cockpit_proto::ProviderConfigView,
+}
+
+async fn fresh_untrusted_workspace() -> (
+    crate::test_env::TestEnvGuard,
+    tempfile::TempDir,
+    Arc<DaemonContext>,
+    MutableClientState,
+    std::path::PathBuf,
+) {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+    )
+    .await;
+    let state = owner_state();
+    (env, tmp, ctx, state, workspace)
+}
+
+async fn take_onboarding_catalog(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    workspace: &Path,
+    snapshot_session_id: &str,
+) -> OnboardingCatalog {
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: snapshot_session_id.to_string(),
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("fresh-install catalog snapshot must succeed");
+    let Response::ProviderCatalogSnapshot {
+        config: view,
+        snapshot_session_id: returned_session,
+        layer_id,
+        base_revision,
+        ..
+    } = response
+    else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    assert_eq!(returned_session, snapshot_session_id);
+    assert!(
+        !layer_id.is_empty(),
+        "user-level config must mint an edit capability"
+    );
+    OnboardingCatalog {
+        snapshot_session_id: snapshot_session_id.to_string(),
+        layer_id,
+        base_revision,
+        view,
+    }
+}
+
+async fn apply_onboarding_mutation(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    catalog: &OnboardingCatalog,
+    client_operation_id: &str,
+    mutation: cockpit_proto::ProviderMutationBatch,
+) -> Response {
+    let mutation_intent_hash = mutation.sanitized_intent_hash().unwrap();
+    handle_request(
+        Request::ApplyProviderMutation {
+            snapshot_session_id: catalog.snapshot_session_id.clone(),
+            layer_id: catalog.layer_id.clone(),
+            expected_revision: catalog.base_revision.clone(),
+            client_operation_id: client_operation_id.into(),
+            mutation_intent_hash,
+            mutation,
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("onboarding provider mutation must commit")
+}
+
+fn global_provider_path(provider_id: &str) -> std::path::PathBuf {
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    crate::config::providers::provider_file_path_for_dir(&global, provider_id).unwrap()
+}
+
+/// Fresh machine, untrusted workspace: catalog snapshot mints an edit
+/// capability against the global layer, and a subsequent save commits there.
+#[tokio::test]
+async fn fresh_untrusted_provider_save_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    assert!(
+        !global.is_dir(),
+        "fresh-install fixture must not pre-create the global layer"
+    );
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-save",
+    )
+    .await;
+    assert!(
+        catalog.view.mcp_edit_capability.is_some(),
+        "MCP global scope must be editable during onboarding"
+    );
+    assert!(
+        catalog.view.mcp_scope_revisions.contains_key("global"),
+        "onboarding snapshot must advertise the global MCP write target"
+    );
+
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+
+    let saved = global_provider_path("onboard");
+    assert!(
+        saved.exists(),
+        "provider save must create the global layer file: {}",
+        saved.display()
+    );
+    assert!(
+        !workspace.join(".cockpit").exists(),
+        "untrusted onboarding must not create a workspace config layer"
+    );
+
+    let reread = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-reread",
+    )
+    .await;
+    assert!(
+        reread.view.providers.contains_key("onboard"),
+        "a second launch must read the saved global provider back"
+    );
+}
+
+/// Provider delete during onboarding removes the global-layer file, not a
+/// workspace overlay.
+#[tokio::test]
+async fn fresh_untrusted_provider_delete_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-delete-save",
+    )
+    .await;
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-delete-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+    assert!(global_provider_path("onboard").exists());
+
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-delete",
+    )
+    .await;
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-delete",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: Vec::new(),
+            deletes: vec![cockpit_proto::ProviderMutationDelete {
+                provider_id: "onboard".into(),
+                delete_stored_secrets: false,
+            }],
+            metadata: None,
+        },
+    )
+    .await;
+    assert!(
+        !global_provider_path("onboard").exists(),
+        "provider delete must remove the global layer file"
+    );
+    assert!(!workspace.join(".cockpit").exists());
+}
+
+/// A pre-existing ephemeral daemon serving onboarding must fail closed with
+/// an actionable error — never a capability-less snapshot.
+#[tokio::test]
+async fn ephemeral_daemon_onboarding_fails_closed_when_global_layer_is_missing() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+    )
+    .await;
+    let mut state = owner_state();
+    let error = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: "ephemeral-onboarding".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("ephemeral onboarding must fail closed");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
+        "error must tell the user to start a persistent daemon: {}",
+        error.message
+    );
+    assert!(
+        !cockpit_config::config::dirs::global_config_dir()
+            .unwrap()
+            .is_dir(),
+        "ephemeral onboarding must not create the global config directory"
+    );
+}
+
+/// MCP add with explicit global scope during onboarding writes mcp.json in
+/// the global layer.
+#[tokio::test]
+async fn fresh_untrusted_mcp_global_add_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let root = workspace.to_string_lossy().into_owned();
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "fresh-untrusted-mcp-global").await;
+    let config = serde_json::json!({
+        "servers": {"onboard-global": {
+            "transport": "streamable",
+            "endpoint": "https://mcp.example.test"
+        }}
+    });
+    let patch = mcp_patch(&config);
+    let mutation_intent_hash =
+        cockpit_proto::mcp_mutation_intent_hash_for_scope(&root, &patch, Some("global"));
+    handle_request(
+        Request::SaveMcpConfig {
+            client_operation_id: "fresh-untrusted-mcp-global".into(),
+            project_root: root,
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
+            mutation_intent_hash,
+            patch,
+            secret_values_json: "{}".into(),
+            target_scope: Some("global".into()),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("onboarding MCP global add must succeed");
+
+    let mcp_path = cockpit_config::config::dirs::global_config_dir()
+        .unwrap()
+        .join(cockpit_config::config::dirs::MCP_FILE);
+    let wire = std::fs::read_to_string(&mcp_path).unwrap();
+    assert!(
+        wire.contains("onboard-global"),
+        "MCP add must persist to the global layer: {wire}"
+    );
+    assert!(
+        !workspace.join(".cockpit").exists(),
+        "untrusted MCP add must not create a workspace config layer"
+    );
+}
+
+/// A trusted workspace that already defines a provider keeps writing that
+/// workspace layer (scope preservation).
+#[tokio::test]
+async fn trusted_workspace_provider_definition_is_preserved_on_save() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let cockpit_dir = workspace.join(".cockpit");
+    std::fs::create_dir_all(cockpit_dir.join("providers")).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let workspace_provider =
+        crate::config::providers::provider_file_path_for_dir(&cockpit_dir, "existing").unwrap();
+    std::fs::write(
+        &workspace_provider,
+        r#"{"url":"https://example.test/v1","name":"Workspace"}"#,
+    )
+    .unwrap();
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await;
+    let mut state = owner_state();
+    let catalog =
+        take_onboarding_catalog(&ctx, &mut state, &workspace, "trusted-workspace-scope").await;
+    let mut entry = onboard_provider_entry();
+    entry.name = Some("Workspace Updated".into());
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "trusted-workspace-scope",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "existing".into(),
+                entry,
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+
+    let workspace_wire = std::fs::read_to_string(&workspace_provider).unwrap();
+    assert!(
+        workspace_wire.contains("Workspace Updated"),
+        "trusted workspace definition must be updated in place: {workspace_wire}"
+    );
+    assert!(
+        !global_provider_path("existing").exists(),
+        "trusted workspace save must not copy the provider into the global layer"
+    );
+}
+
+/// `GetDoctorSnapshot` is a diagnostic read: it creates no global config
+/// directory.
+#[tokio::test]
+async fn doctor_snapshot_does_not_create_the_global_config_dir() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    let mut state = owner_state();
+    handle_request(
+        Request::GetDoctorSnapshot {
+            project_root: Some(workspace.to_string_lossy().into_owned()),
+            no_sandbox: true,
+            offline: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("doctor snapshot is a read");
+    assert!(
+        !cockpit_config::config::dirs::global_config_dir()
+            .unwrap()
+            .is_dir(),
+        "cockpit doctor must not create the global config directory"
+    );
+}
+
+#[test]
+fn doctor_snapshot_handler_does_not_ensure_the_global_config_dir() {
+    let source = include_str!("dispatch.rs");
+    let body = source
+        .split("async fn get_doctor_snapshot_response(")
+        .nth(1)
+        .and_then(|tail| tail.split("\nasync fn ").next())
+        .expect("doctor snapshot handler");
+    assert!(
+        !body.contains("ensure_global_config_dir"),
+        "doctor must not create the global config layer"
+    );
 }
 
 // `#[tokio::test]`: `persistent_test_ctx` spawns the daemon scheduler loop,

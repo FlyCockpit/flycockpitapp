@@ -1176,9 +1176,7 @@ fn discovered_settings_layers(
 /// here: its config is user-owned and must remain writable without a trust
 /// decision for whichever workspace happened to launch onboarding.
 fn is_global_config_root(root: &Path) -> Result<bool, ErrorPayload> {
-    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
-    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
-    Ok(root == canonical_global)
+    cockpit_config::config::dirs::is_global_config_dir(root).map_err(internal)
 }
 
 fn read_optional_config(

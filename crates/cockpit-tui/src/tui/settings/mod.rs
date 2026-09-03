@@ -2633,14 +2633,23 @@ pub(super) enum SettingsPointerSurfaceKind {
     Mcp,
     Lsp,
     Dependencies,
+    #[cfg(feature = "extended")]
     GenerationList,
+    #[cfg(feature = "extended")]
     EndpointEditor,
+    #[cfg(feature = "extended")]
     TargetEditor,
+    #[cfg(feature = "extended")]
     WorkflowEditor,
+    #[cfg(feature = "extended")]
     BudgetEditor,
+    #[cfg(feature = "extended")]
     GrantList,
+    #[cfg(feature = "extended")]
     JobList,
+    #[cfg(feature = "extended")]
     JobDetail,
+    #[cfg(feature = "extended")]
     LateResultAction,
     #[cfg(feature = "extended")]
     SidecarOverview,
@@ -2705,7 +2714,7 @@ impl SettingsPointerSurfaceKind {
         Self::SidecarInvocationDetail,
     ];
     #[cfg(not(feature = "extended"))]
-    pub(super) const ALL: [Self; 23] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::Root,
         Self::DefaultModel,
         Self::Agents,
@@ -2720,15 +2729,6 @@ impl SettingsPointerSurfaceKind {
         Self::Mcp,
         Self::Lsp,
         Self::Dependencies,
-        Self::GenerationList,
-        Self::EndpointEditor,
-        Self::TargetEditor,
-        Self::WorkflowEditor,
-        Self::BudgetEditor,
-        Self::GrantList,
-        Self::JobList,
-        Self::JobDetail,
-        Self::LateResultAction,
     ];
 }
 
@@ -3385,15 +3385,6 @@ impl SettingsCx {
         );
     }
 
-    #[cfg(not(feature = "extended"))]
-    pub(super) fn queue_image_spend_load(
-        &mut self,
-        _project_key: String,
-        _page_instance_id: uuid::Uuid,
-    ) {
-        // Image spend settings are unavailable without the extended profile.
-    }
-
     #[cfg(feature = "extended")]
     fn queue_image_spend_save(
         &mut self,
@@ -3437,15 +3428,6 @@ impl SettingsCx {
             },
         );
         Ok(())
-    }
-
-    #[cfg(not(feature = "extended"))]
-    fn queue_image_spend_save(
-        &mut self,
-        _project_key: String,
-        _page_instance_id: uuid::Uuid,
-    ) -> Result<(), String> {
-        Err("image-generation budgets require the extended build profile".into())
     }
 
     fn enqueue_settlement_effect(
@@ -8768,7 +8750,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
 #[cfg(feature = "extended")]
-const ROOT_NODE_COUNT: usize = 18;
+const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
 const ROOT_NODE_COUNT: usize = 14;
 

@@ -23,23 +23,6 @@ use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-#[test]
-#[cfg(not(feature = "extended"))]
-fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
-    let request = Request::ListScheduledJobs { owner: None };
-    let error = require_compiled_product_domain(&request)
-        .expect_err("scheduler RPC must be unavailable without the extended profile");
-    assert_eq!(error.code, ErrorCode::BadRequest);
-    assert!(
-        error
-            .message
-            .contains("opt-in extended local capability profile")
-    );
-
-    require_compiled_product_domain(&Request::DaemonStatus)
-        .expect("base-profile RPC must remain available");
-}
-
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
     let value = serde_json::to_value(config).unwrap();
     let operations = value

@@ -365,7 +365,7 @@ jobs:
           cargo build --locked
           --workspace --exclude tenant-authority
           --features
-          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote,tenant-authority/remote
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
 
       # The supported extended-local schema profile compiles without remote.
       - name: Build extended-only profile matrix
@@ -377,14 +377,14 @@ jobs:
 
       - name: Test remote-only profile matrix
         run: >
-          cargo build --locked --tests
+          cargo nextest run --locked
           --workspace --exclude tenant-authority
           --features
-          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote,tenant-authority/remote
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
 
       - name: Test extended-only profile matrix
         run: >
-          cargo build --locked --tests
+          cargo nextest run --locked
           --workspace --exclude tenant-authority
           --features
           cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended

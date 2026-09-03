@@ -748,6 +748,8 @@ fn cleanup_worker_on_exit(
     live_session_id: Uuid,
     generation: WorkerGeneration,
 ) {
+    #[cfg(not(feature = "extended"))]
+    let _ = spawn_session_id;
     if let Some(inner) = inner.upgrade() {
         #[cfg(feature = "extended")]
         inner

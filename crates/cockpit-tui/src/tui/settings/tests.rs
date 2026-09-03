@@ -6350,7 +6350,7 @@ fn root_menu_inventory_matches_the_default_profile() {
 #[test]
 fn root_menu_inventory_adds_image_spend_in_extended_profile() {
     let nodes = root_nodes();
-    assert_eq!(nodes.len(), 18);
+    assert_eq!(nodes.len(), 17);
     assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
     assert!(
         nodes

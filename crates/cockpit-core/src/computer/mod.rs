@@ -6610,18 +6610,13 @@ mod tests {
     fn terminal_launch_chord_policy_refuses_provider_native_actions() {
         // The refusal must happen at canonicalization, before approval:
         // the provider never sees a prompt and the chord never dispatches.
-        for provider in [
-            OpenAiComputerAction::KeyChord(KeyChord {
-                keys: vec!["ctrl".to_string(), "alt".to_string(), "t".to_string()],
-            }),
-            Anthropic20251124ComputerAction::KeyChord(KeyChord {
-                keys: vec!["ctrl".to_string(), "alt".to_string(), "t".to_string()],
-            }),
-            Anthropic20250124ComputerAction::KeyChord(KeyChord {
-                keys: vec!["ctrl".to_string(), "alt".to_string(), "t".to_string()],
-            }),
-        ] {
-            let action = provider.to_backend();
+        let keys = vec!["ctrl".to_string(), "alt".to_string(), "t".to_string()];
+        let openai = OpenAiComputerAction::KeyChord(KeyChord { keys: keys.clone() }).to_backend();
+        let anthropic_20251124 =
+            Anthropic20251124ComputerAction::KeyChord(KeyChord { keys: keys.clone() }).to_backend();
+        let anthropic_20250124 =
+            Anthropic20250124ComputerAction::KeyChord(KeyChord { keys }).to_backend();
+        for action in [openai, anthropic_20251124, anthropic_20250124] {
             assert!(
                 matches!(
                     &action,

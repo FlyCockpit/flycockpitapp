@@ -2815,6 +2815,7 @@ async fn blob_backed_tool_artifact_import_restages_body_and_projection() {
     let imported = crate::session::import::import_archive(
         &destination,
         crate::session::import::read_archive_bytes(&archive).unwrap(),
+        false,
     )
     .await
     .unwrap();
@@ -2943,6 +2944,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
     let imported = crate::session::import::import_archive(
         &destination,
         crate::session::import::read_archive_bytes(&archive).unwrap(),
+        false,
     )
     .await
     .expect("typed oversized source remains importable");
@@ -3125,6 +3127,7 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
     let imported = crate::session::import::import_archive(
         &imported_db,
         crate::session::import::read_archive_bytes(&source_zip).unwrap(),
+        false,
     )
     .await
     .unwrap();

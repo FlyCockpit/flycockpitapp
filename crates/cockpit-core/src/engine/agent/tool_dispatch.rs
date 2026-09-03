@@ -7767,6 +7767,7 @@ mod tests {
         let imported = crate::session::import::import_archive(
             &imported_db,
             crate::session::import::read_archive_bytes(&archive).unwrap(),
+            false,
         )
         .await
         .unwrap();

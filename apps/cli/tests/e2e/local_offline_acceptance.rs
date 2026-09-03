@@ -11,11 +11,18 @@ const PUBLIC_SNAPSHOT: &str = include_str!("../fixtures/public-v0.1-command-snap
 
 fn public_commands() -> Vec<String> {
     let snapshot: serde_json::Value = serde_json::from_str(PUBLIC_SNAPSHOT).unwrap();
+    // The snapshot pins the full public surface (roots plus aliases); help
+    // output lists canonical roots only, so narrow to those here.
+    let canonical: std::collections::BTreeSet<String> = cockpit_cli::public_v0_1_command()
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_owned())
+        .collect();
     snapshot["commands"]
         .as_array()
         .unwrap()
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
+        .filter(|command| canonical.contains(command))
         .collect()
 }
 
@@ -88,17 +95,10 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     for command in &public {
         assert!(help_lists_root(&text, command), "missing {command}: {text}");
     }
-    for hidden in [
-        "account",
-        "sync",
-        "connect",
-        "invocation",
-        "mcp",
-        "schedule",
-        "skill",
-        "stats",
-        "completion",
-    ] {
+    // The local profile compiles only local commands: every root implemented
+    // in this build is public, so the only absent roots are the feature-gated
+    // remote/extended commands.
+    for hidden in ["account", "sync", "connect", "schedule"] {
         assert!(!help_lists_root(&text, hidden), "leaked {hidden}: {text}");
     }
     for allowed in &public {
@@ -109,16 +109,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             output_text(&output)
         );
     }
-    for rejected in [
-        "providers",
-        "auth",
-        "invocation",
-        "mcp",
-        "schedule",
-        "skill",
-        "stats",
-        "completion",
-    ] {
+    for rejected in ["providers", "auth", "schedule"] {
         let output = run(&session, &[rejected, "--help"]);
         assert_eq!(
             output.status.code(),
@@ -127,8 +118,10 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             output_text(&output)
         );
     }
-    let rejected = run(&session, &["completion", "bash"]);
-    assert_eq!(rejected.status.code(), Some(2));
+    // `completion` is public: generating a script from the release binary
+    // succeeds and mirrors the release-asset generator.
+    let generated = run(&session, &["completion", "bash"]);
+    assert!(generated.status.success(), "{}", output_text(&generated));
     let mut completion = Vec::new();
     clap_complete::generate(
         clap_complete::Shell::Bash,
@@ -143,7 +136,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             "completion omitted {command}"
         );
     }
-    for hidden in ["account", "sync", "connect", "mcp", "schedule"] {
+    for hidden in ["account", "sync", "connect", "schedule"] {
         assert!(
             !completion_lists_root(&completion, hidden),
             "completion leaked {hidden}"
@@ -239,6 +232,37 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     }
     assert!(policy.is_file(), "settings policy was not persisted");
     assert!(export.is_file(), "redacted session export was not created");
+    // `cockpit import` round-trips `cockpit export`: the archive is pushed as
+    // bounded bulk chunks, verified by the daemon, and restored with fresh
+    // destination session ids (never restoring approval grants).
+    let imported = run(&session, &["import", &export_text]);
+    assert!(
+        imported.status.success(),
+        "import failed: {}",
+        output_text(&imported)
+    );
+    let imported_text = output_text(&imported);
+    assert!(
+        imported_text.contains("Imported 1 session"),
+        "import did not round-trip the export archive: {imported_text}"
+    );
+    assert!(
+        imported_text.contains("archive content was redacted"),
+        "import must report the archive's redacted provenance: {imported_text}"
+    );
+    // The printed destination id is the usable handle for the restored
+    // session: import mints fresh ids, so the source id is the wrong handle
+    // afterwards. Assert the fresh identity, then prove the restored session
+    // is usable by resuming it.
+    let imported_session_id = imported_text
+        .lines()
+        .find_map(|line| line.trim().parse::<uuid::Uuid>().ok())
+        .expect("import must print the fresh destination session id");
+    assert_ne!(
+        imported_session_id.to_string(),
+        session_id,
+        "import must mint a fresh destination session id, not reuse the source id"
+    );
     let resumed = run(
         &session,
         &[
@@ -259,6 +283,90 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         }),
         "resumed provider request did not contain the durable prior content"
     );
+    // Resuming the imported destination session replays the restored
+    // transcript, so a missing or unusable import would fail here.
+    let imported_id_text = imported_session_id.to_string();
+    let imported_resume = run(
+        &session,
+        &[
+            "run",
+            "--session",
+            &imported_id_text,
+            "--json",
+            "resume imported session",
+        ],
+    );
+    assert!(
+        imported_resume.status.success(),
+        "resuming the imported session failed: {}",
+        output_text(&imported_resume)
+    );
+    assert!(
+        provider.captured().iter().any(|request| {
+            let body = request.body.to_string();
+            body.contains("durable release prompt")
+                && body.contains("durable release reply")
+                && body.contains("resume imported session")
+        }),
+        "resuming the imported session did not replay the restored transcript"
+    );
+    // The raw export path (`--include-sensitive`) pairs with an explicit raw
+    // import: without the acknowledgement the daemon refuses the unredacted
+    // archive fail-closed; with it the import reports unredacted provenance
+    // and warns, so the redaction-custody drop is never silent.
+    let raw_export = session.project_path().join("session-export-raw.zip");
+    let raw_export_text = raw_export.to_string_lossy().into_owned();
+    let raw = run(
+        &session,
+        &[
+            "export",
+            &session_id,
+            "--output",
+            &raw_export_text,
+            "--include-sensitive",
+        ],
+    );
+    assert!(raw.status.success(), "{}", output_text(&raw));
+    assert!(
+        output_text(&raw).contains("UNREDACTED"),
+        "raw export must print its mandatory warning: {}",
+        output_text(&raw)
+    );
+    let refused = run(&session, &["import", &raw_export_text]);
+    assert!(
+        !refused.status.success(),
+        "unredacted import without --include-sensitive must fail closed: {}",
+        output_text(&refused)
+    );
+    assert!(
+        output_text(&refused).contains("--include-sensitive"),
+        "the refusal must name the acknowledgement it requires: {}",
+        output_text(&refused)
+    );
+    let raw_imported = run(
+        &session,
+        &["import", &raw_export_text, "--include-sensitive"],
+    );
+    assert!(
+        raw_imported.status.success(),
+        "acknowledged unredacted import failed: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("Imported 1 session"),
+        "acknowledged unredacted import did not restore the archive: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("archive content was unredacted"),
+        "raw import must report unredacted provenance: {}",
+        output_text(&raw_imported)
+    );
+    assert!(
+        output_text(&raw_imported).contains("UNREDACTED"),
+        "raw import must print its mandatory warning: {}",
+        output_text(&raw_imported)
+    );
     let file = std::fs::File::open(export).unwrap();
     let mut archive = zip::ZipArchive::new(file).unwrap();
     let mut exported = String::new();
@@ -272,6 +380,19 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     assert!(
         !exported.contains(secret),
         "redacted export leaked env-derived secret"
+    );
+    let mut raw_archive = zip::ZipArchive::new(std::fs::File::open(&raw_export).unwrap()).unwrap();
+    let mut raw_exported = String::new();
+    for index in 0..raw_archive.len() {
+        let mut entry = raw_archive.by_index(index).unwrap();
+        if entry.is_file() {
+            let _ = entry.read_to_string(&mut raw_exported);
+        }
+    }
+    assert!(raw_exported.contains("durable release reply"));
+    assert!(
+        raw_exported.contains(secret),
+        "the acknowledged raw export must contain the env-derived secret"
     );
     assert_no_network_attempt(&denied_network);
     assert!(

@@ -78,8 +78,7 @@ pub(super) fn apply_live_activity_state(
 pub(super) fn resource_scheduler_snapshot(
     ctx: &DaemonContext,
 ) -> crate::engine::resource_scheduler::ResourceSchedulerSnapshot {
-    ctx.registry
-        .resource_scheduler()
+    ctx.resource_scheduler()
         .map(|scheduler| scheduler.snapshot())
         .unwrap_or_else(|| {
             crate::engine::resource_scheduler::ResourceScheduler::disabled().snapshot()
@@ -93,7 +92,7 @@ pub(super) async fn promote_resource_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     use crate::engine::resource_scheduler::ResourcePromoteError;
 
-    let Some(scheduler) = ctx.registry.resource_scheduler() else {
+    let Some(scheduler) = ctx.resource_scheduler() else {
         let snapshot = resource_scheduler_snapshot(ctx);
         return Ok(Response::PromoteResourceResult {
             status: proto::ResourcePromoteStatus::Disabled,
@@ -620,7 +619,7 @@ pub(super) async fn prepare_session_deletion(
     // that cannot run inside the SQLite ledger transaction, and it is idempotent
     // / reconcilable: a later ledger failure leaves the retry safe because the
     // reconcile pass re-runs it. Run it before either delete path.
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         storage
             .begin_session_deletion_cleanup(session_id, now_wall_ms)
             .await
@@ -781,8 +780,8 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
 
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
-    ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
+) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
+    ctx.scheduler().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })

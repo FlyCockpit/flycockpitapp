@@ -2,7 +2,8 @@
 //!
 //! Lifecycle: attach to a shareable daemon when one is already up; otherwise
 //! this command starts a shared ephemeral daemon for the duration of the run.
-//! That owner can be promoted in place when the user selects background work.
+//! Ctrl+C cancels the agent and exits; it does not promote the owner. TUI
+//! `/exit` still offers in-place background promotion.
 //!
 //! Behavior:
 //!
@@ -1002,27 +1003,13 @@ pub(crate) async fn pump_events(
                         anyhow::bail!("unexpected daemon exit-state response");
                     };
                     if has_live_work && ephemeral_owner {
-                        match prompt_run_exit_choice(&mut stderr)? {
-                            RunExitChoice::Background => {
-                                client
-                                    .request_ok(Request::PromoteToPersistent)
-                                    .await
-                                    .context("promoting daemon to persistent background owner")?;
-                                writeln!(
-                                    stderr,
-                                    "This session is still running in the background; reattach with cockpit run --session {session_id}"
-                                )?;
-                                return Ok(130);
-                            }
-                            RunExitChoice::StopAll => {
-                                // This is the only interactive path that broadens
-                                // cancellation beyond the current invocation.
-                                client
-                                    .request_ok(Request::CancelAllSessionWork)
-                                    .await
-                                    .context("cancelling all attached session work")?;
-                            }
-                        }
+                        // Ctrl+C on `cockpit run` is stop-all: cancel the agent,
+                        // tear down owned processes, and exit. Backgrounding is
+                        // the TUI `/exit` guard's job, not this command.
+                        client
+                            .request_ok(Request::CancelAllSessionWork)
+                            .await
+                            .context("cancelling all attached session work")?;
                     } else if has_live_work {
                         writeln!(
                             stderr,
@@ -1170,31 +1157,6 @@ pub(crate) async fn pump_events(
         stdout.flush()?;
     }
     Ok(code)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunExitChoice {
-    StopAll,
-    Background,
-}
-
-fn prompt_run_exit_choice(stderr: &mut impl Write) -> Result<RunExitChoice> {
-    if !std::io::stdin().is_terminal() {
-        return Ok(RunExitChoice::StopAll);
-    }
-    writeln!(
-        stderr,
-        "This session is still working. What would you like to do? [s]top all / [b]ackground"
-    )?;
-    stderr.flush()?;
-    let mut choice = String::new();
-    std::io::stdin()
-        .read_line(&mut choice)
-        .context("reading exit choice")?;
-    Ok(match choice.trim().to_ascii_lowercase().as_str() {
-        "b" | "background" | "run in background" => RunExitChoice::Background,
-        _ => RunExitChoice::StopAll,
-    })
 }
 
 /// Map an authoritative terminal lifecycle state after interrupt reconciliation.

@@ -288,7 +288,9 @@ pub async fn save_extended_config(
     content: String,
     base_hash: Option<String>,
 ) -> Result<Response, ErrorPayload> {
-    let ephemeral = ctx.paths.ephemeral;
+    // Runtime lifetime, not the boot-time path marker: in-place promotion
+    // never rewrites `ctx.paths.ephemeral`.
+    let ephemeral = ctx.is_ephemeral_lifetime();
     join_fs_handler(
         "save_extended_config",
         tokio::task::spawn_blocking(move || {
@@ -310,7 +312,9 @@ pub async fn get_extended_config_snapshot(
 ) -> Result<Response, ErrorPayload> {
     let root = settings_snapshot_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction();
-    let ephemeral = ctx.paths.ephemeral;
+    // Runtime lifetime, not the boot-time path marker: in-place promotion
+    // never rewrites `ctx.paths.ephemeral`.
+    let ephemeral = ctx.is_ephemeral_lifetime();
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
@@ -711,7 +715,9 @@ pub async fn apply_extended_config_patch(
     let runtime = tokio::runtime::Handle::current();
     let settlement_owner = owner.clone();
     let settlement_operation = client_operation_id.clone();
-    let ephemeral = ctx.paths.ephemeral;
+    // Runtime lifetime, not the boot-time path marker: in-place promotion
+    // never rewrites `ctx.paths.ephemeral`.
+    let ephemeral = ctx.is_ephemeral_lifetime();
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {

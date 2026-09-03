@@ -90,7 +90,7 @@ turn-coturn-conformance = ["remote"]
 workspace = true
 
 # Test-only spawn target: `spawn_detached*` invokes `daemon start --foreground`
-# on this executable when it is co-located with the cockpit-core test binary.
+# on this harness when running cockpit-core tests (see `discover_daemon_spawn_harness_executable`).
 [[bin]]
 name = "cockpit-daemon-spawn-harness"
 path = "src/bin/cockpit-daemon-spawn-harness.rs"

@@ -1,9 +1,9 @@
 //! Minimal `cockpit daemon start --foreground` entry for detached-spawn tests.
 //!
 //! Production `spawn_detached*` uses `current_exe()`, which is the `cockpit`
-//! binary. Unit/integration tests build this harness beside the libtest binary
-//! so spawn paths exercise a real wire-backed foreground daemon without
-//! depending on `apps/cli`.
+//! binary. Unit/integration tests discover this harness under the Cargo
+//! `target/` tree so spawn paths exercise a real wire-backed foreground daemon
+//! without depending on `apps/cli`.
 
 use std::process::ExitCode;
 

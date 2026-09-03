@@ -189,8 +189,8 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
 const DAEMON_LIFETIME_ENV: &str = "COCKPIT_DAEMON_LIFETIME";
 const EPHEMERAL_LIFETIME: &str = "ephemeral";
 /// Optional override for detached daemon spawn tests. Production callers use
-/// `current_exe()`; test builds also auto-discover
-/// [`sibling_daemon_spawn_harness_executable`].
+/// `current_exe()`; test builds require the `cockpit-daemon-spawn-harness`
+/// binary discovered via [`discover_daemon_spawn_harness_executable`].
 pub(crate) const DAEMON_SPAWN_EXECUTABLE_ENV: &str = "COCKPIT_DAEMON_SPAWN_EXECUTABLE";
 const DAEMON_SPAWN_HARNESS_BIN: &str = "cockpit-daemon-spawn-harness";
 
@@ -1216,25 +1216,96 @@ fn resolve_daemon_spawn_executable() -> Result<PathBuf> {
         return canonicalize_spawn_executable(PathBuf::from(override_path));
     }
     #[cfg(test)]
-    if let Some(harness) = sibling_daemon_spawn_harness_executable() {
-        if harness.is_file() {
+    {
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_cockpit_daemon_spawn_harness") {
+            return canonicalize_spawn_executable(PathBuf::from(path));
+        }
+        if let Some(harness) = discover_daemon_spawn_harness_executable() {
             return canonicalize_spawn_executable(harness);
         }
+        anyhow::bail!(
+            "daemon spawn harness ({DAEMON_SPAWN_HARNESS_BIN}) not found; \
+             build cockpit-core with `cargo build -p cockpit-core --bins` \
+             or set {DAEMON_SPAWN_EXECUTABLE_ENV}"
+        );
     }
-    std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .context("locating daemon spawn executable")
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .context("locating daemon spawn executable")
+    }
 }
 
 #[cfg(all(test, any(unix, windows)))]
-fn sibling_daemon_spawn_harness_executable() -> Option<PathBuf> {
-    let test_exe = std::env::current_exe().ok()?;
-    let dir = test_exe.parent()?;
+fn daemon_spawn_harness_filename() -> &'static str {
     #[cfg(windows)]
-    let name = format!("{DAEMON_SPAWN_HARNESS_BIN}.exe");
+    {
+        "cockpit-daemon-spawn-harness.exe"
+    }
     #[cfg(not(windows))]
-    let name = DAEMON_SPAWN_HARNESS_BIN.to_string();
-    Some(dir.join(name))
+    {
+        DAEMON_SPAWN_HARNESS_BIN
+    }
+}
+
+/// Locate the test harness from a libtest/integration-test executable path.
+///
+/// Cargo places libtests under `target/<profile>/deps/` while the harness
+/// `[[bin]]` lands in `target/<profile>/` or, when CI builds with an explicit
+/// `--target`, in `target/<triple>/<profile>/`.
+#[cfg(all(test, any(unix, windows)))]
+fn discover_daemon_spawn_harness_from(test_exe: &std::path::Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+
+    let harness_name = daemon_spawn_harness_filename();
+    let mut dir = test_exe.parent()?;
+    loop {
+        let candidate = dir.join(harness_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.file_name() == Some(OsStr::new("target")) {
+            if let Some(found) = discover_harness_under_target_root(dir, harness_name) {
+                return Some(found);
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn discover_daemon_spawn_harness_executable() -> Option<PathBuf> {
+    let test_exe = std::env::current_exe().ok()?;
+    discover_daemon_spawn_harness_from(&test_exe)
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn discover_harness_under_target_root(
+    target: &std::path::Path,
+    harness_name: &str,
+) -> Option<PathBuf> {
+    const PROFILES: &[&str] = &["debug", "release"];
+    for profile in PROFILES {
+        let candidate = target.join(profile).join(harness_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let entries = std::fs::read_dir(target).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for profile in PROFILES {
+            let candidate = path.join(profile).join(harness_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(any(unix, windows))]
@@ -3917,6 +3988,79 @@ mod windows_pipe_tests {
             .expect("bind reveal");
         assert!(cockpit_host::named_pipe::pipe_is_listening(&reveal));
         drop(listener);
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod spawn_executable_tests {
+    use super::{
+        daemon_spawn_harness_filename, discover_daemon_spawn_harness_from,
+        discover_harness_under_target_root,
+    };
+
+    #[test]
+    fn discover_harness_finds_profile_root_sibling_of_deps_libtest_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let deps = root.join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let harness_path = root
+            .join("target")
+            .join("debug")
+            .join(daemon_spawn_harness_filename());
+        std::fs::write(&harness_path, b"").expect("harness file");
+        let fake_exe = deps.join("cockpit_core-abc");
+        std::fs::write(&fake_exe, b"").expect("fake libtest exe");
+
+        let found = discover_daemon_spawn_harness_from(&fake_exe).expect("harness");
+        assert_eq!(found, harness_path);
+    }
+
+    #[test]
+    fn discover_harness_finds_explicit_target_triple_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let deps = root.join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let harness_path = root
+            .join("target")
+            .join("x86_64-pc-windows-msvc")
+            .join("debug")
+            .join(daemon_spawn_harness_filename());
+        std::fs::create_dir_all(harness_path.parent().expect("parent")).expect("triple debug");
+        std::fs::write(&harness_path, b"").expect("harness file");
+        let fake_exe = deps.join("cockpit_core-abc");
+        std::fs::write(&fake_exe, b"").expect("fake libtest exe");
+
+        let found = discover_daemon_spawn_harness_from(&fake_exe).expect("harness");
+        assert_eq!(found, harness_path);
+    }
+
+    #[test]
+    fn discover_harness_under_target_root_checks_profile_and_triple_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        let harness_path = target
+            .join("aarch64-apple-darwin")
+            .join("release")
+            .join(daemon_spawn_harness_filename());
+        std::fs::create_dir_all(harness_path.parent().expect("parent")).expect("triple release");
+        std::fs::write(&harness_path, b"").expect("harness file");
+
+        let found = discover_harness_under_target_root(&target, daemon_spawn_harness_filename())
+            .expect("harness");
+        assert_eq!(found, harness_path);
+    }
+
+    #[test]
+    fn discover_harness_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let fake_exe = deps.join("cockpit_core-abc");
+        std::fs::write(&fake_exe, b"").expect("fake libtest exe");
+
+        assert!(discover_daemon_spawn_harness_from(&fake_exe).is_none());
     }
 }
 

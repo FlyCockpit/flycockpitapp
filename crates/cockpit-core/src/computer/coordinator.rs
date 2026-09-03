@@ -2150,9 +2150,10 @@ pub struct ComputerActionAuthorization {
     /// have no host lease.
     pub host_lease: Option<HostLeaseToken>,
     /// Currently authorized live focus (window) generation. The Ask gate
-    /// adopts the snapshot it accepts before building the approval packet,
-    /// so this is the identity the human approved and the identity
-    /// pre-handoff validation must still observe.
+    /// adopts the complete live snapshot it accepts (generation and virtual
+    /// display UUID) before building the approval packet, so this is the
+    /// identity the human approved and the identity pre-handoff validation
+    /// must still observe.
     pub focus_generation: TargetGeneration,
     /// Observation generation (display generation) from the opened backend.
     pub observation_generation: ObservationEpoch,
@@ -2179,9 +2180,11 @@ pub struct ComputerActionAuthorization {
     /// Secret-free identity digest for the concrete physical host lease and
     /// its generation.  A virtual backend has no host lease.
     pub lease_binding_digest: Option<String>,
-    /// Secret-free digest of the concrete physical or virtual target evidence.
-    /// This is intentionally present even for virtual displays, which do not
-    /// carry a host lease but still need an exact approval binding.
+    /// Secret-free digest of the currently authorized physical or virtual
+    /// target evidence. Virtual displays bind their live display UUID here
+    /// (no host lease). The Ask gate adopts that UUID before this packet is
+    /// built, so the digest describes the same object identity the lease,
+    /// host-approval effects, and pre-handoff check use.
     pub target_evidence_binding_digest: String,
     /// Human-readable summary of this concrete action for the approval
     /// prompt (issue #286): action kind, coordinates, keys, scroll deltas.
@@ -2240,6 +2243,10 @@ pub struct FakeComputerAuthorizer {
     pub call_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Focus generation from the most recent authorization request.
     pub last_focus_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Target-evidence binding digest from the most recent authorization
+    /// request. Tests use this to prove a reapproval packet binds the live
+    /// virtual-display UUID, not the open-time pin.
+    pub last_target_evidence_binding_digest: Arc<std::sync::Mutex<String>>,
     /// If set, every call returns this decision (overrides `decisions`).
     pub forced_decision: Option<ComputerAuthorizationDecision>,
 }
@@ -2250,6 +2257,7 @@ impl FakeComputerAuthorizer {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
         }
     }
@@ -2259,6 +2267,7 @@ impl FakeComputerAuthorizer {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: Some(ComputerAuthorizationDecision::Deny {
                 reason: reason.into(),
             }),
@@ -2270,6 +2279,7 @@ impl FakeComputerAuthorizer {
             decisions: Vec::new(),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: Some(ComputerAuthorizationDecision::AskBlocked),
         }
     }
@@ -2279,6 +2289,7 @@ impl FakeComputerAuthorizer {
             decisions,
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_focus_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_target_evidence_binding_digest: Arc::new(std::sync::Mutex::new(String::new())),
             forced_decision: None,
         }
     }
@@ -2290,6 +2301,13 @@ impl FakeComputerAuthorizer {
     pub fn last_focus_generation(&self) -> u64 {
         self.last_focus_generation
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn last_target_evidence_binding_digest(&self) -> String {
+        self.last_target_evidence_binding_digest
+            .lock()
+            .unwrap()
+            .clone()
     }
 }
 
@@ -2305,6 +2323,8 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
             request.focus_generation.0,
             std::sync::atomic::Ordering::SeqCst,
         );
+        *self.last_target_evidence_binding_digest.lock().unwrap() =
+            request.target_evidence_binding_digest.clone();
         if let Some(forced) = &self.forced_decision {
             return Ok(forced.clone());
         }
@@ -3450,11 +3470,13 @@ pub struct ComputerActionCoordinator {
     invalidated: bool,
     /// The observation generation (display generation) from the opened backend.
     observation_generation: ObservationEpoch,
-    /// Currently authorized live focus (window) generation. Initialized from
-    /// the open-time planning capture and adopted to the live snapshot the
-    /// Ask gate accepts, so approval metadata, host-approval effects, and
-    /// pre-handoff validation share one authority. A TOCTOU change after
-    /// that adopt still invalidates at [`Self::pre_handoff_check`].
+    /// Currently authorized live focus (window) generation. Together with
+    /// [`Self::virtual_display_uuid`] this is the complete live target
+    /// identity: initialized from the open-time planning capture and adopted
+    /// to the live snapshot the Ask gate accepts, so approval metadata,
+    /// host-approval effects, and pre-handoff validation share one
+    /// authority. A TOCTOU change after that adopt still invalidates at
+    /// [`Self::pre_handoff_check`].
     focus_generation: TargetGeneration,
     /// The backend kind.
     backend_kind: BackendKind,
@@ -3471,10 +3493,12 @@ pub struct ComputerActionCoordinator {
     provider_id: ProviderId,
     /// The model ID for this coordinator's delegation.
     model_id: ModelId,
-    /// The virtual display UUID captured from the target-evidence snapshot at
-    /// `open()`, used to scope Ask leases for virtual backends. `None` for
-    /// physical targets (which scope by host lease) and for evidence-less
-    /// virtual backends (which fail closed on Ask dispatch).
+    /// Currently authorized live virtual-display object identity. Initialized
+    /// from the open-time evidence snapshot and adopted to the live UUID the
+    /// Ask gate accepts, together with [`Self::focus_generation`]. Approval
+    /// packets, host-approval effects, journal target digests, and
+    /// pre-handoff validation all read this field. `None` for physical
+    /// targets and evidence-less virtual backends.
     virtual_display_uuid: Option<[u8; 16]>,
     /// Set once a human terminally denies this delegation's computer path.
     /// Holds the bounded denial reason. Every subsequent computer action on
@@ -3838,9 +3862,9 @@ impl ComputerActionCoordinator {
                         ));
                     }
                     focus_generation = TargetGeneration(evidence.focus_generation);
-                    // Pin the virtual display identity for lease scoping. For
-                    // physical targets this stays `None` (they scope by host
-                    // lease).
+                    // Initial authorized virtual-display identity. Ask later
+                    // adopts the live UUID it accepts; physical targets stay
+                    // `None` (they scope by host lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
                     // Physical opens must take the host lock now and hold it
                     // for the coordinator lifetime. The production physical
@@ -4042,10 +4066,12 @@ impl ComputerActionCoordinator {
         true
     }
 
-    /// Pre-handoff target evidence check. Live focus must still match the
-    /// currently authorized generation (the identity the Ask gate accepted,
-    /// or the open-time capture for Yolo). Drift here is a TOCTOU after
-    /// authorization and hard-invalidates the coordinator.
+    /// Pre-handoff target evidence check. Live focus generation and virtual
+    /// display UUID must still match the currently authorized identity (the
+    /// complete snapshot the Ask gate accepted, or the open-time capture for
+    /// Yolo). Drift here is a TOCTOU after authorization and hard-invalidates
+    /// the coordinator. Generation is not a proxy for object identity: the
+    /// shared focus-generation reducer does not fingerprint the virtual UUID.
     pub fn pre_handoff_check(&mut self) -> Result<(), TargetUnavailableReason> {
         if self.invalidated {
             return Err(TargetUnavailableReason::StaleTarget);
@@ -4058,12 +4084,15 @@ impl ComputerActionCoordinator {
             return Err(TargetUnavailableReason::StaleTarget);
         }
         // If we have a target adapter, re-capture evidence and check for
-        // drift against the currently authorized focus identity.
+        // drift against the currently authorized live identity.
         if let Some(adapter) = &mut self.target_adapter {
             let evidence = adapter.capture_snapshot()?;
-            if evidence.focus_generation != self.focus_generation.0 && self.focus_generation.0 > 0 {
-                // Focus drifted after the authorized identity was adopted —
-                // gate→dispatch TOCTOU. Invalidate.
+            let generation_drifted =
+                self.focus_generation.0 > 0 && evidence.focus_generation != self.focus_generation.0;
+            let uuid_drifted = evidence.virtual_display_uuid != self.virtual_display_uuid;
+            if generation_drifted || uuid_drifted {
+                // Object identity or focus drifted after the authorized
+                // identity was adopted — gate→dispatch TOCTOU. Invalidate.
                 self.invalidate(TargetUnavailableReason::StaleTarget);
                 return Err(TargetUnavailableReason::StaleTarget);
             }
@@ -4153,6 +4182,9 @@ impl ComputerActionCoordinator {
                     };
                 }
             };
+            // Journal target digest uses the authorized live identity so a
+            // virtual UUID adopted at the Ask gate cannot diverge from the
+            // handoff record.
             let target_digest = target_evidence_binding_digest(
                 self.backend_kind,
                 self.host_lease.as_ref(),
@@ -4465,6 +4497,8 @@ impl ComputerActionCoordinator {
         target_window: Option<&str>,
     ) -> Result<ComputerAuthorizationDecision, ComputerError> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
+        // Bind the currently authorized live target (adopted at the Ask
+        // gate, or the open-time pin for Yolo), not a stale open-time copy.
         let target_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
@@ -4524,6 +4558,8 @@ impl ComputerActionCoordinator {
         actions: &[ComputerAction],
     ) -> Vec<serde_json::Value> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
+        // Effect-boundary target digest uses the same authorized live
+        // identity as the approval packet and the pre-handoff fence.
         let target_evidence_binding_digest = target_evidence_binding_digest(
             self.backend_kind,
             self.host_lease.as_ref(),
@@ -4605,12 +4641,13 @@ impl ComputerActionCoordinator {
     /// coordinator's current host/virtual input lease.
     ///
     /// The Ask lease is bound to the exact canonical payload and the live
-    /// focus generation. The live snapshot this gate accepts is adopted as
-    /// the coordinator's authorized focus identity before prompting or
-    /// consuming a lease, so approval metadata and pre-handoff validation
-    /// share that identity. Destructive and credential actions never reuse
-    /// a prior Allow. Neither Ask authority alone nor a host lease alone
-    /// can dispatch.
+    /// target identity (focus generation and virtual display UUID). The live
+    /// snapshot this gate accepts is adopted as the coordinator's authorized
+    /// identity before prompting or consuming a lease, so approval metadata,
+    /// host-approval effects, journal target digests, and pre-handoff
+    /// validation share that identity. Destructive and credential actions
+    /// never reuse a prior Allow. Neither Ask authority alone nor a host
+    /// lease alone can dispatch.
     ///
     /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
     /// blocking/denial case.
@@ -4680,13 +4717,14 @@ impl ComputerActionCoordinator {
             return Err(outcome);
         };
 
-        // The live focus identity this gate accepted is the coherent
-        // authority for approval metadata and dispatch validation. Adopt
-        // it before consume/prompt so `authorize_action`,
-        // `concrete_host_approval_effects`, and `pre_handoff_check` all
-        // observe the same generation. A later TOCTOU change is still
-        // caught by `pre_handoff_check` against this adopted identity.
-        self.adopt_authorized_focus_generation(live_focus_generation);
+        // The complete live identity this gate accepted (focus generation
+        // and virtual display UUID) is the coherent authority for approval
+        // metadata and dispatch validation. Adopt both before consume/prompt
+        // so `authorize_action`, `concrete_host_approval_effects`, journal
+        // target digests, and `pre_handoff_check` all observe the same
+        // object. A later TOCTOU change is still caught by
+        // `pre_handoff_check` against this adopted identity.
+        self.adopt_authorized_live_identity(live_focus_generation, live_uuid);
 
         let policy = AskLeasePolicy::for_actions(actions);
         // Identical retry-safe payloads at this focus may consume one remaining
@@ -4714,12 +4752,7 @@ impl ComputerActionCoordinator {
             Ok(ComputerAuthorizationDecision::Allow) => {
                 // Re-verify live currency AFTER the human answers Allow and
                 // BEFORE install. Two drift classes have different outcomes.
-                match self.recompute_live_lease_key(
-                    live_focus_generation,
-                    live_uuid,
-                    host_present_pre_await,
-                    actions,
-                ) {
+                match self.recompute_live_lease_key(host_present_pre_await, actions) {
                     Ok(fresh_key) if fresh_key == lease_key => {
                         // Currency verified — the live target, focus, and
                         // payload still match the key this Allow was bound to.
@@ -4860,8 +4893,8 @@ impl ComputerActionCoordinator {
     /// install. Re-reads host lease validity/generation via the arbiter and,
     /// when an adapter is present, a fresh (post-await) target-evidence
     /// snapshot; compares the live focus generation and virtual UUID against
-    /// the pinned pre-await baseline; then rebuilds and returns the lease key
-    /// from the re-verified live state.
+    /// the authorized identity adopted at the Ask gate; then rebuilds and
+    /// returns the lease key from the re-verified live state.
     ///
     /// Drift is classified: a lost/replaced host lease (physical path) is a
     /// permanent invalidation ([`LeaseDrift::HostLease`]); a focus-generation
@@ -4869,8 +4902,6 @@ impl ComputerActionCoordinator {
     /// non-sticky discard ([`LeaseDrift::Target`]).
     fn recompute_live_lease_key(
         &mut self,
-        pre_await_focus_generation: u64,
-        pre_await_uuid: Option<[u8; 16]>,
         host_present_pre_await: bool,
         actions: &[ComputerAction],
     ) -> Result<AskLeaseKey, LeaseDrift> {
@@ -4881,13 +4912,14 @@ impl ComputerActionCoordinator {
             return Err(LeaseDrift::HostLease);
         }
 
-        // Fresh post-await evidence snapshot. Unverifiable evidence or a
+        // Fresh post-await evidence snapshot compared to the authorized
+        // live identity adopted before the wait. Unverifiable evidence or a
         // focus-generation / virtual-UUID change is non-sticky target drift.
         let (live_uuid, live_focus) = if let Some(adapter) = self.target_adapter.as_mut() {
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
-                    if evidence.focus_generation != pre_await_focus_generation
-                        || evidence.virtual_display_uuid != pre_await_uuid
+                    if evidence.focus_generation != self.focus_generation.0
+                        || evidence.virtual_display_uuid != self.virtual_display_uuid
                     {
                         return Err(LeaseDrift::Target);
                     }
@@ -4896,7 +4928,7 @@ impl ComputerActionCoordinator {
                 Err(_reason) => return Err(LeaseDrift::Target),
             }
         } else {
-            (pre_await_uuid, pre_await_focus_generation)
+            (self.virtual_display_uuid, self.focus_generation.0)
         };
 
         // Rebuild the key from the re-verified live state (including the
@@ -4906,11 +4938,11 @@ impl ComputerActionCoordinator {
             .ok_or(LeaseDrift::Target)
     }
 
-    /// The virtual display UUID pinned from the target-evidence snapshot at
-    /// `open()`. `None` for physical targets and evidence-less virtual
-    /// backends. This is a trivial accessor of the stored field so lease
-    /// scoping (`ask_lease_key`) stays consistent with the identity captured
-    /// at open.
+    /// Currently authorized live virtual-display object identity. `None` for
+    /// physical targets and evidence-less virtual backends. Lease scoping,
+    /// approval digests, host-approval effects, and pre-handoff all read
+    /// this field so they stay consistent with the identity the Ask gate
+    /// adopted (or the open-time pin for Yolo).
     fn virtual_display_uuid(&self) -> Option<[u8; 16]> {
         self.virtual_display_uuid
     }
@@ -5481,12 +5513,14 @@ impl ComputerActionCoordinator {
         self.focus_generation
     }
 
-    /// Adopt `live` as the currently authorized focus identity. Every
-    /// approval packet, host-approval effect, and pre-handoff check reads
-    /// this field, so the Ask gate must write the live snapshot it accepted
-    /// before those consumers run.
-    fn adopt_authorized_focus_generation(&mut self, live: u64) {
-        self.focus_generation = TargetGeneration(live);
+    /// Adopt `live_focus` and `live_uuid` as the currently authorized live
+    /// target identity. Every approval packet, host-approval effect, journal
+    /// target digest, and pre-handoff check reads these fields, so the Ask
+    /// gate must write the complete snapshot it accepted before those
+    /// consumers run. Generation is not a proxy for object identity.
+    fn adopt_authorized_live_identity(&mut self, live_focus: u64, live_uuid: Option<[u8; 16]>) {
+        self.focus_generation = TargetGeneration(live_focus);
+        self.virtual_display_uuid = live_uuid;
     }
 
     /// The observation verification state machine (starts at Strict; live
@@ -9113,6 +9147,8 @@ mod tests {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backend = CountingBackend::new(input_actions.clone());
+        let expected_focus = post_await.focus_generation;
+        let expected_uuid = post_await.virtual_display_uuid;
         // Three-deep queue: [open, pre_await, post_await]. open + pre_await are
         // the stable Ask fixture; only post_await drifts.
         let queue = vec![ask_virtual_evidence(), ask_virtual_evidence(), post_await];
@@ -9175,6 +9211,21 @@ mod tests {
             "next action re-prompts after a non-sticky discard"
         );
         assert!(!coordinator.is_invalidated());
+        assert_eq!(
+            coordinator.focus_generation().0,
+            expected_focus,
+            "retry must adopt the live focus the drifted snapshot presented"
+        );
+        assert_eq!(
+            coordinator.virtual_display_uuid(),
+            expected_uuid,
+            "retry must adopt the live virtual UUID, not keep the open-time pin"
+        );
+        assert_eq!(
+            authorizer.last_target_evidence_binding_digest(),
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, expected_uuid),
+            "the retry packet must bind the live target object identity"
+        );
     }
 
     #[tokio::test]
@@ -10763,7 +10814,150 @@ mod tests {
             "a reapproved focus change must not permanently invalidate"
         );
         assert_eq!(coordinator.focus_generation().0, 2);
+        assert_eq!(
+            coordinator.virtual_display_uuid(),
+            Some([0xAA; 16]),
+            "adopting live focus must not drop the authorized virtual UUID"
+        );
         assert!(coordinator.ask_lease_store().has_lease(&focus_two));
+    }
+
+    #[tokio::test]
+    async fn computer_ask_lease_virtual_uuid_change_requires_new_approval() {
+        // A changed virtual-display UUID cannot reuse a prior Allow even when
+        // focus generation is unchanged. Generation is not a proxy for object
+        // identity; the Ask gate must adopt the live UUID so the packet,
+        // effects, and handoff describe the same target.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let shared = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            ask_virtual_evidence(),
+        )));
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(SharedFakeAdapter {
+                inner: shared.clone(),
+            })),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-uuid-1", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        let digest_aa =
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xAA; 16]));
+        let digest_bb =
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xBB; 16]));
+        assert_eq!(authorizer.last_target_evidence_binding_digest(), digest_aa);
+        assert_eq!(coordinator.virtual_display_uuid(), Some([0xAA; 16]));
+
+        let uuid_aa = coordinator
+            .ask_lease_key(Some([0xAA; 16]), &screenshot_backend_actions(), 1)
+            .unwrap();
+        let uuid_bb = coordinator
+            .ask_lease_key(Some([0xBB; 16]), &screenshot_backend_actions(), 1)
+            .unwrap();
+        assert_eq!(uuid_aa.focus_generation, uuid_bb.focus_generation);
+        assert!(coordinator.ask_lease_store().has_lease(&uuid_aa));
+        assert!(!coordinator.ask_lease_store().has_lease(&uuid_bb));
+
+        shared.lock().unwrap().snapshot.virtual_display_uuid = Some([0xBB; 16]);
+
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call("call-uuid-2", &screenshot)
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "reapproval against the live virtual UUID must reach dispatch"
+        );
+        assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(
+            authorizer.last_focus_generation(),
+            1,
+            "UUID change with a stable generation must not be smuggled as a focus bump"
+        );
+        assert_eq!(
+            authorizer.last_target_evidence_binding_digest(),
+            digest_bb,
+            "the reapproval packet must bind the live UUID, not the open-time pin"
+        );
+        assert!(
+            !coordinator.is_invalidated(),
+            "a reapproved UUID change must not permanently invalidate"
+        );
+        assert_eq!(coordinator.focus_generation().0, 1);
+        assert_eq!(coordinator.virtual_display_uuid(), Some([0xBB; 16]));
+        assert!(coordinator.ask_lease_store().has_lease(&uuid_bb));
+    }
+
+    #[tokio::test]
+    async fn computer_pre_handoff_rejects_uuid_change_with_stable_generation() {
+        // After Allow, a UUID change at the final fence with an unchanged
+        // generation must still hard-invalidate. The Ask wait-window TOCTOU
+        // already passed against the adopted identity.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let open = ask_virtual_evidence();
+        let mut drifted = open.clone();
+        drifted.virtual_display_uuid = Some([0xBB; 16]);
+        assert_eq!(drifted.focus_generation, open.focus_generation);
+        // [open, pre-await, post-await, pre-handoff]. Only the handoff
+        // snapshot changes object identity.
+        let queue = vec![open.clone(), open.clone(), open, drifted];
+        let adapter = FakeTargetEvidenceAdapter::with_queue(BackendKind::VirtualDisplay, queue);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call("call-uuid-handoff", &[OpenAiComputerAction::Screenshot])
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "pre-handoff UUID drift with a stable generation must invalidate, got {outcome:?}"
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a UUID identity mismatch at handoff"
+        );
+        assert!(coordinator.is_invalidated());
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            authorizer.last_target_evidence_binding_digest(),
+            target_evidence_binding_digest(BackendKind::VirtualDisplay, None, Some([0xAA; 16])),
+            "the Allow was bound to the pre-handoff identity; the fence must still reject the new UUID"
+        );
     }
 
     #[test]
@@ -10786,6 +10980,12 @@ mod tests {
         other_focus.focus_generation = 2;
         assert!(!store.has_lease(&other_focus));
         assert!(!store.try_consume(&other_focus));
+        assert!(store.has_lease(&key));
+
+        let mut other_uuid = key.clone();
+        other_uuid.target_key = LeaseTargetKey::Virtual([0xBB; 16]);
+        assert!(!store.has_lease(&other_uuid));
+        assert!(!store.try_consume(&other_uuid));
         assert!(store.has_lease(&key));
     }
 
@@ -10995,6 +11195,61 @@ mod tests {
             &[BatchItemOutcome::BackendCompleted],
             "the dispatched Move must remain a completed item after the capture recheck"
         );
+    }
+
+    #[tokio::test]
+    async fn computer_yolo_pre_handoff_rejects_uuid_change_with_stable_generation() {
+        // Yolo never adopts a live UUID; open-time object identity remains
+        // the authority. A UUID change with a recycled generation must still
+        // fail closed at the final fence.
+        let open = ask_virtual_evidence();
+        let mut drifted = open.clone();
+        drifted.virtual_display_uuid = Some([0xBB; 16]);
+        assert_eq!(drifted.focus_generation, open.focus_generation);
+        let adapter = FakeTargetEvidenceAdapter::with_queue(open.backend_kind, vec![open, drifted]);
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut coordinator = ComputerActionCoordinator::open(
+            Box::new(CountingBackend::new(input_actions.clone())),
+            params,
+        )
+        .await
+        .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-yolo-uuid",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "Yolo must not follow a live UUID change without a human decision, got {outcome:?}"
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a UUID identity mismatch at handoff"
+        );
+        assert!(coordinator.is_invalidated());
+        assert_eq!(coordinator.virtual_display_uuid(), Some([0xAA; 16]));
     }
 
     #[tokio::test]

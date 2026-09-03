@@ -404,7 +404,8 @@ pub enum AuthorizationRequest<'a> {
         /// Backend kind diagnostic label.
         backend_kind: &'a str,
         /// Currently authorized live focus (window) generation this approval
-        /// is bound to.
+        /// is bound to. Object identity travels separately in
+        /// `target_evidence_binding_digest`.
         focus_generation: u64,
         /// Observation/display generation from the opened backend.
         observation_generation: u64,

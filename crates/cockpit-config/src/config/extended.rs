@@ -2797,6 +2797,11 @@ pub(crate) fn strip_secret_store_key(raw: &mut Value) {
 /// in `extended/tests.rs` fails a stale entry, and the incremental fallback
 /// in [`ExtendedConfigDoc::recover_typed_config`] keeps an unregistered pair
 /// from zeroing the settings view (one spelling still wins by commit order).
+///
+/// The persist path ([`ExtendedConfigDoc::merge_config_raw`]) consults this
+/// table too: written documents are canonical-only, and the alternate
+/// spelling's value is re-seated under the canonical key, so an alias-only
+/// document never loses the setting on save.
 const EXTENDED_CONFIG_KEY_ALIASES: &[(&str, &str)] =
     &[("sandboxEscalationEnabled", "sandbox_escalation_enabled")];
 
@@ -3338,7 +3343,25 @@ impl ExtendedConfigDoc {
                 );
             }
         }
-        obj.remove("sandboxEscalationEnabled");
+        // A rename/alias pair is ONE setting (see EXTENDED_CONFIG_KEY_ALIASES)
+        // and persistence is canonical-only. Discarding the alternate
+        // spelling must never drop the setting it carries: for an alias-only
+        // document whose typed value this caller did not change,
+        // `apply_object_delta` above is a no-op, so removing the alias alone
+        // would delete the only copy and revert the setting to its default on
+        // the next load — fail-open for `sandbox_escalation_enabled`'s
+        // default-true. Re-seat the alias's on-disk value under the canonical
+        // key. When the canonical key is already present — the document
+        // carried both spellings (canonical wins) or this caller changed the
+        // typed value (the delta above already wrote it) — the alias is
+        // simply dropped, as before.
+        for &(alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
+            if let Some(value) = obj.remove(alias)
+                && !obj.contains_key(canonical)
+            {
+                obj.insert(canonical.to_string(), value);
+            }
+        }
         obj.remove("llm_mode");
         obj.remove(&["trusted", "Only"].concat());
         obj.remove(&["trusted", "_only"].concat());

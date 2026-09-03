@@ -1520,6 +1520,42 @@ fn sandbox_escalation_defaults_enabled_and_round_trips() {
 }
 
 #[test]
+fn write_preserves_alias_only_setting_under_canonical_key() {
+    // Persist is canonical-only, but discarding the alternate spelling must
+    // never drop the setting it carries. An alias-only document whose typed
+    // value this caller did not change would otherwise lose the setting
+    // outright: `apply_object_delta` no-ops for unchanged values, the alias
+    // removal deletes the only copy, and the next load reverts
+    // `sandbox_escalation_enabled` to its default-true fail-open.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"sandboxEscalationEnabled":false}"#).unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    assert!(!doc.config().sandbox_escalation_enabled);
+
+    // Unrelated persist: only `gitignore_allow` changes.
+    let mut cfg = doc.config();
+    cfg.gitignore_allow.push("target/".to_string());
+    doc.write(&cfg).unwrap();
+
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false)),
+        "the alias-only setting must survive the write under the canonical key: {raw}"
+    );
+    assert!(raw.get("sandboxEscalationEnabled").is_none(), "{raw}");
+    assert_eq!(
+        raw.get("gitignore_allow"),
+        Some(&serde_json::json!(["target/"])),
+        "{raw}"
+    );
+
+    let doc = ExtendedConfigDoc::load(&path).unwrap();
+    assert!(!doc.config().sandbox_escalation_enabled);
+}
+
+#[test]
 fn approval_mode_defaults_to_manual_and_parses_all_values() {
     // Default + an omitted field both read `manual` (fail-safe default).
     assert_eq!(

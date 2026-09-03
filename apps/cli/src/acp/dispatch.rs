@@ -3,7 +3,7 @@
 //! Cockpit's parser gates each frame and retains raw `params`; the admitted
 //! request is then routed through jsonrpsee's raw-request dispatch API. The
 //! the default module fails closed when no ingress owner is supplied. The
-//! `cockpit acp` command supplies the socket-daemon Code-root ingress; tests
+//! `cockpit acp` command supplies the wire-daemon Code-root ingress; tests
 //! can inject a recording owner to exercise the DTO-to-bridge seam.
 
 use std::sync::{Arc, Mutex};

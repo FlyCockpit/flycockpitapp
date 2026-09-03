@@ -1072,6 +1072,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialize_follows_the_window_the_receipt_was_accepted_under() {
+        let db = Db::open_in_memory().unwrap();
+        let predecessor = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let successor = db
+            .create_compaction_successor(predecessor.session_id)
+            .await
+            .unwrap();
+        let accepted = input(successor.session_id);
+        db.accept_message_with_attachments(accepted.clone(), Arc::new(Allow))
+            .await
+            .unwrap();
+        let err = db
+            .materialize_message_submissions(
+                predecessor.session_id,
+                vec![accepted.client_submission_id],
+                None,
+                None,
+                "{\"client_submission_ids\":[]}".into(),
+                20,
+            )
+            .await
+            .expect_err("materialize keyed to the predecessor must not find live-window receipts");
+        assert!(
+            format!("{err:#}").contains("message receipt is not accepted"),
+            "{err:#}"
+        );
+        let seq = db
+            .materialize_message_submissions(
+                successor.session_id,
+                vec![accepted.client_submission_id],
+                None,
+                None,
+                "{\"client_submission_ids\":[]}".into(),
+                20,
+            )
+            .await
+            .expect("materialize keyed to the live window must settle the receipt");
+        assert!(seq > 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_seed_refuses_while_message_receipts_are_accepted() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        db.accept_message_with_attachments(input(session.session_id), Arc::new(Allow))
+            .await
+            .unwrap();
+        let err = db
+            .create_compaction_successor(session.session_id)
+            .await
+            .expect_err("in-flight receipts must fail-close compaction");
+        assert!(
+            format!("{err:#}").contains("message receipts are still accepted"),
+            "{err:#}"
+        );
+        assert!(
+            db.get_session(session.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended_at_unix_ms
+                .is_none(),
+            "refused seed must leave the predecessor live"
+        );
+    }
+
+    #[tokio::test]
     async fn message_attachment_remote_actor_id_and_generation_rebinding_conflict() {
         let db = Db::open_in_memory().unwrap();
         let session = db

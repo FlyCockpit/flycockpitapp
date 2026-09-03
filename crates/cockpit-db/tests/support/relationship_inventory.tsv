@@ -713,6 +713,12 @@ local	compaction_shadows	created_at	non_relationship
 local	compaction_shadows	payload_json	non_relationship
 local	compaction_shadows	session_id	foreign
 local	compaction_shadows	updated_at	non_relationship
+local	computer_audit_entries	entry_bytes	non_relationship
+local	computer_audit_entries	event_kind	non_relationship
+local	computer_audit_entries	key_version	non_relationship
+local	computer_audit_entries	mac	non_relationship
+local	computer_audit_entries	proposal_id	non_relationship
+local	computer_audit_entries	sequence	primary
 local	computer_outcome_store	batch_index	primary
 local	computer_outcome_store	committed_at_unix_ms	non_relationship
 local	computer_outcome_store	delegation_id	primary

@@ -484,6 +484,7 @@
   },
   "import_session_archive": {
     "params": {
+      "include_sensitive": false,
       "transfer": {
         "mime_class": "archive",
         "sha256": "abababababababababababababababababababababababababababababababab",
@@ -535,6 +536,12 @@
     },
     "request": "list_pinned_messages_with_text"
   },
+  "list_conversation_rules": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "list_conversation_rules"
+  },
   "list_project_notes": {
     "params": {
       "project_root": "/tmp/project"
@@ -549,6 +556,7 @@
   },
   "list_sessions": {
     "params": {
+      "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
       "parent_session_id": "11111111-1111-4111-8111-111111111111",
       "project_id": "project_id-fixture"
     },
@@ -588,6 +596,13 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "pinned_message_state"
+  },
+  "promote_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "promote_conversation_rule"
   },
   "promote_resource": {
     "params": {
@@ -681,6 +696,13 @@
       }
     },
     "request": "refresh_env"
+  },
+  "remove_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "remove_conversation_rule"
   },
   "remove_editable_queued_user_messages": {
     "params": {
@@ -882,6 +904,15 @@
       "mode": "until_idle"
     },
     "request": "set_caffeinate"
+  },
+  "set_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source_trust": "untrusted",
+      "text": "text-fixture"
+    },
+    "request": "set_conversation_rule"
   },
   "set_default_model": {
     "params": {
@@ -1924,6 +1955,20 @@
       "session_id": "11111111-2222-4333-8444-555555555555"
     },
     "request": "get_session_compactions"
+  },
+  "list_media_egress_verdicts": {
+    "params": {
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "list_media_egress_verdicts"
+  },
+  "revoke_media_egress_verdict": {
+    "params": {
+      "purpose": "transcription",
+      "request_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "revoke_media_egress_verdict"
   },
   "purge_ended_sessions": {
     "params": {

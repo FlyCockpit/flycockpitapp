@@ -420,7 +420,7 @@ struct CuratedToolResult {
 async fn stored_session_goal(session: &Session) -> Result<String> {
     let goal = session
         .db
-        .current_session_goal(session.id, false)
+        .current_session_goal(session.live_id(), false)
         .await
         .map_err(CleanRoomSessionGoalError::Load)?
         .ok_or(CleanRoomSessionGoalError::Missing)?;
@@ -442,7 +442,10 @@ async fn curated_tool_results(
     if last_n == 0 {
         return Ok(Vec::new());
     }
-    let calls = session.db.list_tool_calls_for_session(session.id).await?;
+    let calls = session
+        .db
+        .list_tool_calls_for_session(session.live_id())
+        .await?;
     Ok(curate_tool_calls(
         calls,
         last_n,

@@ -21,6 +21,13 @@ const MAX_REDACTED_JSON_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_CANDIDATES: i64 = 64;
 
+/// Canonical payload written when retention cleans an envelope. A cleaned row
+/// is digest-only: its identity, digests, surrogate kind, and timestamps
+/// survive, and this marker replaces the bounded model-visible projection.
+/// It is deliberately not a valid surrogate, so a settlement or recovery path
+/// that reaches a cleaned envelope fails closed instead of dispatching.
+const CLEANED_ENVELOPE_PROJECTION_JSON: &str = "{}";
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -860,14 +867,74 @@ impl Db {
         .await
     }
 
-    /// Retention hook stub. The ledger has no GC today (`retention_state`
-    /// never becomes `'cleaned'`). Wired from the daemon retention tick so a
-    /// later media-retention-style sweep can mark envelopes cleaned without a
-    /// new scheduler.
+    /// Retention sweep for the verification ledger. Envelopes whose owning
+    /// operation is terminal and whose `created_at_unix_ms` is older than
+    /// `cutoff_unix_ms` transition to `retention_state = 'cleaned'`: the row
+    /// survives digest-only (identity, digests, surrogate kind, timestamps)
+    /// and its one heavy payload, the bounded model-visible projection, is
+    /// replaced by the canonical cleaned marker. Rows inside the window are
+    /// retained untouched. Returns the number of envelopes cleaned.
     ///
-    /// TODO(media-retention): implement verification envelope cleaning.
-    pub async fn sweep_verification_retention_stub(&self) -> Result<u64> {
-        Ok(0)
+    /// A pin is a whole-session preservation hold, so a pinned session's
+    /// envelopes are never cleaned: this sweep carries the same pin
+    /// exemption every other payload window in the retention pass applies
+    /// to session evidence. Unpinned sessions clean on the window whether
+    /// or not the session has ended, so a long-lived session cannot
+    /// accumulate unbounded envelopes.
+    ///
+    /// Live operations are never cleaned: dispatch settlement and restart
+    /// recovery revalidate the durable envelope, so a nonterminal operation
+    /// must keep its payload. The marker is deliberately not a valid surrogate,
+    /// so any path that somehow reaches a cleaned envelope fails closed
+    /// instead of re-deriving a dispatch from digests. After cleaning,
+    /// `prepared_projection_digest` intentionally no longer matches the
+    /// re-derived digest of the cleaned marker payload: an integrity
+    /// checker must treat `retention_state = 'cleaned'` rows as cleaned,
+    /// not tampered.
+    pub async fn sweep_verification_retention(
+        &self,
+        cutoff_unix_ms: i64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        if cutoff_unix_ms <= 0 {
+            return Ok(0);
+        }
+        let terminal_states = VerificationOperationState::ALL
+            .into_iter()
+            .filter(|state| state.is_terminal())
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.write(move |conn| {
+            let cleaned = conn
+                .execute(
+                    &format!(
+                        "UPDATE verification_projection_envelopes
+                        SET retention_state = 'cleaned',
+                            model_visible_projection_json = ?1,
+                            updated_at_unix_ms = ?2
+                      WHERE retention_state = 'retained'
+                        AND created_at_unix_ms < ?3
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pins
+                             WHERE pins.session_id =
+                                   verification_projection_envelopes.session_id
+                        )
+                        AND operation_id IN (
+                            SELECT operation_id FROM verification_operations
+                             WHERE state IN ({terminal_states})
+                        )"
+                    ),
+                    params![
+                        CLEANED_ENVELOPE_PROJECTION_JSON,
+                        now_unix_ms,
+                        cutoff_unix_ms
+                    ],
+                )
+                .context("cleaning past-window verification envelopes")?;
+            u64::try_from(cleaned).context("negative verification envelope cleaned count")
+        })
+        .await
     }
 
     pub async fn list_verification_candidates_for_operation(
@@ -3215,6 +3282,261 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(surrogate_kind, "selected_call");
+    }
+
+    /// Drives one operation through a complete dispatched-then-succeeded
+    /// lifecycle so its envelope is durable and its operation is terminal.
+    async fn terminal_envelope_operation(
+        db: &Db,
+        session_id: Uuid,
+        agent_id: Uuid,
+        base: i64,
+    ) -> Uuid {
+        let (operation_id, attempt) =
+            prepared_selected_dispatch(db, session_id, agent_id, base).await;
+        let settled = db
+            .settle_verification_dispatch(
+                session_id,
+                operation_id,
+                attempt.revision,
+                DispatchSettlement::Succeeded,
+                redacted(
+                    VerificationRedactionClass::DispatchSuccess,
+                    "retention-success",
+                ),
+                projection_event(db, session_id, DispatchSettlement::Succeeded, base + 9).await,
+                base + 9,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.state, VerificationOperationState::Succeeded);
+        operation_id
+    }
+
+    async fn set_envelope_created_at(db: &Db, operation_id: Uuid, created_at_unix_ms: i64) {
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE verification_projection_envelopes
+                    SET created_at_unix_ms = ?1, updated_at_unix_ms = ?1
+                  WHERE operation_id = ?2",
+                params![created_at_unix_ms, operation_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `(retention_state, payload, batch_digest, surrogate_kind)` for the
+    /// operation's envelope row.
+    async fn envelope_row(db: &Db, operation_id: Uuid) -> (String, String, String, String) {
+        db.read(move |conn| {
+            conn.query_row(
+                "SELECT retention_state, model_visible_projection_json, batch_digest, surrogate_kind
+                   FROM verification_projection_envelopes WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_retention_sweep_cleans_past_window_and_retains_in_window() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "envelope-retention").await;
+        let past = terminal_envelope_operation(&db, session_id, agent_id, 10).await;
+        let recent = terminal_envelope_operation(&db, session_id, agent_id, 30).await;
+        // Past-window envelope at 5ms, in-window envelope at its natural 37ms.
+        set_envelope_created_at(&db, past, 5).await;
+
+        let cleaned = db.sweep_verification_retention(20, 40).await.unwrap();
+
+        assert_eq!(cleaned, 1);
+        let (past_state, past_payload, past_batch, past_surrogate) = envelope_row(&db, past).await;
+        assert_eq!(past_state, "cleaned");
+        assert_eq!(past_payload, "{}");
+        // The cleaned row stays digest-only: identity, digests, and surrogate
+        // kind survive; only the heavy payload is gone.
+        assert_eq!(past_batch, digest("selected-call").as_str());
+        assert_eq!(past_surrogate, "selected_call");
+        let (recent_state, recent_payload, _, _) = envelope_row(&db, recent).await;
+        assert_eq!(recent_state, "retained");
+        assert_eq!(
+            recent_payload,
+            canonical_model_visible_json(&selected_envelope().model_visible_projection).unwrap()
+        );
+        // The sweep is idempotent: a second pass cleans nothing new.
+        assert_eq!(db.sweep_verification_retention(20, 41).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_retention_sweep_never_cleans_a_live_operation() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "envelope-live-retention").await;
+        let (operation_id, _attempt) =
+            prepared_selected_dispatch(&db, session_id, agent_id, 10).await;
+        set_envelope_created_at(&db, operation_id, 5).await;
+
+        let cleaned = db.sweep_verification_retention(20, 40).await.unwrap();
+
+        assert_eq!(cleaned, 0);
+        let (state, payload, _, _) = envelope_row(&db, operation_id).await;
+        assert_eq!(state, "retained");
+        assert_eq!(
+            payload,
+            canonical_model_visible_json(&selected_envelope().model_visible_projection).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_retention_sweep_preserves_pinned_session_envelope() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "envelope-pinned-retention").await;
+        let operation_id = terminal_envelope_operation(&db, session_id, agent_id, 10).await;
+        set_envelope_created_at(&db, operation_id, 5).await;
+        // A pin is a whole-session preservation hold: it must hold the
+        // envelope's payload too, not just the transcript and raw-wire
+        // windows the retention pass already gates on it.
+        let seq = db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                     VALUES (?1, 1, 'user_message', '{}')",
+                    params![session_id.to_string()],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        assert!(db.pin_message(session_id, seq).await.unwrap());
+
+        let cleaned = db.sweep_verification_retention(20, 40).await.unwrap();
+
+        assert_eq!(cleaned, 0);
+        let (state, payload, _, _) = envelope_row(&db, operation_id).await;
+        assert_eq!(state, "retained");
+        assert_eq!(
+            payload,
+            canonical_model_visible_json(&selected_envelope().model_visible_projection).unwrap()
+        );
+
+        // Releasing the hold re-arms the clean: the fixture was sweepable
+        // all along, and the pin was what held it back.
+        assert!(db.unpin_message(session_id, seq).await.unwrap());
+        assert_eq!(db.sweep_verification_retention(20, 41).await.unwrap(), 1);
+        let (state, payload, _, _) = envelope_row(&db, operation_id).await;
+        assert_eq!(state, "cleaned");
+        assert_eq!(payload, "{}");
+    }
+
+    #[test]
+    fn verification_ledger_db_cleaned_envelope_marker_is_not_a_valid_surrogate() {
+        let marker: Value = serde_json::from_str(CLEANED_ENVELOPE_PROJECTION_JSON).unwrap();
+        // The fail-closed contract: a settlement or recovery path that
+        // somehow reaches a cleaned envelope must error instead of
+        // re-deriving a dispatch from the surviving digests. The marker is
+        // only safe while surrogate validation rejects it, so pin that.
+        let error = VerificationSurrogateCall::from_model_visible(&marker).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("requires an operation"),
+            "cleaned marker must fail surrogate validation: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_terminal_replay_after_a_real_clean_stays_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "envelope-clean-replay").await;
+        let (operation_id, attempt) =
+            prepared_selected_dispatch(&db, session_id, agent_id, 10).await;
+        let settled = db
+            .settle_verification_dispatch(
+                session_id,
+                operation_id,
+                attempt.revision,
+                DispatchSettlement::Succeeded,
+                redacted(VerificationRedactionClass::DispatchSuccess, "clean-replay"),
+                projection_event(&db, session_id, DispatchSettlement::Succeeded, 19).await,
+                19,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.state, VerificationOperationState::Succeeded);
+        set_envelope_created_at(&db, operation_id, 5).await;
+        assert_eq!(db.sweep_verification_retention(20, 40).await.unwrap(), 1);
+        assert_eq!(envelope_row(&db, operation_id).await.0, "cleaned");
+
+        // Same-key terminal replay after a real clean: both settlement and
+        // restart recovery take the terminal early return before any
+        // envelope read, so the cleaned marker is never parsed and neither
+        // path errors or re-derives a dispatch from the surviving digests.
+        let replayed = db
+            .settle_verification_dispatch(
+                session_id,
+                operation_id,
+                attempt.revision,
+                DispatchSettlement::Succeeded,
+                redacted(VerificationRedactionClass::DispatchSuccess, "clean-replay"),
+                None,
+                41,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.state, VerificationOperationState::Succeeded);
+        let recovered = db
+            .recover_verification_operation(
+                session_id,
+                operation_id,
+                Some(DispatchSettlement::Succeeded),
+                redacted(VerificationRedactionClass::DispatchSuccess, "clean-replay"),
+                None,
+                41,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.state, VerificationOperationState::Succeeded);
+        // The cleaned row is untouched by both replays.
+        let (state, payload, _, _) = envelope_row(&db, operation_id).await;
+        assert_eq!(state, "cleaned");
+        assert_eq!(payload, "{}");
+    }
+
+    #[tokio::test]
+    async fn verification_ledger_db_retention_pass_cleans_past_window_envelopes() {
+        use crate::db::retention::RetentionConfig;
+        let db = Db::open_in_memory().unwrap();
+        let (session_id, agent_id) = owner(&db, "envelope-retention-pass").await;
+        let past = terminal_envelope_operation(&db, session_id, agent_id, 10).await;
+        let recent = terminal_envelope_operation(&db, session_id, agent_id, 30).await;
+        // One-day terminal-evidence window at now=86_401s cuts off at 1_000ms:
+        // the past envelope is backdated to 500ms, the recent one sits at
+        // 1_500ms, inside the window.
+        set_envelope_created_at(&db, past, 500).await;
+        set_envelope_created_at(&db, recent, 1_500).await;
+        let cfg = RetentionConfig {
+            transcript_window_days: 0,
+            raw_wire_window_days: 0,
+            terminal_evidence_window_days: 1,
+            session_window_days: 0,
+            vacuum_interval_days: 0,
+            ..RetentionConfig::default()
+        };
+
+        let outcome = db.run_retention_pass(&cfg, 86_401).await.unwrap();
+
+        assert_eq!(outcome.verification_envelopes_cleaned, 1);
+        assert_eq!(envelope_row(&db, past).await.0, "cleaned");
+        assert_eq!(envelope_row(&db, recent).await.0, "retained");
     }
 
     #[tokio::test]

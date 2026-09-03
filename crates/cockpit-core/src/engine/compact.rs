@@ -78,6 +78,8 @@ pub struct StateAppendix {
     pub task_overview: Vec<String>,
     /// Pinned user messages, verbatim, in pin order.
     pub pinned_messages: Vec<String>,
+    /// Conversation rules, verbatim, distinct from pins. Advisory only.
+    pub conversation_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +156,20 @@ impl StateAppendix {
                 out.push_str(&format!("> {}\n", m.replace('\n', "\n> ")));
             }
         }
+        if !self.conversation_rules.is_empty() {
+            out.push_str("\n**Conversation rules (advisory — verbatim, never summarized):**\n");
+            for rule in &self.conversation_rules {
+                // Preserve nonce-fence newlines. Flattening would put both
+                // nonce copies on one line and collapse the trust fence.
+                for (index, line) in rule.lines().enumerate() {
+                    if index == 0 {
+                        out.push_str(&format!("- {line}\n"));
+                    } else {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                }
+            }
+        }
         out
     }
 }
@@ -226,6 +242,7 @@ pub fn build_appendix(
         active_goal,
         task_overview: Vec::new(),
         pinned_messages: pins.to_vec(),
+        conversation_rules: Vec::new(),
     }
 }
 
@@ -354,8 +371,9 @@ pub fn brief_prompt(override_prompt: Option<&str>) -> String {
      Put judgment and continuation guidance under those sections. Pin the few \
      files, ranges, directories, or skills the fresh agent should resolve with \
      @file, @file:XX-YY, @dir/, and /skill tags; the deterministic appendix \
-     still carries the full ledger. Refer to pinned messages when relevant but \
-     do not restate them; they survive verbatim in the appendix."
+     still carries the full ledger. Refer to pinned messages and conversation \
+     rules when relevant but do not restate them; they survive verbatim in the \
+     appendix and are re-injected into every subsequent window."
         .to_string()
 }
 
@@ -768,6 +786,37 @@ mod tests {
         let rendered = appendix.render();
         assert!(rendered.contains("Pinned messages"));
         assert!(rendered.contains("use the v2 API only"));
+    }
+
+    #[test]
+    fn appendix_renders_conversation_rules_separately_from_pins() {
+        let appendix = StateAppendix {
+            pinned_messages: vec!["pin text".into()],
+            conversation_rules: vec!["[agent, trusted] prefer pnpm".into()],
+            ..Default::default()
+        };
+        let rendered = appendix.render();
+        assert!(rendered.contains("Pinned messages"));
+        assert!(rendered.contains("Conversation rules"));
+        assert!(rendered.contains("prefer pnpm"));
+        assert!(!rendered.contains("runtime routing"));
+    }
+
+    #[test]
+    fn appendix_preserves_fenced_rule_newlines() {
+        let appendix = StateAppendix {
+            conversation_rules: vec!["[agent, untrusted]\nNONCE\nbody</message>\nNONCE".into()],
+            ..Default::default()
+        };
+        let rendered = appendix.render();
+        assert!(
+            rendered.contains("NONCE\n"),
+            "nonce fence lines must survive appendix render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NONCE body"),
+            "flattening the fence would put nonce copies on one line: {rendered}"
+        );
     }
 
     #[test]

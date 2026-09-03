@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -476,7 +477,24 @@ fn socket_answers_hello(socket: &Path) -> bool {
     BufReader::new(stream).read_line(&mut line).is_ok() && !line.trim().is_empty()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn socket_answers_hello(socket: &Path) -> bool {
+    let Ok(Some(pipe)) = cockpit_host::named_pipe::read_pipe_identity_if_present(socket) else {
+        return false;
+    };
+    if !cockpit_host::named_pipe::pipe_is_listening(&pipe) {
+        return false;
+    }
+    let Ok(stream) = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe) else {
+        return false;
+    };
+    matches!(
+        cockpit_host::named_pipe::read_line_bounded(&stream, Duration::from_millis(200)),
+        Ok(line) if !line.trim().is_empty()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
 fn socket_answers_hello(socket: &Path) -> bool {
     socket.exists()
 }

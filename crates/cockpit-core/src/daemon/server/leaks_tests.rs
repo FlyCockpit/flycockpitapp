@@ -4,8 +4,8 @@
 //! (`begin_leak_reveal`, `list_leak_reports`, `delete_leak_report`) with an
 //! owner principal, the channel-agnostic consumption core
 //! (`crate::daemon::leak_reveal::consume_leak_reveal`, the funnel both the
-//! in-process and Unix-socket callers reach), the in-process caller, and — on
-//! Unix — the peer-authenticated reveal socket end-to-end.
+//! in-process and socket callers reach), the in-process caller, and the
+//! peer-authenticated reveal socket end-to-end on Unix and Windows.
 
 use super::*;
 use crate::daemon::leak_reveal::{
@@ -362,13 +362,33 @@ async fn leak_reveal_channel_and_proto_surface() {
     );
 }
 
+#[cfg(any(unix, windows))]
+async fn connect_reveal_test(
+    reveal_path: &std::path::Path,
+) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(reveal_path)
+            .await
+            .expect("connect reveal socket")
+    }
+    #[cfg(windows)]
+    {
+        let pipe = cockpit_host::named_pipe::read_pipe_identity(reveal_path)
+            .expect("reveal pipe identity");
+        cockpit_host::named_pipe::connect_client_pipe(&pipe)
+            .await
+            .expect("connect reveal pipe")
+    }
+}
+
 // ---------------------------------------------------------------------------
-// AC5: Unix peer-authenticated reveal socket end-to-end
+// AC5: peer-authenticated reveal socket end-to-end
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-#[tokio::test]
-async fn leak_reveal_unix_peercred_end_to_end() {
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn leak_reveal_peer_auth_end_to_end() {
     let ctx = test_context_for_daemon_modules();
     let secret = "peer-auth-secret";
     let report_id = seed_contained_leak(&ctx, SESSION_A, secret).await;
@@ -426,8 +446,8 @@ async fn leak_reveal_unix_peercred_end_to_end() {
 /// S1: a request that is a valid 67-byte frame FOLLOWED BY a trailing byte must
 /// be rejected (closed with no content) — the closed frame admits no trailing
 /// data, so the plaintext is never revealed.
-#[cfg(unix)]
-#[tokio::test]
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
 async fn leak_reveal_socket_rejects_trailing_bytes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ctx = test_context_for_daemon_modules();
@@ -453,7 +473,7 @@ async fn leak_reveal_socket_rejects_trailing_bytes() {
     .unwrap();
     frame.push(0xFF);
 
-    let mut stream = tokio::net::UnixStream::connect(&reveal_path).await.unwrap();
+    let mut stream = connect_reveal_test(&reveal_path).await;
     stream.write_all(&frame).await.unwrap();
     let _ = stream.flush().await;
 

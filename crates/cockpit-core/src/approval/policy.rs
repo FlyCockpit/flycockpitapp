@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaEgressPromptChoice {
+    Approve,
+    Reject,
+    Dismissed,
+}
+
 /// Maximum typed-text characters rendered in the computer-action approval
 /// prompt (issue #286). The bound applies AFTER secret-shaped withholding
 /// and redaction-table scrubbing: truncating first would leak the surviving
@@ -119,6 +126,78 @@ mod governed_network_question_tests {
                 .unwrap()
                 .is_empty(),
             "headless callers cannot manufacture a settleable network prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn noninteractive_approver_cannot_settle_media_egress() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            db.clone(),
+            ctx.session.id,
+        ));
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        );
+        let approver = Approver::new_for_session(
+            store,
+            db.clone(),
+            ctx.session.clone(),
+            redaction,
+            ctx.agent_id,
+            interrupts,
+        );
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+        let request_digest =
+            crate::audio_transcription::authorization::MediaEgressRequestDigest::from_raw_for_test(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+        let credential_fingerprint_digest =
+            crate::image_sidecar::CredentialFingerprintDigest::from_raw_for_test(
+                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            );
+        let decision = approver
+            .authorize(AuthorizationRequest::MediaEgress {
+                request_digest: &request_digest,
+                purpose: "transcription",
+                provider_id: "openai",
+                model_id: "gpt-transcribe",
+                credential_fingerprint_digest: &credential_fingerprint_digest,
+                origin: "api.openai.com",
+                resolved_location: "us-east-1",
+                project_digest: "project-digest",
+                session_id: "session-1",
+                attachment_id: "attachment-1",
+                attachment_checksum: "checksum-1",
+                interval_start_us: 0,
+                interval_end_us: 1_000_000,
+                prompt_present: false,
+                keyword_count: 0,
+                language_count: 0,
+                timestamps: "off",
+                diarization: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::NoninteractiveDeny);
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "headless callers cannot manufacture a settleable media-egress prompt"
         );
     }
 }
@@ -398,7 +477,11 @@ impl Approver {
                 return;
             }
         };
-        let session_id = self.session_id;
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.live_id())
+            .unwrap_or(self.session_id);
         let agent_id = self.agent_id.clone();
         if let Err(e) = self
             .db
@@ -1353,12 +1436,17 @@ impl Approver {
     /// grant identity is destination/project/purpose policy, never a blanket
     /// allow. The layers:
     ///
-    /// 1. **Yolo** opens no human prompt and allows once after reaching this seam
-    ///    (agent discretion; no grant persisted).
-    /// 2. **Manual/Auto** honor a matching standing grant (fails closed this
-    ///    increment; see [`Self::media_egress_grant_matches`]), else ask the
-    ///    human, disclosing only the redacted provider/model/interval facts and
-    ///    the digest prefix.
+    /// 1. **Standing reject** short-circuits every mode (including Yolo) with
+    ///    no prompt — see [`Self::media_egress_reject_matches`].
+    /// 2. **Standing grant** short-circuits every mode with no prompt — see
+    ///    [`Self::media_egress_grant_matches`].
+    /// 3. **Yolo** allows once with no prompt and no persistence.
+    /// 4. **Manual/Auto** without a matching grant: fail closed with
+    ///    [`Decision::NoninteractiveDeny`] when no interactive client is
+    ///    attached; else ask the human, disclosing only the redacted
+    ///    provider/model/interval facts and the digest prefix. Approving
+    ///    records session-standing consent for the exact digest; denying
+    ///    records a standing reject for it.
     ///
     /// Fail-closed everywhere: a missing grant never fakes an allow.
     pub(super) async fn approve_media_egress_inner(
@@ -1390,46 +1478,75 @@ impl Approver {
             request_digest = facts.request_digest.as_str(),
             "authorizing transcription media egress"
         );
-        match self.approval_mode() {
-            crate::config::extended::ApprovalMode::Yolo => {
-                Ok(Decision::Allow { scope: Scope::Once })
-            }
-            crate::config::extended::ApprovalMode::Manual
-            | crate::config::extended::ApprovalMode::Auto => {
-                if self.media_egress_grant_matches(&facts) {
-                    Ok(Decision::Allow { scope: Scope::Once })
-                } else {
-                    self.raise_media_egress_prompt(&facts).await
-                }
-            }
+        if self.media_egress_reject_matches(&facts).await {
+            let decision = Decision::StandingReject {
+                scope: Scope::Session,
+            };
+            self.record_permission_decision(
+                "media_egress",
+                facts.request_digest.as_str(),
+                &[Scope::Session],
+                decision,
+                crate::approval::DecisionSource::StandingReject,
+            )
+            .await;
+            return Ok(decision);
         }
+        if self.media_egress_grant_matches(&facts).await {
+            let decision = Decision::Allow { scope: Scope::Once };
+            self.record_permission_decision(
+                "media_egress",
+                facts.request_digest.as_str(),
+                &[Scope::Session],
+                decision,
+                crate::approval::DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
+        if self.yolo_mode() {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
+        self.raise_media_egress_prompt(&facts).await
     }
 
     /// Grant-matching hook for transcription media egress. A matching persisted
     /// grant lets Manual/Auto short-circuit to a standing allow without a prompt.
     ///
-    /// TODO(audio-transcription-grant-persistence): this increment ships no
-    /// session/project transcription grant store, so the seam fails closed — no
-    /// grant ever matches, and Manual/Auto always ask the human, re-authorizing
-    /// the exact digest each time. A later increment consults the store keyed by
-    /// destination/project/purpose (never a global grant) and must fail closed on
-    /// any lookup error and never fake a match.
-    fn media_egress_grant_matches(&self, _facts: &MediaEgressAuthzFacts<'_>) -> bool {
-        false
+    /// Consults the session-scoped [`GrantStore`] row keyed by purpose and the
+    /// exact `transcription_request_digest`. Fails closed on any lookup error:
+    /// no grant ever fakes an allow.
+    async fn media_egress_grant_matches(&self, facts: &MediaEgressAuthzFacts<'_>) -> bool {
+        self.store
+            .media_egress_grant_matches(facts.purpose, facts.request_digest.as_str())
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn media_egress_reject_matches(&self, facts: &MediaEgressAuthzFacts<'_>) -> bool {
+        self.store
+            .media_egress_reject_matches(facts.purpose, facts.request_digest.as_str())
+            .await
+            .unwrap_or(false)
     }
 
     /// Raise the human transcription media-egress approval prompt (Manual/Auto
     /// without a matching grant). A single approve/deny question carrying only
     /// secret-free facts: provider/model, the media interval, and the digest
     /// prefix. No prompt text, keyword/language strings, credential token, or
-    /// audio bytes are ever disclosed. Approve → allow once; deny/dismiss → deny.
+    /// audio bytes are ever disclosed. Approve → session-standing allow;
+    /// explicit deny → session-standing reject; dismiss/cancel → deny once with
+    /// no persistence.
     async fn raise_media_egress_prompt(
         &self,
         facts: &MediaEgressAuthzFacts<'_>,
     ) -> Result<Decision> {
         let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
         let prompt = format!(
-            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})?",
+            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})? Approving remembers this exact request for this session.",
             facts.purpose,
             facts.provider_id,
             facts.origin,
@@ -1442,8 +1559,11 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ApprovalOptionId::ApproveOnce, "Yes, transcribe"),
-                opt(ApprovalOptionId::Reject, "Deny"),
+                opt(
+                    ApprovalOptionId::ApproveOnce,
+                    "Yes, transcribe (remember for this session)",
+                ),
+                opt(ApprovalOptionId::Reject, "Deny (remember for this session)"),
             ],
             allow_freetext: false,
             command_detail: None,
@@ -1490,37 +1610,107 @@ impl Approver {
             "timestamps": facts.timestamps,
             "diarization": facts.diarization,
         });
-        self.raise_and_decode(
-            &description,
-            question,
-            "media_egress_transcription",
-            serde_json::json!({
-                "egress": egress.clone(),
-                "candidate_effects": [
-                    {
-                        "selection": ApprovalOptionId::ApproveOnce.as_str(),
-                        "scope": "once",
-                        "execute": {"media_egress": egress},
-                    },
-                    {
-                        "selection": ApprovalOptionId::Reject.as_str(),
-                        "effect": "deny",
-                    },
-                ],
-            }),
-            |response| {
-                // Dismissal (no selection) denies, fail closed.
-                let Some(id) = decode_option_response(response, &set)? else {
-                    return Ok(Decision::Deny);
-                };
-                match id {
-                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
-                    ApprovalOptionId::Reject => Ok(Decision::Deny),
-                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+        let outcome = self
+            .raise_and_decode(
+                &description,
+                question,
+                "media_egress_transcription",
+                serde_json::json!({
+                    "egress": egress.clone(),
+                    "candidate_effects": [
+                        {
+                            "selection": ApprovalOptionId::ApproveOnce.as_str(),
+                            "scope": "session",
+                            "execute": {"media_egress": egress},
+                        },
+                        {
+                            "selection": ApprovalOptionId::Reject.as_str(),
+                            "scope": "session",
+                            "effect": "deny",
+                        },
+                    ],
+                }),
+                |response| {
+                    let Some(id) = decode_option_response(response, &set)? else {
+                        return Ok(MediaEgressPromptChoice::Dismissed);
+                    };
+                    match id {
+                        ApprovalOptionId::ApproveOnce => Ok(MediaEgressPromptChoice::Approve),
+                        ApprovalOptionId::Reject => Ok(MediaEgressPromptChoice::Reject),
+                        _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                    }
+                },
+            )
+            .await?;
+        self.finish_media_egress_prompt(facts, outcome).await
+    }
+
+    async fn finish_media_egress_prompt(
+        &self,
+        facts: &MediaEgressAuthzFacts<'_>,
+        choice: MediaEgressPromptChoice,
+    ) -> Result<Decision> {
+        let (decision, scopes, persist) = match choice {
+            MediaEgressPromptChoice::Approve => (
+                Decision::Allow { scope: Scope::Once },
+                &[Scope::Session][..],
+                true,
+            ),
+            MediaEgressPromptChoice::Reject => (Decision::Deny, &[Scope::Session][..], true),
+            MediaEgressPromptChoice::Dismissed => (Decision::Deny, &[Scope::Once][..], false),
+        };
+        if persist {
+            if let Some(session) = self.session.as_deref() {
+                match choice {
+                    MediaEgressPromptChoice::Approve => {
+                        if let Err(error) = self
+                            .store
+                            .record_media_egress_grant(
+                                &session.project_id,
+                                facts.purpose,
+                                facts.request_digest.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                purpose = facts.purpose,
+                                request_digest = facts.request_digest.as_str(),
+                                "recording media egress grant failed; consent will not stick"
+                            );
+                        }
+                    }
+                    MediaEgressPromptChoice::Reject => {
+                        if let Err(error) = self
+                            .store
+                            .record_media_egress_reject(
+                                &session.project_id,
+                                facts.purpose,
+                                facts.request_digest.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                purpose = facts.purpose,
+                                request_digest = facts.request_digest.as_str(),
+                                "recording media egress reject failed; standing deny will not stick"
+                            );
+                        }
+                    }
+                    MediaEgressPromptChoice::Dismissed => {}
                 }
-            },
+            }
+        }
+        self.record_permission_decision(
+            "media_egress",
+            facts.request_digest.as_str(),
+            scopes,
+            decision,
+            crate::approval::DecisionSource::UserPrompt,
         )
-        .await
+        .await;
+        Ok(decision)
     }
 
     /// The single composite authorization for an image-generation dispatch.

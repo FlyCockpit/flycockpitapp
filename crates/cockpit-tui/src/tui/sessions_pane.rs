@@ -194,6 +194,9 @@ pub fn tier_sort(
 struct Level {
     /// `None` at the root level; `Some` once we've drilled into a fork.
     parent: Option<SessionSummary>,
+    /// When set, this level lists every window of a compaction lineage
+    /// rather than forks of a parent.
+    lineage_root: Option<Uuid>,
     cards: Vec<(SessionSummary, Tier)>,
     selection: ListState,
     /// Durable identity anchor retained while a refresh temporarily clears
@@ -209,6 +212,7 @@ impl Level {
     fn empty(parent: Option<SessionSummary>) -> Self {
         Self {
             parent,
+            lineage_root: None,
             cards: Vec::new(),
             selection: ListState::default(),
             selected_session_id: None,
@@ -503,6 +507,11 @@ impl SessionsPane {
                     desc: "descend into a session's forks",
                 },
                 KeyBinding {
+                    key: "e",
+                    action: "windows",
+                    desc: "expand a compaction lineage",
+                },
+                KeyBinding {
                     key: "←/h",
                     action: "back",
                     desc: "ascend to the parent level",
@@ -597,16 +606,22 @@ impl SessionsPane {
         self.levels = vec![Level::empty(None)];
     }
 
-    pub fn root_request(&self) -> (Option<String>, Option<Uuid>) {
+    pub fn root_request(&self) -> (Option<String>, Option<Uuid>, Option<Uuid>) {
         let level = self.levels.last().expect("at least the root level");
+        if let Some(lineage_root) = level.lineage_root {
+            return (None, None, Some(lineage_root));
+        }
         if let Some(parent) = &level.parent {
-            return (None, Some(parent.session_id));
+            let fork_parent = parent
+                .compaction_lineage_root_id
+                .unwrap_or(parent.session_id);
+            return (None, Some(fork_parent), None);
         }
         let project_id = match self.scope {
             Scope::Project => self.project_id.clone(),
             Scope::All => None,
         };
-        (project_id, None)
+        (project_id, None, None)
     }
 
     pub fn is_preview_enabled(&self) -> bool {
@@ -927,6 +942,15 @@ impl SessionsPane {
                     }
                 }
             }
+            KeyCode::Char('e') => {
+                let before_depth = self.levels.len();
+                if self.drill_in_lineage() || self.levels.len() != before_depth {
+                    self.preview = None;
+                    if self.daemon_connected {
+                        return Some(SessionsOutcome::LoadList);
+                    }
+                }
+            }
             // Go back up one fork level (no-op at the root).
             KeyCode::Left | KeyCode::Char('h') if self.drill_out() => {
                 self.preview = None;
@@ -1043,6 +1067,29 @@ impl SessionsPane {
         }
         self.mark_disconnected_unavailable();
         self.levels.push(Level::empty(Some(parent)));
+        false
+    }
+
+    /// Expand the highlighted conversation into its compaction windows.
+    fn drill_in_lineage(&mut self) -> bool {
+        let Some(selected) = self.selected().cloned() else {
+            return false;
+        };
+        if selected.lineage_window_count <= 1 {
+            return false;
+        }
+        let lineage_root = selected
+            .compaction_lineage_root_id
+            .unwrap_or(selected.session_id);
+        let mut level = Level::empty(Some(selected));
+        level.lineage_root = Some(lineage_root);
+        if self.daemon_connected {
+            self.loading = Some("Loading sessions...");
+            self.levels.push(level);
+            return true;
+        }
+        self.mark_disconnected_unavailable();
+        self.levels.push(level);
         false
     }
 
@@ -2056,7 +2103,17 @@ pub fn card_lines(
     }
     out.push(boxed_row(meta, inner_w, border_style));
 
-    // Row 3 (only when forks exist): fork hint.
+    // Row 3 (only when forks or extra windows exist).
+    if s.lineage_window_count > 1 {
+        out.push(boxed_row(
+            vec![Span::styled(
+                format!("press e to expand {} windows", s.lineage_window_count),
+                Style::default().fg(Color::Cyan),
+            )],
+            inner_w,
+            border_style,
+        ));
+    }
     if s.fork_count > 0 {
         out.push(boxed_row(
             vec![Span::styled(
@@ -2335,6 +2392,9 @@ mod tests {
             pin_count: 0,
             assistant_inbox_unread: 0,
             assistant_inbox_latest_source_session_id: None,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: None,
+            lineage_window_count: 1,
         }
     }
 
@@ -2987,6 +3047,57 @@ mod tests {
         let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)]);
         pane.drill_in();
         assert_eq!(pane.levels.len(), 1);
+    }
+
+    #[test]
+    fn drill_in_lineage_noop_for_a_single_window() {
+        let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)]);
+        pane.drill_in_lineage();
+        assert_eq!(pane.levels.len(), 1);
+    }
+
+    #[test]
+    fn drill_in_lineage_expands_windows_and_root_request_uses_lineage_id() {
+        let root = Uuid::new_v4();
+        let tip = Uuid::new_v4();
+        let mut card = summary(tip, 1);
+        card.compaction_lineage_root_id = Some(root);
+        card.lineage_window_count = 3;
+        let mut pane = test_pane(vec![(card, Tier::Idle)]);
+        assert!(pane.drill_in_lineage());
+        assert_eq!(pane.levels.len(), 2);
+        assert_eq!(pane.root_request(), (None, None, Some(root)));
+    }
+
+    #[test]
+    fn expand_key_loads_lineage_windows() {
+        let root = Uuid::new_v4();
+        let mut card = summary(Uuid::new_v4(), 1);
+        card.compaction_lineage_root_id = Some(root);
+        card.lineage_window_count = 2;
+        let mut pane = test_pane(vec![(card, Tier::Idle)]);
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('e'))),
+            Some(SessionsOutcome::LoadList)
+        ));
+        assert_eq!(pane.levels.len(), 2);
+        assert_eq!(pane.root_request(), (None, None, Some(root)));
+    }
+
+    #[test]
+    fn card_lines_prompt_to_expand_a_multi_window_lineage() {
+        let mut card = summary(Uuid::new_v4(), 1);
+        card.lineage_window_count = 3;
+        let lines = card_lines(&card, Tier::Idle, false, false, 40, false);
+        let joined = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains("press e to expand 3 windows"),
+            "expected expand hint, got {joined:?}"
+        );
     }
 
     #[test]

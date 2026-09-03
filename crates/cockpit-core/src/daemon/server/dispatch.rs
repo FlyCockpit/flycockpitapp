@@ -543,7 +543,7 @@ async fn persist_and_broadcast_default_model_update_receipt(
         .map(|authority| {
             cockpit_config::config::effective_default::RetainedDefaultReceiptProof::new(
                 default_update_id,
-                handle.session_id,
+                handle.session_id(),
                 authority.clone(),
                 &outcome_json,
             )
@@ -553,7 +553,7 @@ async fn persist_and_broadcast_default_model_update_receipt(
     match ctx
         .db
         .record_default_model_update_receipt(
-            handle.session_id,
+            handle.session_id(),
             default_update_id,
             crate::db::session_log::DefaultModelUpdateReceipt {
                 outcome_json,
@@ -781,7 +781,7 @@ async fn recover_retained_defaults_for_attached_worker(
     .context("joining retained effective-default recovery")??;
     let (mut recovered, mut finalization, receipt_validation) = recovery.into_parts();
     if let Some(receipt_validation) = receipt_validation {
-        if receipt_validation.proof().session_id() != handle.session_id {
+        if receipt_validation.proof().session_id() != handle.session_id() {
             anyhow::bail!(
                 "retained receipt-emitted journal belongs to a different session; leaving it pending"
             );
@@ -804,7 +804,7 @@ async fn recover_retained_defaults_for_attached_worker(
     }
     if recovered
         .iter()
-        .any(|transaction| transaction.correlation.session_id() != handle.session_id)
+        .any(|transaction| transaction.correlation.session_id() != handle.session_id())
     {
         anyhow::bail!(
             "retained effective-default journal belongs to a different session; leaving it pending"
@@ -905,7 +905,7 @@ async fn recover_retained_defaults_for_attached_worker(
     if let Some(finalization) = finalization.take() {
         let proof = retained_receipt_proof_from_ledger(
             ctx,
-            handle.session_id,
+            handle.session_id(),
             receipt_update_id,
             &authority,
         )
@@ -2972,7 +2972,7 @@ async fn stop_worker_for_trust_transition(
     for attempt in 0..WORKSPACE_TRUST_STOP_ATTEMPTS {
         let still_owned = ctx
             .registry
-            .live_handle(handle.session_id)
+            .live_handle_matching_worker(handle)
             .is_some_and(|live| live.same_worker_as(handle))
             && handle.trust_transition_matches(transition);
         if !still_owned {
@@ -2984,7 +2984,7 @@ async fn stop_worker_for_trust_transition(
                 let Some(backoff) = WORKSPACE_TRUST_STOP_BACKOFF.get(attempt) else {
                     tracing::error!(
                         %error,
-                        session_id = %handle.session_id,
+                        session_id = %handle.session_id(),
                         revision = transition.revision,
                         reason,
                         "workspace-trust reconciliation could not stop this worker; it stays fail-closed until the daemon restarts"
@@ -2997,7 +2997,7 @@ async fn stop_worker_for_trust_transition(
                 };
                 tracing::warn!(
                     %error,
-                    session_id = %handle.session_id,
+                    session_id = %handle.session_id(),
                     revision = transition.revision,
                     reason,
                     attempt,
@@ -3374,7 +3374,7 @@ async fn handle_send_user_message_v2(
             message: error.to_string(),
         })?;
     let attached = require_attached(state)?;
-    let session_id = attached.handle.session_id;
+    let session_id = attached.handle.session_id();
     if validated.session_locator != session_id.to_string() {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -3703,8 +3703,7 @@ async fn handle_send_user_message_v2(
         Vec::new()
     } else {
         let storage = ctx
-            .media_storage_recovery
-            .as_ref()
+            .active_media_storage_recovery()
             .ok_or_else(|| internal("durable media storage unavailable"))?;
         match storage
             .acquire_message_media_bound(crate::media_storage::AcquireMessageMediaInput {
@@ -4040,7 +4039,7 @@ async fn handle_send_user_message(
                 .to_owned(),
         });
     }
-    let session_id = require_attached(state)?.handle.session_id;
+    let session_id = require_attached(state)?.handle.session_id();
     let handle = require_attached(state)?.handle.clone();
     let origin_principal = state.principal.tag();
     // A text-only oversized source switches to FCM2 before any receipt or
@@ -4538,7 +4537,7 @@ async fn handle_send_user_message_bulk(
             message: "user-message origin must be external_root".to_owned(),
         });
     }
-    let session_id = require_attached(state)?.handle.session_id;
+    let session_id = require_attached(state)?.handle.session_id();
     #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
     #[cfg(not(feature = "remote"))]
@@ -5588,8 +5587,11 @@ async fn dispatch_image_control_read(
     // config contract every other owner config read uses
     // (`resolve_workspace_trust_policy_from_db` + `load_effective_for_daemon`):
     // untrusted project layers are filtered out and remote `image_generation`
-    // is stripped before it can be projected. `project_root` is only a config
-    // cwd here, never authority — the RPC is already `owner_only`-gated.
+    // is stripped before it can be projected. This stays workspace-bound —
+    // unlike user-level provider/MCP onboarding it must not fall back to
+    // IgnoreConfig, because a fresh-install write scaffolds project
+    // `.cockpit/` (secret-bearing). `project_root` is only a config cwd here,
+    // never authority — the RPC is already `owner_only`-gated.
     let project_root = match &request {
         Request::ImageEndpointList { project_root, .. }
         | Request::ImageEndpointGet { project_root, .. }
@@ -6143,20 +6145,34 @@ async fn handle_serialized_request_impl(
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
-        Request::PromoteToPersistent => Err(ErrorPayload {
-            code: ErrorCode::Unavailable,
-            message: "in-place daemon promotion is not available in this daemon build".into(),
-        }),
+        Request::PromoteToPersistent => {
+            ctx.promote_to_persistent(&state.principal)
+                .map_err(internal)?;
+            state.exit_guard_reservation = None;
+            Ok(Response::Ack)
+        }
         Request::ExitGuardStatus => {
-            let (has_schedules, processing, tool_running) =
-                require_attached(state)?.handle.live_status();
+            // Serialize the lifetime classification with promotion and sample
+            // the attached worker directly. Clients must not infer either
+            // half from discovery or their local event projection.
+            let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
+            let (has_schedules, processing, tool_running) = {
+                let attached = require_attached(state)?;
+                attached.handle.live_status()
+            };
+            let has_live_work = has_schedules || processing || tool_running;
+            let ephemeral_owner = ctx.is_ephemeral_lifetime();
+            if ephemeral_owner && has_live_work {
+                ctx.reserve_exit_guard(state).map_err(internal)?;
+            }
             Ok(Response::ExitGuardStatus {
-                ephemeral_owner: ctx.paths.ephemeral,
-                has_live_work: has_schedules || processing || tool_running,
+                ephemeral_owner,
+                has_live_work,
             })
         }
         Request::ReleaseExitGuard => {
             require_attached(state)?;
+            ctx.release_exit_guard_reservation(state);
             Ok(Response::Ack)
         }
         Request::ResumeFromCompaction => {
@@ -6380,7 +6396,7 @@ async fn handle_serialized_request_impl(
             let recovering_root_id = match create_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
-                        attached.handle.session_id != result.attachment.root_id.0
+                        !attached.handle.owns_session_id(result.attachment.root_id.0)
                     }) {
                         let options = request.options.clone();
                         let principal = state.principal.clone();
@@ -6561,7 +6577,7 @@ async fn handle_serialized_request_impl(
             match attach_start {
                 crate::daemon::code_roots::CodeRootRequestStart::Replayed(result) => {
                     if state.attached.as_ref().is_none_or(|attached| {
-                        attached.handle.session_id != result.attachment.root_id.0
+                        !attached.handle.owns_session_id(result.attachment.root_id.0)
                     }) {
                         let options = request.options.clone();
                         let principal = state.principal.clone();
@@ -6790,7 +6806,7 @@ async fn handle_serialized_request_impl(
                     service.release_catalog(root_id.0, &request.attachment_capability);
                 }
                 if state.attached.as_ref().is_none_or(|attached| {
-                    attached.handle.session_id != root_id.0
+                    !attached.handle.owns_session_id(root_id.0)
                         || attached.code_root_capability.as_ref()
                             != Some(&request.attachment_capability)
                 }) {
@@ -6802,7 +6818,7 @@ async fn handle_serialized_request_impl(
                 state
                     .attached
                     .as_ref()
-                    .is_some_and(|attached| attached.handle.session_id == root_id.0)
+                    .is_some_and(|attached| attached.handle.owns_session_id(root_id.0))
             );
             drain_client_attachment_ownership(state, ctx, "Code-root attachment close").await?;
             Ok(Response::CodeRootAttachmentClosed(outcome))
@@ -6872,7 +6888,7 @@ async fn handle_serialized_request_impl(
                 .map_err(code_root_contract_error)?
                 .clone();
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             let root = code_root_read_snapshot(ctx, attached, record.root_id).await?;
             Ok(Response::CodeRootRead(proto::ReadCodeRootV1Result { root }))
         }
@@ -6883,7 +6899,7 @@ async fn handle_serialized_request_impl(
                 .map_err(code_root_contract_error)?
                 .clone();
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             // Deliveries are captured at the worker's durable transition
             // seam. Reading is a pure replay operation: it must never create
             // new history/attention records or turn a poll timestamp into the
@@ -7010,7 +7026,7 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(record.root_id.0, attached.handle.session_id)?;
+            ensure_agent_tree_attached_session(record.root_id.0, &attached.handle)?;
             let attention_id =
                 Uuid::parse_str(request.attention_id.as_str()).map_err(|_| ErrorPayload {
                     code: ErrorCode::BadRequest,
@@ -7747,7 +7763,7 @@ async fn handle_serialized_request_impl(
                 ).await.map_err(internal)?;
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((response, changed)) => {
-                        if changed && let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                        if changed && let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id() == session_id) {
                             att.handle.broadcast_notice("paused work resumed; pending approvals will use the normal prompt flow".to_string());
                         }
                         Ok(response)
@@ -7766,7 +7782,7 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             if changed
                 && let Some(att) = state.attached.as_ref()
-                && att.handle.session_id == session_id
+                && att.handle.session_id() == session_id
             {
                 att.handle.broadcast_notice(
                     "paused work resumed; pending approvals will use the normal prompt flow"
@@ -7815,7 +7831,7 @@ async fn handle_serialized_request_impl(
                             if let Err(error) = ctx.registry.locks().suspend_session(session_id).await {
                                 tracing::warn!(%error, %session_id, "releasing cancelled paused work locks failed");
                             }
-                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id() == session_id) {
                                 att.handle.broadcast_notice("paused work cancelled; the session is waiting for new input".to_string());
                             }
                         }
@@ -7838,7 +7854,7 @@ async fn handle_serialized_request_impl(
                     tracing::warn!(error = %e, %session_id, "releasing cancelled paused work locks failed");
                 }
                 if let Some(att) = state.attached.as_ref()
-                    && att.handle.session_id == session_id
+                    && att.handle.session_id() == session_id
                 {
                     att.handle.broadcast_notice(
                         "paused work cancelled; the session is waiting for new input".to_string(),
@@ -7850,7 +7866,7 @@ async fn handle_serialized_request_impl(
 
         Request::RepairResume { session_id } => {
             let att = require_attached(state)?;
-            if att.handle.session_id != session_id {
+            if att.handle.session_id() != session_id {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "repair_resume session_id does not match the attached session".into(),
@@ -8418,6 +8434,184 @@ async fn handle_serialized_request_impl(
             Ok(Response::PinState {
                 state: proto::PinState { count, seqs },
             })
+        }
+        Request::SetConversationRule {
+            session_id,
+            rule_id,
+            text,
+            source_trust,
+        } => {
+            let source_trust = parse_conversation_rule_source_trust(source_trust.as_deref())
+                .map_err(|error| bad_request(error.to_string()))?;
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let request = Request::SetConversationRule {
+                    session_id,
+                    rule_id,
+                    text: text.clone(),
+                    source_trust: source_trust.map(|value| value.as_str().to_string()),
+                };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let rule = crate::db::Db::set_conversation_rule_conn(
+                            conn,
+                            session_id,
+                            rule_id,
+                            &text,
+                            crate::db::conversation_rules::ConversationRuleCreatedBy::User,
+                            source_trust.unwrap_or(crate::db::conversation_rules::ConversationRuleSourceTrust::Trusted),
+                            chrono::Utc::now().timestamp_millis(),
+                        ).map_err(|error| PinMutationRejected(error.to_string()))?;
+                        let response = Response::ConversationRuleChanged { rule };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response,
+                            safe_response: safe_response.clone(),
+                            outbox_kind: "set_conversation_rule".into(),
+                            outbox_payload: safe_response,
+                        })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<PinMutationRejected>() {
+                        bad_request(rejected.to_string())
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .set_conversation_rule(
+                    session_id,
+                    rule_id,
+                    &text,
+                    crate::db::conversation_rules::ConversationRuleCreatedBy::User,
+                    source_trust.unwrap_or(
+                        crate::db::conversation_rules::ConversationRuleSourceTrust::Trusted,
+                    ),
+                )
+                .await
+                .map(|rule| Response::ConversationRuleChanged { rule })
+                .map_err(|error| bad_request(error.to_string()))
+        }
+        Request::RemoveConversationRule {
+            session_id,
+            rule_id,
+        } => {
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let request = Request::RemoveConversationRule {
+                    session_id,
+                    rule_id,
+                };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let removed = crate::db::Db::remove_conversation_rule_conn(conn, session_id, rule_id)?;
+                        let response = Response::ConversationRuleRemoved { removed };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response,
+                            safe_response: safe_response.clone(),
+                            outbox_kind: "remove_conversation_rule".into(),
+                            outbox_payload: safe_response,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .remove_conversation_rule(session_id, rule_id)
+                .await
+                .map(|removed| Response::ConversationRuleRemoved { removed })
+                .map_err(|error| bad_request(error.to_string()))
+        }
+        Request::ListConversationRules { session_id } => ctx
+            .db
+            .list_conversation_rules(session_id)
+            .await
+            .map(|rules| Response::ConversationRules { rules })
+            .map_err(internal),
+        Request::PromoteConversationRule {
+            session_id,
+            rule_id,
+        } => {
+            let att = require_attached(state)?;
+            if att.handle.session_id() != session_id {
+                return Err(bad_request(
+                    "promote_conversation_rule session_id does not match the attached session",
+                ));
+            }
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let request = Request::PromoteConversationRule {
+                    session_id,
+                    rule_id,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
+            att.handle
+                .send_work(SessionWork::PromoteConversationRule { rule_id })
+                .await
+                .map_err(session_work_error)?;
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "promote_conversation_rule",
+                Response::Ack
+            )
         }
         // ---- v10-only owner-remoted sealed-owner sensitive channel ------
         // Non-owner callers are rejected by the central owner-only authorizer
@@ -9206,12 +9400,12 @@ async fn handle_serialized_request_impl(
                             // session for being busy, which is precisely the
                             // failure mode a grant must not have.
                             tracing::info!(
-                                session_id = %handle.session_id,
+                                session_id = %handle.session_id(),
                                 revision = transition.revision,
                                 generation = refresh.result.applied_generation,
                                 "workspace trust published; live application completes at this session's next turn boundary"
                             );
-                            live_application_pending.push(handle.session_id);
+                            live_application_pending.push(handle.session_id());
                         }
                     }
                     Err(_) => refresh_failed.push((handle.clone(), transition.clone())),
@@ -9537,6 +9731,7 @@ async fn handle_serialized_request_impl(
                         conn,
                         Some(&row.project_id),
                         None,
+                        None,
                         100,
                     )?
                     .into_iter()
@@ -9554,7 +9749,7 @@ async fn handle_serialized_request_impl(
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
         }),
         Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept built-in Assistant settings writes",
                 ));
@@ -9586,7 +9781,7 @@ async fn handle_serialized_request_impl(
                 description: description.clone(),
                 prompt: prompt.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -9630,7 +9825,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -9866,7 +10061,7 @@ async fn handle_serialized_request_impl(
                 local_path: local_path.clone(),
                 deep,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -9922,7 +10117,7 @@ async fn handle_serialized_request_impl(
                 id: id.clone(),
                 as_path,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -9978,7 +10173,7 @@ async fn handle_serialized_request_impl(
                 days,
                 dry_run,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -10011,7 +10206,7 @@ async fn handle_serialized_request_impl(
             let request = Request::ImportKclPackages {
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -10045,7 +10240,7 @@ async fn handle_serialized_request_impl(
         Request::PurgeEndedSessions { before } => {
             #[cfg(feature = "remote")]
             let request = Request::PurgeEndedSessions { before };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent session purges",
                 ));
@@ -10093,7 +10288,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -10280,7 +10475,7 @@ async fn handle_serialized_request_impl(
                 repair_plan_digest: repair_plan_digest.clone(),
                 idempotency_key: idempotency_key.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept media reservation repairs",
                 ));
@@ -10352,6 +10547,22 @@ async fn handle_serialized_request_impl(
         }
         Request::GetSessionCompactions { session_id } => {
             get_session_compactions_response(ctx, session_id).await
+        }
+        Request::ListMediaEgressVerdicts { session_id } => {
+            crate::daemon::media_egress_authority::list_verdicts(ctx, session_id).await
+        }
+        Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose,
+            request_digest,
+        } => {
+            crate::daemon::media_egress_authority::revoke_verdict(
+                ctx,
+                session_id,
+                purpose,
+                request_digest,
+            )
+            .await
         }
         Request::GetAssistant { name } => get_assistant_response(ctx, name).await,
         Request::DiagnoseMediaReservation { scope, id } => {
@@ -10435,12 +10646,12 @@ async fn handle_serialized_request_impl(
             // A per-run daemon can disappear as soon as its client exits.
             // Assistant create returns a session id the same way attach does,
             // so persist before handing that id back.
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 handle.persist_if_needed().map_err(internal)?;
             }
             Ok(Response::AssistantSessionCreated {
                 session: proto::AssistantSessionCreated {
-                    session_id: handle.session_id,
+                    session_id: handle.session_id(),
                     short_id: handle.short_id(),
                     project_root: handle.project_root.display().to_string(),
                     project_id: handle.project_id(),
@@ -10526,7 +10737,10 @@ async fn handle_serialized_request_impl(
             Ok(Response::RemoteOperationStatus { status })
         }
 
-        Request::ImportSessionArchive { transfer } => import_session_archive(ctx, &transfer).await,
+        Request::ImportSessionArchive {
+            transfer,
+            include_sensitive,
+        } => import_session_archive(ctx, &transfer, include_sensitive).await,
         Request::WriteBulkTransferChunk {
             transfer,
             chunk_index,
@@ -10534,7 +10748,7 @@ async fn handle_serialized_request_impl(
         } => {
             let owner =
                 if transfer.mime_class == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque {
-                    let session_id = require_attached(state)?.handle.session_id;
+                    let session_id = require_attached(state)?.handle.session_id();
                     #[cfg(feature = "remote")]
                     {
                         Some(bulk_user_message_transfer_owner(
@@ -10898,7 +11112,7 @@ async fn handle_serialized_request_impl(
             expected_session_id,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             let approval_mode = attached.handle.approval_mode();
             let session = attached.handle.session();
@@ -10931,7 +11145,7 @@ async fn handle_serialized_request_impl(
             invocation_id,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             crate::daemon::image_sidecar_authority::create_grant(
                 ctx,
@@ -10961,7 +11175,7 @@ async fn handle_serialized_request_impl(
             expected_version,
         } => {
             let attached = require_attached(state)?;
-            let authority_session_id = attached.handle.session_id.to_string();
+            let authority_session_id = attached.handle.session_id().to_string();
             let attached_project_root = attached.handle.project_root();
             crate::daemon::image_sidecar_authority::revoke_grant(
                 ctx,
@@ -11062,6 +11276,7 @@ async fn handle_serialized_request_impl(
             // reached disk) so a retry never rewrites the config a second time.
             let mutation = async {
                 let response = crate::daemon::fs_api::save_extended_config(
+                    ctx,
                     project_root,
                     path,
                     content,
@@ -11521,7 +11736,7 @@ async fn handle_serialized_request_impl(
             let session_id = state
                 .attached
                 .as_ref()
-                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id());
             let response = state.terminal_host.open(
                 state.terminal_context.clone(),
                 session_id,
@@ -11550,7 +11765,7 @@ async fn handle_serialized_request_impl(
             let session_id = state
                 .attached
                 .as_ref()
-                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id());
             let response = state.terminal_host.attach(
                 state.terminal_context.clone(),
                 session_id,
@@ -11728,7 +11943,7 @@ async fn handle_serialized_request_impl(
             let att = require_attached(state)?;
             let governed_network_operation = ctx
                 .db
-                .interrupt_governed_network_operation_kind(att.handle.session_id, interrupt_id)
+                .interrupt_governed_network_operation_kind(att.handle.session_id(), interrupt_id)
                 .await
                 .map_err(internal)?;
             let governed_network_attachment = if governed_network_operation.is_some() {
@@ -11766,6 +11981,7 @@ async fn handle_serialized_request_impl(
             project_id,
             parent_session_id,
             assistant_id,
+            compaction_lineage_root_id,
         } => {
             list_sessions(
                 ctx,
@@ -11773,6 +11989,7 @@ async fn handle_serialized_request_impl(
                 project_id,
                 parent_session_id,
                 assistant_id,
+                compaction_lineage_root_id,
             )
             .await
         }
@@ -11919,11 +12136,11 @@ async fn handle_serialized_request_impl(
             limit,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let page = ctx
                 .db
                 .agent_lineage_page(
-                    session_id,
+                    tree_session_id,
                     root_agent_instance_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
@@ -11943,11 +12160,11 @@ async fn handle_serialized_request_impl(
             limit,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let page = ctx
                 .db
                 .decision_attention_page(
-                    session_id,
+                    tree_session_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
                 )
@@ -11966,7 +12183,7 @@ async fn handle_serialized_request_impl(
             answer,
         } => {
             let attached = require_attached(state)?;
-            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             attached
                 .handle
@@ -11984,7 +12201,7 @@ async fn handle_serialized_request_impl(
                 .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
             let decision = ctx
                 .db
-                .decision_request(session_id, decision_request_id)
+                .decision_request(tree_session_id, decision_request_id)
                 .await
                 .map_err(internal)?
                 .context("resolved agent decision disappeared")
@@ -12524,7 +12741,7 @@ async fn handle_serialized_request_impl(
             // and reacquires only for its short Phase-3 authority fence.
             let mut config_publication_guard = Some(CONFIG_PUBLICATION_RPC_LOCK.lock().await);
             let trust_policy = attached_trust_policy_fenced_to_worker(ctx, att).await?;
-            let session_id = att.handle.session_id;
+            let session_id = att.handle.session_id();
             // A caller retrying after a daemon crash receives the one durable
             // terminal result instead of starting a second config mutation.
             // Recovery below still runs first so an already-recorded receipt
@@ -13434,7 +13651,7 @@ async fn handle_serialized_request_impl(
             // failure, and a committed replay returns below without dispatch.
             #[cfg(feature = "remote")]
             let remote_response = if let Some(operation) = remote_operation {
-                let session_id = att.handle.session_id;
+                let session_id = att.handle.session_id();
                 let request = Request::SetAgent { name: name.clone() };
                 let params = request
                     .canonical_remote_operation_params_v1()
@@ -13591,7 +13808,7 @@ async fn handle_serialized_request_impl(
                 if let Some(response) = remote_response.as_ref() {
                     tracing::warn!(
                         %error,
-                        session_id = %att.handle.session_id,
+                        session_id = %att.handle.session_id(),
                         "committed remote SetAgent could not reach its worker; durable selection will converge on recovery"
                     );
                     return Ok(response.clone());
@@ -13610,7 +13827,7 @@ async fn handle_serialized_request_impl(
                     // turn the committed Ack into an error that invites retry.
                     tracing::warn!(
                         ?error,
-                        session_id = %att.handle.session_id,
+                        session_id = %att.handle.session_id(),
                         "committed remote SetAgent live convergence deferred to recovery"
                     );
                 }
@@ -14049,7 +14266,7 @@ async fn handle_serialized_request_impl(
                 credential: credential.clone(),
                 force,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -14121,7 +14338,7 @@ async fn handle_serialized_request_impl(
 
         #[cfg(feature = "remote")]
         Request::ClearFlycockpitCredential => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -14243,7 +14460,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SetFlycockpitConnectorEnabled { enabled } => {
             let request = Request::SetFlycockpitConnectorEnabled { enabled };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit connector settings",
                 ));
@@ -14282,7 +14499,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SyncFlycockpitOrgPolicy => {
             let request = Request::SyncFlycockpitOrgPolicy;
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org policy sync",
                 ));
@@ -14341,7 +14558,7 @@ async fn handle_serialized_request_impl(
             let request = Request::EnrollFlycockpitOrgSync {
                 org_id: org_id.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org sync enrollment",
                 ));
@@ -14387,7 +14604,7 @@ async fn handle_serialized_request_impl(
                 name: name.clone(),
                 value: value.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -14445,7 +14662,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
@@ -14559,7 +14776,7 @@ async fn handle_serialized_request_impl(
         Request::DeleteNamedSecret { name } => {
             #[cfg(feature = "remote")]
             let request = Request::DeleteNamedSecret { name: name.clone() };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -14633,7 +14850,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 record: record.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -14886,7 +15103,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -15222,7 +15439,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -15891,7 +16108,7 @@ async fn handle_serialized_request_impl(
             } else {
                 profile
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -15997,10 +16214,7 @@ async fn handle_serialized_request_impl(
             let server_config = match async {
                 purge_durable_oauth_flows(ctx, &owner).await?;
                 let cwd = std::path::PathBuf::from(&project_root);
-                let trust_policy =
-                    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-                        .await
-                        .map_err(workspace_trust_error)?;
+                let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
                 let server_config = if let Some(agent) = agent.as_deref() {
                     let def = crate::agents::resolve(&cwd, agent)
                         .map_err(bad_config)?
@@ -16399,7 +16613,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -16918,7 +17132,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -17136,7 +17350,7 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             mutation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17163,7 +17377,7 @@ async fn handle_serialized_request_impl(
             on_unlisted,
             allow_fallback,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider model fetches that persist config",
                 ));
@@ -17222,7 +17436,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             entry,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17268,7 +17482,7 @@ async fn handle_serialized_request_impl(
             entry,
             header_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17367,7 +17581,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept Copilot auth setup",
                     ));
@@ -17456,6 +17670,9 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let mutation = async {
+                let global_config =
+                    cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+                prepare_user_level_write_target(ctx, &global_config)?;
                 if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
                     // Catalog I/O is deliberately outside the publication
                     // boundary. Once it is resolved, the config snapshot used
@@ -17800,7 +18017,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept MCP config writes",
                     ));
@@ -17867,7 +18084,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             delete_stored_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17902,7 +18119,7 @@ async fn handle_serialized_request_impl(
             category_defaults_json,
             on_unlisted_models_fetch,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider metadata writes",
                 ));
@@ -18119,7 +18336,7 @@ async fn handle_serialized_request_impl(
             let mut proposals = service.pending_proposals(
                 |scope| {
                     guidance_scope_matches_attached_session(
-                        attached.handle.session_id,
+                        attached.handle.session_id(),
                         &attached.handle.project_root,
                         scope,
                     )
@@ -18140,7 +18357,7 @@ async fn handle_serialized_request_impl(
                 };
                 proposal.persistent_acceptance_allowed = guidance_scope_current_and_persistable(
                     &snapshot,
-                    attached.handle.session_id,
+                    attached.handle.session_id(),
                     &attached.handle.project_root,
                     &scope,
                     config_generation,
@@ -18195,7 +18412,7 @@ async fn handle_serialized_request_impl(
                 .proposal_scope_by_id(*proposal_id.as_bytes())
                 .ok_or_else(|| bad_request("guidance proposal is no longer pending"))?;
             if !guidance_scope_matches_attached_session(
-                attached.handle.session_id,
+                attached.handle.session_id(),
                 &attached.handle.project_root,
                 &scope,
             ) {
@@ -18216,7 +18433,7 @@ async fn handle_serialized_request_impl(
                     .ok_or_else(|| bad_request("guidance proposal receipt is missing"))?;
                 if !guidance_scope_current_and_persistable(
                     &snapshot,
-                    attached.handle.session_id,
+                    attached.handle.session_id(),
                     &attached.handle.project_root,
                     &scope,
                     config_generation,
@@ -18297,8 +18514,7 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -18319,7 +18535,7 @@ async fn handle_serialized_request_impl(
             let receipt = recovery
                 .recover(
                     request,
-                    att.handle.session_id,
+                    att.handle.session_id(),
                     project_digest,
                     None,
                     chrono::Utc::now().timestamp_millis(),
@@ -18355,14 +18571,13 @@ async fn handle_serialized_request_impl(
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
             if request.owner_principal_digest != owner
-                || request.session_id != attached.handle.session_id
+                || request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
@@ -18413,14 +18628,13 @@ async fn handle_serialized_request_impl(
             if request.schema_version != 1
                 || request.kind != "retainHttpsMedia"
                 || request.owner_principal_digest != owner
-                || request.session_id != attached.handle.session_id
+                || request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let trust_policy = attached.handle.current_trust_policy();
             let (_, extended) = ctx
@@ -18467,7 +18681,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
             {
                 return Err(unavailable());
@@ -18509,7 +18723,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != project_digest
                 || request.preview_checksum.len() != 64
                 || request
@@ -18561,8 +18775,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(unavailable)?;
             let now = chrono::Utc::now().timestamp_millis();
             let lease = storage
@@ -18619,7 +18832,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != project_digest
                 || request.actor_role != expected_role
                 || request.actor_principal_digest
@@ -18633,8 +18846,7 @@ async fn handle_serialized_request_impl(
                 .load_effective_for_daemon(&attached.handle.project_root, &trust_policy)
                 .map_err(internal)?;
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .begin_media_upload(
@@ -18693,7 +18905,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.mutation.actor_role != role
                 || request.mutation.actor_principal_digest
@@ -18702,8 +18914,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .append_media_upload_chunk(request, chrono::Utc::now().timestamp_millis())
@@ -18757,7 +18968,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -18766,8 +18977,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .cancel_media_upload(request, chrono::Utc::now().timestamp_millis())
@@ -18821,7 +19031,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -18830,8 +19040,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let storage = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = storage
                 .discard_media_attachment(request, chrono::Utc::now().timestamp_millis())
@@ -18875,7 +19084,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if request.session_id != attached.handle.session_id
+            if request.session_id != attached.handle.session_id()
                 || request.canonical_project_digest != digest
             {
                 return Err(unavailable());
@@ -18932,7 +19141,7 @@ async fn handle_serialized_request_impl(
                 .to_str()
                 .ok_or_else(unavailable)?;
             let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
-            if *session_id != attached.handle.session_id
+            if *session_id != attached.handle.session_id()
                 || *canonical_project_digest != digest
                 || request.actor_role != role
                 || request.actor_principal_digest
@@ -18941,8 +19150,7 @@ async fn handle_serialized_request_impl(
                 return Err(unavailable());
             }
             let recovery = ctx
-                .media_storage_recovery
-                .as_ref()
+                .active_media_storage_recovery()
                 .ok_or_else(|| internal("media storage authority is unavailable"))?;
             let receipt = recovery
                 .finalize_media_upload(request, chrono::Utc::now().timestamp_millis())
@@ -19433,6 +19641,12 @@ async fn handle_concurrent_request_impl(
                 state: proto::PinState { count, seqs },
             })
         }
+        Request::ListConversationRules { session_id } => ctx
+            .db
+            .list_conversation_rules(session_id)
+            .await
+            .map(|rules| Response::ConversationRules { rules })
+            .map_err(internal),
         // v10-only owner-remoted sealed-owner reads (concurrent). Non-owner is
         // rejected by the central authorizer; the live directory backing is
         // installed by the persistence sibling, so these fail closed here.
@@ -19504,7 +19718,10 @@ async fn handle_concurrent_request_impl(
             .await
         }
 
-        Request::ImportSessionArchive { transfer } => import_session_archive(&ctx, &transfer).await,
+        Request::ImportSessionArchive {
+            transfer,
+            include_sensitive,
+        } => import_session_archive(&ctx, &transfer, include_sensitive).await,
         Request::WriteBulkTransferChunk {
             transfer,
             chunk_index,
@@ -19614,6 +19831,7 @@ async fn handle_concurrent_request_impl(
             project_id,
             parent_session_id,
             assistant_id,
+            compaction_lineage_root_id,
         } => {
             list_sessions(
                 &ctx,
@@ -19621,6 +19839,7 @@ async fn handle_concurrent_request_impl(
                 project_id,
                 parent_session_id,
                 assistant_id,
+                compaction_lineage_root_id,
             )
             .await
         }
@@ -19761,11 +19980,12 @@ async fn handle_concurrent_request_impl(
             limit,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
             let page = ctx
                 .db
                 .agent_lineage_page(
-                    session_id,
+                    tree_session_id,
                     root_agent_instance_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
@@ -19784,11 +20004,12 @@ async fn handle_concurrent_request_impl(
             limit,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
             let page = ctx
                 .db
                 .decision_attention_page(
-                    session_id,
+                    tree_session_id,
                     after.map(agent_tree_cursor_from_wire),
                     usize::from(limit),
                 )
@@ -19806,14 +20027,9 @@ async fn handle_concurrent_request_impl(
             answer,
         } => {
             let attached = require_shared_attached(&shared)?;
-            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
-            let handle = ctx
-                .registry
-                .live_handle(session_id)
-                .ok_or_else(|| ErrorPayload {
-                    code: ErrorCode::UnknownSession,
-                    message: "attached session worker is unavailable".into(),
-                })?;
+            let tree_session_id =
+                ensure_agent_tree_attached_session(session_id, attached.handle())?;
+            let handle = attached.handle().clone();
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
                 .send_work(SessionWork::ResolveAgentDecision {
@@ -19830,7 +20046,7 @@ async fn handle_concurrent_request_impl(
                 .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
             let decision = ctx
                 .db
-                .decision_request(session_id, decision_request_id)
+                .decision_request(tree_session_id, decision_request_id)
                 .await
                 .map_err(internal)?
                 .context("resolved agent decision disappeared")
@@ -20193,6 +20409,22 @@ async fn handle_concurrent_request_impl(
         Request::GetSessionCompactions { session_id } => {
             get_session_compactions_response(&ctx, session_id).await
         }
+        Request::ListMediaEgressVerdicts { session_id } => {
+            crate::daemon::media_egress_authority::list_verdicts(&ctx, session_id).await
+        }
+        Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose,
+            request_digest,
+        } => {
+            crate::daemon::media_egress_authority::revoke_verdict(
+                &ctx,
+                session_id,
+                purpose,
+                request_digest,
+            )
+            .await
+        }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
         Request::ListAssistants => {
             let _publication = inventory::read_authority_publication().await;
@@ -20526,25 +20758,14 @@ async fn daemon_provider_config_with_warnings(
         return Err(bad_request("project_root must not be empty"));
     }
     let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     if global_config_root(&cwd)? {
         let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
         let config = crate::config::providers::ConfigDoc::load(&global_config)
             .map_err(daemon_config_error)?
             .providers();
-        let root = crate::config::trust::resolve_trust_root(&cwd).map_err(internal)?;
-        return Ok((
-            cwd,
-            crate::config::trust::WorkspaceTrustPolicy {
-                root,
-                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-            },
-            config,
-            Vec::new(),
-        ));
+        return Ok((cwd, trust_policy, config, Vec::new()));
     }
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(internal)?;
     let (config, _, warnings) = ctx
         .config_source()
         .load_effective_for_daemon_with_provider_warnings(&cwd, &trust_policy)
@@ -20555,10 +20776,91 @@ async fn daemon_provider_config_with_warnings(
 /// A catalog rooted at the canonical global config directory is onboarding
 /// authority, not a workspace setting. It is intentionally the only
 /// trust-free root accepted by the provider mutation capability path.
+/// Comparison is symlink-safe and does not require the directory to exist.
 fn global_config_root(root: &std::path::Path) -> std::result::Result<bool, ErrorPayload> {
-    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
-    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
-    Ok(root == canonical_global)
+    cockpit_config::config::dirs::is_global_config_dir(root).map_err(internal)
+}
+
+/// Resolve workspace trust for user-level configuration (providers, MCP,
+/// and other onboarding-capable user-owned layers). A catalog rooted at
+/// the canonical global config directory is accepted without a trust
+/// decision. An unset or untrusted workspace still serves the global layer
+/// (project `.cockpit/` stays excluded). Other trust-resolution failures
+/// stay fail-closed.
+///
+/// Workspace-bound mutations (sandbox intent, image-generation registry,
+/// policy import, attached-session config) must keep calling
+/// `resolve_workspace_trust_policy_from_db` directly so an untrusted root
+/// cannot author a project layer.
+async fn resolve_user_level_trust_policy(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    if global_config_root(cwd)? {
+        let root = crate::config::trust::resolve_trust_root(cwd).map_err(internal)?;
+        return Ok(crate::config::trust::WorkspaceTrustPolicy {
+            root,
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        });
+    }
+    match crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd).await {
+        Ok(policy) => Ok(policy),
+        Err(error) => user_level_trust_policy(cwd, error),
+    }
+}
+
+/// User-level onboarding is independent of workspace trust: an unset or
+/// untrusted workspace still serves the global layer (project `.cockpit/`
+/// stays excluded). Other trust-resolution failures stay fail-closed.
+fn user_level_trust_policy(
+    cwd: &std::path::Path,
+    error: anyhow::Error,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    if error
+        .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
+        .is_none()
+    {
+        return Err(internal(error));
+    }
+    let root = crate::config::trust::resolve_trust_root(cwd).map_err(internal)?;
+    Ok(crate::config::trust::WorkspaceTrustPolicy {
+        root,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    })
+}
+
+/// Canonicalize a user-level write target without creating directories on
+/// this read path. Ephemeral/diagnostic owners fail closed when the global
+/// layer would have to be created — never a silent capability-less snapshot.
+fn canonical_user_level_write_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
+    canonical_mcp_target_path(path)
+}
+
+/// Gate, then create the missing global layer when this is an authorized
+/// write. Snapshot/read paths must keep using
+/// [`canonical_user_level_write_target`].
+fn prepare_user_level_write_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    let path = canonical_user_level_write_target(ctx, path)?;
+    super::ensure_authorized_global_layer(&path)?;
+    Ok(path)
+}
+
+/// Journal replay of a durable user-level target. Refuses ephemeral
+/// creation of the missing global layer, then creates it only for
+/// authorized persistent owners. Does not re-canonicalize a stored path.
+fn prepare_user_level_journal_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<(), ErrorPayload> {
+    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
+    super::ensure_authorized_global_layer(path)
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -20608,23 +20910,16 @@ async fn provider_catalog_snapshot(
     }
     let config_generation = inventory::current_config_generation();
     let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
-    // A missing provider layer (e.g. a fresh install with no config directory
-    // yet) must not fail this read: the snapshot is still a valid projection,
-    // it just cannot mint an edit capability. Clients treat the absent
-    // capability fields as read-only and an empty `layer_id` as "no editable
-    // layer"; a later mutation attempt fails the capability lookup instead.
-    let target_path = if global_config_root(&cwd)? {
-        cockpit_config::config::dirs::global_config_file()
-            .ok()
-            .and_then(|config| {
-                crate::config::providers::provider_file_path_for_config(&config, "default").ok()
-            })
-    } else {
+    // User-level config always has a writable home: the resolver falls back
+    // to the global layer even when that directory does not yet exist, so
+    // this read mints an edit capability instead of returning a silent
+    // read-only snapshot. Stub config sources that intentionally have no
+    // write target still omit the capability.
+    let target_path =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
-        })
-    };
+        });
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -20636,7 +20931,7 @@ async fn provider_catalog_snapshot(
         })
         .unwrap_or_default();
     let target_path = match target_path {
-        Some(path) => Some(canonical_mcp_target_path(&path)?),
+        Some(path) => Some(canonical_user_level_write_target(ctx, &path)?),
         None => None,
     };
     let revision = if let Some(target_path) = target_path.as_ref() {
@@ -20658,27 +20953,36 @@ async fn provider_catalog_snapshot(
     } else {
         String::new()
     };
-    let (mcp, mcp_scope_targets) = if global_config_root(&cwd)? {
-        (None, std::collections::BTreeMap::new())
-    } else {
-        let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-        let targets = ["global", "workspace"]
-            .into_iter()
-            .filter_map(|scope| {
-                let target = crate::config::trust::with_workspace_trust_policy(
-                    trust_policy.clone(),
-                    || cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope),
-                )?;
-                let path = target
-                    .parent()?
-                    .join(cockpit_config::config::dirs::MCP_FILE);
-                let path = canonical_mcp_target_path(&path).ok()?;
-                let revision = mcp_target_layer_revision(&path).ok()?;
-                Some((scope.to_string(), (path, revision)))
-            })
-            .collect();
-        (mcp, targets)
-    };
+    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    let mut mcp_scope_targets = std::collections::BTreeMap::new();
+    if let Some(target) =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, "global")
+        })
+    {
+        let path = target
+            .parent()
+            .map(|parent| parent.join(cockpit_config::config::dirs::MCP_FILE))
+            .unwrap_or(target);
+        let path = canonical_mcp_target_path(&path)?;
+        let revision = mcp_target_layer_revision(&path)?;
+        mcp_scope_targets.insert("global".to_string(), (path, revision));
+    }
+    if let Some(target) =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, "workspace")
+        })
+    {
+        let path = target
+            .parent()
+            .map(|parent| parent.join(cockpit_config::config::dirs::MCP_FILE))
+            .unwrap_or(target);
+        if let Ok(path) = canonical_mcp_target_path(&path)
+            && let Ok(revision) = mcp_target_layer_revision(&path)
+        {
+            mcp_scope_targets.insert("workspace".to_string(), (path, revision));
+        }
+    }
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -22005,18 +22309,12 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
-    let target = if global_config_root(&cwd)? {
-        let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-        crate::config::providers::provider_file_path_for_config(&global, "default")
-            .map_err(internal)?
-    } else {
-        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            ctx.config_source()
-                .config_write_target_for_provider(&cwd, "default")
-        })
-        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
-    };
-    let target = canonical_mcp_target_path(&target)?;
+    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(&cwd, "default")
+    })
+    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = prepare_user_level_write_target(ctx, &target)?;
     if target != capability_target {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -22034,18 +22332,13 @@ async fn stage_and_recover_provider_batch(
                 .map(|delete| delete.provider_id.as_str()),
         )
     {
-        let provider_target = if global_config_root(&cwd)? {
-            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-            crate::config::providers::provider_file_path_for_config(&global, provider_id)
-                .map_err(internal)?
-        } else {
+        let provider_target =
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 ctx.config_source()
                     .config_write_target_for_provider(&cwd, provider_id)
             })
-            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
-        };
-        let provider_target = canonical_mcp_target_path(&provider_target)?;
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+        let provider_target = prepare_user_level_write_target(ctx, &provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
@@ -22506,9 +22799,9 @@ struct RedactedMcpConfigSnapshot {
     revision: String,
 }
 
-/// `Ok(None)` means no Cockpit config layer exists to project MCP state from
-/// (a fresh install); the catalog snapshot then omits the MCP projection
-/// instead of failing the read.
+/// `Ok(None)` means the global config location itself cannot be resolved
+/// (no home/XDG). A fresh install with a resolvable global layer still
+/// returns an empty projection against that always-writable home.
 fn redacted_mcp_config_snapshot(
     ctx: &DaemonContext,
     cwd: &std::path::Path,
@@ -22624,7 +22917,7 @@ fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<Stri
 fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     let body = serde_json::to_string_pretty(&value)?;
-    cockpit_host::private_fs::ensure_parent_dir_private(path)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path)?;
     cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
 }
 
@@ -24466,6 +24759,7 @@ async fn recover_provider_journal_file_bounded(
         _ => return Err(bad_request("provider config journal has an invalid action")),
     };
     let target = action.target().to_path_buf();
+    prepare_user_level_journal_target(ctx, &target)?;
     let vault = ctx.secret_vault.clone();
     let classify_action = action.clone();
     let classify_vault = vault.clone();
@@ -24555,7 +24849,7 @@ fn classify_provider_journal_file(
             ..
         } => (path, consumed_revision, intended_revision),
     };
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     let doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
     let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
     Ok(if actual == *intended {
@@ -24576,7 +24870,7 @@ fn reconcile_provider_journal_file(
                      intended_revision: &str,
                      desired: Option<crate::config::providers::ProvidersConfig>|
      -> std::result::Result<(), ErrorPayload> {
-        cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+        cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
         let mut doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
         let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
         if actual == intended_revision {
@@ -24855,7 +25149,7 @@ async fn provider_config_save_under_lock(
             "provider header secret count does not match headers",
         ));
     }
-    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    let (cwd, trust_policy, config) = daemon_provider_config(ctx, project_root).await?;
     // Reference-only legacy upserts use absence as "unchanged". Resolve that
     // meaning only after whole-layer journal recovery and under the publication
     // lock; doing it in the outer dispatcher can resurrect the credential from
@@ -24954,16 +25248,12 @@ async fn provider_config_save_under_lock(
         .into_iter()
         .filter(|name| !staged_name_set.contains(name))
         .collect::<std::collections::BTreeSet<_>>();
-    let cwd = std::path::PathBuf::from(project_root);
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(internal)?;
     let config_path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
         ctx.config_source()
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-    let config_path = canonical_mcp_target_path(&config_path)?;
+    let config_path = prepare_user_level_write_target(ctx, &config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
         .providers();
@@ -25247,9 +25537,7 @@ async fn save_mcp_config(
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     let cwd = std::path::PathBuf::from(project_root);
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(workspace_trust_error)?;
+    let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
     for (name, value) in &secret_values {
         if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
@@ -25287,7 +25575,7 @@ async fn save_mcp_config(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
-    let path = canonical_mcp_target_path(&path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let authoritative_expected_revision = if let Some(scope) = target_scope {
         let (authorized_path, authorized_revision) =
             capability.mcp_scope_targets.get(scope).ok_or_else(|| {
@@ -25831,7 +26119,7 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
-    cockpit_host::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(&path).map_err(internal)?;
     let commit_path = path.clone();
     let commit_config = config_json_owned.clone();
     let commit_consumed = consumed_revision.clone();
@@ -26691,6 +26979,9 @@ async fn recover_mcp_config_journals_inner(
         );
         let cleanup_only = settlement_phase == "cleanup_pending";
         let path = std::path::PathBuf::from(path);
+        if !cleanup_only {
+            prepare_user_level_journal_target(ctx, &path)?;
+        }
         let reconcile_path = path.clone();
         let reconcile = move || {
             reconcile_mcp_journal_file(
@@ -26755,7 +27046,7 @@ fn reconcile_mcp_journal_file(
     consumed_revision: &str,
     intended_revision: &str,
 ) -> std::result::Result<(), ErrorPayload> {
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     if canonical_mcp_target_path(path)? != path {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -27206,6 +27497,7 @@ fn persist_daemon_provider(
             .config_write_target_for_provider(cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.providers.insert(provider_id.to_string(), entry);
@@ -27240,6 +27532,7 @@ async fn provider_config_delete_under_lock(
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let layer = doc.providers();
     // Only a provider actually owned by this layer can be deleted here.  In
@@ -27366,6 +27659,7 @@ fn persist_provider_layer_metadata(
             .config_write_target_for_provider(cwd, "default")
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.category_defaults = category_defaults;
@@ -27454,7 +27748,7 @@ pub(super) async fn get_inventory_bundle(
     // invert it. Holding both makes policy and provider projection one view.
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.handle.session_id != session_id {
+    if att.handle.session_id() != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27581,7 +27875,7 @@ async fn get_session_setup_snapshot_under_publication(
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.handle.session_id != session_id {
+    if att.handle.session_id() != session_id {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27788,11 +28082,11 @@ pub(super) async fn get_agent_effective_settings(
     let att = require_attached(state)?;
     let _projection = att.handle.read_config_publication().await;
     attached_trust_policy_fenced_to_worker(ctx, att).await?;
-    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let tree_session_id = ensure_agent_tree_attached_session(session_id, &att.handle)?;
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
         ctx,
-        session_id,
+        tree_session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
@@ -27825,7 +28119,7 @@ async fn get_agent_effective_settings_shared(
             message: "workspace trust is being reconciled; retry the settings request".into(),
         });
     }
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -27834,7 +28128,7 @@ async fn get_agent_effective_settings_shared(
     let config = att.handle.config_snapshot();
     let Some(node_ctx) = build_node_override_context(
         ctx,
-        session_id,
+        att.handle().worker_session_id(),
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
@@ -27978,20 +28272,21 @@ pub(super) async fn apply_agent_session_override(
     let att = require_attached(state)?;
     let _projection = att.handle.read_config_publication().await;
     attached_trust_policy_fenced_to_worker(ctx, att).await?;
-    ensure_agent_tree_attached_session(session_id, att.handle.session_id)?;
+    let tree_session_id = ensure_agent_tree_attached_session(session_id, &att.handle)?;
     let config = att.handle.config_snapshot();
     let mut node_ctx = build_node_override_context(
         ctx,
-        session_id,
+        tree_session_id,
         agent_instance_id,
         config.extended.sandbox.default_mode,
     )
     .await?;
     if node_ctx.is_none() {
-        materialize_reserved_root_for_override(ctx, att, session_id, agent_instance_id).await?;
+        materialize_reserved_root_for_override(ctx, att, tree_session_id, agent_instance_id)
+            .await?;
         node_ctx = build_node_override_context(
             ctx,
-            session_id,
+            tree_session_id,
             agent_instance_id,
             config.extended.sandbox.default_mode,
         )
@@ -28025,7 +28320,7 @@ pub(super) async fn apply_agent_session_override(
             resolve_model_override_field(
                 ctx,
                 att,
-                session_id,
+                tree_session_id,
                 node_ctx.installation_id.as_deref(),
                 &node_ctx.model_bindings,
                 &node_ctx.child_model_bindings,
@@ -28052,7 +28347,7 @@ pub(super) async fn apply_agent_session_override(
     let outcome = ctx
         .db
         .apply_agent_session_override(
-            session_id,
+            tree_session_id,
             agent_instance_id,
             expected_override_revision as i64,
             stored_field,
@@ -28150,7 +28445,7 @@ pub(super) async fn get_inventory_bundle_shared(
     let att = require_shared_attached(shared)?;
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -28236,7 +28531,7 @@ async fn get_session_setup_snapshot_shared(
     let att = require_shared_attached(shared)?;
     let _worker_config_publication = att.handle.read_config_publication().await;
     let _authority_publication = super::inventory::read_authority_publication().await;
-    if att.session_id != session_id {
+    if !att.handle().owns_session_id(session_id) {
         return Err(ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: format!("session `{session_id}` is not the attached session"),
@@ -29090,6 +29385,22 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // A durable Assistant owns background work. Promotion is an owner-only
+    // daemon-global effect: a remote collaborator with an agent-read grant
+    // must not flip lifetime, start persistent services, or disable last-
+    // client teardown. The local owner (TUI, ACP/Zed, CLI) promotes this
+    // live process in place rather than restarting or failing against a
+    // busy ephemeral daemon. A pending exit-guard prompt is settled by
+    // the promotion — persistence is the "run in background" outcome.
+    if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.is_ephemeral_lifetime() {
+        if !principal.is_owner() {
+            return Err(authorization_error(
+                "promoting daemon lifetime requires the local owner",
+            ));
+        }
+        ctx.promote_to_persistent(principal).map_err(internal)?;
+        state.exit_guard_reservation = None;
+    }
     // Terminal results for transactions this attach converged. Delivered
     // through the worker below, once a handle exists to stamp the generation.
     let recovered_default_transactions;
@@ -29209,7 +29520,7 @@ pub(super) async fn attach(
             .bind_created_root(
                 &pending.logical_client_id,
                 &pending.client_request_id,
-                proto::CodeRootIdV1(handle.session_id),
+                proto::CodeRootIdV1(handle.session_id()),
             )
             .map_err(code_root_contract_error)?;
     }
@@ -29222,7 +29533,7 @@ pub(super) async fn attach(
     // required to recover/refresh/receipt them. A failure remains pending and
     // does not make an otherwise valid attachment disappear.
     if let Err(error) = recover_retained_defaults_for_attached_worker(ctx, &handle).await {
-        tracing::warn!(%error, session_id = %handle.session_id, "retained default-model recovery remains pending after attach");
+        tracing::warn!(%error, session_id = %handle.session_id(), "retained default-model recovery remains pending after attach");
     }
     // The worker exists now, so any *ambient* transaction this attach
     // converged can be delivered as a correlated terminal result.
@@ -29245,7 +29556,7 @@ pub(super) async fn attach(
     // A per-run daemon can disappear as soon as its client exits. Make the
     // session row durable before returning its id so another daemon process
     // can always find it through the normal DB-backed resume path.
-    if session_id.is_none() && ctx.paths.ephemeral {
+    if session_id.is_none() && ctx.is_ephemeral_lifetime() {
         handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {
@@ -29270,7 +29581,7 @@ pub(super) async fn attach(
     } else {
         None
     };
-    let session_id = handle.session_id;
+    let session_id = handle.session_id();
     // Reuse the worker's attach-time root proof.  Capturing a fresh proof here
     // would permit an A→B→A swap between worker construction and client
     // attachment, leaving setup authorization bound to A while the worker had
@@ -30250,6 +30561,24 @@ fn package_prune_report_json(report: &crate::packages::PackagePruneReport) -> se
     })
 }
 
+fn parse_conversation_rule_source_trust(
+    value: Option<&str>,
+) -> std::result::Result<Option<crate::db::conversation_rules::ConversationRuleSourceTrust>, String>
+{
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("trusted") => Ok(Some(
+            crate::db::conversation_rules::ConversationRuleSourceTrust::Trusted,
+        )),
+        Some("untrusted") => Ok(Some(
+            crate::db::conversation_rules::ConversationRuleSourceTrust::Untrusted,
+        )),
+        Some(other) => Err(format!(
+            "source_trust must be trusted or untrusted (got `{other}`)"
+        )),
+    }
+}
+
 fn pinned_message_to_proto(row: crate::db::pins::PinnedMessage) -> proto::PinnedMessage {
     proto::PinnedMessage {
         seq: row.seq,
@@ -30820,6 +31149,7 @@ pub(super) async fn read_bulk_transfer_chunk(
 pub(super) async fn import_session_archive(
     ctx: &Arc<DaemonContext>,
     transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
+    include_sensitive: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The archive bytes were staged by prior WriteBulkTransferChunk calls; the
     // staging layer verified their length and SHA-256 before releasing them.
@@ -30829,7 +31159,20 @@ pub(super) async fn import_session_archive(
             code: ErrorCode::BadRequest,
             message: format!("invalid session import archive: {error:#}"),
         })?;
-    let result = crate::session::import::import_archive(&ctx.db, archive)
+    // Fail-closed raw gate: an unredacted archive restores raw secret material
+    // into destination events without reconstructable redaction custody, so it
+    // imports only behind the explicit `include_sensitive` acknowledgement (the
+    // import-side mirror of the export side's single raw opt-in).
+    if !archive.redacted && !include_sensitive {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "unredacted session archive: importing it restores raw secret material \
+                      without redaction custody; re-export a redacted archive, or pass \
+                      --include-sensitive to acknowledge importing raw secrets"
+                .to_owned(),
+        });
+    }
+    let result = crate::session::import::import_archive(&ctx.db, archive, include_sensitive)
         .await
         .map_err(internal)?;
     Ok(Response::ImportSessionArchive {
@@ -31305,10 +31648,10 @@ fn agent_tree_cursor_from_wire(
 
 fn ensure_agent_tree_attached_session(
     requested_session_id: Uuid,
-    attached_session_id: Uuid,
-) -> std::result::Result<(), ErrorPayload> {
-    if requested_session_id == attached_session_id {
-        return Ok(());
+    attached: &crate::daemon::session_worker::SessionWorkerHandle,
+) -> std::result::Result<Uuid, ErrorPayload> {
+    if attached.owns_session_id(requested_session_id) {
+        return Ok(attached.worker_session_id());
     }
     Err(ErrorPayload {
         code: ErrorCode::UnknownSession,

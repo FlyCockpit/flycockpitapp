@@ -31,7 +31,7 @@ pub(super) async fn admit_image_ingress(
         return Err(internal("media admission recovery is incomplete"));
     }
     let attached = require_attached(state)?;
-    if attached.handle.session_id != session_id {
+    if attached.handle.session_id() != session_id {
         return Err(bad_request("image ingress session mismatch"));
     }
     let root = attached.handle.project_root.clone();
@@ -639,7 +639,7 @@ pub(super) async fn drain_client_attachment_ownership(
         attached
             .code_root_capability
             .take()
-            .map(|capability| (attached.handle.session_id, capability))
+            .map(|capability| (attached.handle.session_id(), capability))
     }) {
         crate::sync::lock_or_recover(&ctx.code_root_authority)
             .close(&capability)
@@ -871,7 +871,7 @@ pub(super) fn begin_attachment_upload_with_limits(
 ) -> std::result::Result<Response, ErrorPayload> {
     let session_id = match purpose {
         proto::AttachmentPurpose::UserMessageImage => {
-            Some(require_attached(state)?.handle.session_id)
+            Some(require_attached(state)?.handle.session_id())
         }
     };
     if mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
@@ -1022,7 +1022,7 @@ pub(super) async fn begin_attachment_upload_admitted(
         |attached| {
             (
                 attached.handle.project_id(),
-                attached.handle.session_id.to_string(),
+                attached.handle.session_id().to_string(),
             )
         },
     );

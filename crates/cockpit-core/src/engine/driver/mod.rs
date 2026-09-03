@@ -898,6 +898,10 @@ pub struct AgentSession {
     pub(crate) computer_coordinator_config:
         Option<crate::computer::NativeComputerCoordinatorConfig>,
     pub pending_computer_continuations: Vec<serde_json::Value>,
+    /// Human denial of this frame's computer path. Lives for the
+    /// delegation's lifetime so a failed or deferred coordinator
+    /// replacement cannot reopen a denied path.
+    pub(crate) computer_ask_denial: Option<String>,
     /// Durable lifecycle identity for this concrete executor.  Agent display
     /// names are intentionally not used as identity: several task children can
     /// share one definition name concurrently.
@@ -2107,6 +2111,7 @@ impl Driver {
             mut contract,
             mut coordinator_config,
             mut pending,
+            mut sticky_ask_denial,
         ) = {
             let Some(frame) = self.stack.last_mut() else {
                 return Ok(());
@@ -2122,9 +2127,10 @@ impl Driver {
                 frame.computer_contract.take(),
                 frame.computer_coordinator_config.take(),
                 std::mem::take(&mut frame.pending_computer_continuations),
+                frame.computer_ask_denial.take(),
             )
         };
-        computer_native::reconcile_native_computer_for_delegation(
+        let result = computer_native::reconcile_native_computer_for_delegation(
             &mut agent,
             &self.session,
             self.approver.clone(),
@@ -2133,15 +2139,19 @@ impl Driver {
             &mut contract,
             &mut coordinator_config,
             &mut pending,
+            &mut sticky_ask_denial,
         )
-        .await?;
+        .await;
+        // Write the slot back even when replacement fails: sticky Ask denial
+        // must survive the gap until a later turn opens a successor.
         let frame = self.stack.last_mut().expect("stack nonempty");
         frame.agent = Arc::new(agent);
         frame.computer_coordinator = coordinator;
         frame.computer_contract = contract;
         frame.computer_coordinator_config = coordinator_config;
         frame.pending_computer_continuations = pending;
-        Ok(())
+        frame.computer_ask_denial = sticky_ask_denial;
+        result
     }
 
     /// Build the Driver authority used by a detached/nested turn loop to drain
@@ -2314,6 +2324,7 @@ impl Driver {
                     computer_contract: frame.computer_contract,
                     computer_coordinator_config: frame.computer_coordinator_config,
                     pending_computer_continuations: Vec::new(),
+                    computer_ask_denial: frame.computer_ask_denial.clone(),
                     agent_instance_id: frame.agent_instance_id,
                     endpoint_generation: frame.endpoint_generation,
                     history: frame.history.clone(),
@@ -2721,6 +2732,7 @@ impl Driver {
                 computer_contract: None,
                 computer_coordinator_config: None,
                 pending_computer_continuations: Vec::new(),
+                computer_ask_denial: None,
                 agent_instance_id: None,
                 endpoint_generation: None,
                 history: Vec::new(),
@@ -4541,6 +4553,7 @@ impl Driver {
             computer_contract: None,
             computer_coordinator_config: None,
             pending_computer_continuations: Vec::new(),
+            computer_ask_denial: None,
             agent_instance_id: Some(recovery.agent_instance_id),
             endpoint_generation: Some(endpoint_generation),
             history,
@@ -14871,6 +14884,7 @@ impl Driver {
                         computer_contract: None,
                         computer_coordinator_config: None,
                         pending_computer_continuations: Vec::new(),
+                        computer_ask_denial: None,
                         agent_instance_id: Some(child_agent_instance_id),
                         endpoint_generation: Some(endpoint_generation),
                         history: snapshot_history,

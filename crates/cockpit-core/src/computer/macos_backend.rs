@@ -12,17 +12,25 @@ use async_trait::async_trait;
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent, CGEventField, CGEventFlags,
-    CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMainDisplayID,
-    CGMouseButton, CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess, CGScrollEventUnit,
+    CGEventSource, CGEventSourceStateID, CGEventType, CGMainDisplayID, CGMouseButton,
+    CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess, CGScrollEventUnit,
 };
 
 use super::{
-    CaptureFrame, ComputerActionOutcome, ComputerBackend, ComputerError, DisplayGeometry,
-    DisplayTarget, Easing, Modifiers, MouseButton, NormalizedComputerAction,
-    NormalizedComputerEffect, PixelPoint, PixelRect, PixelSize, RealDesktopGrantStore, ScaleFactor,
+    CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW, CaptureFrame, ComputerActionOutcome, ComputerBackend,
+    ComputerError, DisplayGeometry, DisplayTarget, EVIDENCED_WINDOW_MISMATCH, Easing, Modifiers,
+    MouseButton, NormalizedComputerAction, NormalizedComputerEffect, PixelPoint, PixelRect,
+    PixelSize, RealDesktopGrantStore, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, ScaleFactor,
     click_repetitions, eased_progress, scale_png,
 };
-use crate::computer::target::BackendKind;
+use crate::computer::platform::{
+    MacAddressedInjection, MacFocusedWindowWitness, MacLiveFocusedWindow, MacosAxDeliveryError,
+    MacosAxWindowDelivery, address_macos_injection_window, ax_window_element_is_live,
+    deliver_to_authenticated_ax_window, live_focused_macos_injection_target,
+    macos_injection_target_from_opaque, macos_window_identity_from_opaque,
+    restore_macos_injection_target,
+};
+use crate::computer::target::{BackendKind, OpaqueWindowId};
 
 const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
 const MOVE_STEPS: u32 = 12;
@@ -39,6 +47,16 @@ pub(super) struct MacOsComputerBackend {
     outstanding_buttons: HashSet<MouseButton>,
     physical_capability: Option<super::coordinator::PhysicalDispatchCapability>,
     input_authority: MacHostInputAuthority,
+    evidenced_window: Option<EvidencedMacWindow>,
+    cleanup_window: Option<OpaqueWindowId>,
+}
+
+#[derive(Debug, Clone)]
+struct EvidencedMacWindow {
+    opaque: OpaqueWindowId,
+    pid: u32,
+    window_number: u32,
+    ax: MacFocusedWindowWitness,
 }
 
 // CoreGraphics' immutable event source is safe to retain behind the backend's
@@ -88,6 +106,10 @@ impl MacOsComputerBackend {
                 )
             })?;
         let input_authority = MacHostInputAuthority::open(&active_console_session)?;
+        let cleanup_window = input_authority
+            .state
+            .window
+            .map(crate::computer::target::OpaqueWindowId::from_bytes);
         Ok(Self {
             source,
             geometry: query_geometry()?,
@@ -96,6 +118,8 @@ impl MacOsComputerBackend {
             outstanding_keys: input_authority.state.keys.iter().copied().collect(),
             outstanding_buttons: input_authority.state.buttons.iter().copied().collect(),
             input_authority,
+            evidenced_window: None,
+            cleanup_window,
         })
     }
 
@@ -144,6 +168,7 @@ impl MacOsComputerBackend {
         point: CGPoint,
         flags: CGEventFlags,
         click_state: i64,
+        require_live_window: bool,
     ) -> Result<(), ComputerError> {
         let event =
             CGEvent::new_mouse_event(Some(&self.source), event_type, point, cg_button(button))
@@ -167,6 +192,7 @@ impl MacOsComputerBackend {
                 | CGEventType::OtherMouseUp => Some(InputTransition::ButtonUp(button)),
                 _ => None,
             },
+            require_live_window,
         )
     }
 
@@ -200,6 +226,7 @@ impl MacOsComputerBackend {
                 point,
                 CGEventFlags::empty(),
                 0,
+                true,
             )?;
             if !delay.is_zero() {
                 std::thread::sleep(delay);
@@ -213,6 +240,7 @@ impl MacOsComputerBackend {
         code: u16,
         down: bool,
         flags: CGEventFlags,
+        require_live_window: bool,
     ) -> Result<(), ComputerError> {
         let event = CGEvent::new_keyboard_event(Some(&self.source), code, down)
             .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
@@ -224,6 +252,7 @@ impl MacOsComputerBackend {
             } else {
                 InputTransition::KeyUp(code)
             }),
+            require_live_window,
         )
     }
 
@@ -242,18 +271,73 @@ impl MacOsComputerBackend {
             unsafe {
                 CGEvent::keyboard_set_unicode_string(Some(&down), string_length, chunk.as_ptr());
             }
-            self.post_event(&down, Some(InputTransition::KeyDown(0)))?;
+            self.post_event(&down, Some(InputTransition::KeyDown(0)), true)?;
             let up = CGEvent::new_keyboard_event(Some(&self.source), 0, false)
                 .ok_or_else(|| cg_null("CGEventCreateKeyboardEvent"))?;
-            self.post_event(&up, Some(InputTransition::KeyUp(0)))?;
+            self.post_event(&up, Some(InputTransition::KeyUp(0)), true)?;
         }
         Ok(())
+    }
+
+    fn require_evidenced_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
+        self.evidenced_window.clone().ok_or_else(|| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })
+    }
+
+    fn held_input_window_bytes(&self) -> Option<[u8; 16]> {
+        self.evidenced_window
+            .as_ref()
+            .map(|window| *window.opaque.as_bytes())
+            .or_else(|| self.cleanup_window.map(|window| *window.as_bytes()))
+    }
+
+    fn require_live_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
+        let bound = self.require_evidenced_window()?;
+        let live = live_focused_macos_injection_target()
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        if live.window
+            != (MacLiveFocusedWindow {
+                pid: bound.pid,
+                window_number: bound.window_number,
+            })
+            || !bound.ax.same_element(live.ax.element())
+        {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        address_macos_injection_window(&bound.ax, &bound.opaque)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        Ok(bound)
+    }
+
+    fn require_cleanup_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
+        if let Some(bound) = self.evidenced_window.clone() {
+            if ax_window_element_is_live(bound.ax.element()) {
+                return Ok(bound);
+            }
+        }
+        let opaque = self.cleanup_window.ok_or_else(|| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })?;
+        let live = restore_macos_injection_target(&opaque)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        Ok(EvidencedMacWindow {
+            opaque,
+            pid: live.window.pid,
+            window_number: live.window.window_number,
+            ax: live.ax,
+        })
     }
 
     fn execute_action(
         &mut self,
         action: &NormalizedComputerAction,
     ) -> Result<ComputerActionOutcome, ComputerError> {
+        if action.effect().injects_synthetic_input() {
+            self.require_evidenced_window()?;
+        }
         match action.effect() {
             NormalizedComputerEffect::CaptureFull => {
                 Ok(ComputerActionOutcome::Captured(CaptureFrame {
@@ -303,6 +387,7 @@ impl MacOsComputerBackend {
                         point,
                         flags,
                         i64::from(click),
+                        true,
                     )?;
                     self.post_mouse(
                         mouse_up_type(*button),
@@ -310,6 +395,7 @@ impl MacOsComputerBackend {
                         point,
                         flags,
                         i64::from(click),
+                        true,
                     )?;
                 }
                 Ok(ComputerActionOutcome::Completed)
@@ -321,6 +407,7 @@ impl MacOsComputerBackend {
                     self.cursor()?,
                     CGEventFlags::empty(),
                     1,
+                    true,
                 )?;
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -331,6 +418,7 @@ impl MacOsComputerBackend {
                     self.cursor()?,
                     CGEventFlags::empty(),
                     1,
+                    true,
                 )?;
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -342,11 +430,25 @@ impl MacOsComputerBackend {
                 let first = path[0];
                 self.move_cursor(first.point, first.duration, first.easing, None)?;
                 let flags = modifier_flags(*modifiers);
-                self.post_mouse(mouse_down_type(*button), *button, self.cursor()?, flags, 1)?;
+                self.post_mouse(
+                    mouse_down_type(*button),
+                    *button,
+                    self.cursor()?,
+                    flags,
+                    1,
+                    true,
+                )?;
                 for step in path.iter().skip(1) {
                     self.move_cursor(step.point, step.duration, step.easing, Some(*button))?;
                 }
-                self.post_mouse(mouse_up_type(*button), *button, self.cursor()?, flags, 1)?;
+                self.post_mouse(
+                    mouse_up_type(*button),
+                    *button,
+                    self.cursor()?,
+                    flags,
+                    1,
+                    true,
+                )?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::TypeText { text } => {
@@ -362,10 +464,10 @@ impl MacOsComputerBackend {
                 }
                 let flags = flags_for_macos_key_codes(&codes);
                 for code in &codes {
-                    self.post_key(*code, true, flags)?;
+                    self.post_key(*code, true, flags, true)?;
                 }
                 for code in codes.iter().rev() {
-                    self.post_key(*code, false, flags)?;
+                    self.post_key(*code, false, flags, true)?;
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -373,9 +475,9 @@ impl MacOsComputerBackend {
                 let code = key.macos_key_code().ok_or_else(|| {
                     ComputerError::Refused("unsupported macOS key identity".to_string())
                 })?;
-                self.post_key(code, true, flags_for_macos_key_codes(&[code]))?;
+                self.post_key(code, true, flags_for_macos_key_codes(&[code]), true)?;
                 std::thread::sleep(*duration);
-                self.post_key(code, false, CGEventFlags::empty())?;
+                self.post_key(code, false, CGEventFlags::empty(), true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::Scroll {
@@ -393,7 +495,7 @@ impl MacOsComputerBackend {
                 )
                 .ok_or_else(|| cg_null("CGEventCreateScrollWheelEvent2"))?;
                 CGEvent::set_flags(Some(&event), modifier_flags(*modifiers));
-                self.post_event(&event, None)?;
+                self.post_event(&event, None, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::Wait { duration } => {
@@ -404,12 +506,14 @@ impl MacOsComputerBackend {
     }
 
     /// Sole irreversible CoreGraphics post primitive. Every event, including
-    /// cleanup releases and later-added scroll/Unicode paths, must pass the
-    /// retained active-console-session rebound immediately before posting.
+    /// cleanup releases, must pass the retained active-console-session rebound
+    /// and then be addressed through the retained AX window object.
+    /// [`deliver_to_authenticated_ax_window`] is the object-identity fence.
     fn post_event(
         &mut self,
         event: &CGEvent,
         transition: Option<InputTransition>,
+        require_live_window: bool,
     ) -> Result<(), ComputerError> {
         let prepared = transition
             .map(|transition| self.input_authority.prepare(transition))
@@ -437,7 +541,40 @@ impl MacOsComputerBackend {
         if let Err(error) = capability_check {
             return self.rollback_known_pre_post_refusal(prepared, error);
         }
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        let bound = if require_live_window {
+            match self.require_live_injection_window() {
+                Ok(bound) => bound,
+                Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
+            }
+        } else {
+            match self.require_cleanup_injection_window() {
+                Ok(bound) => bound,
+                Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
+            }
+        };
+        let mut delivery = LiveAxDelivery {
+            event,
+            witness: &bound.ax,
+            opaque: &bound.opaque,
+        };
+        match deliver_to_authenticated_ax_window(&mut delivery, bound.opaque) {
+            Ok(()) => {}
+            Err(MacosAxDeliveryError::AmbiguousDelivery) => {
+                return Err(ambiguous_ax_delivery());
+            }
+            Err(MacosAxDeliveryError::MissingWindowLocationSetter) => {
+                return self.rollback_known_pre_post_refusal(
+                    prepared,
+                    ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string()),
+                );
+            }
+            Err(_) => {
+                return self.rollback_known_pre_post_refusal(
+                    prepared,
+                    ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()),
+                );
+            }
+        }
 
         // From the post onward this backend owns the transition even if the
         // commit write fails. Update process-local cleanup ownership first;
@@ -459,10 +596,18 @@ impl MacOsComputerBackend {
             None => {}
         }
         if transition.is_some() {
-            self.input_authority
-                .commit(&self.outstanding_keys, &self.outstanding_buttons)?;
+            self.input_authority.commit(
+                &self.outstanding_keys,
+                &self.outstanding_buttons,
+                self.held_input_window_bytes(),
+            )?;
         }
-        Ok(())
+        let identity_after = if require_live_window {
+            self.require_live_injection_window()
+        } else {
+            self.require_cleanup_injection_window()
+        };
+        identity_after.map(|_| ())
     }
 
     /// A refusal before the raw post is a known non-effect. Restore the exact
@@ -503,6 +648,10 @@ struct MacHostInputState {
     pending: bool,
     keys: Vec<u16>,
     buttons: Vec<MouseButton>,
+    /// Opaque window identity that received the matching downs. Cleanup must
+    /// address this object; a missing identity with leftover keys fails closed.
+    #[serde(default)]
+    window: Option<[u8; 16]>,
 }
 
 /// Protected host-wide authority for exact Cockpit-owned down transitions.
@@ -550,6 +699,7 @@ impl MacHostInputAuthority {
                 pending: false,
                 keys: Vec::new(),
                 buttons: Vec::new(),
+                window: None,
             };
             let bytes = serde_json::to_vec(&initial).map_err(authority_unavailable)?;
             let mut create = std::fs::OpenOptions::new();
@@ -579,6 +729,11 @@ impl MacHostInputAuthority {
             serde_json::from_slice(&bytes).map_err(authority_unavailable)?;
         if state.version != 1
             || state.pending
+            || !super::platform::macos::mac_held_input_identity_is_complete(
+                &state.keys,
+                !state.buttons.is_empty(),
+                state.window,
+            )
             || ((state.owner_uid, state.console_set, state.audit_session_id)
                 != (owner_uid, console_set, audit_session_id)
                 && (!state.keys.is_empty() || !state.buttons.is_empty()))
@@ -626,6 +781,7 @@ impl MacHostInputAuthority {
         &mut self,
         keys: &HashSet<u16>,
         buttons: &HashSet<MouseButton>,
+        window: Option<[u8; 16]>,
     ) -> Result<(), ComputerError> {
         self.state.keys = keys.iter().copied().collect();
         self.state.keys.sort_unstable();
@@ -635,6 +791,20 @@ impl MacHostInputAuthority {
             MouseButton::Right => 1,
             MouseButton::Middle => 2,
         });
+        self.state.window = if self.state.keys.is_empty() && self.state.buttons.is_empty() {
+            None
+        } else {
+            window
+        };
+        if !super::platform::macos::mac_held_input_identity_is_complete(
+            &self.state.keys,
+            !self.state.buttons.is_empty(),
+            self.state.window,
+        ) {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
         self.state.pending = false;
         self.store()
     }
@@ -768,9 +938,34 @@ impl ComputerBackend for MacOsComputerBackend {
         self.input_authority = MacHostInputAuthority::open(&self.active_console_session)?;
         self.outstanding_keys = self.input_authority.state.keys.iter().copied().collect();
         self.outstanding_buttons = self.input_authority.state.buttons.iter().copied().collect();
+        if let Some(bytes) = self.input_authority.state.window {
+            self.cleanup_window = Some(OpaqueWindowId::from_bytes(bytes));
+        }
+        if self.evidenced_window.is_none()
+            && let Some(opaque) = self.cleanup_window
+        {
+            let live = restore_macos_injection_target(&opaque)
+                .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+            self.evidenced_window = Some(EvidencedMacWindow {
+                opaque,
+                pid: live.window.pid,
+                window_number: live.window.window_number,
+                ax: live.ax,
+            });
+        }
+        if self.evidenced_window.is_none()
+            && (!self.outstanding_keys.is_empty() || !self.outstanding_buttons.is_empty())
+        {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
         let keys: Vec<_> = self.outstanding_keys.iter().copied().collect();
         for code in keys {
-            self.post_key(code, false, CGEventFlags::empty())?;
+            // Releases stay addressed to the evidenced window even if focus
+            // has moved: a live-window refusal would leave keys down in the
+            // window that received the matching downs.
+            self.post_key(code, false, CGEventFlags::empty(), false)?;
         }
         let cursor = self.cursor()?;
         let buttons: Vec<_> = self.outstanding_buttons.iter().copied().collect();
@@ -781,6 +976,7 @@ impl ComputerBackend for MacOsComputerBackend {
                 cursor,
                 CGEventFlags::empty(),
                 1,
+                false,
             )?;
         }
         Ok(())
@@ -793,6 +989,40 @@ impl ComputerBackend for MacOsComputerBackend {
         capability.recheck(BackendKind::RealDesktopMacOs)?;
         self.physical_capability = Some(capability);
         Ok(())
+    }
+
+    fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
+        if let Some(bound) = &self.evidenced_window
+            && bound.opaque == window
+        {
+            return self.require_live_injection_window().map(|_| ());
+        }
+        let (pid, window_number) =
+            macos_injection_target_from_opaque(&window).ok_or_else(|| {
+                ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string())
+            })?;
+        let live = live_focused_macos_injection_target()
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        if live.window != (MacLiveFocusedWindow { pid, window_number }) {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        self.evidenced_window = Some(EvidencedMacWindow {
+            opaque: window,
+            pid,
+            window_number,
+            ax: live.ax,
+        });
+        self.cleanup_window = Some(window);
+        self.require_live_injection_window().map(|_| ())
+    }
+
+    fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
+        if self.evidenced_window.is_none() {
+            return Ok(());
+        }
+        self.require_live_injection_window().map(|_| ())
     }
 }
 
@@ -874,6 +1104,139 @@ fn command_error(program: &str, error: impl std::fmt::Display) -> ComputerError 
 
 fn cg_null(program: &str) -> ComputerError {
     command_error(program, "CoreGraphics returned null")
+}
+
+/// AppKit's `NSEvent.windowNumber` destination, carried on the CGEvent record
+/// (`CGSEventRecord.window`). Distinct from the public
+/// `kCGMouseEventWindowUnderMousePointer` annotation, which is not a destination.
+const EVENT_DESTINATION_WINDOW_NUMBER: CGEventField = CGEventField(55);
+
+const AMBIGUOUS_AX_WINDOW_DELIVERY: &str = "macOS window-addressed CGEvent post could not re-authenticate the retained AX window; delivery is uncertain";
+
+fn ambiguous_ax_delivery() -> ComputerError {
+    ComputerError::CommandFailed {
+        program: "macos computer backend".to_string(),
+        detail: AMBIGUOUS_AX_WINDOW_DELIVERY.to_string(),
+    }
+}
+
+/// Delivery host whose irreversible post takes the retained AX window as the
+/// operand. Pid and CGWindowID are re-read from that object at post time.
+struct LiveAxDelivery<'a> {
+    event: &'a CGEvent,
+    witness: &'a MacFocusedWindowWitness,
+    opaque: &'a crate::computer::target::OpaqueWindowId,
+}
+
+impl MacosAxWindowDelivery for LiveAxDelivery<'_> {
+    fn ax_is_live(&self) -> bool {
+        ax_window_element_is_live(self.witness.element())
+    }
+
+    fn resolve_from_ax(
+        &self,
+    ) -> Result<
+        (
+            u32,
+            u32,
+            [u8; crate::computer::platform::macos::MACOS_WINDOW_GENERATION_LEN],
+            (f64, f64),
+        ),
+        MacosAxDeliveryError,
+    > {
+        let addressed = address_macos_injection_window(self.witness, self.opaque)
+            .map_err(macos_address_error)?;
+        let (_, _, generation) = macos_window_identity_from_opaque(self.opaque)
+            .ok_or(MacosAxDeliveryError::QueryMismatch)?;
+        let pid = u32::try_from(addressed.pid).map_err(|_| MacosAxDeliveryError::QueryMismatch)?;
+        Ok((
+            pid,
+            addressed.window_number,
+            generation,
+            (addressed.origin.x, addressed.origin.y),
+        ))
+    }
+
+    fn window_location_setter_available(&self) -> bool {
+        cg_event_set_window_location().is_some()
+    }
+
+    fn post_to_held_ax(&mut self) -> Result<(), MacosAxDeliveryError> {
+        let addressed = address_macos_injection_window(self.witness, self.opaque)
+            .map_err(macos_address_error)?;
+        stamp_event_window_destination(self.event, addressed)?;
+        CGEvent::post_to_pid(addressed.pid, Some(self.event));
+        Ok(())
+    }
+}
+
+fn macos_address_error(
+    reason: crate::computer::target::TargetUnavailableReason,
+) -> MacosAxDeliveryError {
+    match reason {
+        crate::computer::target::TargetUnavailableReason::QueryMismatch => {
+            MacosAxDeliveryError::QueryMismatch
+        }
+        crate::computer::target::TargetUnavailableReason::MissingCapability => {
+            // `address_macos_injection_window` only surfaces this when
+            // `CGWindowListCopyWindowInfo` is unavailable, not when the
+            // window-local location setter is missing.
+            MacosAxDeliveryError::QueryMismatch
+        }
+        _ => MacosAxDeliveryError::StaleTarget,
+    }
+}
+
+fn stamp_event_window_destination(
+    event: &CGEvent,
+    addressed: MacAddressedInjection,
+) -> Result<(), MacosAxDeliveryError> {
+    let Some(set_location) = cg_event_set_window_location() else {
+        return Err(MacosAxDeliveryError::MissingWindowLocationSetter);
+    };
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::EventTargetUnixProcessID,
+        i64::from(addressed.pid),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        EVENT_DESTINATION_WINDOW_NUMBER,
+        i64::from(addressed.window_number),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::MouseEventWindowUnderMousePointer,
+        i64::from(addressed.window_number),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+        i64::from(addressed.window_number),
+    );
+    let screen = CGEvent::location(Some(event));
+    let local = CGPoint::new(screen.x - addressed.origin.x, screen.y - addressed.origin.y);
+    // SAFETY: `event` is a live CGEvent; the setter writes the window-local
+    // point AppKit uses to route inside the authenticated window object.
+    unsafe { set_location(std::ptr::from_ref(event).cast(), local) };
+    Ok(())
+}
+
+type CgEventSetWindowLocationFn =
+    unsafe extern "C" fn(event: *const std::ffi::c_void, point: CGPoint);
+
+fn cg_event_set_window_location() -> Option<CgEventSetWindowLocationFn> {
+    static CACHED: std::sync::OnceLock<Option<CgEventSetWindowLocationFn>> =
+        std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        const RTLD_DEFAULT: *mut std::ffi::c_void = (-2_isize) as *mut std::ffi::c_void;
+        let ptr = unsafe { libc::dlsym(RTLD_DEFAULT, c"CGEventSetWindowLocation".as_ptr()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(ptr) })
+        }
+    })
 }
 
 fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {

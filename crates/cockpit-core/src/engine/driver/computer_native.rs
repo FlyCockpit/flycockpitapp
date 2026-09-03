@@ -135,14 +135,33 @@ pub(crate) async fn open_native_computer_for_delegation(
     };
     let owner_instance = crate::computer::coordinator::OwnerInstance(u64::from(std::process::id()));
     let (target_adapter, host_arbiter) = match candidate.target {
-        crate::computer::DisplayTarget::Virtual => (
-            Box::new(
-                crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
-                    *uuid::Uuid::new_v4().as_bytes(),
-                ),
-            ) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
-            None,
-        ),
+        crate::computer::DisplayTarget::Virtual => {
+            let display_id = *uuid::Uuid::new_v4().as_bytes();
+            let adapter = {
+                #[cfg(target_os = "linux")]
+                {
+                    match backend.x11_display_name() {
+                        Some(display) => {
+                            crate::computer::coordinator::VirtualTargetEvidenceAdapter::with_x11_display(
+                                display_id,
+                                display.to_string(),
+                            )
+                        }
+                        None => crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
+                            display_id,
+                        ),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(display_id)
+                }
+            };
+            (
+                Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                None,
+            )
+        }
         crate::computer::DisplayTarget::RealDesktop => {
             #[cfg(target_os = "linux")]
             {
@@ -277,6 +296,7 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     contract: &mut Option<ComputerToolContract>,
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
+    sticky_ask_denial: &mut Option<String>,
 ) -> anyhow::Result<()> {
     let session = Arc::clone(session);
     reconcile_native_computer_for_delegation_with_opener(
@@ -285,6 +305,7 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
         contract,
         coordinator_config,
         pending_continuations,
+        sticky_ask_denial,
         &mut move |agent| {
             let session = Arc::clone(&session);
             let approver = approver.clone();
@@ -310,6 +331,7 @@ async fn reconcile_native_computer_for_delegation_with_opener(
     contract: &mut Option<ComputerToolContract>,
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
+    sticky_ask_denial: &mut Option<String>,
     opener: &mut impl for<'a> FnMut(
         &'a mut Agent,
     )
@@ -334,6 +356,18 @@ async fn reconcile_native_computer_for_delegation_with_opener(
     );
     if retained_is_compatible {
         return Ok(());
+    }
+
+    // Ask denial is a delegation-lifetime fact. Capture it into the driver
+    // slot before `take`/`close`/`Drop` so a failed or deferred replacement
+    // still inherits it when a later reconciliation opens a successor.
+    // Installed leases and pending waits die with `close` (fail-closed: the
+    // next action re-prompts unless this sticky denial forbids it).
+    if let Some(reason) = coordinator
+        .as_ref()
+        .and_then(ComputerActionCoordinator::terminal_denial)
+    {
+        *sticky_ask_denial = Some(reason.to_string());
     }
 
     if let Some(mut previous) = coordinator.take() {
@@ -378,7 +412,10 @@ async fn reconcile_native_computer_for_delegation_with_opener(
     }
 
     let opened = opener(agent).await?;
-    if let Some(opened) = opened {
+    if let Some(mut opened) = opened {
+        if let Some(reason) = sticky_ask_denial.clone() {
+            opened.inherit_terminal_denial(reason);
+        }
         let opened_config = agent
             .params
             .native_computer
@@ -740,13 +777,19 @@ pub fn into_wire_items(continuations: Vec<NativeComputerContinuation>) -> Vec<se
 mod tests {
     use super::*;
     use crate::computer::coordinator::{
-        ComputerApprovalTier, ComputerAuthorizer, CoordinatorParams, DelegationId,
-        FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance, ProviderId,
+        ComputerApprovalTier, ComputerAuthorizer, CoordinatedOutcome, CoordinatorParams,
+        DelegationId, FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance,
+        ProviderId,
+    };
+    use crate::computer::target::{
+        EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence, OpaqueWindowId,
+        sample_virtual_evidence,
     };
     use crate::computer::{
         ComputerActionOutcome, ComputerBackend, ComputerToolContract, DisplayGeometry,
         DisplayTarget, LogicalSize, NativeComputerCoordinatorConfig, NativeComputerToolConfig,
-        NormalizedComputerAction, NormalizedComputerEffect, PixelSize, ScaleFactor,
+        NormalizedComputerAction, NormalizedComputerEffect, OpenAiComputerAction, PixelSize,
+        ScaleFactor,
     };
     use async_trait::async_trait;
     use std::sync::{
@@ -912,24 +955,39 @@ mod tests {
         }
     }
 
-    async fn make_coordinator() -> ComputerActionCoordinator {
-        let authorizer: Arc<dyn ComputerAuthorizer> =
-            Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = Box::new(CapturingFakeBackend::new());
-        let params = CoordinatorParams {
+    fn virtual_window_evidence() -> crate::computer::target::TargetIdentityEvidence {
+        let mut evidence = sample_virtual_evidence([0xAA; 16], 1);
+        evidence.focus_generation = 1;
+        evidence.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0x11; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        evidence
+    }
+
+    fn yolo_params(authorizer: Arc<dyn ComputerAuthorizer>) -> CoordinatorParams {
+        CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: None,
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                virtual_window_evidence(),
+            ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
-        };
-        ComputerActionCoordinator::open(backend, params)
+        }
+    }
+
+    async fn make_coordinator() -> ComputerActionCoordinator {
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = Box::new(CapturingFakeBackend::new());
+        ComputerActionCoordinator::open(backend, yolo_params(authorizer))
             .await
             .expect("coordinator open")
     }
@@ -943,20 +1001,7 @@ mod tests {
             inner: CapturingFakeBackend::new(),
             releases,
         });
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: None,
-            target_adapter: None,
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-4o".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        ComputerActionCoordinator::open(backend, params)
+        ComputerActionCoordinator::open(backend, yolo_params(authorizer))
             .await
             .expect("coordinator open")
     }
@@ -969,6 +1014,62 @@ mod tests {
         Box::pin(async move {
             opens.fetch_add(1, Ordering::SeqCst);
             Ok(Some(make_release_counting_coordinator(releases).await))
+        })
+    }
+
+    async fn make_ask_test_coordinator(
+        authorizer: Arc<FakeComputerAuthorizer>,
+    ) -> ComputerActionCoordinator {
+        let mut evidence = crate::computer::target::sample_virtual_evidence([0xAA; 16], 1);
+        evidence.focus_generation = 1;
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: Some(Box::new(
+                crate::computer::target::FakeTargetEvidenceAdapter::new(evidence),
+            )),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-4o".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        ComputerActionCoordinator::open(Box::new(CapturingFakeBackend::new()), params)
+            .await
+            .expect("ask coordinator open")
+    }
+
+    fn panicking_opener<'a>(
+        _agent: &'a mut Agent,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(async {
+            panic!("opener must not run when replacement is deferred before backend construction")
+        })
+    }
+
+    fn none_opener<'a>(
+        _agent: &'a mut Agent,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn error_opener<'a>(
+        _agent: &'a mut Agent,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(async { anyhow::bail!("backend unavailable") })
+    }
+
+    fn open_ask_test_coordinator<'a>(
+        _agent: &'a mut Agent,
+        authorizer: Arc<FakeComputerAuthorizer>,
+        opens: Arc<AtomicUsize>,
+    ) -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>> {
+        Box::pin(async move {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(make_ask_test_coordinator(authorizer).await))
         })
     }
 
@@ -1246,6 +1347,7 @@ mod tests {
                 "type": "computer_call_output",
                 "call_id": "stale-call"
             })];
+            let mut sticky_ask_denial = None;
             let opens = Arc::new(AtomicUsize::new(0));
             let mut opener: Box<
                 dyn for<'a> FnMut(
@@ -1272,6 +1374,7 @@ mod tests {
                 &mut contract,
                 &mut coordinator_config,
                 &mut pending_continuations,
+                &mut sticky_ask_denial,
                 &mut opener,
             )
             .await
@@ -1314,6 +1417,267 @@ mod tests {
                 .await
                 .expect("replacement coordinator closes");
             assert_eq!(reopened_releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_inherits_terminal_ask_denial_onto_replacement() {
+        let initial = NativeComputerToolConfig {
+            contract: ComputerToolContract::OpenAiResponses,
+            target: DisplayTarget::Virtual,
+            require_backend: false,
+            geometry: None,
+            approval_required: false,
+        };
+        let mut agent = test_agent_with_native_geometry(None);
+        agent.params.native_computer = Some(NativeComputerToolConfig {
+            approval_required: true,
+            ..initial.clone()
+        });
+        let original_releases = Arc::new(AtomicUsize::new(0));
+        let reopened_releases = Arc::new(AtomicUsize::new(0));
+        let mut coordinator =
+            Some(make_release_counting_coordinator(Arc::clone(&original_releases)).await);
+        coordinator
+            .as_mut()
+            .expect("original coordinator")
+            .inherit_terminal_denial("policy blocks".to_string());
+        let mut contract = Some(initial.contract);
+        let mut coordinator_config = Some(initial.coordinator_config());
+        let mut pending_continuations = Vec::new();
+        let mut sticky_ask_denial = None;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut opener: Box<
+            dyn for<'a> FnMut(
+                &'a mut Agent,
+            )
+                -> BoxFuture<'a, anyhow::Result<Option<ComputerActionCoordinator>>>,
+        > = Box::new({
+            let opens = Arc::clone(&opens);
+            let reopened_releases = Arc::clone(&reopened_releases);
+            move |agent| {
+                open_release_counting_coordinator(
+                    agent,
+                    Arc::clone(&opens),
+                    Arc::clone(&reopened_releases),
+                )
+            }
+        });
+
+        reconcile_native_computer_for_delegation_with_opener(
+            &mut agent,
+            &mut coordinator,
+            &mut contract,
+            &mut coordinator_config,
+            &mut pending_continuations,
+            &mut sticky_ask_denial,
+            &mut opener,
+        )
+        .await
+        .expect("denied coordinator still reconciles");
+        assert_eq!(
+            sticky_ask_denial.as_deref(),
+            Some("policy blocks"),
+            "driver slot must retain sticky Ask denial after a successful replacement"
+        );
+
+        let replacement = coordinator.as_ref().expect("replacement coordinator");
+        assert_eq!(
+            replacement.terminal_denial(),
+            Some("policy blocks"),
+            "replacement must inherit the sticky Ask denial"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        coordinator
+            .as_mut()
+            .expect("replacement coordinator")
+            .close()
+            .await
+            .expect("replacement coordinator closes");
+    }
+
+    /// Sticky Ask denial outlives a particular coordinator instance. Each
+    /// case drives the production reconcile opener path, closes a denied
+    /// coordinator, then returns without an immediate successor — the
+    /// missing-config, unsupported-optional, opener-`None`, and opener-error
+    /// exits cited in the review finding. A later reconciliation must still
+    /// inherit the denial onto the replacement and refuse to re-prompt.
+    #[tokio::test]
+    async fn reconcile_preserves_terminal_ask_denial_across_failed_replacement() {
+        #[derive(Clone, Copy, Debug)]
+        enum ReplacementGap {
+            MissingConfig,
+            UnsupportedOptionalBackend,
+            OpenerReturnsNone,
+            OpenerError,
+        }
+
+        let screenshot = [OpenAiComputerAction::Screenshot];
+        for gap in [
+            ReplacementGap::MissingConfig,
+            ReplacementGap::UnsupportedOptionalBackend,
+            ReplacementGap::OpenerReturnsNone,
+            ReplacementGap::OpenerError,
+        ] {
+            let initial = NativeComputerToolConfig {
+                contract: ComputerToolContract::OpenAiResponses,
+                target: DisplayTarget::Virtual,
+                require_backend: false,
+                geometry: None,
+                approval_required: false,
+            };
+            let mut agent = test_agent_with_native_geometry(None);
+            agent.params.native_computer = Some(NativeComputerToolConfig {
+                approval_required: true,
+                ..initial.clone()
+            });
+            let deny = Arc::new(FakeComputerAuthorizer::always_deny("policy blocks"));
+            let mut coordinator = Some(make_ask_test_coordinator(Arc::clone(&deny)).await);
+            assert!(
+                matches!(
+                    coordinator
+                        .as_mut()
+                        .expect("original coordinator")
+                        .execute_openai_call("call-deny", &screenshot)
+                        .await,
+                    CoordinatedOutcome::Denied { .. }
+                ),
+                "{gap:?}: original Ask path must record a human denial"
+            );
+            let mut contract = Some(initial.contract);
+            let mut coordinator_config = Some(initial.coordinator_config());
+            let mut pending_continuations = Vec::new();
+            let mut sticky_ask_denial = None;
+
+            match gap {
+                ReplacementGap::MissingConfig => {
+                    agent.params.native_computer = None;
+                    let mut opener = panicking_opener;
+                    reconcile_native_computer_for_delegation_with_opener(
+                        &mut agent,
+                        &mut coordinator,
+                        &mut contract,
+                        &mut coordinator_config,
+                        &mut pending_continuations,
+                        &mut sticky_ask_denial,
+                        &mut opener,
+                    )
+                    .await
+                    .expect("missing config defers replacement");
+                }
+                ReplacementGap::UnsupportedOptionalBackend => {
+                    agent.params.native_computer = Some(NativeComputerToolConfig {
+                        contract: ComputerToolContract::Anthropic20251124,
+                        approval_required: true,
+                        ..initial.clone()
+                    });
+                    let mut opener = panicking_opener;
+                    reconcile_native_computer_for_delegation_with_opener(
+                        &mut agent,
+                        &mut coordinator,
+                        &mut contract,
+                        &mut coordinator_config,
+                        &mut pending_continuations,
+                        &mut sticky_ask_denial,
+                        &mut opener,
+                    )
+                    .await
+                    .expect("unsupported optional backend defers replacement");
+                }
+                ReplacementGap::OpenerReturnsNone => {
+                    let mut opener = none_opener;
+                    reconcile_native_computer_for_delegation_with_opener(
+                        &mut agent,
+                        &mut coordinator,
+                        &mut contract,
+                        &mut coordinator_config,
+                        &mut pending_continuations,
+                        &mut sticky_ask_denial,
+                        &mut opener,
+                    )
+                    .await
+                    .expect("opener returning None defers replacement");
+                }
+                ReplacementGap::OpenerError => {
+                    let mut opener = error_opener;
+                    reconcile_native_computer_for_delegation_with_opener(
+                        &mut agent,
+                        &mut coordinator,
+                        &mut contract,
+                        &mut coordinator_config,
+                        &mut pending_continuations,
+                        &mut sticky_ask_denial,
+                        &mut opener,
+                    )
+                    .await
+                    .expect_err("opener error must surface");
+                }
+            }
+
+            assert!(
+                coordinator.is_none(),
+                "{gap:?}: denied coordinator must be gone after the replacement gap"
+            );
+            assert_eq!(
+                sticky_ask_denial.as_deref(),
+                Some("policy blocks"),
+                "{gap:?}: driver slot must retain sticky Ask denial across the replacement gap"
+            );
+
+            agent.params.native_computer = Some(NativeComputerToolConfig {
+                approval_required: true,
+                ..initial.clone()
+            });
+            let allow = Arc::new(FakeComputerAuthorizer::always_allow());
+            let opens = Arc::new(AtomicUsize::new(0));
+            let mut opener: Box<
+                dyn for<'a> FnMut(
+                    &'a mut Agent,
+                ) -> BoxFuture<
+                    'a,
+                    anyhow::Result<Option<ComputerActionCoordinator>>,
+                >,
+            > = Box::new({
+                let allow = Arc::clone(&allow);
+                let opens = Arc::clone(&opens);
+                move |agent| {
+                    open_ask_test_coordinator(agent, Arc::clone(&allow), Arc::clone(&opens))
+                }
+            });
+            reconcile_native_computer_for_delegation_with_opener(
+                &mut agent,
+                &mut coordinator,
+                &mut contract,
+                &mut coordinator_config,
+                &mut pending_continuations,
+                &mut sticky_ask_denial,
+                &mut opener,
+            )
+            .await
+            .expect("later reconciliation opens a successor");
+
+            let replacement = coordinator.as_mut().expect("successor coordinator");
+            assert_eq!(
+                replacement.terminal_denial(),
+                Some("policy blocks"),
+                "{gap:?}: successor must inherit the sticky Ask denial"
+            );
+            assert!(
+                matches!(
+                    replacement
+                        .execute_openai_call("call-after-gap", &screenshot)
+                        .await,
+                    CoordinatedOutcome::Denied { .. }
+                ),
+                "{gap:?}: successor must refuse dispatch after inherited denial"
+            );
+            assert_eq!(
+                allow.call_count(),
+                0,
+                "{gap:?}: inherited denial must not re-prompt"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 1);
+            replacement.close().await.expect("successor closes");
         }
     }
 

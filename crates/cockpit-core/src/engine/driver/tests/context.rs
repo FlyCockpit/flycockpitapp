@@ -25,6 +25,7 @@ async fn prune_targets_foreground_subagent_only() {
         computer_contract: None,
         computer_coordinator_config: None,
         pending_computer_continuations: Vec::new(),
+        computer_ask_denial: None,
         agent_instance_id: None,
         endpoint_generation: None,
         history: dup_read_history(),

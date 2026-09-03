@@ -11,9 +11,10 @@ use crate::computer::host_identity::{
 use crate::computer::platform::macos::{
     AU_DEFAUDITSID, AxValueTag, AxWindowRect, CgSessionKey, CgSessionSnapshot, CgSessionValue,
     CgWindowCandidate, MacAxAttribute, MacAxNotification, MacCallbackGate,
-    MacCallbackTerminalReason, MacFocusedWindowLifetimeEpoch, MacObservedEpoch, MacProducerKind,
+    MacCallbackTerminalReason, MacObservedEpoch, MacProducerKind, MacosLiveWindowCandidate,
     TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
-    select_display_for_window, validate_cg_session,
+    opaque_macos_window_id, restore_macos_window_object, select_display_for_window,
+    validate_cg_session,
 };
 use crate::computer::platform::wayland::{
     FakeWaylandProvider, WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,
@@ -114,6 +115,10 @@ fn computer_target_platform_evidence() {
     for a in MacAxAttribute::all() {
         assert!(a.as_static_str().starts_with("AX"));
     }
+    assert_eq!(
+        MacAxAttribute::FocusedUIElement.as_static_str(),
+        "AXFocusedUIElement"
+    );
     assert_eq!(
         MacAxNotification::FocusedWindowChanged.as_static_str(),
         "AXFocusedWindowChanged"
@@ -258,6 +263,11 @@ fn computer_target_platform_evidence() {
     let mut virt = sample_virtual_evidence([9u8; 16], 1);
     virt.host_installation_id = FieldEvidence::available(host_id, EvidenceSource::VirtualEngine);
     assert!(virt.physical_target_key().is_err());
+    assert!(
+        virt.focused_window_id_value().is_none(),
+        "virtual display UUID must not be used as a window identity"
+    );
+    assert_eq!(virt.virtual_display_uuid, Some([9u8; 16]));
 
     let desc = WaylandCapabilityDescriptor {
         kind: WaylandProviderKind::CompositorIntegration,
@@ -776,14 +786,34 @@ fn computer_target_observed_epoch_and_aba_claim() {
     };
     assert!(overflow.consume(MacProducerKind::AxMoved).is_err());
 
-    // A replacement AX window is a new lifetime even if its compositor ID,
-    // PID, application ID, and geometry have all been recycled. The adapter
-    // mixes this epoch into its opaque focused-window ID before the planning
-    // and pre-handoff fingerprints consume it.
-    let mut lifetime = MacFocusedWindowLifetimeEpoch::default();
-    assert_eq!(lifetime.observe(false).unwrap(), 1);
-    assert_eq!(lifetime.observe(true).unwrap(), 1);
-    assert_eq!(lifetime.observe(false).unwrap(), 2);
+    // A replacement window that reuses PID and CGWindowID is a different
+    // object: crash recovery authenticates the planted generation token, not
+    // a process-local counter that Default-resets to 1 after restart.
+    let generation_a = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let generation_b = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20];
+    let journal = opaque_macos_window_id(8, 16, generation_a);
+    assert_eq!(
+        restore_macos_window_object(
+            &journal,
+            &[MacosLiveWindowCandidate {
+                pid: 8,
+                window_number: 16,
+                planted_generation: Some(generation_b),
+            }]
+        ),
+        Err(crate::computer::target::TargetUnavailableReason::StaleTarget)
+    );
+    assert_eq!(
+        restore_macos_window_object(
+            &journal,
+            &[MacosLiveWindowCandidate {
+                pid: 8,
+                window_number: 16,
+                planted_generation: Some(generation_a),
+            }]
+        ),
+        Ok(0)
+    );
     assert!(overflow.unavailable);
     assert!(overflow.consume(MacProducerKind::AxMoved).is_err());
 

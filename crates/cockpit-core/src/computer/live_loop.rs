@@ -130,6 +130,10 @@ mod tests {
         ComputerActionCoordinator, ComputerApprovalTier, ComputerAuthorizer, CoordinatorParams,
         DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance, ProviderId,
     };
+    use crate::computer::target::{
+        EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence, OpaqueWindowId,
+        sample_virtual_evidence,
+    };
     use crate::computer::{
         ComputerActionOutcome, ComputerBackend, DisplayGeometry, LogicalSize,
         NormalizedComputerAction, NormalizedComputerEffect, PixelSize, ScaleFactor,
@@ -200,6 +204,16 @@ mod tests {
         }
     }
 
+    fn virtual_window_evidence() -> crate::computer::target::TargetIdentityEvidence {
+        let mut evidence = sample_virtual_evidence([0xAA; 16], 1);
+        evidence.focus_generation = 1;
+        evidence.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0x11; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        evidence
+    }
+
     async fn make_coordinator() -> ComputerActionCoordinator {
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
@@ -211,7 +225,9 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: None,
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                virtual_window_evidence(),
+            ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,

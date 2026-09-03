@@ -601,6 +601,7 @@ impl<'ast> Visit<'ast> for StructuralCallAudit {
 enum PostBoundaryCall {
     SessionRecheck,
     CapabilityRecheck,
+    WindowRecheck,
     RawPost,
 }
 
@@ -640,20 +641,26 @@ impl<'ast> Visit<'ast> for PostBoundaryCallAudit {
                 _ => {}
             }
         }
+        if call.method == "require_live_injection_window"
+            || call.method == "require_evidenced_window"
+            || call.method == "require_cleanup_injection_window"
+        {
+            self.0.push(PostBoundaryCall::WindowRecheck);
+        }
         syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = call.func.as_ref()
-            && path
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            let segments = path
                 .path
                 .segments
                 .iter()
                 .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>()
-                .ends_with(&["CGEvent".to_string(), "post".to_string()])
-        {
-            self.0.push(PostBoundaryCall::RawPost);
+                .collect::<Vec<_>>();
+            if segments.ends_with(&["deliver_to_authenticated_ax_window".to_string()]) {
+                self.0.push(PostBoundaryCall::RawPost);
+            }
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -701,7 +708,18 @@ impl<'ast> Visit<'ast> for CoreGraphicsPostAudit {
             .map(|segment| segment.ident.to_string())
             .collect::<Vec<_>>();
         if segments.ends_with(&["CGEvent".to_string(), "post".to_string()]) {
-            self.associated_posts.push(self.current_function.clone());
+            self.violations.push(
+                "session-global CGEvent::post is forbidden; CoreGraphics cannot address a window"
+                    .to_string(),
+            );
+        }
+        if segments.ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()])
+            && self.current_function.as_deref() != Some("post_to_held_ax")
+        {
+            self.violations.push(
+                "process-directed CGEvent::post_to_pid is forbidden outside post_to_held_ax"
+                    .to_string(),
+            );
         }
         for identifier in &segments {
             if is_legacy_raw_post_identifier(identifier) {
@@ -815,20 +833,71 @@ fn physical_backend_irreversible_primitive_inventory() {
         }
     }
     assert!(violations.is_empty(), "{violations:#?}");
-    assert_eq!(
-        raw_posts.len(),
-        1,
-        "every macOS event in the complete core source tree must use the sole guarded post primitive"
+    assert!(
+        raw_posts.is_empty(),
+        "CoreGraphics posts outside post_event: {raw_posts:?}"
     );
     let mut calls = StructuralCallAudit::default();
     calls.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
-    for required in ["prepare", "recheck", "CGEvent::post", "commit"] {
+    for required in ["prepare", "recheck", "rollback_known_pre_post_refusal"] {
         assert!(
             calls.0.iter().any(|call| call == required),
             "post_event AST lost required call {required}: {:?}",
             calls.0
         );
     }
+    assert!(
+        calls
+            .0
+            .iter()
+            .any(|call| call == "deliver_to_authenticated_ax_window"
+                || call.ends_with("::deliver_to_authenticated_ax_window")),
+        "post_event AST lost required call deliver_to_authenticated_ax_window: {:?}",
+        calls.0
+    );
+    let mac_post_src = mac
+        .split("fn post_event")
+        .nth(1)
+        .expect("post_event source")
+        .split("\n    fn ")
+        .next()
+        .expect("post_event body");
+    assert!(
+        mac_post_src.contains("deliver_to_authenticated_ax_window"),
+        "post_event must deliver through the retained AX window object"
+    );
+    assert!(
+        !mac_post_src.contains("post_to_pid"),
+        "post_event must not call process-directed post_to_pid; that belongs to post_to_held_ax"
+    );
+    assert!(
+        !mac_post_src.contains("try_from(bound.pid)"),
+        "post_event must not post using a stored pid that can be reused"
+    );
+    assert!(
+        mac.contains("fn post_to_held_ax")
+            && mac
+                .split("fn post_to_held_ax")
+                .nth(1)
+                .expect("post_to_held_ax")
+                .contains("post_to_pid"),
+        "the AX-object post primitive must be the only process-directed CGEvent post"
+    );
+    assert!(
+        mac.contains("stamp_event_window_destination")
+            && mac.contains("CGEventSetWindowLocation")
+            && mac
+                .split("fn stamp_event_window_destination")
+                .nth(1)
+                .expect("stamp_event_window_destination")
+                .contains("MissingWindowLocationSetter"),
+        "macOS mouse delivery must require window-local coordinates on the evidenced window"
+    );
+    assert!(
+        mac_post_src.contains("require_live_injection_window")
+            && mac_post_src.contains("require_cleanup_injection_window"),
+        "post_event must re-verify the retained AX window object at delivery"
+    );
     let mut post_boundary = PostBoundaryCallAudit::default();
     post_boundary.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
     assert_eq!(
@@ -836,9 +905,14 @@ fn physical_backend_irreversible_primitive_inventory() {
         vec![
             PostBoundaryCall::SessionRecheck,
             PostBoundaryCall::CapabilityRecheck,
+            PostBoundaryCall::WindowRecheck,
+            PostBoundaryCall::WindowRecheck,
             PostBoundaryCall::RawPost,
+            PostBoundaryCall::WindowRecheck,
+            PostBoundaryCall::WindowRecheck,
         ],
-        "post_event must structurally perform its exact session and physical-capability/lease rechecks before its sole raw post"
+        "post_event must structurally recheck session, capability, and evidenced AX window before and after AX-object delivery: {:?}",
+        post_boundary.0
     );
     assert!(
         calls
@@ -847,17 +921,137 @@ fn physical_backend_irreversible_primitive_inventory() {
             .any(|call| call == "rollback_known_pre_post_refusal"),
         "known pre-post refusals must structurally enter exact rollback"
     );
-    assert_eq!(raw_posts[0].0, core.join("computer/macos_backend.rs"));
-    assert_eq!(
-        raw_posts[0].1.as_deref(),
-        Some("post_event"),
-        "the sole raw post must be structurally owned by post_event"
-    );
-    let positions = ["prepare", "recheck", "CGEvent::post", "commit"]
-        .map(|required| calls.0.iter().position(|call| call == required).unwrap());
+    let mut mac_bind = StructuralCallAudit::default();
+    mac_bind.visit_impl_item_fn(impl_method(&mac_syntax, "bind_evidenced_window"));
     assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "post_event's AST must prepare, recheck, post, then commit"
+        mac_bind
+            .0
+            .iter()
+            .any(|call| call == "live_focused_macos_injection_target"
+                || call.ends_with("::live_focused_macos_injection_target")),
+        "macOS bind must retain the live AX window object: {:?}",
+        mac_bind.0
+    );
+
+    let mut windows_post = StructuralCallAudit::default();
+    windows_post.visit_impl_item_fn(impl_method(&windows_syntax, "post_to_target"));
+    assert!(
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "deliver_to_authenticated_window_object"
+                || call.ends_with("::deliver_to_authenticated_window_object")),
+        "Windows post_to_target must deliver through the retained UIA window object: {:?}",
+        windows_post.0
+    );
+    assert!(
+        !windows_post
+            .0
+            .iter()
+            .any(|call| call == "SendMessageTimeoutW"),
+        "Windows post_to_target must not resolve HWND independently of the UIA object: {:?}",
+        windows_post.0
+    );
+    assert!(
+        !windows_post.0.iter().any(|call| call == "PostMessageW"),
+        "Windows post_to_target must not queue input that cannot be retracted: {:?}",
+        windows_post.0
+    );
+    assert!(
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "ambiguous_send_timeout"
+                || call.ends_with("::ambiguous_send_timeout")),
+        "Windows post_to_target must treat a live-window timeout as ambiguous ownership: {:?}",
+        windows_post.0
+    );
+    let mut windows_send = StructuralCallAudit::default();
+    windows_send.visit_impl_item_fn(impl_method(&windows_syntax, "send_from_object"));
+    assert!(
+        windows_send
+            .0
+            .iter()
+            .any(|call| call == "SendMessageTimeoutW"),
+        "Windows send_from_object must deliver synchronously from the retained UIA object: {:?}",
+        windows_send.0
+    );
+    assert!(
+        windows_send
+            .0
+            .iter()
+            .any(|call| call == "resolve_from_object" || call.ends_with("::resolve_from_object")),
+        "Windows send_from_object must re-resolve the UIA object at send time: {:?}",
+        windows_send.0
+    );
+    let windows_source = std::fs::read_to_string(core.join("computer/platform/windows_native.rs"))
+        .expect("windows backend source");
+    assert!(
+        !windows_source.contains("SendInput("),
+        "Windows must not use session-global SendInput"
+    );
+    assert!(
+        !windows_source.contains("struct HwndObjectLock")
+            && !windows_source.contains("GetDC(Some(hwnd))"),
+        "GetDC is not a USER object lock; delivery must use the retained UIA window object"
+    );
+    assert!(
+        windows_source.contains("CurrentNativeWindowHandle")
+            && windows_source.contains("IUIAutomationElement"),
+        "Windows must retain the UIA window object so delivery addresses that object"
+    );
+    assert!(
+        windows_source.contains("pending") && windows_source.contains("begin_delivery"),
+        "Windows must mark ownership uncertain before SendMessageTimeoutW"
+    );
+    assert!(
+        !windows_source.contains("PostMessageW("),
+        "Windows must not PostMessage; queued delivery cannot prove HWND identity"
+    );
+    let mut windows_release = StructuralCallAudit::default();
+    windows_release.visit_impl_item_fn(impl_method(&windows_syntax, "release_all"));
+    assert!(
+        windows_release
+            .0
+            .iter()
+            .any(|call| call == "windows_owned_cleanup_buttons"),
+        "Windows cleanup must release only owned buttons: {:?}",
+        windows_release.0
+    );
+    let mut mac_release = StructuralCallAudit::default();
+    mac_release.visit_impl_item_fn(impl_method(&mac_syntax, "release_all"));
+    assert!(
+        mac_release
+            .0
+            .iter()
+            .any(|call| call == "restore_macos_injection_target"
+                || call.ends_with("::restore_macos_injection_target")),
+        "macOS cleanup must restore the persisted AX window identity: {:?}",
+        mac_release.0
+    );
+    let macos_platform = std::fs::read_to_string(core.join("computer/platform/macos.rs"))
+        .expect("macos platform source");
+    assert!(
+        macos_platform.contains("macos_window_identity_from_opaque")
+            && macos_platform.contains("read_or_plant_macos_window_generation")
+            && macos_platform.contains("restore_macos_window_object"),
+        "macOS crash recovery must plant a durable generation token and authenticate it"
+    );
+    assert!(
+        macos_platform
+            .split("fn restore_macos_injection_target")
+            .nth(1)
+            .expect("restore_macos_injection_target")
+            .contains("restore_macos_window_object"),
+        "restore_macos_injection_target must authenticate through restore_macos_window_object"
+    );
+    assert!(
+        macos_platform.contains("An existing token is never overwritten"),
+        "macOS generation planting must not overwrite a live window token after restart"
+    );
+    assert!(
+        mac.contains("window: Option<[u8; 16]>"),
+        "macOS held-input authority must persist the window that received the downs"
     );
 
     let driver = std::fs::read_to_string(core.join("engine/driver/computer_native.rs")).unwrap();

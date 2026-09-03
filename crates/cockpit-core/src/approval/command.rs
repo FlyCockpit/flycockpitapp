@@ -30,8 +30,14 @@ impl Approver {
     /// compound construct / wrapper) triggers a prompt for that command.
     /// A single ungranted/denied command denies the whole string.
     ///
-    /// Empty/unparseable input is never auto-allowed — it returns `Deny`
-    /// (the caller surfaces the parse error).
+    /// Empty/effects-only/unparseable input is never auto-allowed — it
+    /// returns `Deny` (the caller surfaces the parse error). Effects-only
+    /// parses (redirect-only lines, assignment-only lines including
+    /// substitution-free `PATH=`/`PROMPT_COMMAND=` mutations,
+    /// substitution-bearing assignments) execute real effects with no
+    /// program token to key a grant on, so they deny exactly like
+    /// unparseable input (issue #289 review cycle 3, finding 1;
+    /// remaining finding 1).
     pub async fn approve_command(&self, command: &str) -> Result<Decision> {
         self.authorize(AuthorizationRequest::Command { command })
             .await
@@ -304,8 +310,17 @@ impl Approver {
                 simple_commands,
                 compound,
             } => (simple_commands.clone(), *compound),
-            // Nothing to run / can't reason about it → deny, don't guess.
-            Classification::Empty | Classification::Unparseable(_) => return Ok(Decision::Deny),
+            // Effects-without-a-program parses (redirect-only lines,
+            // assignment-only lines, substitution-bearing assignments),
+            // nothing to run, or can't reason about it → deny, don't
+            // guess. A redirect-only line executes a filesystem mutation
+            // with no program token to key a grant on, and a bare
+            // assignment mutates interactive-shell state, so neither
+            // must ever auto-run (issue #289 review cycle 3, finding 1;
+            // remaining finding 1).
+            Classification::EffectsOnly
+            | Classification::Empty
+            | Classification::Unparseable(_) => return Ok(Decision::Deny),
         };
         // Read the policy once at the start of the decision. The whole
         // decision — prompt offer, await, and resolution — uses this captured

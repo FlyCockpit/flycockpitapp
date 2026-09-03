@@ -1423,7 +1423,15 @@ mod acp_wire_owner_tests {
     use crate::daemon::owner_capability::OwnerCapability;
     use cockpit_client::{ClientEndpoint, InProcessConnection, InProcessEndpoint};
     use cockpit_proto::{Body, Envelope, RecvFrame, Response};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    struct WireOwnerFixtureState {
+        expect_promotion: bool,
+        promotion_observed: AtomicBool,
+        restart_if_idle_observed: AtomicBool,
+    }
 
     fn connected_with_endpoint(
         client: cockpit_client::DaemonClient,
@@ -1551,7 +1559,7 @@ mod acp_wire_owner_tests {
 
     async fn serve_wire_owner_connection<S>(
         daemon: &mut cockpit_proto::ProtoStream<S>,
-        expect_promotion: bool,
+        state: &WireOwnerFixtureState,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -1562,11 +1570,21 @@ mod acp_wire_owner_tests {
                     Body::Request { id, request, .. } => {
                         let response = match request {
                             Request::DaemonStatus => test_daemon_status_response(),
+                            Request::RestartIfIdle => {
+                                state.restart_if_idle_observed.store(true, Ordering::SeqCst);
+                                Response::RestartDecision {
+                                    will_restart: false,
+                                    reason: Some(
+                                        "fixture owner stays live for ACP attach tests".into(),
+                                    ),
+                                }
+                            }
                             Request::PromoteToPersistent => {
                                 assert!(
-                                    expect_promotion,
+                                    state.expect_promotion,
                                     "unexpected PromoteToPersistent on this connection"
                                 );
+                                state.promotion_observed.store(true, Ordering::SeqCst);
                                 Response::Ack
                             }
                             other => panic!("unexpected wire-owner request: {other:?}"),
@@ -1583,11 +1601,18 @@ mod acp_wire_owner_tests {
         }
     }
 
-    async fn spawn_wire_owner_server(
-        mut listener: crate::daemon::DaemonListener,
+    fn spawn_wire_owner_server(
+        listener: crate::daemon::DaemonListener,
         expect_promotion: bool,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    ) -> (tokio::task::JoinHandle<()>, Arc<WireOwnerFixtureState>) {
+        let state = Arc::new(WireOwnerFixtureState {
+            expect_promotion,
+            promotion_observed: AtomicBool::new(false),
+            restart_if_idle_observed: AtomicBool::new(false),
+        });
+        let state_for_task = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let mut listener = listener;
             loop {
                 #[cfg(unix)]
                 let stream = match listener.accept().await {
@@ -1600,9 +1625,10 @@ mod acp_wire_owner_tests {
                     Err(_) => break,
                 };
                 let mut daemon = cockpit_proto::ProtoStream::new(stream);
-                serve_wire_owner_connection(&mut daemon, expect_promotion).await;
+                serve_wire_owner_connection(&mut daemon, &state_for_task).await;
             }
-        })
+        });
+        (server, state)
     }
 
     #[test]
@@ -1722,13 +1748,22 @@ mod acp_wire_owner_tests {
         OwnerCapability::mint()
             .publish(&paths.socket)
             .expect("publish owner capability");
-        let server = spawn_wire_owner_server(listener, false).await;
+        crate::daemon::skew_restart::reset_skew_restart_cooldown_for_tests();
+        let (server, fixture) = spawn_wire_owner_server(listener, false);
 
         let client = acquire_acp_socket_daemon(false)
             .await
             .expect("ACP must attach to a discoverable wire owner");
         assert!(client.is_socket_backed());
         assert!(client.has_owner_capability());
+        assert!(
+            fixture.restart_if_idle_observed.load(Ordering::SeqCst),
+            "attach must run the production version-skew RestartIfIdle probe before reuse"
+        );
+        assert!(
+            !fixture.promotion_observed.load(Ordering::SeqCst),
+            "ACP with background_agents=false must not promote an attached ephemeral owner"
+        );
         client
             .request_ok(Request::DaemonStatus)
             .await
@@ -1755,13 +1790,22 @@ mod acp_wire_owner_tests {
         OwnerCapability::mint()
             .publish(&paths.socket)
             .expect("publish owner capability");
-        let server = spawn_wire_owner_server(listener, true).await;
+        crate::daemon::skew_restart::reset_skew_restart_cooldown_for_tests();
+        let (server, fixture) = spawn_wire_owner_server(listener, true);
 
         let client = acquire_acp_socket_daemon(true)
             .await
             .expect("ACP must attach and promote an ephemeral wire owner");
         assert!(client.is_socket_backed());
         assert!(client.has_owner_capability());
+        assert!(
+            fixture.restart_if_idle_observed.load(Ordering::SeqCst),
+            "promotion attach must run the production version-skew RestartIfIdle probe before reuse"
+        );
+        assert!(
+            fixture.promotion_observed.load(Ordering::SeqCst),
+            "ACP with background_agents=true must promote an attached ephemeral wire owner in place"
+        );
         client
             .request_ok(Request::DaemonStatus)
             .await
@@ -1773,6 +1817,38 @@ mod acp_wire_owner_tests {
         owner_child.wait().ok();
         let _ = std::fs::remove_file(&paths.socket);
         let _ = std::fs::remove_file(&paths.pid_file);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_acp_socket_daemon_spawns_wire_owner_when_absent() {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let runtime = env.path().expect("isolated runtime root").join("runtime");
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
+        assert!(
+            !paths.socket.exists() && !paths.pid_file.exists(),
+            "isolated home must not already host a daemon"
+        );
+
+        let client = acquire_acp_socket_daemon(false)
+            .await
+            .expect("ACP must spawn a discoverable wire owner when none is running");
+        assert!(client.is_socket_backed());
+        assert!(client.has_owner_capability());
+        client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("spawned wire owner answers DaemonStatus");
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while paths.socket.exists() || paths.pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawned ephemeral wire owner must reap after the last ACP client disconnects");
     }
 
     #[tokio::test(flavor = "current_thread")]

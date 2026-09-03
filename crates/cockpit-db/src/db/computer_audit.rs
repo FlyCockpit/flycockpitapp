@@ -155,9 +155,11 @@ impl Db {
     }
 
     /// Append one chain entry. Returns `Ok(true)` when inserted, `Ok(false)`
-    /// when a guidance-proposal `(kind, proposal_id)` replay hits the unique
-    /// index (idempotent). Any other constraint (including a sequence clash)
-    /// is an error: the chain must not fork.
+    /// only when a guidance-proposal replay hits the unique index *and* the
+    /// existing row matches `sequence`, `entry_bytes`, `mac`, and
+    /// `key_version`. Any other constraint (including a sequence clash or a
+    /// same-identity row with different bytes) is an error: the chain must
+    /// not fork.
     pub async fn insert_computer_audit_entry(&self, row: ComputerAuditEntryRow) -> Result<bool> {
         anyhow::ensure!(row.sequence >= 1, "computer audit sequence must be >= 1");
         anyhow::ensure!(
@@ -187,19 +189,26 @@ impl Db {
                     "computer audit insert changed {changed} rows, expected 1"
                 )),
                 Err(err) if is_constraint(&err) && is_guidance_kind(row.event_kind) => {
-                    let existing: Option<i64> = conn
+                    let existing = conn
                         .query_row(
-                            "SELECT sequence FROM computer_audit_entries
+                            "SELECT sequence, entry_bytes, mac, event_kind, proposal_id, key_version
+                             FROM computer_audit_entries
                              WHERE event_kind = ?1 AND proposal_id = ?2",
                             params![i64::from(row.event_kind), row.proposal_id.as_slice()],
-                            |r| r.get(0),
+                            parse_entry_row,
                         )
                         .optional()
                         .context("checking guidance audit replay")?;
-                    if existing.is_some() {
-                        Ok(false)
-                    } else {
-                        Err(anyhow!("computer audit insert constraint: {err}"))
+                    match existing {
+                        Some(existing)
+                            if existing.sequence == row.sequence
+                                && existing.entry_bytes == row.entry_bytes
+                                && existing.mac == row.mac
+                                && existing.key_version == row.key_version =>
+                        {
+                            Ok(false)
+                        }
+                        _ => Err(anyhow!("computer audit insert constraint: {err}")),
                     }
                 }
                 Err(err) => Err(anyhow!("computer audit insert failed: {err}")),
@@ -268,6 +277,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn guidance_replay_at_a_different_sequence_is_not_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let first = sample(1, GUIDANCE_PROPOSAL_CREATED, 3);
+        assert!(db.insert_computer_audit_entry(first.clone()).await.unwrap());
+        let err = db
+            .insert_computer_audit_entry(sample(2, GUIDANCE_PROPOSAL_CREATED, 3))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("computer audit insert constraint"),
+            "{err}"
+        );
+        let rows = db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], first);
+    }
+
+    #[tokio::test]
+    async fn guidance_replay_byte_mismatch_is_not_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let first = sample(1, GUIDANCE_PROPOSAL_CREATED, 3);
+        assert!(db.insert_computer_audit_entry(first.clone()).await.unwrap());
+        let mut mismatched = first.clone();
+        mismatched.entry_bytes[10] = 0xff;
+        mismatched.mac[1] = 0xff;
+        let err = db
+            .insert_computer_audit_entry(mismatched)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("computer audit insert constraint"),
+            "{err}"
+        );
+        let rows = db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], first);
     }
 
     #[tokio::test]

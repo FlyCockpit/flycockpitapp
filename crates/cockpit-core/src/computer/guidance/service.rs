@@ -33,8 +33,8 @@ use super::{
     validate_proposal,
 };
 use crate::computer::audit::{
-    AuditEventKind, ComputerAuditChain, Disposition, GuidanceAuditAppend, GuidanceScope,
-    domain_digest, domains,
+    AuditEventKind, ComputerAuditChain, Disposition, GuidanceAppendError, GuidanceAuditAppend,
+    GuidanceScope, domain_digest, domains,
 };
 use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
@@ -109,6 +109,17 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         _ => None,
     }
+}
+
+/// Create-path rollback is allowed only when the append API proves the
+/// event is durably absent. Writers that do not implement
+/// [`GuidanceAppendError`] have no pending-head protocol, so their errors
+/// stay fail-closed (rollback).
+fn guidance_append_is_durably_absent(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GuidanceAppendError>()
+        .map(GuidanceAppendError::is_durably_absent)
+        .unwrap_or(true)
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
@@ -208,7 +219,8 @@ impl GuidanceAuditWriter for ChainGuidanceAuditWriter {
     }
 
     async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
-        self.chain.append_guidance(event.into()).await
+        self.chain.append_guidance(event.into()).await?;
+        Ok(())
     }
 }
 
@@ -709,17 +721,40 @@ impl GuidanceProposalService {
                     None => None,
                 },
             };
-            self.audit.append(&event).await?;
-            self.db
-                .mark_guidance_proposal_audit_delivered(
-                    &row.proposal_id,
-                    item.event_state,
-                    now_unix_ms,
-                )
-                .await?;
-            delivered += 1;
+            match self.audit.append(&event).await {
+                Ok(()) => {
+                    self.db
+                        .mark_guidance_proposal_audit_delivered(
+                            &row.proposal_id,
+                            item.event_state,
+                            now_unix_ms,
+                        )
+                        .await?;
+                    delivered += 1;
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<GuidanceAppendError>()
+                        .is_some_and(GuidanceAppendError::is_predecessor_missing) =>
+                {
+                    tracing::warn!(
+                        %error,
+                        proposal_id = %row.proposal_id,
+                        "guidance successor audit waiting for created predecessor"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(delivered)
+    }
+
+    /// Deliver any undelivered `created` (and other predecessor) outbox rows
+    /// before appending a successor lifecycle event.
+    async fn flush_predecessor_audits(&self, now_unix_ms: i64) {
+        if let Err(error) = self.flush_audit_outbox(now_unix_ms).await {
+            tracing::warn!(%error, "guidance predecessor audit flush deferred");
+        }
     }
 
     /// Borrow the pending-proposal store (for the review UI to read typed
@@ -774,11 +809,12 @@ impl GuidanceProposalService {
     ///    work).
     /// 4. Insert the content-free receipt + increment counters (transactional,
     ///    cap-enforced). On any failure release the reservation and return.
-    /// 5. Append `guidance_proposal_created` via the audit writer (fail-closed
-    ///    on append failure: atomically delete the new receipt, its outbox row,
-    ///    and both counter increments; then release the memory reservation.
-    ///    If that rollback cannot complete, the reservation stays so a leftover
-    ///    `created` row cannot be shadowed by a second create).
+    /// 5. Append `guidance_proposal_created` via the audit writer. Rollback of
+    ///    the receipt/outbox/counters is permitted only when the append API
+    ///    proves the event is durably absent. An error after a pending head or
+    ///    database body is left recoverable (keep the receipt; outbox/recovery
+    ///    will commit). If a durably-absent rollback cannot complete, the
+    ///    reservation stays so a leftover `created` row cannot be shadowed.
     /// 6. Install typed values + rationale into memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
@@ -878,37 +914,47 @@ impl GuidanceProposalService {
             scope: None,
         };
         if self.audit.delivers_immediately() {
-            if let Err(audit_error) = self.audit.append(&audit_event).await {
-                let proposal_id = hex16(&proposal_id);
-                let rollback = self
-                    .db
-                    .rollback_created_guidance_proposal_receipt(&proposal_id)
-                    .await;
-                return match rollback {
-                    Ok(true) => {
-                        self.pending.release(&key, pid);
-                        Err(CreateProposalError::AuditUnavailable(
-                            audit_error.to_string(),
-                        ))
+            match self.audit.append(&audit_event).await {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .db
+                        .mark_guidance_proposal_audit_delivered(
+                            &hex16(&proposal_id),
+                            GuidanceProposalReceiptState::Created,
+                            now_unix_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
                     }
-                    Ok(false) => Err(CreateProposalError::Storage(format!(
-                        "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
-                    ))),
-                    Err(rollback_error) => Err(CreateProposalError::Storage(format!(
-                        "guidance audit append failed and rollback failed: {audit_error}; {rollback_error}"
-                    ))),
-                };
-            }
-            if let Err(error) = self
-                .db
-                .mark_guidance_proposal_audit_delivered(
-                    &hex16(&proposal_id),
-                    GuidanceProposalReceiptState::Created,
-                    now_unix_ms,
-                )
-                .await
-            {
-                tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
+                }
+                Err(audit_error) if guidance_append_is_durably_absent(&audit_error) => {
+                    let proposal_id = hex16(&proposal_id);
+                    let rollback = self
+                        .db
+                        .rollback_created_guidance_proposal_receipt(&proposal_id)
+                        .await;
+                    return match rollback {
+                        Ok(true) => {
+                            self.pending.release(&key, pid);
+                            Err(CreateProposalError::AuditUnavailable(
+                                audit_error.to_string(),
+                            ))
+                        }
+                        Ok(false) => Err(CreateProposalError::Storage(format!(
+                            "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
+                        ))),
+                        Err(rollback_error) => Err(CreateProposalError::Storage(format!(
+                            "guidance audit append failed and rollback failed: {audit_error}; {rollback_error}"
+                        ))),
+                    };
+                }
+                Err(audit_error) => {
+                    tracing::warn!(
+                        %audit_error,
+                        "guidance created audit remains recoverable; keeping receipt"
+                    );
+                }
             }
         }
 
@@ -1096,6 +1142,7 @@ impl GuidanceProposalService {
             disposition: Some(disp),
             scope: Some(gscope),
         };
+        self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
@@ -1200,6 +1247,7 @@ impl GuidanceProposalService {
             disposition: Some(Disposition::Rejected),
             scope: None,
         };
+        self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
@@ -1413,6 +1461,9 @@ impl GuidanceProposalService {
         now_unix_ms: i64,
         audit_kind: AuditEventKind,
     ) -> Result<bool, TransitionProposalError> {
+        if audit_kind != AuditEventKind::GuidanceProposalCreated {
+            self.flush_predecessor_audits(now_unix_ms).await;
+        }
         let applied = self
             .db
             .cas_guidance_proposal_receipt_state(
@@ -1936,22 +1987,187 @@ mod tests {
         );
         let n = svc2.reconcile_on_restart(9000).await.unwrap();
         assert_eq!(n, 1);
-        // Exactly one expired audit append.
+        // Lifecycle order: created before expired. Exactly one of each.
         let kinds = recorded.lock().unwrap();
-        assert!(
-            kinds
-                .iter()
-                .any(|k| *k == AuditEventKind::GuidanceProposalCreated)
-        );
         assert_eq!(
-            kinds
-                .iter()
-                .filter(|k| **k == AuditEventKind::GuidanceProposalExpired)
-                .count(),
-            1
+            kinds.as_slice(),
+            &[
+                AuditEventKind::GuidanceProposalCreated,
+                AuditEventKind::GuidanceProposalExpired,
+            ]
         );
         // No counter re-increment.
         assert_eq!(svc2.delegation_counter(&id16(2)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_flush_then_reconcile_chains_created_before_expired() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+        use cockpit_db::computer_audit::{GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        // Crash window: receipt+outbox exist, created was never appended.
+        // Production boot flushes the outbox before reconcile.
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+        let n = svc.reconcile_on_restart(9000).await.unwrap();
+        assert_eq!(n, 1);
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_kind, GUIDANCE_PROPOSAL_CREATED);
+        assert_eq!(rows[1].event_kind, GUIDANCE_PROPOSAL_EXPIRED);
+        assert_eq!(rows[0].proposal_id, id16(9));
+        assert_eq!(rows[1].proposal_id, id16(9));
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn restart_reconcile_without_flush_still_cannot_invert_lifecycle() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+        use cockpit_db::computer_audit::{GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        // Even if reconcile runs first, cas_and_audit flushes created before
+        // appending expired, and the chain refuses a successor without it.
+        let n = svc.reconcile_on_restart(9000).await.unwrap();
+        assert_eq!(n, 1);
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_kind, GUIDANCE_PROPOSAL_CREATED);
+        assert_eq!(rows[1].event_kind, GUIDANCE_PROPOSAL_EXPIRED);
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn create_rolls_back_when_pending_head_is_aborted() {
+        use crate::computer::audit::{AppendFault, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHead);
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        let err = svc
+            .create_proposal(
+                snapshot(&svc, &providers_enabled(), "m", b"proj"),
+                id16(1),
+                id16(2),
+                id16(9),
+                vec![rule()],
+                None,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateProposalError::AuditUnavailable(_)));
+        assert!(svc.pending_store().is_empty());
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 0);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let handle = harness.actor.as_ref().unwrap().handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        assert_eq!(reopened.verify().await.confirmed_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn create_keeps_receipt_when_insert_is_durable_but_unconfirmed() {
+        use crate::computer::audit::{AppendFault, AuditVerifyStatus, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsert);
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        svc.create_proposal(
+            snapshot(&svc, &providers_enabled(), "m", b"proj"),
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let handle = harness.actor.as_ref().unwrap().handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
     }
 
     #[tokio::test]

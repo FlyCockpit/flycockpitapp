@@ -23,8 +23,8 @@ use cockpit_db::installation_identity::InstallationIdentity;
 
 use crate::db::Db;
 use crate::secure_key::{
-    COMPUTER_AUDIT_HEAD_V1_NAMESPACE, COMPUTER_AUDIT_V1_NAMESPACE, SealedPayload, SecureKeyBytes,
-    SecureKeyError, SecureKeyHandle,
+    COMPUTER_AUDIT_HEAD_V1_NAMESPACE, COMPUTER_AUDIT_V1_NAMESPACE, SealedPayload, SealedStateView,
+    SecureKeyBytes, SecureKeyError, SecureKeyHandle,
 };
 
 use super::{
@@ -33,6 +33,61 @@ use super::{
 };
 
 const MAX_CAS_RETRIES: usize = 8;
+
+const _: () = {
+    assert!(AuditEventKind::GuidanceProposalCreated as u8 == GUIDANCE_PROPOSAL_CREATED);
+    assert!(AuditEventKind::GuidanceProposalAccepted as u8 == GUIDANCE_PROPOSAL_ACCEPTED);
+    assert!(AuditEventKind::GuidanceProposalRejected as u8 == GUIDANCE_PROPOSAL_REJECTED);
+    assert!(AuditEventKind::GuidanceProposalExpired as u8 == GUIDANCE_PROPOSAL_EXPIRED);
+};
+
+/// Outcome of a guidance-chain append that did not commit.
+///
+/// Create-path rollback of a durable receipt is permitted only for
+/// [`Self::is_durably_absent`]. Pending-head recovery can still commit an
+/// event after [`Self::Unknown`], so those callers must keep the receipt.
+#[derive(Debug, thiserror::Error)]
+pub enum GuidanceAppendError {
+    /// No pending head and no database row were written for this event.
+    #[error("computer audit append failed with no durable write: {0}")]
+    Absent(#[source] anyhow::Error),
+    /// A successor event was refused because `guidance_proposal_created` is
+    /// not yet on the chain. Nothing was written.
+    #[error("computer audit append requires a prior guidance_proposal_created event")]
+    PredecessorMissing,
+    /// A pending head and/or database row may exist; recovery can still
+    /// commit the event.
+    #[error("computer audit append failed after a durable write: {0}")]
+    Unknown(#[source] anyhow::Error),
+}
+
+impl GuidanceAppendError {
+    /// Whether the event is known not to exist on the durable chain and
+    /// cannot be recovered into one.
+    pub fn is_durably_absent(&self) -> bool {
+        matches!(self, Self::Absent(_) | Self::PredecessorMissing)
+    }
+
+    pub fn is_predecessor_missing(&self) -> bool {
+        matches!(self, Self::PredecessorMissing)
+    }
+
+    fn absent(error: impl Into<anyhow::Error>) -> Self {
+        Self::Absent(error.into())
+    }
+
+    fn unknown(error: impl Into<anyhow::Error>) -> Self {
+        Self::Unknown(error.into())
+    }
+}
+
+/// Test-only injection points between the three durable append stages.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendFault {
+    AfterPendingHead,
+    AfterDatabaseInsert,
+}
 
 /// Fields for a guidance-proposal audit append. Typed rule values and
 /// rationale never appear here.
@@ -64,6 +119,8 @@ pub struct ComputerAuditChain {
     keys: SecureKeyHandle,
     inner: tokio::sync::Mutex<Option<ChainInner>>,
     available: AtomicBool,
+    #[cfg(test)]
+    append_fault: std::sync::Mutex<Option<AppendFault>>,
 }
 
 impl ComputerAuditChain {
@@ -87,6 +144,8 @@ impl ComputerAuditChain {
             keys,
             inner: tokio::sync::Mutex::new(None),
             available: AtomicBool::new(false),
+            #[cfg(test)]
+            append_fault: std::sync::Mutex::new(None),
         };
         chain.bootstrap().await?;
         Ok(chain)
@@ -98,6 +157,8 @@ impl ComputerAuditChain {
             keys,
             inner: tokio::sync::Mutex::new(None),
             available: AtomicBool::new(false),
+            #[cfg(test)]
+            append_fault: std::sync::Mutex::new(None),
         }
     }
 
@@ -120,18 +181,28 @@ impl ComputerAuditChain {
 
     /// Append one guidance-proposal event. Idempotent for
     /// `(event_kind, proposal_id)` so outbox replay cannot fork the chain.
-    pub async fn append_guidance(&self, event: GuidanceAuditAppend) -> Result<()> {
+    ///
+    /// A returned [`GuidanceAppendError`] tells the caller whether the event
+    /// is known to be durably absent (safe to roll back prior work) or may
+    /// still be recovered into a committed chain entry.
+    pub async fn append_guidance(
+        &self,
+        event: GuidanceAuditAppend,
+    ) -> Result<(), GuidanceAppendError> {
         if !self.is_available() {
-            bail!("computer audit chain is not available");
+            return Err(GuidanceAppendError::absent(
+                "computer audit chain is not available",
+            ));
         }
-        anyhow::ensure!(
-            is_guidance_kind(event.kind),
-            "audit chain guidance append requires a guidance-proposal event kind"
-        );
+        if !is_guidance_kind(event.kind) {
+            return Err(GuidanceAppendError::absent(
+                "audit chain guidance append requires a guidance-proposal event kind",
+            ));
+        }
         let mut guard = self.inner.lock().await;
         let inner = guard
             .as_mut()
-            .ok_or_else(|| anyhow!("computer audit chain is not available"))?;
+            .ok_or_else(|| GuidanceAppendError::absent("computer audit chain is not available"))?;
         match self.append_locked(inner, &event).await {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -147,6 +218,28 @@ impl ComputerAuditChain {
                 }
                 Err(error)
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_append_fault(&self, fault: AppendFault) {
+        *self
+            .append_fault
+            .lock()
+            .expect("computer audit append fault mutex") = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn take_append_fault(&self, expected: AppendFault) -> bool {
+        let mut guard = self
+            .append_fault
+            .lock()
+            .expect("computer audit append fault mutex");
+        if *guard == Some(expected) {
+            *guard = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -242,52 +335,78 @@ impl ComputerAuditChain {
         &self,
         inner: &mut ChainInner,
         event: &GuidanceAuditAppend,
-    ) -> Result<()> {
+    ) -> Result<(), GuidanceAppendError> {
         for _ in 0..MAX_CAS_RETRIES {
             let mut view = self
                 .keys
                 .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
                 .await
-                .context("loading computer audit sealed head")?;
-            let mut head = decode_head(view.payload.as_slice())?;
-            let mut rows = self.db.list_computer_audit_entries().await?;
-            let status = verify_with(inner, Some(&head), Some(&rows))?;
+                .context("loading computer audit sealed head")
+                .map_err(GuidanceAppendError::Absent)?;
+            let mut head =
+                decode_head(view.payload.as_slice()).map_err(GuidanceAppendError::Absent)?;
+            let mut rows = self
+                .db
+                .list_computer_audit_entries()
+                .await
+                .map_err(GuidanceAppendError::Absent)?;
+            let status = verify_with(inner, Some(&head), Some(&rows))
+                .map_err(GuidanceAppendError::Absent)?;
             match status.status {
                 AuditVerifyStatus::Verified => {}
                 AuditVerifyStatus::PendingRecovery => {
-                    self.recover_pending(inner, &view, &head, &rows).await?;
+                    self.recover_pending(inner, &view, &head, &rows)
+                        .await
+                        .map_err(GuidanceAppendError::Absent)?;
                     view = self
                         .keys
                         .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
                         .await
-                        .context("reloading sealed head after pending recovery")?;
-                    head = decode_head(view.payload.as_slice())?;
-                    rows = self.db.list_computer_audit_entries().await?;
-                    let status = verify_with(inner, Some(&head), Some(&rows))?;
+                        .context("reloading sealed head after pending recovery")
+                        .map_err(GuidanceAppendError::Absent)?;
+                    head = decode_head(view.payload.as_slice())
+                        .map_err(GuidanceAppendError::Absent)?;
+                    rows = self
+                        .db
+                        .list_computer_audit_entries()
+                        .await
+                        .map_err(GuidanceAppendError::Absent)?;
+                    let status = verify_with(inner, Some(&head), Some(&rows))
+                        .map_err(GuidanceAppendError::Absent)?;
                     if status.status != AuditVerifyStatus::Verified {
-                        bail!(
+                        return Err(GuidanceAppendError::absent(anyhow!(
                             "computer audit chain failed closed: {}",
                             status.status.as_str()
-                        );
+                        )));
                     }
                 }
                 other => {
-                    bail!("computer audit chain failed closed: {}", other.as_str());
+                    return Err(GuidanceAppendError::absent(anyhow!(
+                        "computer audit chain failed closed: {}",
+                        other.as_str()
+                    )));
                 }
             }
 
-            if let Some(existing) = rows.iter().find(|row| {
+            if rows.iter().any(|row| {
                 row.event_kind == event.kind.as_byte() && row.proposal_id == event.proposal_id
             }) {
-                anyhow::ensure!(
-                    existing.event_kind == event.kind.as_byte(),
-                    "computer audit guidance replay kind mismatch"
-                );
                 return Ok(());
             }
 
-            let sequence = head.confirmed_sequence.saturating_add(1);
-            anyhow::ensure!(sequence >= 1, "computer audit sequence overflow");
+            if is_guidance_successor(event.kind)
+                && !rows.iter().any(|row| {
+                    row.event_kind == GUIDANCE_PROPOSAL_CREATED
+                        && row.proposal_id == event.proposal_id
+                })
+            {
+                return Err(GuidanceAppendError::PredecessorMissing);
+            }
+
+            let sequence = head
+                .confirmed_sequence
+                .checked_add(1)
+                .ok_or_else(|| GuidanceAppendError::absent("computer audit sequence overflow"))?;
             let monotonic = next_monotonic(inner.last_monotonic);
             let wall_unix_millis = chrono::Utc::now().timestamp_millis();
             let entry = build_guidance_entry(
@@ -297,12 +416,13 @@ impl ComputerAuditChain {
                 inner.current_key_version,
                 monotonic,
                 wall_unix_millis,
-            )?;
+            )
+            .map_err(GuidanceAppendError::Absent)?;
             let entry_bytes = entry.encode();
             let hmac_key = inner
                 .hmac_keys
                 .get(&inner.current_key_version)
-                .ok_or_else(|| anyhow!("computer audit HMAC key missing"))?;
+                .ok_or_else(|| GuidanceAppendError::absent("computer audit HMAC key missing"))?;
             let mac = super::entry_mac(hmac_key.as_ref(), &entry_bytes);
 
             let pending = ComputerAuditSealedHeadV1::with_pending(
@@ -321,7 +441,19 @@ impl ComputerAuditChain {
             match self.cas_head(&view, &pending).await {
                 Ok(pending_view) => view = pending_view,
                 Err(CasOutcome::Conflict) => continue,
-                Err(CasOutcome::Fatal(error)) => return Err(error),
+                Err(CasOutcome::Fatal(error)) => return Err(GuidanceAppendError::Absent(error)),
+            }
+
+            #[cfg(test)]
+            if self.take_append_fault(AppendFault::AfterPendingHead) {
+                return self
+                    .abort_uncommitted_pending(
+                        inner,
+                        &view,
+                        &head,
+                        anyhow!("injected fault after pending head"),
+                    )
+                    .await;
             }
 
             let row = ComputerAuditEntryRow {
@@ -332,10 +464,23 @@ impl ComputerAuditChain {
                 proposal_id: event.proposal_id,
                 key_version: inner.current_key_version,
             };
-            self.db
+            if let Err(error) = self
+                .db
                 .insert_computer_audit_entry(row)
                 .await
-                .context("inserting computer audit entry")?;
+                .context("inserting computer audit entry")
+            {
+                return self
+                    .abort_uncommitted_pending(inner, &view, &head, error)
+                    .await;
+            }
+
+            #[cfg(test)]
+            if self.take_append_fault(AppendFault::AfterDatabaseInsert) {
+                // The body is durable; pending-head recovery will confirm.
+                inner.last_monotonic = monotonic;
+                return Ok(());
+            }
 
             let confirmed = ComputerAuditSealedHeadV1::confirmed_only(
                 head.sealed_generation.saturating_add(1).max(1),
@@ -350,16 +495,57 @@ impl ComputerAuditChain {
                     return Ok(());
                 }
                 Err(CasOutcome::Conflict) => continue,
-                Err(CasOutcome::Fatal(error)) => return Err(error),
+                Err(CasOutcome::Fatal(_)) => {
+                    // Database row exists; recovery will confirm the head.
+                    inner.last_monotonic = monotonic;
+                    return Ok(());
+                }
             }
         }
-        bail!("computer audit chain CAS retries exhausted")
+        Err(GuidanceAppendError::unknown(
+            "computer audit chain CAS retries exhausted",
+        ))
+    }
+
+    /// Revert a pending head that has no matching database body so an
+    /// in-process append error is durably absent rather than recoverable.
+    async fn abort_uncommitted_pending(
+        &self,
+        inner: &ChainInner,
+        view: &SealedStateView,
+        confirmed: &ComputerAuditSealedHeadV1,
+        cause: anyhow::Error,
+    ) -> Result<(), GuidanceAppendError> {
+        let aborted = ComputerAuditSealedHeadV1::confirmed_only(
+            confirmed.sealed_generation.saturating_add(1).max(1),
+            confirmed.confirmed_sequence,
+            confirmed.confirmed_mac,
+            confirmed.confirmed_key_version,
+            inner.database_instance_id,
+        );
+        match self.cas_head(view, &aborted).await {
+            Ok(_) => Err(GuidanceAppendError::Absent(cause)),
+            Err(CasOutcome::Conflict) => match self
+                .keys
+                .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
+                .await
+            {
+                Ok(current) => match decode_head(current.payload.as_slice()) {
+                    Ok(head) if head.pending_present => Err(GuidanceAppendError::Unknown(cause)),
+                    Ok(head) if head.confirmed_sequence > confirmed.confirmed_sequence => Ok(()),
+                    Ok(_) => Err(GuidanceAppendError::Absent(cause)),
+                    Err(_) => Err(GuidanceAppendError::Unknown(cause)),
+                },
+                Err(_) => Err(GuidanceAppendError::Unknown(cause)),
+            },
+            Err(CasOutcome::Fatal(_)) => Err(GuidanceAppendError::Unknown(cause)),
+        }
     }
 
     async fn recover_pending(
         &self,
         inner: &mut ChainInner,
-        view: &crate::secure_key::SealedStateView,
+        view: &SealedStateView,
         head: &ComputerAuditSealedHeadV1,
         rows: &[ComputerAuditEntryRow],
     ) -> Result<()> {
@@ -421,9 +607,9 @@ impl ComputerAuditChain {
 
     async fn cas_head(
         &self,
-        expected: &crate::secure_key::SealedStateView,
+        expected: &SealedStateView,
         new_head: &ComputerAuditSealedHeadV1,
-    ) -> Result<crate::secure_key::SealedStateView, CasOutcome> {
+    ) -> Result<SealedStateView, CasOutcome> {
         let payload = SealedPayload::new(new_head.encode())
             .map_err(|e| CasOutcome::Fatal(anyhow!("computer audit sealed head payload: {e}")))?;
         match self
@@ -501,6 +687,15 @@ fn is_guidance_kind(kind: AuditEventKind) -> bool {
     )
 }
 
+fn is_guidance_successor(kind: AuditEventKind) -> bool {
+    matches!(
+        kind,
+        AuditEventKind::GuidanceProposalAccepted
+            | AuditEventKind::GuidanceProposalRejected
+            | AuditEventKind::GuidanceProposalExpired
+    )
+}
+
 fn decode_head(bytes: &[u8]) -> Result<ComputerAuditSealedHeadV1> {
     ComputerAuditSealedHeadV1::decode(bytes).map_err(|e| anyhow!("computer audit sealed head: {e}"))
 }
@@ -546,13 +741,8 @@ fn verify_with(
     rows: Option<&[ComputerAuditEntryRow]>,
 ) -> Result<AuditVerifyResult> {
     let entries = rows.map(chain_entries);
-    let key_map: HashMap<u32, Vec<u8>> = inner
-        .hmac_keys
-        .iter()
-        .map(|(version, key)| (*version, key.as_ref().to_vec()))
-        .collect();
     Ok(verify_chain(head, entries.as_deref(), |version| {
-        key_map.get(&version).cloned()
+        inner.hmac_keys.get(&version).map(|key| key.as_ref())
     }))
 }
 
@@ -870,5 +1060,98 @@ mod tests {
             "{err}"
         );
         assert!(!harness.chain.is_available());
+    }
+
+    #[tokio::test]
+    async fn successor_without_created_is_rejected_and_writes_nothing() {
+        let harness = TestAuditHarness::new().await;
+        let err = harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalExpired, 1))
+            .await
+            .unwrap_err();
+        assert!(err.is_durably_absent(), "{err}");
+        assert!(
+            matches!(err, GuidanceAppendError::PredecessorMissing),
+            "{err}"
+        );
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let result = harness.chain.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn fault_after_pending_head_aborts_and_stays_absent() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHead);
+        let err = harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap_err();
+        assert!(err.is_durably_absent(), "{err}");
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let handle = harness.actor.as_ref().unwrap().handle();
+        let reopened = ComputerAuditChain::try_open(harness.db.clone(), handle)
+            .await
+            .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 0);
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn fault_after_database_insert_is_recovered_on_reopen() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsert);
+        harness
+            .chain
+            .append_guidance(sample_event(AuditEventKind::GuidanceProposalCreated, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let handle = harness.actor.as_ref().unwrap().handle();
+        let reopened = ComputerAuditChain::try_open(harness.db.clone(), handle)
+            .await
+            .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+        assert_eq!(result.entry_count, 1);
     }
 }

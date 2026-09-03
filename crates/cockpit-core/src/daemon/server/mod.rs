@@ -4534,7 +4534,9 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     // every receipt still `created` has unrecoverable memory-only values, so
     // CAS each to `expired_on_restart` with exactly one expired audit append
     // and no counter re-increment (creation already counted). The tamper-evident
-    // audit chain must be installed first so those appends are durable.
+    // audit chain must be installed first, and the durable outbox flushed,
+    // so `guidance_proposal_created` is on the chain before any expired
+    // successor is appended.
     if let Some(handle) = ctx.secure_key.clone() {
         let chain =
             crate::computer::audit::ComputerAuditChain::open(Arc::new(ctx.db.clone()), handle)
@@ -4560,6 +4562,12 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .reload_persistent_rules()
         .await
         .context("loading machine-local persistent guidance rules")?;
+    if let Err(error) = guidance_svc.flush_audit_outbox(now_unix_ms).await {
+        tracing::warn!(
+            %error,
+            "guidance proposal audit outbox flush deferred before restart reconciliation"
+        );
+    }
     let reconciled_guidance = guidance_svc
         .reconcile_on_restart(now_unix_ms)
         .await

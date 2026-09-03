@@ -636,9 +636,10 @@ impl Db {
         .await
     }
 
-    /// Undelivered audit events in stable creation/transition order. Joining
-    /// the receipt supplies the original safe metadata required to reconstruct
-    /// the event after a crash.
+    /// Undelivered audit events in lifecycle-causal order: `created` before
+    /// any terminal state (so a successor cannot chain before its predecessor),
+    /// then transition time. Joining the receipt supplies the original safe
+    /// metadata required to reconstruct the event after a crash.
     pub async fn pending_guidance_proposal_audits(&self) -> Result<Vec<PendingGuidanceAuditRow>> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -653,7 +654,9 @@ impl Db {
                  FROM guidance_proposal_audit_outbox o
                  JOIN guidance_proposal_receipts r USING (proposal_id)
                  WHERE o.delivered_at_unix_ms IS NULL
-                 ORDER BY o.transitioned_at_unix_ms, o.proposal_id",
+                 ORDER BY CASE o.terminal_state WHEN 'created' THEN 0 ELSE 1 END,
+                          o.transitioned_at_unix_ms,
+                          o.proposal_id",
             )?;
             let rows = stmt
                 .query_and_then([], |row| {

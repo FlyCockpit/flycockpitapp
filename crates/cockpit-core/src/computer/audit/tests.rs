@@ -559,14 +559,14 @@ fn computer_audit_verify_verified_empty_chain() {
 #[test]
 fn computer_audit_verify_unavailable_secure_store() {
     let entries: Vec<ChainEntry> = vec![];
-    let result = verify_chain(None, Some(&entries), |_| None);
+    let result = verify_chain(None, Some(&entries), |_| None::<Vec<u8>>);
     assert_eq!(result.status, AuditVerifyStatus::UnavailableSecureStore);
 }
 
 #[test]
 fn computer_audit_verify_unavailable_database() {
     let head = ComputerAuditSealedHeadV1::confirmed_only(1, 0, [0u8; 32], 1, nonzero_uuid(1));
-    let result = verify_chain(Some(&head), None, |_| None);
+    let result = verify_chain(Some(&head), None, |_| None::<Vec<u8>>);
     assert_eq!(result.status, AuditVerifyStatus::UnavailableDatabase);
 }
 

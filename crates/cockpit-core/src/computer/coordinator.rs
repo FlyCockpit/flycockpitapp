@@ -376,6 +376,12 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
 /// Larger batches summarize the first actions and count the rest.
 const MAX_PROMPT_BATCH_ACTIONS: usize = 8;
 
+/// Extra identical retry-safe Ask dispatches allowed after the approved
+/// action. Destructive, credential, and other non-retry-safe classes install
+/// no lease (one action per approval). This is an action-count bound, never a
+/// delegation-wide or wall-clock-only lease (issue #287).
+const BENIGN_ASK_LEASE_REMAINING_USES: u32 = 1;
+
 /// Render a [`std::time::Duration`] for the human approval prompt.
 fn prompt_duration(duration: std::time::Duration) -> String {
     let millis = duration.as_millis();
@@ -2158,8 +2164,10 @@ pub struct ComputerActionAuthorization {
     pub batch_index: u32,
     /// Geometry generation from the opened backend.
     pub geometry_generation: GeometryGeneration,
-    /// Advisory action risk class (audit/guidance only — never affects
-    /// dispatch).
+    /// Action risk class. Recorded for audit/guidance in both tiers. In Ask,
+    /// it also selects the lease policy: destructive and credential actions
+    /// are one-shot (no reusable lease); only identical retry-safe (benign)
+    /// actions may share a short bounded lease.
     pub action_class: ActionRiskClass,
     /// Secret-free digest of the canonical action list handed to the backend.
     /// Type-text content is included only as hash input; it is never retained
@@ -2291,17 +2299,17 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
 }
 
 // ---------------------------------------------------------------------------
-// Advisory action semantics (audit/guidance only — never prompt, deny, or grant)
+// Action risk classes (audit/guidance; Ask lease reuse policy)
 // ---------------------------------------------------------------------------
 
-/// Exhaustive advisory action-class taxonomy for computer-use actions.
+/// Exhaustive action-class taxonomy for computer-use actions.
 ///
-/// These classes are audit/guidance fields only. They never trigger a prompt,
-/// hard denial, or persistent grant in either Ask or Yolo tier. Yolo is
-/// complete trust: zero Cockpit human prompts, zero semantic target/action
-/// hard denials, and zero persistent grants. Ask asks exactly once per
-/// uninterrupted delegation/display lease generation and reuses that decision
-/// for all action classes until invalidation.
+/// Yolo is complete trust: zero Cockpit human prompts, zero semantic
+/// target/action hard denials, and zero persistent grants. Ask still never
+/// hard-denies from class alone; class only scopes the Ask lease (issue #287):
+/// destructive and credential actions are one approval per action (no lease),
+/// and only identical retry-safe benign actions may share a short bounded
+/// lease. A class never becomes a standing grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionRiskClass {
     /// Reversible navigation/observation (screenshot, cursor move, scroll).
@@ -2321,11 +2329,10 @@ pub enum ActionRiskClass {
 }
 
 impl ActionRiskClass {
-    /// Classify a canonical [`ComputerAction`] into its advisory class.
+    /// Classify a canonical [`ComputerAction`] into its risk class.
     ///
-    /// This mapping is advisory only and never affects the dispatch decision.
-    /// The central authorizer and lease composition gate dispatch; this
-    /// classification is recorded for audit/guidance.
+    /// The mapping never hard-denies in Yolo or Ask. In Ask it selects the
+    /// lease policy (one-shot vs bounded identical retry-safe reuse).
     pub fn classify(action: &ComputerAction) -> Self {
         match action {
             ComputerAction::CaptureFull
@@ -2341,13 +2348,14 @@ impl ActionRiskClass {
             | ComputerAction::KeyChord { .. }
             | ComputerAction::HoldKey { .. } => Self::StateChanging,
             ComputerAction::TypeText { text } => {
-                // Heuristic advisory classification: never used for denial.
+                // Heuristic classification: never used for hard denial.
                 // Credential entry reuses the shared secret-shape detector
                 // (novel credential shapes plus credential words) so the
                 // audit class and the prompt disclosure fence
                 // (`computer_typed_text_for_prompt`) agree on what counts as
                 // a credential instead of carrying two divergent keyword
-                // lists.
+                // lists. Destructive/credential classes are one-shot Ask
+                // approvals (issue #287); they still never hard-deny.
                 let lower = text.to_ascii_lowercase();
                 if crate::redact::text_is_secret_shaped(text) {
                     Self::CredentialEntry
@@ -2377,10 +2385,68 @@ impl ActionRiskClass {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Destructive and credential (and other high-risk) classes require a
+    /// fresh human Allow for every action. They never install an Ask lease.
+    pub fn requires_fresh_approval_each_action(self) -> bool {
+        matches!(
+            self,
+            Self::Destructive
+                | Self::CredentialEntry
+                | Self::Submission
+                | Self::Purchase
+                | Self::Unknown
+        )
+    }
+
+    /// Only reversible observation/navigation is retry-safe enough to share
+    /// a short bounded Ask lease for an identical payload and focus.
+    pub fn is_retry_safe(self) -> bool {
+        matches!(self, Self::Reversible)
+    }
+}
+
+/// Ask lease reuse policy for one canonical action batch (issue #287).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskLeasePolicy {
+    /// This Allow covers only the current action. No lease is installed.
+    OneShot,
+    /// Install a lease for this exact payload and focus, with
+    /// `remaining_uses` extra identical retry-safe dispatches.
+    Bounded { remaining_uses: u32 },
+}
+
+impl AskLeasePolicy {
+    fn for_actions(actions: &[ComputerAction]) -> Self {
+        if actions.is_empty() {
+            return Self::OneShot;
+        }
+        let mut all_retry_safe = true;
+        for action in actions {
+            let class = ActionRiskClass::classify(action);
+            if class.requires_fresh_approval_each_action() {
+                return Self::OneShot;
+            }
+            if !class.is_retry_safe() {
+                all_retry_safe = false;
+            }
+        }
+        if all_retry_safe {
+            Self::Bounded {
+                remaining_uses: BENIGN_ASK_LEASE_REMAINING_USES,
+            }
+        } else {
+            Self::OneShot
+        }
+    }
+
+    fn allows_reuse(self) -> bool {
+        matches!(self, Self::Bounded { remaining_uses } if remaining_uses > 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Ask delegation lease: one coalesced human decision per delegation/display gen
+// Ask delegation lease: exact action/payload/focus binding, bounded reuse
 // ---------------------------------------------------------------------------
 
 /// Identifies the provider that emits computer actions.
@@ -2403,9 +2469,11 @@ pub enum LeaseTargetKey {
 
 /// The composite key for an Ask delegation lease.
 ///
-/// One coalesced Ask decision is reused for all action classes until any key
-/// field or generation changes. The lease never persists and cannot be
-/// broadened to session/project/global.
+/// The key binds the exact canonical action payload and the live focus
+/// (window) generation in addition to session/delegation/provider/model/
+/// target/host-lease/display identity. A materially different action or a
+/// changed target window cannot reuse a prior Allow. The lease never
+/// persists and cannot be broadened to session/project/global.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AskLeaseKey {
     pub session_id: String,
@@ -2415,14 +2483,23 @@ pub struct AskLeaseKey {
     pub target_key: LeaseTargetKey,
     pub host_lease_generation: Option<LeaseGeneration>,
     pub display_generation: u64,
+    /// Live focus (window) generation captured at the Ask gate. A changed
+    /// target window produces a different key and cannot reuse a prior Allow.
+    pub focus_generation: u64,
+    /// Digest of the exact canonical action list this Allow covers. Action
+    /// identity (kind, coordinates, keys, text, batch order) is inside the
+    /// digest; a different payload cannot reuse the lease.
+    pub action_payload_digest: String,
 }
 
 /// An unforgeable, in-memory Ask delegation lease.
 ///
-/// Created by `Approve` on the first valid Ask action for one uninterrupted
-/// delegation/display lease generation. Keyed by
+/// Created by `Approve` for one exact retry-safe action payload at the live
+/// focus generation. Keyed by
 /// `(session_id, delegation_id, provider_id, model_id, target_key_or_virtual_id,
-///   host_lease_generation, display_generation)`.
+///   host_lease_generation, display_generation, focus_generation,
+///   action_payload_digest)`. Destructive and credential actions never
+/// install a lease: one Allow covers one action.
 ///
 /// # Unforgeability
 ///
@@ -2439,8 +2516,12 @@ pub struct AskLeaseKey {
 ///
 /// # Lifecycle
 ///
-/// - Created on `Approve` for the first valid Ask action.
-/// - Reused for all action classes until invalidation.
+/// - Created on `Approve` for a retry-safe identical payload at the current
+///   focus generation, with a short remaining-use bound.
+/// - Consumed on each matching reuse; exhausted leases are removed and the
+///   next matching action re-prompts.
+/// - Never reused across action identity, payload, focus generation, or
+///   risk class.
 /// - Revoked before queued work on: delegation terminal state, cancel,
 ///   detach, provider/model change, display/target/host generation change,
 ///   lost OS lock, or daemon restart.
@@ -2454,6 +2535,9 @@ pub struct AskDelegationLease {
     token: [u8; 32],
     /// Monotonic version of the approval wait that produced this lease.
     approval_version: u64,
+    /// Extra identical retry-safe dispatches remaining after the approved
+    /// action. Zero means the lease is exhausted and must be removed.
+    remaining_uses: u32,
 }
 
 impl std::fmt::Debug for AskDelegationLease {
@@ -2462,6 +2546,7 @@ impl std::fmt::Debug for AskDelegationLease {
             .field("key", &self.key)
             .field("token", &"[REDACTED; 32]")
             .field("approval_version", &self.approval_version)
+            .field("remaining_uses", &self.remaining_uses)
             .finish()
     }
 }
@@ -2485,6 +2570,12 @@ impl AskDelegationLease {
     pub fn approval_version(&self) -> u64 {
         self.approval_version
     }
+
+    /// Extra identical retry-safe dispatches remaining after the approved
+    /// action.
+    pub fn remaining_uses(&self) -> u32 {
+        self.remaining_uses
+    }
 }
 
 /// Constant-time byte-slice equality. Returns `true` if all bytes match.
@@ -2502,7 +2593,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The outcome of an Ask authorization attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AskAuthorizationOutcome {
-    /// A lease was already installed for this key — reuse it (zero new prompt).
+    /// A lease was already installed for this exact payload/focus key — reuse
+    /// its remaining bound (zero new prompt).
     ReusedExisting,
     /// A new lease was installed from a fresh human approval.
     Installed,
@@ -2562,11 +2654,36 @@ impl AskDelegationLeaseStore {
         Self::default()
     }
 
-    /// Check if a valid lease exists for the given key. This is the dispatch
-    /// gate: Ask requires both a current Ask delegation lease AND the
-    /// coordinator's current host/virtual input lease.
+    /// Check if a valid lease exists for the given key. A matching key is
+    /// exact: payload digest and focus generation are part of the key, so a
+    /// different action or window cannot satisfy this lookup.
     pub fn has_lease(&self, key: &AskLeaseKey) -> bool {
         self.leases.contains_key(key)
+    }
+
+    /// Consume one remaining use of an installed lease for `key`. Returns
+    /// `true` if a lease was present with remaining uses; the lease is
+    /// removed when the bound is exhausted. One-shot (destructive/credential)
+    /// actions never call this: they do not install a lease.
+    pub fn try_consume(&mut self, key: &AskLeaseKey) -> bool {
+        let remaining = match self.leases.get(key) {
+            Some(lease) if lease.remaining_uses > 0 => lease.remaining_uses,
+            Some(_) => {
+                self.leases.remove(key);
+                return false;
+            }
+            None => return false,
+        };
+        if remaining == 1 {
+            self.leases.remove(key);
+            return true;
+        }
+        if let Some(lease) = self.leases.get_mut(key) {
+            lease.remaining_uses = remaining - 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Look up a lease for diagnostic purposes.
@@ -2614,12 +2731,18 @@ impl AskDelegationLeaseStore {
     /// `expected_key`). If the key changed while waiting, the answer is
     /// discarded ([`AskAuthorizationOutcome::StaleAnswerDiscarded`]).
     ///
+    /// `remaining_uses` is the extra identical retry-safe dispatch bound
+    /// after this approved action. Pass `0` only if the caller intends to
+    /// install an immediately exhausted lease (the Ask gate does not: it
+    /// skips install for one-shot classes).
+    ///
     /// If a lease already exists for this key, it is reused
     /// ([`AskAuthorizationOutcome::ReusedExisting`]).
     pub fn install(
         &mut self,
         expected_key: &AskLeaseKey,
         approval_version: u64,
+        remaining_uses: u32,
     ) -> AskAuthorizationOutcome {
         // Refuse to install for a terminally denied delegation, even if an
         // answer somehow arrives. Denial is sticky for the store's lifetime.
@@ -2630,7 +2753,8 @@ impl AskDelegationLeaseStore {
             };
         }
 
-        // If already installed, reuse — one coalesced decision.
+        // If already installed for this exact payload/focus key, reuse the
+        // remaining bound rather than minting a second token.
         if self.leases.contains_key(expected_key) {
             // Clear the pending wait.
             self.pending.remove(expected_key);
@@ -2663,6 +2787,7 @@ impl AskDelegationLeaseStore {
             key: expected_key.clone(),
             token,
             approval_version,
+            remaining_uses,
         };
         self.leases.insert(expected_key.clone(), lease);
         self.pending.remove(expected_key);
@@ -3317,7 +3442,9 @@ pub struct ComputerActionCoordinator {
     /// Whether the backend is dead (readiness failure).
     backend_dead: bool,
     /// The Ask delegation lease store (Ask tier only). Yolo creates no
-    /// approval grant and uses only the host lease.
+    /// approval grant and uses only the host lease. Ask leases are scoped
+    /// to exact payload + live focus and are count-bounded; destructive
+    /// and credential actions install none.
     ask_lease_store: AskDelegationLeaseStore,
     /// The provider ID for this coordinator's delegation.
     provider_id: ProviderId,
@@ -3334,9 +3461,9 @@ pub struct ComputerActionCoordinator {
     denied: Option<String>,
     /// Coordinator-owned cancellation generation for a concrete native
     /// computer backend handoff.  It is intentionally separate from Ask
-    /// leases: a lease is reusable delegation authority, while this token
-    /// fences the one currently approved host operation at its final backend
-    /// boundary.
+    /// leases: a lease is reusable only for the exact approved payload at
+    /// the live focus, while this token fences the one currently approved
+    /// host operation at its final backend boundary.
     host_effect_cancel: tokio_util::sync::CancellationToken,
     /// The observation verification state machine. Starts at
     /// [`VerificationLevel::Strict`]. Full post-action `evaluate_qualification`
@@ -4402,14 +4529,21 @@ impl ComputerActionCoordinator {
         })).collect()
     }
 
-    /// Build the Ask lease key for the current coordinator state. The key is
+    /// Build the Ask lease key for the current coordinator identity plus the
+    /// live focus generation and exact canonical action payload. The key is
     /// `(session_id, delegation_id, provider_id, model_id, target_key_or_virtual_id,
-    ///   host_lease_generation, display_generation)`.
+    ///   host_lease_generation, display_generation, focus_generation,
+    ///   action_payload_digest)`.
     ///
     /// For physical targets, the host lease generation is included. For
     /// virtual displays, `host_lease_generation` is `None` and the virtual
     /// display UUID is used as the target key.
-    fn ask_lease_key(&self, virtual_display_uuid: Option<[u8; 16]>) -> Option<AskLeaseKey> {
+    fn ask_lease_key(
+        &self,
+        virtual_display_uuid: Option<[u8; 16]>,
+        actions: &[ComputerAction],
+        focus_generation: u64,
+    ) -> Option<AskLeaseKey> {
         let target_key = match (&self.host_lease, virtual_display_uuid) {
             // A target cannot simultaneously be the host-global physical
             // surface and an independent virtual display. Do not silently
@@ -4436,6 +4570,8 @@ impl ComputerActionCoordinator {
             target_key,
             host_lease_generation,
             display_generation: self.observation_generation.0,
+            focus_generation,
+            action_payload_digest: canonical_computer_action_payload_digest(actions),
         })
     }
 
@@ -4443,8 +4579,10 @@ impl ComputerActionCoordinator {
     /// requires both a current Ask delegation lease (Ask only) and the
     /// coordinator's current host/virtual input lease.
     ///
-    /// This is the lease composition gate. Neither Ask authority alone nor a
-    /// host lease alone can dispatch.
+    /// The Ask lease is bound to the exact canonical payload and the live
+    /// focus generation. Destructive and credential actions never reuse a
+    /// prior Allow. Neither Ask authority alone nor a host lease alone can
+    /// dispatch.
     ///
     /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
     /// blocking/denial case.
@@ -4461,34 +4599,11 @@ impl ComputerActionCoordinator {
             return Ok(());
         }
 
-        // Ask tier: require both the Ask delegation lease and the host lease
-        // (for physical targets). For virtual displays, only the Ask lease is
-        // required (no host lease).
-        let Some(lease_key) = self.ask_lease_key(virtual_display_uuid) else {
-            // Neither a host lease nor a known virtual display UUID — the lease
-            // cannot be scoped to a real target. Fail closed: no human prompt,
-            // no backend input, and let the execute chokepoint durably record
-            // the security-relevant refusal (never a benign cancellation).
-            self.dispatch_states
-                .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-            let outcome = CoordinatedOutcome::Invalidated {
-                reason: TargetUnavailableReason::VirtualIdentityUnavailable,
-            };
-            return Err(outcome);
-        };
-
-        // If a lease is already installed, reuse it (one coalesced decision).
-        if self.ask_lease_store.has_lease(&lease_key) {
-            return Ok(());
-        }
-
-        // No lease yet — this is the first valid Ask action for this
-        // delegation/display lease generation. Pin a fresh pre-await evidence
-        // baseline (focus generation + virtual UUID) before prompting, so the
-        // post-answer re-verification can detect drift that occurs while the
-        // human is deciding. Unverifiable evidence at this point is a
-        // fail-closed, non-sticky refusal — never install on evidence we
-        // cannot read.
+        // Capture live evidence before keying the lease so a changed focus
+        // window cannot reuse a prior Allow. Pin this snapshot as the
+        // pre-await baseline for post-answer re-verification. Unverifiable
+        // evidence is a fail-closed, non-sticky refusal — never prompt or
+        // install on evidence we cannot read.
         // Capture into locals first so the adapter borrow ends before any
         // `&mut self` fail-closed bookkeeping below.
         type PreCaptureSnapshot = Result<(u64, Option<[u8; 16]>, Option<String>), ()>;
@@ -4509,13 +4624,42 @@ impl ComputerActionCoordinator {
             } else {
                 None
             };
-        let (pre_await_focus_generation, pre_await_uuid, prompt_target_window) = match pre_capture {
+        let (live_focus_generation, live_uuid, prompt_target_window) = match pre_capture {
             Some(Ok(baseline)) => baseline,
             Some(Err(())) => {
-                return Err(self.discard_answer_nonsticky(call_id, &lease_key));
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                return Err(CoordinatedOutcome::Invalidated {
+                    reason: TargetUnavailableReason::StaleTarget,
+                });
             }
             None => (self.focus_generation.0, virtual_display_uuid, None),
         };
+
+        // Ask tier: require both the Ask delegation lease and the host lease
+        // (for physical targets). For virtual displays, only the Ask lease is
+        // required (no host lease). The key includes live focus + payload.
+        let Some(lease_key) = self.ask_lease_key(live_uuid, actions, live_focus_generation) else {
+            // Neither a host lease nor a known virtual display UUID — the lease
+            // cannot be scoped to a real target. Fail closed: no human prompt,
+            // no backend input, and let the execute chokepoint durably record
+            // the security-relevant refusal (never a benign cancellation).
+            self.dispatch_states
+                .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+            let outcome = CoordinatedOutcome::Invalidated {
+                reason: TargetUnavailableReason::VirtualIdentityUnavailable,
+            };
+            return Err(outcome);
+        };
+
+        let policy = AskLeasePolicy::for_actions(actions);
+        // Identical retry-safe payloads at this focus may consume one remaining
+        // use of a previously installed bounded lease. Destructive/credential
+        // (one-shot) classes never take this path.
+        if policy.allows_reuse() && self.ask_lease_store.try_consume(&lease_key) {
+            return Ok(());
+        }
+
         let host_present_pre_await = self.host_lease.is_some();
 
         // Begin an approval wait and authorize (raises the human prompt).
@@ -4535,47 +4679,62 @@ impl ComputerActionCoordinator {
                 // Re-verify live currency AFTER the human answers Allow and
                 // BEFORE install. Two drift classes have different outcomes.
                 match self.recompute_live_lease_key(
-                    pre_await_focus_generation,
-                    pre_await_uuid,
+                    live_focus_generation,
+                    live_uuid,
                     host_present_pre_await,
+                    actions,
                 ) {
                     Ok(fresh_key) if fresh_key == lease_key => {
-                        // Currency verified — the live target still matches the
-                        // pinned display this coordinator was opened for.
-                        // Approve installs an in-memory AskDelegationLease.
-                        match self.ask_lease_store.install(&lease_key, approval_version) {
-                            AskAuthorizationOutcome::Installed
-                            | AskAuthorizationOutcome::ReusedExisting => Ok(()),
-                            AskAuthorizationOutcome::StaleAnswerDiscarded => {
-                                // A newer approval wait superseded this one. The
-                                // answer is discarded; a new decision is
-                                // required before another action.
-                                self.dispatch_states.insert(
-                                    call_id.to_string(),
-                                    DispatchState::CancelledBeforeDispatch,
-                                );
-                                let outcome = CoordinatedOutcome::Invalidated {
-                                    reason: TargetUnavailableReason::StaleTarget,
-                                };
-                                Err(outcome)
+                        // Currency verified — the live target, focus, and
+                        // payload still match the key this Allow was bound to.
+                        match policy {
+                            AskLeasePolicy::OneShot => {
+                                // Destructive/credential (and other non-retry-
+                                // safe) classes: this Allow covers only the
+                                // current action. Do not install a lease.
+                                self.ask_lease_store.cancel_pending(&lease_key);
+                                Ok(())
                             }
-                            AskAuthorizationOutcome::Denied { reason } => {
-                                self.denied = Some(reason.clone());
-                                self.dispatch_states.insert(
-                                    call_id.to_string(),
-                                    DispatchState::CancelledBeforeDispatch,
-                                );
-                                let outcome = CoordinatedOutcome::Denied { reason };
-                                Err(outcome)
-                            }
-                            AskAuthorizationOutcome::CancelledBeforeInstall
-                            | AskAuthorizationOutcome::Pending => {
-                                self.dispatch_states.insert(
-                                    call_id.to_string(),
-                                    DispatchState::CancelledBeforeDispatch,
-                                );
-                                let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                                Err(outcome)
+                            AskLeasePolicy::Bounded { remaining_uses } => {
+                                match self.ask_lease_store.install(
+                                    &lease_key,
+                                    approval_version,
+                                    remaining_uses,
+                                ) {
+                                    AskAuthorizationOutcome::Installed
+                                    | AskAuthorizationOutcome::ReusedExisting => Ok(()),
+                                    AskAuthorizationOutcome::StaleAnswerDiscarded => {
+                                        // A newer approval wait superseded this one. The
+                                        // answer is discarded; a new decision is
+                                        // required before another action.
+                                        self.dispatch_states.insert(
+                                            call_id.to_string(),
+                                            DispatchState::CancelledBeforeDispatch,
+                                        );
+                                        let outcome = CoordinatedOutcome::Invalidated {
+                                            reason: TargetUnavailableReason::StaleTarget,
+                                        };
+                                        Err(outcome)
+                                    }
+                                    AskAuthorizationOutcome::Denied { reason } => {
+                                        self.denied = Some(reason.clone());
+                                        self.dispatch_states.insert(
+                                            call_id.to_string(),
+                                            DispatchState::CancelledBeforeDispatch,
+                                        );
+                                        let outcome = CoordinatedOutcome::Denied { reason };
+                                        Err(outcome)
+                                    }
+                                    AskAuthorizationOutcome::CancelledBeforeInstall
+                                    | AskAuthorizationOutcome::Pending => {
+                                        self.dispatch_states.insert(
+                                            call_id.to_string(),
+                                            DispatchState::CancelledBeforeDispatch,
+                                        );
+                                        let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
+                                        Err(outcome)
+                                    }
+                                }
                             }
                         }
                     }
@@ -4677,6 +4836,7 @@ impl ComputerActionCoordinator {
         pre_await_focus_generation: u64,
         pre_await_uuid: Option<[u8; 16]>,
         host_present_pre_await: bool,
+        actions: &[ComputerAction],
     ) -> Result<AskLeaseKey, LeaseDrift> {
         // Host lease re-check (physical path). `check_host_lease` sets the
         // sticky `invalidated` flag and drops the token if the held lease is
@@ -4687,7 +4847,7 @@ impl ComputerActionCoordinator {
 
         // Fresh post-await evidence snapshot. Unverifiable evidence or a
         // focus-generation / virtual-UUID change is non-sticky target drift.
-        let live_uuid = if let Some(adapter) = self.target_adapter.as_mut() {
+        let (live_uuid, live_focus) = if let Some(adapter) = self.target_adapter.as_mut() {
             match adapter.capture_snapshot() {
                 Ok(evidence) => {
                     if evidence.focus_generation != pre_await_focus_generation
@@ -4695,23 +4855,26 @@ impl ComputerActionCoordinator {
                     {
                         return Err(LeaseDrift::Target);
                     }
-                    evidence.virtual_display_uuid
+                    (evidence.virtual_display_uuid, evidence.focus_generation)
                 }
                 Err(_reason) => return Err(LeaseDrift::Target),
             }
         } else {
-            pre_await_uuid
+            (pre_await_uuid, pre_await_focus_generation)
         };
 
-        // Rebuild the key from the re-verified live state. A `None` here means
-        // the live target can no longer be scoped — treat as target drift.
-        self.ask_lease_key(live_uuid).ok_or(LeaseDrift::Target)
+        // Rebuild the key from the re-verified live state (including the
+        // exact payload digest and live focus). A `None` here means the live
+        // target can no longer be scoped — treat as target drift.
+        self.ask_lease_key(live_uuid, actions, live_focus)
+            .ok_or(LeaseDrift::Target)
     }
 
     /// The virtual display UUID pinned from the target-evidence snapshot at
     /// `open()`. `None` for physical targets and evidence-less virtual
     /// backends. This is a trivial accessor of the stored field so lease
-    /// scoping (`ask_lease_key`) and `revoke_ask_lease` stay consistent.
+    /// scoping (`ask_lease_key`) stays consistent with the identity captured
+    /// at open.
     fn virtual_display_uuid(&self) -> Option<[u8; 16]> {
         self.virtual_display_uuid
     }
@@ -4763,16 +4926,13 @@ impl ComputerActionCoordinator {
         &self.model_id
     }
 
-    /// Revoke the Ask delegation lease for the current coordinator state.
-    /// Called on delegation terminal state, cancel, detach, provider/model
-    /// change, display/target/host generation change, lost OS lock, or daemon
-    /// restart.
+    /// Revoke every Ask lease for this coordinator's delegation. Payload-
+    /// scoped keys mean one coordinator may hold several leases; a target
+    /// or generation change must drop all of them. Called on delegation
+    /// terminal state, cancel, detach, provider/model change,
+    /// display/target/host generation change, lost OS lock, or daemon restart.
     pub fn revoke_ask_lease(&mut self) -> bool {
-        if let Some(key) = self.ask_lease_key(self.virtual_display_uuid()) {
-            self.ask_lease_store.revoke(&key)
-        } else {
-            false
-        }
+        self.revoke_ask_lease_for_delegation() > 0
     }
 
     /// Revoke all Ask leases for this coordinator's delegation. Called on
@@ -5840,8 +6000,8 @@ mod tests {
     use super::super::host_identity::HostInstallationId;
     use super::super::platform::x11::{X11SessionParts, x11_session_or_seat_id};
     use super::super::target::{
-        FakeTargetEvidenceAdapter, TargetIdentityEvidence, empty_unavailable,
-        sample_physical_evidence,
+        FakeTargetEvidenceAdapter, TargetEvidenceAdapter, TargetIdentityEvidence,
+        TargetUnavailableReason, empty_unavailable, sample_physical_evidence,
     };
     use super::super::{
         Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, CanonicalKeyChord,
@@ -5914,6 +6074,44 @@ mod tests {
         evidence.focus_generation = 1;
         evidence.adapter_observed_epoch = 1;
         evidence
+    }
+
+    fn screenshot_backend_actions() -> Vec<ComputerAction> {
+        vec![ComputerAction::CaptureFull]
+    }
+
+    fn fixture_ask_lease_key(target: [u8; 16], digest: impl Into<String>) -> AskLeaseKey {
+        AskLeaseKey {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            target_key: LeaseTargetKey::Virtual(target),
+            host_lease_generation: None,
+            display_generation: 1,
+            focus_generation: 1,
+            action_payload_digest: digest.into(),
+        }
+    }
+
+    /// Shared handle so a test can mutate live focus after the coordinator
+    /// has taken ownership of the adapter.
+    struct SharedFakeAdapter {
+        inner: Arc<std::sync::Mutex<FakeTargetEvidenceAdapter>>,
+    }
+
+    impl TargetEvidenceAdapter for SharedFakeAdapter {
+        fn backend_kind(&self) -> BackendKind {
+            self.inner.lock().unwrap().backend_kind()
+        }
+
+        fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
+            self.inner.lock().unwrap().capture_snapshot()
+        }
+
+        fn observed_focus_epoch(&self) -> u64 {
+            self.inner.lock().unwrap().observed_focus_epoch()
+        }
     }
 
     fn physical_evidence() -> TargetIdentityEvidence {
@@ -8333,8 +8531,9 @@ mod tests {
 
     // =====================================================================
     // Acceptance criterion 1: computer_lease_scoped_to_delegation
-    // Proves one coalesced Ask decision, reuse, re-prompt for every
-    // key/generation change, and no broader persistence.
+    // Proves an Ask decision is bound to exact payload + focus, may be
+    // reused only for identical retry-safe actions within a short bound,
+    // re-prompts on key/generation change, and never persists more broadly.
     // =====================================================================
 
     fn make_ask_coordinator_params(
@@ -8366,10 +8565,11 @@ mod tests {
 
     #[tokio::test]
     async fn computer_lease_scoped_to_delegation() {
-        // Ask tier: the first valid Ask action creates one coalesced central
-        // authorization request. Approve creates an in-memory
-        // AskDelegationLease. The lease is reused for all action classes until
-        // invalidation. The lease never persists and cannot be broadened.
+        // Ask tier: the first valid retry-safe Ask action creates one central
+        // authorization request. Approve installs an in-memory
+        // AskDelegationLease bound to that exact payload and live focus.
+        // A different payload requires a new decision. The lease never
+        // persists and cannot be broadened.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
         let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
@@ -8377,13 +8577,31 @@ mod tests {
             .await
             .expect("coordinator open");
 
-        // First Ask action — authorizer is called once (one coalesced decision).
+        // First Ask action — authorizer is called once.
         let actions = vec![OpenAiComputerAction::Screenshot];
         let outcome1 = coordinator.execute_openai_call("call-1", &actions).await;
         assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer.call_count(), 1);
 
-        // Second action — the lease is reused, no new authorizer call.
+        // The lease is installed in the store, keyed to the real captured
+        // virtual display UUID (`[0xAA; 16]`), payload digest, and focus.
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+        let lease_key = coordinator
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &screenshot_backend_actions(),
+                coordinator.focus_generation().0,
+            )
+            .unwrap();
+        assert!(coordinator.ask_lease_store().has_lease(&lease_key));
+        assert_eq!(lease_key.target_key, LeaseTargetKey::Virtual([0xAA; 16]));
+        assert_eq!(
+            lease_key.action_payload_digest,
+            canonical_computer_action_payload_digest(&screenshot_backend_actions())
+        );
+        assert_eq!(lease_key.focus_generation, coordinator.focus_generation().0);
+
+        // A different reversible payload cannot reuse the screenshot lease.
         let actions2 = vec![OpenAiComputerAction::Move {
             to: Point {
                 x: 10.0,
@@ -8393,17 +8611,7 @@ mod tests {
         }];
         let outcome2 = coordinator.execute_openai_call("call-2", &actions2).await;
         assert!(matches!(outcome2, CoordinatedOutcome::Completed { .. }));
-        assert_eq!(authorizer.call_count(), 1); // Still 1 — lease reused.
-
-        // The lease is installed in the store.
-        assert_eq!(coordinator.ask_lease_store().len(), 1);
-
-        // The lease is scoped — it cannot be broadened to session/project/global.
-        // It is keyed to the real captured virtual display UUID (`[0xAA; 16]`),
-        // not the deleted zero-UUID fallback.
-        let lease_key = coordinator.ask_lease_key(Some([0xAA; 16])).unwrap();
-        assert!(coordinator.ask_lease_store().has_lease(&lease_key));
-        assert_eq!(lease_key.target_key, LeaseTargetKey::Virtual([0xAA; 16]));
+        assert_eq!(authorizer.call_count(), 2);
     }
 
     #[tokio::test]
@@ -8541,19 +8749,11 @@ mod tests {
         let mut store = AskDelegationLeaseStore::new();
         assert!(store.is_empty());
 
-        let key = AskLeaseKey {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            target_key: LeaseTargetKey::Virtual([0u8; 16]),
-            host_lease_generation: None,
-            display_generation: 1,
-        };
+        let key = fixture_ask_lease_key([0u8; 16], "");
         assert!(!store.has_lease(&key));
 
         let v = store.begin_approval_wait(&key);
-        let outcome = store.install(&key, v);
+        let outcome = store.install(&key, v, 1);
         assert_eq!(outcome, AskAuthorizationOutcome::Installed);
         assert!(store.has_lease(&key));
     }
@@ -8562,23 +8762,21 @@ mod tests {
     fn computer_lease_unforgeable_constant_time_token() {
         // The opaque token is compared in constant time. Two leases with the
         // same key but different tokens are not equal.
-        let key = AskLeaseKey {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            target_key: LeaseTargetKey::Virtual([0u8; 16]),
-            host_lease_generation: None,
-            display_generation: 1,
-        };
+        let key = fixture_ask_lease_key([0u8; 16], "");
         let mut store = AskDelegationLeaseStore::new();
         let v1 = store.begin_approval_wait(&key);
-        assert_eq!(store.install(&key, v1), AskAuthorizationOutcome::Installed);
+        assert_eq!(
+            store.install(&key, v1, 1),
+            AskAuthorizationOutcome::Installed
+        );
         let lease1 = store.lease(&key).unwrap().clone();
 
         assert!(store.revoke(&key));
         let v2 = store.begin_approval_wait(&key);
-        assert_eq!(store.install(&key, v2), AskAuthorizationOutcome::Installed);
+        assert_eq!(
+            store.install(&key, v2, 1),
+            AskAuthorizationOutcome::Installed
+        );
         let lease2 = store.lease(&key).unwrap().clone();
 
         assert_eq!(lease1.key(), lease2.key());
@@ -8682,20 +8880,12 @@ mod tests {
         // is a fresh CSPRNG draw, never derived from the (public) key + version.
         // Against the old DefaultHasher derivation the tokens would be
         // identical and the leases would compare equal.
-        let key = AskLeaseKey {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-            target_key: LeaseTargetKey::Virtual([0xAA; 16]),
-            host_lease_generation: None,
-            display_generation: 1,
-        };
+        let key = fixture_ask_lease_key([0xAA; 16], "");
 
         let mut store_a = AskDelegationLeaseStore::new();
         let va = store_a.begin_approval_wait(&key);
         assert_eq!(
-            store_a.install(&key, va),
+            store_a.install(&key, va, 1),
             AskAuthorizationOutcome::Installed
         );
         let lease_a = store_a.lease(&key).unwrap().clone();
@@ -8706,7 +8896,7 @@ mod tests {
         // so only the random token can distinguish the leases.
         assert_eq!(va, vb, "identical approval-version sequence");
         assert_eq!(
-            store_b.install(&key, vb),
+            store_b.install(&key, vb, 1),
             AskAuthorizationOutcome::Installed
         );
         let lease_b = store_b.lease(&key).unwrap().clone();
@@ -8744,7 +8934,11 @@ mod tests {
         assert_eq!(coordinator.ask_lease_store().len(), 1);
 
         let key = coordinator
-            .ask_lease_key(Some([0xAA; 16]))
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &screenshot_backend_actions(),
+                coordinator.focus_generation().0,
+            )
             .expect("virtual key scoped to real UUID");
         let lease = coordinator
             .ask_lease_store()
@@ -9367,20 +9561,26 @@ mod tests {
         for class in labels {
             assert!(!class.label().is_empty());
         }
+
+        assert!(ActionRiskClass::Reversible.is_retry_safe());
+        assert!(!ActionRiskClass::StateChanging.is_retry_safe());
+        assert!(ActionRiskClass::Destructive.requires_fresh_approval_each_action());
+        assert!(ActionRiskClass::CredentialEntry.requires_fresh_approval_each_action());
+        assert!(!ActionRiskClass::Reversible.requires_fresh_approval_each_action());
+        assert!(!ActionRiskClass::StateChanging.requires_fresh_approval_each_action());
     }
 
     #[tokio::test]
     async fn computer_action_semantics_advisory_no_deny_difference() {
-        // Advisory classes never trigger a prompt/deny/grant difference.
+        // Risk class never hard-denies in Ask: both a reversible and a
+        // destructive action complete. Class does force a new Ask decision
+        // for the higher-risk action (issue #287); it does not refuse it.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
         // Ask tier with a real virtual-display identity (UUID `[0xAA; 16]`) and
         // a nonzero focus generation via the target-evidence adapter, so lease
         // scoping succeeds and the destructive `type` action clears the
         // focus-generation gate; `host_arbiter: None` skips lock acquisition.
-        // The advisory action class must not change the outcome (still
-        // Completed) or add an authorizer call (the lease is reused, so
-        // call_count stays 1).
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
@@ -9412,8 +9612,8 @@ mod tests {
             .await;
         assert!(matches!(outcome_d, CoordinatedOutcome::Completed { .. }));
 
-        // Only one authorizer call — lease reused for both classes.
-        assert_eq!(authorizer.call_count(), 1);
+        // Higher-risk class requires a new decision; neither action is denied.
+        assert_eq!(authorizer.call_count(), 2);
     }
 
     // =====================================================================
@@ -9498,11 +9698,13 @@ mod tests {
             target_key: LeaseTargetKey::Virtual([0u8; 16]),
             host_lease_generation: None,
             display_generation: 1,
+            focus_generation: 1,
+            action_payload_digest: String::new(),
         };
         let mut other_store = AskDelegationLeaseStore::new();
         let v = other_store.begin_approval_wait(&other_key);
         assert_eq!(
-            other_store.install(&other_key, v),
+            other_store.install(&other_key, v, 1),
             AskAuthorizationOutcome::Installed
         );
 
@@ -9516,7 +9718,13 @@ mod tests {
         // A lease was installed for THIS delegation, not inherited. The key is
         // scoped to the real captured virtual UUID (`[0xAA; 16]`).
         assert_eq!(coordinator.ask_lease_store().len(), 1);
-        let this_key = coordinator.ask_lease_key(Some([0xAA; 16])).unwrap();
+        let this_key = coordinator
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &screenshot_backend_actions(),
+                coordinator.focus_generation().0,
+            )
+            .unwrap();
         assert!(coordinator.ask_lease_store().has_lease(&this_key));
         assert_ne!(this_key.session_id, other_key.session_id);
     }
@@ -10220,7 +10428,9 @@ mod tests {
     // =====================================================================
     // Action hardening: computer_action_no_semantic_floor
     // AC7: Submission/purchase/credential/destructive classes add no
-    // prompt/deny in Yolo and no decision beyond the Ask delegation lease.
+    // prompt/deny in Yolo. In Ask they never hard-deny from class alone,
+    // but they do require a fresh Allow (issue #287): they do not reuse a
+    // benign delegation lease.
     // =====================================================================
 
     #[tokio::test]
@@ -10269,9 +10479,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_action_no_semantic_floor_ask_one_lease_all_classes() {
-        // Ask: one coalesced decision for all action classes. Advisory class
-        // never changes dispatch authorization.
+    async fn computer_action_ask_lease_reapproves_higher_risk_classes() {
+        // Issue #287: a benign Allow does not lease destructive or credential
+        // follow-ups. Each higher-risk class requires a new authorizer call.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let adapter = FakeTargetEvidenceAdapter::new(ask_virtual_evidence());
         let params = CoordinatorParams {
@@ -10291,23 +10501,33 @@ mod tests {
             .await
             .expect("coordinator open");
 
-        // Reversible action — one decision.
         let reversible = vec![OpenAiComputerAction::Screenshot];
         let outcome_r = coordinator
             .execute_openai_call("call-reversible-ask", &reversible)
             .await;
         assert!(matches!(outcome_r, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
 
-        // Destructive action — same lease, no new decision.
         let destructive = vec![OpenAiComputerAction::TypeText("rm -rf /".to_string())];
         let outcome_d = coordinator
             .execute_openai_call("call-destructive-ask", &destructive)
             .await;
         assert!(matches!(outcome_d, CoordinatedOutcome::Completed { .. }));
-        assert_eq!(authorizer.call_count(), 1); // Still 1 — lease reused.
+        assert_eq!(authorizer.call_count(), 2);
+        // One-shot: the destructive Allow must not install a reusable lease.
+        // The screenshot lease may still be present (different payload key).
+        let destructive_key = coordinator
+            .ask_lease_key(
+                Some([0xAA; 16]),
+                &[ComputerAction::TypeText {
+                    text: "rm -rf /".to_string(),
+                }],
+                coordinator.focus_generation().0,
+            )
+            .unwrap();
+        assert!(!coordinator.ask_lease_store().has_lease(&destructive_key));
 
-        // Credential action — same lease, no new decision.
         let credential = vec![OpenAiComputerAction::TypeText(
             "password secret".to_string(),
         )];
@@ -10315,7 +10535,202 @@ mod tests {
             .execute_openai_call("call-credential-ask", &credential)
             .await;
         assert!(matches!(outcome_c, CoordinatedOutcome::Completed { .. }));
-        assert_eq!(authorizer.call_count(), 1); // Still 1 — lease reused.
+        assert_eq!(authorizer.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_lease_state_changing_is_one_shot() {
+        // Typing is not retry-safe: identical StateChanging payloads still
+        // require a fresh Allow and install no lease.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let typed = vec![OpenAiComputerAction::TypeText("hello world".to_string())];
+        assert!(matches!(
+            coordinator.execute_openai_call("call-type-1", &typed).await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+
+        assert!(matches!(
+            coordinator.execute_openai_call("call-type-2", &typed).await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_lease_identical_reversible_reuses_bounded_lease() {
+        // Identical retry-safe actions share a short action-count bound.
+        // The bound is not delegation-wide and is not wall-clock-only.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-shot-1", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        // One identical reuse consumes the remaining bound.
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-shot-2", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            coordinator.ask_lease_store().len(),
+            0,
+            "bounded lease is exhausted after the allowed identical reuse"
+        );
+
+        // The next identical action must re-prompt.
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-shot-3", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_lease_destructive_one_shot_no_reuse() {
+        // Two identical destructive actions each require a fresh Allow.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let destructive = vec![OpenAiComputerAction::TypeText("rm -rf /".to_string())];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-destroy-1", &destructive)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            coordinator.ask_lease_store().len(),
+            0,
+            "destructive actions install no Ask lease"
+        );
+
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-destroy-2", &destructive)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 2);
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_ask_lease_focus_generation_change_requires_new_approval() {
+        // A changed target window (focus generation) cannot reuse a prior Allow.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let shared = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            ask_virtual_evidence(),
+        )));
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(SharedFakeAdapter {
+                inner: shared.clone(),
+            })),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let screenshot = vec![OpenAiComputerAction::Screenshot];
+        assert!(matches!(
+            coordinator
+                .execute_openai_call("call-focus-1", &screenshot)
+                .await,
+            CoordinatedOutcome::Completed { .. }
+        ));
+        assert_eq!(authorizer.call_count(), 1);
+
+        let focus_one = coordinator
+            .ask_lease_key(Some([0xAA; 16]), &screenshot_backend_actions(), 1)
+            .unwrap();
+        let focus_two = coordinator
+            .ask_lease_key(Some([0xAA; 16]), &screenshot_backend_actions(), 2)
+            .unwrap();
+        assert!(coordinator.ask_lease_store().has_lease(&focus_one));
+        assert!(!coordinator.ask_lease_store().has_lease(&focus_two));
+
+        shared.lock().unwrap().snapshot.focus_generation = 2;
+
+        // Live focus is now 2, so the focus-1 lease cannot authorize this
+        // screenshot. A new decision is required.
+        let _ = coordinator
+            .execute_openai_call("call-focus-2", &screenshot)
+            .await;
+        assert_eq!(authorizer.call_count(), 2);
+    }
+
+    #[test]
+    fn computer_ask_lease_store_payload_and_focus_are_distinct_keys() {
+        let mut store = AskDelegationLeaseStore::new();
+        let mut key = fixture_ask_lease_key([0xAA; 16], "payload-a");
+        key.focus_generation = 1;
+        let v = store.begin_approval_wait(&key);
+        assert_eq!(
+            store.install(&key, v, 1),
+            AskAuthorizationOutcome::Installed
+        );
+        assert!(store.has_lease(&key));
+
+        let mut other_payload = key.clone();
+        other_payload.action_payload_digest = "payload-b".to_string();
+        assert!(!store.has_lease(&other_payload));
+
+        let mut other_focus = key.clone();
+        other_focus.focus_generation = 2;
+        assert!(!store.has_lease(&other_focus));
+        assert!(!store.try_consume(&other_focus));
+        assert!(store.has_lease(&key));
+    }
+
+    #[test]
+    fn computer_ask_lease_store_try_consume_exhausts_bound() {
+        let mut store = AskDelegationLeaseStore::new();
+        let key = fixture_ask_lease_key([0xAA; 16], "payload-a");
+        let v = store.begin_approval_wait(&key);
+        assert_eq!(
+            store.install(&key, v, 1),
+            AskAuthorizationOutcome::Installed
+        );
+        assert_eq!(store.lease(&key).unwrap().remaining_uses(), 1);
+        assert!(store.try_consume(&key));
+        assert!(!store.has_lease(&key));
+        assert!(!store.try_consume(&key));
     }
 
     // =====================================================================

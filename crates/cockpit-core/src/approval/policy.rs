@@ -1334,11 +1334,13 @@ impl Approver {
                 },
             )
             .await?;
-        // No durable permission record for computer actions. The delegation
-        // lease contract forbids standing computer grants: reuse of an Ask
-        // approval is only via the in-memory `AskDelegationLease`, never a
-        // persisted `permission_decision` row. (Contrast every other approval
-        // path, which records the decision here.)
+        // No durable permission record for computer actions. The Ask lease
+        // contract forbids standing computer grants: reuse of an Allow is
+        // only via the in-memory `AskDelegationLease` (exact payload + live
+        // focus, short action-count bound; destructive/credential classes
+        // install none), never a persisted `permission_decision` row.
+        // (Contrast every other approval path, which records the decision
+        // here.)
         Ok(decision)
     }
 

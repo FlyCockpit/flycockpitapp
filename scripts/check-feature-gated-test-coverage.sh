@@ -16,6 +16,18 @@ set -euo pipefail
 #
 # Features in LIVE_INFRA_FEATURES may be executed by a workflow_dispatch
 # opt-in. Every other feature must run on a blocking pull_request/push job.
+#
+# This script must itself run as an unconditional `run:` step of a blocking
+# pull_request/push job. A file-wide substring in a contract test is not that
+# binding: relocating the step onto a workflow_dispatch job, wrapping it in
+# `echo`, or giving it `continue-on-error` / a step-level `if:` must fail here.
+#
+# Module graph: `mod X;` in `lib.rs`/`main.rs`/`mod.rs` resolves to sibling
+# `X.rs` or `X/mod.rs`; in `foo.rs` it resolves to `foo/X.rs` or `foo/X/mod.rs`;
+# `#[path = "..."]` is relative to the parent file. An out-of-line `mod X;`
+# that cannot be resolved is a hard error (string/char literals are not
+# declarations). Cargo nextest/test coverage steps must be unconditional:
+# no step-level `if:`, no step `continue-on-error`, no shell control flow.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -29,6 +41,8 @@ from pathlib import Path
 import re
 import sys
 import tomllib
+
+COVERAGE_CMD = "bash scripts/check-feature-gated-test-coverage.sh"
 
 ROOT = Path(".")
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -50,8 +64,12 @@ IGNORE_ATTR = re.compile(r"#\[ignore\b")
 MOD_DECL = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*(;|\{)"
 )
+PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\s*\]')
 JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.M)
 TOKEN_RE = re.compile(r"""(?:[^\s"']+|"[^"]*"|'[^']*')""")
+SHELL_CONDITIONAL = re.compile(
+    r"(?:^|[\s;|&])(?:if|case|while|until|for)\s|(?:&&|\|\|)"
+)
 
 
 def die(message: str) -> None:
@@ -63,13 +81,17 @@ def die(message: str) -> None:
 # Comment stripping
 # ---------------------------------------------------------------------------
 
-def strip_comments_preserve_ws(src: str) -> str:
+def strip_comments_preserve_ws(
+    src: str,
+) -> tuple[str, tuple[tuple[int, int], ...]]:
     out: list[str] = []
+    literals: list[tuple[int, int]] = []
     i, n = 0, len(src)
     while i < n:
         ch = src[i]
         if ch == '"' or ch == "'":
             quote = ch
+            start = len(out)
             out.append(ch)
             i += 1
             while i < n:
@@ -84,6 +106,7 @@ def strip_comments_preserve_ws(src: str) -> str:
                     i += 1
                     break
                 i += 1
+            literals.append((start, len(out)))
             continue
         if ch == "/" and i + 1 < n and src[i + 1] == "/":
             while i < n and src[i] != "\n":
@@ -102,13 +125,13 @@ def strip_comments_preserve_ws(src: str) -> str:
             continue
         out.append(ch)
         i += 1
-    return "".join(out)
+    return "".join(out), tuple(literals)
 
 
-_FILE_CACHE: dict[Path, str] = {}
+_FILE_CACHE: dict[Path, tuple[str, tuple[tuple[int, int], ...]]] = {}
 
 
-def stripped(path: Path) -> str:
+def file_scan(path: Path) -> tuple[str, tuple[tuple[int, int], ...]]:
     cached = _FILE_CACHE.get(path)
     if cached is None:
         cached = strip_comments_preserve_ws(
@@ -116,6 +139,19 @@ def stripped(path: Path) -> str:
         )
         _FILE_CACHE[path] = cached
     return cached
+
+
+def stripped(path: Path) -> str:
+    return file_scan(path)[0]
+
+
+def is_in_literal(ranges: tuple[tuple[int, int], ...], index: int) -> bool:
+    for start, end in ranges:
+        if start <= index < end:
+            return True
+        if start > index:
+            return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -288,14 +324,29 @@ def rust_files(package_dir: Path) -> list[Path]:
     return files
 
 
-def resolve_mod_file(parent: Path, name: str) -> Path | None:
-    candidates = [
-        parent.parent / f"{name}.rs",
-        parent.parent / name / "mod.rs",
-    ]
-    if parent.name == "mod.rs":
-        candidates.insert(0, parent.parent / f"{name}.rs")
-    for candidate in candidates:
+def path_from_attrs(file: Path, attrs: str) -> str | None:
+    if "#[path" not in attrs:
+        return None
+    match = PATH_ATTR.search(attrs)
+    if match is None:
+        die(
+            f"{file.as_posix()}: unparseable #[path] on a mod declaration: "
+            f"{attrs.strip()!r}"
+        )
+    return match.group(1)
+
+
+def resolve_mod_file(
+    parent: Path, name: str, path_attr: str | None
+) -> Path | None:
+    if path_attr is not None:
+        candidate = parent.parent / path_attr
+        return candidate if candidate.is_file() else None
+    if parent.name in {"mod.rs", "lib.rs", "main.rs"}:
+        directory = parent.parent
+    else:
+        directory = parent.parent / parent.stem
+    for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
         if candidate.is_file():
             return candidate
     return None
@@ -378,28 +429,58 @@ def dnf_from_attrs(attrs: str) -> list[frozenset[str]]:
 def collect_file_inherited_dnf(package_dir: Path) -> dict[Path, list[frozenset[str]]]:
     inherited: dict[Path, list[frozenset[str]]] = {}
     files = rust_files(package_dir)
+    unresolved: list[str] = []
     for path in files:
-        text = stripped(path)
+        text, literals = file_scan(path)
+        for match in MOD_DECL.finditer(text):
+            if match.group(2) != ";":
+                continue
+            if is_in_literal(literals, match.start()):
+                continue
+            attrs = preceding_attrs(text, match.start())
+            path_attr = path_from_attrs(path, attrs)
+            target = resolve_mod_file(path, match.group(1), path_attr)
+            if target is None:
+                extra = f" #[path = \"{path_attr}\"]" if path_attr else ""
+                unresolved.append(
+                    f"{path.as_posix()}: mod {match.group(1)};{extra}"
+                )
         acc = [frozenset()]
         for match in CFG_INNER_ATTR.finditer(text):
+            if is_in_literal(literals, match.start()):
+                continue
             acc = dnf_and(acc, cfg_text_dnf(match.group(1)))
         if acc != [frozenset()]:
             inherited[path] = acc
+
+    if unresolved:
+        print(
+            "feature-gated test coverage: unresolved out-of-line mod declarations "
+            "(foo.rs → foo/bar.rs, lib.rs/mod.rs siblings, and #[path] are "
+            "modeled; anything else is a scanner hole):",
+            file=sys.stderr,
+        )
+        for line in unresolved:
+            print(f"  {line}", file=sys.stderr)
+        die("unresolved mod declarations cannot inherit cfg(feature) gates")
 
     changed = True
     while changed:
         changed = False
         for path in files:
-            text = stripped(path)
+            text, literals = file_scan(path)
             current = inherited.get(path, [frozenset()])
             for match in MOD_DECL.finditer(text):
                 if match.group(2) != ";":
+                    continue
+                if is_in_literal(literals, match.start()):
                     continue
                 attrs = preceding_attrs(text, match.start())
                 dnf = dnf_and(current, dnf_from_attrs(attrs))
                 if dnf == [frozenset()]:
                     continue
-                target = resolve_mod_file(path, match.group(1))
+                path_attr = path_from_attrs(path, attrs)
+                target = resolve_mod_file(path, match.group(1), path_attr)
                 if target is None:
                     continue
                 before = inherited.get(target, [frozenset()])
@@ -445,11 +526,15 @@ def matching_brace(src: str, open_at: int) -> int:
     return n
 
 
-def inline_module_ranges(src: str) -> list[tuple[int, int, list[frozenset[str]]]]:
+def inline_module_ranges(
+    src: str, literals: tuple[tuple[int, int], ...]
+) -> list[tuple[int, int, list[frozenset[str]]]]:
     """(start, end, dnf) for each `#[cfg] mod name { ... }` inline module."""
     ranges: list[tuple[int, int, list[frozenset[str]]]] = []
     for match in MOD_DECL.finditer(src):
         if match.group(2) != "{":
+            continue
+        if is_in_literal(literals, match.start()):
             continue
         attrs = preceding_attrs(src, match.start())
         dnf = dnf_from_attrs(attrs)
@@ -466,16 +551,20 @@ def scan_source_tests(
     file_dnf: list[frozenset[str]],
     extra: frozenset[str],
 ) -> list[GatedTest]:
-    src = stripped(path)
+    src, literals = file_scan(path)
     if "#[test]" not in src and "#[tokio::test" not in src:
         return []
     extra_dnf = [extra] if extra else [frozenset()]
     crate_dnf = file_dnf
     for match in CFG_INNER_ATTR.finditer(src):
+        if is_in_literal(literals, match.start()):
+            continue
         crate_dnf = dnf_and(crate_dnf, cfg_text_dnf(match.group(1)))
-    modules = inline_module_ranges(src)
+    modules = inline_module_ranges(src, literals)
     tests: list[GatedTest] = []
     for test_match in TEST_ATTR.finditer(src):
+        if is_in_literal(literals, test_match.start()):
+            continue
         following, after = collect_following_attrs(src, test_match.end())
         attrs = preceding_attrs(src, test_match.start()) + test_match.group(0) + following
         ignored = bool(IGNORE_ATTR.search(attrs))
@@ -658,11 +747,13 @@ def workflow_triggers(text: str) -> set[str]:
 
 
 def job_continue_on_error(job: str) -> bool:
-    return bool(re.search(r"(?m)^\s+continue-on-error:\s*true\s*$", job))
+    # Job-level key only (4-space indent). Step-level continue-on-error is
+    # modeled on the step, not as a job property.
+    return bool(re.search(r"(?m)^    continue-on-error:\s*true\s*$", job))
 
 
 def job_if(job: str) -> str:
-    match = re.search(r"(?m)^\s+if:\s*(.+)$", job)
+    match = re.search(r"(?m)^    if:\s*(.+)$", job)
     return match.group(1).strip() if match else ""
 
 
@@ -682,42 +773,121 @@ def is_opt_in_job(job_if_expr: str) -> bool:
     return "workflow_dispatch" in job_if_expr and "inputs." in job_if_expr
 
 
-def folded_run_scripts(job: str) -> list[str]:
-    scripts: list[str] = []
+@dataclass
+class ParsedStep:
+    name: str
+    if_expr: str
+    continue_on_error: bool
+    script: str | None
+
+
+def parse_run_value(
+    lines: list[str], i: int, line: str, key_indent: int
+) -> tuple[str, int]:
+    idx = line.find("run:")
+    rest = line[idx + 4 :].strip()
+    if rest in (">", "|", ">-", "|-"):
+        folded = rest.startswith(">")
+        block: list[str] = []
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip():
+                block.append("")
+                i += 1
+                continue
+            nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+            if nxt_indent <= key_indent:
+                break
+            prefix = " " * (key_indent + 2)
+            block.append(nxt[len(prefix) :] if nxt.startswith(prefix) else nxt.lstrip())
+            i += 1
+        if folded:
+            return " ".join(part.strip() for part in block if part.strip()), i
+        return "\n".join(block), i
+    return rest, i + 1
+
+
+def parse_job_steps(job: str) -> list[ParsedStep]:
+    """Parse `steps:` list items. Unmodeled step `if:` / continue-on-error stay on the step."""
     lines = job.splitlines()
     i = 0
     while i < len(lines):
-        line = lines[i]
-        stripped_line = line.lstrip()
-        if not stripped_line.startswith("run:"):
+        if re.match(r"^    steps:\s*$", lines[i]):
             i += 1
-            continue
-        rest = stripped_line[len("run:") :].strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if rest in (">", "|", ">-", "|-"):
-            folded = rest.startswith(">")
-            block: list[str] = []
-            i += 1
-            while i < len(lines):
-                nxt = lines[i]
-                if not nxt.strip():
-                    block.append("")
-                    i += 1
-                    continue
-                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
-                if nxt_indent <= indent:
-                    break
-                prefix = " " * (indent + 2)
-                block.append(nxt[len(prefix) :] if nxt.startswith(prefix) else nxt.lstrip())
-                i += 1
-            if folded:
-                scripts.append(" ".join(part.strip() for part in block if part.strip()))
-            else:
-                scripts.append("\n".join(block))
-            continue
-        scripts.append(rest)
+            break
         i += 1
-    return scripts
+    else:
+        return []
+    steps: list[ParsedStep] = []
+    current: dict | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is None:
+            return
+        steps.append(
+            ParsedStep(
+                name=current["name"],
+                if_expr=current["if"],
+                continue_on_error=current["continue_on_error"],
+                script=current["script"],
+            )
+        )
+        current = None
+
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() and not line.startswith("      "):
+            break
+        if re.match(r"^      - ", line):
+            flush()
+            current = {
+                "name": "",
+                "if": "",
+                "continue_on_error": False,
+                "script": None,
+            }
+            rest = line[len("      - ") :]
+            if rest.startswith("name:"):
+                current["name"] = rest[len("name:") :].strip().strip("'\"")
+                i += 1
+                continue
+            if rest.startswith("run:"):
+                script, i = parse_run_value(lines, i, line, 6)
+                current["script"] = script
+                continue
+            i += 1
+            continue
+        if current is None:
+            i += 1
+            continue
+        stripped_line = line.strip()
+        if stripped_line.startswith("name:"):
+            current["name"] = stripped_line[len("name:") :].strip().strip("'\"")
+            i += 1
+            continue
+        if stripped_line.startswith("if:"):
+            value = stripped_line[len("if:") :].strip()
+            if value in (">", "|", ">-", "|-"):
+                die(
+                    f"step {current['name'] or '(unnamed)'}: multiline `if:` is unmodeled"
+                )
+            current["if"] = value
+            i += 1
+            continue
+        if stripped_line.startswith("continue-on-error:"):
+            current["continue_on_error"] = stripped_line.endswith("true")
+            i += 1
+            continue
+        if "run:" in line and stripped_line.startswith("run:"):
+            key_indent = len(line) - len(line.lstrip(" "))
+            script, i = parse_run_value(lines, i, line, key_indent)
+            current["script"] = script
+            continue
+        i += 1
+    flush()
+    return steps
 
 
 def tokenize(command: str) -> list[str]:
@@ -894,31 +1064,144 @@ def parse_cargo_test_command(
     )
 
 
-def iter_commands(script: str) -> list[str]:
-    commands = [line.strip() for line in script.splitlines() if line.strip()]
+def looks_like_cargo_test(command: str) -> bool:
+    tokens = tokenize(command)
+    if len(tokens) < 2 or tokens[0] != "cargo" or tokens[1] not in {"nextest", "test"}:
+        return False
+    if tokens[1] == "nextest":
+        return len(tokens) >= 3 and tokens[2] == "run"
+    return True
+
+
+def uncommented_script_lines(script: str) -> list[str]:
+    lines = []
+    for raw in script.splitlines():
+        stripped_line = raw.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        lines.append(stripped_line)
+    return lines
+
+
+def coalesce_commands(lines: list[str]) -> list[str]:
+    """Join a cargo command with immediately following flag-only continuation lines."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        cmd = lines[i]
+        i += 1
+        if looks_like_cargo_test(cmd) or cmd.startswith("cargo nextest") or cmd.startswith(
+            "cargo test"
+        ):
+            while i < len(lines) and lines[i].startswith("-"):
+                cmd += " " + lines[i]
+                i += 1
+        out.append(cmd)
+    return out
+
+
+def script_has_cargo_test(script: str) -> bool:
     joined = " ".join(script.split())
-    if ("cargo nextest" in joined or "cargo test" in joined) and joined not in commands:
+    if looks_like_cargo_test(joined):
+        return True
+    for command in coalesce_commands(uncommented_script_lines(script)):
+        if looks_like_cargo_test(command):
+            return True
+    return False
+
+
+def assert_unconditional_cargo_script(script: str, where: str) -> None:
+    body = "\n".join(uncommented_script_lines(script))
+    if SHELL_CONDITIONAL.search(body):
+        die(
+            f"{where}: cargo nextest/test coverage command is inside a shell "
+            "conditional (`if`/`case`/`&&`/`||`); the ratchet only accepts "
+            "unconditional cargo test steps"
+        )
+
+
+def iter_cargo_test_commands(script: str) -> list[str]:
+    commands = coalesce_commands(uncommented_script_lines(script))
+    joined = " ".join(script.split())
+    if looks_like_cargo_test(joined) and joined not in commands:
         commands.append(joined)
-    return commands
+    return [cmd for cmd in commands if looks_like_cargo_test(cmd)]
 
 
-def discover_invocations() -> list[Invocation]:
-    invocations: list[Invocation] = []
+def iter_workflow_jobs():
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text(encoding="utf-8")
         triggers = workflow_triggers(text)
         for job_name, job in split_jobs(text).items():
-            cont = job_continue_on_error(job)
             if_expr = job_if(job)
-            blocking = is_blocking_job(triggers, if_expr, cont)
-            opt_in = is_opt_in_job(if_expr)
-            for script in folded_run_scripts(job):
-                for command in iter_commands(script):
-                    parsed = parse_cargo_test_command(
-                        command, path.name, job_name, blocking, opt_in
-                    )
-                    if parsed is not None:
-                        invocations.append(parsed)
+            cont = job_continue_on_error(job)
+            yield path, job_name, job, triggers, if_expr, cont
+
+
+def assert_coverage_ratchet_is_blocking() -> None:
+    """This ratchet is only as strong as its own blocking execution."""
+    blocking_hits: list[str] = []
+    other_hits: list[str] = []
+    for path, job_name, job, triggers, if_expr, cont in iter_workflow_jobs():
+        blocking = is_blocking_job(triggers, if_expr, cont)
+        for step in parse_job_steps(job):
+            if not step.script:
+                continue
+            commands = coalesce_commands(uncommented_script_lines(step.script))
+            if step.script.strip() == COVERAGE_CMD:
+                commands = [COVERAGE_CMD]
+            if COVERAGE_CMD not in commands:
+                continue
+            loc = f"{path.name} job `{job_name}` step `{step.name or '(unnamed)'}`"
+            if (
+                blocking
+                and not step.if_expr
+                and not step.continue_on_error
+                and not SHELL_CONDITIONAL.search(step.script)
+            ):
+                blocking_hits.append(loc)
+            else:
+                other_hits.append(loc)
+    if blocking_hits:
+        return
+    detail = ""
+    if other_hits:
+        detail = " found only as a non-blocking/conditional step: " + ", ".join(
+            other_hits
+        )
+    die(
+        "feature-gated test coverage ratchet is not bound to a blocking "
+        "pull_request/push job as an unconditional "
+        f"`run: {COVERAGE_CMD}` step{detail}"
+    )
+
+
+def discover_invocations() -> list[Invocation]:
+    invocations: list[Invocation] = []
+    for path, job_name, job, triggers, if_expr, cont in iter_workflow_jobs():
+        blocking = is_blocking_job(triggers, if_expr, cont)
+        opt_in = is_opt_in_job(if_expr)
+        for step in parse_job_steps(job):
+            if not step.script or not script_has_cargo_test(step.script):
+                continue
+            where = f"{path.name} job `{job_name}` step `{step.name or '(unnamed)'}`"
+            if step.if_expr:
+                die(
+                    f"{where}: cargo nextest/test step has `if: {step.if_expr}`; "
+                    "the ratchet does not model step-level conditions"
+                )
+            if step.continue_on_error:
+                die(
+                    f"{where}: cargo nextest/test step has continue-on-error; "
+                    "not a coverage gate"
+                )
+            assert_unconditional_cargo_script(step.script, where)
+            for command in iter_cargo_test_commands(step.script):
+                parsed = parse_cargo_test_command(
+                    command, path.name, job_name, blocking, opt_in
+                )
+                if parsed is not None:
+                    invocations.append(parsed)
     return invocations
 
 
@@ -938,6 +1221,7 @@ def covers(inv: Invocation, test: GatedTest) -> bool:
 
 
 def main() -> int:
+    assert_coverage_ratchet_is_blocking()
     load_feature_graph()
     tests = discover_gated_tests()
     invocations = discover_invocations()

@@ -23,6 +23,19 @@ fn source(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("reading {relative}: {error}"))
 }
 
+/// Job body in `.github/workflows/cli-ci.yml` bounded by the next job name.
+/// A file-wide substring is not a job binding: relocating a step, wrapping it
+/// in `echo`, or parking it on a `workflow_dispatch` job stays green unless
+/// the assertion is against this slice.
+fn cli_ci_job<'a>(ci: &'a str, name: &str, next: &str) -> &'a str {
+    ci.split(&format!("\n  {name}:\n"))
+        .nth(1)
+        .and_then(|rest| rest.split(&format!("\n  {next}:\n")).next())
+        .unwrap_or_else(|| {
+            panic!("cli-ci.yml must contain job `{name}` immediately before `{next}`")
+        })
+}
+
 #[test]
 fn local_release_has_one_opt_in_remote_capability() {
     for manifest in [
@@ -135,19 +148,26 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 #[test]
 fn feature_gated_tests_are_mapped_to_executing_gates() {
     let ci = source(".github/workflows/cli-ci.yml");
+    let gates = cli_ci_job(&ci, "gates", "supply-chain");
     assert!(
-        ci.contains("bash scripts/check-feature-gated-test-coverage.sh"),
-        "the default gate must run the feature-gated test coverage bound"
+        gates
+            .lines()
+            .any(|line| line.trim() == "run: bash scripts/check-feature-gated-test-coverage.sh"),
+        "gates must run the coverage ratchet as an unconditional `run:` step"
     );
     assert!(
-        ci.contains("--no-default-features"),
+        !gates.contains("continue-on-error:"),
+        "gates must fail the PR/push gate"
+    );
+    assert!(
+        !gates.contains("workflow_dispatch"),
+        "gates must not be a manual opt-in"
+    );
+    assert!(
+        gates.contains("--no-default-features"),
         "the default local gate must stay local-only"
     );
-    let lockstep = ci
-        .split("\n  remote-lockstep:\n")
-        .nth(1)
-        .and_then(|rest| rest.split("\n  daemon-custody-pkcs11-softhsm:\n").next())
-        .expect("cli-ci.yml must contain a blocking remote-lockstep job");
+    let lockstep = cli_ci_job(&ci, "remote-lockstep", "daemon-custody-pkcs11-softhsm");
     assert!(
         !lockstep.contains("continue-on-error:"),
         "remote lockstep must fail the PR/push gate"

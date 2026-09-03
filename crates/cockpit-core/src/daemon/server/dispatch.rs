@@ -6146,20 +6146,34 @@ async fn handle_serialized_request_impl(
                 .map_err(session_work_error)?;
             Ok(Response::Ack)
         }
-        Request::PromoteToPersistent => Err(ErrorPayload {
-            code: ErrorCode::Unavailable,
-            message: "in-place daemon promotion is not available in this daemon build".into(),
-        }),
+        Request::PromoteToPersistent => {
+            ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
+                .map_err(internal)?;
+            state.exit_guard_reservation = None;
+            Ok(Response::Ack)
+        }
         Request::ExitGuardStatus => {
-            let (has_schedules, processing, tool_running) =
-                require_attached(state)?.handle.live_status();
+            // Serialize the lifetime classification with promotion and sample
+            // the attached worker directly. Clients must not infer either
+            // half from discovery or their local event projection.
+            let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
+            let (has_schedules, processing, tool_running) = {
+                let attached = require_attached(state)?;
+                attached.handle.live_status()
+            };
+            let has_live_work = has_schedules || processing || tool_running;
+            let ephemeral_owner = ctx.is_ephemeral_lifetime();
+            if ephemeral_owner && has_live_work {
+                ctx.reserve_exit_guard(state).map_err(internal)?;
+            }
             Ok(Response::ExitGuardStatus {
-                ephemeral_owner: ctx.paths.ephemeral,
-                has_live_work: has_schedules || processing || tool_running,
+                ephemeral_owner,
+                has_live_work,
             })
         }
         Request::ReleaseExitGuard => {
             require_attached(state)?;
+            ctx.release_exit_guard_reservation(state);
             Ok(Response::Ack)
         }
         Request::ResumeFromCompaction => {
@@ -9557,7 +9571,7 @@ async fn handle_serialized_request_impl(
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
         }),
         Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept built-in Assistant settings writes",
                 ));
@@ -9589,7 +9603,7 @@ async fn handle_serialized_request_impl(
                 description: description.clone(),
                 prompt: prompt.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -9633,7 +9647,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -9869,7 +9883,7 @@ async fn handle_serialized_request_impl(
                 local_path: local_path.clone(),
                 deep,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -9925,7 +9939,7 @@ async fn handle_serialized_request_impl(
                 id: id.clone(),
                 as_path,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -9981,7 +9995,7 @@ async fn handle_serialized_request_impl(
                 days,
                 dry_run,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -10014,7 +10028,7 @@ async fn handle_serialized_request_impl(
             let request = Request::ImportKclPackages {
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept package registry writes",
                 ));
@@ -10048,7 +10062,7 @@ async fn handle_serialized_request_impl(
         Request::PurgeEndedSessions { before } => {
             #[cfg(feature = "remote")]
             let request = Request::PurgeEndedSessions { before };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent session purges",
                 ));
@@ -10096,7 +10110,7 @@ async fn handle_serialized_request_impl(
             expected_revision,
             expected_config_generation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
@@ -10283,7 +10297,7 @@ async fn handle_serialized_request_impl(
                 repair_plan_digest: repair_plan_digest.clone(),
                 idempotency_key: idempotency_key.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept media reservation repairs",
                 ));
@@ -10438,7 +10452,7 @@ async fn handle_serialized_request_impl(
             // A per-run daemon can disappear as soon as its client exits.
             // Assistant create returns a session id the same way attach does,
             // so persist before handing that id back.
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 handle.persist_if_needed().map_err(internal)?;
             }
             Ok(Response::AssistantSessionCreated {
@@ -14053,7 +14067,7 @@ async fn handle_serialized_request_impl(
                 credential: credential.clone(),
                 force,
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -14125,7 +14139,7 @@ async fn handle_serialized_request_impl(
 
         #[cfg(feature = "remote")]
         Request::ClearFlycockpitCredential => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
@@ -14247,7 +14261,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SetFlycockpitConnectorEnabled { enabled } => {
             let request = Request::SetFlycockpitConnectorEnabled { enabled };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit connector settings",
                 ));
@@ -14286,7 +14300,7 @@ async fn handle_serialized_request_impl(
         #[cfg(feature = "remote")]
         Request::SyncFlycockpitOrgPolicy => {
             let request = Request::SyncFlycockpitOrgPolicy;
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org policy sync",
                 ));
@@ -14345,7 +14359,7 @@ async fn handle_serialized_request_impl(
             let request = Request::EnrollFlycockpitOrgSync {
                 org_id: org_id.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept FlyCockpit org sync enrollment",
                 ));
@@ -14391,7 +14405,7 @@ async fn handle_serialized_request_impl(
                 name: name.clone(),
                 value: value.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -14449,7 +14463,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
@@ -14563,7 +14577,7 @@ async fn handle_serialized_request_impl(
         Request::DeleteNamedSecret { name } => {
             #[cfg(feature = "remote")]
             let request = Request::DeleteNamedSecret { name: name.clone() };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
@@ -14637,7 +14651,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 record: record.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -14890,7 +14904,7 @@ async fn handle_serialized_request_impl(
             client_operation_id,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -15226,7 +15240,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
@@ -15895,7 +15909,7 @@ async fn handle_serialized_request_impl(
             } else {
                 profile
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -16400,7 +16414,7 @@ async fn handle_serialized_request_impl(
             flow_id,
             input,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
@@ -16919,7 +16933,7 @@ async fn handle_serialized_request_impl(
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
             };
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
@@ -17137,7 +17151,7 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             mutation,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17164,7 +17178,7 @@ async fn handle_serialized_request_impl(
             on_unlisted,
             allow_fallback,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider model fetches that persist config",
                 ));
@@ -17223,7 +17237,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             entry,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17269,7 +17283,7 @@ async fn handle_serialized_request_impl(
             entry,
             header_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17368,7 +17382,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept Copilot auth setup",
                     ));
@@ -17804,7 +17818,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.paths.ephemeral {
+                if ctx.is_ephemeral_lifetime() {
                     return Err(bad_request(
                         "ephemeral daemons do not accept MCP config writes",
                     ));
@@ -17871,7 +17885,7 @@ async fn handle_serialized_request_impl(
             provider_id,
             delete_stored_secrets,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider config writes",
                 ));
@@ -17906,7 +17920,7 @@ async fn handle_serialized_request_impl(
             category_defaults_json,
             on_unlisted_models_fetch,
         } => {
-            if ctx.paths.ephemeral {
+            if ctx.is_ephemeral_lifetime() {
                 return Err(bad_request(
                     "ephemeral daemons do not accept provider metadata writes",
                 ));
@@ -20608,7 +20622,7 @@ fn canonical_user_level_write_target(
     ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.paths.ephemeral, path)?;
+    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     canonical_mcp_target_path(path)
 }
 
@@ -20631,7 +20645,7 @@ fn prepare_user_level_journal_target(
     ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<(), ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.paths.ephemeral, path)?;
+    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     super::ensure_authorized_global_layer(path)
 }
 
@@ -29156,6 +29170,14 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // A durable Assistant owns background work. An already-attached client
+    // (TUI lifecycle, ACP/Zed, CLI) promotes this live owner in place rather
+    // than restarting or failing closed against a busy ephemeral daemon.
+    if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.is_ephemeral_lifetime() {
+        ctx.promote_to_persistent(state.exit_guard_reservation.as_ref())
+            .map_err(internal)?;
+        state.exit_guard_reservation = None;
+    }
     // Terminal results for transactions this attach converged. Delivered
     // through the worker below, once a handle exists to stamp the generation.
     let recovered_default_transactions;
@@ -29311,7 +29333,7 @@ pub(super) async fn attach(
     // A per-run daemon can disappear as soon as its client exits. Make the
     // session row durable before returning its id so another daemon process
     // can always find it through the normal DB-backed resume path.
-    if session_id.is_none() && ctx.paths.ephemeral {
+    if session_id.is_none() && ctx.is_ephemeral_lifetime() {
         handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {

@@ -7936,6 +7936,121 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
     ))
 }
 
+#[test]
+#[cfg(feature = "extended")]
+fn preparing_ephemeral_promotion_keeps_persistent_services_private() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+
+    // Preparation may allocate/open private resources, but must not register a
+    // scheduler or start a worker before endpoint/lifetime publication commits.
+    let prepared = ctx
+        .prepare_persistent_services()
+        .expect("prepare persistent services");
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    drop(prepared);
+}
+
+#[test]
+fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+
+    let ctx = test_ctx();
+    ctx.persistent_endpoint_publication_failure
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    assert!(ctx.promote_to_persistent(None).is_err());
+    assert!(ctx.is_ephemeral_lifetime());
+    assert!(ctx.scheduler().is_none());
+    assert!(ctx.registry.scheduler().is_none());
+    assert!(ctx.registry.resource_scheduler().is_none());
+    assert!(ctx.active_media_storage_recovery().is_none());
+    assert!(ctx.registry.tool_media_runtime().is_none());
+    #[cfg(feature = "extended")]
+    assert!(
+        crate::sync::lock_or_recover(&ctx.promoted_persistent_services)
+            .image_generation_worker
+            .is_none()
+    );
+}
+
+#[test]
+fn live_exit_guard_reservation_blocks_another_clients_promotion_until_released() {
+    let ctx = test_ctx();
+    let mut deciding_client = MutableClientState::detached_for_test();
+    ctx.reserve_exit_guard(&mut deciding_client)
+        .expect("reserve live exit decision");
+
+    let error = ctx
+        .promote_to_persistent(None)
+        .expect_err("another client cannot promote during an exit decision");
+    assert!(
+        error
+            .to_string()
+            .contains("another client is deciding how to detach"),
+        "promotion must be fenced until the deciding client resolves or disconnects"
+    );
+
+    ctx.release_exit_guard_reservation(&mut deciding_client);
+    ctx.require_exit_guard_promotion_owner(None)
+        .expect("releasing the prompt lets another client promote");
+}
+
+#[test]
+fn in_place_promotion_is_idempotent_and_holds_the_reaper() {
+    let env = crate::test_env::lock();
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    assert!(ctx.is_ephemeral_lifetime());
+
+    let first = ctx
+        .promote_to_persistent(None)
+        .expect("first promotion publishes persistent lifetime");
+    assert!(first, "first promotion must change lifetime");
+    assert!(!ctx.is_ephemeral_lifetime());
+    assert_eq!(
+        ctx.reap_ephemeral_last_client(),
+        super::EphemeralReapDecision::Persistent
+    );
+
+    let second = ctx
+        .promote_to_persistent(None)
+        .expect("second promotion is a no-op");
+    assert!(!second, "idempotent promotion must not republish");
+    assert!(!ctx.is_ephemeral_lifetime());
+    assert_eq!(
+        ctx.reap_ephemeral_last_client(),
+        super::EphemeralReapDecision::Persistent
+    );
+}
+
+#[tokio::test]
+async fn already_attached_client_promotes_busy_ephemeral_owner_in_place() {
+    let env = crate::test_env::lock_async().await;
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let response = handle_request(Request::PromoteToPersistent, &mut state, &ctx)
+        .await
+        .expect("already-attached client can promote without re-acquire");
+    assert!(matches!(response, Response::Ack));
+    assert!(!ctx.is_ephemeral_lifetime());
+    assert_eq!(
+        ctx.reap_ephemeral_last_client(),
+        super::EphemeralReapDecision::Persistent
+    );
+}
+
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -18794,7 +18909,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
             AuthzAllowedOutcome::Error(ErrorCode::Internal)
         }
         "knowledge_dream_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        "promote_to_persistent" => AuthzAllowedOutcome::Error(ErrorCode::Unavailable),
+        "promote_to_persistent" => AuthzAllowedOutcome::Response,
         "run_knowledge_dream" => AuthzAllowedOutcome::Response,
         // `docs_ask` is authorized for the owner but then resolves workspace
         // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
@@ -22429,6 +22544,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
     }
     match case.kind {
         "attach" => {
+            let env = crate::test_env::lock_async().await;
+            let data = tempfile::tempdir().expect("temporary XDG data directory");
+            env.set_var("XDG_DATA_HOME", data.path());
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
             ctx.db
@@ -22438,6 +22556,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                 )
                 .await
                 .unwrap();
+            assert!(ctx.is_ephemeral_lifetime());
             let response = dispatch_matrix_request(
                 &ctx,
                 Request::Attach {
@@ -22460,6 +22579,14 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                 panic!("expected Attached");
             };
             assert!(ctx.registry.live_handle(session_id).is_some());
+            assert!(
+                !ctx.is_ephemeral_lifetime(),
+                "Assistant attach must promote a busy ephemeral owner in place"
+            );
+            assert_eq!(
+                ctx.reap_ephemeral_last_client(),
+                super::EphemeralReapDecision::Persistent
+            );
         }
         "attach_knowledge_base_session" | "detach_knowledge_base_session" => {
             assert_knowledge_base_session_mutating_happy(case.kind).await;
@@ -26178,7 +26305,7 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
+    let scheduler = ctx.scheduler().expect("persistent scheduler");
     if kind != "create_scheduled_job" {
         dispatch_matrix_request(
             &ctx,
@@ -35020,11 +35147,14 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
+        ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -35033,6 +35163,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         credential_store_path: None,
@@ -35239,11 +35370,14 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         global_redaction: base.global_redaction.clone(),
         redaction_generation: std::sync::atomic::AtomicU64::new(0),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_presence: base.client_presence.clone(),
         shutdown: base.shutdown.clone(),
         restart_decision: StdMutex::new(()),
+        exit_guard_reservation: StdMutex::new(std::sync::Weak::new()),
+        ephemeral_lifetime: std::sync::atomic::AtomicBool::new(base.is_ephemeral_lifetime()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -35252,6 +35386,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
+        promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
         credential_store_path: None,

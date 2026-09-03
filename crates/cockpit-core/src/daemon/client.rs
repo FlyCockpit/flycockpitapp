@@ -107,12 +107,30 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
         if !connected.client.has_owner_capability() {
             anyhow::bail!("ACP stdio ingress requires the daemon-private owner capability");
         }
+        // Reuse the already-attached client. When the user prefers background
+        // agents, promote the shared ephemeral owner in place so closing the
+        // ACP subprocess cannot reap live work. This is not a re-acquire and
+        // not a restart.
+        if background_agents && connected.ephemeral_owner {
+            promote_attached_owner_in_place(&connected.client).await?;
+        }
         return Ok(connected.client);
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = connected;
         anyhow::bail!("ACP socket ledger ownership is unavailable on this platform")
+    }
+}
+
+/// Request in-place promotion of the owner this client is already talking to.
+///
+/// Does not spawn, restart, drop the connection, or re-acquire a socket. The
+/// RPC is idempotent: a persistent owner acknowledges without changing state.
+pub async fn promote_attached_owner_in_place(client: &DaemonClient) -> Result<()> {
+    match client.request_ok(Request::PromoteToPersistent).await? {
+        proto::Response::Ack => Ok(()),
+        other => anyhow::bail!("unexpected live promotion response: {other:?}"),
     }
 }
 

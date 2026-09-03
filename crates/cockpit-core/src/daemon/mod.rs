@@ -3773,6 +3773,58 @@ mod windows_pipe_tests {
     use super::*;
     use cockpit_proto::{Body, Envelope, RecvFrame};
 
+    fn daemon_status_response(daemon_version: impl Into<String>) -> proto::Response {
+        proto::Response::DaemonStatus {
+            pid: 1,
+            uptime_secs: 0,
+            active_sessions: 0,
+            socket_path: "test".into(),
+            daemon_version: daemon_version.into(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            paused_sessions: 0,
+            database_path: "test.db".into(),
+            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+        }
+    }
+
+    async fn send_daemon_hello<S>(
+        daemon: &mut proto::ProtoStream<S>,
+        daemon_version: impl Into<String>,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        daemon
+            .send(&Envelope::response(
+                uuid::Uuid::nil(),
+                daemon_status_response(daemon_version),
+            ))
+            .await
+            .expect("hello");
+    }
+
+    /// `DaemonClient::connect` does not return until this matching response
+    /// is written. Receiving the confirmation request is not the handshake.
+    async fn confirm_client_lifetime<S>(daemon: &mut proto::ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let id = match daemon.recv().await.expect("recv").expect("frame") {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: proto::Request::DaemonStatus,
+                    ..
+                } => id,
+                other => panic!("expected lifetime confirmation, got {other:?}"),
+            },
+            other => panic!("expected envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(id, daemon_status_response("0.1.pipe")))
+            .await
+            .expect("lifetime confirmation");
+    }
+
     #[test]
     fn identity_file_without_a_listening_pipe_is_stale_not_running() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3811,33 +3863,8 @@ mod windows_pipe_tests {
             )
             .expect("owner ACL peer");
             let mut proto = proto::ProtoStream::new(stream);
-            proto
-                .send(&Envelope::response(
-                    uuid::Uuid::nil(),
-                    proto::Response::DaemonStatus {
-                        pid: 1,
-                        uptime_secs: 0,
-                        active_sessions: 0,
-                        socket_path: "test".into(),
-                        daemon_version: "0.1.pipe".into(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                        paused_sessions: 0,
-                        database_path: "test.db".into(),
-                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
-                    },
-                ))
-                .await
-                .expect("hello");
-            match proto.recv().await.expect("recv").expect("frame") {
-                RecvFrame::Envelope(envelope) => match envelope.body {
-                    Body::Request {
-                        request: proto::Request::DaemonStatus,
-                        ..
-                    } => {}
-                    other => panic!("expected lifetime confirmation, got {other:?}"),
-                },
-                other => panic!("expected envelope, got {other:?}"),
-            }
+            send_daemon_hello(&mut proto, "0.1.pipe").await;
+            confirm_client_lifetime(&mut proto).await;
         });
 
         let client = cockpit_client::DaemonClient::connect(&socket)

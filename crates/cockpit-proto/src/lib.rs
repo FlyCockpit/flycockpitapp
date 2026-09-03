@@ -2641,6 +2641,10 @@ pub use cockpit_db::wire::{
     SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
+pub use cockpit_db::db::conversation_rules::{
+    ConversationRule, ConversationRuleCreatedBy, ConversationRuleSourceTrust,
+    MAX_CONVERSATION_RULE_TEXT_BYTES, MAX_CONVERSATION_RULES_PER_LINEAGE,
+};
 pub use cockpit_db::db::session_goals::{
     GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };
@@ -7574,6 +7578,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             },
         };
@@ -7601,6 +7606,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: None,
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,
@@ -7617,6 +7623,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,

@@ -818,6 +818,31 @@ pub enum Request {
     PinnedMessageState {
         session_id: Uuid,
     },
+    /// Create or replace an advisory conversation rule on the session's
+    /// compaction lineage. Distinct from `/pin`; no silent conversion.
+    SetConversationRule {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<Uuid>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_trust: Option<String>,
+    },
+    RemoveConversationRule {
+        session_id: Uuid,
+        rule_id: Uuid,
+    },
+    ListConversationRules {
+        session_id: Uuid,
+    },
+    /// Launch a write-scoped subagent that places the rule in the resolved
+    /// instructions file (AGENTS.md / SOUL.md / project guidance) or a linked
+    /// file in that directory subtree. Acked immediately; the diff/summary
+    /// arrives as a session `Notice` once the subagent finishes.
+    PromoteConversationRule {
+        session_id: Uuid,
+        rule_id: Uuid,
+    },
     // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
     // Every variant below is a NEW wire shape gated to protocol v10 by
     // `body_required_protocol_version`. The plaintext literal rides ONLY the
@@ -1112,8 +1137,16 @@ pub enum Request {
     /// The archive never travels inline. `transfer` references a completed
     /// bulk-lane transfer; the daemon reads the bytes from there after the
     /// transfer's digest and length have been verified.
+    ///
+    /// `include_sensitive` is the explicit acknowledgement for an UNREDACTED
+    /// archive (one written by `cockpit export --include-sensitive`), the
+    /// mirror of the export side's single raw opt-in. Fail-closed: absent or
+    /// `false`, the daemon refuses an unredacted archive rather than
+    /// silently restoring raw secret material into destination events.
     ImportSessionArchive {
         transfer: crate::bulk_transfer::BulkTransferRef,
+        #[serde(default)]
+        include_sensitive: bool,
     },
 
     /// Push one chunk of a bulk transfer into daemon-side staging.
@@ -1337,6 +1370,10 @@ pub enum Request {
     /// `assistant_id` is a v10-only extended filter: when `Some(name)`,
     /// only sessions belonging to that assistant are returned. A v9
     /// envelope carrying this field is rejected by the version gate.
+    ///
+    /// `compaction_lineage_root_id` lists every context window in that
+    /// conversation lineage (oldest first) so the session browser can
+    /// expand a collapsed card. Distinct from `parent_session_id` (forks).
     ListSessions {
         #[serde(default)]
         project_id: Option<String>,
@@ -1344,6 +1381,8 @@ pub enum Request {
         parent_session_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_lineage_root_id: Option<Uuid>,
     },
 
     /// Read a paginated page of plain user/agent messages for a session.
@@ -1819,7 +1858,7 @@ pub enum Request {
     Prune,
 
     /// Run `/compact` on the attached session's foreground agent. Acked
-    /// immediately; the in-place boundary arrives as a `CompactReady` event.
+    /// immediately; the successor window arrives as a `CompactReady` event.
     Compact,
 
     /// Accept the compacted branch of a prior interactive attach's rolling
@@ -4366,6 +4405,10 @@ macro_rules! request_variants {
             (Request::ListPinnedMessageSeqs { .. }, "list_pinned_message_seqs");
             (Request::ListPinnedMessagesWithText { .. }, "list_pinned_messages_with_text");
             (Request::PinnedMessageState { .. }, "pinned_message_state");
+            (Request::SetConversationRule { .. }, "set_conversation_rule");
+            (Request::RemoveConversationRule { .. }, "remove_conversation_rule");
+            (Request::ListConversationRules { .. }, "list_conversation_rules");
+            (Request::PromoteConversationRule { .. }, "promote_conversation_rule");
             (Request::BeginSealedOwnerOperation { .. }, "begin_sealed_owner_operation");
             (Request::ApplySealedOwnerOperation { .. }, "apply_sealed_owner_operation");
             (Request::CancelSealedOwnerOperation { .. }, "cancel_sealed_owner_operation");
@@ -4704,6 +4747,10 @@ macro_rules! command {
             (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::SetConversationRule { session_id, rule_id, text, source_trust }, "set_conversation_rule", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|rule_id:Option<Uuid>|text:String|source_trust:Option<String>", [session_id: Uuid => session, rule_id: Option<Uuid> => param, text: String => param, source_trust: Option<String> => param]);
+            (Request::RemoveConversationRule { session_id, rule_id }, "remove_conversation_rule", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|rule_id:Uuid", [session_id: Uuid => session, rule_id: Uuid => param]);
+            (Request::ListConversationRules { session_id }, "list_conversation_rules", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::PromoteConversationRule { session_id, rule_id }, "promote_conversation_rule", session_row_writer(session_id), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|rule_id:Uuid", [session_id: Uuid => session, rule_id: Uuid => param]);
             (Request::BeginSealedOwnerOperation { disposition, record_id, name, description, scope_kind, scope_key }, "begin_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "disposition:String|record_id:Option<String>|name:Option<String>|description:Option<String>|scope_kind:Option<String>|scope_key:Option<String>", [disposition: String => param, record_id: Option<String> => param, name: Option<String> => param, description: Option<String> => param, scope_kind: Option<String> => param, scope_key: Option<String> => param]);
             (Request::ApplySealedOwnerOperation { capability_id, literal }, "apply_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String|literal:Option<SensitiveWireLiteral>", [capability_id: String => param, literal: Option<SensitiveWireLiteral> => param]);
             (Request::CancelSealedOwnerOperation { capability_id }, "cancel_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String", [capability_id: String => param]);
@@ -4743,7 +4790,7 @@ macro_rules! command {
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
-            (Request::ImportSessionArchive { transfer }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef", [transfer: $crate::bulk_transfer::BulkTransferRef => param]);
+            (Request::ImportSessionArchive { transfer, include_sensitive }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef|include_sensitive:bool", [transfer: $crate::bulk_transfer::BulkTransferRef => param, include_sensitive: bool => param]);
             // Remote oversized text ingress stages source bytes over the bulk
             // lane before its reference-only FCM2 request. It is scoped to the
             // attached session writer (while local owners retain their normal
@@ -4781,7 +4828,7 @@ macro_rules! command {
             (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
-            (Request::ListSessions { project_id, parent_session_id, assistant_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param]);
+            (Request::ListSessions { project_id, parent_session_id, assistant_id, compaction_lineage_root_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>|compaction_lineage_root_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param, compaction_lineage_root_id: Option<Uuid> => param]);
             (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadAssistantInbox { main_session_id, include_delivered, limit }, "read_assistant_inbox", session_row_reader(main_session_id), field(main_session_id), false, read_only, none, concurrent, none, "main_session_id:Uuid|include_delivered:bool|limit:u32", [main_session_id: Uuid => session, include_delivered: bool => param, limit: u32 => param]);
             (Request::AcknowledgeAssistantInboxHumanRead { main_session_id, inbox_item_ids }, "acknowledge_assistant_inbox_human_read", session_row_writer(main_session_id), field(main_session_id), true, idempotent_adapter_mutation, sql_transaction, serialized, none, "main_session_id:Uuid|inbox_item_ids:Vec<Uuid>", [main_session_id: Uuid => session, inbox_item_ids: Vec<Uuid> => param]);
@@ -5624,6 +5671,7 @@ mod tests {
                 RemoteBulkMimeClass::Archive,
             )
             .unwrap(),
+            include_sensitive: false,
         };
         assert_eq!(request.wire_tag(), "import_session_archive");
 
@@ -5640,9 +5688,27 @@ mod tests {
 
         let round_tripped: Request = serde_json::from_str(&encoded).unwrap();
         match round_tripped {
-            Request::ImportSessionArchive { transfer } => {
+            Request::ImportSessionArchive {
+                transfer,
+                include_sensitive,
+            } => {
                 assert_eq!(transfer.total_length_value(), 64 * 1024 * 1024);
                 assert_eq!(transfer.mime_class, RemoteBulkMimeClass::Archive);
+                // The raw-archive acknowledgement round-trips and defaults
+                // fail-closed when the field is absent.
+                assert!(!include_sensitive);
+                let mut without_ack: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                without_ack
+                    .pointer_mut("/params")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("request params object")
+                    .remove("include_sensitive");
+                match serde_json::from_value::<Request>(without_ack).unwrap() {
+                    Request::ImportSessionArchive {
+                        include_sensitive, ..
+                    } => assert!(!include_sensitive),
+                    other => panic!("unexpected variant: {}", other.wire_tag()),
+                }
             }
             other => panic!("unexpected variant: {}", other.wire_tag()),
         }
@@ -6659,6 +6725,43 @@ mod tests {
                 "list_pinned_message_seqs",
                 "list_pinned_messages_with_text",
                 "pinned_message_state",
+            ]
+        );
+        let command_tags = crate::command!(command_tags);
+        for tag in tags {
+            assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn conversation_rule_rpcs_are_registered_in_both_macro_tables() {
+        let session_id = Uuid::nil();
+        let rule_id = Uuid::nil();
+        let requests = [
+            Request::SetConversationRule {
+                session_id,
+                rule_id: None,
+                text: "prefer pnpm".into(),
+                source_trust: None,
+            },
+            Request::RemoveConversationRule {
+                session_id,
+                rule_id,
+            },
+            Request::ListConversationRules { session_id },
+            Request::PromoteConversationRule {
+                session_id,
+                rule_id,
+            },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "set_conversation_rule",
+                "remove_conversation_rule",
+                "list_conversation_rules",
+                "promote_conversation_rule",
             ]
         );
         let command_tags = crate::command!(command_tags);

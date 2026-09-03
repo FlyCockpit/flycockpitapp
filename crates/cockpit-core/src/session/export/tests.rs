@@ -2815,6 +2815,7 @@ async fn blob_backed_tool_artifact_import_restages_body_and_projection() {
     let imported = crate::session::import::import_archive(
         &destination,
         crate::session::import::read_archive_bytes(&archive).unwrap(),
+        false,
     )
     .await
     .unwrap();
@@ -2943,6 +2944,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
     let imported = crate::session::import::import_archive(
         &destination,
         crate::session::import::read_archive_bytes(&archive).unwrap(),
+        false,
     )
     .await
     .expect("typed oversized source remains importable");
@@ -3125,6 +3127,7 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
     let imported = crate::session::import::import_archive(
         &imported_db,
         crate::session::import::read_archive_bytes(&source_zip).unwrap(),
+        false,
     )
     .await
     .unwrap();
@@ -3756,6 +3759,55 @@ async fn archive_is_private() {
         std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
         0o600,
         "export archives must never be group- or world-readable"
+    );
+}
+
+// Windows twin of `archive_is_private`: the export write funnels through
+// `private_fs::write_private_export_file`, whose Windows arm enforces the
+// protected owner-only DACL; here we prove the end-to-end export still
+// assembles and lands a VALID, owner-only archive on Windows — the write
+// that used to hard-fail the command outright. Not compiled out: it runs on
+// the Windows gate runner.
+#[cfg(windows)]
+#[tokio::test]
+async fn archive_lands_valid_and_private_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(
+        &db,
+        "p",
+        tmp.path().to_str().expect("temporary path is UTF-8"),
+        "builder",
+    )
+    .await;
+    let target = get_test_session(&db, session.session_id).await;
+    let out = tmp.path().join("export.zip");
+
+    write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .expect("Windows export must succeed");
+
+    // Windows twin of the 0o600 assertion: the landed archive must carry the
+    // protected owner-only DACL — export archives must never be group- or
+    // world-readable on any platform.
+    cockpit_host::goal_scratch::verify_private_dacl(&out)
+        .expect("export archive must carry the protected owner-only DACL");
+
+    // The archive is a real, importable debug bundle, not a stub.
+    let bytes = std::fs::read(&out).expect("export file exists");
+    let manifest = read_zip_entry(&bytes, "manifest.json")
+        .expect("manifest.json must be readable from the archive");
+    assert!(manifest.contains("\"redacted\": true"));
+    assert!(
+        read_zip_entry(&bytes, "events.json").is_some(),
+        "events.json must be present in the archive"
     );
 }
 

@@ -26,6 +26,7 @@ pub mod capabilities;
 pub use cockpit_config as config;
 pub mod computer;
 pub mod container;
+pub mod conversation_rules;
 pub mod credentials;
 pub mod daemon;
 pub mod diagnostics;
@@ -38,6 +39,8 @@ pub mod external_runtime;
 pub mod generated_svg;
 pub mod git;
 pub mod gitignore;
+#[cfg(test)]
+mod global_layer_mkdir_ratchet;
 pub mod harness;
 pub mod host_capabilities;
 pub mod image_generation;

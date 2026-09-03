@@ -1212,7 +1212,7 @@ mod tests {
             })
         ));
         handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
-            session_id: handle.session_id,
+            session_id: handle.session_id(),
             turn_id: Some("turn-1".to_string()),
             reason: crate::engine::IdleReason::Completed,
         });

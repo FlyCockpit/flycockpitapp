@@ -427,8 +427,12 @@ impl ConfigSource {
         })
     }
 
-    /// Resolve the config-file write target for `provider_id` (the
-    /// most-specific layer defining it). Callers wrap this in
+    /// Resolve the config-file write target for `provider_id`.
+    ///
+    /// Production wiring uses the shared resolver: a trusted workspace layer
+    /// that already defines the provider (or is the nearest applicable
+    /// project layer) wins; otherwise the canonical global layer is returned
+    /// even when that directory does not yet exist. Callers wrap this in
     /// `with_workspace_trust_policy` where the write-target rule is
     /// trust-sensitive, matching the production call shape.
     pub fn config_write_target_for_provider(

@@ -1,5 +1,7 @@
-//! The closed binary frame contract for the Unix peer-authenticated leak-reveal
-//! socket. One request/response exchange per connection; network byte order.
+//! The closed binary frame contract for the peer-authenticated leak-reveal
+//! socket (Unix domain socket or Windows named pipe). One request/response
+//! exchange per connection; network byte order. The request is a fixed 67-byte
+//! frame; its terminator is that length, not a write-side half-close.
 //! These encode/decode helpers are the **single** wire writers/readers — both
 //! the daemon accept loop and the TUI client connect path use them, so the two
 //! ends can never drift. The in-process caller does **not** use these frames

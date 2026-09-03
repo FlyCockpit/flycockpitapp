@@ -276,6 +276,23 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
             "stable receipt-bound lifecycle primitive is missing: {required}"
         );
     }
+    let named_pipe =
+        std::fs::read_to_string(workspace_root().join("crates/cockpit-host/src/named_pipe.rs"))
+            .expect("read host named-pipe identity");
+    for required in [
+        "PIPE_IDENTITY_VERSION",
+        "fn validate_pipe_name",
+        "fn derive_pipe_name",
+        "OwnerOnlyPipeSecurity",
+        "pipe_is_listening",
+        r"\\.\pipe\cockpit-",
+        "well-known unprotected",
+    ] {
+        assert!(
+            named_pipe.contains(required),
+            "named-pipe identity primitive is missing: {required}"
+        );
+    }
     for required in [
         "fn read_bound_endpoint_record_from",
         "reclaim_stale_and_reserve(",

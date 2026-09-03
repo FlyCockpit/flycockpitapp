@@ -560,7 +560,7 @@ impl Session {
         let project_root = self.project_root.to_string_lossy().into_owned();
         ToolCallEvent {
             event_id: row.event_id,
-            session_id: self.id,
+            session_id: self.live_id(),
             call_id: row.call_id,
             parent_call_id: row.parent_call_id,
             parent_child_index: row.parent_child_index,
@@ -684,7 +684,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.id.to_string();
+        let session_id_str = self.live_id().to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -827,7 +827,7 @@ impl Session {
         };
         let row = crate::db::inference_calls::InferenceCallRow {
             call_id,
-            session_id: self.id,
+            session_id: self.live_id(),
             project_id: self.project_id.clone(),
             project_root: self.project_root.to_string_lossy().into_owned(),
             model,
@@ -886,7 +886,7 @@ impl Session {
                 .insert_inference_request(
                     &call_id.to_string(),
                     ordinal,
-                    self.id,
+                    self.live_id(),
                     payload,
                     meta,
                     provenance,
@@ -982,7 +982,7 @@ impl Session {
                 .insert_inference_request(
                     &call_id.to_string(),
                     ordinal,
-                    self.id,
+                    self.live_id(),
                     payload,
                     meta,
                     provenance,
@@ -998,7 +998,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.id.to_string();
+        let session_id_str = self.live_id().to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -1056,7 +1056,7 @@ impl Session {
             ),
         ];
 
-        let session_id = self.id;
+        let session_id = self.live_id();
         let provider = meta.provider.map(str::to_owned);
         let model = meta.model.map(str::to_owned);
         let trust = meta.trust.map(str::to_owned);
@@ -1140,7 +1140,7 @@ impl Session {
             .insert_inference_request(
                 &call_id.to_string(),
                 ordinal,
-                self.id,
+                self.live_id(),
                 &redacted,
                 meta,
                 provenance,
@@ -1184,7 +1184,7 @@ impl Session {
                 .db
                 .upsert_tandem_inference(
                     id,
-                    self.id,
+                    self.live_id(),
                     parent_call_id,
                     parent_seq,
                     agent,
@@ -1253,7 +1253,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.id.to_string();
+        let session_id_str = self.live_id().to_string();
         // JSON-value-aware match (F2) over each side: the request column and the
         // response column are distinct artifacts, so a literal is tagged with the
         // side it appeared in for accurate provenance.
@@ -1322,7 +1322,7 @@ impl Session {
                 .db
                 .upsert_tandem_inference(
                     id,
-                    self.id,
+                    self.live_id(),
                     parent_call_id,
                     parent_seq,
                     agent,
@@ -1337,7 +1337,7 @@ impl Session {
                 .context("inserting tandem_inference");
         }
 
-        let session_id = self.id;
+        let session_id = self.live_id();
         let id_owned = id.to_owned();
         let parent_call_id_owned = parent_call_id.to_owned();
         let agent_owned = agent.map(str::to_owned);
@@ -1446,7 +1446,7 @@ impl Session {
         self.db
             .upsert_tandem_inference(
                 id,
-                self.id,
+                self.live_id(),
                 parent_call_id,
                 parent_seq,
                 agent,
@@ -1498,7 +1498,7 @@ impl Session {
         }
         if let Err(e) = self
             .db
-            .set_guidance_baseline(self.id, baseline.as_ref())
+            .set_guidance_baseline(self.live_id(), baseline.as_ref())
             .await
         {
             tracing::warn!(error = %e, "guidance baseline: setting baseline failed");
@@ -1526,7 +1526,7 @@ impl Session {
     /// `(path, hash)` so the same change is injected exactly once; the next
     /// request diffs from the just-injected version.
     pub async fn guidance_change_injection(&self, cwd: &std::path::Path) -> Option<String> {
-        let baseline = match self.db.guidance_baseline(self.id).await {
+        let baseline = match self.db.guidance_baseline(self.live_id()).await {
             Ok(Some(b)) => b,
             // No baseline stored → feature inert for this session.
             Ok(None) => return None,
@@ -1581,7 +1581,7 @@ impl Session {
         };
         if let Err(e) = self
             .db
-            .set_guidance_baseline(self.id, Some(&advanced))
+            .set_guidance_baseline(self.live_id(), Some(&advanced))
             .await
         {
             tracing::warn!(error = %e, "guidance diff: advancing baseline failed");
@@ -1637,7 +1637,7 @@ impl Session {
             )
             .collect();
         self.db
-            .insert_client_submission_terminal_receipts(self.id, receipts)
+            .insert_client_submission_terminal_receipts(self.live_id(), receipts)
             .await
     }
 
@@ -1689,7 +1689,7 @@ impl Session {
         }
 
         self.db
-            .insert_session_event_with_context(self.id, kind, agent, call_id, context, data)
+            .insert_session_event_with_context(self.live_id(), kind, agent, call_id, context, data)
             .await
             .context("inserting session_event")
     }
@@ -1717,7 +1717,14 @@ impl Session {
         if matches.is_empty() {
             return self
                 .db
-                .insert_session_event_with_context(self.id, kind, agent, call_id, context, data)
+                .insert_session_event_with_context(
+                    self.live_id(),
+                    kind,
+                    agent,
+                    call_id,
+                    context,
+                    data,
+                )
                 .await
                 .context("inserting session_event");
         }
@@ -1728,7 +1735,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.id.to_string();
+        let session_id_str = self.live_id().to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -1758,7 +1765,7 @@ impl Session {
         }
 
         let artifact_kind = event_artifact_kind(kind);
-        let session_id = self.id;
+        let session_id = self.live_id();
         // Owned copies for the `move` closure. Named distinctly so the original
         // borrowed `agent`/`call_id`/`context` params stay available for the
         // decision-12 fallback below (F1).
@@ -1844,7 +1851,14 @@ impl Session {
     ) -> Result<i64> {
         let redacted = scrub_body_fail_closed(data, session_table);
         self.db
-            .insert_session_event_with_context(self.id, kind, agent, call_id, context, &redacted)
+            .insert_session_event_with_context(
+                self.live_id(),
+                kind,
+                agent,
+                call_id,
+                context,
+                &redacted,
+            )
             .await
             .context("inserting redacted session_event")
     }
@@ -1949,7 +1963,7 @@ impl Session {
         });
         self.db
             .record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
-                session_id: self.id,
+                session_id: self.live_id(),
                 kind: crate::db::session_log::SessionEventKind::ContextPruned,
                 agent: Some(agent.to_string()),
                 call_id: None,
@@ -1978,9 +1992,12 @@ impl Session {
         seed_tool_count: usize,
         brief_text: &str,
     ) -> Result<i64> {
+        let predecessor_short_id = self.short_id();
         self.record_session_compacted_with_source(
             agent,
             SessionCompactionRecord {
+                predecessor_session_id: self.live_id(),
+                predecessor_short_id: &predecessor_short_id,
                 successor_session_id,
                 successor_short_id,
                 seed_tool_count,
@@ -2029,8 +2046,8 @@ impl Session {
         );
         let data = serde_json::json!({
             "kind": "compaction",
-            "predecessor_session_id": self.id.to_string(),
-            "predecessor_short_id": self.short_id(),
+            "predecessor_session_id": record.predecessor_session_id.to_string(),
+            "predecessor_short_id": record.predecessor_short_id,
             "successor_session_id": record.successor_session_id.to_string(),
             "successor_short_id": record.successor_short_id,
             "seed_tool_count": record.seed_tool_count,
@@ -2054,8 +2071,8 @@ impl Session {
                 .await?;
             let trimmed = serde_json::json!({
                 "kind": "compaction",
-                "predecessor_session_id": self.id.to_string(),
-                "predecessor_short_id": self.short_id(),
+                "predecessor_session_id": record.predecessor_session_id.to_string(),
+                "predecessor_short_id": record.predecessor_short_id,
                 "successor_session_id": record.successor_session_id.to_string(),
                 "successor_short_id": record.successor_short_id,
                 "seed_tool_count": record.seed_tool_count,
@@ -2124,7 +2141,7 @@ impl Session {
         else {
             return self
                 .db
-                .store_compaction_payload(handoff_id, self.id, &data.to_string())
+                .store_compaction_payload(handoff_id, self.live_id(), &data.to_string())
                 .await;
         };
 
@@ -2133,7 +2150,7 @@ impl Session {
         if matches.is_empty() {
             return self
                 .db
-                .store_compaction_payload(handoff_id, self.id, &data.to_string())
+                .store_compaction_payload(handoff_id, self.live_id(), &data.to_string())
                 .await;
         }
         let payload_json =
@@ -2144,7 +2161,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.id.to_string();
+        let session_id_str = self.live_id().to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -2173,7 +2190,7 @@ impl Session {
             }
         }
 
-        let session_id = self.id;
+        let session_id = self.live_id();
         let refs = [
             crate::redact::protected_redaction_history::ArtifactRef::new(
                 crate::redact::protected_redaction_history::RedactionArtifactKind::Event,
@@ -2226,7 +2243,7 @@ impl Session {
     ) -> Result<()> {
         let redacted = scrub_body_fail_closed(data, session_table);
         self.db
-            .store_compaction_payload(handoff_id, self.id, &redacted.to_string())
+            .store_compaction_payload(handoff_id, self.live_id(), &redacted.to_string())
             .await
     }
 
@@ -2971,6 +2988,8 @@ mod trusted_journaling_tests {
         let sid = session.id.to_string();
 
         let record = |brief: &'static str| SessionCompactionRecord {
+            predecessor_session_id: session.id,
+            predecessor_short_id: "pred",
             successor_session_id: session.id,
             successor_short_id: "succ",
             seed_tool_count: 0,
@@ -3068,6 +3087,73 @@ mod trusted_journaling_tests {
         let stored = serde_json::to_string(&event.data).unwrap();
         assert!(!stored.contains(LIT), "matched literal must be scrubbed");
         assert!(stored.contains("[redacted]"), "generic placeholder present");
+    }
+
+    #[tokio::test]
+    async fn compacted_event_uses_record_predecessor_not_frozen_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let window1 = session.id;
+        let window2 = db.create_compaction_successor(window1).await.unwrap();
+        let window2_short = window2
+            .short_id
+            .clone()
+            .unwrap_or_else(|| window2.session_id.to_string());
+        session.adopt_compaction_successor(window2.session_id, window2_short.clone());
+        let window3 = db
+            .create_compaction_successor(window2.session_id)
+            .await
+            .unwrap();
+        let window3_short = window3
+            .short_id
+            .clone()
+            .unwrap_or_else(|| window3.session_id.to_string());
+        session
+            .record_session_compacted_with_source(
+                "Build",
+                SessionCompactionRecord {
+                    predecessor_session_id: session.live_id(),
+                    predecessor_short_id: &window2_short,
+                    successor_session_id: window3.session_id,
+                    successor_short_id: &window3_short,
+                    seed_tool_count: 0,
+                    brief_text: "brief",
+                    handoff_text: "handoff",
+                    source: "manual",
+                    trigger_ctx_pct: None,
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    turns_summarized: 0,
+                    tail_kept: 0,
+                    tail_trimmed: 0,
+                    tail_messages: &[],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let events = db.list_session_events(session.live_id()).await.unwrap();
+        let compacted = events
+            .iter()
+            .find(|event| event.kind == "session_compacted")
+            .expect("session_compacted recorded on the live window");
+        let expected_predecessor = window2.session_id.to_string();
+        let frozen_original = window1.to_string();
+        assert_eq!(
+            compacted.data["predecessor_session_id"].as_str(),
+            Some(expected_predecessor.as_str())
+        );
+        assert_ne!(
+            compacted.data["predecessor_session_id"].as_str(),
+            Some(frozen_original.as_str())
+        );
     }
 
     // -- AC10 ----------------------------------------------------------------

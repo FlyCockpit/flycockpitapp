@@ -37,7 +37,10 @@
         "short_id": "abc123",
         "started_at": 1700000000,
         "turns": 0,
-        "session_entry_mode": "code"
+        "session_entry_mode": "code",
+        "compaction_predecessor_session_id": null,
+        "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
+        "lineage_window_count": 1
       }
     },
     "response": "assistant_session_resolved"
@@ -195,6 +198,40 @@
       "changed": true
     },
     "response": "config_refreshed"
+  },
+  "conversation_rule_changed": {
+    "data": {
+      "rule": {
+        "created_at_unix_ms": 7,
+        "created_by": "agent",
+        "lineage_id": "11111111-1111-4111-8111-111111111111",
+        "rule_id": "11111111-1111-4111-8111-111111111111",
+        "source_trust": "trusted",
+        "text": "text-fixture"
+      }
+    },
+    "response": "conversation_rule_changed"
+  },
+  "conversation_rule_removed": {
+    "data": {
+      "removed": true
+    },
+    "response": "conversation_rule_removed"
+  },
+  "conversation_rules": {
+    "data": {
+      "rules": [
+        {
+          "created_at_unix_ms": 7,
+          "created_by": "user",
+          "lineage_id": "11111111-1111-4111-8111-111111111111",
+          "rule_id": "11111111-1111-4111-8111-111111111111",
+          "source_trust": "untrusted",
+          "text": "text-fixture"
+        }
+      ]
+    },
+    "response": "conversation_rules"
   },
   "approval_mode_state": {
     "data": {
@@ -1571,7 +1608,10 @@
           "started_at": 1700000000,
           "title": "Title",
           "turns": 2,
-          "session_entry_mode": "code"
+          "session_entry_mode": "code",
+          "compaction_predecessor_session_id": null,
+          "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
+          "lineage_window_count": 1
         }
       ]
     },

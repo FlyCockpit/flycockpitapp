@@ -89,7 +89,7 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
-    cwd_scoped_creatable_dirs, discover_config_dirs, global_config_dir,
+    cwd_scoped_creatable_dirs, discover_config_dirs, ensure_config_layer_dir, global_config_dir,
 };
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
@@ -6133,7 +6133,7 @@ impl Dialog {
     /// Re-open the picker after scaffolding a new scoped config, so the
     /// fresh row shows up and lands as the cursor target.
     fn scaffold_directory_error(directory: &std::path::Path) -> Option<String> {
-        match std::fs::create_dir_all(directory) {
+        match ensure_config_layer_dir(directory) {
             Ok(()) => None,
             Err(error) => Some(format!("failed to create {}: {error}", directory.display())),
         }

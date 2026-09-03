@@ -146,7 +146,7 @@ impl Tool for UseSealedValueTool {
             caller_trust: crate::config::providers::ModelTrust::default(),
             project_key: SealedProjectKey::from_canonical(ctx.session.project_id.clone()),
             project_trust,
-            session_id: ctx.session.id,
+            session_id: ctx.session.live_id(),
             // The session's config generation. A config change — including any
             // provider, model, or trust change — bumps it and thereby retires
             // every outstanding grant.

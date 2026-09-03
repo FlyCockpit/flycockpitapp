@@ -592,6 +592,15 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
     }
     tb.with(Arc::new(crate::tools::session_search::HistorySearchTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
+        .with(Arc::new(
+            crate::tools::conversation_rule::SetConversationRuleTool,
+        ))
+        .with(Arc::new(
+            crate::tools::conversation_rule::ListConversationRulesTool,
+        ))
+        .with(Arc::new(
+            crate::tools::conversation_rule::RemoveConversationRuleTool,
+        ))
 }
 
 fn with_tiered_recall_tools(
@@ -604,7 +613,13 @@ fn with_tiered_recall_tools(
     if !args.interactive {
         return Ok(tb);
     }
-    for name in ["history_search", "todo"] {
+    for name in [
+        "history_search",
+        "todo",
+        "set_conversation_rule",
+        "list_conversation_rules",
+        "remove_conversation_rule",
+    ] {
         // Recall is part of the built-in primary-agent surface. It remains
         // discoverable through native Monty even though every agent now gets
         // that runtime. A custom assistant must still opt into it explicitly:
@@ -690,6 +705,9 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "semantic_search",
         "structured_search",
         "todo",
+        "set_conversation_rule",
+        "list_conversation_rules",
+        "remove_conversation_rule",
         "write",
         "edit",
         "delete",
@@ -842,6 +860,24 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             family: "Planning",
             name: "todo",
             summary: "Manage session todos and notes.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "set_conversation_rule",
+            summary: "Record an advisory conversation-lineage directive that survives compaction.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "list_conversation_rules",
+            summary: "List advisory conversation-lineage rules.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "remove_conversation_rule",
+            summary: "Revoke an advisory conversation-lineage rule.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
@@ -1113,6 +1149,9 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::session_search::HistorySearchTool),
         Arc::new(tools::thread_start::ThreadStartTool),
         Arc::new(tools::todo::TodoTool),
+        Arc::new(tools::conversation_rule::SetConversationRuleTool),
+        Arc::new(tools::conversation_rule::ListConversationRulesTool),
+        Arc::new(tools::conversation_rule::RemoveConversationRuleTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::worktree_orchestrate::WorktreeOrchestrateTool),
@@ -1267,6 +1306,15 @@ pub(crate) fn materialize_tool_by_name(
         "return" => tb.with(Arc::new(tools::return_tool::ReturnTool)),
         "start_build" => tb.with(Arc::new(tools::plan_doc::StartBuildTool)),
         "todo" => tb.with(Arc::new(tools::todo::TodoTool)),
+        "set_conversation_rule" => {
+            tb.with(Arc::new(tools::conversation_rule::SetConversationRuleTool))
+        }
+        "list_conversation_rules" => tb.with(Arc::new(
+            tools::conversation_rule::ListConversationRulesTool,
+        )),
+        "remove_conversation_rule" => tb.with(Arc::new(
+            tools::conversation_rule::RemoveConversationRuleTool,
+        )),
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
@@ -1765,6 +1813,9 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_invoke",
             "history_search",
             "todo",
+            "set_conversation_rule",
+            "list_conversation_rules",
+            "remove_conversation_rule",
             "webfetch",
             "websearch",
         ],
@@ -5511,6 +5562,9 @@ pub(crate) mod tests {
             "code",
             "context_pack",
             "todo",
+            "set_conversation_rule",
+            "list_conversation_rules",
+            "remove_conversation_rule",
         ] {
             assert!(names.contains(&tool), "{tool} should be directly injected");
         }
@@ -6071,7 +6125,15 @@ pub(crate) mod tests {
             names.len() <= 10,
             "Careful direct tools should stay within the small-surface budget: {names:?}"
         );
-        for non_direct in ["history_search", "todo", "webfetch", "websearch"] {
+        for non_direct in [
+            "history_search",
+            "todo",
+            "set_conversation_rule",
+            "list_conversation_rules",
+            "remove_conversation_rule",
+            "webfetch",
+            "websearch",
+        ] {
             assert!(
                 !names.contains(&non_direct),
                 "{non_direct} must not be injected into Careful's direct tool surface"
@@ -6697,7 +6759,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_computer_provider_config(
             tmp.path(),
-            "{}",
+            r#"{"computer_target":"real_desktop"}"#,
             r#"{
                 "url": "http://localhost:1/v1",
                 "computer_use": "yolo",
@@ -7403,6 +7465,9 @@ pub(crate) mod tests {
         assert!(names.contains(&"todo"));
         assert!(names.contains(&"history_search"));
         assert!(names.contains(&"thread_start"));
+        assert!(names.contains(&"set_conversation_rule"));
+        assert!(names.contains(&"list_conversation_rules"));
+        assert!(names.contains(&"remove_conversation_rule"));
         // `goal` is deliberately not a grantable/runtime tool: the session goal
         // is host/driver-owned durable state, not a tool an agent may mention in
         // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
@@ -7419,7 +7484,14 @@ pub(crate) mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "history_search", "thread_start"] {
+        for name in [
+            "todo",
+            "history_search",
+            "thread_start",
+            "set_conversation_rule",
+            "list_conversation_rules",
+            "remove_conversation_rule",
+        ] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
@@ -7532,6 +7604,7 @@ pub(crate) mod tests {
 
         // CompactReady still carries a handoff string field (compaction).
         let compact_ready = TurnEvent::CompactReady {
+            predecessor_session_id: uuid::Uuid::nil(),
             new_session_id: uuid::Uuid::nil(),
             handoff: "brief".into(),
             brief: "brief body".into(),
@@ -7566,6 +7639,7 @@ pub(crate) mod tests {
             active_goal: None,
             task_overview: Vec::new(),
             pinned_messages: Vec::new(),
+            conversation_rules: Vec::new(),
         };
         let assembled = assemble_handoff("brief body", &appendix, &[], false);
         assert!(
@@ -7604,6 +7678,15 @@ pub(crate) mod tests {
         assert!(!effects.contains_key("handoff"), "{effects:?}");
         assert!(effects.contains_key("task"), "{effects:?}");
         assert!(effects.contains_key("todo"), "{effects:?}");
+        assert!(effects.contains_key("set_conversation_rule"), "{effects:?}");
+        assert!(
+            effects.contains_key("list_conversation_rules"),
+            "{effects:?}"
+        );
+        assert!(
+            effects.contains_key("remove_conversation_rule"),
+            "{effects:?}"
+        );
     }
 
     #[test]

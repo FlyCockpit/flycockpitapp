@@ -67,3 +67,4 @@ pub mod worktree_orchestrate;
 pub mod write;
 
 pub mod common;
+pub mod conversation_rule;

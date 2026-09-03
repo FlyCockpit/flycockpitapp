@@ -23,10 +23,57 @@
 use crate::computer::ComputerToolContract;
 use crate::computer::coordinator::{ComputerActionCoordinator, NativeComputerContinuation};
 use crate::computer::live_loop::NativeComputerLiveLoop;
+use crate::computer::{ComputerError, DisplayTarget};
 use crate::engine::agent::Agent;
 use crate::session::Session;
 use futures::future::BoxFuture;
 use std::sync::Arc;
+
+pub(crate) fn computer_backend_open_remediation(
+    target: DisplayTarget,
+    error: &ComputerError,
+) -> &'static str {
+    match error {
+        ComputerError::MissingTool { .. } => {
+            #[cfg(target_os = "linux")]
+            {
+                "Install the missing host tools listed above on this Linux host"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "Install the missing host tools listed above on this Mac"
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                "Install the missing host tools listed above on this host"
+            }
+        }
+        ComputerError::UnsupportedPlatform { .. } => match target {
+            DisplayTarget::Virtual => {
+                "The isolated virtual display is supported on Linux only; use a Linux host or explicitly opt into real-desktop control with a machine grant"
+            }
+            DisplayTarget::RealDesktop => {
+                "Real desktop control is unavailable on this platform or session; set `computer_target` to `virtual` for the isolated display or use a supported desktop session"
+            }
+        },
+        ComputerError::RealDesktopGrantMissing => {
+            "Real desktop control requires a stored machine-local grant for this host"
+        }
+        ComputerError::CommandFailed { .. } => match target {
+            DisplayTarget::Virtual => {
+                "Resolve the host setup error above (Cockpit data directory permissions, capture workspace, or virtual display startup)"
+            }
+            DisplayTarget::RealDesktop => {
+                "Resolve the host setup error above (Cockpit data directory permissions, input-state journal, or display session)"
+            }
+        },
+        ComputerError::InvalidCoordinates(_) => {
+            "The computer backend reported invalid coordinates during setup; see the error above"
+        }
+        ComputerError::Refused(_) => "The computer backend refused to open; see the error above",
+        ComputerError::Cancelled => "The computer backend open was cancelled; retry the session",
+    }
+}
 
 /// Open a selected delegation's native-computer capability before its first
 /// advertised request. This is shared by foreground and noninteractive
@@ -74,8 +121,9 @@ pub(crate) async fn open_native_computer_for_delegation(
             tracing::warn!(error = %error, "native computer backend open failed");
             agent.params.native_computer = None;
             if candidate.require_backend {
+                let remediation = computer_backend_open_remediation(candidate.target, &error);
                 anyhow::bail!(
-                    "Computer primary could not open its {} backend: {error}. Set `computer_target` to `virtual` to use the isolated display instead",
+                    "Computer primary could not open its {} backend: {error}. {remediation}",
                     match candidate.target {
                         crate::computer::DisplayTarget::Virtual => "virtual-display",
                         crate::computer::DisplayTarget::RealDesktop => "real-desktop",
@@ -705,6 +753,79 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn computer_backend_open_remediation_is_error_kind_aware() {
+        let missing_tool = ComputerError::MissingTool {
+            tool: "Xvfb".to_string(),
+            install_hint: "the `xvfb` package".to_string(),
+        };
+        let virtual_missing_hint =
+            computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool);
+        assert!(virtual_missing_hint.contains("Install the missing host tools"));
+        assert!(!virtual_missing_hint.contains("computer_target"));
+        #[cfg(target_os = "linux")]
+        assert!(virtual_missing_hint.contains("Linux host"));
+        #[cfg(target_os = "macos")]
+        assert!(virtual_missing_hint.contains("this Mac"));
+        #[cfg(target_os = "macos")]
+        assert!(!virtual_missing_hint.contains("Linux"));
+
+        let real_desktop_missing_tool = ComputerError::MissingTool {
+            tool: "xdotool".to_string(),
+            install_hint: "the `xdotool` package".to_string(),
+        };
+        let real_desktop_missing_hint = computer_backend_open_remediation(
+            DisplayTarget::RealDesktop,
+            &real_desktop_missing_tool,
+        );
+        assert!(real_desktop_missing_hint.contains("Install the missing host tools"));
+        assert!(!real_desktop_missing_hint.contains("machine grant"));
+        #[cfg(target_os = "linux")]
+        assert!(real_desktop_missing_hint.contains("Linux host"));
+        #[cfg(target_os = "macos")]
+        {
+            let screencapture_missing = ComputerError::MissingTool {
+                tool: "/usr/sbin/screencapture".to_string(),
+                install_hint: "the system macOS screencapture utility".to_string(),
+            };
+            let mac_hint = computer_backend_open_remediation(
+                DisplayTarget::RealDesktop,
+                &screencapture_missing,
+            );
+            assert!(mac_hint.contains("this Mac"));
+            assert!(!mac_hint.contains("Linux"));
+        }
+
+        let command_failed = ComputerError::CommandFailed {
+            program: "Xvfb".to_string(),
+            detail: "Permission denied".to_string(),
+        };
+        let virtual_command_hint =
+            computer_backend_open_remediation(DisplayTarget::Virtual, &command_failed);
+        assert!(virtual_command_hint.contains("Resolve the host setup error"));
+        assert!(!virtual_command_hint.contains("Xvfb"));
+        assert!(!virtual_command_hint.contains("Install"));
+
+        let unsupported = ComputerError::UnsupportedPlatform {
+            platform: "linux".to_string(),
+        };
+        assert!(
+            computer_backend_open_remediation(DisplayTarget::Virtual, &unsupported)
+                .contains("Linux only")
+        );
+        assert!(
+            computer_backend_open_remediation(
+                DisplayTarget::RealDesktop,
+                &ComputerError::RealDesktopGrantMissing
+            )
+            .contains("machine-local grant")
+        );
+        assert!(
+            computer_backend_open_remediation(DisplayTarget::RealDesktop, &unsupported)
+                .contains("computer_target")
+        );
+    }
 
     /// A fake backend that yields a successful capture frame.
     struct CapturingFakeBackend {

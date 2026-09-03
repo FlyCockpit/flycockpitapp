@@ -245,6 +245,16 @@ CREATE TABLE sessions (
     btw_parent_session_id TEXT,
     btw_tangent INTEGER NOT NULL DEFAULT 0 CHECK (btw_tangent IN (0, 1)),
 
+    -- Typed linear compaction predecessor. Distinct from parent_session_id
+    -- (forks) and btw_parent_session_id (side conversations): a session is
+    -- one context window, and this edge links windows into a conversation
+    -- lineage. Forks keep their own lineage root.
+    compaction_predecessor_session_id TEXT,
+    -- Stable conversation id. Roots and forks use their own session_id
+    -- (filled by sessions_lineage_root_fill when omitted). Compaction
+    -- successors copy the predecessor's lineage root.
+    compaction_lineage_root_id TEXT,
+
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
     -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
@@ -290,14 +300,53 @@ CREATE TABLE sessions (
         AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
     )),
     CHECK (is_assistant_thread = 0 OR (
-        parent_session_id IS NOT NULL
-        AND fork_point_turn_id IS NOT NULL
+        (
+            (parent_session_id IS NOT NULL AND fork_point_turn_id IS NOT NULL)
+            OR compaction_predecessor_session_id IS NOT NULL
+        )
         AND ephemeral = 0
         AND btw_parent_session_id IS NULL
         AND assistant_name IS NOT NULL
         AND is_dream_session = 0
     )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
+    CHECK (
+        compaction_predecessor_session_id IS NULL
+        OR compaction_predecessor_session_id <> session_id
+    ),
+    -- A window is either a fork or a compaction successor, never both.
+    CHECK (
+        parent_session_id IS NULL
+        OR compaction_predecessor_session_id IS NULL
+    ),
+    CHECK (
+        compaction_predecessor_session_id IS NULL
+        OR compaction_lineage_root_id IS NOT NULL
+    ),
+    CHECK (
+        compaction_lineage_root_id IS NULL OR (
+            length(compaction_lineage_root_id) = 36
+            AND compaction_lineage_root_id = lower(compaction_lineage_root_id)
+            AND substr(compaction_lineage_root_id, 9, 1) = '-'
+            AND substr(compaction_lineage_root_id, 14, 1) = '-'
+            AND substr(compaction_lineage_root_id, 19, 1) = '-'
+            AND substr(compaction_lineage_root_id, 24, 1) = '-'
+            AND length(replace(compaction_lineage_root_id, '-', '')) = 32
+            AND replace(compaction_lineage_root_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        compaction_predecessor_session_id IS NULL OR (
+            length(compaction_predecessor_session_id) = 36
+            AND compaction_predecessor_session_id = lower(compaction_predecessor_session_id)
+            AND substr(compaction_predecessor_session_id, 9, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 14, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 19, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 24, 1) = '-'
+            AND length(replace(compaction_predecessor_session_id, '-', '')) = 32
+            AND replace(compaction_predecessor_session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
     CHECK (last_viewed_at_unix_ms IS NULL OR last_viewed_at_unix_ms >= started_at_unix_ms),
     CHECK (archived_at_unix_ms IS NULL OR archived_at_unix_ms >= started_at_unix_ms),
@@ -305,7 +354,9 @@ CREATE TABLE sessions (
     FOREIGN KEY (parent_session_id, fork_point_turn_id)
         REFERENCES session_events(session_id, seq)
         ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (compaction_predecessor_session_id) REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (compaction_lineage_root_id) REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 -- ---- Monty governed network capability -----------------------------------
@@ -342,18 +393,23 @@ CREATE TABLE monty_network_agent_grants (
 -- cycle-safe if a pre-release database was externally corrupted before this
 -- trigger existed; valid mutations fail before introducing another cycle.
 CREATE TRIGGER sessions_parent_cycle_guard
-BEFORE UPDATE OF parent_session_id, btw_parent_session_id ON sessions
+BEFORE UPDATE OF parent_session_id, btw_parent_session_id, compaction_predecessor_session_id ON sessions
 WHEN EXISTS (
     WITH RECURSIVE ancestors(session_id) AS (
         SELECT NEW.parent_session_id WHERE NEW.parent_session_id IS NOT NULL
         UNION
         SELECT NEW.btw_parent_session_id WHERE NEW.btw_parent_session_id IS NOT NULL
         UNION
+        SELECT NEW.compaction_predecessor_session_id WHERE NEW.compaction_predecessor_session_id IS NOT NULL
+        UNION
         SELECT s.parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.parent_session_id IS NOT NULL
         UNION
         SELECT s.btw_parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.btw_parent_session_id IS NOT NULL
+        UNION
+        SELECT s.compaction_predecessor_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.compaction_predecessor_session_id IS NOT NULL
     )
     SELECT 1 FROM ancestors WHERE session_id=NEW.session_id
 )
@@ -372,16 +428,35 @@ WHEN EXISTS (
         UNION
         SELECT NEW.btw_parent_session_id WHERE NEW.btw_parent_session_id IS NOT NULL
         UNION
+        SELECT NEW.compaction_predecessor_session_id WHERE NEW.compaction_predecessor_session_id IS NOT NULL
+        UNION
         SELECT s.parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.parent_session_id IS NOT NULL
         UNION
         SELECT s.btw_parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.btw_parent_session_id IS NOT NULL
+        UNION
+        SELECT s.compaction_predecessor_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.compaction_predecessor_session_id IS NOT NULL
     )
     SELECT 1 FROM ancestors WHERE session_id=NEW.session_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'session parent cycle');
+END;
+
+-- Roots and forks omitted from compaction_lineage_root_id are their own
+-- conversation. Compaction successors must set the column explicitly
+-- (CHECK above) so this backstop cannot mint a new lineage for a window.
+CREATE TRIGGER sessions_lineage_root_fill
+AFTER INSERT ON sessions
+FOR EACH ROW
+WHEN NEW.compaction_lineage_root_id IS NULL
+ AND NEW.compaction_predecessor_session_id IS NULL
+BEGIN
+    UPDATE sessions
+       SET compaction_lineage_root_id = NEW.session_id
+     WHERE session_id = NEW.session_id;
 END;
 
 -- ---- typed media attachments ----------------------------------------------
@@ -1175,6 +1250,13 @@ CREATE INDEX idx_sessions_btw_parent ON sessions (btw_parent_session_id);
 CREATE UNIQUE INDEX idx_sessions_one_live_btw
     ON sessions (btw_parent_session_id)
     WHERE btw_parent_session_id IS NOT NULL;
+CREATE INDEX idx_sessions_compaction_predecessor
+    ON sessions (compaction_predecessor_session_id);
+CREATE UNIQUE INDEX idx_sessions_one_compaction_successor
+    ON sessions (compaction_predecessor_session_id)
+    WHERE compaction_predecessor_session_id IS NOT NULL;
+CREATE INDEX idx_sessions_compaction_lineage_root
+    ON sessions (compaction_lineage_root_id, last_active_at_unix_ms DESC);
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;
@@ -3847,6 +3929,41 @@ CREATE TABLE pins (
 );
 
 CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
+
+-- ---- conversation_rules --------------------------------------------------------------
+-- Lineage-scoped advisory directives. They attach to the compaction lineage
+-- root (not an individual window), are injected verbatim into every window
+-- seed, and never summarized. Distinct from `/pin` (user free-text
+-- must-survive messages); there is no silent conversion between them.
+
+CREATE TABLE conversation_rules (
+    rule_id TEXT PRIMARY KEY CHECK (
+        length(rule_id) = 36 AND rule_id = lower(rule_id)
+        AND substr(rule_id, 9, 1) = '-' AND substr(rule_id, 14, 1) = '-'
+        AND substr(rule_id, 19, 1) = '-' AND substr(rule_id, 24, 1) = '-'
+        AND length(replace(rule_id, '-', '')) = 32
+        AND replace(rule_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    -- Compaction lineage root (`sessions.compaction_lineage_root_id`, or
+    -- `session_id` for the first window). Forks mint their own root and
+    -- do not inherit these rows.
+    lineage_id TEXT NOT NULL CHECK (
+        length(lineage_id) = 36 AND lineage_id = lower(lineage_id)
+        AND substr(lineage_id, 9, 1) = '-' AND substr(lineage_id, 14, 1) = '-'
+        AND substr(lineage_id, 19, 1) = '-' AND substr(lineage_id, 24, 1) = '-'
+        AND length(replace(lineage_id, '-', '')) = 32
+        AND replace(lineage_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 4000),
+    created_by TEXT NOT NULL CHECK (created_by IN ('user', 'agent')),
+    source_trust TEXT NOT NULL CHECK (source_trust IN ('trusted', 'untrusted')),
+    created_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (lineage_id) REFERENCES sessions(session_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
+);
+
+CREATE INDEX conversation_rules_lineage_idx
+    ON conversation_rules (lineage_id, created_at_unix_ms);
 
 -- ---- prune_ledger --------------------------------------------------------------------
 -- Session resume prune-ledger: resuming must be a TRUE CONTINUATION.
@@ -7883,10 +8000,19 @@ CREATE TABLE guidance_proposal_receipts (
         AND proposal_id = lower(proposal_id)
         AND proposal_id NOT GLOB '*[^0-9a-f]*'
     ),
-    -- The session UUID text (matches sessions.session_id spelling) — no FK
-    -- because a receipt may outlive its session row during retention.
-    session_id               TEXT    NOT NULL CHECK (length(session_id) BETWEEN 1 AND 64),
-    delegation_id            TEXT    NOT NULL CHECK (length(delegation_id) BETWEEN 1 AND 64),
+    -- 16-byte session/delegation identifiers as 32 lowercase hex characters
+    -- (the same spelling the producer writes). No FK: a receipt may outlive
+    -- its session row during retention.
+    session_id               TEXT    NOT NULL CHECK (
+        length(session_id) = 32
+        AND session_id = lower(session_id)
+        AND session_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    delegation_id            TEXT    NOT NULL CHECK (
+        length(delegation_id) = 32
+        AND delegation_id = lower(delegation_id)
+        AND delegation_id NOT GLOB '*[^0-9a-f]*'
+    ),
     canonical_project_digest TEXT    NOT NULL CHECK (
         length(canonical_project_digest) = 64
         AND canonical_project_digest = lower(canonical_project_digest)
@@ -7952,7 +8078,13 @@ CREATE UNIQUE INDEX uq_guidance_proposal_receipts_one_created_per_scope
 -- does NOT re-increment these counters.
 CREATE TABLE guidance_proposal_counters (
     scope_kind TEXT    NOT NULL CHECK (scope_kind IN ('session', 'delegation')),
-    scope_id   TEXT    NOT NULL CHECK (length(scope_id) BETWEEN 1 AND 64),
+    -- Session or delegation identifier; same 32 lowercase hex spelling as the
+    -- matching receipt column.
+    scope_id   TEXT    NOT NULL CHECK (
+        length(scope_id) = 32
+        AND scope_id = lower(scope_id)
+        AND scope_id NOT GLOB '*[^0-9a-f]*'
+    ),
     count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
     PRIMARY KEY (scope_kind, scope_id)
 );
@@ -7962,9 +8094,21 @@ CREATE TABLE guidance_proposal_counters (
 -- deliberately isolated from config/export tables and keyed only by opaque
 -- local scope digests.  Session-scoped accepted rules never enter SQLite.
 CREATE TABLE accepted_persistent_guidance_rules (
-    canonical_project_digest TEXT NOT NULL CHECK (length(canonical_project_digest) = 64),
-    provider_digest          TEXT NOT NULL CHECK (length(provider_digest) = 64),
-    model_digest             TEXT NOT NULL CHECK (length(model_digest) = 64),
+    canonical_project_digest TEXT NOT NULL CHECK (
+        length(canonical_project_digest) = 64
+        AND canonical_project_digest = lower(canonical_project_digest)
+        AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    provider_digest          TEXT NOT NULL CHECK (
+        length(provider_digest) = 64
+        AND provider_digest = lower(provider_digest)
+        AND provider_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    model_digest             TEXT NOT NULL CHECK (
+        length(model_digest) = 64
+        AND model_digest = lower(model_digest)
+        AND model_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     rule_kind                INTEGER NOT NULL CHECK (rule_kind BETWEEN 1 AND 6),
     encoded_rule             BLOB NOT NULL CHECK (length(encoded_rule) = 3),
     updated_at_unix_ms       INTEGER NOT NULL,
@@ -7984,6 +8128,59 @@ CREATE TABLE guidance_proposal_audit_outbox (
     PRIMARY KEY (proposal_id, terminal_state),
     FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+
+-- ---- computer_audit_entries (issue #271) -----------------------------------
+-- Append-only bodies of the daemon-only tamper-evident computer-use audit
+-- chain. The HMAC signing key and signed/checkpointed chain head live in the
+-- machine-local protected secret store, not here. SQLite mutation, reorder,
+-- insertion, or tail deletion is detected by verifying this log against that
+-- sealed head; verification fails closed (no silent re-anchor). Entries never
+-- contain pixels, typed rule values, rationale, OCR, or raw target text.
+--
+-- `sequence` is the chain sequence (1-based). `entry_bytes` is the canonical
+-- 424-byte ComputerAuditEntryV1 encoding. `mac` is HMAC-SHA-256 over that
+-- body. `event_kind` / `proposal_id` / `key_version` are projections of that
+-- body for indexes and idempotent outbox replay — never independent identity.
+-- Offsets are 0-indexed ComputerAuditEntryV1 layout (SQLite substr is
+-- 1-indexed): event_kind at byte 5, sequence at bytes 10-17, proposal_id at
+-- 114-129, key_version at 420-423. CHECK plus insert-time proof reject a
+-- row whose columns do not match; uniqueness is on the authenticated body
+-- so an offline column relabel cannot occupy another event's identity.
+CREATE TABLE computer_audit_entries (
+    sequence     INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    entry_bytes  BLOB    NOT NULL CHECK (typeof(entry_bytes) = 'blob' AND length(entry_bytes) = 424),
+    mac          BLOB    NOT NULL CHECK (typeof(mac) = 'blob' AND length(mac) = 32),
+    event_kind   INTEGER NOT NULL CHECK (event_kind BETWEEN 1 AND 29),
+    proposal_id  BLOB    NOT NULL CHECK (typeof(proposal_id) = 'blob' AND length(proposal_id) = 16),
+    key_version  INTEGER NOT NULL CHECK (key_version >= 1),
+    CHECK (printf('%016X', sequence) = hex(substr(entry_bytes, 11, 8))),
+    CHECK (printf('%02X', event_kind) = hex(substr(entry_bytes, 6, 1))),
+    CHECK (proposal_id = substr(entry_bytes, 115, 16)),
+    CHECK (printf('%08X', key_version) = hex(substr(entry_bytes, 421, 4)))
+);
+
+-- At most one guidance-proposal audit event per authenticated (kind, proposal)
+-- taken from entry_bytes. The uniqueness key prevents a fork; it is not event
+-- identity. Replay may succeed only when the canonical body is the requested
+-- event. Kinds 20..=23 are X'14'..X'17'.
+CREATE UNIQUE INDEX uq_computer_audit_entries_guidance_proposal
+    ON computer_audit_entries(
+        substr(entry_bytes, 6, 1),
+        substr(entry_bytes, 115, 16)
+    )
+    WHERE substr(entry_bytes, 6, 1) IN (X'14', X'15', X'16', X'17');
+
+CREATE TRIGGER computer_audit_entries_immutable_update
+BEFORE UPDATE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
+
+CREATE TRIGGER computer_audit_entries_immutable_delete
+BEFORE DELETE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
 
 -- Local image-sidecar destination grants are daemon-owned durable authority.
 -- There is intentionally no global scope. Invocation audit rows are added

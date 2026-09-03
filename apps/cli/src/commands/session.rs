@@ -120,6 +120,7 @@ async fn list(args: SessionListArgs) -> Result<()> {
             project_id: None,
             parent_session_id: None,
             assistant_id: args.assistant.clone(),
+            compaction_lineage_root_id: None,
         })
         .await
         .context("requesting session list from daemon")?
@@ -407,7 +408,15 @@ fn response_from_args(args: &SessionAnswerArgs) -> Result<ResolveResponse> {
 
 fn parse_answers_json(source: &str) -> Result<ResolveResponse> {
     let body = if Path::new(source).exists() {
-        std::fs::read_to_string(source).with_context(|| format!("reading answers JSON {source}"))?
+        // The answers travel inline in one request frame, so bound the read
+        // at the wire frame cap: an oversized or non-regular answers file
+        // fails here instead of allocating or blocking the CLI.
+        let bytes = cockpit_host::bounded::read_at_most(
+            Path::new(source),
+            crate::daemon::proto::MAX_NDJSON_FRAME_BYTES as u64,
+        )
+        .with_context(|| format!("reading answers JSON {source}"))?;
+        String::from_utf8(bytes).with_context(|| format!("reading answers JSON {source}"))?
     } else {
         source.to_string()
     };

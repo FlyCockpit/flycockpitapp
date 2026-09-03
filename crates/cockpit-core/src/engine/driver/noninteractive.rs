@@ -1673,7 +1673,7 @@ impl Driver {
                 crate::db::task_delegation_payloads::NewTaskDelegationPayload {
                     task_call_id,
                     function_call_id: task_function_call_id,
-                    parent_session_id: self.session.id,
+                    parent_session_id: self.session.live_id(),
                     parent_agent,
                     label,
                     child_agent,
@@ -1727,7 +1727,12 @@ impl Driver {
     }
 
     pub(in crate::engine::driver) async fn current_message_fork_point(&self) -> Option<String> {
-        match self.session.db.list_session_events(self.session.id).await {
+        match self
+            .session
+            .db
+            .list_session_events(self.session.live_id())
+            .await
+        {
             Ok(events) => events
                 .into_iter()
                 .rev()
@@ -1752,7 +1757,7 @@ impl Driver {
         let fork_point = self.current_message_fork_point().await;
         let session = crate::session::Session::create_fork(
             self.session.db.clone(),
-            self.session.id,
+            self.session.live_id(),
             fork_point,
             self.session.redaction_key_resolver().clone(),
             self.session.secret_vault().clone(),
@@ -1904,7 +1909,7 @@ impl Driver {
             .session
             .db
             .settle_task_delegation_child_and_agent(
-                self.session.id,
+                self.session.live_id(),
                 task_call_id.to_string(),
                 label.to_string(),
                 outcome,
@@ -2938,7 +2943,7 @@ impl Driver {
                 .db
                 .upsert_task_delegation_job_and_payload(
                     crate::db::task_delegations::TaskDelegationJobUpsert {
-                        session_id: self.session.id,
+                        session_id: self.session.live_id(),
                         task_call_id: &task_call_id,
                         function_call_id: task_function_call_id.as_deref(),
                         parent_agent: &parent_agent,
@@ -2948,7 +2953,7 @@ impl Driver {
                     crate::db::task_delegation_payloads::NewTaskDelegationPayload {
                         task_call_id: &task_call_id,
                         function_call_id: task_function_call_id.as_deref(),
-                        parent_session_id: self.session.id,
+                        parent_session_id: self.session.live_id(),
                         parent_agent: &parent_agent,
                         label: "default",
                         child_agent: &task.child_agent,
@@ -5859,7 +5864,7 @@ impl Driver {
         let rows = match self
             .session
             .db
-            .list_task_delegation_children(self.session.id)
+            .list_task_delegation_children(self.session.live_id())
             .await
         {
             Ok(rows) => rows,
@@ -6021,7 +6026,7 @@ impl Driver {
         let rows = self
             .session
             .db
-            .list_task_delegation_children(self.session.id)
+            .list_task_delegation_children(self.session.live_id())
             .await
             .map_err(|e| format!("could not load task delegations: {e:#}"))?;
         let orphaned = orphaned_task_control_keys(&rows, &self.noninteractive_delegations);
@@ -6098,7 +6103,7 @@ impl Driver {
         let rows = match self
             .session
             .db
-            .list_task_delegation_children(self.session.id)
+            .list_task_delegation_children(self.session.live_id())
             .await
         {
             Ok(rows) => rows,
@@ -6554,7 +6559,7 @@ impl Driver {
                 |entry| crate::db::task_delegation_payloads::NewTaskDelegationPayload {
                     task_call_id: task_call_id.as_str(),
                     function_call_id: task_function_call_id.as_deref(),
-                    parent_session_id: self.session.id,
+                    parent_session_id: self.session.live_id(),
                     parent_agent: parent_agent.as_str(),
                     label: entry.label.as_str(),
                     child_agent: entry.child_agent.as_str(),
@@ -6567,7 +6572,7 @@ impl Driver {
             .db
             .upsert_task_delegation_job_and_payloads(
                 crate::db::task_delegations::TaskDelegationJobUpsert {
-                    session_id: self.session.id,
+                    session_id: self.session.live_id(),
                     task_call_id: &task_call_id,
                     function_call_id: task_function_call_id.as_deref(),
                     parent_agent: &parent_agent,
@@ -10653,7 +10658,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         Some(target) => match session
             .db
             .task_delegation_child_agent(
-                session.id,
+                session.live_id(),
                 target.task_call_id.clone(),
                 target.label.clone(),
             )

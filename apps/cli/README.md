@@ -64,7 +64,8 @@ Completions are explicit release assets. After extracting an archive, copy
 `completions/cockpit.fish` into the completion directory for your shell. Copy
 files from `man/` into a `man1` directory on `MANPATH`. Homebrew performs these
 steps automatically, while the POSIX installer makes a best-effort user-local
-copy. To uninstall a script installation, remove `cockpit` from Cargo's bin
+copy. `cockpit completion <shell>` generates the same scripts on demand from
+an installed binary. To uninstall a script installation, remove `cockpit` from Cargo's bin
 directory and remove only the Cockpit completion and man-page files you copied.
 
 ### External runtimes
@@ -230,7 +231,7 @@ cockpit packages prune --dry-run
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
 | `cockpit assistants list` | List persistent assistants. |
-| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
+| `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. Compiled only into internal `remote`-feature builds; absent from the public local binary (see the internal remote profile section below). |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
 | `cockpit models [provider]` | Show the effective default model for new sessions plus its scope, then list locally configured models. |
@@ -246,11 +247,11 @@ cockpit packages prune --dry-run
 | `cockpit session purge --before <YYYY-MM-DD|30d> [--dry-run] [--yes]` | Permanently delete ended sessions before a cutoff; `--dry-run` reports the count only. |
 | `cockpit knowledge attach <kb> <session>` | Attach a session to a knowledge base as dream input consent. |
 | `cockpit dream <kb>\|--all` | Dream one knowledge base or every configured knowledge base. |
-| `cockpit schedule list` | List durable scheduler jobs. |
+| `cockpit schedule list` | List durable scheduler jobs. Compiled only into opt-in `extended`-feature builds; absent from the public local binary. |
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |
-| `cockpit export <session>` | Export a redacted session/fork tree debug bundle. |
-| `cockpit import <file>` | Import a session export (never restores approval grants or other authorization state). |
+| `cockpit export <session>` | Export a session/fork tree debug bundle, redacted by default; `--include-sensitive` writes an unredacted archive (local-only opt-in, mandatory stderr warning). |
+| `cockpit import <file>` | Import a session export (never restores approval grants or other authorization state). Refuses an unredacted `--include-sensitive` export unless `--include-sensitive` is passed again, and prints the fresh destination session ids. |
 | `cockpit stats` | Show token and cost statistics. |
 | `cockpit debug paths` | Show resolved global paths for debugging. |
 | `cockpit debug config` | Print effective configuration with credentials redacted. |
@@ -274,8 +275,9 @@ cockpit packages prune --dry-run
 ### Internal remote profile
 
 Account, organization-sync, and relay-control commands are compiled only for
-internal builds using the opt-in Cargo `remote` feature. They are not part of
-the public v0.1 command or compatibility surface. Remote-profile operators use
+internal builds using the opt-in Cargo `remote` feature. They are absent from
+the public v0.1 (local) command surface; a build that enables the `remote`
+feature exposes them as ordinary commands. Remote-profile operators use
 `cockpit account`, `cockpit sync`, and `cockpit connect`; public local installs
 must not depend on those commands or FlyCockpit service reachability.
 
@@ -689,7 +691,7 @@ cockpit provider-catalog-status
 
 Provider and model entries can carry policy metadata used by routing, diagnostics, and export safety:
 
-- `trust`: model trust is the host-mediated capture/write setting and is separate from workspace trust. Every inference request receives redacted, reference-only sealed values. A `trusted` model may participate in host-mediated capture; an `untrusted` model may not. Missing trust resolves to the conservative `untrusted`. Trust never sends a provider raw secrets or environment values. Exports and client display stay redacted regardless of trust.
+- `trust`: model trust is the host-mediated capture/write setting and is separate from workspace trust. Every inference request receives redacted, reference-only sealed values. A `trusted` model may participate in host-mediated capture; an `untrusted` model may not. Missing trust resolves to the conservative `untrusted`. Trust never sends a provider raw secrets or environment values. Client display stays redacted regardless of trust, and model trust never produces an unredacted export: the only raw archive is the explicit local `cockpit export --include-sensitive` opt-in, which no trust level can trigger.
 - Harness mode (agent-definition posture) never changes provider eligibility, data custody, or redaction. Trust and mode are independent, and every combination is valid — no mode, and no locality, implies trust.
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
@@ -710,7 +712,7 @@ cockpit config export-policy -o cockpit-policy.json
 cockpit config import-policy cockpit-policy.json
 ```
 
-Debug exports are permanently redacted using the active redaction table. Every `cockpit export` archive is a portable, shareable diagnostic artifact: sealed values, environment values, credential values, and contained leak values are scrubbed for every model trust level. There is no unredacted export path.
+Debug exports are redacted by default using the active redaction table: sealed values, environment values, credential values, and contained leak values are scrubbed for every model trust level, so a default `cockpit export` archive is a portable, shareable diagnostic artifact. The single unredacted path is the explicit local `cockpit export --include-sensitive` opt-in: the daemon refuses it for any remoted caller, it prints a mandatory stderr warning, records `"redacted": false` in the archive manifest, and writes the file with private permissions. Never share an `--include-sensitive` archive; it pairs only with `cockpit import --include-sensitive` on a machine you control.
 
 See [Redaction](docs/redaction.md) for `min_secret_length`, allowlist, denylist, and filesystem-path protection details.
 
@@ -796,7 +798,7 @@ Cockpit is built around explicit trust and scoped execution:
 - Command approval and safety-gate decisions are recorded.
 - Write-capable tools acquire daemon-managed path locks.
 - Credentials are stored outside project config and written with private file permissions on Unix.
-- Session exports are permanently redacted; there is no unredacted export path. Sensitive-record recovery occurs only through the authenticated per-record `/sealed` or `/leaks` channel, never through archive generation.
+- Session exports are redacted by default; sensitive-record recovery normally occurs only through the authenticated per-record `/sealed` or `/leaks` channel, never through archive generation. The single unredacted path is the explicit local `cockpit export --include-sensitive` opt-in, and `cockpit import` refuses such an archive unless `--include-sensitive` is passed again. Neither flag is reachable through model trust or the TUI, and the daemon rejects a raw `include_sensitive` export from any non-local caller.
 
 ## What Leaves Your Machine
 
@@ -839,7 +841,7 @@ records terminal settlement. An expired open lease is likewise removed with
 its sealed payload when reconciliation observes it; retention never deletes an
 open lease row alone and leaves encrypted payload orphaned.
 
-Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are permanently redacted regardless of provider trust.
+Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: default exports are redacted regardless of provider trust; the only raw archive is the explicit local `cockpit export --include-sensitive` opt-in.
 
 ### Sealed reference injection
 

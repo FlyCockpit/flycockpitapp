@@ -58,6 +58,7 @@ pub mod pty;
 pub mod quick_dialog;
 pub(crate) mod read_highlight;
 pub mod resources_pane;
+pub mod rules_overlay;
 pub mod sealed_overlay;
 pub mod session_setup;
 pub mod sessions_pane;

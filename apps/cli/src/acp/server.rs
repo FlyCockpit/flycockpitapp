@@ -111,7 +111,7 @@ fn run_blocking(handle: &Handle) -> Result<()> {
                     let background_agents = background_agents_setting()?;
                     let client = handle
                         .block_on(super::acquire_ledger_owner(background_agents))
-                        .context("acquiring the socket daemon for ACP")?;
+                        .context("acquiring the wire daemon for ACP")?;
                     peer = Some(Peer::new(handle.clone(), client, background_agents));
                 }
                 let peer = peer.as_mut().expect("initialized ACP peer");

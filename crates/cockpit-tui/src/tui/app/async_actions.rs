@@ -1798,6 +1798,36 @@ impl App {
                 Ok(_) => self.pin_toast("pin: unexpected response".to_string()),
                 Err(e) => self.pin_toast(format!("pin: {e}")),
             },
+            AsyncActionKind::Internal("rules.review") => match result.payload {
+                Ok(AsyncActionPayload::RulesReview { session_id, rules }) => {
+                    self.apply_rules_review(session_id, rules);
+                }
+                Ok(_) => self.push_plain("/rules: unexpected response".to_string()),
+                Err(e) => self.push_plain(format!("/rules: {e}")),
+            },
+            AsyncActionKind::Internal("rules.set") => match result.payload {
+                Ok(AsyncActionPayload::RuleSet { session_id, rule }) => {
+                    self.apply_rule_set(session_id, rule)
+                }
+                Ok(_) => self.push_plain("/rule: unexpected response".to_string()),
+                Err(e) => self.push_plain(format!("/rule: {e}")),
+            },
+            AsyncActionKind::Internal("rules.remove") => match result.payload {
+                Ok(AsyncActionPayload::RuleRemoved {
+                    session_id,
+                    rule_id,
+                    removed,
+                }) => {
+                    self.apply_rule_removed(session_id, rule_id, removed);
+                }
+                Ok(_) => self.push_plain("/rules: unexpected response".to_string()),
+                Err(e) => self.push_plain(format!("/rules: {e}")),
+            },
+            AsyncActionKind::Internal("rules.promote") => match result.payload {
+                Ok(AsyncActionPayload::RulePromoteStarted) => self.apply_rule_promote_started(),
+                Ok(_) => self.push_plain("/rules: unexpected promote response".to_string()),
+                Err(e) => self.push_plain(format!("/rules: {e}")),
+            },
             AsyncActionKind::Internal("pins.unpin") => match result.payload {
                 Ok(AsyncActionPayload::PinUnpin {
                     session_id,
@@ -3168,7 +3198,7 @@ impl App {
         let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
-        let (project_id, parent) = pane.root_request();
+        let (project_id, parent, lineage_root) = pane.root_request();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
@@ -3176,8 +3206,13 @@ impl App {
             move || {
                 let endpoint = endpoint
                     .ok_or_else(|| "daemon endpoint unavailable for sessions.list".to_string())?;
-                crate::tui::agent_runner::list_sessions_blocking(&endpoint, project_id, parent)
-                    .map(AsyncActionPayload::Sessions)
+                crate::tui::agent_runner::list_sessions_blocking(
+                    &endpoint,
+                    project_id,
+                    parent,
+                    lineage_root,
+                )
+                .map(AsyncActionPayload::Sessions)
             },
         );
     }

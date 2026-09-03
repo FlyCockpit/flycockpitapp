@@ -375,6 +375,26 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "set_conversation_rule",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "remove_conversation_rule",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "list_conversation_rules",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "promote_conversation_rule",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
     // v10-only owner-remoted sealed-owner sensitive channel. Small, bounded
     // params. The apply request carries at most one MAX_SENSITIVE_FRAME_BYTES
     // (16 KiB) literal, well within the bounded inline payload cap.
@@ -475,6 +495,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "list_assistants",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "set_primary_assistant_soul_edit_mode",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1396,6 +1421,246 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "create_code_root_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "attach_existing_code_root_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "close_code_root_attachment_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "create_code_root_with_acp_ingress_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "attach_existing_code_root_with_acp_ingress_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "close_acp_code_root_attachment_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "discover_code_roots_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "read_code_root_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "read_code_root_deliveries_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "ack_code_root_deliveries_v1",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "resolve_code_root_interrupt_v1",
+        RemoteMessageClass::Approval,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "attach_knowledge_base_session",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "detach_knowledge_base_session",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "knowledge_dream_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "run_knowledge_dream",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "create_declared_sealed_action",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "cancel_leak_reveal",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mark_app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_storage_report",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "preview_storage_cleanup",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "execute_storage_cleanup",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "save_assistant_definition",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "read_assistant_inbox",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "acknowledge_assistant_inbox_human_read",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "read_agent_tree",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "read_agent_attention",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "resolve_agent_decision",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_session_setup_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_agent_effective_settings",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "apply_agent_session_override",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "resume_from_compaction",
+        RemoteMessageClass::ResumeWindow,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "apply_provider_mutation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "get_agent_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_agent_edit_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mutate_agent",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "begin_agent_editor_lease",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "complete_agent_editor_lease",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "get_agent_editor_lease_settlement",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_extended_config_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_image_sidecar_authority_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "create_image_sidecar_grant",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "revoke_image_sidecar_grant",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "apply_extended_config_patch",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "clean_managed_workspace_lease",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "list_guidance_proposals",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_guidance_enablement_trace",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "review_guidance_proposal",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "agent_installation_begin",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1573,6 +1838,21 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         "pins_with_text",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "conversation_rules",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "conversation_rule_changed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "conversation_rule_removed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
     ),
     row(
         "pin_state",
@@ -2217,6 +2497,211 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "knowledge_dream_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "knowledge_dream_runs",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_created",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_attached",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_attachment_closed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "code_root_with_acp_ingress_created",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_with_acp_ingress_attached",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "acp_code_root_attachment_closed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "code_roots_discovered",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_read",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_deliveries",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "code_root_deliveries_acked",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "code_root_interrupt_resolved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "assistant_inbox",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "agent_tree_page",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "agent_attention_page",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "agent_decision_steered",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "leak_reveal_cancelled",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_mutation_committed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "storage_report",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "storage_cleanup_preview",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "storage_cleanup_completed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "primary_assistant_soul_edit_mode",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "assistant_definition_saved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "session_setup_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "agent_effective_settings",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_session_override_outcome",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "extended_config_written",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "extended_config_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "image_sidecar_authority_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "image_sidecar_grant_mutated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "agent_edit_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "agent_mutated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_editor_lease_begun",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_editor_lease_completed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "guidance_proposals",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "guidance_enablement_trace",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "guidance_proposal_reviewed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Event` variant.
@@ -2348,6 +2833,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "user_message_retracted",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "user_message_removed",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2645,6 +3135,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "agent_tree_changed",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// The committed inventory of variants whose pre-migration encoded payload
@@ -2747,6 +3242,51 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Event, "gitignore_allow"),
     (RemoteMessageKind::Event, "terminal_output"),
     (RemoteMessageKind::Event, "terminal_clipboard"),
+    (RemoteMessageKind::Request, "create_code_root_v1"),
+    (RemoteMessageKind::Request, "attach_existing_code_root_v1"),
+    (
+        RemoteMessageKind::Request,
+        "create_code_root_with_acp_ingress_v1",
+    ),
+    (
+        RemoteMessageKind::Request,
+        "attach_existing_code_root_with_acp_ingress_v1",
+    ),
+    (RemoteMessageKind::Request, "resolve_code_root_interrupt_v1"),
+    (RemoteMessageKind::Request, "save_assistant_definition"),
+    (RemoteMessageKind::Request, "apply_provider_mutation"),
+    (RemoteMessageKind::Request, "mutate_agent"),
+    (RemoteMessageKind::Request, "complete_agent_editor_lease"),
+    (RemoteMessageKind::Request, "apply_extended_config_patch"),
+    (RemoteMessageKind::Response, "conversation_rules"),
+    (RemoteMessageKind::Response, "knowledge_dream_runs"),
+    (RemoteMessageKind::Response, "code_root_created"),
+    (RemoteMessageKind::Response, "code_root_attached"),
+    (
+        RemoteMessageKind::Response,
+        "code_root_with_acp_ingress_created",
+    ),
+    (
+        RemoteMessageKind::Response,
+        "code_root_with_acp_ingress_attached",
+    ),
+    (RemoteMessageKind::Response, "code_roots_discovered"),
+    (RemoteMessageKind::Response, "code_root_read"),
+    (RemoteMessageKind::Response, "code_root_deliveries"),
+    (RemoteMessageKind::Response, "assistant_inbox"),
+    (RemoteMessageKind::Response, "agent_tree_page"),
+    (RemoteMessageKind::Response, "agent_attention_page"),
+    (RemoteMessageKind::Response, "storage_report"),
+    (RemoteMessageKind::Response, "storage_cleanup_preview"),
+    (RemoteMessageKind::Response, "session_setup_snapshot"),
+    (RemoteMessageKind::Response, "extended_config_snapshot"),
+    (
+        RemoteMessageKind::Response,
+        "image_sidecar_authority_snapshot",
+    ),
+    (RemoteMessageKind::Response, "agent_inventory"),
+    (RemoteMessageKind::Response, "agent_edit_snapshot"),
+    (RemoteMessageKind::Response, "guidance_proposals"),
 ];
 
 fn lookup(
@@ -2890,9 +3430,9 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 234);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 157);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 84);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 287);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 201);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 86);
     }
 
     #[test]
@@ -2947,7 +3487,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 75);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 108);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

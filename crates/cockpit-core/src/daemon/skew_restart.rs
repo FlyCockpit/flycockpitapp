@@ -258,6 +258,13 @@ fn record_attempt(now: Instant) {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_skew_restart_cooldown_for_tests() {
+    *last_attempt_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

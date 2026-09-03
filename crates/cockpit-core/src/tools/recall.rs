@@ -87,11 +87,12 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     // cannot leave a prefix or suffix in a later continuation.
     let source = redactor.scrub(&content);
     let mut output = render_page(&source, path, args)?;
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &source,
-    )?;
+    )
+    .await?;
     Ok(output)
 }
 
@@ -109,7 +110,7 @@ pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             "only `cockpit://session/<short_id>/plan` is writable",
         ));
     };
-    if session_id != ctx.session.id {
+    if session_id != ctx.session.live_id() {
         return Err(invalid_input(
             "only the current session's plan pseudofile is writable",
         ));
@@ -190,11 +191,12 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         }
     };
     let source = output.content.model_text().to_string();
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &source,
-    )?;
+    )
+    .await?;
     Ok(Some(output))
 }
 
@@ -255,11 +257,12 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             || !append_capped_record(&mut out, &format!("{path}:{}: {text}\n", line + 1))
         {
             let mut output = truncated_search_output(out);
-            crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+            crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
                 ctx,
                 &mut output,
                 &content,
-            )?;
+            )
+            .await?;
             return Ok(Some(output));
         }
     }
@@ -269,11 +272,12 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     } else {
         out
     });
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &content,
-    )?;
+    )
+    .await?;
     Ok(Some(output))
 }
 
@@ -313,13 +317,12 @@ async fn parse(path: &str, ctx: &ToolCtx) -> Result<RecallPath> {
 async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
     let dream_scope = crate::tools::session_search::established_dream_read_scope(ctx)?;
     if id == ctx.session.short_id() {
-        if dream_scope
-            .as_ref()
-            .is_some_and(|scope| !scope.contains(&ctx.session.id))
-        {
+        if dream_scope.as_ref().is_some_and(|scope| {
+            !scope.contains(&ctx.session.id) && !scope.contains(&ctx.session.live_id())
+        }) {
             return Err(invalid_input(DREAM_SCOPE_DENIED));
         }
-        return Ok(ctx.session.id);
+        return Ok(ctx.session.live_id());
     }
     if let Ok(id) = Uuid::parse_str(id) {
         if dream_scope

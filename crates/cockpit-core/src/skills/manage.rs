@@ -44,16 +44,18 @@ type PreparedRootCapability = UnixPreparedSkillRoot;
 #[cfg(windows)]
 type PreparedRootCapability = WindowsPreparedSkillRoot;
 
-/// The retained identity of the prepared skill package that later
-/// mutations compare a freshly no-follow-opened package against.  Unix
-/// keeps the open descriptor; Windows keeps the volume-serial plus
-/// file-index value and closes the handle, because a Windows disposition
-/// delete completes only when the last handle closes — a retained live
-/// handle would block the tombstone deletion in the delete path.
-#[cfg(unix)]
+/// The retained pin on the prepared skill package that later mutations
+/// compare a freshly no-follow-opened package against: a live held handle on
+/// both platforms.  A live handle pins the object itself across the whole
+/// approval window — Unix keeps the inode referenced, and on Windows an open
+/// handle keeps the directory object (and its file index) from being deleted
+/// and recycled into a lookalike — so a hostile delete-and-recreate at the
+/// same spelling can never satisfy the later identity check the way a bare
+/// identity value could.  The Windows delete path releases this pin only
+/// after every identity check, immediately before the disposition delete
+/// that requires the last handle to be closed
+/// (see [`ManagedTarget::delete_package`]).
 type RetainedPackageIdentity = std::fs::File;
-#[cfg(windows)]
-type RetainedPackageIdentity = cockpit_host::private_fs::held_nt::HandleIdentity;
 
 /// What a no-follow entry probe reported beneath a held parent.  On Windows
 /// a reparse point (junction / symlink / mount point) is the twin of the
@@ -442,10 +444,13 @@ impl<'a> SkillMutationService<'a> {
     /// Execute a prepared mutation without awaiting.  Do not make this async:
     /// callers rely on that type-level boundary to ensure a cancellation or
     /// revision cannot win after an approved effect is claimed but before the
-    /// selected filesystem mutation begins.
+    /// selected filesystem mutation begins.  The plan is taken by mutable
+    /// reference because the delete path consumes the retained package pin
+    /// (see [`ManagedTarget::delete_package`]) exactly at its release point;
+    /// a plan whose pin is already consumed refuses a second application.
     pub(crate) fn apply_prepared(
         &self,
-        prepared: &PreparedSkillMutation,
+        prepared: &mut PreparedSkillMutation,
     ) -> Result<SkillMutationResult> {
         let result = match prepared {
             PreparedSkillMutation::Create(prepared) => self.create_prepared(prepared),
@@ -500,8 +505,8 @@ impl<'a> SkillMutationService<'a> {
     }
 
     pub async fn apply(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
-        let prepared = self.prepare(args).await?;
-        let result = self.apply_prepared(&prepared)?;
+        let mut prepared = self.prepare(args).await?;
+        let result = self.apply_prepared(&mut prepared)?;
         self.record_post_mutation(&prepared, &result).await;
         Ok(result)
     }
@@ -634,7 +639,7 @@ impl<'a> SkillMutationService<'a> {
         }))
     }
 
-    fn delete_prepared(&self, prepared: &PreparedDelete) -> Result<SkillMutationResult> {
+    fn delete_prepared(&self, prepared: &mut PreparedDelete) -> Result<SkillMutationResult> {
         prepared.target.delete_package(&prepared.tombstone)?;
         Ok(changed(format!(
             "Deleted skill `{}` after consolidation into `{}`",
@@ -723,26 +728,16 @@ impl<'a> SkillMutationService<'a> {
         let package_parent = writable_root.package_parent(&package)?;
         let package_name =
             component_buf_os(package.file_name().context("skill package has no name")?)?;
-        // Capture and retain the package descriptor while preflight is still
-        // under its native read fence.  The final mutation later compares a
-        // freshly no-follow-opened package to this identity before staging;
-        // an already-swapped package or symlink is rejected rather than
-        // silently receiving a prepared operation.  On Windows only the
-        // stable identity is retained (see `RetainedPackageIdentity`).
-        #[cfg(unix)]
+        // Capture and retain the live package handle while preflight is
+        // still under its native read fence.  The handle pins the package
+        // object itself for the whole approval window on both platforms, so
+        // a hostile delete-and-recreate at the same spelling (which on NTFS
+        // could otherwise recycle the file index and spoof an identity
+        // comparison) is rejected by the later check against this pin; an
+        // already-swapped package or symlink is likewise rejected rather
+        // than silently receiving a prepared operation.
         let package_directory = open_directory_child(&package_parent, &package_name)
             .with_context(|| format!("opening prepared skill package {}", package.display()))?;
-        #[cfg(windows)]
-        let package_directory = {
-            let held = open_directory_child(&package_parent, &package_name)
-                .with_context(|| format!("opening prepared skill package {}", package.display()))?;
-            cockpit_host::private_fs::held_nt::handle_identity(&held).with_context(|| {
-                format!(
-                    "reading prepared skill package identity {}",
-                    package.display()
-                )
-            })?
-        };
         Ok(ManagedTarget {
             skill,
             package,
@@ -750,7 +745,7 @@ impl<'a> SkillMutationService<'a> {
             pinned,
             package_parent,
             package_name,
-            package_directory,
+            package_directory: Some(package_directory),
         })
     }
 
@@ -1153,10 +1148,14 @@ impl ManagedTarget {
         // parent. This rejects an ancestor/root replacement even though that
         // replacement cannot redirect the descriptor-rooted operation.
         let _root = self.writable_root.capability.open_existing_root()?;
+        let retained = self
+            .package_directory
+            .as_ref()
+            .context("prepared skill package pin was already consumed; refusing re-application")?;
         let current = open_directory_child(&self.package_parent, &self.package_name)
             .with_context(|| format!("opening current skill package {}", self.package.display()))?;
         ensure!(
-            matches_retained_package(&current, &self.package_directory)?,
+            same_directory_identity(&current, retained)?,
             "skill package changed after preparation; refusing mutation"
         );
         Ok(current)
@@ -1191,7 +1190,7 @@ impl ManagedTarget {
         Ok((parent, leaf))
     }
 
-    fn delete_package(&self, tombstone: &str) -> Result<()> {
+    fn delete_package(&mut self, tombstone: &str) -> Result<()> {
         let package = self.open_verified_package()?;
         let tombstone = component_buf(tombstone)?;
         move_noreplace(
@@ -1231,12 +1230,17 @@ impl ManagedTarget {
             );
             return Err(error).context("removing staged skill package");
         }
-        // Release the handles onto the staged package before removing the
+        // Release every handle onto the staged package before removing the
         // entry: a Windows disposition delete completes only once the last
-        // handle to the object closes.  Unix does not need this, but closing
-        // early changes nothing there.
+        // handle to the object closes.  That includes the retained prepared
+        // pin, which kept the package object (and its file index) from being
+        // recycled across the approval window — it is released only here,
+        // after every identity check has passed, and its absence is what
+        // makes a second application of the same plan fail closed.  Unix
+        // does not need the early close, but it changes nothing there.
         drop(staged);
         drop(package);
+        drop(self.package_directory.take());
         remove_dir_child(&self.package_parent, &tombstone)
             .context("removing empty staged skill package")?;
         Ok(())
@@ -1253,10 +1257,7 @@ impl ManagedTarget {
         // support-parent descriptor below is the actual authority for every
         // rename/unlink, so a later `references` symlink swap cannot redirect
         // either staging or deletion.
-        #[cfg(unix)]
         let _package = self.open_verified_package()?;
-        #[cfg(windows)]
-        let package = self.open_verified_package()?;
         validate_directory_bindings(&parent.bindings)?;
         let leaf = component_buf(leaf)?;
         let staged = component_buf(staged)?;
@@ -1281,18 +1282,17 @@ impl ManagedTarget {
             let _ = move_noreplace(&parent.directory, &staged, &parent.directory, &leaf);
             return Err(error).context("removing staged support file");
         }
-        // Unix writes provenance through the retained prepared package
-        // descriptor.  Windows retains only the package identity (a live
-        // handle would block the delete path), so the just-verified current
-        // package handle is the write authority there.
-        #[cfg(unix)]
-        {
-            atomic_write_at(&self.package_directory, PROVENANCE_FILE, provenance)
-        }
-        #[cfg(windows)]
-        {
-            atomic_write_at(&package, PROVENANCE_FILE, provenance)
-        }
+        // Provenance is written through the retained prepared package pin on
+        // both platforms: the pin is the handle that identity checks already
+        // proved is the approved package object, and a remove-file plan never
+        // releases it (no package-level disposition happens on this path).
+        atomic_write_at(
+            self.package_directory
+                .as_ref()
+                .context("prepared skill package pin was already consumed")?,
+            PROVENANCE_FILE,
+            provenance,
+        )
     }
 }
 
@@ -1644,25 +1644,6 @@ fn same_directory_identity(left: &std::fs::File, right: &std::fs::File) -> Resul
         .metadata()
         .context("reading prepared skill directory identity")?;
     Ok(left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino())
-}
-
-/// Compare a freshly no-follow-opened package against the retained prepared
-/// identity (see [`RetainedPackageIdentity`]).
-#[cfg(unix)]
-fn matches_retained_package(current: &std::fs::File, retained: &std::fs::File) -> Result<bool> {
-    same_directory_identity(current, retained)
-}
-
-#[cfg(windows)]
-fn matches_retained_package(
-    current: &std::fs::File,
-    retained: &cockpit_host::private_fs::held_nt::HandleIdentity,
-) -> Result<bool> {
-    let directory = cockpit_host::private_fs::held_nt::handle_is_directory(current)
-        .context("reading held skill directory identity")?;
-    let identity = cockpit_host::private_fs::held_nt::handle_identity(current)
-        .context("reading prepared skill directory identity")?;
-    Ok(directory && identity == *retained)
 }
 
 #[cfg(windows)]
@@ -2080,7 +2061,11 @@ struct ManagedTarget {
     pinned: bool,
     package_parent: std::fs::File,
     package_name: SkillComponentBuf,
-    package_directory: RetainedPackageIdentity,
+    /// Live pin on the prepared package object (see
+    /// [`RetainedPackageIdentity`]).  `None` only after the delete path
+    /// released it immediately before the final disposition delete; the
+    /// absence of the pin makes a second application fail closed.
+    package_directory: Option<RetainedPackageIdentity>,
 }
 
 fn required<'a>(value: &'a Option<String>, message: &str) -> Result<&'a str> {
@@ -2625,13 +2610,13 @@ mod tests {
             let svc = service(tmp.path(), &cfg);
             svc.apply(&create_args("existing")).await.unwrap();
 
-            let prepared = svc.prepare(&create_args("must-not-escape")).await.unwrap();
+            let mut prepared = svc.prepare(&create_args("must-not-escape")).await.unwrap();
             let outside = tmp.path().join("outside");
             std::fs::create_dir_all(outside.join("skills")).unwrap();
             std::fs::rename(&container, tmp.path().join("container-held")).unwrap();
             symlink(&outside, &container).unwrap();
 
-            let error = svc.apply_prepared(&prepared).unwrap_err();
+            let error = svc.apply_prepared(&mut prepared).unwrap_err();
             assert!(
                 error.to_string().contains("skill root changed")
                     || error.to_string().contains("refusing mutation"),
@@ -2675,7 +2660,7 @@ mod tests {
             delete.description = None;
             delete.content = None;
             delete.absorbed_into = Some("umbrella".to_string());
-            let prepared = svc.prepare(&delete).await.unwrap();
+            let mut prepared = svc.prepare(&delete).await.unwrap();
 
             let outside = tmp.path().join("outside-specific");
             std::fs::create_dir_all(&outside).unwrap();
@@ -2683,7 +2668,7 @@ mod tests {
             std::fs::rename(root.join("specific"), root.join("specific-held")).unwrap();
             symlink(&outside, root.join("specific")).unwrap();
 
-            assert!(svc.apply_prepared(&prepared).is_err());
+            assert!(svc.apply_prepared(&mut prepared).is_err());
             assert_eq!(
                 std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
                 "outside must remain"
@@ -2717,7 +2702,7 @@ mod tests {
             remove.description = None;
             remove.content = None;
             remove.path = Some("references/old.md".to_string());
-            let prepared = svc.prepare(&remove).await.unwrap();
+            let mut prepared = svc.prepare(&remove).await.unwrap();
 
             let outside = tmp.path().join("outside-references");
             std::fs::create_dir_all(&outside).unwrap();
@@ -2725,7 +2710,7 @@ mod tests {
             std::fs::rename(package.join("references"), package.join("references-held")).unwrap();
             symlink(&outside, package.join("references")).unwrap();
 
-            assert!(svc.apply_prepared(&prepared).is_err());
+            assert!(svc.apply_prepared(&mut prepared).is_err());
             assert_eq!(
                 std::fs::read_to_string(outside.join("old.md")).unwrap(),
                 "outside must remain"
@@ -2740,7 +2725,11 @@ mod tests {
 
     // Windows twins of the Unix reparse/replacement swap proofs above.  A
     // directory reparse point (junction/symlink) requires the symlink
-    // privilege (or Developer Mode); hosts without it skip rather than fail.
+    // privilege (or Developer Mode).  Creating one is part of the fixture,
+    // not an optional decoration: a host without the privilege fails these
+    // tests loudly with remediation instructions instead of skipping green,
+    // because a silent skip would let the no-reparse discipline regress
+    // unnoticed wherever the fixture cannot be built.
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_prepared_create_rejects_a_root_ancestor_reparse_swap() {
@@ -2758,17 +2747,16 @@ mod tests {
             let svc = service(tmp.path(), &cfg);
             svc.apply(&create_args("existing")).await.unwrap();
 
-            let prepared = svc.prepare(&create_args("must-not-escape")).await.unwrap();
+            let mut prepared = svc.prepare(&create_args("must-not-escape")).await.unwrap();
             let outside = tmp.path().join("outside");
             std::fs::create_dir_all(outside.join("skills")).unwrap();
             std::fs::rename(&container, tmp.path().join("container-held")).unwrap();
-            if symlink_dir(&outside, &container).is_err() {
-                // No symlink privilege on this host; the no-reparse open
-                // discipline is still covered by the held_nt unit tests.
-                return;
-            }
+            symlink_dir(&outside, &container).expect(
+                "building the reparse-swap fixture requires the symlink privilege; \
+                 enable Developer Mode or run the tests as administrator",
+            );
 
-            let error = svc.apply_prepared(&prepared).unwrap_err();
+            let error = svc.apply_prepared(&mut prepared).unwrap_err();
             assert!(
                 error.to_string().contains("skill root changed")
                     || error.to_string().contains("refusing mutation"),
@@ -2812,17 +2800,18 @@ mod tests {
             delete.description = None;
             delete.content = None;
             delete.absorbed_into = Some("umbrella".to_string());
-            let prepared = svc.prepare(&delete).await.unwrap();
+            let mut prepared = svc.prepare(&delete).await.unwrap();
 
             let outside = tmp.path().join("outside-specific");
             std::fs::create_dir_all(&outside).unwrap();
             std::fs::write(outside.join("SKILL.md"), "outside must remain").unwrap();
             std::fs::rename(root.join("specific"), root.join("specific-held")).unwrap();
-            if symlink_dir(&outside, root.join("specific")).is_err() {
-                return;
-            }
+            symlink_dir(&outside, root.join("specific")).expect(
+                "building the reparse-swap fixture requires the symlink privilege; \
+                 enable Developer Mode or run the tests as administrator",
+            );
 
-            assert!(svc.apply_prepared(&prepared).is_err());
+            assert!(svc.apply_prepared(&mut prepared).is_err());
             assert_eq!(
                 std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
                 "outside must remain"
@@ -2856,17 +2845,18 @@ mod tests {
             remove.description = None;
             remove.content = None;
             remove.path = Some("references/old.md".to_string());
-            let prepared = svc.prepare(&remove).await.unwrap();
+            let mut prepared = svc.prepare(&remove).await.unwrap();
 
             let outside = tmp.path().join("outside-references");
             std::fs::create_dir_all(&outside).unwrap();
             std::fs::write(outside.join("old.md"), "outside must remain").unwrap();
             std::fs::rename(package.join("references"), package.join("references-held")).unwrap();
-            if symlink_dir(&outside, package.join("references")).is_err() {
-                return;
-            }
+            symlink_dir(&outside, package.join("references")).expect(
+                "building the reparse-swap fixture requires the symlink privilege; \
+                 enable Developer Mode or run the tests as administrator",
+            );
 
-            assert!(svc.apply_prepared(&prepared).is_err());
+            assert!(svc.apply_prepared(&mut prepared).is_err());
             assert_eq!(
                 std::fs::read_to_string(outside.join("old.md")).unwrap(),
                 "outside must remain"

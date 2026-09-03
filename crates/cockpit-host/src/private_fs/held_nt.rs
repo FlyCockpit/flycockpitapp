@@ -877,17 +877,22 @@ mod tests {
         assert!(open_dir_child(&root, std::ffi::OsStr::new("leaf")).is_err());
         assert!(open_file_child(&root, std::ffi::OsStr::new("missing")).is_err());
         std::fs::create_dir(temp.path().join("target")).unwrap();
-        if std::os::windows::fs::symlink_dir(temp.path().join("target"), temp.path().join("alias"))
-            .is_ok()
-        {
-            assert!(open_dir_child(&root, std::ffi::OsStr::new("alias")).is_err());
-            assert_eq!(
-                entry_kind_nofollow(&root, std::ffi::OsStr::new("alias"))
-                    .unwrap()
-                    .unwrap(),
-                EntryKind::ReparsePoint
+        // Creating the reparse point is part of the fixture, not optional
+        // decoration: a host without the symlink privilege fails loudly with
+        // remediation instructions instead of skipping the reparse
+        // assertions green.
+        std::os::windows::fs::symlink_dir(temp.path().join("target"), temp.path().join("alias"))
+            .expect(
+                "building the reparse fixture requires the symlink privilege; \
+                 enable Developer Mode or run the tests as administrator",
             );
-        }
+        assert!(open_dir_child(&root, std::ffi::OsStr::new("alias")).is_err());
+        assert_eq!(
+            entry_kind_nofollow(&root, std::ffi::OsStr::new("alias"))
+                .unwrap()
+                .unwrap(),
+            EntryKind::ReparsePoint
+        );
     }
 
     #[test]

@@ -3832,7 +3832,7 @@ async fn inject_volatile_context(
     if is_root {
         let listing = session
             .db
-            .list_active_conversation_rules(session.compaction_lineage_root())
+            .list_conversation_rules(session.compaction_lineage_root())
             .await;
         crate::conversation_rules::inject_conversation_rules_from_listing(
             history,

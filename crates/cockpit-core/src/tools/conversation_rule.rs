@@ -72,7 +72,7 @@ impl Tool for SetConversationRuleTool {
             "type": "object",
             "properties": {
                 "text": { "type": "string", "description": "Required advisory directive; injected verbatim into later windows" },
-                "rule_id": { "type": "string", "description": "Optional UUID of an existing active rule to edit" },
+                "rule_id": { "type": "string", "description": "Optional UUID of an existing rule to edit" },
                 "source_trust": { "type": "string", "description": "trusted unless derived from untrusted tool output", "enum": ["trusted", "untrusted"] }
             },
             "required": ["text"]
@@ -130,7 +130,7 @@ impl Tool for ListConversationRulesTool {
 
     fn verbose_description(&self) -> Option<String> {
         Some(
-            "List active conversation rules on this lineage with id, attribution, trust, and text."
+            "List conversation rules on this lineage with id, attribution, trust, and text."
                 .to_string(),
         )
     }
@@ -143,7 +143,7 @@ impl Tool for ListConversationRulesTool {
         Some(serde_json::json!({
             "type": "object",
             "properties": {},
-            "description": "No arguments; returns id+text for each active rule"
+            "description": "No arguments; returns id+text for each rule"
         }))
     }
 
@@ -155,7 +155,7 @@ impl Tool for ListConversationRulesTool {
         let rules = ctx
             .session
             .db
-            .list_active_conversation_rules(ctx.session.live_id())
+            .list_conversation_rules(ctx.session.live_id())
             .await?;
         if rules.is_empty() {
             return Ok(ToolOutput::text("No active conversation rules."));
@@ -192,7 +192,7 @@ impl Tool for RemoveConversationRuleTool {
     }
 
     fn verbose_description(&self) -> Option<String> {
-        Some("Deactivate a conversation rule so it is no longer injected. The user can also revoke rules in the UI.".to_string())
+        Some("Remove a conversation rule so it is no longer injected. The user can also revoke rules in the UI.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -234,7 +234,7 @@ impl Tool for RemoveConversationRuleTool {
             )))
         } else {
             Ok(ToolOutput::text(format!(
-                "No active conversation rule `{rule_id}` on this lineage."
+                "No conversation rule `{rule_id}` on this lineage."
             )))
         }
     }
@@ -264,7 +264,7 @@ mod tests {
         let rules = ctx
             .session
             .db
-            .list_active_conversation_rules(ctx.session.live_id())
+            .list_conversation_rules(ctx.session.live_id())
             .await
             .unwrap();
         assert_eq!(rules.len(), 1);
@@ -281,7 +281,7 @@ mod tests {
         assert!(
             ctx.session
                 .db
-                .list_active_conversation_rules(ctx.session.live_id())
+                .list_conversation_rules(ctx.session.live_id())
                 .await
                 .unwrap()
                 .is_empty()
@@ -322,7 +322,7 @@ mod tests {
         let rules = ctx
             .session
             .db
-            .list_active_conversation_rules(ctx.session.live_id())
+            .list_conversation_rules(ctx.session.live_id())
             .await
             .unwrap();
         assert_eq!(rules.len(), 1);

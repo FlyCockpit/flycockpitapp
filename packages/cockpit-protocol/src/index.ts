@@ -3140,7 +3140,6 @@ export const conversationRuleSchema = z
     created_by: conversationRuleCreatedBySchema,
     source_trust: conversationRuleSourceTrustSchema,
     created_at_unix_ms: safeI64NumberSchema,
-    active: z.boolean(),
   })
   .strict();
 export type ConversationRule = z.infer<typeof conversationRuleSchema>;

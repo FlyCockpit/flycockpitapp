@@ -418,12 +418,6 @@ pub enum Response {
     ConversationRuleRemoved {
         removed: bool,
     },
-    ConversationRulePromoted {
-        rule_id: Uuid,
-        target_path: String,
-        write_scope: String,
-        report: String,
-    },
     // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
     // The plaintext literal appears ONLY on `SealedOwnerOperationApplied` for a
     // recover success (`revealed_literal`); every other response below is
@@ -1692,7 +1686,6 @@ macro_rules! response_variants {
             (Response::ConversationRules { .. }, "conversation_rules");
             (Response::ConversationRuleChanged { .. }, "conversation_rule_changed");
             (Response::ConversationRuleRemoved { .. }, "conversation_rule_removed");
-            (Response::ConversationRulePromoted { .. }, "conversation_rule_promoted");
             (Response::SealedOwnerOperationBegun { .. }, "sealed_owner_operation_begun");
             (Response::SealedOwnerOperationApplied { .. }, "sealed_owner_operation_applied");
             (Response::SealedOwnerOperationCancelled { .. }, "sealed_owner_operation_cancelled");

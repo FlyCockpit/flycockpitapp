@@ -3958,13 +3958,12 @@ CREATE TABLE conversation_rules (
     created_by TEXT NOT NULL CHECK (created_by IN ('user', 'agent')),
     source_trust TEXT NOT NULL CHECK (source_trust IN ('trusted', 'untrusted')),
     created_at_unix_ms INTEGER NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     FOREIGN KEY (lineage_id) REFERENCES sessions(session_id)
         ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
-CREATE INDEX conversation_rules_lineage_active_idx
-    ON conversation_rules (lineage_id, active, created_at_unix_ms);
+CREATE INDEX conversation_rules_lineage_idx
+    ON conversation_rules (lineage_id, created_at_unix_ms);
 
 -- ---- prune_ledger --------------------------------------------------------------------
 -- Session resume prune-ledger: resuming must be a TRUE CONTINUATION.

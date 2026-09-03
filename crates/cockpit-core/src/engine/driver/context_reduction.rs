@@ -1580,9 +1580,6 @@ impl Driver {
         let rule = crate::conversation_rules::load_rule_for_session(&self.session, rule_id)
             .await
             .map_err(|error| error.to_string())?;
-        if !rule.active {
-            return Err(format!("conversation rule {rule_id} is not active"));
-        }
         let target = crate::conversation_rules::resolve_instructions_target(&self.session)
             .await
             .map_err(|error| error.to_string())?;
@@ -1814,14 +1811,14 @@ impl Driver {
         let conversation_rules = match self
             .session
             .db
-            .list_active_conversation_rules(self.session.compaction_lineage_root())
+            .list_conversation_rules(self.session.compaction_lineage_root())
             .await
         {
             Ok(rules) => rules,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "conversation rules: listing active rules failed; aborting compact"
+                    "conversation rules: listing rules failed; aborting compact"
                 );
                 return Err(PrepareCompactionError::ConversationRules(error.to_string()));
             }

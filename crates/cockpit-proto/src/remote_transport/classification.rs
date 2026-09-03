@@ -1610,11 +1610,6 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "conversation_rule_promoted",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::TruncatedByCap,
-    ),
-    row(
         "pin_state",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2931,7 +2926,7 @@ mod tests {
 
         // Exact table sizes, so a silent shrink is caught.
         assert_eq!(REQUEST_CLASSIFICATION.len(), 238);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 161);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 160);
         assert_eq!(EVENT_CLASSIFICATION.len(), 84);
     }
 

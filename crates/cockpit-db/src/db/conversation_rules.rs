@@ -16,7 +16,7 @@ use crate::db::session_log::now_ms;
 
 /// Maximum UTF-8 byte length of a rule body.
 pub const MAX_CONVERSATION_RULE_TEXT_BYTES: usize = 4000;
-/// Maximum number of active rules on one conversation lineage.
+/// Maximum number of rules on one conversation lineage.
 pub const MAX_CONVERSATION_RULES_PER_LINEAGE: usize = 32;
 
 /// Who authored the rule. Attribution is user-visible; it is not an
@@ -80,14 +80,13 @@ pub struct ConversationRule {
     pub created_by: ConversationRuleCreatedBy,
     pub source_trust: ConversationRuleSourceTrust,
     pub created_at_unix_ms: i64,
-    pub active: bool,
 }
 
 impl Db {
     /// Insert or replace a conversation rule on the lineage that contains
     /// `session_id`. `rule_id = None` creates a new row. `Some` replaces the
-    /// text of an existing active rule and persists the replacement's
-    /// `created_by` and `source_trust` (the current text's provenance).
+    /// text of an existing rule and persists the replacement's `created_by`
+    /// and `source_trust` (the current text's provenance).
     pub async fn set_conversation_rule(
         &self,
         session_id: Uuid,
@@ -156,34 +155,11 @@ impl Db {
         }
     }
 
-    /// Active rules for the lineage that contains `session_id`, oldest first.
-    pub async fn list_active_conversation_rules(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<ConversationRule>> {
-        self.read(move |conn| list_rules_conn(conn, session_id, true))
-            .await
-    }
-
-    pub fn list_active_conversation_rules_conn(
-        conn: &rusqlite::Connection,
-        session_id: Uuid,
-    ) -> Result<Vec<ConversationRule>> {
-        list_rules_conn(conn, session_id, true)
-    }
-
-    /// All remaining rules for the lineage, oldest first. Revoke hard-deletes,
-    /// so this is the same set as the active list after a successful remove.
+    /// Remaining rules for the lineage that contains `session_id`, oldest
+    /// first. Revoke hard-deletes, so this is the live set.
     pub async fn list_conversation_rules(&self, session_id: Uuid) -> Result<Vec<ConversationRule>> {
-        self.read(move |conn| list_rules_conn(conn, session_id, false))
+        self.read(move |conn| list_rules_conn(conn, session_id))
             .await
-    }
-
-    pub fn list_conversation_rules_conn(
-        conn: &rusqlite::Connection,
-        session_id: Uuid,
-    ) -> Result<Vec<ConversationRule>> {
-        list_rules_conn(conn, session_id, false)
     }
 
     /// Load one rule by id if it belongs to the lineage of `session_id`.
@@ -197,7 +173,7 @@ impl Db {
     }
 
     /// Hard-delete. Returns `true` when a row on this lineage was removed.
-    /// Revoked rules must not accumulate: the 32-active cap only bounds live
+    /// Revoked rules must not accumulate: the 32-rule cap only bounds live
     /// rows, and the list RPC returns the full lineage set in one response.
     pub async fn remove_conversation_rule(&self, session_id: Uuid, rule_id: Uuid) -> Result<bool> {
         self.transaction(move |conn| remove_rule_conn(conn, session_id, rule_id))
@@ -238,22 +214,22 @@ fn insert_rule_conn(
     source_trust: &str,
     created_at_unix_ms: i64,
 ) -> Result<ConversationRule> {
-    let active: i64 = conn
+    let live: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM conversation_rules
-              WHERE lineage_id = ?1 AND active = 1",
+              WHERE lineage_id = ?1",
             [lineage_id.to_string()],
             |row| row.get(0),
         )
         .context("counting conversation rules")?;
-    if active as usize >= MAX_CONVERSATION_RULES_PER_LINEAGE {
-        bail!("conversation lineage already has {MAX_CONVERSATION_RULES_PER_LINEAGE} active rules");
+    if live as usize >= MAX_CONVERSATION_RULES_PER_LINEAGE {
+        bail!("conversation lineage already has {MAX_CONVERSATION_RULES_PER_LINEAGE} rules");
     }
     let rule_id = Uuid::now_v7();
     conn.execute(
         "INSERT INTO conversation_rules
-            (rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms, active)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            (rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             rule_id.to_string(),
             lineage_id.to_string(),
@@ -271,7 +247,6 @@ fn insert_rule_conn(
         created_by: ConversationRuleCreatedBy::parse(created_by)?,
         source_trust: ConversationRuleSourceTrust::parse(source_trust)?,
         created_at_unix_ms,
-        active: true,
     })
 }
 
@@ -290,7 +265,7 @@ fn update_rule_text_conn(
         .execute(
             "UPDATE conversation_rules
                 SET text = ?1, created_by = ?2, source_trust = ?3
-              WHERE rule_id = ?4 AND lineage_id = ?5 AND active = 1",
+              WHERE rule_id = ?4 AND lineage_id = ?5",
             params![
                 text,
                 created_by,
@@ -301,7 +276,7 @@ fn update_rule_text_conn(
         )
         .context("updating conversation rule")?;
     if n != 1 {
-        bail!("conversation rule {rule_id} is not an active rule on this lineage");
+        bail!("conversation rule {rule_id} is not a rule on this lineage");
     }
     get_rule_by_id_conn(conn, rule_id)?
         .ok_or_else(|| anyhow::anyhow!("conversation rule {rule_id} missing after update"))
@@ -319,24 +294,16 @@ fn remove_rule_conn(conn: &rusqlite::Connection, session_id: Uuid, rule_id: Uuid
     Ok(n == 1)
 }
 
-fn list_rules_conn(
-    conn: &rusqlite::Connection,
-    session_id: Uuid,
-    active_only: bool,
-) -> Result<Vec<ConversationRule>> {
+fn list_rules_conn(conn: &rusqlite::Connection, session_id: Uuid) -> Result<Vec<ConversationRule>> {
     let lineage_id = lineage_id_conn(conn, session_id)?;
-    let sql = if active_only {
-        "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms, active
-           FROM conversation_rules
-          WHERE lineage_id = ?1 AND active = 1
-          ORDER BY created_at_unix_ms ASC, rule_id ASC"
-    } else {
-        "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms, active
-           FROM conversation_rules
-          WHERE lineage_id = ?1
-          ORDER BY created_at_unix_ms ASC, rule_id ASC"
-    };
-    let mut stmt = conn.prepare(sql).context("preparing conversation rules")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms
+               FROM conversation_rules
+              WHERE lineage_id = ?1
+              ORDER BY created_at_unix_ms ASC, rule_id ASC",
+        )
+        .context("preparing conversation rules")?;
     let rows = stmt
         .query_map([lineage_id.to_string()], decode_rule_row)
         .context("querying conversation rules")?;
@@ -355,7 +322,7 @@ fn get_rule_conn(
     let lineage_id = lineage_id_conn(conn, session_id)?;
     let mut stmt = conn
         .prepare(
-            "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms, active
+            "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms
                FROM conversation_rules
               WHERE rule_id = ?1 AND lineage_id = ?2",
         )
@@ -376,7 +343,7 @@ fn get_rule_by_id_conn(
 ) -> Result<Option<ConversationRule>> {
     let mut stmt = conn
         .prepare(
-            "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms, active
+            "SELECT rule_id, lineage_id, text, created_by, source_trust, created_at_unix_ms
                FROM conversation_rules
               WHERE rule_id = ?1",
         )
@@ -395,7 +362,6 @@ fn decode_rule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversat
     let created_by: String = row.get(3)?;
     let source_trust: String = row.get(4)?;
     let created_at_unix_ms: i64 = row.get(5)?;
-    let active: i64 = row.get(6)?;
     Ok((|| {
         Ok(ConversationRule {
             rule_id: Uuid::parse_str(&rule_id).context("parsing rule_id")?,
@@ -404,7 +370,6 @@ fn decode_rule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversat
             created_by: ConversationRuleCreatedBy::parse(&created_by)?,
             source_trust: ConversationRuleSourceTrust::parse(&source_trust)?,
             created_at_unix_ms,
-            active: active != 0,
         })
     })())
 }
@@ -452,20 +417,16 @@ mod tests {
             .unwrap();
         assert_eq!(created.text, "prefer pnpm, not npm");
         assert_eq!(created.created_by, ConversationRuleCreatedBy::Agent);
-        assert!(created.active);
         assert_eq!(created.lineage_id, root.compaction_lineage_root());
 
         let on_successor = db
-            .list_active_conversation_rules(successor.session_id)
+            .list_conversation_rules(successor.session_id)
             .await
             .unwrap();
         assert_eq!(on_successor.len(), 1);
         assert_eq!(on_successor[0].rule_id, created.rule_id);
 
-        let on_fork = db
-            .list_active_conversation_rules(fork.session_id)
-            .await
-            .unwrap();
+        let on_fork = db.list_conversation_rules(fork.session_id).await.unwrap();
         assert!(
             on_fork.is_empty(),
             "forks mint their own lineage and must not inherit rules"
@@ -520,15 +481,9 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let remaining = db.list_conversation_rules(root.session_id).await.unwrap();
         assert!(
-            db.list_active_conversation_rules(root.session_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let all = db.list_conversation_rules(root.session_id).await.unwrap();
-        assert!(
-            all.is_empty(),
+            remaining.is_empty(),
             "revoke must hard-delete; revoked rows must not accumulate"
         );
         assert!(
@@ -627,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caps_active_rules_per_lineage() {
+    async fn caps_rules_per_lineage() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         for i in 0..MAX_CONVERSATION_RULES_PER_LINEAGE {
@@ -658,10 +613,7 @@ mod tests {
     async fn unknown_session_and_missing_rule_fail_closed() {
         let db = Db::open_in_memory().unwrap();
         let missing = Uuid::now_v7();
-        let err = db
-            .list_active_conversation_rules(missing)
-            .await
-            .unwrap_err();
+        let err = db.list_conversation_rules(missing).await.unwrap_err();
         assert!(format!("{err:#}").contains("unknown session"));
 
         let session = db.create_session("p", "/x", "Build").await.unwrap();
@@ -675,6 +627,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("not an active rule"));
+        assert!(format!("{err:#}").contains("not a rule on this lineage"));
     }
 }

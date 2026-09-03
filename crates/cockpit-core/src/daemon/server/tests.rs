@@ -824,7 +824,7 @@ async fn conversation_rule_rpc_parity_with_direct_db_calls() {
     ));
     let listed = ctx
         .db
-        .list_active_conversation_rules(session.session_id)
+        .list_conversation_rules(session.session_id)
         .await
         .unwrap();
     assert!(listed.is_empty());

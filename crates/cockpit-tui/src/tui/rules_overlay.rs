@@ -68,15 +68,12 @@ impl RulesReview {
                 cockpit_proto::ConversationRuleCreatedBy::Agent => "agent",
             };
             let trust = rule.source_trust.as_str();
-            let status = if rule.active { "" } else { " (revoked)" };
             let preview = preview_text(&rule.text, width.saturating_sub(18) as usize);
-            let row = format!(" [ ] {who}/{trust}{status} {preview}");
+            let row = format!(" [ ] {who}/{trust} {preview}");
             let style = if i == self.cursor {
                 Style::default()
                     .fg(RULES_YELLOW)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else if !rule.active {
-                Style::default().fg(Color::Indexed(244))
             } else {
                 Style::default()
             };
@@ -119,7 +116,6 @@ mod tests {
             created_by: by,
             source_trust: ConversationRuleSourceTrust::Trusted,
             created_at_unix_ms: 1,
-            active: true,
         }
     }
 

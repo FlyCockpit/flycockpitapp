@@ -53,7 +53,7 @@
   "counts": {
     "event": 84,
     "request": 239,
-    "response": 161
+    "response": 160
   },
   "messages": {
     "event": [
@@ -2202,12 +2202,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "conversation_rule_removed"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "truncated_by_cap",
-        "lane": "interactive",
-        "tag": "conversation_rule_promoted"
       },
       {
         "class": "bounded_request_response",

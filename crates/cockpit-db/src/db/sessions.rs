@@ -2577,6 +2577,116 @@ impl Db {
             params![session_id.to_string(), predecessor_session_id.to_string()],
         )
         .context("copying plan document onto compaction successor")?;
+        conn.execute(
+            "UPDATE task_todos SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving task todos onto compaction successor")?;
+        conn.execute(
+            "UPDATE task_todo_notes SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving task todo notes onto compaction successor")?;
+        conn.execute(
+            "UPDATE task_todo_assignments SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving task todo assignments onto compaction successor")?;
+        conn.execute(
+            "UPDATE task_delegation_jobs SET parent_session_id = ?1 WHERE parent_session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving task delegation jobs onto compaction successor")?;
+        conn.execute(
+            "UPDATE task_delegation_payloads SET parent_session_id = ?1 WHERE parent_session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving task delegation payloads onto compaction successor")?;
+        conn.execute(
+            "UPDATE sealed_value_records SET scope_key = ?1 WHERE scope = 'session' AND scope_key = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving session-scoped sealed records onto compaction successor")?;
+        {
+            let grants: Vec<(
+                String,
+                i64,
+                String,
+                i64,
+                String,
+                i64,
+                i64,
+                i64,
+                Option<i64>,
+                Option<i64>,
+            )> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT record_id, value_version, project_key, session_generation,
+                                action_id, action_revision, use_epoch, issued_at_ms,
+                                expires_at_ms, revoked_at_ms
+                           FROM sealed_action_grants
+                          WHERE session_id = ?1",
+                    )
+                    .context("listing predecessor sealed action grants")?;
+                stmt.query_map(params![predecessor_session_id.to_string()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                })
+                .context("querying predecessor sealed action grants")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("decoding predecessor sealed action grants")?
+            };
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO sealed_action_grants (
+                        grant_id, record_id, value_version, project_key, session_id,
+                        session_generation, action_id, action_revision, use_epoch,
+                        issued_at_ms, expires_at_ms, revoked_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                )
+                .context("preparing successor sealed action grant insert")?;
+            for (
+                record_id,
+                value_version,
+                project_key,
+                session_generation,
+                action_id,
+                action_revision,
+                use_epoch,
+                issued_at_ms,
+                expires_at_ms,
+                revoked_at_ms,
+            ) in grants
+            {
+                insert
+                    .execute(params![
+                        Uuid::new_v4().to_string(),
+                        record_id,
+                        value_version,
+                        project_key,
+                        session_id.to_string(),
+                        session_generation,
+                        action_id,
+                        action_revision,
+                        use_epoch,
+                        issued_at_ms,
+                        expires_at_ms,
+                        revoked_at_ms,
+                    ])
+                    .context("copying sealed action grant onto compaction successor")?;
+            }
+        }
         Ok(row)
     }
 
@@ -6009,6 +6119,49 @@ mod tests {
         assert_eq!(lineage.len(), 2);
         assert_eq!(lineage[0].session_id, predecessor.session_id);
         assert_eq!(lineage[1].session_id, successor.session_id);
+    }
+
+    #[tokio::test]
+    async fn compaction_successor_moves_conversation_live_state() {
+        let db = Db::open_in_memory().unwrap();
+        let predecessor = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.create_session_goal(
+            predecessor.session_id,
+            "p",
+            "ship the lineage window",
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
+        db.create_task_todo(predecessor.session_id, "keep the todo", 1)
+            .await
+            .unwrap();
+        let successor = db
+            .create_compaction_successor(predecessor.session_id)
+            .await
+            .unwrap();
+        assert!(
+            db.current_session_goal(predecessor.session_id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let goal = db
+            .current_session_goal(successor.session_id, false)
+            .await
+            .unwrap()
+            .expect("open goal follows the live window");
+        assert_eq!(goal.objective, "ship the lineage window");
+        assert!(
+            db.list_task_todos(predecessor.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let todos = db.list_task_todos(successor.session_id).await.unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "keep the todo");
     }
 
     #[tokio::test]

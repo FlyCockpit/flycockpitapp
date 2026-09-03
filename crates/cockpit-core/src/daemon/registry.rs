@@ -317,6 +317,11 @@ pub struct ImageGenerationClockContext {
 struct WorkerState {
     live: HashMap<Uuid, WorkerEntry>,
     starting: HashMap<Uuid, Arc<StartSlot>>,
+    /// Successor id → current live map key of the worker being rekeyed.
+    /// Occupied before the successor row commits so `claim_attach` joins the
+    /// existing worker instead of spawning a second one on a published,
+    /// worker-less id.
+    rekeying: HashMap<Uuid, Uuid>,
     next_generation: WorkerGeneration,
 }
 
@@ -655,6 +660,17 @@ fn live_map_key_for_generation(
         .map(|(id, _)| *id)
 }
 
+fn live_map_key_for_session_id(workers: &WorkerState, session_id: Uuid) -> Option<Uuid> {
+    if workers.live.contains_key(&session_id) {
+        return Some(session_id);
+    }
+    workers
+        .rekeying
+        .get(&session_id)
+        .copied()
+        .filter(|from| workers.live.contains_key(from))
+}
+
 fn live_map_key_for_handle(workers: &WorkerState, handle: &SessionWorkerHandle) -> Option<Uuid> {
     let live = handle.session_id();
     if workers
@@ -693,6 +709,9 @@ fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: Wor
     let retained_by_activation = {
         let mut workers = crate::sync::lock_or_recover(&inner.workers);
         let key = live_map_key_for_generation(&workers, generation).unwrap_or(session_id);
+        workers
+            .rekeying
+            .retain(|to, from| *from != key && *to != key);
         if workers.live.get(&key).is_some_and(|entry| {
             entry.generation == generation
                 && entry.activation_leases == 0
@@ -769,6 +788,7 @@ impl SessionRegistry {
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
                     starting: HashMap::new(),
+                    rekeying: HashMap::new(),
                     next_generation: 0,
                 }),
                 worker_publication: Arc::new(AsyncMutex::new(())),
@@ -1475,7 +1495,10 @@ impl SessionRegistry {
     ) -> Result<Option<LiveAttachClaim>> {
         let claim = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
-            let Some(entry) = workers.live.get_mut(&session_id) else {
+            let Some(key) = live_map_key_for_session_id(&workers, session_id) else {
+                return Ok(None);
+            };
+            let Some(entry) = workers.live.get_mut(&key) else {
                 return Ok(None);
             };
             if entry.handle.is_closed() {
@@ -2057,6 +2080,37 @@ impl SessionRegistry {
         self.lookup_entry(session_id).map(|(_, handle)| handle)
     }
 
+    /// Occupy `to` as this worker's successor before the successor row is
+    /// committed. `claim_attach(to)` joins the existing worker until
+    /// [`Self::rekey_live_worker`] consumes the reservation.
+    pub fn begin_compaction_rekey(&self, from: Uuid, to: Uuid) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        anyhow::ensure!(
+            workers.live.contains_key(&from),
+            "compaction predecessor {from} has no live worker"
+        );
+        anyhow::ensure!(
+            !workers.live.contains_key(&to)
+                && !workers.starting.contains_key(&to)
+                && !workers.rekeying.contains_key(&to),
+            "compaction successor {to} already has a live, starting, or rekeying worker"
+        );
+        workers.rekeying.insert(to, from);
+        Ok(())
+    }
+
+    /// Drop a successor reservation after a failed seed. Idempotent if the
+    /// reservation was already consumed by [`Self::rekey_live_worker`].
+    pub fn abort_compaction_rekey(&self, from: Uuid, to: Uuid) {
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        if workers.rekeying.get(&to).copied() == Some(from) {
+            workers.rekeying.remove(&to);
+        }
+    }
+
     /// Move a live worker from `from` to `to` after compaction seeds a
     /// successor window. Lookups, drain, and join tracking follow the new id.
     pub fn rekey_live_worker(&self, from: Uuid, to: Uuid) -> Result<()> {
@@ -2064,14 +2118,33 @@ impl SessionRegistry {
             return Ok(());
         }
         let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        if let Some(reserved_from) = workers.rekeying.get(&to).copied() {
+            anyhow::ensure!(
+                reserved_from == from,
+                "compaction successor {to} is reserved for {reserved_from}, not {from}"
+            );
+        }
         anyhow::ensure!(
-            !workers.live.contains_key(&to) && !workers.starting.contains_key(&to),
-            "compaction successor {to} already has a live or starting worker"
+            !workers.starting.contains_key(&to),
+            "compaction successor {to} already has a starting worker"
         );
-        let Some(entry) = workers.live.remove(&from) else {
-            return Ok(());
-        };
-        workers.live.insert(to, entry);
+        if workers.live.contains_key(&to) {
+            let same_worker = workers.live.get(&to).is_some_and(|entry| {
+                entry.handle.worker_session_id() == from || entry.handle.session_id() == from
+            });
+            anyhow::ensure!(
+                same_worker,
+                "compaction successor {to} already has a live or starting worker"
+            );
+            workers.live.remove(&from);
+        } else {
+            let Some(entry) = workers.live.remove(&from) else {
+                workers.rekeying.remove(&to);
+                return Ok(());
+            };
+            workers.live.insert(to, entry);
+        }
+        workers.rekeying.remove(&to);
         drop(workers);
         let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
         if let Some(join) = joins.remove(&from) {
@@ -2081,9 +2154,11 @@ impl SessionRegistry {
     }
 
     fn lookup_entry(&self, session_id: Uuid) -> Option<(WorkerGeneration, SessionWorkerHandle)> {
-        crate::sync::lock_or_recover(&self.inner.workers)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers
             .live
-            .get(&session_id)
+            .get(&key)
             .map(|entry| (entry.generation, entry.handle.clone()))
     }
 
@@ -2129,7 +2204,8 @@ impl SessionRegistry {
 
     fn claim_attach(&self, session_id: Uuid) -> AttachClaim {
         let mut state = crate::sync::lock_or_recover(&self.inner.workers);
-        let closed_generation = if let Some(entry) = state.live.get_mut(&session_id) {
+        let resolved_id = live_map_key_for_session_id(&state, session_id).unwrap_or(session_id);
+        let closed_generation = if let Some(entry) = state.live.get_mut(&resolved_id) {
             if !entry.handle.is_closed() {
                 entry.activation_leases = entry.activation_leases.saturating_add(1);
                 return AttachClaim::Live(LiveAttachClaim {
@@ -2164,14 +2240,20 @@ impl SessionRegistry {
             None
         };
         if let Some(generation) = closed_generation {
-            state.live.remove(&session_id);
+            state.live.remove(&resolved_id);
+            state
+                .rekeying
+                .retain(|to, from| *from != resolved_id && *to != resolved_id);
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
             if joins
-                .get(&session_id)
+                .get(&resolved_id)
                 .is_some_and(|join| join.generation == generation)
             {
-                joins.remove(&session_id);
+                joins.remove(&resolved_id);
             }
+        }
+        if state.rekeying.contains_key(&session_id) {
+            return AttachClaim::Activating;
         }
         if let Some(slot) = state.starting.get(&session_id) {
             return AttachClaim::Starting(slot.clone());
@@ -2468,6 +2550,18 @@ impl SessionRegistry {
                 },
             );
         let registry = self.clone();
+        handle
+            .session()
+            .set_compaction_successor_begin_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.begin_compaction_rekey(from, to)
+            }));
+        handle
+            .session()
+            .set_compaction_successor_abort_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.abort_compaction_rekey(from, to)
+            }));
         handle.session().set_compaction_successor_hook(Arc::new(move |from, to| {
             if let Err(error) = registry.rekey_live_worker(from, to) {
                 tracing::warn!(
@@ -2899,9 +2993,11 @@ impl SessionRegistry {
     /// as not-processing / no-jobs). Lock-free read of the worker's
     /// shared atomics (GOALS §17f).
     pub fn live_status(&self, session_id: Uuid) -> Option<(bool, bool, bool)> {
-        crate::sync::lock_or_recover(&self.inner.workers)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers
             .live
-            .get(&session_id)
+            .get(&key)
             .map(|entry| entry.handle.live_status())
     }
 
@@ -2911,10 +3007,7 @@ impl SessionRegistry {
     /// the shared DB-backed resume path. No cross-process state may be cached
     /// across requests without an invalidation path.
     pub fn live_handle(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&session_id)
-            .map(|entry| entry.handle.clone())
+        self.lookup_entry(session_id).map(|(_, handle)| handle)
     }
 
     /// Find the live worker that owns this handle after a compaction rekey.
@@ -3192,6 +3285,31 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
+    fn install_compaction_rekey_hooks(&self, session: &Session) {
+        let registry = self.clone();
+        session.set_compaction_successor_begin_hook(Arc::new({
+            let registry = registry.clone();
+            move |from, to| registry.begin_compaction_rekey(from, to)
+        }));
+        session.set_compaction_successor_abort_hook(Arc::new({
+            let registry = registry.clone();
+            move |from, to| registry.abort_compaction_rekey(from, to)
+        }));
+        session.set_compaction_successor_hook(Arc::new(move |from, to| {
+            if let Err(error) = registry.rekey_live_worker(from, to) {
+                panic!("test compaction rekey failed: {error:#}");
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    fn activation_leases(&self, session_id: Uuid) -> Option<usize> {
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers.live.get(&key).map(|entry| entry.activation_leases)
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_test_worker(
         &self,
         handle: SessionWorkerHandle,
@@ -3249,10 +3367,9 @@ impl SessionRegistry {
 
     #[cfg(test)]
     fn live_generation(&self, id: Uuid) -> Option<WorkerGeneration> {
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&id)
-            .map(|entry| entry.generation)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, id)?;
+        workers.live.get(&key).map(|entry| entry.generation)
     }
 
     #[cfg(test)]
@@ -5956,5 +6073,116 @@ mod tests {
             None,
             "a foreign-owned command name must never be injected/expanded"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_rekey_reservation_joins_existing_worker_instead_of_spawning() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session.clone());
+        let generation = reg.insert_test_worker(handle.clone(), tokio::spawn(async {}));
+        reg.install_compaction_rekey_hooks(handle.session().as_ref());
+
+        let successor_id = Uuid::new_v4();
+        session.begin_compaction_successor(successor_id).unwrap();
+
+        let reserved = reg
+            .live_handle(successor_id)
+            .expect("successor id must resolve to the existing worker during rekey");
+        assert!(reserved.same_worker_as(&handle));
+        assert_eq!(reg.live_generation(successor_id), Some(generation));
+        assert!(
+            crate::sync::lock_or_recover(&reg.inner.workers)
+                .starting
+                .is_empty(),
+            "reservation must not open a start slot"
+        );
+        assert!(
+            matches!(reg.claim_attach(successor_id), AttachClaim::Live(_)),
+            "attach to the unpublished successor must join the live worker"
+        );
+
+        session.abort_compaction_successor(successor_id);
+        assert!(
+            reg.live_handle(successor_id).is_none(),
+            "abort must release the successor key so a later attach can start"
+        );
+        assert!(reg.live_handle(session.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn compaction_rekey_preserves_handle_stop_trust_and_keep_warm_identity() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let spawn_id = session.id;
+        let successor = reg
+            .inner
+            .db
+            .create_compaction_successor(spawn_id)
+            .await
+            .unwrap();
+        let successor_id = successor.session_id;
+        let successor_short = successor
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor_id.to_string());
+
+        let (handle, _rx) = test_handle_with_rx(&reg, session.clone());
+        let generation = reg.insert_test_worker(handle.clone(), tokio::spawn(async {}));
+        reg.install_compaction_rekey_hooks(handle.session().as_ref());
+        session.begin_compaction_successor(successor_id).unwrap();
+
+        let claim = reg
+            .claim_live_attach_if_present(successor_id)
+            .await
+            .unwrap()
+            .expect("reservation must be claimable by the successor id");
+        assert_eq!(reg.activation_leases(spawn_id), Some(1));
+        assert!(claim.handle().same_worker_as(&handle));
+
+        session.adopt_compaction_successor(successor_id, successor_short);
+        assert_eq!(session.live_id(), successor_id);
+        assert_eq!(handle.session_id(), successor_id);
+        assert!(
+            reg.live_handle(successor_id)
+                .is_some_and(|live| live.same_worker_as(&handle))
+        );
+        assert!(
+            reg.live_handle(spawn_id).is_none(),
+            "map key must move off the predecessor"
+        );
+        assert_eq!(reg.live_generation(successor_id), Some(generation));
+        assert_eq!(reg.activation_leases(successor_id), Some(1));
+        assert!(
+            reg.live_handle_matching_worker(&handle)
+                .is_some_and(|live| live.same_worker_as(&handle))
+        );
+        let keep_warm_tip = reg
+            .live_keep_warm_handle(successor_id)
+            .await
+            .unwrap()
+            .expect("keep-warm must target the live tip");
+        assert!(keep_warm_tip.same_worker_as(&handle));
+        let keep_warm_from_predecessor = reg
+            .live_keep_warm_handle(spawn_id)
+            .await
+            .unwrap()
+            .expect("keep-warm on the predecessor must retarget the live worker");
+        assert!(keep_warm_from_predecessor.same_worker_as(&handle));
+
+        drop(claim);
+        assert_eq!(
+            reg.activation_leases(successor_id),
+            Some(0),
+            "LiveAttachClaim drop must follow the rekeyed map entry"
+        );
+
+        assert!(
+            reg.interrupt_and_stop_exact(&handle)
+                .await
+                .expect("exact-stop after rekey")
+        );
+        assert!(reg.live_handle(successor_id).is_none());
+        assert!(reg.live_handle_matching_worker(&handle).is_none());
     }
 }

@@ -1428,6 +1428,8 @@ impl Session {
             btw_tangent: row.btw_tangent,
             compaction_predecessor_session_id: row.compaction_predecessor_session_id,
             compaction_lineage_root_id: row.compaction_lineage_root(),
+            on_compaction_successor_begin: Mutex::new(None),
+            on_compaction_successor_abort: Mutex::new(None),
             on_compaction_successor: Mutex::new(None),
             title: Mutex::new(row.title),
             description: Mutex::new(row.description),

@@ -1651,6 +1651,9 @@ impl std::fmt::Debug for InteractiveAttachmentPermit {
 }
 
 impl InteractiveAttachmentPermit {
+    /// Conversation identity, not window identity. An interactive attachment
+    /// outlives compaction successor adoption, so the permit stays valid for
+    /// both the spawn window and the live tip of this worker.
     pub fn belongs_to(&self, session_id: Uuid) -> bool {
         !self.attachment_id.is_nil()
             && (self.session.live_id() == session_id || self.session.id == session_id)

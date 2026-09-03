@@ -83,7 +83,7 @@ impl Tool for TodoTool {
                 let todo = ctx
                     .session
                     .db
-                    .create_task_todo(ctx.session.id, content, priority)
+                    .create_task_todo(ctx.session.live_id(), content, priority)
                     .await?;
                 Ok(ToolOutput::text(format!(
                     "Created todo `{}`: {}",
@@ -91,7 +91,11 @@ impl Tool for TodoTool {
                 )))
             }
             "list" => {
-                let todos = ctx.session.db.list_task_todos(ctx.session.id).await?;
+                let todos = ctx
+                    .session
+                    .db
+                    .list_task_todos(ctx.session.live_id())
+                    .await?;
                 if todos.is_empty() {
                     return Ok(ToolOutput::text("No todos for this session."));
                 }
@@ -113,7 +117,7 @@ impl Tool for TodoTool {
                 let Some(detail) = ctx
                     .session
                     .db
-                    .task_todo_detail_by_id_or_name(ctx.session.id, key)
+                    .task_todo_detail_by_id_or_name(ctx.session.live_id(), key)
                     .await?
                 else {
                     return Ok(ToolOutput::text(format!("No todo matched `{key}`.")));
@@ -133,7 +137,14 @@ impl Tool for TodoTool {
                 let summary = args.outcome_summary.as_deref();
                 ctx.session
                     .db
-                    .update_task_todo(ctx.session.id, todo_id, status, content, priority, summary)
+                    .update_task_todo(
+                        ctx.session.live_id(),
+                        todo_id,
+                        status,
+                        content,
+                        priority,
+                        summary,
+                    )
                     .await?;
                 Ok(ToolOutput::text(format!("Updated todo `{todo_id}`.")))
             }
@@ -150,7 +161,14 @@ impl Tool for TodoTool {
                 let id = ctx
                     .session
                     .db
-                    .append_task_todo_note(ctx.session.id, todo_id, kind, note, &ctx.agent_id, None)
+                    .append_task_todo_note(
+                        ctx.session.live_id(),
+                        todo_id,
+                        kind,
+                        note,
+                        &ctx.agent_id,
+                        None,
+                    )
                     .await?;
                 Ok(ToolOutput::text(format!(
                     "Appended {} note `{}` to todo `{}`.",

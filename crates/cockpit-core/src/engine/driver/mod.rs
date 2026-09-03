@@ -1982,7 +1982,7 @@ impl Driver {
             .session
             .db
             .task_delegation_child_agent(
-                self.session.id,
+                self.session.live_id(),
                 task_call_id.to_string(),
                 label.to_string(),
             )
@@ -2446,7 +2446,13 @@ impl Driver {
         let assigned = match self
             .session
             .db
-            .assign_task_todos(self.session.id, todo_ids, task_call_id, label, child_agent)
+            .assign_task_todos(
+                self.session.live_id(),
+                todo_ids,
+                task_call_id,
+                label,
+                child_agent,
+            )
             .await
         {
             Ok(todos) => todos,
@@ -2488,7 +2494,7 @@ impl Driver {
         if let Err(e) = self
             .session
             .db
-            .finish_task_assignment(self.session.id, task_call_id, label, state, None)
+            .finish_task_assignment(self.session.live_id(), task_call_id, label, state, None)
             .await
         {
             tracing::warn!(error = %e, task_call_id, "finish task todo assignment failed");
@@ -2518,7 +2524,7 @@ impl Driver {
                     if let Err(e) = self
                         .session
                         .db
-                        .update_task_todo(self.session.id, id, status, None, None, summary)
+                        .update_task_todo(self.session.live_id(), id, status, None, None, summary)
                         .await
                     {
                         tracing::warn!(error = %e, todo_id = %id, "todo delta status update failed");
@@ -2544,7 +2550,7 @@ impl Driver {
                             .session
                             .db
                             .append_task_todo_note(
-                                self.session.id,
+                                self.session.live_id(),
                                 id,
                                 kind,
                                 body,
@@ -2568,7 +2574,7 @@ impl Driver {
                             .session
                             .db
                             .append_task_todo_note(
-                                self.session.id,
+                                self.session.live_id(),
                                 id,
                                 crate::db::task_todos::TodoNoteKind::Handoff,
                                 &body,
@@ -3437,7 +3443,7 @@ impl Driver {
         let projection_calls = match self
             .session
             .db
-            .text_artifact_projection_call_ids(self.session.id)
+            .text_artifact_projection_call_ids(self.session.live_id())
             .await
         {
             Ok(calls) => calls,
@@ -3457,7 +3463,7 @@ impl Driver {
         if let Err(e) = self
             .session
             .db
-            .save_prune_ledger(self.session.id, &ledger)
+            .save_prune_ledger(self.session.live_id(), &ledger)
             .await
         {
             tracing::warn!(error = %e, "persisting prune ledger failed");
@@ -4277,7 +4283,7 @@ impl Driver {
         let recovered_child_has_parked_continuation = self
             .session
             .db
-            .list_reconcilable_interrupts(self.session.id)
+            .list_reconcilable_interrupts(self.session.live_id())
             .await
             .context("loading recovered interactive child parked continuations")?
             .into_iter()
@@ -5305,7 +5311,7 @@ impl Driver {
                 if let Err(e) = self
                     .session
                     .db
-                    .refresh_session_goal_usage(self.session.id)
+                    .refresh_session_goal_usage(self.session.live_id())
                     .await
                 {
                     tracing::warn!(error = %e, "refreshing goal usage failed");
@@ -5918,7 +5924,7 @@ impl Driver {
         match self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -6843,7 +6849,7 @@ impl Driver {
         let Some(goal) = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await?
         else {
             if self.goal_was_active_recently {
@@ -6868,7 +6874,7 @@ impl Driver {
                 .session
                 .db
                 .update_session_goal(
-                    self.session.id,
+                    self.session.live_id(),
                     crate::db::session_goals::GoalDisposition::BudgetLimited,
                     None,
                     None,
@@ -7264,7 +7270,7 @@ impl Driver {
         let Ok(Some(goal)) = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
         else {
             return false;
@@ -7276,7 +7282,7 @@ impl Driver {
             .session
             .db
             .update_session_goal(
-                self.session.id,
+                self.session.live_id(),
                 crate::db::session_goals::GoalDisposition::InfraPaused,
                 None,
                 None,
@@ -7325,7 +7331,7 @@ impl Driver {
         let Some(goal) = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await?
         else {
             return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
@@ -7348,7 +7354,7 @@ impl Driver {
         self.session
             .db
             .update_session_goal(
-                self.session.id,
+                self.session.live_id(),
                 crate::db::session_goals::GoalDisposition::Running,
                 None,
                 None,
@@ -7389,7 +7395,7 @@ impl Driver {
         for event in self
             .session
             .db
-            .list_session_events(self.session.id)
+            .list_session_events(self.session.live_id())
             .await?
             .into_iter()
             .filter(|event| event.seq > anchor_seq)
@@ -7486,7 +7492,7 @@ impl Driver {
         }
         self.session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -7498,7 +7504,7 @@ impl Driver {
     async fn latest_session_event_seq(&self) -> i64 {
         self.session
             .db
-            .list_session_events(self.session.id)
+            .list_session_events(self.session.live_id())
             .await
             .ok()
             .and_then(|events| events.last().map(|event| event.seq))
@@ -7512,7 +7518,7 @@ impl Driver {
         let events = self
             .session
             .db
-            .list_session_events(self.session.id)
+            .list_session_events(self.session.live_id())
             .await
             .ok()?;
         for event in events.iter().rev() {
@@ -7595,7 +7601,7 @@ impl Driver {
         let active_goal = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -7693,7 +7699,12 @@ impl Driver {
     }
 
     async fn goal_continue_progress_since(&self, anchor_seq: i64) -> bool {
-        let Ok(events) = self.session.db.list_session_events(self.session.id).await else {
+        let Ok(events) = self
+            .session
+            .db
+            .list_session_events(self.session.live_id())
+            .await
+        else {
             return false;
         };
         events
@@ -7717,7 +7728,7 @@ impl Driver {
             || self
                 .session
                 .db
-                .current_session_goal(self.session.id, false)
+                .current_session_goal(self.session.live_id(), false)
                 .await
                 .ok()
                 .flatten()
@@ -8814,7 +8825,7 @@ impl Driver {
         let Some(stored) = self
             .session
             .db
-            .reserved_text_artifact_submission(self.session.id, *receipt.id.as_bytes())
+            .reserved_text_artifact_submission(self.session.live_id(), *receipt.id.as_bytes())
             .await?
         else {
             return Ok(None);
@@ -8824,7 +8835,7 @@ impl Driver {
                 &stored.canonical_message,
             )?;
         anyhow::ensure!(
-            canonical.session_id == self.session.id,
+            canonical.session_id == self.session.live_id(),
             "FCM2 session mismatch"
         );
         anyhow::ensure!(
@@ -8912,7 +8923,7 @@ impl Driver {
             .session
             .db
             .text_artifact_submission_durable_state(
-                self.session.id,
+                self.session.live_id(),
                 *client_submission_id.as_bytes(),
             )
             .await
@@ -9447,7 +9458,7 @@ impl Driver {
         let items = self
             .session
             .db
-            .claim_assistant_inbox_for_delivery(self.session.id, include_deferred)
+            .claim_assistant_inbox_for_delivery(self.session.live_id(), include_deferred)
             .await?;
         if items.is_empty() {
             return Ok(None);
@@ -9473,7 +9484,7 @@ impl Driver {
     async fn acknowledge_assistant_inbox(&self, inbox_item_ids: Vec<Uuid>) -> Result<()> {
         self.session
             .db
-            .acknowledge_assistant_inbox_delivery(self.session.id, inbox_item_ids)
+            .acknowledge_assistant_inbox_delivery(self.session.live_id(), inbox_item_ids)
             .await
     }
 
@@ -9523,7 +9534,7 @@ impl Driver {
         let status = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -11239,7 +11250,7 @@ impl Driver {
                 .session
                 .db
                 .settle_task_delegation_child_and_agent(
-                    self.session.id,
+                    self.session.live_id(),
                     pending.call_id.clone(),
                     "default".to_owned(),
                     terminal_state,
@@ -11438,7 +11449,7 @@ impl Driver {
                 self.session
                     .db
                     .settle_task_delegation_child_and_agent(
-                        self.session.id,
+                        self.session.live_id(),
                         pending.call_id.clone(),
                         "default".to_owned(),
                         state,
@@ -12007,7 +12018,7 @@ impl Driver {
                 let outcome = self
                     .session
                     .db
-                    .message_submission_safe_outcome(self.session.id, *receipt.id.as_bytes())
+                    .message_submission_safe_outcome(self.session.live_id(), *receipt.id.as_bytes())
                     .await?;
                 if !matches!(
                     outcome,
@@ -12403,13 +12414,13 @@ impl Driver {
             // Every accepted source is therefore blob-backed, including a
             // source just above a per-agent threshold below the default 8 KiB.
             let source_blob_path = {
-                let path = crate::text_artifact_blob::new_path(self.session.id);
+                let path = crate::text_artifact_blob::new_path(self.session.live_id());
                 if let Err(error) = self
                     .session
                     .db
                     .stage_text_artifact_blob_cleanup_intent(
                         path.clone(),
-                        self.session.id,
+                        self.session.live_id(),
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await
@@ -12442,13 +12453,13 @@ impl Driver {
             let model_projection =
                 (user_text != oversized.source_text).then_some(user_text.clone());
             let model_projection_blob_path = if let Some(projection) = model_projection.as_deref() {
-                let path = crate::text_artifact_blob::new_path(self.session.id);
+                let path = crate::text_artifact_blob::new_path(self.session.live_id());
                 if let Err(error) = self
                     .session
                     .db
                     .stage_text_artifact_blob_cleanup_intent(
                         path.clone(),
-                        self.session.id,
+                        self.session.live_id(),
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await
@@ -13090,7 +13101,7 @@ impl Driver {
                 let envelope = self
                     .session
                     .db
-                    .user_message_model_envelope(self.session.id, *event_seq)
+                    .user_message_model_envelope(self.session.live_id(), *event_seq)
                     .await?
                     .ok_or_else(|| {
                         anyhow!("materialized oversized user event lacks accepted envelope")
@@ -13631,7 +13642,7 @@ impl Driver {
                         && self
                             .session
                             .db
-                            .remove_latest_user_message(self.session.id, seq)
+                            .remove_latest_user_message(self.session.live_id(), seq)
                             .await
                             .unwrap_or_else(|error| {
                                 tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
@@ -13854,7 +13865,7 @@ impl Driver {
                 if let Err(e) = self
                     .session
                     .db
-                    .refresh_session_goal_usage(self.session.id)
+                    .refresh_session_goal_usage(self.session.live_id())
                     .await
                 {
                     tracing::warn!(error = %e, "refreshing goal usage failed");
@@ -14303,7 +14314,7 @@ impl Driver {
                         .db
                         .upsert_task_delegation_job_and_payload(
                             crate::db::task_delegations::TaskDelegationJobUpsert {
-                                session_id: self.session.id,
+                                session_id: self.session.live_id(),
                                 task_call_id: &task_call_id,
                                 function_call_id: task_function_call_id.as_deref(),
                                 parent_agent: &parent_agent,
@@ -14313,7 +14324,7 @@ impl Driver {
                             crate::db::task_delegation_payloads::NewTaskDelegationPayload {
                                 task_call_id: &task_call_id,
                                 function_call_id: task_function_call_id.as_deref(),
-                                parent_session_id: self.session.id,
+                                parent_session_id: self.session.live_id(),
                                 parent_agent: &parent_agent,
                                 label: "default",
                                 child_agent: &child_agent,

@@ -774,7 +774,7 @@ async fn toolbox_with_retrieval_if_needed(
     }
     if session
         .db
-        .session_has_task_delegation_payloads(session.id)
+        .session_has_task_delegation_payloads(session.live_id())
         .await
         .unwrap_or(false)
     {

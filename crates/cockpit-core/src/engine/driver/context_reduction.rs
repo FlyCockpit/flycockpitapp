@@ -1933,9 +1933,12 @@ impl Driver {
         let predecessor_id = self.session.live_id();
         let predecessor_short_id = self.session.short_id();
         let successor_id = uuid::Uuid::new_v4();
+        self.session
+            .begin_compaction_successor(successor_id)
+            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
         let vault = self.session.secret_vault().clone();
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let successor_row = self
+        let successor_row = match self
             .session
             .db
             .transaction(move |conn| {
@@ -1953,7 +1956,15 @@ impl Driver {
                 )
             })
             .await
-            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
+        {
+            Ok(row) => row,
+            Err(error) => {
+                self.session.abort_compaction_successor(successor_id);
+                return Err(PreparedCompactionApplyError::SeedSuccessor(
+                    error.to_string(),
+                ));
+            }
+        };
         let successor_short_id = successor_row
             .short_id
             .clone()

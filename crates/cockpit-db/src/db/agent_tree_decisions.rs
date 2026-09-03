@@ -2302,16 +2302,20 @@ impl Db {
             let Some(child_uuid) = child_uuid else {
                 return Ok(None);
             };
-            let agent_id: Option<String> = conn
+            let agent_id: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT agent_instance_id FROM agent_instances
-                     WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
-                    params![session_id.to_string(), child_uuid],
-                    |row| row.get(0),
+                    "SELECT agent_instance_id, session_id FROM agent_instances
+                     WHERE task_delegation_child_uuid = ?1",
+                    params![child_uuid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             match agent_id {
-                Some(agent_id) => load_agent(conn, session_id, parse_uuid(agent_id)?),
+                Some((agent_id, instance_session_id)) => load_agent(
+                    conn,
+                    parse_uuid(instance_session_id)?,
+                    parse_uuid(agent_id)?,
+                ),
                 None => Ok(None),
             }
         })
@@ -2336,8 +2340,7 @@ impl Db {
                    JOIN task_delegation_jobs j
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
-                    AND a.agent_instance_id = ?2
-                    AND j.parent_session_id = ?1",
+                    AND a.agent_instance_id = ?2",
                 params![session_id.to_string(), agent_instance_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2367,8 +2370,7 @@ impl Db {
                        JOIN task_delegation_jobs j
                          ON j.task_call_id = c.task_call_id
                       WHERE a.session_id = ?1
-                        AND a.agent_instance_id = ?2
-                        AND j.parent_session_id = ?1",
+                        AND a.agent_instance_id = ?2",
                     params![session_id.to_string(), agent_instance_id.to_string()],
                     |row| row.get(0),
                 )
@@ -2407,7 +2409,6 @@ impl Db {
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
                     AND a.agent_instance_id = ?2
-                    AND j.parent_session_id = ?1
                     AND c.status IN ('running', 'backgrounded', 'paused_pending_tool')",
                 params![session_id.to_string(), agent_instance_id.to_string()],
                 |row| {
@@ -2458,7 +2459,6 @@ impl Db {
                    JOIN task_delegation_jobs j
                      ON j.task_call_id = c.task_call_id
                   WHERE a.session_id = ?1
-                    AND j.parent_session_id = ?1
                     AND c.task_call_id = ?2
                     AND c.status IN ('running', 'backgrounded', 'paused_pending_tool')
                   ORDER BY c.label ASC",
@@ -2524,7 +2524,7 @@ impl Db {
             };
             match self
                 .transition_agent_instance(
-                    session_id,
+                    agent.session_id,
                     agent.agent_instance_id,
                     agent.revision,
                     next_state,
@@ -2589,12 +2589,20 @@ impl Db {
                     |row| Ok((parse_uuid(row.get::<_, String>(0)?)?, row.get(1)?)),
                 )
                 .context("task delegation child is not authorized for this session")?;
-            let agent_id: Uuid = conn
+            // Jobs follow the live conversation window; AgentTree rows stay on
+            // the worker spawn id. Resolve the executor by unique child uuid
+            // so compaction successor adoption does not lose the tree.
+            let (agent_id, session_id): (Uuid, Uuid) = conn
                 .query_row(
-                    "SELECT agent_instance_id FROM agent_instances
-                      WHERE session_id = ?1 AND task_delegation_child_uuid = ?2",
-                    params![session_id.to_string(), child_uuid.to_string()],
-                    |row| parse_uuid(row.get::<_, String>(0)?),
+                    "SELECT agent_instance_id, session_id FROM agent_instances
+                      WHERE task_delegation_child_uuid = ?1",
+                    params![child_uuid.to_string()],
+                    |row| {
+                        Ok((
+                            parse_uuid(row.get::<_, String>(0)?)?,
+                            parse_uuid(row.get::<_, String>(1)?)?,
+                        ))
+                    },
                 )
                 .context("live task delegation child has no AgentTree executor")?;
 

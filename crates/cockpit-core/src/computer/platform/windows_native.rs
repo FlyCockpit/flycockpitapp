@@ -3,12 +3,16 @@
 //! Pixel perception remains authoritative. UI Automation contributes only
 //! target identity/control-type evidence used by the approval boundary.
 
+use std::cell::Cell;
 use std::mem::size_of;
 use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, HANDLE, HWND, LPARAM, POINT, RECT,
+    SetLastError, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, ClientToScreen,
     CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DISPLAY_DEVICEW, DeleteDC,
@@ -17,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     ScreenToClient, SelectObject,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
@@ -77,16 +81,42 @@ pub(crate) struct WindowsDesktopBackend {
     cleanup_window: Option<EvidencedWindowsWindow>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Evidenced USER window. `element` is the object-identity witness: a retained
+/// UI Automation node bound to that window object. `CurrentNativeWindowHandle`
+/// on a live element names this object; a recycled HWND is a different node
+/// and fails the runtime-id / planted-property checks instead of receiving
+/// input. Journal restore starts with `element == None` and re-acquires only
+/// after the planted property authenticates the HWND slot.
 struct EvidencedWindowsWindow {
     opaque: OpaqueWindowId,
     hwnd_bits: isize,
+    element: Option<IUIAutomationElement>,
 }
 
-/// Every keyboard down event is made durable before the window-addressed post.
-/// Recovery uses the journal under the Windows session-wide host lease, so an
-/// extra key-up is preferred over handing a possibly held key to a replacement
-/// daemon.
+impl std::fmt::Debug for EvidencedWindowsWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidencedWindowsWindow")
+            .field("opaque", &self.opaque)
+            .field("hwnd_bits", &self.hwnd_bits)
+            .field("element", &self.element.is_some())
+            .finish()
+    }
+}
+
+impl Clone for EvidencedWindowsWindow {
+    fn clone(&self) -> Self {
+        Self {
+            opaque: self.opaque,
+            hwnd_bits: self.hwnd_bits,
+            element: self.element.clone(),
+        }
+    }
+}
+
+/// Every keyboard/button transition is marked pending in the journal before
+/// the window-addressed post, then committed only after confirmed delivery.
+/// A timeout while the HWND still names a window leaves pending set so
+/// recovery fail-closes rather than guessing WndProc progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum HeldKeyboardInput {
     VirtualKey { key: u16, extended: bool },
@@ -139,6 +169,11 @@ impl WindowsHeldInputJournal {
         };
         let state: WindowsHeldInputState = serde_json::from_slice(&bytes)
             .map_err(|_| win_input_error("Windows held-input journal is malformed"))?;
+        if state.pending {
+            return Err(win_input_error(
+                "Windows held-input journal has uncertain outstanding input",
+            ));
+        }
         if (!state.keyboard.is_empty() || !state.buttons.is_empty())
             && (state.window.is_none() || state.hwnd_bits.is_none())
         {
@@ -150,7 +185,7 @@ impl WindowsHeldInputJournal {
     }
 
     fn store(&self, state: &WindowsHeldInputState) -> Result<(), ComputerError> {
-        if state.keyboard.is_empty() && state.buttons.is_empty() {
+        if !state.pending && state.keyboard.is_empty() && state.buttons.is_empty() {
             return cockpit_host::private_fs::delete_private_file(&self.path)
                 .map_err(win_input_error);
         }
@@ -170,6 +205,11 @@ struct WindowsHeldInputState {
     buttons: Vec<MouseButton>,
     window: Option<[u8; 16]>,
     hwnd_bits: Option<i64>,
+    /// Set before an irreversible send whose effect is not yet known. A crash
+    /// or timeout that leaves this set fail-closes rather than guessing
+    /// whether the evidenced window processed the message.
+    #[serde(default)]
+    pending: bool,
 }
 
 impl WindowsDesktopBackend {
@@ -218,28 +258,12 @@ impl WindowsDesktopBackend {
     fn resolve_injection_hwnd(&self, require_live_focus: bool) -> Result<HWND, ComputerError> {
         let bound = self
             .evidenced_window
-            .or(self.cleanup_window)
+            .as_ref()
+            .or(self.cleanup_window.as_ref())
             .ok_or_else(|| {
                 ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
             })?;
-        let hwnd = hwnd_from_bits(bound.hwnd_bits);
-        // SAFETY: `IsWindow` accepts any HWND-sized handle; invalid values return false.
-        if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
-        }
-        let live = opaque_id_for_hwnd(hwnd)?;
-        if live != bound.opaque {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
-        }
-        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
-        }
+        let (hwnd, _) = hwnd_from_retained_window_object(bound)?;
         if require_live_focus {
             // SAFETY: GetForegroundWindow returns a possibly-invalid HWND; identity is
             // re-checked through UI Automation before any post.
@@ -282,13 +306,76 @@ impl WindowsDesktopBackend {
         keyboard: &[HeldKeyboardInput],
         buttons: &[MouseButton],
     ) -> Result<(), ComputerError> {
-        let bound = self.evidenced_window.or(self.cleanup_window);
+        self.persist_held_state_with_pending(keyboard, buttons, false)
+    }
+
+    fn persist_held_state_with_pending(
+        &self,
+        keyboard: &[HeldKeyboardInput],
+        buttons: &[MouseButton],
+        pending: bool,
+    ) -> Result<(), ComputerError> {
+        let bound = self
+            .evidenced_window
+            .as_ref()
+            .or(self.cleanup_window.as_ref());
         self.held_input_journal.store(&WindowsHeldInputState {
             keyboard: keyboard.to_vec(),
             buttons: buttons.to_vec(),
             window: bound.map(|window| *window.opaque.as_bytes()),
             hwnd_bits: bound.map(|window| window.hwnd_bits as i64),
+            pending,
         })
+    }
+
+    fn begin_delivery(&mut self) -> Result<WindowsHeldInputState, ComputerError> {
+        let previous = WindowsHeldInputState {
+            keyboard: self.held_keyboard_inputs.clone(),
+            buttons: self.held_buttons.clone(),
+            window: self
+                .evidenced_window
+                .as_ref()
+                .or(self.cleanup_window.as_ref())
+                .map(|window| *window.opaque.as_bytes()),
+            hwnd_bits: self
+                .evidenced_window
+                .as_ref()
+                .or(self.cleanup_window.as_ref())
+                .map(|window| window.hwnd_bits as i64),
+            pending: false,
+        };
+        self.persist_held_state_with_pending(&self.held_keyboard_inputs, &self.held_buttons, true)?;
+        Ok(previous)
+    }
+
+    fn rollback_delivery(&mut self, previous: WindowsHeldInputState) -> Result<(), ComputerError> {
+        self.held_keyboard_inputs = previous.keyboard.clone();
+        self.held_buttons = previous.buttons.clone();
+        if let Err(error) =
+            self.persist_held_state_with_pending(&previous.keyboard, &previous.buttons, false)
+        {
+            // A failed rollback must not look like known state.
+            let _ = self.persist_held_state_with_pending(
+                &self.held_keyboard_inputs,
+                &self.held_buttons,
+                true,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn rollback_known_pre_send_refusal(
+        &mut self,
+        previous: WindowsHeldInputState,
+        refusal: ComputerError,
+    ) -> Result<(), ComputerError> {
+        self.rollback_delivery(previous).map_err(|rollback| {
+            ComputerError::Refused(format!(
+                "{refusal}; exact pre-send authority rollback failed: {rollback}"
+            ))
+        })?;
+        Err(refusal)
     }
 
     fn remember_held_keyboard_input(
@@ -319,12 +406,12 @@ impl WindowsDesktopBackend {
     }
 
     fn remember_held_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
-        if !self.held_buttons.contains(&button) {
-            let mut buttons = self.held_buttons.clone();
+        let mut buttons = self.held_buttons.clone();
+        if !buttons.contains(&button) {
             buttons.push(button);
-            self.persist_held_state(&self.held_keyboard_inputs, &buttons)?;
-            self.held_buttons = buttons;
         }
+        self.persist_held_state(&self.held_keyboard_inputs, &buttons)?;
+        self.held_buttons = buttons;
         Ok(())
     }
 
@@ -341,33 +428,63 @@ impl WindowsDesktopBackend {
     }
 
     fn key_down(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        self.remember_held_keyboard_input(HeldKeyboardInput::VirtualKey {
+        let input = HeldKeyboardInput::VirtualKey {
             key: key.key.0,
             extended: key.extended,
-        })?;
-        let hwnd = self.require_live_evidenced_window()?;
-        self.send_key(hwnd, key, false)
+        };
+        let previous = self.begin_delivery()?;
+        let hwnd = match self.require_live_evidenced_window() {
+            Ok(hwnd) => hwnd,
+            Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+        };
+        match self.send_key(hwnd, key, false) {
+            Ok(()) => self.remember_held_keyboard_input(input),
+            Err(error) if delivery_is_ambiguous(&error) => Err(error),
+            Err(error) => self.rollback_known_pre_send_refusal(previous, error),
+        }
     }
 
     fn key_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        let hwnd = self.require_live_evidenced_window()?;
-        self.send_key(hwnd, key, true)?;
-        self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey {
+        let input = HeldKeyboardInput::VirtualKey {
             key: key.key.0,
             extended: key.extended,
-        })
+        };
+        let previous = self.begin_delivery()?;
+        let hwnd = match self.require_live_evidenced_window() {
+            Ok(hwnd) => hwnd,
+            Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+        };
+        match self.send_key(hwnd, key, true) {
+            Ok(()) => self.forget_held_keyboard_input(input),
+            Err(error) if delivery_is_ambiguous(&error) => Err(error),
+            Err(error) => self.rollback_known_pre_send_refusal(previous, error),
+        }
     }
 
     fn unicode_down(&mut self, unit: u16) -> Result<(), ComputerError> {
-        self.remember_held_keyboard_input(HeldKeyboardInput::Unicode(unit))?;
-        let hwnd = self.require_live_evidenced_window()?;
-        self.send_unicode(hwnd, unit, false)
+        let previous = self.begin_delivery()?;
+        let hwnd = match self.require_live_evidenced_window() {
+            Ok(hwnd) => hwnd,
+            Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+        };
+        match self.send_unicode(hwnd, unit, false) {
+            Ok(()) => self.remember_held_keyboard_input(HeldKeyboardInput::Unicode(unit)),
+            Err(error) if delivery_is_ambiguous(&error) => Err(error),
+            Err(error) => self.rollback_known_pre_send_refusal(previous, error),
+        }
     }
 
     fn unicode_up(&mut self, unit: u16) -> Result<(), ComputerError> {
-        let hwnd = self.require_live_evidenced_window()?;
-        self.send_unicode(hwnd, unit, true)?;
-        self.forget_held_keyboard_input(HeldKeyboardInput::Unicode(unit))
+        let previous = self.begin_delivery()?;
+        let hwnd = match self.require_live_evidenced_window() {
+            Ok(hwnd) => hwnd,
+            Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+        };
+        match self.send_unicode(hwnd, unit, true) {
+            Ok(()) => self.forget_held_keyboard_input(HeldKeyboardInput::Unicode(unit)),
+            Err(error) if delivery_is_ambiguous(&error) => Err(error),
+            Err(error) => self.rollback_known_pre_send_refusal(previous, error),
+        }
     }
 
     fn send_modifiers(&mut self, modifiers: Modifiers, up: bool) -> Result<(), ComputerError> {
@@ -509,41 +626,43 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    /// Sole irreversible input primitive. A `GetDC` lock holds the USER window
-    /// object so the HWND slot cannot be recycled across identity proof and
-    /// delivery; `SendMessageTimeoutW` then runs the target WndProc before this
-    /// call returns. Checking the planted property after an asynchronous
-    /// `PostMessageW` cannot retract a queued message to a recycled handle.
+    /// Sole irreversible input primitive. Delivery HWND is read from the
+    /// retained UI Automation window object (or re-acquired only after the
+    /// planted property authenticates a journal HWND). `SendMessageTimeoutW`
+    /// then runs that object's WndProc; a timeout while the HWND still names
+    /// a window is ownership-ambiguous and must not be treated as a known
+    /// non-effect.
     fn post_to_target(
         &self,
         msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<(), ComputerError> {
-        let hwnd = self.resolve_injection_hwnd(self.evidenced_window.is_some())?;
+        let require_live_focus = self.evidenced_window.is_some();
         let bound = self
             .evidenced_window
-            .or(self.cleanup_window)
+            .as_ref()
+            .or(self.cleanup_window.as_ref())
             .ok_or_else(|| {
                 ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
             })?;
-        let _lock = HwndObjectLock::acquire(hwnd)?;
-        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
-        }
-        let live = opaque_id_for_hwnd(hwnd)?;
-        if live != bound.opaque {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
+        let (hwnd, element) = hwnd_from_retained_window_object(bound)?;
+        if require_live_focus {
+            let foreground = unsafe { GetForegroundWindow() };
+            if foreground != hwnd {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
         }
         let mut result = 0_usize;
-        // SAFETY: `hwnd` is locked by `_lock` and just matched the planted
-        // identity property. SendMessageTimeoutW calls that window object's
-        // WndProc before returning; SMTO_ERRORONEXIT fails if the object is
-        // destroyed mid-call instead of delivering to a recycled slot.
+        // Reset the thread error so a zero return can distinguish timeout
+        // (ambiguous: WndProc may already be running) from a refused lookup.
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        // SAFETY: `hwnd` was just produced by the retained UIA window object
+        // and matched the planted identity property. SendMessageTimeoutW
+        // validates that handle once, holds the USER object for the call,
+        // and SMTO_ERRORONEXIT fails if the object is destroyed mid-call.
         let sent = unsafe {
             SendMessageTimeoutW(
                 hwnd,
@@ -559,19 +678,21 @@ impl WindowsDesktopBackend {
         let still_live = unsafe { IsWindow(Some(hwnd)).as_bool() };
         if sent.0 == 0 {
             if still_live {
-                return Err(win32_error("SendMessageTimeoutW"));
+                return Err(ambiguous_send_timeout());
             }
             // The evidenced object destroyed itself while processing (for
             // example a close button). Delivery addressed that object.
             return Ok(());
         }
         if still_live {
-            if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+            let live_hwnd = unsafe { element.CurrentNativeWindowHandle() }
+                .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+            if live_hwnd != hwnd || !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
                 return Err(ComputerError::Refused(
                     EVIDENCED_WINDOW_MISMATCH.to_string(),
                 ));
             }
-            let live = opaque_id_for_hwnd(hwnd)?;
+            let live = opaque_id_for_element(&element)?;
             if live != bound.opaque {
                 return Err(ComputerError::Refused(
                     EVIDENCED_WINDOW_MISMATCH.to_string(),
@@ -672,32 +793,74 @@ impl WindowsDesktopBackend {
 }
 
 const WINDOW_DELIVERY_TIMEOUT_MS: u32 = 5_000;
+const AMBIGUOUS_WINDOW_DELIVERY: &str = "SendMessageTimeoutW timed out or the target hung; delivery to the evidenced window is uncertain";
 
-/// Holds a USER window-object reference (`GetDC`) so the HWND handle table
-/// slot cannot be reused until drop. This is the Windows analog of X11
-/// `grab_server` for identity-fenced delivery.
-struct HwndObjectLock {
-    hwnd: HWND,
-    dc: HDC,
+fn delivery_is_ambiguous(error: &ComputerError) -> bool {
+    matches!(
+        error,
+        ComputerError::CommandFailed { detail, .. } if detail.contains(AMBIGUOUS_WINDOW_DELIVERY)
+    )
 }
 
-impl HwndObjectLock {
-    fn acquire(hwnd: HWND) -> Result<Self, ComputerError> {
-        // SAFETY: `GetDC` accepts any HWND-sized handle; failure is an
-        // invalid HDC which we refuse rather than proceeding unlocked.
-        let dc = unsafe { GetDC(Some(hwnd)) };
-        if dc.is_invalid() {
-            return Err(win32_error("GetDC"));
+fn ambiguous_send_timeout() -> ComputerError {
+    let last = unsafe { GetLastError() };
+    let detail = if last == ERROR_TIMEOUT || last == ERROR_SUCCESS {
+        AMBIGUOUS_WINDOW_DELIVERY.to_string()
+    } else {
+        format!("{AMBIGUOUS_WINDOW_DELIVERY} ({last:?})")
+    };
+    ComputerError::CommandFailed {
+        program: "windows computer backend".to_string(),
+        detail,
+    }
+}
+
+/// HWND of the retained USER window object, authenticated by planted property
+/// and UIA runtime id. The handle used for `SendMessageTimeoutW` is read from
+/// that live object — never from a stored HWND integer alone.
+fn hwnd_from_retained_window_object(
+    bound: &EvidencedWindowsWindow,
+) -> Result<(HWND, IUIAutomationElement), ComputerError> {
+    let element = if let Some(element) = bound.element.clone() {
+        element
+    } else {
+        let hwnd = hwnd_from_bits(bound.hwnd_bits);
+        if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
         }
-        Ok(Self { hwnd, dc })
+        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        uia_window_element(hwnd)?
+    };
+    let hwnd = unsafe { element.CurrentNativeWindowHandle() }
+        .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+    if hwnd.is_invalid() || hwnd_bits(hwnd) != bound.hwnd_bits {
+        return Err(ComputerError::Refused(
+            EVIDENCED_WINDOW_MISMATCH.to_string(),
+        ));
     }
-}
-
-impl Drop for HwndObjectLock {
-    fn drop(&mut self) {
-        // SAFETY: `dc` was obtained from GetDC on `hwnd` and is released once.
-        let _ = unsafe { ReleaseDC(Some(self.hwnd), self.dc) };
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return Err(ComputerError::Refused(
+            EVIDENCED_WINDOW_MISMATCH.to_string(),
+        ));
     }
+    if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+        return Err(ComputerError::Refused(
+            EVIDENCED_WINDOW_MISMATCH.to_string(),
+        ));
+    }
+    let live = opaque_id_for_element(&element)?;
+    if live != bound.opaque {
+        return Err(ComputerError::Refused(
+            EVIDENCED_WINDOW_MISMATCH.to_string(),
+        ));
+    }
+    Ok((hwnd, element))
 }
 
 fn lparam_point(point: POINT) -> LPARAM {
@@ -722,7 +885,11 @@ fn evidenced_windows_window_from_journal(
     if hwnd_bits == 0 {
         return None;
     }
-    Some(EvidencedWindowsWindow { opaque, hwnd_bits })
+    Some(EvidencedWindowsWindow {
+        opaque,
+        hwnd_bits,
+        element: None,
+    })
 }
 
 fn windows_owned_cleanup_buttons(held: &[MouseButton]) -> Vec<MouseButton> {
@@ -797,24 +964,55 @@ impl ComputerBackend for WindowsDesktopBackend {
                 modifiers,
             } => {
                 self.send_modifiers(*modifiers, false)?;
-                let hwnd = self.require_live_evidenced_window()?;
                 for _ in 0..click_count(*count) {
-                    self.send_button(hwnd, *button, false, self.pointer, true)?;
-                    self.send_button(hwnd, *button, true, self.pointer, true)?;
+                    let previous = self.begin_delivery()?;
+                    let hwnd = match self.require_live_evidenced_window() {
+                        Ok(hwnd) => hwnd,
+                        Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                    };
+                    match self.send_button(hwnd, *button, false, self.pointer, true) {
+                        Ok(()) => self.remember_held_button(*button)?,
+                        Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                        Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                    }
+                    let previous = self.begin_delivery()?;
+                    let hwnd = match self.require_live_evidenced_window() {
+                        Ok(hwnd) => hwnd,
+                        Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                    };
+                    match self.send_button(hwnd, *button, true, self.pointer, true) {
+                        Ok(()) => self.forget_held_button(*button)?,
+                        Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                        Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                    }
                 }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseDown { button } => {
-                self.remember_held_button(*button)?;
-                let hwnd = self.require_live_evidenced_window()?;
-                self.send_button(hwnd, *button, false, self.pointer, true)?;
+                let previous = self.begin_delivery()?;
+                let hwnd = match self.require_live_evidenced_window() {
+                    Ok(hwnd) => hwnd,
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                };
+                match self.send_button(hwnd, *button, false, self.pointer, true) {
+                    Ok(()) => self.remember_held_button(*button)?,
+                    Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                }
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseUp { button } => {
-                let hwnd = self.require_live_evidenced_window()?;
-                self.send_button(hwnd, *button, true, self.pointer, true)?;
-                self.forget_held_button(*button)?;
+                let previous = self.begin_delivery()?;
+                let hwnd = match self.require_live_evidenced_window() {
+                    Ok(hwnd) => hwnd,
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                };
+                match self.send_button(hwnd, *button, true, self.pointer, true) {
+                    Ok(()) => self.forget_held_button(*button)?,
+                    Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                }
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::Drag {
@@ -824,15 +1022,29 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 self.send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
-                self.remember_held_button(*button)?;
-                let hwnd = self.require_live_evidenced_window()?;
-                self.send_button(hwnd, *button, false, self.pointer, true)?;
+                let previous = self.begin_delivery()?;
+                let hwnd = match self.require_live_evidenced_window() {
+                    Ok(hwnd) => hwnd,
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                };
+                match self.send_button(hwnd, *button, false, self.pointer, true) {
+                    Ok(()) => self.remember_held_button(*button)?,
+                    Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                }
                 for step in &path[1..] {
                     move_with_timing(self, step.point, step.duration, step.easing)?;
                 }
-                let hwnd = self.require_live_evidenced_window()?;
-                self.send_button(hwnd, *button, true, self.pointer, true)?;
-                self.forget_held_button(*button)?;
+                let previous = self.begin_delivery()?;
+                let hwnd = match self.require_live_evidenced_window() {
+                    Ok(hwnd) => hwnd,
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                };
+                match self.send_button(hwnd, *button, true, self.pointer, true) {
+                    Ok(()) => self.forget_held_button(*button)?,
+                    Err(error) if delivery_is_ambiguous(&error) => return Err(error),
+                    Err(error) => return self.rollback_known_pre_send_refusal(previous, error),
+                }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -949,12 +1161,14 @@ impl ComputerBackend for WindowsDesktopBackend {
                 CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
             ));
         }
+        plant_hwnd_identity(hwnd, window)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        let element = uia_window_element(hwnd)?;
         self.evidenced_window = Some(EvidencedWindowsWindow {
             opaque: window,
             hwnd_bits: hwnd_bits(hwnd),
+            element: Some(element),
         });
-        plant_hwnd_identity(hwnd, window)
-            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         self.require_live_evidenced_window().map(|_| ())
     }
 
@@ -1551,20 +1765,47 @@ fn foreground_window_identity() -> Result<(HWND, OpaqueWindowId), ComputerError>
 }
 
 fn opaque_id_for_hwnd(hwnd: HWND) -> Result<OpaqueWindowId, ComputerError> {
-    // SAFETY: UI Automation is initialized for the duration of `uia_evidence`.
+    opaque_id_for_element(&uia_window_element(hwnd)?)
+}
+
+fn opaque_id_for_element(element: &IUIAutomationElement) -> Result<OpaqueWindowId, ComputerError> {
+    // SAFETY: UI Automation is initialized for the duration of the runtime-id query.
     unsafe {
-        let capture = uia_evidence(hwnd).map_err(|_| {
+        let identity = uia_runtime_id(element).map_err(|_| {
             ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
         })?;
-        Ok(OpaqueWindowId::from_bytes(
-            capture.fingerprint.window_runtime_id,
-        ))
+        Ok(OpaqueWindowId::from_bytes(identity))
     }
 }
 
+fn ensure_com_mta() -> Result<(), ComputerError> {
+    thread_local! {
+        static INITIALIZED: Cell<bool> = const { Cell::new(false) };
+    }
+    INITIALIZED.with(|initialized| {
+        if !initialized.get() {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.map_err(|_| {
+                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+            })?;
+            initialized.set(true);
+        }
+        Ok(())
+    })
+}
+
+fn uia_window_element(hwnd: HWND) -> Result<IUIAutomationElement, ComputerError> {
+    ensure_com_mta()?;
+    let automation: IUIAutomation = unsafe {
+        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+    }
+    .map_err(|_| ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string()))?;
+    unsafe { automation.ElementFromHandle(hwnd) }
+        .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))
+}
+
 unsafe fn uia_evidence(hwnd: HWND) -> Result<UiaCapture, TargetUnavailableReason> {
-    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-    let evidence = (|| -> Result<_, TargetUnavailableReason> {
+    ensure_com_mta().map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    (|| -> Result<_, TargetUnavailableReason> {
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
@@ -1609,11 +1850,7 @@ unsafe fn uia_evidence(hwnd: HWND) -> Result<UiaCapture, TargetUnavailableReason
             _ => super::windows::UiaWidgetFingerprint::window_only(identity),
         };
         Ok(UiaCapture { fingerprint, name })
-    })();
-    if initialized {
-        unsafe { CoUninitialize() };
-    }
-    evidence
+    })()
 }
 
 /// True when `focused` is the foreground window or a descendant of it.
@@ -1803,6 +2040,19 @@ mod tests {
             mouse_message_keys(&[MouseButton::Middle], MouseButton::Middle, true),
             0
         );
+    }
+
+    #[test]
+    fn send_timeout_while_the_window_lives_is_ambiguous_ownership() {
+        let timeout = ComputerError::CommandFailed {
+            program: "windows computer backend".to_string(),
+            detail: AMBIGUOUS_WINDOW_DELIVERY.to_string(),
+        };
+        assert!(delivery_is_ambiguous(&timeout));
+        assert!(!delivery_is_ambiguous(&ComputerError::Refused(
+            EVIDENCED_WINDOW_MISMATCH.to_string()
+        )));
+        assert!(!delivery_is_ambiguous(&win32_error("SendMessageTimeoutW")));
     }
 
     #[test]

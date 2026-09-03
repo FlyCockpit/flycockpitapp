@@ -19,12 +19,13 @@ pub use macos::{
     AU_DEFAUDITSID, CgSessionKey, MacAxAttribute, MacAxNotification, MacCallbackGate,
     MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,
     TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
-    macos_injection_target_from_opaque, opaque_macos_window_id,
+    macos_injection_target_from_opaque, macos_window_identity_from_opaque, opaque_macos_window_id,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MacFocusedWindowWitness, MacLiveFocusedWindow, address_macos_injection_window,
-    ax_window_element_is_live, live_focused_macos_injection_target, restore_macos_injection_target,
+    MacAddressedInjection, MacFocusedWindowWitness, MacLiveFocusedWindow,
+    address_macos_injection_window, ax_window_element_is_live, live_focused_macos_injection_target,
+    restore_macos_injection_target,
 };
 pub use wayland::{
     WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,

@@ -866,13 +866,21 @@ fn physical_backend_irreversible_primitive_inventory() {
         "post_event must address the retained AX window object, not a stored pid"
     );
     assert!(
-        mac_post_src.contains("MouseEventWindowUnderMousePointer")
-            && mac_post_src.contains("MouseEventWindowUnderMousePointerThatCanHandleThisEvent"),
-        "post_event must name the evidenced CGWindowID on the event"
+        mac_post_src.contains("stamp_event_window_destination"),
+        "post_event must stamp the live AX-joined CGWindowID as the event destination"
     );
     assert!(
         !mac_post_src.contains("try_from(bound.pid)"),
         "post_event must not post using a stored pid that can be reused"
+    );
+    assert!(
+        mac.contains("stamp_event_window_destination")
+            && mac.contains("EVENT_DESTINATION_WINDOW_NUMBER"),
+        "macOS delivery must name the destination CGWindowID on the event itself"
+    );
+    assert!(
+        mac.contains("CGEventSetWindowLocation"),
+        "macOS mouse delivery must set window-local coordinates on the evidenced window"
     );
     assert!(
         mac_post_src.contains("require_live_injection_window")
@@ -928,8 +936,9 @@ fn physical_backend_irreversible_primitive_inventory() {
         windows_post
             .0
             .iter()
-            .any(|call| call == "acquire" || call.ends_with("::acquire")),
-        "Windows post_to_target must hold the USER window object across identity and delivery: {:?}",
+            .any(|call| call == "hwnd_from_retained_window_object"
+                || call.ends_with("::hwnd_from_retained_window_object")),
+        "Windows post_to_target must send to the HWND of the retained UIA window object: {:?}",
         windows_post.0
     );
     assert!(
@@ -945,6 +954,15 @@ fn physical_backend_irreversible_primitive_inventory() {
         "Windows post_to_target must re-check the planted HWND identity at delivery: {:?}",
         windows_post.0
     );
+    assert!(
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "ambiguous_send_timeout"
+                || call.ends_with("::ambiguous_send_timeout")),
+        "Windows post_to_target must treat a live-window timeout as ambiguous ownership: {:?}",
+        windows_post.0
+    );
     let windows_source = std::fs::read_to_string(core.join("computer/platform/windows_native.rs"))
         .expect("windows backend source");
     assert!(
@@ -952,9 +970,18 @@ fn physical_backend_irreversible_primitive_inventory() {
         "Windows must not use session-global SendInput"
     );
     assert!(
-        windows_source.contains("struct HwndObjectLock")
-            && windows_source.contains("GetDC(Some(hwnd))"),
-        "Windows must lock the USER window object so HWND recycling cannot race delivery"
+        !windows_source.contains("struct HwndObjectLock")
+            && !windows_source.contains("GetDC(Some(hwnd))"),
+        "GetDC is not a USER object lock; delivery must use the retained UIA window object"
+    );
+    assert!(
+        windows_source.contains("CurrentNativeWindowHandle")
+            && windows_source.contains("IUIAutomationElement"),
+        "Windows must retain the UIA window object so delivery addresses that object"
+    );
+    assert!(
+        windows_source.contains("pending") && windows_source.contains("begin_delivery"),
+        "Windows must mark ownership uncertain before SendMessageTimeoutW"
     );
     assert!(
         !windows_source.contains("PostMessageW("),
@@ -980,6 +1007,22 @@ fn physical_backend_irreversible_primitive_inventory() {
                 || call.ends_with("::restore_macos_injection_target")),
         "macOS cleanup must restore the persisted AX window identity: {:?}",
         mac_release.0
+    );
+    let macos_platform = std::fs::read_to_string(core.join("computer/platform/macos.rs"))
+        .expect("macos platform source");
+    assert!(
+        macos_platform.contains("macos_window_identity_from_opaque")
+            && macos_platform.contains("read_macos_window_generation")
+            && macos_platform.contains("plant_macos_window_generation"),
+        "macOS crash recovery must plant and authenticate the lifetime epoch on the CG window object"
+    );
+    assert!(
+        macos_platform
+            .split("fn restore_macos_injection_target")
+            .nth(1)
+            .expect("restore_macos_injection_target")
+            .contains("read_macos_window_generation"),
+        "restore_macos_injection_target must authenticate the planted generation, not join pid/window-number alone"
     );
     assert!(
         mac.contains("window: Option<[u8; 16]>"),

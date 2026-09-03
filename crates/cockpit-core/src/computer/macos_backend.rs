@@ -24,8 +24,8 @@ use super::{
     click_repetitions, eased_progress, scale_png,
 };
 use crate::computer::platform::{
-    MacFocusedWindowWitness, MacLiveFocusedWindow, address_macos_injection_window,
-    ax_window_element_is_live, live_focused_macos_injection_target,
+    MacAddressedInjection, MacFocusedWindowWitness, MacLiveFocusedWindow,
+    address_macos_injection_window, ax_window_element_is_live, live_focused_macos_injection_target,
     macos_injection_target_from_opaque, restore_macos_injection_target,
 };
 use crate::computer::target::{BackendKind, OpaqueWindowId};
@@ -305,6 +305,8 @@ impl MacOsComputerBackend {
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
         }
+        address_macos_injection_window(&bound.ax, &bound.opaque)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         Ok(bound)
     }
 
@@ -503,11 +505,11 @@ impl MacOsComputerBackend {
 
     /// Sole irreversible CoreGraphics post primitive. Every event, including
     /// cleanup releases, must pass the retained active-console-session rebound
-    /// and then be addressed through the retained AX window object. CoreGraphics
-    /// has no CGWindowID destination, so the AX object is installed as the
-    /// application's focused window and the pid is read from that live object
-    /// immediately before `post_to_pid`. A stored pid/window-number pair is
-    /// never the destination operand.
+    /// and then be addressed through the retained AX window object. Pid and
+    /// CGWindowID are read from that live object and authenticated by the
+    /// planted generation; the window number is the event destination, not
+    /// process focus. A stored pid/window-number pair is never the destination
+    /// operand.
     fn post_event(
         &mut self,
         event: &CGEvent,
@@ -551,8 +553,8 @@ impl MacOsComputerBackend {
                 Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
             }
         };
-        let pid = match address_macos_injection_window(&bound.ax) {
-            Ok(pid) => pid,
+        let addressed = match address_macos_injection_window(&bound.ax, &bound.opaque) {
+            Ok(addressed) => addressed,
             Err(_) => {
                 return self.rollback_known_pre_post_refusal(
                     prepared,
@@ -560,22 +562,8 @@ impl MacOsComputerBackend {
                 );
             }
         };
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::EventTargetUnixProcessID,
-            i64::from(pid),
-        );
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::MouseEventWindowUnderMousePointer,
-            i64::from(bound.window_number),
-        );
-        CGEvent::set_integer_value_field(
-            Some(event),
-            CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
-            i64::from(bound.window_number),
-        );
-        CGEvent::post_to_pid(pid, Some(event));
+        stamp_event_window_destination(event, addressed);
+        CGEvent::post_to_pid(addressed.pid, Some(event));
 
         // From the post onward this backend owns the transition even if the
         // commit write fails. Update process-local cleanup ownership first;
@@ -1105,6 +1093,58 @@ fn command_error(program: &str, error: impl std::fmt::Display) -> ComputerError 
 
 fn cg_null(program: &str) -> ComputerError {
     command_error(program, "CoreGraphics returned null")
+}
+
+/// AppKit routes a process-directed event using this CGEvent field as the
+/// destination CGWindowID (`NSEvent.windowNumber`). Distinct from the public
+/// `kCGMouseEventWindowUnderMousePointer` annotation, which is not a destination.
+const EVENT_DESTINATION_WINDOW_NUMBER: CGEventField = CGEventField(55);
+
+fn stamp_event_window_destination(event: &CGEvent, addressed: MacAddressedInjection) {
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::EventTargetUnixProcessID,
+        i64::from(addressed.pid),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        EVENT_DESTINATION_WINDOW_NUMBER,
+        i64::from(addressed.window_number),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::MouseEventWindowUnderMousePointer,
+        i64::from(addressed.window_number),
+    );
+    CGEvent::set_integer_value_field(
+        Some(event),
+        CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+        i64::from(addressed.window_number),
+    );
+    let screen = CGEvent::location(Some(event));
+    let local = CGPoint::new(screen.x - addressed.origin.x, screen.y - addressed.origin.y);
+    if let Some(set_location) = cg_event_set_window_location() {
+        // SAFETY: `event` is a live CGEvent; the private setter writes the
+        // window-local point AppKit uses to route inside `window_number`.
+        unsafe { set_location(std::ptr::from_ref(event).cast(), local) };
+    }
+}
+
+type CgEventSetWindowLocationFn =
+    unsafe extern "C" fn(event: *const std::ffi::c_void, point: CGPoint);
+
+fn cg_event_set_window_location() -> Option<CgEventSetWindowLocationFn> {
+    static CACHED: std::sync::OnceLock<Option<CgEventSetWindowLocationFn>> =
+        std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        const RTLD_DEFAULT: *mut std::ffi::c_void = (-2_isize) as *mut std::ffi::c_void;
+        let ptr = unsafe { libc::dlsym(RTLD_DEFAULT, c"CGEventSetWindowLocation".as_ptr()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(ptr) })
+        }
+    })
 }
 
 fn modifier_flags(modifiers: Modifiers) -> CGEventFlags {

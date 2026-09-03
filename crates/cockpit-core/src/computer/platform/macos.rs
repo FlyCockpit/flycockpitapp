@@ -462,13 +462,22 @@ pub fn opaque_macos_window_id(pid: u32, window_number: u32, lifetime_epoch: u64)
 /// `None` when either targeting field is zero so callers refuse rather than
 /// post through the session-global HID tap.
 pub fn macos_injection_target_from_opaque(id: &OpaqueWindowId) -> Option<(u32, u32)> {
+    let (pid, window_number, _) = macos_window_identity_from_opaque(id)?;
+    Some((pid, window_number))
+}
+
+/// PID, CoreGraphics window number, and planted AX lifetime epoch stored by
+/// [`opaque_macos_window_id`]. `None` when any field is zero so a recycled
+/// pair cannot match without the generation token.
+pub fn macos_window_identity_from_opaque(id: &OpaqueWindowId) -> Option<(u32, u32, u64)> {
     let bytes = id.as_bytes();
     let pid = u32::from_le_bytes(bytes[..4].try_into().ok()?);
     let window_number = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    if pid == 0 || window_number == 0 {
+    let lifetime_epoch = u64::from_le_bytes(bytes[8..].try_into().ok()?);
+    if pid == 0 || window_number == 0 || lifetime_epoch == 0 {
         return None;
     }
-    Some((pid, window_number))
+    Some((pid, window_number, lifetime_epoch))
 }
 
 /// Live focused-window targeting fields observed independently of the
@@ -1292,6 +1301,7 @@ impl MacOsTargetEvidenceAdapter {
             display_id_from_uuid_bytes(display_uuid_bytes),
             EvidenceSource::ColorSyncDisplayUuid,
         );
+        plant_macos_window_generation(window_number, focused_window_lifetime_epoch)?;
         snapshot.focused_window_id = FieldEvidence::available(
             opaque_macos_window_id(frontmost_pid, window_number, focused_window_lifetime_epoch),
             EvidenceSource::CgWindowList,
@@ -1589,8 +1599,9 @@ pub(crate) fn ax_window_element_is_live(element: &objc2_application_services::AX
 /// Re-acquire the AX window object named by a persisted opaque id.
 ///
 /// Crash recovery has no retained CF witness. The pid/window-number pair is
-/// joined against the live AX window list of that process; a recycled pair
-/// that does not uniquely match is refused rather than guessed.
+/// joined against the live AX window list of that process, then authenticated
+/// against the generation planted on that CoreGraphics window object. A
+/// recycled pair whose planted token does not match is refused.
 #[cfg(target_os = "macos")]
 pub(crate) fn restore_macos_injection_target(
     opaque: &OpaqueWindowId,
@@ -1598,8 +1609,13 @@ pub(crate) fn restore_macos_injection_target(
     use objc2_application_services::AXUIElement;
     use objc2_core_foundation::{CFArray, CFRetained};
 
-    let (pid, window_number) =
-        macos_injection_target_from_opaque(opaque).ok_or(TargetUnavailableReason::QueryMismatch)?;
+    let (pid, window_number, epoch) =
+        macos_window_identity_from_opaque(opaque).ok_or(TargetUnavailableReason::QueryMismatch)?;
+    let planted =
+        read_macos_window_generation(window_number)?.ok_or(TargetUnavailableReason::StaleTarget)?;
+    if planted != epoch {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
     let pid_t = libc::pid_t::try_from(pid).map_err(|_| TargetUnavailableReason::QueryMismatch)?;
     // SAFETY: AXUIElementCreateApplication is documented to return a retained
     // application element for any pid; a dead pid fails subsequent queries.
@@ -1622,51 +1638,205 @@ pub(crate) fn restore_macos_injection_target(
         0 => return Err(TargetUnavailableReason::FocusIdentityUnavailable),
         _ => return Err(TargetUnavailableReason::AmbiguousOutput),
     };
+    let planted =
+        read_macos_window_generation(window_number)?.ok_or(TargetUnavailableReason::StaleTarget)?;
+    if planted != epoch {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
     Ok(MacLiveInjectionTarget {
         window: MacLiveFocusedWindow { pid, window_number },
         ax: MacFocusedWindowWitness::new(window),
     })
 }
 
-/// Install the retained AX window as the destination of the owning
-/// application's input. CoreGraphics cannot accept a CGWindowID; the window
-/// object itself is made the key window, and the pid used for posting is
-/// read from that live object rather than a stored integer.
+/// Live pid and CGWindowID read from the retained AX window object, then
+/// authenticated against the generation planted on that CoreGraphics window.
+/// The returned window number is the destination operand stamped onto the
+/// event; a stored pid/window-number pair is never the destination.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MacAddressedInjection {
+    pub pid: libc::pid_t,
+    pub window_number: u32,
+    pub origin: objc2_core_foundation::CGPoint,
+}
+
+/// Address the retained AX window object for irreversible delivery.
+///
+/// Pid and CGWindowID are read from the live AX element and authenticated by
+/// the planted generation. AXRaise is best-effort visual ordering; it is not
+/// the destination. Focus writes are not a lock and are not used as the
+/// delivery operand.
 #[cfg(target_os = "macos")]
 pub(crate) fn address_macos_injection_window(
     witness: &MacFocusedWindowWitness,
-) -> Result<libc::pid_t, TargetUnavailableReason> {
-    use objc2_application_services::{AXError, AXUIElement};
-    use objc2_core_foundation::{CFString, CFType};
+    expected: &OpaqueWindowId,
+) -> Result<MacAddressedInjection, TargetUnavailableReason> {
+    use objc2_application_services::AXError;
+    use objc2_core_foundation::CFString;
 
+    let (expected_pid, expected_window, expected_epoch) =
+        macos_window_identity_from_opaque(expected)
+            .ok_or(TargetUnavailableReason::QueryMismatch)?;
     let window = witness.element();
     if !ax_window_element_is_live(window) {
         return Err(TargetUnavailableReason::StaleTarget);
     }
     let mut pid: libc::pid_t = 0;
     let pid_status = unsafe { window.pid(std::ptr::NonNull::from(&mut pid)) };
-    if pid_status != AXError::Success || pid <= 0 {
+    if pid_status != AXError::Success || pid <= 0 || u32::try_from(pid).ok() != Some(expected_pid) {
         return Err(TargetUnavailableReason::QueryMismatch);
     }
-    // SAFETY: `pid` was just read from a live AX window object.
-    let application = unsafe { AXUIElement::new_application(pid) };
-    let raise = CFString::from_static_str("AXRaise");
-    // Raise is best-effort: some windows do not implement the action. The
-    // focused-window write below is the addressing that must succeed.
-    let _ = unsafe { window.perform_action(&raise) };
-    let focused = CFString::from_static_str(MacAxAttribute::FocusedWindow.as_static_str());
-    let window_type: &CFType = window.as_ref();
-    let set_status = unsafe { application.set_attribute_value(&focused, window_type) };
-    if set_status != AXError::Success {
-        return Err(TargetUnavailableReason::QueryMismatch);
-    }
-    let live = ax_attribute(&application, MacAxAttribute::FocusedWindow)?
-        .downcast::<AXUIElement>()
-        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
-    if !witness.same_element(&live) {
+    let (position, size) = ax_window_rect(window)?;
+    let window_number = cg_window_number_for_ax_window(expected_pid, position, size)?;
+    if window_number != expected_window {
         return Err(TargetUnavailableReason::StaleTarget);
     }
-    Ok(pid)
+    let planted =
+        read_macos_window_generation(window_number)?.ok_or(TargetUnavailableReason::StaleTarget)?;
+    if planted != expected_epoch {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
+    let raise = CFString::from_static_str("AXRaise");
+    let _ = unsafe { window.perform_action(&raise) };
+    Ok(MacAddressedInjection {
+        pid,
+        window_number,
+        origin: position,
+    })
+}
+
+const MACOS_WINDOW_GENERATION_KEY: &str = "com.flycockpit.window-generation";
+
+#[cfg(target_os = "macos")]
+fn plant_macos_window_generation(
+    window_number: u32,
+    epoch: u64,
+) -> Result<(), TargetUnavailableReason> {
+    let Some(set) = cgs_set_window_property() else {
+        return Err(TargetUnavailableReason::MissingCapability);
+    };
+    let cid = cgs_main_connection_id().ok_or(TargetUnavailableReason::MissingCapability)?;
+    let key = objc2_core_foundation::CFString::from_static_str(MACOS_WINDOW_GENERATION_KEY);
+    let value = objc2_core_foundation::CFNumber::new_i64(epoch as i64);
+    // SAFETY: `key`/`value` are live CF objects for the call; CGS copies them.
+    let status = unsafe {
+        set(
+            cid,
+            window_number,
+            key.as_ref() as *const _ as *const std::ffi::c_void,
+            value.as_ref() as *const _ as *const std::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    let live = read_macos_window_generation(window_number)?
+        .ok_or(TargetUnavailableReason::QueryMismatch)?;
+    if live != epoch {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_window_generation(
+    window_number: u32,
+) -> Result<Option<u64>, TargetUnavailableReason> {
+    let Some(copy) = cgs_copy_window_property() else {
+        return Ok(None);
+    };
+    let Some(cid) = cgs_main_connection_id() else {
+        return Ok(None);
+    };
+    let key = objc2_core_foundation::CFString::from_static_str(MACOS_WINDOW_GENERATION_KEY);
+    let mut raw: *const objc2_core_foundation::CFType = std::ptr::null();
+    // SAFETY: `raw` is a writable out pointer. On success CGS returns a +1 CF object.
+    let status = unsafe {
+        copy(
+            cid,
+            window_number,
+            key.as_ref() as *const _ as *const std::ffi::c_void,
+            (&mut raw as *mut *const objc2_core_foundation::CFType).cast(),
+        )
+    };
+    if status != 0 || raw.is_null() {
+        return Ok(None);
+    }
+    let raw =
+        std::ptr::NonNull::new(raw.cast_mut()).ok_or(TargetUnavailableReason::QueryMismatch)?;
+    // SAFETY: CGSCopyWindowProperty transferred a +1 CF object.
+    let value = unsafe { objc2_core_foundation::CFRetained::from_raw(raw) };
+    let number = value
+        .downcast::<objc2_core_foundation::CFNumber>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let epoch = number
+        .as_i64()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|epoch| *epoch != 0)
+        .ok_or(TargetUnavailableReason::QueryMismatch)?;
+    Ok(Some(epoch))
+}
+
+#[cfg(target_os = "macos")]
+fn cgs_main_connection_id() -> Option<i32> {
+    type Fn = unsafe extern "C" fn() -> i32;
+    static CACHED: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let f = CACHED.get_or_init(|| dlsym_fn(c"CGSMainConnectionID"))?;
+    // SAFETY: CGSMainConnectionID takes no arguments and returns the process
+    // WindowServer connection id.
+    Some(unsafe { f() })
+}
+
+#[cfg(target_os = "macos")]
+fn cgs_set_window_property()
+-> Option<unsafe extern "C" fn(i32, u32, *const std::ffi::c_void, *const std::ffi::c_void) -> i32> {
+    static CACHED: std::sync::OnceLock<
+        Option<
+            unsafe extern "C" fn(i32, u32, *const std::ffi::c_void, *const std::ffi::c_void) -> i32,
+        >,
+    > = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| dlsym_fn(c"CGSSetWindowProperty"))
+}
+
+#[cfg(target_os = "macos")]
+fn cgs_copy_window_property() -> Option<
+    unsafe extern "C" fn(i32, u32, *const std::ffi::c_void, *mut *const std::ffi::c_void) -> i32,
+> {
+    static CACHED: std::sync::OnceLock<
+        Option<
+            unsafe extern "C" fn(
+                i32,
+                u32,
+                *const std::ffi::c_void,
+                *mut *const std::ffi::c_void,
+            ) -> i32,
+        >,
+    > = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| dlsym_fn(c"CGSCopyWindowProperty"))
+}
+
+#[cfg(target_os = "macos")]
+fn dlsym_fn<T>(name: &std::ffi::CStr) -> Option<T> {
+    const RTLD_DEFAULT: *mut std::ffi::c_void = (-2_isize) as *mut std::ffi::c_void;
+    // SAFETY: `name` is a static C string; a NULL return means the symbol is absent.
+    let mut ptr = unsafe { libc::dlsym(RTLD_DEFAULT, name.as_ptr()) };
+    if ptr.is_null() {
+        let sky = unsafe {
+            libc::dlopen(
+                c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight".as_ptr(),
+                libc::RTLD_LAZY,
+            )
+        };
+        if sky.is_null() {
+            return None;
+        }
+        ptr = unsafe { libc::dlsym(sky, name.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+    }
+    Some(unsafe { std::mem::transmute_copy(&ptr) })
 }
 
 #[cfg(target_os = "macos")]
@@ -1939,12 +2109,16 @@ mod authority_transaction_tests {
 
 #[cfg(test)]
 mod opaque_window_tests {
-    use super::{macos_injection_target_from_opaque, opaque_macos_window_id};
+    use super::{
+        macos_injection_target_from_opaque, macos_window_identity_from_opaque,
+        opaque_macos_window_id,
+    };
 
     #[test]
     fn macos_window_id_round_trips_targeting_fields_and_rejects_zeros() {
         let id = opaque_macos_window_id(4242, 99, 7);
         assert_eq!(macos_injection_target_from_opaque(&id), Some((4242, 99)));
+        assert_eq!(macos_window_identity_from_opaque(&id), Some((4242, 99, 7)));
         assert_eq!(id.as_bytes()[8..], 7_u64.to_le_bytes());
         assert_eq!(
             macos_injection_target_from_opaque(&opaque_macos_window_id(0, 99, 1)),
@@ -1952,6 +2126,10 @@ mod opaque_window_tests {
         );
         assert_eq!(
             macos_injection_target_from_opaque(&opaque_macos_window_id(1, 0, 1)),
+            None
+        );
+        assert_eq!(
+            macos_window_identity_from_opaque(&opaque_macos_window_id(1, 1, 0)),
             None
         );
     }
@@ -1963,6 +2141,11 @@ mod opaque_window_tests {
         assert_ne!(first, recycled);
         assert_eq!(macos_injection_target_from_opaque(&first), Some((8, 16)));
         assert_eq!(macos_injection_target_from_opaque(&recycled), Some((8, 16)));
+        assert_eq!(macos_window_identity_from_opaque(&first), Some((8, 16, 1)));
+        assert_eq!(
+            macos_window_identity_from_opaque(&recycled),
+            Some((8, 16, 2))
+        );
     }
 }
 

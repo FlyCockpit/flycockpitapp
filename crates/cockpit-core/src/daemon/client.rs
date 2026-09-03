@@ -99,7 +99,7 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
         LifecycleMode::AttachOrEphemeral
     };
     let connected = probe_or_spawn(mode).await?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if !matches!(&connected.endpoint, cockpit_client::ClientEndpoint::Wire(_)) {
             anyhow::bail!("ACP requires a discoverable socket ledger owner");
@@ -109,7 +109,7 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
         }
         return Ok(connected.client);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = connected;
         anyhow::bail!("ACP socket ledger ownership is unavailable on this platform")

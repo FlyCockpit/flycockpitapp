@@ -1277,6 +1277,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "cockpit-host",
  "cockpit-proto",
  "rand 0.10.2",
  "serde",

@@ -3968,3 +3968,89 @@ fn malformed_upper_layer_section_cannot_clobber_lower_layer_setting() {
         "the lower layer's valid retention must load without warnings: {warnings:?}"
     );
 }
+
+#[test]
+fn recovery_keeps_valid_sections_alongside_a_malformed_one() {
+    // The per-section recovery path (linear single-key probes plus one final
+    // union decode) must drop only the malformed key: every other section
+    // still loads, and the dropped key is named in exactly one warning.
+    let mut raw = serde_json::Map::new();
+    raw.insert(
+        "retention".into(),
+        serde_json::json!({ "session_window_days": 30 }),
+    );
+    raw.insert("predictNextMessage".into(), Value::Array(Vec::new()));
+    let (cfg, warnings) = doc_from_raw(Value::Object(raw)).config_with_warnings();
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("predictNextMessage"), "{warnings:?}");
+}
+
+#[test]
+fn sandbox_alias_pair_is_one_setting_with_canonical_spelling_winning() {
+    // A rename/alias pair is ONE setting, not two sections: when a document
+    // carries both spellings, the canonical one wins and the typed decode
+    // still succeeds in one shot — the recovery path must never commit the
+    // alias first (it sorts before the canonical key) and drop the
+    // canonical value as a duplicate.
+    let doc = doc_from_raw(serde_json::json!({
+        "sandboxEscalationEnabled": true,
+        "sandbox_escalation_enabled": false
+    }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(!cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // The legacy spelling alone is still honored.
+    let doc = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(!cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn layered_sandbox_spelling_does_not_affect_last_layer_wins() {
+    // Layered last-layer-wins must not depend on which spelling each layer
+    // used. Each layer is normalized to the canonical key before merge, so
+    // deep merge never sees two spellings of one setting and layer order
+    // alone decides. Before per-layer normalization, the lower layer's
+    // alias sorted first in recovery and silently beat the upper layer's
+    // canonical spelling.
+    let lower_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
+    let upper_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": true }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_alias, upper_canonical]);
+    assert!(cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let lower_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": false }));
+    let upper_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": true }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_canonical, upper_alias]);
+    assert!(cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn extended_config_key_alias_table_matches_serde() {
+    // Staleness guard for `EXTENDED_CONFIG_KEY_ALIASES`: the canonical key
+    // must be a key the type actually serializes, and the alias must be a
+    // real serde alias of it — carrying both spellings in one raw document
+    // must collide in the typed decode as a duplicate field. A stale table
+    // entry (alias removed from the struct, or pointing at a non-field)
+    // fails here instead of silently rewriting keys.
+    for (alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
+        let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
+        assert!(
+            default_doc.as_object().unwrap().contains_key(*canonical),
+            "`{canonical}` is not a serialized canonical config key"
+        );
+        let mut raw = serde_json::Map::new();
+        raw.insert(alias.to_string(), Value::Bool(true));
+        raw.insert(canonical.to_string(), Value::Bool(false));
+        let error = serde_json::from_value::<ExtendedConfig>(Value::Object(raw))
+            .expect_err("two spellings of one field must collide in the raw typed decode");
+        assert!(
+            error.to_string().contains("duplicate field"),
+            "unexpected error for `{alias}` vs `{canonical}`: {error}"
+        );
+    }
+}

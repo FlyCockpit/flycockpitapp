@@ -39,12 +39,16 @@ mod history_scope_tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .current_dir(&repo)
             .args(["init"])
             .output()
             .expect("run git init");
-        assert!(status.success, "git init failed in {}", repo.display());
+        assert!(
+            output.status.success(),
+            "git init failed in {}",
+            repo.display()
+        );
         let subdir = repo.join("crates").join("inner");
         std::fs::create_dir_all(&subdir).unwrap();
 

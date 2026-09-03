@@ -627,6 +627,9 @@ pub struct ExtendedConfig {
     /// Whether sandbox escalation is enabled for new sessions. When true, a
     /// sandboxed command may offer an explicit unsandboxed retry path; the
     /// approval mode still controls whether that retry requires confirmation.
+    /// The camelCase `alias` is a read-only legacy spelling: it must stay
+    /// registered in `EXTENDED_CONFIG_KEY_ALIASES` so the canonical spelling
+    /// wins when a document carries both.
     #[serde(
         default = "default_true",
         rename = "sandbox_escalation_enabled",
@@ -2774,6 +2777,52 @@ pub(crate) fn strip_secret_store_key(raw: &mut Value) {
     }
 }
 
+/// Accepted alternate spellings for top-level [`ExtendedConfig`] keys,
+/// paired with the key's canonical spelling.
+///
+/// A rename/alias pair is ONE setting, not two sections. serde's derived
+/// deserializer treats both spellings as the same field, so a document
+/// carrying both fails the typed decode with `duplicate field`, and without
+/// normalization the per-section recovery path would commit whichever
+/// spelling sorts first in the (BTree-backed) object map — inverting the
+/// documented canonical-spelling-wins contract and making layered
+/// last-layer-wins depend on which spelling each layer happened to use.
+/// [`canonicalize_extended_config_key_aliases`] renames every accepted
+/// spelling to its canonical key (canonical spelling wins when a document
+/// carries both) at the typed decode/merge funnels, so serde never sees a
+/// duplicate field.
+///
+/// When adding a `serde(alias)` to a top-level `ExtendedConfig` field,
+/// register the pair here: `extended_config_key_alias_table_matches_serde`
+/// in `extended/tests.rs` fails a stale entry, and the incremental fallback
+/// in [`ExtendedConfigDoc::recover_typed_config`] keeps an unregistered pair
+/// from zeroing the settings view (one spelling still wins by commit order).
+const EXTENDED_CONFIG_KEY_ALIASES: &[(&str, &str)] =
+    &[("sandboxEscalationEnabled", "sandbox_escalation_enabled")];
+
+/// Rename accepted alternate spellings ([`EXTENDED_CONFIG_KEY_ALIASES`]) to
+/// their canonical key. The canonical spelling wins when the document
+/// carries both, matching the pre-typed-decode parse order that applied the
+/// canonical key last; a document carrying only the alternate spelling is
+/// honored unchanged. Applied to clones at the decode/merge funnels
+/// ([`ExtendedConfigDoc::config_with_warnings`] and
+/// [`ExtendedConfigDoc::raw_for_layer_merge`]) so the stored raw keeps the
+/// on-disk spelling for round-trip preservation while no decode or merge
+/// ever sees two spellings of one setting.
+fn canonicalize_extended_config_key_aliases(raw: &mut Map<String, Value>) {
+    for &(alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
+        // Rename the alternate spelling to the canonical key. When the
+        // document carries both, the canonical spelling wins and the
+        // alternate value is dropped — exactly like the pre-typed-decode
+        // parse order, which applied the canonical key last.
+        if let Some(value) = raw.remove(alias)
+            && raw.get(canonical).is_none()
+        {
+            raw.insert(canonical.to_string(), value);
+        }
+    }
+}
+
 /// Stable, secret-free warning for a malformed `image_generation` value.
 /// Deliberately omits BOTH the deserialization/validation error (whose `{:?}`
 /// rendering can embed attacker-supplied credential-like strings) AND the
@@ -2890,20 +2939,25 @@ impl ExtendedConfigDoc {
     /// structurally.
     ///
     /// Per-section independence is preserved: when the whole-document
-    /// decode fails, each top-level key is retried against the accumulated
-    /// document ([`Self::recover_typed_config`]), so one malformed section
-    /// is dropped with a warning instead of zeroing the entire settings
-    /// view.
+    /// decode fails, each top-level key is retried on its own
+    /// ([`Self::recover_typed_config`]), so one malformed section is dropped
+    /// with a warning instead of zeroing the entire settings view.
+    ///
+    /// Alternate spellings (`EXTENDED_CONFIG_KEY_ALIASES`) are normalized
+    /// to the canonical key first (canonical spelling wins when the document
+    /// carries both), so serde never sees a duplicate field.
     pub fn config_with_warnings(&self) -> (ExtendedConfig, Vec<String>) {
         let mut cfg = ExtendedConfig::default();
         let mut warnings = Vec::new();
-        let Some(raw) = self.raw.as_object() else {
+        let Some(raw_obj) = self.raw.as_object() else {
             return (cfg, warnings);
         };
+        let mut raw = raw_obj.clone();
+        canonicalize_extended_config_key_aliases(&mut raw);
 
         match serde_json::from_value::<ExtendedConfig>(Value::Object(raw.clone())) {
             Ok(parsed) => cfg = parsed,
-            Err(_) => cfg = self.recover_typed_config(raw, &mut warnings),
+            Err(_) => cfg = self.recover_typed_config(&raw, &mut warnings),
         }
 
         // `image_spend` is intentionally not a config section: spend policy
@@ -2952,57 +3006,97 @@ impl ExtendedConfigDoc {
     }
 
     /// Per-section recovery for documents whose whole-document typed decode
-    /// fails. A top-level key is committed only when `accumulated + key`
-    /// still decodes through the [`ExtendedConfig`] type; a key that does
-    /// not decode is left at its default with a warning, so one malformed
+    /// fails. Each top-level key is probed against a single-key document, so
+    /// one malformed section costs one section decode; a key that does not
+    /// decode is left at its default with a warning, so one malformed
     /// section cannot zero the rest of the settings view. Keys the type
     /// does not recognize (provider metadata, future keys) decode trivially
     /// and stay ignored exactly as before.
+    ///
+    /// The probe is per-key (not against the accumulated document) so
+    /// recovery stays linear: re-decoding the accumulated document for every
+    /// key was quadratic in the number of top-level keys, and the 2 MiB
+    /// document cap ([`crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES`])
+    /// admits on the order of 10^5 of them. Top-level fields decode
+    /// independently and alternate spellings are normalized away by
+    /// [`canonicalize_extended_config_key_aliases`] before this runs, so the
+    /// union of individually-valid keys decodes in one final pass. The
+    /// incremental fallback inside is the drift guard for a future
+    /// `serde(alias)` added without a companion
+    /// [`EXTENDED_CONFIG_KEY_ALIASES`] entry: two spellings of one field
+    /// would fail jointly (duplicate field) there, and commit-order recovery
+    /// still loads every other section instead of zeroing the settings view.
     fn recover_typed_config(
         &self,
         raw: &Map<String, Value>,
         warnings: &mut Vec<String>,
     ) -> ExtendedConfig {
-        let mut accumulated: Map<String, Value> = Map::new();
-        let mut recovered = ExtendedConfig::default();
+        let mut accepted: Map<String, Value> = Map::new();
         for (key, value) in raw {
-            let mut probe = accumulated.clone();
+            let mut probe = Map::new();
             probe.insert(key.clone(), value.clone());
-            match serde_json::from_value::<ExtendedConfig>(Value::Object(probe.clone())) {
-                Ok(parsed) => {
-                    accumulated = probe;
-                    recovered = parsed;
+            match serde_json::from_value::<ExtendedConfig>(Value::Object(probe)) {
+                Ok(_) => {
+                    accepted.insert(key.clone(), value.clone());
                 }
-                Err(error) => match key.as_str() {
-                    // Path-free AND error-free for these sections: the
-                    // config path can itself carry a secret (token-named
-                    // dir) and the serde error can embed credential-like
-                    // values, so neither may reach the log.
-                    "image_generation" => {
-                        tracing::warn!("ignored malformed `image_generation` configuration");
-                        warnings.push(image_generation_malformed_warning());
-                    }
-                    "knowledgeBases" => {
-                        tracing::warn!("ignored invalid `knowledgeBases` policy");
-                        warnings.push("ignored invalid `knowledgeBases` policy".to_string());
-                    }
-                    _ => {
-                        tracing::warn!(
-                            path = %self.path.display(),
-                            key = %key,
-                            %error,
-                            "skipping malformed extended config field"
-                        );
-                        warnings.push(format!(
-                            "ignored malformed `{}` in {}",
-                            key,
-                            self.path.display()
-                        ));
-                    }
-                },
+                Err(error) => self.warn_skipped_config_key(key, &error, warnings),
             }
         }
-        recovered
+        match serde_json::from_value::<ExtendedConfig>(Value::Object(accepted.clone())) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let mut accumulated: Map<String, Value> = Map::new();
+                let mut recovered = ExtendedConfig::default();
+                for (key, value) in &accepted {
+                    let mut probe = accumulated.clone();
+                    probe.insert(key.clone(), value.clone());
+                    match serde_json::from_value::<ExtendedConfig>(Value::Object(probe.clone())) {
+                        Ok(parsed) => {
+                            accumulated = probe;
+                            recovered = parsed;
+                        }
+                        Err(error) => self.warn_skipped_config_key(key, &error, warnings),
+                    }
+                }
+                recovered
+            }
+        }
+    }
+
+    /// Warn for a top-level key the typed decode rejected. Path-free AND
+    /// error-free for the credential-bearing sections: the config path can
+    /// itself carry a secret (token-named dir) and the serde error can embed
+    /// credential-like values, so neither may reach the log or the returned
+    /// warning for those sections.
+    fn warn_skipped_config_key(
+        &self,
+        key: &str,
+        error: &serde_json::Error,
+        warnings: &mut Vec<String>,
+    ) {
+        match key {
+            "image_generation" => {
+                tracing::warn!("ignored malformed `image_generation` configuration");
+                warnings.push(image_generation_malformed_warning());
+            }
+            "knowledgeBases" => {
+                tracing::warn!("ignored invalid `knowledgeBases` policy");
+                warnings.push("ignored invalid `knowledgeBases` policy".to_string());
+            }
+            _ => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    key = key,
+                    %error,
+                    "skipping malformed extended config field"
+                );
+                warnings.push(format!(
+                    "ignored malformed `{}` in {}",
+                    key,
+                    self.path.display()
+                ));
+            }
+        }
     }
 
     fn raw_for_layer_merge(&self, warnings: &mut Vec<String>) -> Value {
@@ -3026,6 +3120,11 @@ impl ExtendedConfigDoc {
         let Some(obj) = raw.as_object_mut() else {
             return raw;
         };
+        // Normalize alternate spellings to the canonical key per layer, so
+        // every layer contributes at most one spelling of a setting and
+        // `deep_merge_value` last-layer-wins is decided by layer order alone,
+        // never by which spelling a layer happened to use.
+        canonicalize_extended_config_key_aliases(obj);
 
         // `image_spend` is deliberately not merged here: spend policy is never
         // a layered config value (its only authority is the ledger), so there

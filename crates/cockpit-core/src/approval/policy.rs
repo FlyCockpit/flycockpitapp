@@ -1244,10 +1244,12 @@ impl Approver {
     ///
     /// 1. **Yolo** opens no human prompt and allows once after reaching this seam
     ///    (agent discretion; no grant persisted).
-    /// 2. **Manual/Auto** honor a matching standing grant (fails closed this
-    ///    increment; see [`Self::media_egress_grant_matches`]), else ask the
-    ///    human, disclosing only the redacted provider/model/interval facts and
-    ///    the digest prefix.
+    /// 2. **Manual/Auto** honor a matching standing reject (see
+    ///    [`Self::media_egress_reject_matches`]) or grant (see
+    ///    [`Self::media_egress_grant_matches`]), else ask the human,
+    ///    disclosing only the redacted provider/model/interval facts and the
+    ///    digest prefix. Approving records session-standing consent for the
+    ///    exact digest; denying records a standing reject for it.
     ///
     /// Fail-closed everywhere: a missing grant never fakes an allow.
     pub(super) async fn approve_media_egress_inner(
@@ -1285,7 +1287,20 @@ impl Approver {
             }
             crate::config::extended::ApprovalMode::Manual
             | crate::config::extended::ApprovalMode::Auto => {
-                if self.media_egress_grant_matches(&facts).await {
+                if self.media_egress_reject_matches(&facts).await {
+                    let decision = Decision::StandingReject {
+                        scope: Scope::Session,
+                    };
+                    self.record_permission_decision(
+                        "media_egress",
+                        facts.request_digest.as_str(),
+                        &[Scope::Session],
+                        decision,
+                        crate::approval::DecisionSource::StandingReject,
+                    )
+                    .await;
+                    Ok(decision)
+                } else if self.media_egress_grant_matches(&facts).await {
                     let decision = Decision::Allow { scope: Scope::Once };
                     self.record_permission_decision(
                         "media_egress",
@@ -1316,6 +1331,13 @@ impl Approver {
             .unwrap_or(false)
     }
 
+    async fn media_egress_reject_matches(&self, facts: &MediaEgressAuthzFacts<'_>) -> bool {
+        self.store
+            .media_egress_reject_matches(facts.purpose, facts.request_digest.as_str())
+            .await
+            .unwrap_or(false)
+    }
+
     /// Raise the human transcription media-egress approval prompt (Manual/Auto
     /// without a matching grant). A single approve/deny question carrying only
     /// secret-free facts: provider/model, the media interval, and the digest
@@ -1327,7 +1349,7 @@ impl Approver {
     ) -> Result<Decision> {
         let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
         let prompt = format!(
-            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})?",
+            "Approve {} egress to `{}` at `{}` ({}) model `{}` for attachment interval {}..{}us (request {})? Approving remembers this exact request for this session.",
             facts.purpose,
             facts.provider_id,
             facts.origin,
@@ -1340,8 +1362,11 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ApprovalOptionId::ApproveOnce, "Yes, transcribe"),
-                opt(ApprovalOptionId::Reject, "Deny"),
+                opt(
+                    ApprovalOptionId::ApproveOnce,
+                    "Yes, transcribe (remember for this session)",
+                ),
+                opt(ApprovalOptionId::Reject, "Deny (remember for this session)"),
             ],
             allow_freetext: false,
             command_detail: None,
@@ -1398,11 +1423,12 @@ impl Approver {
                     "candidate_effects": [
                         {
                             "selection": ApprovalOptionId::ApproveOnce.as_str(),
-                            "scope": "once",
+                            "scope": "session",
                             "execute": {"media_egress": egress},
                         },
                         {
                             "selection": ApprovalOptionId::Reject.as_str(),
+                            "scope": "session",
                             "effect": "deny",
                         },
                     ],
@@ -1420,17 +1446,46 @@ impl Approver {
                 },
             )
             .await?;
-        if matches!(decision, Decision::Allow { .. })
-            && let Some(session) = self.session.as_deref()
-        {
-            let _ = self
-                .store
-                .record_media_egress_grant(
-                    &session.project_id,
-                    facts.purpose,
-                    facts.request_digest.as_str(),
-                )
-                .await;
+        if let Some(session) = self.session.as_deref() {
+            match decision {
+                Decision::Allow { .. } => {
+                    if let Err(error) = self
+                        .store
+                        .record_media_egress_grant(
+                            &session.project_id,
+                            facts.purpose,
+                            facts.request_digest.as_str(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            purpose = facts.purpose,
+                            request_digest = facts.request_digest.as_str(),
+                            "recording media egress grant failed; consent will not stick"
+                        );
+                    }
+                }
+                Decision::Deny => {
+                    if let Err(error) = self
+                        .store
+                        .record_media_egress_reject(
+                            &session.project_id,
+                            facts.purpose,
+                            facts.request_digest.as_str(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            purpose = facts.purpose,
+                            request_digest = facts.request_digest.as_str(),
+                            "recording media egress reject failed; standing deny will not stick"
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
         self.record_permission_decision(
             "media_egress",

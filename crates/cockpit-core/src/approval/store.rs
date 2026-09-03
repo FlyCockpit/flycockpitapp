@@ -988,19 +988,41 @@ impl GrantStore {
 
     /// Exact digest lookup for transcription media egress. A matching session
     /// grant lets Manual/Auto short-circuit without re-prompting the human.
-    pub async fn media_egress_grant_matches(
+    pub(super) async fn media_egress_grant_matches(
         &self,
         purpose: &str,
         request_digest: &str,
     ) -> Result<bool, StoreError> {
+        self.media_egress_verdict_matches(purpose, request_digest, "allow")
+            .await
+    }
+
+    /// Standing reject lookup for transcription media egress. A matching
+    /// session reject auto-denies without re-prompting the human.
+    pub(super) async fn media_egress_reject_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<bool, StoreError> {
+        self.media_egress_verdict_matches(purpose, request_digest, "reject")
+            .await
+    }
+
+    async fn media_egress_verdict_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+        verdict: &str,
+    ) -> Result<bool, StoreError> {
         let session_id = self.session_id.to_string();
         let purpose = purpose.to_owned();
         let request_digest = request_digest.to_owned();
+        let verdict = verdict.to_owned();
         self.db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL)",
-                    rusqlite::params![session_id, purpose, request_digest],
+                    "SELECT EXISTS(SELECT 1 FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = ?4 AND revoked_at_unix_ms IS NULL)",
+                    rusqlite::params![session_id, purpose, request_digest, verdict],
                     |row| row.get(0),
                 )
             })
@@ -1021,6 +1043,10 @@ impl GrantStore {
         self.db
             .write(move |conn| {
                 conn.execute(
+                    "DELETE FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'reject'",
+                    rusqlite::params![session_id, purpose, request_digest],
+                )?;
+                conn.execute(
                     "INSERT OR REPLACE INTO media_egress_grants (grant_id,session_id,project_id,purpose,request_digest,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'allow',?6,NULL)",
                     rusqlite::params![
                         uuid::Uuid::now_v7().to_string(),
@@ -1033,6 +1059,66 @@ impl GrantStore {
                 )?;
                 Ok(())
             })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Record a session-scoped media-egress **reject** for an exact digest.
+    /// Revokes any standing allow for the same tuple first, then writes the
+    /// reject row.
+    pub(super) async fn record_media_egress_reject(
+        &self,
+        project_id: &str,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        let revoked_at = now_epoch_seconds() * 1000;
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE media_egress_grants SET revoked_at_unix_ms = ?1 WHERE session_id = ?2 AND purpose = ?3 AND request_digest = ?4 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                    rusqlite::params![revoked_at, session_id, purpose, request_digest],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO media_egress_grants (grant_id,session_id,project_id,purpose,request_digest,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'reject',?6,NULL)",
+                    rusqlite::params![
+                        uuid::Uuid::now_v7().to_string(),
+                        session_id,
+                        project_id,
+                        purpose,
+                        request_digest,
+                        now_epoch_seconds() * 1000
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Revoke every live allow grant for one exact session/purpose/digest tuple.
+    pub async fn revoke_media_egress_grant(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<usize, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| Ok(conn.execute(
+                "UPDATE media_egress_grants SET revoked_at_unix_ms = ?1 WHERE session_id = ?2 AND purpose = ?3 AND request_digest = ?4 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                rusqlite::params![
+                    now_epoch_seconds() * 1000,
+                    session_id,
+                    purpose,
+                    request_digest
+                ],
+            )?))
             .await
             .map_err(StoreError::Io)
     }
@@ -6312,6 +6398,10 @@ mod image_generation_grant_tests {
             None
         );
     }
+}
+
+mod media_egress_grant_tests {
+    use super::*;
 
     #[tokio::test]
     async fn media_egress_grant_matches_exact_digest_only() {
@@ -6341,6 +6431,62 @@ mod image_generation_grant_tests {
                     "transcription",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_egress_reject_revoke_and_polarity_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        store
+            .record_media_egress_reject(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_reject_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_reject_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            store
+                .revoke_media_egress_grant("transcription", digest)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
                 .await
                 .unwrap()
         );

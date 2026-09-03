@@ -109,6 +109,7 @@ const DELEGATE_KEYS: &[&str] = &[
     "seed_reads",
     "seed_reads_receipt",
     "todo_ids",
+    "budget",
 ];
 
 const CONTROL_KEYS: &[&str] = &["task_call_id", "label", "message"];

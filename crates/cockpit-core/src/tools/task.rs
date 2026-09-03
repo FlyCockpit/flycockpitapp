@@ -219,6 +219,10 @@ impl TaskTool {
                 "remaining_depth": {
                     "type": "integer",
                     "minimum": 0
+                },
+                "budget": {
+                    "type": "object",
+                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
                 }
             },
             "required": ["agent", "prompt"]
@@ -273,6 +277,10 @@ impl TaskTool {
                 "remaining_depth": {
                     "type": "integer",
                     "minimum": 0
+                },
+                "budget": {
+                    "type": "object",
+                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
                 }
             },
             "required": ["agent", "prompt"]
@@ -311,6 +319,7 @@ impl TaskTool {
                 "seed_reads_receipt": delegate_payload["properties"]["seed_reads_receipt"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
+                "budget": delegate_payload["properties"]["budget"].clone(),
                 "task_call_id": control_payload["properties"]["task_call_id"].clone(),
                 "label": control_payload["properties"]["label"].clone(),
                 "message": control_payload["properties"]["message"].clone()
@@ -520,6 +529,14 @@ mod tests {
             assert_eq!(
                 payload_props["grant_tools"]["type"], "array",
                 "grant_tools is an array: {schema}"
+            );
+            assert!(
+                payload_props.contains_key("budget"),
+                "missing per-delegation `budget`: {schema}"
+            );
+            assert_eq!(
+                payload_props["budget"]["type"], "object",
+                "budget is an object overlay: {schema}"
             );
             assert_eq!(
                 payload_props["seed_reads"]["type"], "array",

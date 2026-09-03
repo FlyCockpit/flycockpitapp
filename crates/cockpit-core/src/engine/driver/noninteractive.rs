@@ -666,6 +666,8 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     /// worker crash.  The snapshot owns the real next `Message`; no recovery
     /// path projects it through text or replays the original task payload.
     pub(in crate::engine::driver) recovery: Option<RecoveredNoninteractiveTaskState>,
+    pub(in crate::engine::driver) budget:
+        Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 }
 
 struct SingleDelegationAdmission {
@@ -1359,6 +1361,7 @@ pub(in crate::engine::driver) fn single_noninteractive_original_args_json(
         "provider_item_id": &task.task_provider_item_id,
         "function_call_id": &task.task_function_call_id,
         "interactive": false,
+        "budget": &task.budget,
     }))
     .ok()
 }
@@ -1383,6 +1386,7 @@ pub(in crate::engine::driver) fn batch_noninteractive_original_args_json(
             "workspace_lease": &entry.workspace_lease,
             "granted_tools": &entry.granted_tools,
             "todo_ids": &entry.todo_ids,
+            "budget": &entry.budget,
         })).collect::<Vec<_>>(),
         "why": &task.why,
         "repair_notes": &task.repair_notes,
@@ -2151,6 +2155,9 @@ impl Driver {
                 start_gate: None,
                 endpoint_collector: Some(endpoint_collector.clone()),
             }),
+            budget: crate::engine::agent::task_budget_spec(entry)
+                .map_err(anyhow::Error::msg)
+                .context("recovered noninteractive task has an invalid budget overlay")?,
         };
         self.launch_recovered_noninteractive_task(task, tx).await?;
         endpoint_attached
@@ -2310,6 +2317,9 @@ impl Driver {
                 start_gate: None,
                 endpoint_collector: Some(endpoint_collector),
             }),
+            budget: crate::engine::agent::task_budget_spec(entry)
+                .map_err(anyhow::Error::msg)
+                .context("recovered batch child has an invalid budget overlay")?,
         })
     }
 
@@ -3256,6 +3266,7 @@ impl Driver {
             task_call_id,
             task_provider_item_id,
             task_function_call_id,
+            budget,
         } = outcome
         else {
             return Err(Message::user(
@@ -3302,6 +3313,7 @@ impl Driver {
             task_function_call_id,
             execution_surface: None,
             recovery: None,
+            budget,
         })
     }
 
@@ -3997,6 +4009,7 @@ impl Driver {
             task_function_call_id,
             mut execution_surface,
             recovery,
+            budget,
         } = task;
 
         if let Some(recovery) = recovery {
@@ -4186,6 +4199,8 @@ impl Driver {
                 recovery.endpoint_collector,
                 recovery.pending_recursive,
                 recovered_seed_reads,
+                Some(self.budget.clone()),
+                budget,
             )
             .await;
             let retire = if let Some(lease) = recovered_workspace_lease.as_ref() {
@@ -5004,6 +5019,8 @@ impl Driver {
                         None,
                         None,
                         seed_reads,
+                        Some(self.budget.clone()),
+                        budget,
                     )
                     .await
                     {
@@ -7835,6 +7852,8 @@ impl Driver {
                         None,
                         None,
                         Vec::new(),
+                        Some(driver.budget.clone()),
+                        entry.budget.clone(),
                     )
                     .await
                     {
@@ -8648,6 +8667,8 @@ pub(crate) async fn run_noninteractive(
         None,
         None,
         Vec::new(),
+        None,
+        None,
     )
     .await?;
     Ok(out.report)
@@ -9538,6 +9559,7 @@ struct PreparedRecoveredRecursiveExecutor {
     child: Agent,
     child_cwd: std::path::PathBuf,
     snapshot: NoninteractiveRecoverySnapshot,
+    budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 }
 
 async fn prepare_recovered_recursive_noninteractive_executor(
@@ -9570,6 +9592,9 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         .and_then(serde_json::Value::as_str)
         .context("recursive executor launch descriptor has no child agent")?
         .to_owned();
+    let budget = crate::engine::agent::task_budget_spec(&launch)
+        .map_err(anyhow::Error::msg)
+        .context("recursive executor launch descriptor has an invalid budget overlay")?;
     let model =
         crate::engine::model_roles::DelegationModelSelector::from_value(launch.get("model"))
             .map_err(anyhow::Error::msg)?;
@@ -9754,6 +9779,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         child,
         child_cwd,
         snapshot,
+        budget,
     })
 }
 
@@ -9867,6 +9893,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         child,
         child_cwd,
         snapshot,
+        budget,
     } = prepare_recovered_recursive_noninteractive_executor(
         &descriptor,
         parent_agent,
@@ -9914,6 +9941,8 @@ async fn run_recovered_recursive_noninteractive_executor(
         endpoint_collector,
         snapshot.pending_recursive,
         Vec::new(),
+        None,
+        budget,
     )
     .await
     .map(|outcome| outcome.report)
@@ -10558,6 +10587,8 @@ pub(crate) async fn run_fresh_noninteractive_resumable(
         None,
         None,
         Vec::new(),
+        None,
+        None,
     )
     .await
 }
@@ -10610,6 +10641,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     endpoint_collector: Option<std::sync::Arc<RecoveredNoninteractiveEndpointCollector>>,
     pending_recursive: Option<PendingRecursiveContinuation>,
     seed_reads: Vec<crate::engine::seed_reads::SeedRead>,
+    parent_budget: Option<crate::engine::delegation_budget::BudgetPool>,
+    per_delegation: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
 
@@ -10708,6 +10741,19 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     // delegate candidates from one provider turn each believe they owned the
     // final slot.
     scheduled_lane_driver.vnext_child_admissions = recursive_vnext_admissions.clone();
+    let child_ceiling = config
+        .extended()
+        .resolved_delegation_budget(&agent.name, per_delegation.as_ref());
+    let budget = match parent_budget {
+        Some(parent) => parent.allot(child_ceiling),
+        // Docs pipeline, fresh utility, and crash-recovery recursive (parent
+        // remainder is not persisted). The child's own overlay still bounds
+        // this mint via `child_ceiling`; sharing the parent ledger across a
+        // process restart is the deferred durable remainder.
+        None => crate::engine::delegation_budget::BudgetPool::new(child_ceiling),
+    };
+    scheduled_lane_driver.budget = budget.clone();
+    scheduled_lane_driver.bind_active_retry_budget();
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {
             scheduled_lane_driver.set_guidance_proposal_service(service.clone());
@@ -11071,6 +11117,37 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     'turns: for _ in 0..max_turns {
+        // Round reservation before dispatch: same gate as the interactive
+        // driver (`admit_provider_round`) and the swarm/schedule loops.
+        if let Err(exhaustion) = budget.charge_round() {
+            retain_noninteractive_late_steer_checkpoint(
+                &active_claimed_agent_tree_steers,
+                std::mem::take(&mut active_externally_claimed_agent_tree_steers),
+                crate::engine::driver::LateUserSteerContinuationOutcome::failed(
+                    exhaustion.message(),
+                ),
+            );
+            drop(child_tx);
+            let _ = forwarder.await;
+            let partial = history
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        let text = crate::engine::message::extract_text(content);
+                        (!text.trim().is_empty()).then_some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let report =
+                crate::engine::delegation_budget::budget_exhausted_report(&partial, &exhaustion);
+            return Ok(NoninteractiveOutcome {
+                report,
+                history,
+                fallback_decision,
+            });
+        }
         if cancel.is_cancelled() {
             return Err(NoninteractiveRunError::new(
                 anyhow::Error::new(crate::engine::model::InferenceCancelled {
@@ -11952,10 +12029,12 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
-                let turn_agent = super::computer_native::with_live_loop_native_computer_geometry(
-                    agent.as_ref().clone(),
-                    computer_coordinator.as_ref(),
-                );
+                let mut turn_agent =
+                    super::computer_native::with_live_loop_native_computer_geometry(
+                        agent.as_ref().clone(),
+                        computer_coordinator.as_ref(),
+                    );
+                turn_agent.bind_retry_budget(&budget);
                 let turn_future = crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_agent_instance_id(
@@ -12203,6 +12282,32 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             // this loop without another provider turn.
         }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
+        let usage_charge = session.take_uncharged_budget_charge();
+        if !usage_charge.is_empty()
+            && let Err(exhaustion) = budget.charge(usage_charge)
+        {
+            drop(child_tx);
+            let _ = forwarder.await;
+            let partial = history
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        let text = crate::engine::message::extract_text(content);
+                        (!text.trim().is_empty()).then_some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return Ok(NoninteractiveOutcome {
+                report: crate::engine::delegation_budget::budget_exhausted_report(
+                    &partial,
+                    &exhaustion,
+                ),
+                history,
+                fallback_decision,
+            });
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -12335,6 +12440,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                 task_call_id,
                 task_provider_item_id,
                 task_function_call_id,
+                budget: nested_budget,
             } if agent.vnext_grant.is_some() => {
                 // A launch-v1 child can itself be a noninteractive orchestrator.
                 // vNext task parsing routes here rather than through the
@@ -12565,6 +12671,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                     "cwd": child_cwd.to_string_lossy(),
                                     "write_scope": &resolved_write_scope,
                                     "workspace_lease": durable_workspace_lease_id(live_lease.as_ref()),
+                                    "budget": &nested_budget,
                                 }));
                                 let snapshot_json = ready_noninteractive_recovery_snapshot(
                                     Vec::new(),
@@ -12782,6 +12889,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                         None,
                         None,
                         seed_reads,
+                        Some(scheduled_lane_driver.budget.clone()),
+                        nested_budget,
                     ))
                     .await
                     .map(|outcome| outcome.report)
@@ -13183,6 +13292,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                             "cwd": child_cwd.to_string_lossy(),
                                             "write_scope": &entry.write_scope,
                                             "workspace_lease": durable_workspace_lease_id(child.workspace_lease.as_deref()),
+                                            "budget": &entry.budget,
                                         }))
                                         .context("serializing recursive batch child launch descriptor")?)?,
                                         snapshot: validated_recursive_noninteractive_snapshot(ready_noninteractive_recovery_snapshot(
@@ -13327,10 +13437,13 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     })
                     .collect::<std::collections::HashMap<_, _>>();
                 let mut runs = futures::stream::FuturesUnordered::new();
+                // Field access inside `async move` would move the Driver.
+                let nested_parent_budget = scheduled_lane_driver.budget.clone();
                 for (idx, entry, child, child_cwd) in prepared {
                     let admission = vnext_admissions
                         .pop()
                         .expect("one vNext admission per prepared child");
+                    let nested_parent_budget = nested_parent_budget.clone();
                     let session = session.clone();
                     let locks = locks.clone();
                     let redact = redact.clone();
@@ -13490,6 +13603,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                             None,
                             None,
                             Vec::new(),
+                            Some(nested_parent_budget),
+                            entry.budget.clone(),
                         ))
                         .await
                         .map(|outcome| outcome.report)

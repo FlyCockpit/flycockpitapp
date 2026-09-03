@@ -997,7 +997,7 @@ impl Model {
                     let result = if compact_utility {
                         attempt().await
                     } else if single_handoff {
-                        retry::with_retry_max(
+                        retry::with_retry_max_gated(
                             agent_name,
                             &reconnect_target,
                             event_tx,
@@ -1005,11 +1005,12 @@ impl Model {
                             probe.as_ref(),
                             1,
                             Some(&recovery_signal),
+                            params.retry_budget.as_ref(),
                             attempt,
                         )
                         .await
                     } else if tried_swap {
-                        retry::with_retry_max(
+                        retry::with_retry_max_gated(
                             agent_name,
                             &reconnect_target,
                             event_tx,
@@ -1017,17 +1018,19 @@ impl Model {
                             probe.as_ref(),
                             5,
                             Some(&recovery_signal),
+                            params.retry_budget.as_ref(),
                             attempt,
                         )
                         .await
                     } else {
-                        retry::with_retry(
+                        retry::with_retry_gated(
                             agent_name,
                             &reconnect_target,
                             event_tx,
                             cancel,
                             probe.as_ref(),
                             Some(&recovery_signal),
+                            params.retry_budget.as_ref(),
                             attempt,
                         )
                         .await
@@ -1204,7 +1207,7 @@ impl Model {
                 if compact_utility {
                     attempt().await
                 } else if single_handoff {
-                    retry::with_retry_max(
+                    retry::with_retry_max_gated(
                         agent_name,
                         &reconnect_target,
                         event_tx,
@@ -1212,17 +1215,19 @@ impl Model {
                         probe.as_ref(),
                         1,
                         Some(&recovery_signal),
+                        params.retry_budget.as_ref(),
                         attempt,
                     )
                     .await
                 } else {
-                    retry::with_retry(
+                    retry::with_retry_gated(
                         agent_name,
                         &reconnect_target,
                         event_tx,
                         cancel,
                         probe.as_ref(),
                         Some(&recovery_signal),
+                        params.retry_budget.as_ref(),
                         attempt,
                     )
                     .await
@@ -1271,7 +1276,7 @@ impl Model {
                 if compact_utility {
                     attempt().await
                 } else if single_handoff {
-                    retry::with_retry_max(
+                    retry::with_retry_max_gated(
                         agent_name,
                         &reconnect_target,
                         event_tx,
@@ -1279,17 +1284,19 @@ impl Model {
                         probe.as_ref(),
                         1,
                         Some(&recovery_signal),
+                        params.retry_budget.as_ref(),
                         attempt,
                     )
                     .await
                 } else {
-                    retry::with_retry(
+                    retry::with_retry_gated(
                         agent_name,
                         &reconnect_target,
                         event_tx,
                         cancel,
                         probe.as_ref(),
                         Some(&recovery_signal),
+                        params.retry_budget.as_ref(),
                         attempt,
                     )
                     .await

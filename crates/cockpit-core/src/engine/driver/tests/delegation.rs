@@ -666,6 +666,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
         execution_surface: None,
         recovery: None,
+        budget: None,
     };
 
     let completion = driver

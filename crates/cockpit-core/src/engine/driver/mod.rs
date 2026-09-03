@@ -935,6 +935,16 @@ pub struct AgentSession {
     /// Reservation held by this child for the lifetime of its interactive
     /// frame. Dropping the frame releases its parent's vNext child slot.
     _vnext_child_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Parent spend handle to restore when this interactive child pops. The
+    /// child charges the same ledger with a tighter local cap; the parent
+    /// must not keep the child's local ceiling after the pop.
+    parent_budget: Option<crate::engine::delegation_budget::BudgetPool>,
+    /// Per-delegation `task.budget` overlay that was intersected into this
+    /// frame's local cap at allotment. Part of the child's allotment identity:
+    /// any later allot of this same child (resume, recovery, remint) must
+    /// pass it. `None` on the root frame and on children spawned without an
+    /// overlay.
+    per_delegation_budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
     /// This child frame's own `subagentStop` continuation latch. Keeping it on
     /// the frame makes the 8-continuation budget independent per nested child
     /// and — because it is dropped on every pop / unwind / teardown of the
@@ -1195,8 +1205,19 @@ pub struct Driver {
     /// before the loop starts.
     pub loop_guard_threshold: u32,
     /// Maximum root-agent `Continue` cycles allowed per user message
-    /// before the driver pauses for confirmation. `0` means unlimited.
+    /// before the driver pauses for confirmation. `0` means the hierarchical
+    /// budget's rounds dimension is unlimited (explicit opt-in).
     pub max_primary_rounds: u32,
+    /// Hierarchical spend pool for this driver and every descendant it
+    /// allots. One mechanism: turn loop, spawn, swarm, schedule, compact.
+    pub budget: crate::engine::delegation_budget::BudgetPool,
+    /// Compact-and-continue progress guard. Lives on the driver, not the
+    /// spend pool, so reminting a turn budget cannot reset the liveness
+    /// bound.
+    compact_guard: crate::engine::delegation_budget::CompactProgressGuard,
+    /// True when the agent produced new assistant/tool work since the last
+    /// compaction. Token-count reduction is not progress.
+    progress_since_compact: bool,
     delegation_retry_budget_remaining: usize,
     /// Config opt-in for schedule `limit=0` loops. Even when true, an
     /// interactive session approval is still required once per session.
@@ -2272,6 +2293,7 @@ impl Driver {
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
+            budget: self.budget.clone(),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -2316,6 +2338,8 @@ impl Driver {
                     // frame, whose reservation remains held there. New children
                     // admitted by the clone use the shared registry below.
                     _vnext_child_admission: None,
+                    parent_budget: frame.parent_budget.clone(),
+                    per_delegation_budget: frame.per_delegation_budget.clone(),
                     // Carry the child's continuation budget so a cloned frame
                     // cannot silently reset its 8-cap.
                     stop_gate: frame.stop_gate.clone(),
@@ -2333,6 +2357,9 @@ impl Driver {
             time_injection_interval_minutes: self.time_injection_interval_minutes,
             loop_guard_threshold: self.loop_guard_threshold,
             max_primary_rounds: self.max_primary_rounds,
+            budget: self.budget.clone(),
+            compact_guard: self.compact_guard.clone(),
+            progress_since_compact: self.progress_since_compact,
             delegation_retry_budget_remaining: self.delegation_retry_budget_remaining,
             allow_unbounded_schedule_loops: self.allow_unbounded_schedule_loops,
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
@@ -2662,7 +2689,9 @@ impl Driver {
             // is updated through the same setter.
             write_scope: None,
             dream_read_scope: dream_read_scope.clone(),
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
+        let shared_budget = ctx.budget.share();
         // The authority needs the engine UI-event channel (`tx`) to emit
         // started/progress/note signals, but `tx` isn't known until
         // `run_main_loop`. Build with a dummy sender now; `run_main_loop`
@@ -2713,6 +2742,8 @@ impl Driver {
                 recovery_activation: None,
                 late_user_steer_permit: None,
                 _vnext_child_admission: None,
+                parent_budget: None,
+                per_delegation_budget: None,
                 stop_gate: crate::engine::agent::hooks::StopGateState::default(),
             }],
             pending_late_user_steer_acks: std::collections::HashMap::new(),
@@ -2725,6 +2756,9 @@ impl Driver {
             time_injection_interval_minutes: 5,
             loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             max_primary_rounds: 0,
+            budget: shared_budget,
+            compact_guard: crate::engine::delegation_budget::CompactProgressGuard::default(),
+            progress_since_compact: true,
             delegation_retry_budget_remaining: DELEGATION_RETRY_BUDGET_PER_TURN,
             allow_unbounded_schedule_loops: false,
             unbounded_schedule_loops_approved: false,
@@ -3097,6 +3131,182 @@ impl Driver {
         // Read from the turn-pinned config snapshot rather than re-reading disk
         // (`engine-config-snapshot-adoption`).
         self.config.extended().max_primary_rounds
+    }
+
+    pub(in crate::engine::driver) fn install_turn_budget(&mut self) {
+        let root_name = self
+            .stack
+            .first()
+            .map(|frame| frame.agent.name.as_str())
+            .unwrap_or("Build");
+        let resolved = self
+            .config
+            .extended()
+            .resolved_delegation_budget(root_name, None);
+        // Remint the session-live ledger in place. `BudgetPool::new` here
+        // would orphan in-flight swarm / background `task` / schedule clones
+        // and fail open on the hierarchical aggregate cap. Remint updates the
+        // ceiling only: spend and the wall-clock origin stay monotonic so
+        // descendants that survived the turn boundary cannot be forgiven.
+        // Stacked children keep the handle allotted at spawn (overlay already
+        // baked into the local cap); re-allotting would drop `task.budget`.
+        let root = self.root_budget_handle();
+        root.remint_root(resolved);
+        self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);
+        self.budget.reset_retry_turn();
+        self.schedule.set_budget(root.share());
+        self.bind_active_retry_budget();
+    }
+
+    /// The session-root spend handle. Nested frames store the parent pool on
+    /// `parent_budget`; the driver's `budget` is the active (innermost) local
+    /// cap. Remint and schedule rebind must target the root so a stacked
+    /// child's overlay is not widened to the root ceiling.
+    fn root_budget_handle(&self) -> crate::engine::delegation_budget::BudgetPool {
+        self.stack
+            .iter()
+            .find_map(|frame| frame.parent_budget.clone())
+            .unwrap_or_else(|| self.budget.clone())
+    }
+
+    pub(crate) fn bind_active_retry_budget(&mut self) {
+        if let Some(frame) = self.stack.last_mut() {
+            Arc::make_mut(&mut frame.agent).bind_retry_budget(&self.budget);
+        }
+    }
+
+    fn allot_child_budget(
+        &mut self,
+        agent_name: &str,
+        per_delegation: Option<&cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
+    ) -> crate::engine::delegation_budget::BudgetPool {
+        let parent = self.budget.clone();
+        let ceiling = self
+            .config
+            .extended()
+            .resolved_delegation_budget(agent_name, per_delegation);
+        self.budget = self.budget.allot(ceiling);
+        parent
+    }
+
+    fn restore_parent_budget(
+        &mut self,
+        parent: Option<crate::engine::delegation_budget::BudgetPool>,
+    ) {
+        if let Some(parent) = parent {
+            self.budget = parent;
+        }
+    }
+
+    fn charge_recorded_usage(
+        &mut self,
+    ) -> Result<(), crate::engine::delegation_budget::BudgetExhaustion> {
+        let charge = self.session.take_uncharged_budget_charge();
+        if self.session.take_pending_forward_progress() {
+            self.progress_since_compact = true;
+        }
+        if charge.is_empty() {
+            return Ok(());
+        }
+        self.budget.charge(charge)
+    }
+
+    /// Reserve one provider round on the live ledger before dispatching
+    /// inference. Interactive roots may extend a **round** ceiling; exhaustion
+    /// on any other dimension is terminal. `Ok(true)` means dispatch;
+    /// `Ok(false)` means the caller must stop without contacting the
+    /// provider.
+    ///
+    /// `charge_round` is the reservation (not a peek) and fails closed if
+    /// any finite spend dimension is already at its ceiling. Descendants
+    /// share this ledger, so check-then-dispatch would race. Swarm,
+    /// schedule, and noninteractive loops call `charge_round` at the same
+    /// point.
+    async fn admit_provider_round(
+        &mut self,
+        is_root: bool,
+        max_primary_rounds: u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<bool> {
+        match self.budget.charge_round() {
+            Ok(()) => Ok(true),
+            Err(exhaustion) => {
+                if is_root
+                    && max_primary_rounds > 0
+                    && exhaustion.dimension
+                        == crate::engine::delegation_budget::BudgetDimension::Rounds
+                    && self.interrupts.is_interactive_attached()
+                {
+                    if self
+                        .primary_round_ceiling_allows_more(
+                            max_primary_rounds,
+                            max_primary_rounds,
+                            tx,
+                        )
+                        .await?
+                    {
+                        self.budget.extend_rounds(max_primary_rounds);
+                        if let Err(exhaustion) = self.budget.charge_round() {
+                            self.emit_round_admission_failure(&exhaustion, max_primary_rounds, tx)
+                                .await;
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                self.emit_round_admission_failure(&exhaustion, max_primary_rounds, tx)
+                    .await;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn emit_round_admission_failure(
+        &mut self,
+        exhaustion: &crate::engine::delegation_budget::BudgetExhaustion,
+        max_primary_rounds: u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        if !self.interrupts.is_interactive_attached()
+            && exhaustion.dimension == crate::engine::delegation_budget::BudgetDimension::Rounds
+        {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "Reached the configured limit of {} tool round(s) for this message. Stopping because no interactive client can approve more rounds.",
+                        max_primary_rounds.max(1)
+                    ),
+                })
+                .await;
+        }
+        self.on_budget_exhausted(exhaustion, tx).await;
+    }
+
+    pub(in crate::engine::driver) fn record_compact_progress(
+        &mut self,
+        tokens_after: u64,
+    ) -> Result<(), crate::engine::delegation_budget::CompactLoopExhausted> {
+        let progress = self.progress_since_compact;
+        self.progress_since_compact = false;
+        self.compact_guard.record(tokens_after, progress)
+    }
+
+    async fn on_budget_exhausted(
+        &mut self,
+        exhaustion: &crate::engine::delegation_budget::BudgetExhaustion,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let snapshot = exhaustion.snapshot.render();
+        let _ = tx
+            .send(TurnEvent::Notice {
+                text: format!(
+                    "{}. {snapshot}. Returning the best partial result.",
+                    exhaustion.message()
+                ),
+            })
+            .await;
+        self.pending_idle_reason = Some(crate::engine::IdleReason::BudgetLimited);
     }
 
     async fn refuse_unredacted_send(
@@ -4325,6 +4535,11 @@ impl Driver {
             &self.spawn_args_delegated(true, granted_tools, model, child_recursion),
         )
         .context("loading recovered interactive task child")?;
+        let per_delegation_budget = crate::engine::agent::task_budget_spec(&args)
+            .map_err(anyhow::Error::msg)
+            .context("recovered interactive task has an invalid budget overlay")?;
+        let parent_budget =
+            self.allot_child_budget(&recovery.child_agent, per_delegation_budget.as_ref());
         let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
         let recovered_frame = AgentSession {
             queue_target: crate::engine::message::QueueTarget::child(
@@ -4353,6 +4568,8 @@ impl Driver {
             recovery_activation: Some(recovery.activation_gate),
             late_user_steer_permit: None,
             _vnext_child_admission: admission.pop(),
+            parent_budget: Some(parent_budget),
+            per_delegation_budget,
             stop_gate: crate::engine::agent::hooks::StopGateState::default(),
         };
         self.mutate_live_stack(|stack| stack.push(recovered_frame));
@@ -4984,6 +5201,7 @@ impl Driver {
         // boundary (`engine-config-snapshot-adoption`).
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.install_turn_budget();
         self.reset_delegation_retry_budget();
         if let Err(error) = self.refresh_redaction_table_for_turn(tx).await {
             self.mark_bound_turn_refused(Self::redaction_refresh_idle_reason());
@@ -5114,6 +5332,14 @@ impl Driver {
             {
                 return Err(error);
             }
+            if scheduled_turn_result.is_none()
+                && !self
+                    .admit_provider_round(is_root, max_primary_rounds, tx)
+                    .await?
+            {
+                self.acknowledge_interrupted_turns_after_progress().await;
+                return Ok(ParkedReplayOutcome::Completed);
+            }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
@@ -5130,10 +5356,11 @@ impl Driver {
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
                 let pending = std::mem::take(&mut top.pending_computer_continuations);
-                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                let mut turn_agent = computer_native::with_live_loop_native_computer_geometry(
                     agent.as_ref().clone(),
                     top.computer_coordinator.as_ref(),
                 );
+                turn_agent.bind_retry_budget(&self.budget);
                 Box::pin(crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_foreground_queue(
@@ -5343,6 +5570,11 @@ impl Driver {
                     .map(|frame| frame.history.as_slice())
                     .unwrap_or(&[]),
             );
+            if let Err(exhaustion) = self.charge_recorded_usage() {
+                self.on_budget_exhausted(&exhaustion, tx).await;
+                self.acknowledge_interrupted_turns_after_progress().await;
+                return Ok(ParkedReplayOutcome::Completed);
+            }
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {
@@ -11063,6 +11295,7 @@ impl Driver {
         let popped_depth = self.stack.len();
         let child =
             self.mutate_live_stack(|stack| stack.pop().expect("pop_child requires a child frame"));
+        self.restore_parent_budget(child.parent_budget.clone());
         if let Some(agent_instance_id) = child.agent_instance_id {
             self.invalidate_guidance_for_computer_delegation(agent_instance_id)
                 .await;
@@ -12145,6 +12378,7 @@ impl Driver {
         // boundary (`engine-config-snapshot-adoption`).
         self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.install_turn_budget();
         self.reset_delegation_retry_budget();
         if let Err(_error) = self.refresh_redaction_table_for_turn(tx).await {
             // Notice already published by the refresh. Settle this bound
@@ -13503,6 +13737,13 @@ impl Driver {
                     }
                 }
             }
+            if scheduled_turn_result.is_none()
+                && !self
+                    .admit_provider_round(is_root, max_primary_rounds, tx)
+                    .await?
+            {
+                return Ok(());
+            }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
@@ -13529,10 +13770,11 @@ impl Driver {
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
                 let pending = std::mem::take(&mut top.pending_computer_continuations);
-                let turn_agent = computer_native::with_live_loop_native_computer_geometry(
+                let mut turn_agent = computer_native::with_live_loop_native_computer_geometry(
                     agent.as_ref().clone(),
                     top.computer_coordinator.as_ref(),
                 );
+                turn_agent.bind_retry_budget(&self.budget);
                 Box::pin(crate::engine::model::with_native_computer_continuations(
                     pending,
                     crate::engine::agent::with_foreground_queue(
@@ -13900,6 +14142,10 @@ impl Driver {
                     .map(|frame| frame.history.as_slice())
                     .unwrap_or(&[]),
             );
+            if let Err(exhaustion) = self.charge_recorded_usage() {
+                self.on_budget_exhausted(&exhaustion, tx).await;
+                return Ok(());
+            }
             match outcome {
                 TurnOutcome::Continue => {
                     if is_root && max_primary_rounds > 0 {
@@ -14221,6 +14467,7 @@ impl Driver {
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
+                    budget,
                 } => {
                     if let Err(err) = self.consume_delegation_retry_budget() {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -14318,6 +14565,7 @@ impl Driver {
                         "function_call_id": &task_function_call_id,
                         "repair_notes": &repair_notes,
                         "interactive": true,
+                        "budget": &budget,
                     }))
                     .ok();
                     let model_display = model_selector_display(&model);
@@ -14654,6 +14902,8 @@ impl Driver {
                         // the child frame releases the parent slot when this
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
+                        parent_budget: Some(self.allot_child_budget(&child_agent, budget.as_ref())),
+                        per_delegation_budget: budget,
                         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
                     };
                     self.mutate_live_stack(|stack| stack.push(child_frame));
@@ -14750,6 +15000,7 @@ impl Driver {
                     task_call_id,
                     task_provider_item_id,
                     task_function_call_id,
+                    budget,
                 } => {
                     if let Err(err) = self.consume_delegation_retry_budget() {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -15023,6 +15274,7 @@ impl Driver {
                         task_function_call_id,
                         execution_surface: None,
                         recovery: None,
+                        budget,
                     };
                     next_prompt = if self.active_pending_scheduled_turn_index().is_some() {
                         self.run_single_noninteractive_task_scheduled(task, tx, cancel.clone())

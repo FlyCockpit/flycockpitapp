@@ -821,6 +821,19 @@ impl Session {
         is_utility: bool,
     ) -> Result<()> {
         *self.last_usage.lock().unwrap() = Some(usage);
+        let priced_cost = self.cost_microusd_for_usage(&usage);
+        {
+            let mut uncharged = self.uncharged_budget.lock().unwrap();
+            let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
+            if let Some(cost) = priced_cost {
+                charge = charge.with_cost(cost);
+            }
+            *uncharged += charge;
+        }
+        if !is_utility {
+            self.pending_forward_progress
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
 
         let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
             return Ok(());
@@ -837,7 +850,7 @@ impl Session {
             output_tokens: usage.output_tokens as i64,
             cached_input_tokens: usage.cached_input_tokens as i64,
             cache_creation_input_tokens: usage.cache_creation_input_tokens as i64,
-            cost_usd_micros: None,
+            cost_usd_micros: priced_cost.filter(|&c| c > 0).map(|c| c as i64),
             is_utility,
         };
         self.db
@@ -2368,6 +2381,42 @@ impl Session {
     /// finishes — callers fall back to a local tiktoken estimate.
     pub fn last_usage(&self) -> Option<crate::tokens::TokenUsage> {
         *self.last_usage.lock().unwrap()
+    }
+
+    /// Drain usage recorded since the last charge. Callers must charge the
+    /// returned amount against the live [`BudgetPool`] exactly once. Unpriced
+    /// usage (no active model or no catalog row) is marked on the charge so a
+    /// finite cost ceiling fails closed.
+    pub fn take_uncharged_budget_charge(&self) -> crate::engine::delegation_budget::BudgetCharge {
+        std::mem::take(&mut *self.uncharged_budget.lock().unwrap())
+    }
+
+    pub fn take_pending_forward_progress(&self) -> bool {
+        self.pending_forward_progress
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Install a price table used to convert usage into cost. Production
+    /// loads `~/.cockpit/prices.json` on first charge; tests inject a table.
+    pub fn set_price_table(&self, table: crate::db::stats::PriceTable) {
+        let _ = self.price_table.set(table);
+    }
+
+    /// Catalog cost for this usage, or `None` when the active model is missing
+    /// or has no price row. Callers must not treat `None` as `$0`: a finite
+    /// delegation cost ceiling fails closed on unpriced usage.
+    fn cost_microusd_for_usage(&self, usage: &crate::tokens::TokenUsage) -> Option<u64> {
+        let model = self.active_model()?;
+        let table = self
+            .price_table
+            .get_or_init(crate::db::stats::PriceTable::load_default);
+        table.cost_microusd(
+            &model,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        )
     }
 
     /// Record a real cache hit against the concrete endpoint that dispatched

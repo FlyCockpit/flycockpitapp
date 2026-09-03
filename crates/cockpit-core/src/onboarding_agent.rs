@@ -144,6 +144,7 @@ impl OnboardingAgentPlan {
                         (tool.clone(), tier)
                     })
                     .collect(),
+                budget: crate::config::extended::DelegationBudgetSpec::default(),
             },
         );
         extended.image_sidecar = self.sidecar.clone();

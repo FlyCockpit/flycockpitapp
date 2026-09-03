@@ -10705,6 +10705,12 @@ fn validate_recursive_noninteractive_launch_json(raw: &str) -> Result<String> {
             "recursive noninteractive launch descriptor has an invalid write scope"
         );
     }
+    if let Some(budget) = value.get("budget") {
+        ensure!(
+            budget.is_null() || budget.is_object(),
+            "recursive noninteractive launch descriptor has an invalid budget overlay"
+        );
+    }
     if let Some(depends_on) = value.get("depends_on") {
         let depends_on = depends_on
             .as_array()
@@ -11228,6 +11234,21 @@ mod tests {
         assert!(
             ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json").is_err()
         );
+        let with_budget = ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
+            r#"{"budget":{"maxRounds":4},"write_scope":null,"cwd":"/workspace","granted_tools":[],"model":{},"child_agent":"child","label":"label","task_call_id":"task","version":2}"#,
+        )
+        .unwrap();
+        assert!(
+            with_budget
+                .as_json()
+                .contains(r#""budget":{"maxRounds":4}"#),
+            "{}",
+            with_budget.as_json()
+        );
+        assert!(ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
+            r#"{"version":2,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace","budget":"unlimited"}"#,
+        )
+        .is_err());
     }
 
     #[tokio::test]

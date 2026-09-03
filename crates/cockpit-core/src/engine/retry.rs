@@ -29,13 +29,17 @@
 //!
 //! ## Active reconnection probe
 //!
-//! During a backoff wait we run a lightweight connectivity probe (TCP
-//! connect to the provider host:port, falling back to a DNS resolve) so
+//! During a *network* backoff wait we run a lightweight connectivity probe
+//! (TCP connect to the provider host:port, falling back to a DNS resolve) so
 //! a retry fires *promptly* when the network returns rather than waiting
 //! out the full capped interval. The backoff governs the probe cadence;
 //! a successful probe short-circuits the remaining wait. The probe is
 //! abstracted behind [`ConnectivityProbe`] so the loop is testable with
 //! a fake (the live TCP/DNS probe is environment-dependent).
+//!
+//! A `429`/`503` [`RetryDecision::RetryAfter`] wait does **not** use the
+//! probe: the host is already reachable (it just rate-limited us), so a
+//! successful probe would short-circuit every backoff into a ~1 Hz storm.
 
 use std::time::{Duration, SystemTime};
 
@@ -44,6 +48,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::delegation_budget::TurnRetryBudget;
 use crate::engine::model::InferenceErrorClass;
 
 /// First backoff interval (before jitter). Doubles each repeated
@@ -56,6 +61,11 @@ const BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// that, absent a probe hit, we still re-check connectivity twice a
 /// minute.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// Sane ceiling for a provider `Retry-After` delay. Network backoff stays
+/// at [`BACKOFF_CAP`]; rate-limit pacing may wait longer so a `Retry-After:
+/// 120` is not collapsed into a 30s (and then probe-short-circuited) storm.
+pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(300);
 
 /// Per-probe timeout. The probe is a liveness check, not the real
 /// request — keep it short so a still-dead network fails the probe fast
@@ -409,7 +419,9 @@ pub(crate) fn wait_for_decision(
         RetryDecision::Retry => {
             (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
         }
-        RetryDecision::RetryAfter(Some(d)) => (!overload_retry_used).then(|| d.min(BACKOFF_CAP)),
+        RetryDecision::RetryAfter(Some(d)) => {
+            (!overload_retry_used).then(|| d.min(RETRY_AFTER_CAP))
+        }
         RetryDecision::RetryAfter(None) => {
             (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
         }
@@ -600,6 +612,7 @@ where
         probe,
         Some(DEFAULT_MAX_ATTEMPTS),
         recovery_out,
+        None,
         attempt_fn,
     )
     .await
@@ -629,6 +642,72 @@ where
         probe,
         Some(max_attempts.max(1)),
         recovery_out,
+        None,
+        attempt_fn,
+    )
+    .await
+}
+
+/// Like [`with_retry`], honoring a turn-scoped retry bound in addition to
+/// the per-call attempt cap. The turn bound is a liveness guard: unlimited
+/// spend cannot lift it.
+#[allow(clippy::too_many_arguments)]
+pub async fn with_retry_gated<T, F, Fut, P>(
+    agent_name: &str,
+    target: &ReconnectTarget,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    probe: Option<&P>,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
+    attempt_fn: F,
+) -> Result<T, CompletionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    P: ConnectivityProbe,
+{
+    with_retry_inner(
+        agent_name,
+        target,
+        event_tx,
+        cancel,
+        probe,
+        Some(DEFAULT_MAX_ATTEMPTS),
+        recovery_out,
+        retry_budget,
+        attempt_fn,
+    )
+    .await
+}
+
+/// Like [`with_retry_max`], with a turn-scoped retry bound.
+#[allow(clippy::too_many_arguments)]
+pub async fn with_retry_max_gated<T, F, Fut, P>(
+    agent_name: &str,
+    target: &ReconnectTarget,
+    event_tx: Option<&mpsc::Sender<TurnEvent>>,
+    cancel: &CancellationToken,
+    probe: Option<&P>,
+    max_attempts: u32,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
+    attempt_fn: F,
+) -> Result<T, CompletionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    P: ConnectivityProbe,
+{
+    with_retry_inner(
+        agent_name,
+        target,
+        event_tx,
+        cancel,
+        probe,
+        Some(max_attempts.max(1)),
+        recovery_out,
+        retry_budget,
         attempt_fn,
     )
     .await
@@ -643,6 +722,7 @@ async fn with_retry_inner<T, F, Fut, P>(
     probe: Option<&P>,
     max_attempts: Option<u32>,
     recovery_out: Option<&std::sync::atomic::AtomicU8>,
+    retry_budget: Option<&TurnRetryBudget>,
     mut attempt_fn: F,
 ) -> Result<T, CompletionError>
 where
@@ -698,6 +778,14 @@ where
                 {
                     return Err(err);
                 }
+                // Per-turn retry bound: always enforced, including under
+                // unlimited spend. Overload `RetryOnce` is exempt (same as
+                // the per-call cap) because it self-limits via the latch.
+                if !matches!(decision, RetryDecision::RetryOnce)
+                    && retry_budget.is_some_and(|budget| !budget.allow_retry())
+                {
+                    return Err(err);
+                }
 
                 failures = failures.saturating_add(1);
                 // Recurring, attempt-numbered log line so a headless `run`
@@ -731,7 +819,14 @@ where
                         .await;
                 }
 
-                match wait_with_probe(wait, probe, cancel).await {
+                // Rate-limit waits must not be probe-short-circuited: the
+                // provider already answered, so the host looks reachable and
+                // a probe hit would collapse every 429 into a ~1 Hz storm.
+                let probe_for_wait = match decision {
+                    RetryDecision::RetryAfter(_) => None,
+                    _ => probe,
+                };
+                match wait_with_probe(wait, probe_for_wait, cancel).await {
                     WaitOutcome::Proceed => {}
                     WaitOutcome::Cancelled => {
                         // The turn was cancelled during the wait. Return
@@ -1422,14 +1517,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_wait_is_capped_at_thirty_seconds() {
+    async fn retry_after_wait_honors_provider_delay_up_to_five_minutes() {
         assert_eq!(
             wait_for_decision(
                 RetryDecision::RetryAfter(Some(Duration::from_secs(120))),
                 0,
                 false,
             ),
-            Some(BACKOFF_CAP)
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            wait_for_decision(
+                RetryDecision::RetryAfter(Some(Duration::from_secs(600))),
+                0,
+                false,
+            ),
+            Some(RETRY_AFTER_CAP)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_retry_does_not_let_a_reachable_probe_storm() {
+        // A 429 with a live host must wait out backoff, not probe-short-circuit
+        // into a 1 Hz storm. The per-call attempt cap then terminates.
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let probe = FakeProbe {
+            reachable: true,
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+
+        let target = test_target();
+        let result: Result<u32, _> = with_retry(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            Some(&probe),
+            None,
+            move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_status(429)) }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "Retry-After waits must not consult the connectivity probe"
         );
     }
 
@@ -1572,5 +1712,33 @@ mod tests {
             crate::engine::model::ProviderRecoverySignal::Overloaded,
             "an overload at any attempt wins over a later generic error"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_retry_budget_stops_a_429_before_the_per_call_cap() {
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let budget = crate::engine::delegation_budget::TurnRetryBudget::new(2);
+        let target = test_target();
+        let result: Result<u32, _> = with_retry_gated(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            None::<&FakeProbe>,
+            None,
+            Some(&budget),
+            move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_status(429)) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        // Initial attempt + 2 turn-budgeted retries, not DEFAULT_MAX_ATTEMPTS (4).
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!budget.allow_retry());
     }
 }

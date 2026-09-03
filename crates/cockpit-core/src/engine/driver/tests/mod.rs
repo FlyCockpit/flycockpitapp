@@ -1375,6 +1375,8 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
         recovery_activation: None,
         late_user_steer_permit: None,
         _vnext_child_admission: None,
+        parent_budget: None,
+        per_delegation_budget: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
 }
@@ -1470,6 +1472,8 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         recovery_activation: None,
         late_user_steer_permit: None,
         _vnext_child_admission: None,
+        parent_budget: None,
+        per_delegation_budget: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     };
     driver.mutate_live_stack(|stack| stack.push(frame));

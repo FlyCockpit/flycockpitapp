@@ -934,8 +934,9 @@ impl SettingId {
             }
             SettingId::MaxPrimaryRounds => {
                 "Maximum number of primary-agent tool round-trips allowed for one \
-                 user message. `0` (default) is unlimited; positive values pause \
-                 for approval in the TUI and stop headless runs at the ceiling."
+                 user message. Default is a finite 32; type `unlimited` for an \
+                 explicit opt-in with no rounds ceiling (progress, retry pacing, \
+                 cancel, and oversized-request guards still hold)."
             }
             SettingId::Concurrency => {
                 "How an agent fans out sub-tasks. `subagents` (default) runs them \
@@ -2184,10 +2185,13 @@ impl SettingsCx {
                 "{} (consecutive identical tool calls before approval; 2 = first repeat)",
                 e.loop_guard.effective_threshold()
             ),
-            S::MaxPrimaryRounds => format!(
-                "{} (primary tool round cap per message; 0 = unlimited)",
-                e.max_primary_rounds
-            ),
+            S::MaxPrimaryRounds => {
+                let resolved = e.resolved_delegation_budget("Build", None);
+                match resolved.max_rounds {
+                    None => "unlimited (explicit opt-in; liveness guards still hold)".to_string(),
+                    Some(n) => format!("{n} (primary tool round cap per message; default 32)"),
+                }
+            }
             S::Concurrency => concurrency_label(e.concurrency).to_string(),
             S::ScheduleMaxConcurrent => format!(
                 "{} (cap on running scheduled tasks; >= 1)",
@@ -3190,7 +3194,10 @@ impl SettingsCx {
         match id {
             S::ExitTailLines => e.tui.exit_tail_lines.to_string(),
             S::LoopGuardThreshold => e.loop_guard.effective_threshold().to_string(),
-            S::MaxPrimaryRounds => e.max_primary_rounds.to_string(),
+            S::MaxPrimaryRounds => match e.resolved_delegation_budget("Build", None).max_rounds {
+                None => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+            },
             S::ScheduleMaxConcurrent => e.schedule.max_concurrent.to_string(),
             S::DelegationMaxParallel => e.delegation.max_parallel.to_string(),
             S::GoalSupervisionSkepticCount => e
@@ -3262,8 +3269,16 @@ impl SettingsCx {
                 self.extended.loop_guard.repeat_threshold = v;
             }
             S::MaxPrimaryRounds => {
-                let v = parse_min_u32(trimmed, 0)?;
-                self.extended.max_primary_rounds = v;
+                if trimmed.eq_ignore_ascii_case("unlimited") {
+                    self.extended.max_primary_rounds = 0;
+                    self.extended.delegation_budget.max_rounds =
+                        Some(cockpit_config::extended::SpendLimit::Unlimited);
+                } else {
+                    let v = parse_min_u32(trimmed, 1)?;
+                    self.extended.max_primary_rounds = v;
+                    self.extended.delegation_budget.max_rounds =
+                        Some(cockpit_config::extended::SpendLimit::Finite(u64::from(v)));
+                }
             }
             S::ScheduleMaxConcurrent => {
                 let v = parse_min_usize(trimmed, 1)?;
@@ -3580,6 +3595,7 @@ impl SettingsCx {
                 e.deepthink = d.deepthink;
                 e.loop_guard = d.loop_guard;
                 e.max_primary_rounds = d.max_primary_rounds;
+                e.delegation_budget = d.delegation_budget;
                 e.concurrency = d.concurrency;
                 e.schedule = d.schedule;
                 e.goal_supervision = d.goal_supervision;

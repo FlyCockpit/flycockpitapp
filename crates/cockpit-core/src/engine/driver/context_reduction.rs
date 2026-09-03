@@ -1498,6 +1498,17 @@ impl Driver {
             return false;
         }
         if self.session.take_agent_compact_request() {
+            let tokens_after = self
+                .context_input_tokens(self.active_model_context_length())
+                .unwrap_or(0);
+            if let Err(err) = self.record_compact_progress(tokens_after) {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: err.message(),
+                    })
+                    .await;
+                return false;
+            }
             self.do_compact_with_source(tx, "agent_requested").await;
             return true;
         }
@@ -1536,6 +1547,19 @@ impl Driver {
         {
             return false;
         }
+        // Compact-and-continue progress guard: always enforced, including
+        // under an unlimited spend budget. Token reduction is not progress;
+        // only new assistant/tool work resets the counter. #314 draws from
+        // this same surface.
+        let tokens_after = self.context_input_tokens(context_length).unwrap_or(0);
+        if let Err(err) = self.record_compact_progress(tokens_after) {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: err.message(),
+                })
+                .await;
+            return false;
+        }
         self.do_compact_with_source(tx, "auto").await;
         true
     }
@@ -1545,6 +1569,17 @@ impl Driver {
     /// deterministic appendix, derive context tags, then seed a new linked
     /// session as the next context window.
     pub(in crate::engine::driver) async fn do_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let tokens_after = self
+            .context_input_tokens(self.active_model_context_length())
+            .unwrap_or(0);
+        if let Err(err) = self.record_compact_progress(tokens_after) {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: err.message(),
+                })
+                .await;
+            return;
+        }
         self.do_compact_with_source(tx, "manual").await;
     }
 
@@ -2082,6 +2117,7 @@ impl Driver {
                     .clone(),
                 write_scope: self.write_scope.clone(),
                 dream_read_scope: self.dream_read_scope.clone(),
+                budget: self.budget.clone(),
             },
         );
         #[cfg(test)]

@@ -383,9 +383,12 @@ pub enum AuthorizationRequest<'a> {
     /// Every canonical computer-use action goes through this exhaustive
     /// central variant. It carries only engine-owned session/delegation/action
     /// IDs, tier, host lease token, target/focus/observation generations, and
-    /// safe metadata. No pixel bytes, raw titles, or provider request payloads
-    /// are carried. Ask pauses on this seam; Yolo emits no human request and
-    /// imposes no semantic action/target denial.
+    /// safe metadata. No pixel bytes or raw titles are carried. The one
+    /// deliberate payload fragment is the bounded typed text of a pending
+    /// TypeText action (issue #286), which travels solely so the approval
+    /// seam can render it after secret redaction; it never enters interrupt
+    /// metadata or a durable record. Ask pauses on this seam; Yolo emits no
+    /// human request and imposes no semantic action/target denial.
     ComputerAction {
         session_id: &'a str,
         delegation_id: &'a str,
@@ -419,6 +422,22 @@ pub enum AuthorizationRequest<'a> {
         /// target evidence. Virtual displays have no host lease and therefore
         /// need their own exact authority witness.
         target_evidence_binding_digest: &'a str,
+        /// Human-readable summary of the pending concrete action for the
+        /// approval prompt (issue #286): action kind, coordinates, keys,
+        /// scroll deltas. Typed text is excluded; it travels in `typed_text`.
+        action_detail: &'a str,
+        /// Bounded typed text of a pending TypeText action, rendered in the
+        /// approval prompt only after secret redaction. `None` for every
+        /// other action kind and for secret-shaped (credential-class) text,
+        /// which is never shown in a prompt.
+        typed_text: Option<&'a str>,
+        /// One bounded line summarizing every action of the batch (issue
+        /// #286), present only for multi-action batches.
+        batch_detail: Option<&'a str>,
+        /// Prompt-safe focused target window summary (redacted title hint
+        /// plus an opaque window id prefix), when target evidence is
+        /// available.
+        target_window: Option<&'a str>,
     },
     /// The single central composite authorization for an image-generation
     /// dispatch. It is the one decision issuer for image generation; the pure
@@ -710,6 +729,10 @@ impl Approver {
                 action_payload_digest,
                 lease_binding_digest,
                 target_evidence_binding_digest,
+                action_detail,
+                typed_text,
+                batch_detail,
+                target_window,
             } => {
                 // The computer-use action coordinator resolves tier before
                 // reaching this seam. "ask" pauses for a human response;
@@ -734,6 +757,10 @@ impl Approver {
                     action_payload_digest,
                     lease_binding_digest,
                     target_evidence_binding_digest,
+                    action_detail,
+                    typed_text,
+                    batch_detail,
+                    target_window,
                 )
                 .await
             }
@@ -2410,6 +2437,10 @@ mod tests {
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
             target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail: "wait 10ms",
+            typed_text: None,
+            batch_detail: None,
+            target_window: None,
         }
     }
 
@@ -2446,6 +2477,190 @@ mod tests {
         };
         let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
         assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
+    }
+
+    /// A computer-action request carrying the prompt-level facts of issue
+    /// #286: concrete action detail, typed text, batch summary, target
+    /// window, and risk class.
+    fn computer_action_request_with_prompt_detail<'a>(
+        action_id: &'a str,
+        action_detail: &'a str,
+        typed_text: Option<&'a str>,
+        batch_detail: Option<&'a str>,
+        target_window: Option<&'a str>,
+        action_class: &'a str,
+    ) -> AuthorizationRequest<'a> {
+        AuthorizationRequest::ComputerAction {
+            session_id: "session-1",
+            delegation_id: "delegation-1",
+            action_id,
+            tier: "ask",
+            action_label: "openai_call:2",
+            backend_kind: "virtual_display",
+            focus_generation: 1,
+            observation_generation: 1,
+            has_host_lease: false,
+            provider_call_id: action_id,
+            batch_index: 0,
+            geometry_generation: 1,
+            action_class,
+            action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            lease_binding_digest: None,
+            target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail,
+            typed_text,
+            batch_detail,
+            target_window,
+        }
+    }
+
+    fn single_prompt(question: &InterruptQuestion) -> &str {
+        let InterruptQuestion::Single { prompt, .. } = question else {
+            panic!("expected a single-question computer-action interrupt");
+        };
+        prompt
+    }
+
+    /// Issue #286: the Ask-tier computer-action prompt must render the
+    /// concrete pending action, the resolved target window, the risk class,
+    /// and a per-action summary for multi-action batches — never just an
+    /// opaque `openai_call:N` label.
+    #[tokio::test]
+    async fn computer_action_prompt_shows_detail_window_and_risk_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "click left single at (512, 384)",
+                None,
+                Some("click left single at (512, 384); type text (11 chars)"),
+                Some("Term… (window 0a1b2c3d4e5f6070…)"),
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("click left single at (512, 384)"),
+            "prompt must render the concrete pending action detail, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("risk class: state_changing"),
+            "prompt must render the computed action risk class, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Target window: Term… (window 0a1b2c3d4e5f6070…)"),
+            "prompt must render the resolved target window, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Batch: click left single at (512, 384); type text (11 chars)"),
+            "multi-action batches must summarize each action, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: typed text renders in the prompt only after scrubbing
+    /// through the live redaction table; a table-known secret never appears.
+    #[tokio::test]
+    async fn computer_action_prompt_scrubs_secret_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(
+            tmp.path(),
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal("sk-live-abc123".to_string(), "$test:forced".to_string())
+                .unwrap(),
+        );
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "type text (21 chars)",
+                Some("deploy key sk-live-abc123"),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            !prompt.contains("sk-live-abc123"),
+            "secret-shaped typed text must be redacted in the prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("deploy key"),
+            "non-secret typed text survives redaction, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: with no redaction table available (a headless approver
+    /// built without a session), typed text is withheld rather than shown
+    /// unredacted.
+    #[tokio::test]
+    async fn computer_action_prompt_withholds_typed_text_without_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                "type text (5 chars)",
+                Some("super private note"),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("[text withheld: no redaction table]"),
+            "typed text must be withheld without a redaction table, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("super private note"),
+            "unredacted typed text must never render, got: {prompt}"
+        );
+    }
+
+    /// Build an approver whose redaction slot carries the given table (the
+    /// live session approver shape, `Approver::new_for_session`).
+    fn approver_with_redaction(
+        cwd: &std::path::Path,
+        table: crate::redact::RedactionTable,
+    ) -> Approver {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                cwd.to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
+        let hub = Arc::new(InterruptHub::detached());
+        Approver::new_for_session(
+            store,
+            db,
+            session,
+            Arc::new(std::sync::RwLock::new(Arc::new(table))),
+            "builder",
+            hub,
+        )
     }
 
     /// Build an approver whose shared session is in a specific global approval
@@ -2506,6 +2721,10 @@ mod tests {
             action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             lease_binding_digest: None,
             target_evidence_binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            action_detail: "wait 10ms",
+            typed_text: None,
+            batch_detail: None,
+            target_window: None,
         }
     }
 

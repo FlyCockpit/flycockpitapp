@@ -1120,6 +1120,27 @@ impl Approver {
         Ok(decision)
     }
 
+    /// Render the typed-text clause of a computer-action approval prompt
+    /// (issue #286). Secret-shaped text never renders: credential-shaped
+    /// text is withheld by the coordinator (it never reaches this seam), and
+    /// all other text is scrubbed through the live redaction table before it
+    /// reaches the prompt. With no redaction table available (a headless
+    /// approver without a session), the text is withheld rather than shown
+    /// unredacted.
+    fn computer_typed_text_display(&self, typed_text: Option<&str>) -> String {
+        let Some(text) = typed_text else {
+            return String::new();
+        };
+        let Some(redact) = self.redact.as_ref().map(|slot| {
+            slot.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }) else {
+            return " [text withheld: no redaction table]".to_string();
+        };
+        format!(" \"{}\"", redact.scrub(text))
+    }
+
     /// Central authorization for every canonical computer-use action.
     ///
     /// The coordinator resolves tier before reaching this seam. "ask" pauses
@@ -1132,6 +1153,11 @@ impl Approver {
     /// provider call ID maps to one engine action/batch identity; there is
     /// no standing grant or reject for computer actions (the later lease
     /// prompt defines one-decision reuse).
+    ///
+    /// The Ask prompt renders the concrete pending action (issue #286):
+    /// action kind with coordinates/keys, the redacted typed text, the
+    /// resolved target window, the advisory risk class, and — for a
+    /// multi-action batch — a summary of every pending action.
     pub(super) async fn approve_computer_action_inner(
         &self,
         session_id: &str,
@@ -1150,6 +1176,10 @@ impl Approver {
         action_payload_digest: &str,
         lease_binding_digest: Option<&str>,
         target_evidence_binding_digest: &str,
+        action_detail: &str,
+        typed_text: Option<&str>,
+        batch_detail: Option<&str>,
+        target_window: Option<&str>,
     ) -> Result<Decision> {
         // Yolo tier: zero human requests, no semantic denial. Only the
         // *computer* effective tier grants this — the global session
@@ -1163,7 +1193,19 @@ impl Approver {
 
         // Ask tier: raise a human prompt. The action is blocked until the
         // user responds. Noninteractive clients get a noninteractive deny.
-        let prompt = format!("Allow computer action `{action_label}` (id: {action_id})?");
+        // The prompt must show what is actually being approved (issue #286),
+        // never just an opaque `openai_call:N` batch label.
+        let typed_display = self.computer_typed_text_display(typed_text);
+        let target_line = match target_window {
+            Some(window) => format!(" Target window: {window}."),
+            None => format!(" Target: {backend_kind} display."),
+        };
+        let batch_line = batch_detail
+            .map(|batch| format!(" Batch: {batch}."))
+            .unwrap_or_default();
+        let prompt = format!(
+            "Allow computer action `{action_detail}{typed_display}` (risk class: {action_class})?{target_line}{batch_line} (call `{action_label}`, id: {action_id})"
+        );
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
@@ -1176,7 +1218,7 @@ impl Approver {
             approval_class: None,
             sandbox_escalation: None,
         };
-        let description = format!("Computer action `{action_label}` (id: {action_id})");
+        let description = format!("Computer action `{action_detail}` (id: {action_id})");
         let set = ApprovalOptionSet::new(
             "computer_action_approval",
             [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],

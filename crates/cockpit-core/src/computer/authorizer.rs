@@ -90,6 +90,10 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
             action_payload_digest: &request.action_payload_digest,
             lease_binding_digest: request.lease_binding_digest.as_deref(),
             target_evidence_binding_digest: &request.target_evidence_binding_digest,
+            action_detail: &request.action_detail,
+            typed_text: request.typed_text.as_deref(),
+            batch_detail: request.batch_detail.as_deref(),
+            target_window: request.target_window.as_deref(),
         };
         match self.approver.authorize(central).await {
             Ok(decision) => Ok(map_decision(decision)),
@@ -156,6 +160,10 @@ mod tests {
             lease_binding_digest: None,
             target_evidence_binding_digest:
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            action_detail: "wait 10ms".to_string(),
+            typed_text: None,
+            batch_detail: None,
+            target_window: None,
         }
     }
 

@@ -889,15 +889,30 @@ pub(crate) struct VirtualDisplayBackend {
     capture_root: PathBuf,
     physical_capability: Option<coordinator::PhysicalDispatchCapability>,
     /// Evidenced window this backend will inject into. Both physical X11 and
-    /// virtual displays store the decoded X11 id from evidence; they never
-    /// pin whichever window happens to be active at bind time.
+    /// virtual displays store the decoded X11 id and planted generation from
+    /// evidence; they never pin whichever window happens to be active at bind
+    /// time.
     evidenced_injection_window: Option<EvidencedX11Window>,
+    /// Window identity recovered from the held-input journal. Cleanup uses this
+    /// when dispatch has not yet bound a live window.
+    cleanup_window: Option<EvidencedX11Window>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EvidencedX11Window {
     opaque: target::OpaqueWindowId,
     x11: u32,
+    generation: [u8; 12],
+}
+
+fn evidenced_x11_window_from_opaque_bytes(bytes: Option<[u8; 16]>) -> Option<EvidencedX11Window> {
+    let opaque = target::OpaqueWindowId::from_bytes(bytes?);
+    let (x11, generation) = crate::computer::platform::x11_window_identity_from_opaque(&opaque)?;
+    Some(EvidencedX11Window {
+        opaque,
+        x11,
+        generation,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -922,6 +937,9 @@ struct HeldInputState {
     pending: bool,
     keys: Vec<String>,
     buttons: Vec<u8>,
+    /// Opaque window identity that received the matching downs. Cleanup must
+    /// address this object; a missing identity with leftover keys fails closed.
+    window: Option<[u8; 16]>,
 }
 
 impl HeldKeyJournal {
@@ -959,6 +977,7 @@ impl HeldKeyJournal {
         if state.pending
             || state.keys.iter().any(|key| key.is_empty())
             || state.buttons.iter().any(|button| !(1..=3).contains(button))
+            || (state.window.is_none() && (!state.keys.is_empty() || !state.buttons.is_empty()))
         {
             return Err(ComputerError::CommandFailed {
                 program: "computer input-state journal".to_string(),
@@ -968,7 +987,13 @@ impl HeldKeyJournal {
         Ok(state)
     }
 
-    fn store(&self, keys: &[String], buttons: &[u8], pending: bool) -> Result<(), ComputerError> {
+    fn store(
+        &self,
+        keys: &[String],
+        buttons: &[u8],
+        pending: bool,
+        window: Option<[u8; 16]>,
+    ) -> Result<(), ComputerError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -976,10 +1001,16 @@ impl HeldKeyJournal {
             return cockpit_host::private_fs::delete_private_file(path)
                 .map_err(input_journal_error);
         }
+        if window.is_none() && (!keys.is_empty() || !buttons.is_empty() || pending) {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
         let bytes = serde_json::to_vec(&HeldInputState {
             pending,
             keys: keys.to_vec(),
             buttons: buttons.to_vec(),
+            window,
         })
         .map_err(|error| ComputerError::CommandFailed {
             program: "computer input-state journal".to_string(),
@@ -1079,6 +1110,7 @@ impl VirtualDisplayBackend {
             capture_root,
             physical_capability: None,
             evidenced_injection_window: None,
+            cleanup_window: evidenced_x11_window_from_opaque_bytes(held.window),
         })
     }
 
@@ -1139,6 +1171,7 @@ impl VirtualDisplayBackend {
             capture_root,
             physical_capability: None,
             evidenced_injection_window: None,
+            cleanup_window: None,
         })
     }
 
@@ -1189,16 +1222,24 @@ impl VirtualDisplayBackend {
         if let Some(bound) = self.evidenced_injection_window
             && bound.opaque == window
         {
+            crate::computer::platform::x11_window_generation_is_live(
+                &self.display,
+                bound.x11,
+                &bound.generation,
+            )
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
             return Ok(());
         }
-        let x11 = crate::computer::platform::x11_window_from_opaque(&window)
-            .filter(|window| *window != 0)
+        let (x11, generation) = crate::computer::platform::x11_window_identity_from_opaque(&window)
             .ok_or_else(|| {
                 ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string())
             })?;
+        crate::computer::platform::x11_window_generation_is_live(&self.display, x11, &generation)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         self.evidenced_injection_window = Some(EvidencedX11Window {
             opaque: window,
             x11,
+            generation,
         });
         Ok(())
     }
@@ -1256,11 +1297,13 @@ impl VirtualDisplayBackend {
 
     #[cfg(target_os = "linux")]
     fn run_release_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
-        let Some(bound) = self.evidenced_injection_window else {
-            return Err(ComputerError::Refused(
-                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
-            ));
-        };
+        let bound = self.release_injection_window()?;
+        crate::computer::platform::x11_window_generation_is_live(
+            &self.display,
+            bound.x11,
+            &bound.generation,
+        )
+        .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
     }
 
@@ -1301,7 +1344,34 @@ impl VirtualDisplayBackend {
                 self.held_buttons.push(button);
             }
         }
+        if self.cleanup_window.is_none() {
+            self.cleanup_window = evidenced_x11_window_from_opaque_bytes(state.window);
+        }
         Ok(())
+    }
+
+    fn held_input_window_bytes(&self) -> Option<[u8; 16]> {
+        self.evidenced_injection_window
+            .or(self.cleanup_window)
+            .map(|bound| *bound.opaque.as_bytes())
+    }
+
+    fn persist_held_input(
+        &self,
+        keys: &[String],
+        buttons: &[u8],
+        pending: bool,
+    ) -> Result<(), ComputerError> {
+        self.held_key_journal
+            .store(keys, buttons, pending, self.held_input_window_bytes())
+    }
+
+    fn release_injection_window(&self) -> Result<EvidencedX11Window, ComputerError> {
+        self.evidenced_injection_window
+            .or(self.cleanup_window)
+            .ok_or_else(|| {
+                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+            })
     }
 
     /// Persist a pending transition before emitting `keydown`. Recovery never
@@ -1312,14 +1382,11 @@ impl VirtualDisplayBackend {
             // Re-publish even for a repeated key: a prior recovery attempt may
             // have loaded the key before its journal was removed, and keydown
             // must never proceed without a durable recovery record.
-            return self
-                .held_key_journal
-                .store(&self.held_keys, &self.held_buttons, true);
+            return self.persist_held_input(&self.held_keys, &self.held_buttons, true);
         }
         let mut keys = self.held_keys.clone();
         keys.push(key);
-        self.held_key_journal
-            .store(&keys, &self.held_buttons, true)?;
+        self.persist_held_input(&keys, &self.held_buttons, true)?;
         self.held_keys = keys;
         Ok(())
     }
@@ -1334,8 +1401,7 @@ impl VirtualDisplayBackend {
             .filter(|held| held.as_str() != key)
             .cloned()
             .collect::<Vec<_>>();
-        self.held_key_journal
-            .store(&keys, &self.held_buttons, false)?;
+        self.persist_held_input(&keys, &self.held_buttons, false)?;
         self.held_keys = keys;
         Ok(())
     }
@@ -1345,8 +1411,7 @@ impl VirtualDisplayBackend {
         if !self.held_buttons.contains(&button) {
             let mut buttons = self.held_buttons.clone();
             buttons.push(button);
-            self.held_key_journal
-                .store(&self.held_keys, &buttons, true)?;
+            self.persist_held_input(&self.held_keys, &buttons, true)?;
             self.held_buttons = buttons;
         }
         Ok(())
@@ -1360,20 +1425,17 @@ impl VirtualDisplayBackend {
             .copied()
             .filter(|held| *held != button)
             .collect::<Vec<_>>();
-        self.held_key_journal
-            .store(&self.held_keys, &buttons, false)?;
+        self.persist_held_input(&self.held_keys, &buttons, false)?;
         self.held_buttons = buttons;
         Ok(())
     }
 
     fn prepare_current_input_transition(&self) -> Result<(), ComputerError> {
-        self.held_key_journal
-            .store(&self.held_keys, &self.held_buttons, true)
+        self.persist_held_input(&self.held_keys, &self.held_buttons, true)
     }
 
     fn commit_known_input_state(&self) -> Result<(), ComputerError> {
-        self.held_key_journal
-            .store(&self.held_keys, &self.held_buttons, false)
+        self.persist_held_input(&self.held_keys, &self.held_buttons, false)
     }
 }
 
@@ -1968,8 +2030,7 @@ impl ComputerBackend for VirtualDisplayBackend {
                     LinuxReleaseTransition::Button(button) => {
                         self.run_release_xdotool("mouseup", &[OsString::from(button.to_string())])?;
                         self.held_buttons.retain(|held| *held != button);
-                        self.held_key_journal
-                            .store(&self.held_keys, &self.held_buttons, false)
+                        self.persist_held_input(&self.held_keys, &self.held_buttons, false)
                     }
                 }
             })?;
@@ -2021,6 +2082,12 @@ impl ComputerBackend for VirtualDisplayBackend {
                     EVIDENCED_WINDOW_MISMATCH.to_string(),
                 ));
             }
+            crate::computer::platform::x11_window_generation_is_live(
+                &self.display,
+                bound.x11,
+                &bound.generation,
+            )
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
             return Ok(());
         }
         #[cfg(not(target_os = "linux"))]
@@ -4896,8 +4963,14 @@ mod tests {
             path: Some(temp.path().join("held-keys.json")),
         };
 
+        let window = [0x11_u8; 16];
         journal
-            .store(&["F13".to_string(), "a".to_string()], &[1], false)
+            .store(
+                &["F13".to_string(), "a".to_string()],
+                &[1],
+                false,
+                Some(window),
+            )
             .expect("persist held keys before keydown");
         assert_eq!(
             journal.load().expect("reload held keys"),
@@ -4905,13 +4978,14 @@ mod tests {
                 pending: false,
                 keys: vec!["F13".to_string(), "a".to_string()],
                 buttons: vec![1],
+                window: Some(window),
             }
         );
 
         // A partial cleanup may remove only the keys whose keyup succeeded;
         // the remainder is what a retry or replacement daemon must see.
         journal
-            .store(&["a".to_string()], &[], false)
+            .store(&["a".to_string()], &[], false, Some(window))
             .expect("retain failed keyup key");
         assert_eq!(
             journal.load().expect("reload failed keyup key"),
@@ -4919,11 +4993,12 @@ mod tests {
                 pending: false,
                 keys: vec!["a".to_string()],
                 buttons: vec![],
+                window: Some(window),
             }
         );
 
         journal
-            .store(&[], &[], false)
+            .store(&[], &[], false, None)
             .expect("clear after successful keyup");
         assert_eq!(
             journal.load().expect("empty journal"),
@@ -4931,9 +5006,14 @@ mod tests {
         );
 
         journal
-            .store(&["F13".to_string()], &[], true)
+            .store(&["F13".to_string()], &[], true, Some(window))
             .expect("persist ambiguous transition");
         assert!(journal.load().is_err(), "pending state must fail closed");
+
+        assert!(
+            journal.store(&["a".to_string()], &[], false, None).is_err(),
+            "held keys without a window identity must fail closed"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5541,7 +5621,7 @@ mod tests {
         let mut evidence = sample_virtual_evidence([4u8; 16], 1);
         evidence.focus_generation = 1;
         evidence.focused_window_id = crate::computer::target::FieldEvidence::available(
-            crate::computer::platform::opaque_x11_window_id(1),
+            crate::computer::platform::opaque_x11_window_id(1, [0x11; 12]),
             crate::computer::target::EvidenceSource::InjectedTest,
         );
         let adapter = FakeTargetEvidenceAdapter::new(evidence);
@@ -6189,8 +6269,12 @@ mod tests {
             "binding must decode the evidenced X11 id, not pin the live active window"
         );
         assert!(
-            body.contains("x11_window_from_opaque"),
+            body.contains("x11_window_identity_from_opaque"),
             "binding must require an encoded X11 window identity"
+        );
+        assert!(
+            body.contains("x11_window_generation_is_live"),
+            "binding must verify the planted generation so a recycled XID cannot match"
         );
     }
 

@@ -8,12 +8,13 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
-    CreateCompatibleDC, DIB_RGB_COLORS, DISPLAY_DEVICEW, DeleteDC, DeleteObject,
-    EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
-    MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, ClientToScreen,
+    CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DISPLAY_DEVICEW, DeleteDC,
+    DeleteObject, EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY,
+    ScreenToClient, SelectObject,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -35,9 +36,11 @@ use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomat
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos,
+    EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT, GetAncestor, GetClassNameW, GetClientRect,
     GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsChild,
-    IsWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    IsWindow, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -52,11 +55,11 @@ use crate::computer::target::{
     TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
 };
 use crate::computer::{
-    CaptureFrame, ClickCount, ComputerActionOutcome, ComputerBackend, ComputerError,
-    DisplayGeometry, DisplayTarget, EVIDENCED_WINDOW_MISMATCH, Easing, LogicalSize, Modifiers,
-    MouseButton, NormalizedComputerAction, NormalizedComputerEffect, NormalizedKeyCode, PixelPoint,
-    PixelRect, PixelSize, RealDesktopGrantStore, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW,
-    ScaleFactor,
+    CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW, CaptureFrame, ClickCount, ComputerActionOutcome,
+    ComputerBackend, ComputerError, DisplayGeometry, DisplayTarget, EVIDENCED_WINDOW_MISMATCH,
+    Easing, LogicalSize, Modifiers, MouseButton, NormalizedComputerAction,
+    NormalizedComputerEffect, NormalizedKeyCode, PixelPoint, PixelRect, PixelSize,
+    RealDesktopGrantStore, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, ScaleFactor,
 };
 
 #[derive(Debug)]
@@ -64,16 +67,25 @@ pub(crate) struct WindowsDesktopBackend {
     geometry: DisplayGeometry,
     origin_x: i32,
     origin_y: i32,
+    pointer: PixelPoint,
     held_keyboard_inputs: Vec<HeldKeyboardInput>,
     held_input_journal: WindowsHeldInputJournal,
     held_buttons: Vec<MouseButton>,
     physical_capability: Option<crate::computer::coordinator::PhysicalDispatchCapability>,
-    evidenced_window: Option<OpaqueWindowId>,
+    evidenced_window: Option<EvidencedWindowsWindow>,
+    cleanup_window: Option<EvidencedWindowsWindow>,
 }
 
-/// Every keyboard down event is made durable before `SendInput`. Recovery uses
-/// the journal under the Windows session-wide host lease, so an extra key-up is
-/// preferred over handing a possibly held key to a replacement daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvidencedWindowsWindow {
+    opaque: OpaqueWindowId,
+    hwnd_bits: isize,
+}
+
+/// Every keyboard down event is made durable before the window-addressed post.
+/// Recovery uses the journal under the Windows session-wide host lease, so an
+/// extra key-up is preferred over handing a possibly held key to a replacement
+/// daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum HeldKeyboardInput {
     VirtualKey { key: u16, extended: bool },
@@ -117,25 +129,46 @@ impl WindowsHeldInputJournal {
         })
     }
 
-    fn load(&self) -> Result<Vec<HeldKeyboardInput>, ComputerError> {
+    fn load(&self) -> Result<WindowsHeldInputState, ComputerError> {
         let Some(bytes) =
             cockpit_host::private_fs::read_private_file(&self.path, "Windows computer held-input")
                 .map_err(win_input_error)?
         else {
-            return Ok(Vec::new());
+            return Ok(WindowsHeldInputState::default());
         };
-        serde_json::from_slice(&bytes)
-            .map_err(|_| win_input_error("Windows held-input journal is malformed"))
+        let state: WindowsHeldInputState = serde_json::from_slice(&bytes)
+            .map_err(|_| win_input_error("Windows held-input journal is malformed"))?;
+        if (!state.keyboard.is_empty() || !state.buttons.is_empty())
+            && (state.window.is_none() || state.hwnd_bits.is_none())
+        {
+            return Err(win_input_error(
+                "Windows held-input journal is missing the window that received the downs",
+            ));
+        }
+        Ok(state)
     }
 
-    fn store(&self, inputs: &[HeldKeyboardInput]) -> Result<(), ComputerError> {
-        if inputs.is_empty() {
+    fn store(&self, state: &WindowsHeldInputState) -> Result<(), ComputerError> {
+        if state.keyboard.is_empty() && state.buttons.is_empty() {
             return cockpit_host::private_fs::delete_private_file(&self.path)
                 .map_err(win_input_error);
         }
-        let bytes = serde_json::to_vec(inputs).map_err(win_input_error)?;
+        if state.window.is_none() || state.hwnd_bits.is_none() {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
+        let bytes = serde_json::to_vec(state).map_err(win_input_error)?;
         cockpit_host::private_fs::write_private_file(&self.path, &bytes).map_err(win_input_error)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+struct WindowsHeldInputState {
+    keyboard: Vec<HeldKeyboardInput>,
+    buttons: Vec<MouseButton>,
+    window: Option<[u8; 16]>,
+    hwnd_bits: Option<i64>,
 }
 
 impl WindowsDesktopBackend {
@@ -153,16 +186,18 @@ impl WindowsDesktopBackend {
         }
         let (geometry, origin_x, origin_y) = query_geometry()?;
         let held_input_journal = WindowsHeldInputJournal::for_current_input_session()?;
-        let held_keyboard_inputs = held_input_journal.load()?;
+        let held = held_input_journal.load()?;
         Ok(Self {
             geometry,
             origin_x,
             origin_y,
-            held_keyboard_inputs,
+            pointer: PixelPoint { x: 0, y: 0 },
+            held_keyboard_inputs: held.keyboard,
             held_input_journal,
-            held_buttons: Vec::new(),
+            held_buttons: held.buttons,
             physical_capability: None,
             evidenced_window: None,
+            cleanup_window: evidenced_windows_window_from_journal(&held),
         })
     }
 
@@ -175,22 +210,79 @@ impl WindowsDesktopBackend {
             .recheck(BackendKind::RealDesktopWindows)
     }
 
-    fn require_live_evidenced_window(&self) -> Result<(), ComputerError> {
-        let expected = self.evidenced_window.ok_or_else(|| {
-            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
-        })?;
-        let live = foreground_opaque_window_id()?;
-        if live != expected {
+    fn require_live_evidenced_window(&self) -> Result<HWND, ComputerError> {
+        self.resolve_injection_hwnd(true)
+    }
+
+    fn resolve_injection_hwnd(&self, require_live_focus: bool) -> Result<HWND, ComputerError> {
+        let bound = self
+            .evidenced_window
+            .or(self.cleanup_window)
+            .ok_or_else(|| {
+                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+            })?;
+        let hwnd = hwnd_from_bits(bound.hwnd_bits);
+        // SAFETY: `IsWindow` accepts any HWND-sized handle; invalid values return false.
+        if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
             return Err(ComputerError::Refused(
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
         }
-        Ok(())
+        let live = opaque_id_for_hwnd(hwnd)?;
+        if live != bound.opaque {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        if require_live_focus {
+            // SAFETY: GetForegroundWindow returns a possibly-invalid HWND; identity is
+            // re-checked through UI Automation before any post.
+            let foreground = unsafe { GetForegroundWindow() };
+            if foreground != hwnd {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
+            let foreground_id = opaque_id_for_hwnd(foreground)?;
+            if foreground_id != bound.opaque {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
+        }
+        Ok(hwnd)
     }
 
     fn reload_held_keyboard_inputs(&mut self) -> Result<(), ComputerError> {
-        self.held_keyboard_inputs = self.held_input_journal.load()?;
+        let state = self.held_input_journal.load()?;
+        self.held_keyboard_inputs = state.keyboard;
+        if self.held_buttons.is_empty() {
+            self.held_buttons = state.buttons;
+        } else {
+            for button in state.buttons {
+                if !self.held_buttons.contains(&button) {
+                    self.held_buttons.push(button);
+                }
+            }
+        }
+        if self.cleanup_window.is_none() {
+            self.cleanup_window = evidenced_windows_window_from_journal(&state);
+        }
         Ok(())
+    }
+
+    fn persist_held_state(
+        &self,
+        keyboard: &[HeldKeyboardInput],
+        buttons: &[MouseButton],
+    ) -> Result<(), ComputerError> {
+        let bound = self.evidenced_window.or(self.cleanup_window);
+        self.held_input_journal.store(&WindowsHeldInputState {
+            keyboard: keyboard.to_vec(),
+            buttons: buttons.to_vec(),
+            window: bound.map(|window| *window.opaque.as_bytes()),
+            hwnd_bits: bound.map(|window| window.hwnd_bits as i64),
+        })
     }
 
     fn remember_held_keyboard_input(
@@ -199,7 +291,7 @@ impl WindowsDesktopBackend {
     ) -> Result<(), ComputerError> {
         let mut inputs = self.held_keyboard_inputs.clone();
         inputs.push(input);
-        self.held_input_journal.store(&inputs)?;
+        self.persist_held_state(&inputs, &self.held_buttons)?;
         self.held_keyboard_inputs = inputs;
         Ok(())
     }
@@ -215,8 +307,30 @@ impl WindowsDesktopBackend {
             ));
         };
         inputs.remove(index);
-        self.held_input_journal.store(&inputs)?;
+        self.persist_held_state(&inputs, &self.held_buttons)?;
         self.held_keyboard_inputs = inputs;
+        Ok(())
+    }
+
+    fn remember_held_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
+        if !self.held_buttons.contains(&button) {
+            let mut buttons = self.held_buttons.clone();
+            buttons.push(button);
+            self.persist_held_state(&self.held_keyboard_inputs, &buttons)?;
+            self.held_buttons = buttons;
+        }
+        Ok(())
+    }
+
+    fn forget_held_button(&mut self, button: MouseButton) -> Result<(), ComputerError> {
+        let buttons = self
+            .held_buttons
+            .iter()
+            .copied()
+            .filter(|held| *held != button)
+            .collect::<Vec<_>>();
+        self.persist_held_state(&self.held_keyboard_inputs, &buttons)?;
+        self.held_buttons = buttons;
         Ok(())
     }
 
@@ -225,11 +339,13 @@ impl WindowsDesktopBackend {
             key: key.key.0,
             extended: key.extended,
         })?;
-        self.send_key(key, false)
+        let hwnd = self.require_live_evidenced_window()?;
+        self.send_key(hwnd, key, false)
     }
 
     fn key_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        self.send_key(key, true)?;
+        let hwnd = self.require_live_evidenced_window()?;
+        self.send_key(hwnd, key, true)?;
         self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey {
             key: key.key.0,
             extended: key.extended,
@@ -238,11 +354,13 @@ impl WindowsDesktopBackend {
 
     fn unicode_down(&mut self, unit: u16) -> Result<(), ComputerError> {
         self.remember_held_keyboard_input(HeldKeyboardInput::Unicode(unit))?;
-        self.send_unicode(unit, false)
+        let hwnd = self.require_live_evidenced_window()?;
+        self.send_unicode(hwnd, unit, false)
     }
 
     fn unicode_up(&mut self, unit: u16) -> Result<(), ComputerError> {
-        self.send_unicode(unit, true)?;
+        let hwnd = self.require_live_evidenced_window()?;
+        self.send_unicode(hwnd, unit, true)?;
         self.forget_held_keyboard_input(HeldKeyboardInput::Unicode(unit))
     }
 
@@ -377,95 +495,156 @@ impl WindowsDesktopBackend {
         }
     }
 
-    fn move_cursor(&self, point: PixelPoint) -> Result<(), ComputerError> {
-        let (x, y) = (point.x, point.y);
-        let width = self.geometry.physical.width.saturating_sub(1).max(1);
-        let height = self.geometry.physical.height.saturating_sub(1).max(1);
-        self.send_mouse(
-            ((u64::from(x) * 65_535) / u64::from(width)) as i32,
-            ((u64::from(y) * 65_535) / u64::from(height)) as i32,
-            0,
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    fn move_cursor(&mut self, point: PixelPoint) -> Result<(), ComputerError> {
+        let hwnd = self.require_live_evidenced_window()?;
+        let client = self.client_point(hwnd, point, true)?;
+        self.post_to_target(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam_point(client))?;
+        self.pointer = point;
+        Ok(())
+    }
+
+    /// Sole irreversible input primitive. Every keyboard, pointer, and cleanup
+    /// event is posted to the evidenced HWND so delivery cannot retarget a
+    /// newly focused unevidenced window.
+    fn post_to_target(
+        &self,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<(), ComputerError> {
+        // SAFETY: `hwnd` was validated as a live window belonging to the
+        // evidenced UIA identity immediately before this call.
+        unsafe { PostMessageW(Some(hwnd), msg, wparam, lparam) }
+            .map_err(|_| win32_error("PostMessageW"))
+    }
+
+    fn client_point(
+        &self,
+        hwnd: HWND,
+        point: PixelPoint,
+        require_inside: bool,
+    ) -> Result<POINT, ComputerError> {
+        let mut screen = POINT {
+            x: self.origin_x + i32::try_from(point.x).map_err(win_input_error)?,
+            y: self.origin_y + i32::try_from(point.y).map_err(win_input_error)?,
+        };
+        // SAFETY: `screen` is valid writable storage for the duration of the call.
+        if !unsafe { ScreenToClient(hwnd, &mut screen) }.as_bool() {
+            return Err(win32_error("ScreenToClient"));
+        }
+        if require_inside {
+            let mut client = RECT::default();
+            // SAFETY: `client` is valid writable storage for the duration of the call.
+            unsafe { GetClientRect(hwnd, &mut client) }
+                .map_err(|_| win32_error("GetClientRect"))?;
+            if screen.x < client.left
+                || screen.y < client.top
+                || screen.x >= client.right
+                || screen.y >= client.bottom
+            {
+                return Err(ComputerError::Refused(
+                    "cursor point is outside the evidenced window".to_string(),
+                ));
+            }
+        }
+        Ok(screen)
+    }
+
+    fn send_button(
+        &self,
+        hwnd: HWND,
+        button: MouseButton,
+        up: bool,
+        point: PixelPoint,
+        require_inside: bool,
+    ) -> Result<(), ComputerError> {
+        let client = self.client_point(hwnd, point, require_inside)?;
+        let (msg, keys) = match (button, up) {
+            (MouseButton::Left, false) => (WM_LBUTTONDOWN, 0x0001_usize),
+            (MouseButton::Left, true) => (WM_LBUTTONUP, 0x0001_usize),
+            (MouseButton::Right, false) => (WM_RBUTTONDOWN, 0x0002_usize),
+            (MouseButton::Right, true) => (WM_RBUTTONUP, 0x0002_usize),
+            (MouseButton::Middle, false) => (WM_MBUTTONDOWN, 0x0010_usize),
+            (MouseButton::Middle, true) => (WM_MBUTTONUP, 0x0010_usize),
+        };
+        self.post_to_target(hwnd, msg, WPARAM(keys), lparam_point(client))
+    }
+
+    fn send_wheel(&self, hwnd: HWND, horizontal: bool, delta: i32) -> Result<(), ComputerError> {
+        let client = self.client_point(hwnd, self.pointer, true)?;
+        let mut screen = client;
+        // SAFETY: `screen` is valid writable storage; WM_MOUSEWHEEL lParam is
+        // in screen coordinates.
+        if !unsafe { ClientToScreen(hwnd, &mut screen) }.as_bool() {
+            return Err(win32_error("ClientToScreen"));
+        }
+        let delta_bits = (delta as i16 as u16 as u32) << 16;
+        let wparam = WPARAM(delta_bits as usize);
+        let msg = if horizontal {
+            WM_MOUSEHWHEEL
+        } else {
+            WM_MOUSEWHEEL
+        };
+        self.post_to_target(hwnd, msg, wparam, lparam_point(screen))
+    }
+
+    fn send_key(&self, hwnd: HWND, key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
+        // SAFETY: MapVirtualKeyW reads only the virtual-key integer.
+        let scan = unsafe { MapVirtualKeyW(u32::from(key.key.0), MAPVK_VK_TO_VSC) };
+        let mut lparam = 1_u32;
+        lparam |= (scan & 0xff) << 16;
+        if key.extended {
+            lparam |= 1 << 24;
+        }
+        if up {
+            lparam |= 1 << 30;
+            lparam |= 1 << 31;
+        }
+        let msg = if up { WM_KEYUP } else { WM_KEYDOWN };
+        self.post_to_target(
+            hwnd,
+            msg,
+            WPARAM(usize::from(key.key.0)),
+            LPARAM(lparam as isize),
         )
     }
 
-    /// Sole irreversible `SendInput` primitive. Every keyboard, pointer, and
-    /// cleanup event rechecks the evidenced foreground window immediately
-    /// before the syscall so a mid-compound focus change cannot redirect
-    /// remaining events.
-    fn send_input(&self, inputs: &[INPUT]) -> Result<(), ComputerError> {
-        self.require_live_evidenced_window()?;
-        send_raw(inputs)
+    fn send_unicode(&self, hwnd: HWND, unit: u16, up: bool) -> Result<(), ComputerError> {
+        if up {
+            return Ok(());
+        }
+        self.post_to_target(hwnd, WM_CHAR, WPARAM(usize::from(unit)), LPARAM(1))
     }
+}
 
-    fn send_mouse(
-        &self,
-        dx: i32,
-        dy: i32,
-        data: u32,
-        flags: MOUSE_EVENT_FLAGS,
-    ) -> Result<(), ComputerError> {
-        self.send_input(&[INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx,
-                    dy,
-                    mouseData: data,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }])
-    }
+fn lparam_point(point: POINT) -> LPARAM {
+    let x = point.x as u16 as u32;
+    let y = point.y as u16 as u32;
+    LPARAM(((y << 16) | x) as isize)
+}
 
-    fn send_button(&self, button: MouseButton, up: bool) -> Result<(), ComputerError> {
-        let flags = match (button, up) {
-            (MouseButton::Left, false) => MOUSEEVENTF_LEFTDOWN,
-            (MouseButton::Left, true) => MOUSEEVENTF_LEFTUP,
-            (MouseButton::Right, false) => MOUSEEVENTF_RIGHTDOWN,
-            (MouseButton::Right, true) => MOUSEEVENTF_RIGHTUP,
-            (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEDOWN,
-            (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEUP,
-        };
-        self.send_mouse(0, 0, 0, flags)
-    }
+fn hwnd_bits(hwnd: HWND) -> isize {
+    hwnd.0 as isize
+}
 
-    fn send_key(&self, key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
-        self.send_input(&[INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: key.key,
-                    wScan: 0,
-                    dwFlags: key_event_flags(key, up),
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }])
-    }
+fn hwnd_from_bits(bits: isize) -> HWND {
+    HWND(bits as *mut core::ffi::c_void)
+}
 
-    fn send_unicode(&self, unit: u16, up: bool) -> Result<(), ComputerError> {
-        self.send_input(&[INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: unit,
-                    dwFlags: KEYEVENTF_UNICODE
-                        | if up {
-                            KEYEVENTF_KEYUP
-                        } else {
-                            KEYBD_EVENT_FLAGS(0)
-                        },
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }])
+fn evidenced_windows_window_from_journal(
+    state: &WindowsHeldInputState,
+) -> Option<EvidencedWindowsWindow> {
+    let opaque = OpaqueWindowId::from_bytes(state.window?);
+    let hwnd_bits = isize::try_from(state.hwnd_bits?).ok()?;
+    if hwnd_bits == 0 {
+        return None;
     }
+    Some(EvidencedWindowsWindow { opaque, hwnd_bits })
+}
+
+fn windows_owned_cleanup_buttons(held: &[MouseButton]) -> Vec<MouseButton> {
+    held.to_vec()
 }
 
 /// A 32-bit `BI_RGB` DIB is BGRA-shaped in memory, but GDI does not define its
@@ -536,23 +715,24 @@ impl ComputerBackend for WindowsDesktopBackend {
                 modifiers,
             } => {
                 self.send_modifiers(*modifiers, false)?;
+                let hwnd = self.require_live_evidenced_window()?;
                 for _ in 0..click_count(*count) {
-                    self.send_button(*button, false)?;
-                    self.send_button(*button, true)?;
+                    self.send_button(hwnd, *button, false, self.pointer, true)?;
+                    self.send_button(hwnd, *button, true, self.pointer, true)?;
                 }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseDown { button } => {
-                self.send_button(*button, false)?;
-                if !self.held_buttons.contains(button) {
-                    self.held_buttons.push(*button);
-                }
+                self.remember_held_button(*button)?;
+                let hwnd = self.require_live_evidenced_window()?;
+                self.send_button(hwnd, *button, false, self.pointer, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseUp { button } => {
-                self.send_button(*button, true)?;
-                self.held_buttons.retain(|held| held != button);
+                let hwnd = self.require_live_evidenced_window()?;
+                self.send_button(hwnd, *button, true, self.pointer, true)?;
+                self.forget_held_button(*button)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::Drag {
@@ -562,13 +742,15 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 self.send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
-                self.send_button(*button, false)?;
-                self.held_buttons.push(*button);
+                self.remember_held_button(*button)?;
+                let hwnd = self.require_live_evidenced_window()?;
+                self.send_button(hwnd, *button, false, self.pointer, true)?;
                 for step in &path[1..] {
                     move_with_timing(self, step.point, step.duration, step.easing)?;
                 }
-                self.send_button(*button, true)?;
-                self.held_buttons.retain(|held| held != button);
+                let hwnd = self.require_live_evidenced_window()?;
+                self.send_button(hwnd, *button, true, self.pointer, true)?;
+                self.forget_held_button(*button)?;
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -602,11 +784,12 @@ impl ComputerBackend for WindowsDesktopBackend {
                 modifiers,
             } => {
                 self.send_modifiers(*modifiers, false)?;
+                let hwnd = self.require_live_evidenced_window()?;
                 if *delta_y != 0 {
-                    self.send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?;
+                    self.send_wheel(hwnd, false, *delta_y * 120)?;
                 }
                 if *delta_x != 0 {
-                    self.send_mouse(0, 0, (*delta_x * 120) as u32, MOUSEEVENTF_HWHEEL)?;
+                    self.send_wheel(hwnd, true, *delta_x * 120)?;
                 }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
@@ -623,16 +806,24 @@ impl ComputerBackend for WindowsDesktopBackend {
         if let Err(error) = self.reload_held_keyboard_inputs() {
             first.get_or_insert(error);
         }
+        if self.held_keyboard_inputs.is_empty() && self.held_buttons.is_empty() {
+            return first.map_or(Ok(()), Err);
+        }
+        let hwnd = match self.resolve_injection_hwnd(false) {
+            Ok(hwnd) => hwnd,
+            Err(error) => return Err(first.unwrap_or(error)),
+        };
         for input in self.held_keyboard_inputs.clone().into_iter().rev() {
             let released = match input {
                 HeldKeyboardInput::VirtualKey { key, extended } => self.send_key(
+                    hwnd,
                     VirtualKeyInput {
                         key: VIRTUAL_KEY(key),
                         extended,
                     },
                     true,
                 ),
-                HeldKeyboardInput::Unicode(unit) => self.send_unicode(unit, true),
+                HeldKeyboardInput::Unicode(unit) => self.send_unicode(hwnd, unit, true),
             };
             match released {
                 Ok(()) => {
@@ -645,12 +836,10 @@ impl ComputerBackend for WindowsDesktopBackend {
                 }
             }
         }
-        for button in self.held_buttons.drain(..).chain([
-            MouseButton::Left,
-            MouseButton::Right,
-            MouseButton::Middle,
-        ]) {
-            if let Err(error) = self.send_button(button, true) {
+        for button in windows_owned_cleanup_buttons(&self.held_buttons) {
+            if let Err(error) = self.send_button(hwnd, button, true, self.pointer, false) {
+                first.get_or_insert(error);
+            } else if let Err(error) = self.forget_held_button(button) {
                 first.get_or_insert(error);
             }
         }
@@ -667,15 +856,29 @@ impl ComputerBackend for WindowsDesktopBackend {
     }
 
     fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
-        self.evidenced_window = Some(window);
-        self.require_live_evidenced_window()
+        let (hwnd, live) = foreground_window_identity()?;
+        if live != window {
+            return Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            ));
+        }
+        if hwnd.is_invalid() {
+            return Err(ComputerError::Refused(
+                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
+        self.evidenced_window = Some(EvidencedWindowsWindow {
+            opaque: window,
+            hwnd_bits: hwnd_bits(hwnd),
+        });
+        self.require_live_evidenced_window().map(|_| ())
     }
 
     fn recheck_evidenced_window(&mut self) -> Result<(), ComputerError> {
         if self.evidenced_window.is_none() {
             return Ok(());
         }
-        self.require_live_evidenced_window()
+        self.require_live_evidenced_window().map(|_| ())
     }
 }
 
@@ -725,7 +928,7 @@ fn query_geometry() -> Result<(DisplayGeometry, i32, i32), ComputerError> {
 }
 
 fn move_with_timing(
-    backend: &WindowsDesktopBackend,
+    backend: &mut WindowsDesktopBackend,
     point: PixelPoint,
     duration: Duration,
     easing: Easing,
@@ -733,11 +936,8 @@ fn move_with_timing(
     if duration.is_zero() {
         return backend.move_cursor(point);
     }
-    let mut cursor = POINT::default();
-    // SAFETY: `cursor` is valid writable storage for the duration of the call.
-    unsafe { GetCursorPos(&mut cursor) }.map_err(|_| win32_error("GetCursorPos"))?;
-    let start_x = f64::from(cursor.x - backend.origin_x);
-    let start_y = f64::from(cursor.y - backend.origin_y);
+    let start_x = f64::from(backend.pointer.x);
+    let start_y = f64::from(backend.pointer.y);
     let steps = 12;
     for step in 1..=steps {
         let mut progress = f64::from(step) / f64::from(steps);
@@ -755,16 +955,6 @@ fn move_with_timing(
         thread::sleep(duration / steps);
     }
     Ok(())
-}
-
-fn send_raw(inputs: &[INPUT]) -> Result<(), ComputerError> {
-    // SAFETY: INPUT is ABI-owned by the pinned windows binding; the slice stays live for the call.
-    let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
-    if sent == inputs.len() as u32 {
-        Ok(())
-    } else {
-        Err(win32_error("SendInput"))
-    }
 }
 
 fn key_event_flags(key: VirtualKeyInput, up: bool) -> KEYBD_EVENT_FLAGS {
@@ -1061,7 +1251,7 @@ unsafe fn session_desktop_names() -> Result<(String, String), TargetUnavailableR
 }
 
 /// The input journal follows the Windows interactive session/desktop rather
-/// than a monitor. `SendInput` is scoped to precisely this input namespace.
+/// than a monitor. Window-addressed posts are scoped to this input namespace.
 fn windows_input_session_identity() -> Result<[u8; 32], ComputerError> {
     // SAFETY: the Win32 calls write only to initialized local storage.
     unsafe {
@@ -1200,7 +1390,7 @@ struct UiaCapture {
     name: Option<String>,
 }
 
-fn foreground_opaque_window_id() -> Result<OpaqueWindowId, ComputerError> {
+fn foreground_window_identity() -> Result<(HWND, OpaqueWindowId), ComputerError> {
     // SAFETY: queried HWND is validated before use; UI Automation is initialized
     // for the duration of `uia_evidence`.
     unsafe {
@@ -1210,6 +1400,13 @@ fn foreground_opaque_window_id() -> Result<OpaqueWindowId, ComputerError> {
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
         }
+        Ok((hwnd, opaque_id_for_hwnd(hwnd)?))
+    }
+}
+
+fn opaque_id_for_hwnd(hwnd: HWND) -> Result<OpaqueWindowId, ComputerError> {
+    // SAFETY: UI Automation is initialized for the duration of `uia_evidence`.
+    unsafe {
         let capture = uia_evidence(hwnd).map_err(|_| {
             ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
         })?;
@@ -1425,6 +1622,19 @@ mod tests {
         }
         assert!(!translated("enter").extended);
         assert!(KeyCode::parse("not-a-key").is_err());
+    }
+
+    #[test]
+    fn cleanup_releases_only_owned_buttons() {
+        assert_eq!(
+            windows_owned_cleanup_buttons(&[]),
+            Vec::<MouseButton>::new(),
+            "empty held state must not synthesize left/right/middle ups"
+        );
+        assert_eq!(
+            windows_owned_cleanup_buttons(&[MouseButton::Left]),
+            vec![MouseButton::Left]
+        );
     }
 
     #[test]

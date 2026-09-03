@@ -34,10 +34,10 @@ pub use windows::{
 pub(crate) use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdapter};
 #[cfg(target_os = "linux")]
 pub use x11::X11TargetEvidenceAdapter;
-#[cfg(target_os = "linux")]
-pub use x11::x11_net_active_window;
 pub use x11::{
     EdidValidation, MirrorGroup, RandrOutputSnapshot, X11EvidenceLogic, X11SessionParts,
     opaque_x11_window_id, select_mirror_group, validate_edid, x11_physical_display_id,
-    x11_session_or_seat_id, x11_window_from_opaque,
+    x11_session_or_seat_id, x11_window_from_opaque, x11_window_identity_from_opaque,
 };
+#[cfg(target_os = "linux")]
+pub use x11::{x11_active_window_identity, x11_net_active_window, x11_window_generation_is_live};

@@ -708,12 +708,15 @@ impl<'ast> Visit<'ast> for CoreGraphicsPostAudit {
             .collect::<Vec<_>>();
         if segments.ends_with(&["CGEvent".to_string(), "post".to_string()]) {
             self.violations.push(
-                "session-global CGEvent::post is forbidden; post_to_pid is the sole post"
+                "session-global CGEvent::post is forbidden; CoreGraphics cannot address a window"
                     .to_string(),
             );
         }
         if segments.ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()]) {
-            self.associated_posts.push(self.current_function.clone());
+            self.violations.push(
+                "process-directed CGEvent::post_to_pid is forbidden; CoreGraphics cannot address a window"
+                    .to_string(),
+            );
         }
         for identifier in &segments {
             if is_legacy_raw_post_identifier(identifier) {
@@ -827,20 +830,27 @@ fn physical_backend_irreversible_primitive_inventory() {
         }
     }
     assert!(violations.is_empty(), "{violations:#?}");
-    assert_eq!(
-        raw_posts.len(),
-        1,
-        "every macOS event in the complete core source tree must use the sole guarded post primitive"
+    assert!(
+        raw_posts.is_empty(),
+        "CoreGraphics has no window-targeted post; every event must refuse rather than post: {raw_posts:?}"
     );
     let mut calls = StructuralCallAudit::default();
     calls.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
-    for required in ["prepare", "recheck", "CGEvent::post_to_pid", "commit"] {
+    for required in ["prepare", "recheck", "rollback_known_pre_post_refusal"] {
         assert!(
             calls.0.iter().any(|call| call == required),
             "post_event AST lost required call {required}: {:?}",
             calls.0
         );
     }
+    let mac_post_src = mac
+        .split("fn post_event")
+        .nth(1)
+        .expect("post_event source");
+    assert!(
+        mac_post_src.contains("CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW"),
+        "post_event must refuse: CoreGraphics cannot address the evidenced window"
+    );
     let mut post_boundary = PostBoundaryCallAudit::default();
     post_boundary.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
     assert_eq!(
@@ -850,9 +860,8 @@ fn physical_backend_irreversible_primitive_inventory() {
             PostBoundaryCall::CapabilityRecheck,
             PostBoundaryCall::WindowRecheck,
             PostBoundaryCall::WindowRecheck,
-            PostBoundaryCall::RawPost,
         ],
-        "post_event must structurally recheck session, capability, and evidenced window before its sole process-directed post"
+        "post_event must structurally recheck session, capability, and evidenced window before refusing"
     );
     assert!(
         calls
@@ -861,34 +870,29 @@ fn physical_backend_irreversible_primitive_inventory() {
             .any(|call| call == "rollback_known_pre_post_refusal"),
         "known pre-post refusals must structurally enter exact rollback"
     );
-    assert_eq!(raw_posts[0].0, core.join("computer/macos_backend.rs"));
-    assert_eq!(
-        raw_posts[0].1.as_deref(),
-        Some("post_event"),
-        "the sole raw post must be structurally owned by post_event"
-    );
-    let positions = ["prepare", "recheck", "CGEvent::post_to_pid", "commit"]
-        .map(|required| calls.0.iter().position(|call| call == required).unwrap());
-    assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "post_event's AST must prepare, recheck, post, then commit"
-    );
 
-    let mut windows_send = StructuralCallAudit::default();
-    windows_send.visit_impl_item_fn(impl_method(&windows_syntax, "send_input"));
-    let window_check = windows_send
-        .0
-        .iter()
-        .position(|call| call == "require_live_evidenced_window")
-        .expect("Windows send_input must recheck the evidenced window");
-    let raw_send = windows_send
-        .0
-        .iter()
-        .position(|call| call == "send_raw")
-        .expect("Windows send_input must use the sole SendInput wrapper");
+    let mut windows_post = StructuralCallAudit::default();
+    windows_post.visit_impl_item_fn(impl_method(&windows_syntax, "post_to_target"));
     assert!(
-        window_check < raw_send,
-        "Windows SendInput must recheck the evidenced window immediately before the syscall"
+        windows_post.0.iter().any(|call| call == "PostMessageW"),
+        "Windows post_to_target must post to the evidenced HWND: {:?}",
+        windows_post.0
+    );
+    let windows_source = std::fs::read_to_string(core.join("computer/platform/windows_native.rs"))
+        .expect("windows backend source");
+    assert!(
+        !windows_source.contains("SendInput("),
+        "Windows must not use session-global SendInput"
+    );
+    let mut windows_release = StructuralCallAudit::default();
+    windows_release.visit_impl_item_fn(impl_method(&windows_syntax, "release_all"));
+    assert!(
+        windows_release
+            .0
+            .iter()
+            .any(|call| call == "windows_owned_cleanup_buttons"),
+        "Windows cleanup must release only owned buttons: {:?}",
+        windows_release.0
     );
 
     let driver = std::fs::read_to_string(core.join("engine/driver/computer_native.rs")).unwrap();

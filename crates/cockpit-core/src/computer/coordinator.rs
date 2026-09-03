@@ -2072,9 +2072,9 @@ async fn acquire_host_lease(
                     b"cockpit.x11.input-arbiter.v1",
                     delegation.clone(),
                 ),
-                // SendInput controls session-global keyboard, pointer, focus,
-                // and absolute virtual-desktop coordinates. A monitor-specific
-                // evidence key must therefore not partition its host lease.
+                // Windows synthetic input still occupies the interactive
+                // session/desktop: a monitor-specific evidence key must
+                // therefore not partition its host lease.
                 BackendKind::RealDesktopWindows => arbiter.try_acquire_input_session(
                     physical_key,
                     b"cockpit.windows.input-arbiter.v1",
@@ -3985,9 +3985,8 @@ impl TargetEvidenceAdapter for VirtualTargetEvidenceAdapter {
             let mut evidence =
                 super::target::sample_virtual_evidence(self.display_id, self.generation);
             if let Some(display) = &self.x11_display {
-                let window = super::platform::x11_net_active_window(display)?;
                 evidence.focused_window_id = FieldEvidence::available(
-                    super::platform::opaque_x11_window_id(window),
+                    super::platform::x11_active_window_identity(display)?,
                     super::target::EvidenceSource::X11NetActiveWindow,
                 );
             }

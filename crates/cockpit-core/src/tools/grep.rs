@@ -156,7 +156,7 @@ impl Tool for GrepTool {
         // budget, and the retained artifact capture all elide their omission
         // boundaries under the same table the §7 egress scrub will use.
         let redact = ctx.redact.clone();
-        let out = tokio::task::spawn_blocking(move || {
+        let (mut out, knowledge_source) = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
                 sandbox::within_root(&guard_root, path)
                     && !secret_paths.is_secret_path(path)
@@ -171,6 +171,14 @@ impl Tool for GrepTool {
         .await
         .map_err(|e| anyhow::anyhow!("grep worker joined: {e}"))??;
 
+        // Layered KB boundary (issue #273): the deterministic floor first, then
+        // the utility-model second layer over the floor-clean KB match
+        // records. The scan source carries each matched KB file's
+        // quarantine state, so a quarantined file fences its line records.
+        let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+        crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &knowledge_source, &guard)
+            .await;
+
         Ok(out)
     }
 }
@@ -180,9 +188,16 @@ fn render_search_outcome(
     outcome: SearchOutcome,
     query: &str,
     attached_knowledge_roots: &[std::path::PathBuf],
-) -> ToolOutput {
+) -> (ToolOutput, String) {
+    let knowledge_source = crate::knowledge::knowledge_line_record_scan_source(
+        &outcome.records,
+        attached_knowledge_roots,
+    );
     if outcome.records.is_empty() {
-        return ToolOutput::text("No matches.".to_string());
+        return (
+            ToolOutput::text("No matches.".to_string()),
+            knowledge_source,
+        );
     }
 
     let raw = outcome
@@ -209,7 +224,7 @@ fn render_search_outcome(
     let writer_truncated = writer.is_truncated();
     let truncated = writer_truncated || outcome.hit_match_cap || thinned;
     let mut body = writer.into_string_redacted(redact);
-    let mut output = if truncated {
+    let output = if truncated {
         if writer_truncated || outcome.hit_match_cap {
             body.push_str("... [truncated; narrow the pattern or pass a `path`]\n");
         }
@@ -218,21 +233,7 @@ fn render_search_outcome(
     } else {
         ToolOutput::text(body)
     };
-    let knowledge_source = outcome
-        .records
-        .iter()
-        .filter(|record| {
-            attached_knowledge_roots.iter().any(|root| {
-                cockpit_host::path_containment::contained_under(root, &record.source_path)
-            })
-        })
-        // Both fields are KB-derived model input: `path` is rendered in the
-        // result (and retained raw artifact) alongside the matched text.
-        .map(|record| format!("{}\n{}", record.path, record.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    crate::knowledge::fence_knowledge_tool_output_if_needed(&mut output, &knowledge_source);
-    output
+    (output, knowledge_source)
 }
 
 #[cfg(test)]
@@ -409,10 +410,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn quarantined_knowledge_file_fences_a_clean_line_match() {
+        let workspace = tempfile::tempdir().unwrap();
+        let knowledge = tempfile::tempdir().unwrap();
+        // A dream-write quarantine marker retained at the file tail: the
+        // matched line itself stays floor-clean, so only the propagated
+        // file-level quarantine state can fence this slice (issue #273).
+        write(
+            knowledge.path(),
+            "concept.md",
+            format!(
+                "please do the thing\n\n{}",
+                crate::knowledge::DREAM_INJECTION_NEUTRALIZED_MARKER
+            ),
+        );
+        let mut ctx = test_ctx(workspace.path());
+        ctx.allowed_knowledge_bases =
+            Some(std::collections::BTreeSet::from(["team-notes".to_string()]));
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended
+            .knowledge_bases
+            .push(crate::config::extended::KnowledgeBaseRegistryEntry::new(
+                "team-notes".to_string(),
+                "Team notes".to_string(),
+                "Local team knowledge".to_string(),
+                crate::config::extended::KnowledgeBaseSource::Local {
+                    path: knowledge.path().to_path_buf(),
+                },
+                crate::config::extended::KnowledgeBaseEmbeddingOwnership::Local,
+                None,
+                None,
+                false,
+                crate::config::extended::KnowledgeBaseMergePolicy::Auto,
+            ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+
+        let out = GrepTool
+            .call(
+                serde_json::json!({
+                    "pattern": "please do",
+                    "path": knowledge.path().display().to_string(),
+                    "mode": "literal",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.content.contains("UNTRUSTED KNOWLEDGE DATA"),
+            "got: {}",
+            out.content
+        );
+    }
+
     #[test]
     fn attached_knowledge_grep_fences_hostile_filename() {
         let knowledge = tempfile::tempdir().unwrap();
-        let out = render_search_outcome(
+        let (mut out, knowledge_source) = render_search_outcome(
             &crate::redact::RedactionTable::empty(),
             SearchOutcome {
                 records: vec![crate::tools::text_search::SearchRecord {
@@ -428,6 +490,10 @@ mod tests {
             "ordinary",
             &[knowledge.path().to_path_buf()],
         );
+        // The production call applies the layered KB boundary to the pair
+        // the renderer returns; the deterministic floor half is what a
+        // hostile rendered KB path trips.
+        crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &knowledge_source);
 
         assert!(
             out.content.contains("UNTRUSTED KNOWLEDGE DATA"),

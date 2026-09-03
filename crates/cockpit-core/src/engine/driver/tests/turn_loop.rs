@@ -2253,6 +2253,102 @@ fn turn_loop_max_verification_attempts_guard_terminates_turn() {
     });
 }
 
+#[test]
+fn turn_loop_does_not_dispatch_when_round_ceiling_already_met() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("must not run".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        write_max_primary_rounds_config(tmp.path(), 1);
+        driver.refresh_config_from_disk_for_tests();
+        driver.install_turn_budget();
+        let in_flight = driver.budget.clone();
+        in_flight
+            .charge_round()
+            .expect("one round fills the configured ceiling");
+        assert!(
+            in_flight.charge_round().is_err(),
+            "shared ledger must already reject the next round"
+        );
+        let (queue, tx, mut rx) = event_harness();
+
+        driver
+            .run_user_input(UserSubmission::text("hello"), &queue, &tx)
+            .await
+            .unwrap();
+
+        assert!(
+            provider.captured().is_empty(),
+            "an already-met round ceiling must not dispatch inference: {:?}",
+            provider.captured()
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TurnEvent::Notice { text } if text.contains("budget exhausted")
+            )),
+            "{events:?}"
+        );
+        assert_eq!(
+            driver.take_idle_reason(false).await,
+            crate::engine::IdleReason::BudgetLimited
+        );
+    });
+}
+
+#[test]
+fn hierarchical_budget_default_round_ceiling_is_finite() {
+    let cfg = crate::config::extended::ExtendedConfig::default();
+    let resolved = cfg.resolved_delegation_budget("Build", None);
+    assert_eq!(
+        resolved.max_rounds,
+        Some(crate::config::extended::DEFAULT_MAX_ROUNDS)
+    );
+    assert!(!resolved.is_unlimited());
+}
+
+#[test]
+fn install_turn_budget_rebinds_schedule_to_the_driver_ledger() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.install_turn_budget();
+    let schedule_budget = driver.schedule.schedule_context_for_tests().budget;
+    assert!(
+        driver.budget.shares_ledger_with(&schedule_budget),
+        "schedule/swarm/goal loops must charge the same parent ledger as the foreground"
+    );
+}
+
+#[test]
+fn install_turn_budget_does_not_orphan_in_flight_clones() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.install_turn_budget();
+    let in_flight = driver.budget.clone();
+    in_flight
+        .charge_round()
+        .expect("first turn can spend against the live ledger");
+    assert_eq!(driver.budget.snapshot().spent.rounds, 1);
+    driver.install_turn_budget();
+    let schedule_budget = driver.schedule.schedule_context_for_tests().budget;
+    assert!(
+        driver.budget.shares_ledger_with(&in_flight),
+        "a remint must not allocate a new ledger while background/swarm clones still charge"
+    );
+    assert!(driver.budget.shares_ledger_with(&schedule_budget));
+    assert_eq!(
+        in_flight.snapshot().spent.rounds,
+        1,
+        "turn remint must not forgive spend already charged by in-flight clones"
+    );
+    in_flight
+        .charge_round()
+        .expect("post-remint charge hits the remaining live ledger");
+    assert_eq!(driver.budget.snapshot().spent.rounds, 2);
+}
+
 #[tokio::test]
 async fn turn_loop_terminal_inference_failure_ends_turn_cleanly() {
     let provider = ScriptedProvider::builder()

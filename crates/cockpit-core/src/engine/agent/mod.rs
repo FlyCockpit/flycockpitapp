@@ -83,8 +83,8 @@ pub use events::{
     AgentTreeExecutorRequest, AgentTreeResolverRequest, ControlRequestId,
     ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
 };
-pub(crate) use outcome::collapse_continue_without_injection;
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
+pub(crate) use outcome::{collapse_continue_without_injection, task_budget_spec};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;
 
@@ -419,6 +419,17 @@ pub struct Agent {
     /// Source-tagged MCP catalog frozen at agent construction and threaded
     /// read-only through every `ToolCtx` built for this agent.
     pub mcp_resolver: std::sync::Arc<crate::mcp::resolver::EffectiveCatalogResolver>,
+}
+
+impl Agent {
+    /// Attach the live turn's retry pacing handle so inference consults the
+    /// same per-turn bound as the spend pool.
+    pub(crate) fn bind_retry_budget(
+        &mut self,
+        budget: &crate::engine::delegation_budget::BudgetPool,
+    ) {
+        self.params.retry_budget = Some(budget.retry_handle());
+    }
 }
 
 pub(crate) async fn turn_toolbox(

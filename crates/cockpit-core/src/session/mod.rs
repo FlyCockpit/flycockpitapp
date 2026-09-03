@@ -683,6 +683,17 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
+    /// Usage charged against the hierarchical budget since the last drain.
+    /// Every `record_usage` accumulates here so multi-call rounds, cache
+    /// writes, and the final Done turn are not dropped.
+    uncharged_budget: Mutex<crate::engine::delegation_budget::BudgetCharge>,
+    /// Set when a non-utility inference recorded usage. Compact utility
+    /// briefs must not count as compact-and-continue forward progress.
+    pending_forward_progress: std::sync::atomic::AtomicBool,
+    /// Catalog prices used to convert usage into `cost_microusd`. Missing
+    /// file or model row leaves usage unpriced; a finite cost ceiling then
+    /// fails closed rather than treating unknown cost as free.
+    price_table: OnceLock<crate::db::stats::PriceTable>,
     /// Configured endpoints that reported a real prompt-cache hit. This is
     /// deliberately separate from `last_usage`: context chrome may use a
     /// session-wide estimate, but cache work is authorized only by a hit from

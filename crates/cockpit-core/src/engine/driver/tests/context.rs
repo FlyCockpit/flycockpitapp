@@ -35,6 +35,8 @@ async fn prune_targets_foreground_subagent_only() {
         recovery_activation: None,
         late_user_steer_permit: None,
         _vnext_child_admission: None,
+        parent_budget: None,
+        per_delegation_budget: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
 

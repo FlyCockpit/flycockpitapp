@@ -1662,6 +1662,21 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             ));
                         }
                     };
+                    let budget = match task_budget_spec(item) {
+                        Ok(budget) => budget,
+                        Err(err) => {
+                            return_structural!(task_refusal(
+                                &tc.id,
+                                tc.provider
+                                    .as_ref()
+                                    .and_then(|provider| provider.item_id.clone()),
+                                tc.provider
+                                    .as_ref()
+                                    .map(|provider| provider.call_id.clone()),
+                                format!("batch entry `{label}` has invalid budget: {err}"),
+                            ));
+                        }
+                    };
                     let write_scope = item
                         .get("write_scope")
                         .and_then(Value::as_str)
@@ -1738,6 +1753,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         todo_ids: task_todo_ids(item),
                         write_scope,
                         workspace_lease,
+                        budget,
                     });
                 }
                 if let Err(error) = validate_batch_dependencies(&entries) {
@@ -1909,6 +1925,21 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         ));
                     }
                 };
+                let budget = match task_budget_spec(&args) {
+                    Ok(budget) => budget,
+                    Err(err) => {
+                        return_structural!(task_refusal(
+                            &tc.id,
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
+                            err
+                        ));
+                    }
+                };
                 // Per-delegation tool grants (`task.grant_tools`, prompt
                 // `parent-granted-tools.md`): the parent may attach extra tools to
                 // this one delegation. Present in the `task` schema from session
@@ -2053,6 +2084,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             .provider
                             .as_ref()
                             .map(|provider| provider.call_id.clone()),
+                        budget,
                     });
                 }
                 return_structural!(TurnOutcome::SpawnNoninteractive {
@@ -2071,6 +2103,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     seed_reads_receipt,
                     todo_ids,
                     repair_notes,
+                    budget,
                     task_call_id: tc.id.to_string(),
                     task_provider_item_id: tc
                         .provider

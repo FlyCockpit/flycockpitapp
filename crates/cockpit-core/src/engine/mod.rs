@@ -29,6 +29,7 @@ pub mod compact;
 pub(crate) mod compact_draft;
 pub mod deferred;
 pub mod deleg_shrink;
+pub mod delegation_budget;
 pub mod delegation_prompt_prune;
 pub mod docs_pipeline;
 pub mod driver;

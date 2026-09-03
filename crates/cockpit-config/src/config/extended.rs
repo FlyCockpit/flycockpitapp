@@ -31,6 +31,14 @@ mod resource_scheduler;
 pub mod tui;
 
 #[allow(unused_imports)]
+pub use crate::config::delegation_budget::{
+    BudgetSpend, DEFAULT_COMPACT_NO_PROGRESS_LIMIT, DEFAULT_MAX_COST_MICROUSD,
+    DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_RETRIES_PER_TURN,
+    DEFAULT_MAX_ROUNDS, DEFAULT_MAX_WALL_CLOCK_SECS, DEFAULT_SCHEDULE_RUN_MAX_ROUNDS,
+    DelegationBudgetConfig, DelegationBudgetSpec, ResolvedDelegationBudget, SpendLimit,
+    resolve_delegation_budget, resolve_schedule_run_budget,
+};
+#[allow(unused_imports)]
 pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
@@ -556,10 +564,21 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub loop_guard: LoopGuardConfig,
 
-    /// Maximum number of primary-agent tool round-trips allowed for one
-    /// user message. `0` (default) means unlimited. When nonzero, the
-    /// interactive driver pauses after this many `Continue` cycles and asks
-    /// whether to grant another chunk; headless runs stop at the ceiling.
+    /// Hierarchical delegation spend budget (rounds / tokens / cost /
+    /// wall-clock). Omitted fields inherit compiled finite defaults.
+    /// `"unlimited"` is an explicit opt-in and never the default.
+    #[serde(
+        rename = "delegationBudget",
+        default,
+        skip_serializing_if = "DelegationBudgetConfig::is_empty"
+    )]
+    pub delegation_budget: DelegationBudgetConfig,
+
+    /// Legacy rounds-only overlay for the global budget. `0` now means
+    /// inherit the compiled default (currently 32), not unlimited. A
+    /// nonzero value applies only when `delegationBudget.maxRounds` is
+    /// omitted. Set `delegationBudget.maxRounds` to `"unlimited"` for an
+    /// explicit unlimited rounds ceiling.
     #[serde(rename = "maxPrimaryRounds", default)]
     pub max_primary_rounds: u32,
 
@@ -1217,6 +1236,12 @@ pub struct AgentRuntimeDefaults {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub tool_tiers: BTreeMap<String, AgentRuntimeToolTier>,
+    #[serde(
+        rename = "budget",
+        default,
+        skip_serializing_if = "DelegationBudgetSpec::is_empty"
+    )]
+    pub budget: DelegationBudgetSpec,
 }
 
 impl<'de> Deserialize<'de> for DefaultPrimaryAgent {
@@ -1827,6 +1852,30 @@ impl ExtendedConfig {
     pub fn removed_llm_mode(&self) -> Option<&str> {
         self.removed_llm_mode.as_deref()
     }
+
+    /// Resolve the hierarchical spend budget for `agent_name`.
+    pub fn resolved_delegation_budget(
+        &self,
+        agent_name: &str,
+        per_delegation: Option<&DelegationBudgetSpec>,
+    ) -> ResolvedDelegationBudget {
+        let runtime = self
+            .agent_runtime_defaults
+            .get(agent_name)
+            .map(|defaults| &defaults.budget);
+        resolve_delegation_budget(
+            &self.delegation_budget,
+            agent_name,
+            runtime,
+            per_delegation,
+            self.max_primary_rounds,
+        )
+    }
+
+    /// Per-run budget for one schedule/goal loop iteration.
+    pub fn resolved_schedule_run_budget(&self) -> ResolvedDelegationBudget {
+        resolve_schedule_run_budget(&self.delegation_budget)
+    }
 }
 
 impl Default for ExtendedConfig {
@@ -1884,6 +1933,7 @@ impl Default for ExtendedConfig {
             lsp: LspConfig::default(),
             data_syntax: DataSyntaxConfig::default(),
             loop_guard: LoopGuardConfig::default(),
+            delegation_budget: DelegationBudgetConfig::default(),
             max_primary_rounds: 0,
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),

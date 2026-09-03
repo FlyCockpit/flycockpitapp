@@ -275,6 +275,9 @@ pub struct ScheduleContext {
     pub write_scope: Option<crate::write_scope::WriteScopeSource>,
     pub dream_read_scope:
         std::sync::Arc<std::sync::RwLock<Option<std::collections::BTreeSet<uuid::Uuid>>>>,
+    /// Hierarchical spend pool this job charges. Swarm children share one
+    /// pool; schedule/goal iterations receive a per-run allotment.
+    pub budget: crate::engine::delegation_budget::BudgetPool,
 }
 
 impl ScheduleContext {
@@ -283,6 +286,20 @@ impl ScheduleContext {
         self.write_scope
             .as_ref()
             .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
+    }
+
+    /// Allot a child slice of this context's remaining pool, intersecting
+    /// with the child's resolved ceiling (global → per-agent → per-delegation).
+    pub fn allot_child(
+        &self,
+        agent_name: &str,
+        per_delegation: Option<&cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
+    ) -> crate::engine::delegation_budget::BudgetPool {
+        let child_ceiling = self
+            .config
+            .extended()
+            .resolved_delegation_budget(agent_name, per_delegation);
+        self.budget.allot(child_ceiling)
     }
 }
 
@@ -634,6 +651,20 @@ impl ScheduleAuthority {
         self.ctx.update(|ctx| ctx.config = config);
     }
 
+    /// Publish the driver's live spend handle so newly spawned swarm/loop
+    /// work allots from the current remaining. Turn install remints that
+    /// ledger in place (same Arc, spend kept); in-flight runners that already
+    /// cloned a handle keep charging it. `start_swarm_now` snapshots once for
+    /// the runner lifetime — it must not mint a disjoint ledger.
+    pub fn set_budget(&mut self, budget: crate::engine::delegation_budget::BudgetPool) {
+        self.ctx.update(|ctx| ctx.budget = budget);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_context_for_tests(&self) -> ScheduleContext {
+        self.ctx.snapshot()
+    }
+
     pub fn set_local_installations(
         &mut self,
         local_installations: crate::agents::LocalInstallationResolver,
@@ -703,11 +734,17 @@ impl ScheduleAuthority {
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
 
         let cancel = self.session_work_cancel.child_for_generation(generation);
+        let mut ctx = self.ctx.snapshot();
+        // Swarm `spawn` has no per-delegation overlay; the child's per-agent
+        // resolved ceiling is intersected with the live parent remaining.
+        // The allotted handle shares the session ledger, so a later turn
+        // remint cannot orphan this runner.
+        ctx.budget = ctx.allot_child(spec.worker.agent_name(), None);
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
             spec,
-            ctx: self.ctx.snapshot(),
+            ctx,
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
@@ -1486,6 +1523,7 @@ mod tests {
             guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
+            budget: crate::engine::delegation_budget::BudgetPool::defaults(),
         };
         let authority = ScheduleAuthority::new(
             event_tx,
@@ -2217,5 +2255,37 @@ mod tests {
                 .unwrap();
         auth.start_loop_in_context(args);
         assert!(auth.at_capacity());
+    }
+
+    /// Issue #313 acceptance: K parallel swarm children share the parent
+    /// remaining ledger. Production `start_swarm_now` allots through
+    /// [`ScheduleContext::allot_child`]; this exercises that helper against
+    /// the same parent pool the authority hands to every spawn.
+    #[test]
+    fn swarm_fan_out_cannot_each_spend_the_parent_full_budget() {
+        use crate::engine::delegation_budget::BudgetPool;
+        use cockpit_config::config::delegation_budget::ResolvedDelegationBudget;
+
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        let parent = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(4),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        auth.set_budget(parent.share());
+        let ctx = auth.schedule_context_for_tests();
+        let child_a = ctx.allot_child("bee", None);
+        let child_b = ctx.allot_child("bee", None);
+        assert!(parent.shares_ledger_with(&child_a));
+        assert!(parent.shares_ledger_with(&child_b));
+        assert!(parent.shares_ledger_with(&ctx.budget));
+        for _ in 0..2 {
+            child_a.charge_round().unwrap();
+        }
+        for _ in 0..2 {
+            child_b.charge_round().unwrap();
+        }
+        assert!(child_a.charge_round().is_err());
+        assert!(child_b.charge_round().is_err());
+        assert_eq!(parent.snapshot().spent.rounds, 4);
     }
 }

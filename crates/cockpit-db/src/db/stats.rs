@@ -308,6 +308,34 @@ impl PriceTable {
         self.by_model.get(model)
     }
 
+    /// Compute micro-USD cost for a token mix, or `None` when the model has
+    /// no price row. Cached-read tokens are billed at the cached rate and
+    /// subtracted from `input_tokens` (which includes them); cache-creation
+    /// tokens are billed in addition.
+    pub fn cost_microusd(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) -> Option<u64> {
+        let p = self.by_model.get(model)?;
+        let uncached = input_tokens.saturating_sub(cached_input_tokens);
+        let per = |tokens: u64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
+        let dollars = per(uncached, p.input_per_mtok)
+            + per(output_tokens, p.output_per_mtok)
+            + per(cached_input_tokens, p.cached_input_per_mtok)
+            + per(cache_creation_input_tokens, p.cache_creation_input_per_mtok);
+        Some((dollars * 1_000_000.0).round().max(0.0) as u64)
+    }
+
+    pub fn with_model(model: impl Into<String>, price: ModelPrice) -> Self {
+        let mut by_model = std::collections::HashMap::new();
+        by_model.insert(model.into(), price);
+        Self { by_model }
+    }
+
     /// Compute dollar cost for a token mix, or `None` when the model has
     /// no price row. Cached-read and cache-creation input tokens are billed
     /// at their own rates; the remaining `input_tokens` are billed at the

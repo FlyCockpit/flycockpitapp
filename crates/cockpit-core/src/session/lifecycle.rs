@@ -1394,6 +1394,7 @@ impl Session {
                 .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
             path
         };
+        let compaction_lineage_root_id = row.compaction_lineage_root();
         Ok(Self {
             id: row.session_id,
             live_id: std::sync::RwLock::new(row.session_id),
@@ -1427,7 +1428,7 @@ impl Session {
             btw_parent_session_id: row.btw_parent_session_id,
             btw_tangent: row.btw_tangent,
             compaction_predecessor_session_id: row.compaction_predecessor_session_id,
-            compaction_lineage_root_id: row.compaction_lineage_root(),
+            compaction_lineage_root_id,
             on_compaction_successor_begin: Mutex::new(None),
             on_compaction_successor_abort: Mutex::new(None),
             on_compaction_successor: Mutex::new(None),

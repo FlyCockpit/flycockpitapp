@@ -631,6 +631,15 @@ impl AgentRunner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Rewrite live conversation identity in place. Compaction successor
+    /// adoption uses this so the same runner observes the new window.
+    pub fn adopt_live_session_id(&self, session_id: uuid::Uuid) {
+        *self
+            .session_id_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session_id;
+    }
+
     pub fn attachment_epoch(&self) -> u64 {
         self.attachment_epoch.load(Ordering::Acquire)
     }

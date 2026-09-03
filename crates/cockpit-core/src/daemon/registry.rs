@@ -4216,7 +4216,7 @@ mod tests {
             )
             .await
             .expect("explicit model should recover the same model-less session");
-        assert_eq!(recovered.session_id, legacy_id);
+        assert_eq!(recovered.session_id(), legacy_id);
         assert_eq!(recovered.active_model_selection(), Some(selection.clone()));
         reg.forget(legacy_id);
         let durable = Session::resume_for_test(

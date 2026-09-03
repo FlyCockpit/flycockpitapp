@@ -2315,10 +2315,7 @@ impl App {
                     _ => String::new(),
                 };
                 if let Some(Ok(runner)) = self.agent_runner.as_mut() {
-                    runner.session_id = new_session_id;
-                    if let Ok(mut live) = runner.session_id_state.lock() {
-                        *live = new_session_id;
-                    }
+                    runner.adopt_live_session_id(new_session_id);
                 }
                 self.launch.session_id = Some(new_session_id);
                 self.history.push(HistoryEntry::CompactBoundary {

@@ -277,6 +277,14 @@ pub struct SessionRow {
     /// `true` when a `/btw` fork was created in tangent mode, meaning it
     /// starts with an empty transcript instead of a parent-seeded transcript.
     pub btw_tangent: bool,
+    /// Immediate predecessor window in this conversation's compaction
+    /// lineage. Distinct from [`Self::parent_session_id`] (forks). `None`
+    /// for the first window of a lineage (roots and forks).
+    pub compaction_predecessor_session_id: Option<Uuid>,
+    /// Stable conversation id shared by every window in a compaction
+    /// lineage. Forks mint their own root (their `session_id`). `None`
+    /// only for rows that have not yet been filled by the insert trigger.
+    pub compaction_lineage_root_id: Option<Uuid>,
     /// Running cl100k_base estimate of RAW typed user content
     /// (pre-skill-injection) this session. Migration 0037.
     pub user_content_tokens: i64,
@@ -347,6 +355,18 @@ impl SessionRow {
             Some(s) => Some(parse_uuid(&s)?),
             None => None,
         };
+        let compaction_predecessor_str: Option<String> =
+            row.get("compaction_predecessor_session_id").unwrap_or(None);
+        let compaction_predecessor_session_id = match compaction_predecessor_str {
+            Some(s) => Some(parse_uuid(&s)?),
+            None => None,
+        };
+        let compaction_lineage_root_str: Option<String> =
+            row.get("compaction_lineage_root_id").unwrap_or(None);
+        let compaction_lineage_root_id = match compaction_lineage_root_str {
+            Some(s) => Some(parse_uuid(&s)?),
+            None => None,
+        };
         let user_renamed: i64 = row.get("user_renamed")?;
         Ok(Self {
             session_id,
@@ -383,6 +403,8 @@ impl SessionRow {
             ephemeral: row.get::<_, i64>("ephemeral")? != 0,
             btw_parent_session_id,
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
+            compaction_predecessor_session_id,
+            compaction_lineage_root_id,
             user_content_tokens: row.get("user_content_tokens")?,
             title_stage: row.get("title_stage")?,
             title_recovery_nudge_state: nudge_state_from_sql(
@@ -405,6 +427,12 @@ impl SessionRow {
                 .get::<_, String>("lifecycle")
                 .unwrap_or_else(|_| "active".to_string()),
         })
+    }
+
+    /// Conversation identity for this window. Falls back to `session_id`
+    /// when the insert trigger has not yet filled the column.
+    pub fn compaction_lineage_root(&self) -> Uuid {
+        self.compaction_lineage_root_id.unwrap_or(self.session_id)
     }
 }
 
@@ -573,8 +601,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
-          is_assistant_thread)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+          is_assistant_thread, compaction_predecessor_session_id, compaction_lineage_root_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -601,6 +629,10 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.shared_with_collaborators as i64,
             row.is_dream_session as i64,
             row.is_assistant_thread as i64,
+            row.compaction_predecessor_session_id.map(|id| id.to_string()),
+            row.compaction_lineage_root_id
+                .unwrap_or(row.session_id)
+                .to_string(),
         ],
     )?;
     Ok(())
@@ -643,8 +675,9 @@ fn execute_fork_insert(
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
-          assistant_name, active_model_revision, is_dream_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+          assistant_name, active_model_revision, is_dream_session,
+          compaction_predecessor_session_id, compaction_lineage_root_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -679,6 +712,10 @@ fn execute_fork_insert(
             row.assistant_name,
             row.active_model_revision,
             row.is_dream_session as i64,
+            row.compaction_predecessor_session_id.map(|id| id.to_string()),
+            row.compaction_lineage_root_id
+                .unwrap_or(row.session_id)
+                .to_string(),
         ],
     )?;
     Ok(())
@@ -803,6 +840,8 @@ fn build_session_row(
         ephemeral: false,
         btw_parent_session_id: None,
         btw_tangent: false,
+        compaction_predecessor_session_id: None,
+        compaction_lineage_root_id: Some(session_id),
         user_content_tokens: 0,
         title_stage: 0,
         // A brand-new session never carries a recovery nudge.
@@ -2030,6 +2069,8 @@ impl Db {
             ephemeral: true,
             btw_parent_session_id: Some(parent_session_id),
             btw_tangent: tangent,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: Some(session_id),
             user_content_tokens: if tangent {
                 0
             } else {
@@ -2237,6 +2278,8 @@ impl Db {
             ephemeral,
             btw_parent_session_id: None,
             btw_tangent: false,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: Some(session_id),
             user_content_tokens: if fresh_thread {
                 0
             } else {
@@ -2309,6 +2352,169 @@ impl Db {
             params![session_id.to_string(), parent_session_id.to_string()],
         )
         .context("copying sealed values into fork")?;
+        Ok(row)
+    }
+
+    /// Seed a new context window linked to `predecessor_session_id` by the
+    /// typed compaction edge. The predecessor row is preserved whole and
+    /// marked ended; the successor inherits conversation metadata (title,
+    /// agent, model, assistant-thread flag) but starts with an empty
+    /// transcript. Fork identity stays on the lineage root: the successor
+    /// does not copy `parent_session_id`.
+    ///
+    /// Refuses unless `session_id` already owns a `redaction_table` vault
+    /// item on `conn`. Copy or persist that item first in the same
+    /// transaction.
+    pub fn create_compaction_successor_conn(
+        conn: &Connection,
+        predecessor_session_id: Uuid,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<SessionRow> {
+        SessionRedactionCustody::require_on_conn(conn, session_id)?;
+        Self::create_compaction_successor_body_conn(
+            conn,
+            predecessor_session_id,
+            session_id,
+            now_unix_ms,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn create_compaction_successor(
+        &self,
+        predecessor_session_id: Uuid,
+    ) -> Result<SessionRow> {
+        let session_id = Uuid::new_v4();
+        let now_unix_ms = Utc::now().timestamp_millis();
+        self.write(move |conn| {
+            Self::create_compaction_successor_body_conn(
+                conn,
+                predecessor_session_id,
+                session_id,
+                now_unix_ms,
+            )
+        })
+        .await
+    }
+
+    fn create_compaction_successor_body_conn(
+        conn: &Connection,
+        predecessor_session_id: Uuid,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<SessionRow> {
+        let predecessor = get_session_inner(conn, predecessor_session_id)?.ok_or_else(|| {
+            anyhow::anyhow!("compaction predecessor session {predecessor_session_id} not found")
+        })?;
+        ensure!(
+            predecessor.ended_at_unix_ms.is_none(),
+            "compaction predecessor {predecessor_session_id} is already ended"
+        );
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE compaction_predecessor_session_id = ?1",
+                [predecessor_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("checking existing compaction successor")?;
+        ensure!(
+            existing == 0,
+            "compaction predecessor {predecessor_session_id} already has a successor window"
+        );
+        let short_id = generate_unique_short_id(conn, &predecessor.project_id)
+            .context("generating compaction successor short_id")?;
+        let lineage_root = predecessor.compaction_lineage_root();
+        let row = SessionRow {
+            session_id,
+            project_id: predecessor.project_id.clone(),
+            project_root: predecessor.project_root.clone(),
+            started_at_unix_ms: now_unix_ms,
+            last_active_at_unix_ms: now_unix_ms,
+            ended_at_unix_ms: None,
+            provider: predecessor.provider.clone(),
+            model: predecessor.model.clone(),
+            model_selection_json: predecessor.model_selection_json.clone(),
+            active_model_revision: 0,
+            session_entry_mode: predecessor.session_entry_mode.clone(),
+            tool_surface_override_json: predecessor.tool_surface_override_json.clone(),
+            goal_settings_override_json: predecessor.goal_settings_override_json.clone(),
+            active_agent: predecessor.active_agent.clone(),
+            pending_remote_agent_selection: None,
+            assistant_name: predecessor.assistant_name.clone(),
+            short_id: Some(short_id),
+            parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: predecessor.is_assistant_thread,
+            title: predecessor.title.clone(),
+            description: predecessor.description.clone(),
+            description_provider_id: predecessor.description_provider_id.clone(),
+            description_model_id: predecessor.description_model_id.clone(),
+            description_model_trust: predecessor.description_model_trust.clone(),
+            user_renamed: predecessor.user_renamed,
+            last_viewed_at_unix_ms: None,
+            archived_at_unix_ms: None,
+            is_dream_session: predecessor.is_dream_session,
+            ephemeral: predecessor.ephemeral,
+            btw_parent_session_id: None,
+            btw_tangent: false,
+            compaction_predecessor_session_id: Some(predecessor_session_id),
+            compaction_lineage_root_id: Some(lineage_root),
+            user_content_tokens: 0,
+            title_stage: predecessor.title_stage,
+            title_recovery_nudge_state: TitleRecoveryNudgeState::None,
+            guidance_baseline_path: predecessor.guidance_baseline_path.clone(),
+            guidance_baseline_hash: predecessor.guidance_baseline_hash.clone(),
+            model_system_prompt_snapshot_json: predecessor
+                .model_system_prompt_snapshot_json
+                .clone(),
+            knowledge_base_prompt_snapshot_json: predecessor
+                .knowledge_base_prompt_snapshot_json
+                .clone(),
+            knowledge_base_prompt_snapshot_captured: predecessor
+                .knowledge_base_prompt_snapshot_captured,
+            created_by_principal: predecessor.created_by_principal.clone(),
+            shared_with_collaborators: predecessor.shared_with_collaborators,
+            lifecycle: "active".to_string(),
+        };
+        let row = insert_session_row_with_short_id_retry(conn, row)
+            .context("inserting compaction successor session")?;
+        conn.execute(
+            "UPDATE sessions
+                SET title = ?1,
+                    description = ?2,
+                    description_provider_id = ?3,
+                    description_model_id = ?4,
+                    description_model_trust = ?5,
+                    user_renamed = ?6,
+                    title_stage = ?7,
+                    ephemeral = ?8
+              WHERE session_id = ?9",
+            params![
+                row.title,
+                row.description,
+                row.description_provider_id,
+                row.description_model_id,
+                row.description_model_trust,
+                row.user_renamed as i64,
+                row.title_stage,
+                row.ephemeral as i64,
+                row.session_id.to_string(),
+            ],
+        )
+        .context("copying conversation metadata onto compaction successor")?;
+        conn.execute(
+            "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2 AND ended_at_unix_ms IS NULL",
+            params![now_unix_ms, predecessor_session_id.to_string()],
+        )
+        .context("ending compaction predecessor session")?;
+        // Keep an open goal attached to the live window so scheduled/goal
+        // loops continue without a composer step.
+        conn.execute(
+            "UPDATE session_goals SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving open goal onto compaction successor")?;
         Ok(row)
     }
 
@@ -2813,8 +3019,17 @@ impl Db {
     pub fn list_forks_conn(conn: &Connection, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
         let mut stmt = conn
             .prepare(
-                "SELECT * FROM sessions WHERE parent_session_id = ?1 AND ephemeral = 0
-             ORDER BY last_active_at_unix_ms DESC",
+                "SELECT * FROM sessions
+                  WHERE ephemeral = 0
+                    AND compaction_lineage_root_id IN (
+                        SELECT session_id FROM sessions
+                         WHERE parent_session_id = ?1 AND ephemeral = 0
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sessions nxt
+                         WHERE nxt.compaction_predecessor_session_id = sessions.session_id
+                    )
+                  ORDER BY last_active_at_unix_ms DESC",
             )
             .context("preparing list_forks")?;
         let rows = stmt
@@ -2838,7 +3053,16 @@ impl Db {
     fn count_forks_for_conn(conn: &Connection, parent_session_id: Uuid) -> Result<u32> {
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1 AND ephemeral = 0",
+                "SELECT COUNT(*) FROM sessions
+                  WHERE ephemeral = 0
+                    AND compaction_lineage_root_id IN (
+                        SELECT session_id FROM sessions
+                         WHERE parent_session_id = ?1 AND ephemeral = 0
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sessions nxt
+                         WHERE nxt.compaction_predecessor_session_id = sessions.session_id
+                    )",
                 [parent_session_id.to_string()],
                 |row| row.get(0),
             )
@@ -2889,7 +3113,16 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT * FROM sessions
-             WHERE project_id = ?1 AND parent_session_id IS NULL AND ephemeral = 0
+             WHERE project_id = ?1
+               AND ephemeral = 0
+               AND compaction_lineage_root_id IN (
+                    SELECT COALESCE(compaction_lineage_root_id, session_id) FROM sessions
+                     WHERE project_id = ?1 AND parent_session_id IS NULL AND ephemeral = 0
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM sessions nxt
+                     WHERE nxt.compaction_predecessor_session_id = sessions.session_id
+               )
              ORDER BY last_active_at_unix_ms DESC LIMIT ?2",
             )
             .context("preparing list_root_sessions")?;
@@ -3246,6 +3479,7 @@ impl Db {
                                     FROM sessions AS child
                                    WHERE child.parent_session_id = sessions.session_id
                                       OR child.btw_parent_session_id = sessions.session_id
+                                      OR child.compaction_predecessor_session_id = sessions.session_id
                                 )",
                     )
                     .context("preparing empty-session sweep")?;
@@ -3679,6 +3913,10 @@ impl Db {
                      AND ephemeral = 0
                      AND archived_at_unix_ms IS NULL
                      AND is_dream_session = 0
+                     AND NOT EXISTS (
+                          SELECT 1 FROM sessions nxt
+                           WHERE nxt.compaction_predecessor_session_id = sessions.session_id
+                     )
                    ORDER BY last_active_at_unix_ms DESC, session_id DESC
                    LIMIT ?3",
             )
@@ -3786,35 +4024,85 @@ impl Db {
     ) -> Result<Vec<crate::db::wire::SessionSummary>> {
         let project_id = project_id.map(str::to_string);
         self.read(move |conn| {
-            Self::list_session_summaries_conn(conn, project_id.as_deref(), parent_session_id, limit)
+            Self::list_session_summaries_conn(
+                conn,
+                project_id.as_deref(),
+                parent_session_id,
+                None,
+                limit,
+            )
         })
         .await
+    }
+
+    pub fn list_compaction_lineage_windows_conn(
+        conn: &Connection,
+        lineage_root_id: Uuid,
+    ) -> Result<Vec<SessionRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM sessions
+                  WHERE COALESCE(compaction_lineage_root_id, session_id) = ?1
+                    AND ephemeral = 0
+                  ORDER BY started_at_unix_ms ASC, session_id ASC",
+            )
+            .context("preparing compaction lineage windows")?;
+        let rows = stmt
+            .query_map([lineage_root_id.to_string()], SessionRow::from_row)
+            .context("querying compaction lineage windows")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding compaction lineage window")?);
+        }
+        Ok(out)
+    }
+
+    fn count_lineage_windows_conn(conn: &Connection, lineage_root_id: Uuid) -> Result<u32> {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions
+                  WHERE COALESCE(compaction_lineage_root_id, session_id) = ?1
+                    AND ephemeral = 0",
+                [lineage_root_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting compaction lineage windows")?;
+        Ok(count.max(0) as u32)
     }
 
     pub fn list_session_summaries_conn(
         conn: &Connection,
         project_id: Option<&str>,
         parent_session_id: Option<Uuid>,
+        compaction_lineage_root_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<crate::db::wire::SessionSummary>> {
-        let rows = match (project_id, parent_session_id) {
-            (_, Some(parent)) => Self::list_forks_conn(conn, parent)?,
-            (Some(pid), None) => Self::list_root_sessions_conn(conn, pid, limit)?,
-            (None, None) => Self::list_sessions_conn(conn, true, limit)?,
+        let rows = match (compaction_lineage_root_id, parent_session_id, project_id) {
+            (Some(root), _, _) => Self::list_compaction_lineage_windows_conn(conn, root)?,
+            (None, Some(parent), _) => Self::list_forks_conn(conn, parent)?,
+            (None, None, Some(pid)) => Self::list_root_sessions_conn(conn, pid, limit)?,
+            (None, None, None) => Self::list_sessions_conn(conn, true, limit)?,
         };
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
+            let lineage_root = row.compaction_lineage_root();
             let fork_count = summary_count_or_zero(
-                row.session_id,
+                lineage_root,
                 "fork_count",
-                Self::count_forks_for_conn(conn, row.session_id),
+                Self::count_forks_for_conn(conn, lineage_root),
             );
             // Full subtree descendant count for the archive/delete cascade
-            // statement (GOALS §17h) — direct forks plus their descendants.
+            // statement (GOALS §17h) — direct forks plus their descendants
+            // plus other windows in this compaction lineage.
             let descendant_count = summary_count_or_zero(
                 row.session_id,
                 "descendant_count",
                 Self::count_descendants_conn(conn, row.session_id),
+            );
+            let lineage_window_count = summary_count_or_zero(
+                lineage_root,
+                "lineage_window_count",
+                Self::count_lineage_windows_conn(conn, lineage_root),
             );
             // Read/unread + pending-question inputs for the browser's tiers
             // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
@@ -3885,6 +4173,9 @@ impl Db {
                 pin_count,
                 assistant_inbox_unread,
                 assistant_inbox_latest_source_session_id,
+                compaction_predecessor_session_id: row.compaction_predecessor_session_id,
+                compaction_lineage_root_id: Some(lineage_root),
+                lineage_window_count,
             });
         }
         Ok(summaries)
@@ -4113,9 +4404,16 @@ pub fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
                  UNION
                  SELECT s.session_id
                    FROM sessions AS s
+                   JOIN sessions AS origin ON origin.session_id = ?1
+                  WHERE s.compaction_lineage_root_id = COALESCE(origin.compaction_lineage_root_id, origin.session_id)
+                     OR s.session_id = COALESCE(origin.compaction_lineage_root_id, origin.session_id)
+                 UNION
+                 SELECT s.session_id
+                   FROM sessions AS s
                    JOIN cascade AS c
                      ON s.parent_session_id = c.session_id
                      OR s.btw_parent_session_id = c.session_id
+                     OR s.compaction_predecessor_session_id = c.session_id
              )
              SELECT session_id FROM cascade",
         )
@@ -5579,6 +5877,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_successor_is_a_new_linked_window() {
+        let db = Db::open_in_memory().unwrap();
+        let predecessor = db.create_session("p", "/proj", "Build").await.unwrap();
+        let successor = db
+            .create_compaction_successor(predecessor.session_id)
+            .await
+            .unwrap();
+        assert_ne!(successor.session_id, predecessor.session_id);
+        assert_eq!(
+            successor.compaction_predecessor_session_id,
+            Some(predecessor.session_id)
+        );
+        assert_eq!(
+            successor.compaction_lineage_root(),
+            predecessor.compaction_lineage_root()
+        );
+        assert!(successor.parent_session_id.is_none());
+        let ended = db
+            .get_session(predecessor.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.ended_at_unix_ms.is_some());
+        let roots = db.list_root_sessions("p", 100).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].session_id, successor.session_id);
+        let lineage_root = predecessor.compaction_lineage_root();
+        let lineage = db
+            .read(move |conn| Db::list_compaction_lineage_windows_conn(conn, lineage_root))
+            .await
+            .unwrap();
+        assert_eq!(lineage.len(), 2);
+        assert_eq!(lineage[0].session_id, predecessor.session_id);
+        assert_eq!(lineage[1].session_id, successor.session_id);
+    }
+
+    #[tokio::test]
     async fn forks_and_tangents_start_with_no_title_recovery_nudge() {
         let db = Db::open_in_memory().unwrap();
 
@@ -6009,7 +6344,7 @@ mod tests {
             .await
             .unwrap();
         let direct = db
-            .read(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, 100))
+            .read(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, None, 100))
             .await
             .unwrap();
 

@@ -550,6 +550,7 @@ fn fully_populated_config_json_round_trips_byte_identically() {
         sweep_interval_hours: 12,
         vacuum_min_deletions: 10,
         vacuum_interval_days: 2,
+        compaction_lineage_keep_windows: 3,
     };
     cfg.delegation.max_parallel = 2;
     cfg.delegation.default_recursion_depth = 1;

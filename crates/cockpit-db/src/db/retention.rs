@@ -31,6 +31,11 @@ pub struct RetentionConfig {
     /// Vacuum interval in days.
     #[serde(default = "default_retention_vacuum_interval_days")]
     pub vacuum_interval_days: u32,
+    /// Number of most-recent compaction windows in a lineage whose
+    /// transcripts stay verbatim. Older windows past the transcript
+    /// horizon may be rolled up. Zero means keep every window verbatim.
+    #[serde(default = "default_compaction_lineage_keep_windows")]
+    pub compaction_lineage_keep_windows: u32,
 }
 
 impl Default for RetentionConfig {
@@ -43,6 +48,7 @@ impl Default for RetentionConfig {
             sweep_interval_hours: default_retention_sweep_interval_hours(),
             vacuum_min_deletions: default_retention_vacuum_min_deletions(),
             vacuum_interval_days: default_retention_vacuum_interval_days(),
+            compaction_lineage_keep_windows: default_compaction_lineage_keep_windows(),
         }
     }
 }
@@ -73,6 +79,10 @@ fn default_retention_vacuum_min_deletions() -> u64 {
 
 fn default_retention_vacuum_interval_days() -> u32 {
     7
+}
+
+fn default_compaction_lineage_keep_windows() -> u32 {
+    3
 }
 
 /// `retention_meta` key for the last expiry pass's media-barrier skip count.
@@ -222,6 +232,7 @@ impl Db {
         transcript_cutoff_secs: i64,
         raw_wire_cutoff_secs: i64,
         terminal_evidence_cutoff_secs: i64,
+        compaction_lineage_keep_windows: u32,
     ) -> Result<(u64, u64, u64)> {
         if transcript_cutoff_secs <= 0
             && raw_wire_cutoff_secs <= 0
@@ -235,6 +246,7 @@ impl Db {
                 transcript_cutoff_secs,
                 raw_wire_cutoff_secs,
                 terminal_evidence_cutoff_secs,
+                compaction_lineage_keep_windows,
             )
         })
         .await
@@ -356,7 +368,12 @@ impl Db {
         let terminal_evidence_cutoff =
             retention_cutoff(now_secs, cfg.terminal_evidence_window_days);
         let (transcripts, raw_wire, terminal_evidence) = self
-            .prune_session_payloads(transcript_cutoff, raw_wire_cutoff, terminal_evidence_cutoff)
+            .prune_session_payloads(
+                transcript_cutoff,
+                raw_wire_cutoff,
+                terminal_evidence_cutoff,
+                cfg.compaction_lineage_keep_windows,
+            )
             .await?;
         outcome.transcript_rows_deleted = transcripts;
         outcome.raw_wire_rows_deleted_or_redacted = raw_wire;
@@ -456,6 +473,7 @@ fn prune_session_payloads_conn(
     transcript_cutoff_secs: i64,
     raw_wire_cutoff_secs: i64,
     terminal_evidence_cutoff_secs: i64,
+    compaction_lineage_keep_windows: u32,
 ) -> Result<(u64, u64, u64)> {
     let tx = conn
         .unchecked_transaction()
@@ -474,8 +492,38 @@ fn prune_session_payloads_conn(
     )";
     let mut transcripts = 0_u64;
     if transcript_cutoff_secs > 0 {
+        let recent_windows = if compaction_lineage_keep_windows == 0 {
+            String::new()
+        } else {
+            format!(
+                "AND (
+                     SELECT COUNT(*) FROM sessions newer
+                      WHERE COALESCE(newer.compaction_lineage_root_id, newer.session_id)
+                          = COALESCE(
+                                (SELECT COALESCE(compaction_lineage_root_id, session_id)
+                                   FROM sessions owner
+                                  WHERE owner.session_id = session_events.session_id),
+                                session_events.session_id
+                            )
+                        AND (
+                            newer.started_at_unix_ms > (
+                                SELECT started_at_unix_ms FROM sessions owner
+                                 WHERE owner.session_id = session_events.session_id
+                            )
+                            OR (
+                                newer.started_at_unix_ms = (
+                                    SELECT started_at_unix_ms FROM sessions owner
+                                     WHERE owner.session_id = session_events.session_id
+                                )
+                                AND newer.session_id >= session_events.session_id
+                            )
+                        )
+                 ) > {compaction_lineage_keep_windows}"
+            )
+        };
         let predicate = format!(
             "ts_ms < ?1 AND {closed}
+             {recent_windows}
              AND NOT EXISTS (
                  SELECT 1 FROM sessions child
                   WHERE child.parent_session_id=session_events.session_id
@@ -758,7 +806,7 @@ mod tests {
         insert_payload_rows(&db, open.session_id, "open", 10).await;
 
         assert_eq!(
-            db.prune_session_payloads(20, 20, 20).await.unwrap(),
+            db.prune_session_payloads(20, 20, 20, 0).await.unwrap(),
             (1, 2, 1)
         );
 
@@ -800,7 +848,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = db.prune_session_payloads(20, 20, 20).await.unwrap_err();
+        let err = db.prune_session_payloads(20, 20, 20, 0).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected payload prune failure"),
@@ -827,7 +875,7 @@ mod tests {
         insert_payload_rows(&db, old.session_id, "old", 99).await;
 
         assert_eq!(
-            db.prune_session_payloads(100, 100, 100).await.unwrap(),
+            db.prune_session_payloads(100, 100, 100, 0).await.unwrap(),
             (1, 2, 1)
         );
 
@@ -853,7 +901,7 @@ mod tests {
         close_session(&db, s.session_id, 10).await;
         insert_payload_rows(&db, s.session_id, "closed", 10).await;
 
-        db.prune_session_payloads(20, 20, 20).await.unwrap();
+        db.prune_session_payloads(20, 20, 20, 0).await.unwrap();
 
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
@@ -884,7 +932,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.prune_session_payloads(0, 20, 0).await.unwrap(),
+            db.prune_session_payloads(0, 20, 0, 0).await.unwrap(),
             (0, 6, 0)
         );
         assert_eq!(

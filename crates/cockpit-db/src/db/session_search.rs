@@ -945,6 +945,36 @@ fn existing_session_ids(conn: &Connection) -> Result<std::collections::HashSet<U
 }
 
 fn compaction_links(conn: &Connection) -> Result<Vec<(Uuid, Uuid)>> {
+    let mut links = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, compaction_predecessor_session_id
+               FROM sessions
+              WHERE compaction_predecessor_session_id IS NOT NULL",
+        )
+        .context("preparing typed compaction edge scan")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>("session_id")?,
+                row.get::<_, String>("compaction_predecessor_session_id")?,
+            ))
+        })
+        .context("querying typed compaction edges")?;
+    for row in rows {
+        let (successor, predecessor) = row.context("decoding typed compaction edge")?;
+        let Ok(successor) = Uuid::parse_str(&successor) else {
+            continue;
+        };
+        let Ok(predecessor) = Uuid::parse_str(&predecessor) else {
+            continue;
+        };
+        if seen.insert((predecessor, successor)) {
+            links.push((predecessor, successor));
+        }
+    }
+
     let mut stmt = conn
         .prepare(
             "SELECT e.session_id, e.data_json, h.payload_json
@@ -965,7 +995,6 @@ fn compaction_links(conn: &Connection) -> Result<Vec<(Uuid, Uuid)>> {
             ))
         })
         .context("querying compaction links")?;
-    let mut out = Vec::new();
     for row in rows {
         let (_, data_json, payload_json) = row.context("decoding compaction link")?;
         let link_source = payload_json.as_deref().unwrap_or(data_json.as_str());
@@ -986,9 +1015,14 @@ fn compaction_links(conn: &Connection) -> Result<Vec<(Uuid, Uuid)>> {
         else {
             continue;
         };
-        out.push((predecessor, successor));
+        if predecessor == successor {
+            continue;
+        }
+        if seen.insert((predecessor, successor)) {
+            links.push((predecessor, successor));
+        }
     }
-    Ok(out)
+    Ok(links)
 }
 
 fn scan_tool_events_in_sessions_conn(

@@ -120,6 +120,7 @@ async fn list(args: SessionListArgs) -> Result<()> {
             project_id: None,
             parent_session_id: None,
             assistant_id: args.assistant.clone(),
+            compaction_lineage_root_id: None,
         })
         .await
         .context("requesting session list from daemon")?

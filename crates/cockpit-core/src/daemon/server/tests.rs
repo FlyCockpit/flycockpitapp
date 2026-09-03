@@ -20885,6 +20885,7 @@ impl ReadonlyDispatchCaseKind {
                         project_id: None,
                         parent_session_id: None,
                         assistant_id: None,
+                        compaction_lineage_root_id: None,
                     },
                 )
                 .await
@@ -21410,6 +21411,7 @@ impl ReadonlyDispatchCaseKind {
                         project_id: Some("missing-project".into()),
                         parent_session_id: None,
                         assistant_id: None,
+                        compaction_lineage_root_id: None,
                     },
                 )
                 .await
@@ -27069,6 +27071,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 project_id: Some("proj".into()),
                 parent_session_id: None,
                 assistant_id: None,
+                compaction_lineage_root_id: None,
             },
             kind: "list_sessions",
             session_id: None,
@@ -34686,6 +34689,7 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
             project_id: None,
             parent_session_id: None,
             assistant_id: Some("helper-bot".into()),
+            compaction_lineage_root_id: None,
         },
         &mut state,
         &ctx,
@@ -34706,6 +34710,7 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
             project_id: None,
             parent_session_id: None,
             assistant_id: None,
+            compaction_lineage_root_id: None,
         },
         &mut state,
         &ctx,

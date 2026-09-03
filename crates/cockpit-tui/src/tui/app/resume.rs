@@ -133,7 +133,7 @@ impl App {
         self.push_plain("Resume: keeping full conversation.".to_string());
     }
 
-    /// `/compact`: enqueue an in-place compaction turn on the active session.
+    /// `/compact`: enqueue a compaction turn that seeds a new linked window.
     pub(super) fn start_compact(&mut self) {
         let submission = ClientUserSubmission::compact_notice();
         if !matches!(self.agent_runner, Some(Ok(_))) {

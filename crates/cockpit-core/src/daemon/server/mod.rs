@@ -1773,6 +1773,9 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         pin_count: _,
         assistant_inbox_unread: _,
         assistant_inbox_latest_source_session_id: _,
+        compaction_predecessor_session_id: _,
+        compaction_lineage_root_id: _,
+        lineage_window_count: _,
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);

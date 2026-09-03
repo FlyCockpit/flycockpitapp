@@ -160,6 +160,7 @@ async fn resolve_requested_session_via_daemon(
                 project_id: None,
                 parent_session_id: None,
                 assistant_id: None,
+                compaction_lineage_root_id: None,
             })
             .await
             .context("looking up --session via daemon")?
@@ -208,6 +209,7 @@ async fn resolve_requested_session_via_daemon(
             project_id: Some(project_id),
             parent_session_id: None,
             assistant_id: None,
+            compaction_lineage_root_id: None,
         })
         .await
         .context("listing sessions for --continue via daemon")?

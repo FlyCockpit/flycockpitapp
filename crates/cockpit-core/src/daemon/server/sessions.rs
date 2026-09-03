@@ -7,6 +7,7 @@ pub(super) async fn list_sessions(
     project_id: Option<String>,
     parent_session_id: Option<Uuid>,
     assistant_id: Option<String>,
+    compaction_lineage_root_id: Option<Uuid>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
@@ -21,6 +22,7 @@ pub(super) async fn list_sessions(
                 conn,
                 project_id.as_deref(),
                 parent_session_id,
+                compaction_lineage_root_id,
                 100,
             )
         })
@@ -800,6 +802,9 @@ mod sessions_activity_tests {
             pin_count: 0,
             assistant_inbox_unread: 0,
             assistant_inbox_latest_source_session_id: None,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: None,
+            lineage_window_count: 1,
         }
     }
 

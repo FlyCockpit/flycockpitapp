@@ -1337,6 +1337,10 @@ pub enum Request {
     /// `assistant_id` is a v10-only extended filter: when `Some(name)`,
     /// only sessions belonging to that assistant are returned. A v9
     /// envelope carrying this field is rejected by the version gate.
+    ///
+    /// `compaction_lineage_root_id` lists every context window in that
+    /// conversation lineage (oldest first) so the session browser can
+    /// expand a collapsed card. Distinct from `parent_session_id` (forks).
     ListSessions {
         #[serde(default)]
         project_id: Option<String>,
@@ -1344,6 +1348,8 @@ pub enum Request {
         parent_session_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_lineage_root_id: Option<Uuid>,
     },
 
     /// Read a paginated page of plain user/agent messages for a session.
@@ -1819,7 +1825,7 @@ pub enum Request {
     Prune,
 
     /// Run `/compact` on the attached session's foreground agent. Acked
-    /// immediately; the in-place boundary arrives as a `CompactReady` event.
+    /// immediately; the successor window arrives as a `CompactReady` event.
     Compact,
 
     /// Accept the compacted branch of a prior interactive attach's rolling
@@ -4781,7 +4787,7 @@ macro_rules! command {
             (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
-            (Request::ListSessions { project_id, parent_session_id, assistant_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param]);
+            (Request::ListSessions { project_id, parent_session_id, assistant_id, compaction_lineage_root_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>|compaction_lineage_root_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param, compaction_lineage_root_id: Option<Uuid> => param]);
             (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadAssistantInbox { main_session_id, include_delivered, limit }, "read_assistant_inbox", session_row_reader(main_session_id), field(main_session_id), false, read_only, none, concurrent, none, "main_session_id:Uuid|include_delivered:bool|limit:u32", [main_session_id: Uuid => session, include_delivered: bool => param, limit: u32 => param]);
             (Request::AcknowledgeAssistantInboxHumanRead { main_session_id, inbox_item_ids }, "acknowledge_assistant_inbox_human_read", session_row_writer(main_session_id), field(main_session_id), true, idempotent_adapter_mutation, sql_transaction, serialized, none, "main_session_id:Uuid|inbox_item_ids:Vec<Uuid>", [main_session_id: Uuid => session, inbox_item_ids: Vec<Uuid> => param]);

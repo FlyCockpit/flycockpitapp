@@ -9537,6 +9537,7 @@ async fn handle_serialized_request_impl(
                         conn,
                         Some(&row.project_id),
                         None,
+                        None,
                         100,
                     )?
                     .into_iter()
@@ -11766,6 +11767,7 @@ async fn handle_serialized_request_impl(
             project_id,
             parent_session_id,
             assistant_id,
+            compaction_lineage_root_id,
         } => {
             list_sessions(
                 ctx,
@@ -11773,6 +11775,7 @@ async fn handle_serialized_request_impl(
                 project_id,
                 parent_session_id,
                 assistant_id,
+                compaction_lineage_root_id,
             )
             .await
         }
@@ -19614,6 +19617,7 @@ async fn handle_concurrent_request_impl(
             project_id,
             parent_session_id,
             assistant_id,
+            compaction_lineage_root_id,
         } => {
             list_sessions(
                 &ctx,
@@ -19621,6 +19625,7 @@ async fn handle_concurrent_request_impl(
                 project_id,
                 parent_session_id,
                 assistant_id,
+                compaction_lineage_root_id,
             )
             .await
         }

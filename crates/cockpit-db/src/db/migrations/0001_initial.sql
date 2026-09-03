@@ -7883,10 +7883,19 @@ CREATE TABLE guidance_proposal_receipts (
         AND proposal_id = lower(proposal_id)
         AND proposal_id NOT GLOB '*[^0-9a-f]*'
     ),
-    -- The session UUID text (matches sessions.session_id spelling) — no FK
-    -- because a receipt may outlive its session row during retention.
-    session_id               TEXT    NOT NULL CHECK (length(session_id) BETWEEN 1 AND 64),
-    delegation_id            TEXT    NOT NULL CHECK (length(delegation_id) BETWEEN 1 AND 64),
+    -- 16-byte session/delegation identifiers as 32 lowercase hex characters
+    -- (the same spelling the producer writes). No FK: a receipt may outlive
+    -- its session row during retention.
+    session_id               TEXT    NOT NULL CHECK (
+        length(session_id) = 32
+        AND session_id = lower(session_id)
+        AND session_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    delegation_id            TEXT    NOT NULL CHECK (
+        length(delegation_id) = 32
+        AND delegation_id = lower(delegation_id)
+        AND delegation_id NOT GLOB '*[^0-9a-f]*'
+    ),
     canonical_project_digest TEXT    NOT NULL CHECK (
         length(canonical_project_digest) = 64
         AND canonical_project_digest = lower(canonical_project_digest)
@@ -7952,7 +7961,13 @@ CREATE UNIQUE INDEX uq_guidance_proposal_receipts_one_created_per_scope
 -- does NOT re-increment these counters.
 CREATE TABLE guidance_proposal_counters (
     scope_kind TEXT    NOT NULL CHECK (scope_kind IN ('session', 'delegation')),
-    scope_id   TEXT    NOT NULL CHECK (length(scope_id) BETWEEN 1 AND 64),
+    -- Session or delegation identifier; same 32 lowercase hex spelling as the
+    -- matching receipt column.
+    scope_id   TEXT    NOT NULL CHECK (
+        length(scope_id) = 32
+        AND scope_id = lower(scope_id)
+        AND scope_id NOT GLOB '*[^0-9a-f]*'
+    ),
     count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
     PRIMARY KEY (scope_kind, scope_id)
 );
@@ -7962,9 +7977,21 @@ CREATE TABLE guidance_proposal_counters (
 -- deliberately isolated from config/export tables and keyed only by opaque
 -- local scope digests.  Session-scoped accepted rules never enter SQLite.
 CREATE TABLE accepted_persistent_guidance_rules (
-    canonical_project_digest TEXT NOT NULL CHECK (length(canonical_project_digest) = 64),
-    provider_digest          TEXT NOT NULL CHECK (length(provider_digest) = 64),
-    model_digest             TEXT NOT NULL CHECK (length(model_digest) = 64),
+    canonical_project_digest TEXT NOT NULL CHECK (
+        length(canonical_project_digest) = 64
+        AND canonical_project_digest = lower(canonical_project_digest)
+        AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    provider_digest          TEXT NOT NULL CHECK (
+        length(provider_digest) = 64
+        AND provider_digest = lower(provider_digest)
+        AND provider_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    model_digest             TEXT NOT NULL CHECK (
+        length(model_digest) = 64
+        AND model_digest = lower(model_digest)
+        AND model_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     rule_kind                INTEGER NOT NULL CHECK (rule_kind BETWEEN 1 AND 6),
     encoded_rule             BLOB NOT NULL CHECK (length(encoded_rule) = 3),
     updated_at_unix_ms       INTEGER NOT NULL,

@@ -39,7 +39,7 @@ use crate::computer::audit::{
 use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
     CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
-    GuidanceProposalReceiptInsert, GuidanceProposalReceiptState,
+    GuidanceProposalReceiptInsert, GuidanceProposalReceiptRow, GuidanceProposalReceiptState,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,6 +168,73 @@ impl From<&GuidanceAuditEvent> for GuidanceAuditAppend {
             disposition: event.disposition,
             scope: event.scope,
         }
+    }
+}
+
+impl GuidanceAuditEvent {
+    /// Reconstruct an audit event from a durable receipt.
+    ///
+    /// Identity fields are cryptographic chain inputs. A malformed hex string
+    /// or out-of-range integer must fail closed — never coerce into a valid
+    /// zero identifier or a silently truncated generation/bitset.
+    fn try_from_receipt(
+        row: &GuidanceProposalReceiptRow,
+        event_state: GuidanceProposalReceiptState,
+        accepted_scope: Option<GuidanceProposalAcceptedScope>,
+    ) -> anyhow::Result<Self> {
+        let kind = match event_state {
+            GuidanceProposalReceiptState::Created => AuditEventKind::GuidanceProposalCreated,
+            GuidanceProposalReceiptState::Accepted => AuditEventKind::GuidanceProposalAccepted,
+            GuidanceProposalReceiptState::Rejected => AuditEventKind::GuidanceProposalRejected,
+            GuidanceProposalReceiptState::Expired
+            | GuidanceProposalReceiptState::ExpiredOnRestart => {
+                AuditEventKind::GuidanceProposalExpired
+            }
+        };
+        let proposal_id = parse_hex16(&row.proposal_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt proposal id"))?;
+        let session_id = parse_hex16(&row.session_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt session id"))?;
+        let delegation_id = parse_hex16(&row.delegation_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt delegation id"))?;
+        let canonical_project_digest = parse_hex32(&row.canonical_project_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt project digest"))?;
+        let provider_digest = parse_hex32(&row.provider_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt provider digest"))?;
+        let model_digest = parse_hex32(&row.model_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt model digest"))?;
+        let config_generation = u64::try_from(row.config_generation)?;
+        let rule_kind_bits = u16::try_from(row.rule_kind_bits)?;
+        let (disposition, scope) = match event_state {
+            GuidanceProposalReceiptState::Created => (None, None),
+            GuidanceProposalReceiptState::Rejected => (Some(Disposition::Rejected), None),
+            GuidanceProposalReceiptState::Expired
+            | GuidanceProposalReceiptState::ExpiredOnRestart => (Some(Disposition::Expired), None),
+            GuidanceProposalReceiptState::Accepted => match accepted_scope {
+                Some(GuidanceProposalAcceptedScope::Session) => (
+                    Some(Disposition::AcceptedSession),
+                    Some(GuidanceScope::Session),
+                ),
+                Some(GuidanceProposalAcceptedScope::Persistent) => (
+                    Some(Disposition::AcceptedPersistent),
+                    Some(GuidanceScope::ProjectProviderModel),
+                ),
+                None => anyhow::bail!("accepted guidance audit lacks scope"),
+            },
+        };
+        Ok(Self {
+            kind,
+            proposal_id,
+            session_id,
+            delegation_id,
+            canonical_project_digest,
+            provider_digest,
+            model_digest,
+            config_generation,
+            rule_kind_bits,
+            disposition,
+            scope,
+        })
     }
 }
 
@@ -673,54 +740,8 @@ impl GuidanceProposalService {
         for item in pending {
             let row = &item.receipt;
             let accepted_scope = item.event_accepted_scope;
-            let kind = match item.event_state {
-                GuidanceProposalReceiptState::Created => AuditEventKind::GuidanceProposalCreated,
-                GuidanceProposalReceiptState::Accepted => AuditEventKind::GuidanceProposalAccepted,
-                GuidanceProposalReceiptState::Rejected => AuditEventKind::GuidanceProposalRejected,
-                GuidanceProposalReceiptState::Expired
-                | GuidanceProposalReceiptState::ExpiredOnRestart => {
-                    AuditEventKind::GuidanceProposalExpired
-                }
-            };
-            let event = GuidanceAuditEvent {
-                kind,
-                proposal_id: parse_hex16(&row.proposal_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt proposal id"))?,
-                session_id: parse_hex16(&row.session_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt session id"))?,
-                delegation_id: parse_hex16(&row.delegation_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt delegation id"))?,
-                canonical_project_digest: parse_hex32(&row.canonical_project_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt project digest"))?,
-                provider_digest: parse_hex32(&row.provider_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt provider digest"))?,
-                model_digest: parse_hex32(&row.model_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt model digest"))?,
-                config_generation: u64::try_from(row.config_generation)?,
-                rule_kind_bits: u16::try_from(row.rule_kind_bits)?,
-                disposition: match item.event_state {
-                    GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                        Some(GuidanceProposalAcceptedScope::Session) => {
-                            Some(Disposition::AcceptedSession)
-                        }
-                        Some(GuidanceProposalAcceptedScope::Persistent) => {
-                            Some(Disposition::AcceptedPersistent)
-                        }
-                        None => anyhow::bail!("accepted guidance audit lacks scope"),
-                    },
-                    GuidanceProposalReceiptState::Rejected => Some(Disposition::Rejected),
-                    GuidanceProposalReceiptState::Expired
-                    | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
-                    GuidanceProposalReceiptState::Created => None,
-                },
-                scope: match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => Some(GuidanceScope::Session),
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(GuidanceScope::ProjectProviderModel)
-                    }
-                    None => None,
-                },
-            };
+            let event =
+                GuidanceAuditEvent::try_from_receipt(row, item.event_state, accepted_scope)?;
             match self.audit.append(&event).await {
                 Ok(()) => {
                     self.db
@@ -973,7 +994,6 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::Expired,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await;
             return Err(CreateProposalError::Storage(
@@ -1120,28 +1140,12 @@ impl GuidanceProposalService {
             .ok_or(TransitionProposalError::NotFound)?;
 
         // Audit append.
-        let (disp, gscope) = match accepted_scope {
-            GuidanceProposalAcceptedScope::Session => {
-                (Disposition::AcceptedSession, GuidanceScope::Session)
-            }
-            GuidanceProposalAcceptedScope::Persistent => (
-                Disposition::AcceptedPersistent,
-                GuidanceScope::ProjectProviderModel,
-            ),
-        };
-        let audit_event = GuidanceAuditEvent {
-            kind: AuditEventKind::GuidanceProposalAccepted,
-            proposal_id,
-            session_id: scope.session_id,
-            delegation_id: scope.delegation_id,
-            canonical_project_digest: scope.project_digest,
-            provider_digest: scope.provider_digest,
-            model_digest: scope.model_digest,
-            config_generation: receipt.config_generation as u64,
-            rule_kind_bits: receipt.rule_kind_bits as u16,
-            disposition: Some(disp),
-            scope: Some(gscope),
-        };
+        let audit_event = GuidanceAuditEvent::try_from_receipt(
+            &receipt,
+            GuidanceProposalReceiptState::Accepted,
+            Some(accepted_scope),
+        )
+        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
         self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
@@ -1234,19 +1238,12 @@ impl GuidanceProposalService {
             .await
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
             .ok_or(TransitionProposalError::NotFound)?;
-        let audit_event = GuidanceAuditEvent {
-            kind: AuditEventKind::GuidanceProposalRejected,
-            proposal_id,
-            session_id: scope.session_id,
-            delegation_id: scope.delegation_id,
-            canonical_project_digest: scope.project_digest,
-            provider_digest: scope.provider_digest,
-            model_digest: scope.model_digest,
-            config_generation: receipt.config_generation as u64,
-            rule_kind_bits: receipt.rule_kind_bits as u16,
-            disposition: Some(Disposition::Rejected),
-            scope: None,
-        };
+        let audit_event = GuidanceAuditEvent::try_from_receipt(
+            &receipt,
+            GuidanceProposalReceiptState::Rejected,
+            None,
+        )
+        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
         self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
@@ -1297,7 +1294,6 @@ impl GuidanceProposalService {
                 GuidanceProposalReceiptState::Expired,
                 None,
                 now_unix_ms,
-                AuditEventKind::GuidanceProposalExpired,
             )
             .await?;
         if applied {
@@ -1330,7 +1326,6 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::Expired,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await
             {
@@ -1377,11 +1372,6 @@ impl GuidanceProposalService {
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
         let mut count = 0;
         for row in stale {
-            // The proposal id hex is already 32 lowercase chars.
-            let proposal_id = match parse_hex16(&row.proposal_id) {
-                Some(id) => id,
-                None => continue,
-            };
             let applied = self
                 .cas_and_audit(
                     &row.proposal_id,
@@ -1389,13 +1379,11 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::ExpiredOnRestart,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await?;
             if applied {
                 // Exactly one audit append per stale receipt; no counter
                 // re-increment (creation already counted).
-                let _ = proposal_id;
                 count += 1;
             }
         }
@@ -1459,9 +1447,8 @@ impl GuidanceProposalService {
         to: GuidanceProposalReceiptState,
         accepted_scope: Option<GuidanceProposalAcceptedScope>,
         now_unix_ms: i64,
-        audit_kind: AuditEventKind,
     ) -> Result<bool, TransitionProposalError> {
-        if audit_kind != AuditEventKind::GuidanceProposalCreated {
+        if to != GuidanceProposalReceiptState::Created {
             self.flush_predecessor_audits(now_unix_ms).await;
         }
         let applied = self
@@ -1487,44 +1474,11 @@ impl GuidanceProposalService {
             .await
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
             .ok_or(TransitionProposalError::NotFound)?;
-        let proposal_id = parse_hex16(&row.proposal_id).unwrap_or([0u8; 16]);
-        let event = GuidanceAuditEvent {
-            kind: audit_kind,
-            proposal_id,
-            session_id: parse_hex16(&row.session_id).unwrap_or([0u8; 16]),
-            delegation_id: parse_hex16(&row.delegation_id).unwrap_or([0u8; 16]),
-            canonical_project_digest: parse_hex32(&row.canonical_project_digest)
-                .unwrap_or([0u8; 32]),
-            provider_digest: parse_hex32(&row.provider_digest).unwrap_or([0u8; 32]),
-            model_digest: parse_hex32(&row.model_digest).unwrap_or([0u8; 32]),
-            config_generation: row.config_generation as u64,
-            rule_kind_bits: row.rule_kind_bits as u16,
-            disposition: match to {
-                GuidanceProposalReceiptState::Expired
-                | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
-                GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => {
-                        Some(Disposition::AcceptedSession)
-                    }
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(Disposition::AcceptedPersistent)
-                    }
-                    None => None,
-                },
-                GuidanceProposalReceiptState::Rejected => Some(Disposition::Rejected),
-                GuidanceProposalReceiptState::Created => None,
-            },
-            scope: match to {
-                GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => Some(GuidanceScope::Session),
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(GuidanceScope::ProjectProviderModel)
-                    }
-                    None => None,
-                },
-                _ => None,
-            },
-        };
+        // Malformed durable identities must not become a signed zero-identity
+        // chain entry. Refuse delivery; the outbox stays pending and replay
+        // uses the same fail-closed reconstruction.
+        let event = GuidanceAuditEvent::try_from_receipt(&row, to, accepted_scope)
+            .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
         if self.audit.delivers_immediately() && self.audit.append(&event).await.is_ok() {
             if let Err(error) = self
                 .db
@@ -2286,5 +2240,87 @@ mod tests {
         let after_str = std::str::from_utf8(&after).unwrap();
         assert!(after_str.contains("five"));
         assert!(!after_str.contains("two"));
+    }
+
+    fn receipt_row(session_id: String, delegation_id: String) -> GuidanceProposalReceiptRow {
+        GuidanceProposalReceiptRow {
+            proposal_id: hex16(&id16(9)),
+            session_id,
+            delegation_id,
+            canonical_project_digest: hex32(&[1u8; 32]),
+            provider_digest: hex32(&[2u8; 32]),
+            model_digest: hex32(&[3u8; 32]),
+            config_generation: 1,
+            rule_kind_bits: 1,
+            created_at_unix_ms: 1000,
+            expires_at_unix_ms: 2000,
+            state: GuidanceProposalReceiptState::Created,
+            accepted_scope: None,
+            transitioned_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn audit_event_from_receipt_keeps_parsed_identities() {
+        let row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        let event =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap();
+        assert_eq!(event.proposal_id, id16(9));
+        assert_eq!(event.session_id, id16(1));
+        assert_eq!(event.delegation_id, id16(2));
+        assert_eq!(event.canonical_project_digest, [1u8; 32]);
+        assert_eq!(event.kind, AuditEventKind::GuidanceProposalExpired);
+        assert_eq!(event.disposition, Some(Disposition::Expired));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_session_id() {
+        let row = receipt_row("s1".into(), hex16(&id16(2)));
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("session id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_delegation_id() {
+        let row = receipt_row(hex16(&id16(1)), "d1".into());
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("delegation id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_proposal_id() {
+        let mut row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        row.proposal_id = "not-hex".into();
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Created, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("proposal id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_accepted_without_scope() {
+        let row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        let err = GuidanceAuditEvent::try_from_receipt(
+            &row,
+            GuidanceProposalReceiptState::Accepted,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("lacks scope"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_out_of_range_generation() {
+        let mut row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        row.config_generation = -1;
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Created, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }

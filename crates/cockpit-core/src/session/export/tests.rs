@@ -3761,10 +3761,10 @@ async fn archive_is_private() {
 
 // Windows twin of `archive_is_private`: the export write funnels through
 // `private_fs::write_private_export_file`, whose Windows arm enforces the
-// protected owner-only DACL (asserted against real on-disk behaviour in
-// `cockpit-host`); here we prove the end-to-end export still assembles and
-// lands a VALID archive on Windows — the write that used to hard-fail the
-// command outright. Not compiled out: it runs on the Windows gate runner.
+// protected owner-only DACL; here we prove the end-to-end export still
+// assembles and lands a VALID, owner-only archive on Windows — the write
+// that used to hard-fail the command outright. Not compiled out: it runs on
+// the Windows gate runner.
 #[cfg(windows)]
 #[tokio::test]
 async fn archive_lands_valid_and_private_on_windows() {
@@ -3790,6 +3790,12 @@ async fn archive_lands_valid_and_private_on_windows() {
     )
     .await
     .expect("Windows export must succeed");
+
+    // Windows twin of the 0o600 assertion: the landed archive must carry the
+    // protected owner-only DACL — export archives must never be group- or
+    // world-readable on any platform.
+    cockpit_host::goal_scratch::verify_private_dacl(&out)
+        .expect("export archive must carry the protected owner-only DACL");
 
     // The archive is a real, importable debug bundle, not a stub.
     let bytes = std::fs::read(&out).expect("export file exists");

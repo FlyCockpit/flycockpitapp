@@ -309,7 +309,14 @@ fn apply_windows_dacl(path: &Path, descriptor_text: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(windows, test))]
+/// Apply an arbitrary test DACL to a path. Test instrumentation behind the
+/// explicit `test-support` cargo feature — mirroring `cockpit_core`'s
+/// convention — NOT `cfg(test)`: `cfg(test)` is only active while compiling
+/// this crate's own test target, so an upper crate's Windows tests (which link
+/// the normal rlib, e.g. `cockpit-core`'s spool-guard test) would not see the
+/// symbol and would fail to compile. Never a production edge: production
+/// code calls [`set_private`] / [`verify_private_dacl`].
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn apply_test_windows_dacl(path: &Path, descriptor: &str) -> Result<()> {
     apply_windows_dacl(path, descriptor)
 }

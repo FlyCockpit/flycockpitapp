@@ -38,10 +38,13 @@
 //! on [`PrivateFsPolicy::export_file_discipline_enforced`] and are NOT
 //! Unix-only: on Windows the export writer enforces the same file-level
 //! discipline (reparse refusal at every component, hostile-target refusal,
-//! protected owner-only DACL applied to the staged file before any export
-//! byte is written and re-verified through the written object afterwards,
-//! delete-or-refuse on verify failure) while, like the Unix export funnel,
-//! never tightening the user-chosen output parent directory.
+//! a staged temp file that is BORN with the protected owner-only DACL — a
+//! create-time `SECURITY_ATTRIBUTES`, the Windows twin of the Unix `0600`
+//! at-create, so no create-then-harden window exists — verified through the
+//! held handle before any export byte is written and re-verified through the
+//! written object afterwards, delete-or-refuse on verify failure) while,
+//! like the Unix export funnel, never tightening the user-chosen output
+//! parent directory.
 
 use std::path::Path;
 use std::{ffi::OsStr, path::PathBuf};
@@ -2306,9 +2309,21 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     refuse_windows_hostile_target(path)?;
 
     let dir = atomic_write_dir(path);
-    let mut temp = tempfile::NamedTempFile::new_in(dir)
+    // The staged temp is born with the protected owner-only DACL. The parent
+    // was just tightened, but tightening does not propagate to new files: the
+    // applied directory descriptor carries no inheritable ACE flags, so a
+    // plain create would land under the token-default DACL (owner + SYSTEM +
+    // Administrators) and only be hardened after the secret bytes are
+    // already staged — the same create-then-harden window the export writer
+    // closes at create time.
+    let mut temp = tempfile::Builder::new()
+        .make_in(dir, create_windows_private_file_exclusive)
         .with_context(|| format!("creating temp file for {}", path.display()))?;
     let staged = (|| -> Result<()> {
+        // Fail closed before any secret byte lands: the born DACL must
+        // verify owner-only through the held handle, not merely through the
+        // create call that supplied it.
+        verify_windows_open_file(temp.as_file(), temp.path(), "staged KEK")?;
         temp.write_all(bytes)
             .with_context(|| format!("writing temp file for {}", path.display()))?;
         temp.as_file_mut()
@@ -2317,7 +2332,6 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         temp.as_file()
             .sync_all()
             .with_context(|| format!("fsync temp file for {}", path.display()))?;
-        apply_windows_owner_only_dacl(temp.path())?;
         Ok(())
     })();
     if let Err(error) = staged {
@@ -2359,9 +2373,21 @@ pub fn write_private_file_exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
     refuse_windows_hostile_target(path)?;
 
     let dir = atomic_write_dir(path);
-    let mut temp = tempfile::NamedTempFile::new_in(dir)
+    // The staged temp is born with the protected owner-only DACL. The parent
+    // was just tightened, but tightening does not propagate to new files: the
+    // applied directory descriptor carries no inheritable ACE flags, so a
+    // plain create would land under the token-default DACL (owner + SYSTEM +
+    // Administrators) and only be hardened after the secret bytes are
+    // already staged — the same create-then-harden window the export writer
+    // closes at create time.
+    let mut temp = tempfile::Builder::new()
+        .make_in(dir, create_windows_private_file_exclusive)
         .with_context(|| format!("creating temp file for {}", path.display()))?;
     let staged = (|| -> Result<()> {
+        // Fail closed before any secret byte lands: the born DACL must
+        // verify owner-only through the held handle, not merely through the
+        // create call that supplied it.
+        verify_windows_open_file(temp.as_file(), temp.path(), "staged KEK")?;
         temp.write_all(bytes)
             .with_context(|| format!("writing temp file for {}", path.display()))?;
         temp.as_file_mut()
@@ -2370,7 +2396,6 @@ pub fn write_private_file_exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
         temp.as_file()
             .sync_all()
             .with_context(|| format!("fsync temp file for {}", path.display()))?;
-        apply_windows_owner_only_dacl(temp.path())?;
         Ok(())
     })();
     if let Err(error) = staged {
@@ -2622,6 +2647,126 @@ fn map_windows_dacl_error(path: &Path, err: anyhow::Error) -> PrivateFsError {
 #[cfg(windows)]
 fn apply_windows_owner_only_dacl(path: &Path) -> Result<(), PrivateFsError> {
     crate::goal_scratch::set_private(path).map_err(|err| map_windows_dacl_error(path, err))
+}
+
+/// Create a brand-new file that is BORN with the protected owner-only DACL
+/// (create-time `SECURITY_ATTRIBUTES`), instead of being created with the
+/// process token's default DACL and hardened afterwards — the Windows twin
+/// of the Unix `openat_create_private_excl` mode argument, where `0600` is
+/// set at create time so no byte is ever written through a wider mode.
+///
+/// Born-private is load-bearing, not stylistic. A newly created file does
+/// NOT inherit the parent directory's DACL: the owner-only descriptor this
+/// module applies to directories carries no inheritable ACE flags, so a
+/// create-then-harden sequence stages the secret under the token-default
+/// DACL (owner + SYSTEM + Administrators, and whatever else the token
+/// grants) for the whole write. Windows DACLs gate *opens*, not
+/// already-held handles, so a co-tenant of a deliberately-never-tightened
+/// export directory who opens the staged file in that window keeps reading
+/// export bytes written after the harden — and a directory-write co-tenant
+/// can plant a hard link whose alias survives the delete-or-refuse cleanup
+/// (which removes only the published name). Creating through this helper
+/// closes the window: the object never exists with any broader DACL.
+///
+/// `CREATE_NEW` guarantees a brand-new name (never an attacker's
+/// pre-existing object, the `O_EXCL` twin). The share mode matches `std`'s
+/// `OpenOptions` default (read/write/delete) so tempfile's path-based
+/// publish keeps working while the handle is held; secrecy is carried by the
+/// born DACL, exactly like the Unix arm's `0600` mode carries it.
+#[cfg(windows)]
+fn create_windows_private_file_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr;
+
+    /// Win32 `SECURITY_ATTRIBUTES`: carries the owner-only descriptor to the
+    /// create call so the object is born private.
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        inherit_handle: i32,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor: *const u16,
+            revision: u32,
+            security_descriptor: *mut *mut core::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            filename: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut SecurityAttributes,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    const SDDL_REVISION_1: u32 = 1;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as _;
+
+    let sid = crate::named_pipe::current_user_sid().map_err(std::io::Error::other)?;
+    // The same protected descriptor the finalize pass re-applies: explicit
+    // owner (no inherited extra principals), current user + SYSTEM only.
+    let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+    let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: `wide_sddl` is NUL-terminated, the out-pointer is valid, and the
+    // LocalAlloc'd descriptor is freed exactly once below.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        security_descriptor: descriptor,
+        inherit_handle: 0,
+    };
+    // SAFETY: `wide_path` is NUL-terminated and `attributes` stays live across
+    // the call; CreateFileW copies the descriptor into the new object, so the
+    // converted descriptor can be freed immediately after it returns.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &mut attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `handle` was just returned by CreateFileW and is solely owned.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 /// Open an existing path without following a final-component reparse.
@@ -2990,14 +3135,17 @@ pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Enforces the same file-level discipline the KEK writer does — reparse
 /// refusal at every existing path component, hostile-target refusal (a
 /// reparse point, a non-regular file, or a hard-linked alias at the
-/// destination), a staged temp file that carries the protected owner-only
-/// DACL *before* any export byte is written into it, an atomic replace, and
-/// a finalize pass that re-applies and re-verifies the DACL through the
-/// written object (delete-or-refuse on any verify failure) — while never
-/// touching the parent directory's ACL. A user-chosen export directory is
-/// legitimately shared; like the Unix funnel (which never tightens a `0755`
-/// parent), the export's confidentiality is carried by the file's own
-/// owner-only DACL, not by tightening the directory the user picked.
+/// destination), a staged temp file that is BORN with the protected
+/// owner-only DACL (create-time `SECURITY_ATTRIBUTES`, so no
+/// create-then-harden window exists even though the user-chosen parent is
+/// never tightened) and verifies it through the held handle before any
+/// export byte is written, an atomic replace, and a finalize pass that
+/// re-applies and re-verifies the DACL through the written object
+/// (delete-or-refuse on any verify failure) — while never touching the
+/// parent directory's ACL. A user-chosen export directory is legitimately
+/// shared; like the Unix funnel (which never tightens a `0755` parent), the
+/// export's confidentiality is carried by the file's own owner-only DACL,
+/// not by tightening the directory the user picked.
 #[cfg(windows)]
 fn write_windows_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -3006,13 +3154,21 @@ fn write_windows_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
     refuse_windows_hostile_target(path)?;
 
     let dir = atomic_write_dir(path);
-    let mut temp = tempfile::NamedTempFile::new_in(dir)
+    // The staged temp is born with the protected owner-only DACL: the
+    // user-chosen output directory is deliberately never tightened, and
+    // Windows DACLs gate *opens*, not already-held handles — a
+    // create-then-harden sequence would leave a window in which a co-tenant
+    // of the directory could open the staged export and keep reading bytes
+    // written after the harden, or plant a hard link whose alias survives
+    // the final delete-or-refuse cleanup.
+    let mut temp = tempfile::Builder::new()
+        .make_in(dir, create_windows_private_file_exclusive)
         .with_context(|| format!("creating temp file for {}", path.display()))?;
     let staged = (|| -> Result<()> {
-        // Harden the staged file BEFORE any export byte is written: the temp
-        // is created with the directory's default (inherited) DACL, which may
-        // be broader than owner-only.
-        apply_windows_owner_only_dacl(temp.path())?;
+        // Fail closed before any export byte lands: the born DACL must
+        // verify owner-only through the held handle, not merely through the
+        // create call that supplied it.
+        verify_windows_open_file(temp.as_file(), temp.path(), "staged export")?;
         temp.write_all(bytes)
             .with_context(|| format!("writing temp file for {}", path.display()))?;
         temp.as_file_mut()
@@ -3588,6 +3744,29 @@ mod tests {
         let nested = created.join("deep.zip");
         write_private_export_file(&nested, b"NESTED").expect("write into created parent");
         verify_windows_private_path(&nested, "export").expect("nested export verifies private");
+    }
+
+    // The staged file is BORN owner-only — the Windows twin of the Unix
+    // `0600`-at-create. This must hold inside a shared parent whose ACL is
+    // deliberately never tightened (no create-then-harden window in which a
+    // co-tenant of the output directory could open the staged export and
+    // keep reading bytes written after a later harden), and it must verify
+    // through the held handle before any byte is written.
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_create_is_born_owner_only_in_a_shared_parent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(
+            crate::goal_scratch::verify_private_dacl(root.path()).is_err(),
+            "fixture parent must start as a non-owner-only directory"
+        );
+        let staged = root.path().join(".tmp-born");
+        let file = create_windows_private_file_exclusive(&staged).expect("born-private create");
+        verify_windows_open_file(&file, &staged, "staged export")
+            .expect("the born DACL must verify owner-only through the held handle");
+        drop(file);
+        crate::goal_scratch::verify_private_dacl(&staged)
+            .expect("a newly staged file must be born with the protected owner-only DACL");
     }
 
     // The Windows export writer refuses the same hostile targets the Unix

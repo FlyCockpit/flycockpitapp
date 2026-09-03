@@ -465,16 +465,15 @@ pub enum AsyncActionPayload {
         rules: Vec<cockpit_proto::ConversationRule>,
     },
     RuleSet {
+        session_id: uuid::Uuid,
         rule: cockpit_proto::ConversationRule,
     },
     RuleRemoved {
+        session_id: uuid::Uuid,
         rule_id: uuid::Uuid,
         removed: bool,
     },
-    RulePromoted {
-        target_path: String,
-        report: String,
-    },
+    RulePromoteStarted,
     LocalCommand {
         label: String,
         raw_output: String,

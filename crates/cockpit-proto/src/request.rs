@@ -837,7 +837,8 @@ pub enum Request {
     },
     /// Launch a write-scoped subagent that places the rule in the resolved
     /// instructions file (AGENTS.md / SOUL.md / project guidance) or a linked
-    /// file in that directory subtree.
+    /// file in that directory subtree. Acked immediately; the diff/summary
+    /// arrives as a session `Notice` once the subagent finishes.
     PromoteConversationRule {
         session_id: Uuid,
         rule_id: Uuid,

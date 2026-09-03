@@ -18573,6 +18573,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: DriverForwarded,
             observation: "SessionWork::Pin delivered to attached worker",
         },
+        MutatingDispatchCase {
+            kind: "promote_conversation_rule",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::PromoteConversationRule delivered to attached worker",
+        },
         #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "store_flycockpit_credential",
@@ -23077,20 +23082,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_conversation_rule"
         | "remove_conversation_rule"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
-        "promote_conversation_rule" => {
-            let ctx = test_ctx();
-            let tmp = tempfile::tempdir().unwrap();
-            let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
-            let _ = handle_request(
-                Request::PromoteConversationRule {
-                    session_id,
-                    rule_id: Uuid::nil(),
-                },
-                &mut state,
-                &ctx,
-            )
-            .await;
-        }
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
         "import_session_archive" => assert_import_session_archive_happy().await,
@@ -23150,7 +23141,8 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "prune"
         | "compact"
         | "resume_from_compaction"
-        | "pin" => assert_worker_delivery_happy(case.kind).await,
+        | "pin"
+        | "promote_conversation_rule" => assert_worker_delivery_happy(case.kind).await,
         "cancel_run_invocation" => {
             let ctx = test_ctx();
             let id = Uuid::new_v4();
@@ -23320,7 +23312,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "list_project_notes"
         | "set_conversation_rule"
         | "remove_conversation_rule"
-        | "promote_conversation_rule"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
             let ctx = test_ctx();
@@ -23418,7 +23409,8 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "prune"
         | "compact"
         | "resume_from_compaction"
-        | "pin" => assert_attached_required_malformed(case.kind).await,
+        | "pin"
+        | "promote_conversation_rule" => assert_attached_required_malformed(case.kind).await,
         "steer_delegation" => assert_steer_delegation_malformed().await,
         "set_caffeinate" => {
             let ctx = test_ctx();
@@ -23843,6 +23835,10 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
+        "promote_conversation_rule" => Request::PromoteConversationRule {
+            session_id,
+            rule_id: Uuid::nil(),
+        },
         other => panic!("unexpected worker case {other}"),
     };
     let response =
@@ -24161,6 +24157,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(job_id, "job-1");
                 }
                 ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                ("promote_conversation_rule", SessionWork::PromoteConversationRule { rule_id }) => {
+                    assert_eq!(rule_id, Uuid::nil());
+                }
                 ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
                     respond_to
                         .send(Ok(()))
@@ -24483,6 +24482,10 @@ async fn assert_attached_required_malformed(kind: &str) {
         "compact" => Request::Compact,
         "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
+        "promote_conversation_rule" => Request::PromoteConversationRule {
+            session_id: Uuid::new_v4(),
+            rule_id: Uuid::nil(),
+        },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
         },
@@ -25966,10 +25969,6 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
             session_id: session.session_id,
             rule_id: Uuid::nil(),
         },
-        "promote_conversation_rule" => Request::PromoteConversationRule {
-            session_id: session.session_id,
-            rule_id: Uuid::nil(),
-        },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
             name: "new".into(),
@@ -26047,10 +26046,6 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
             source_trust: None,
         },
         "remove_conversation_rule" => Request::RemoveConversationRule {
-            session_id: Uuid::new_v4(),
-            rule_id: Uuid::new_v4(),
-        },
-        "promote_conversation_rule" => Request::PromoteConversationRule {
             session_id: Uuid::new_v4(),
             rule_id: Uuid::new_v4(),
         },

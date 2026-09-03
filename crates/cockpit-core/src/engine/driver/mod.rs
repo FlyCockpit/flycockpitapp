@@ -219,11 +219,9 @@ pub enum DriverControl {
         text: String,
     },
     /// Promote a conversation rule into the resolved instructions file.
+    /// Fire-and-ack: the RPC returns immediately; completion arrives as a Notice.
     PromoteConversationRule {
         rule_id: uuid::Uuid,
-        respond_to: tokio::sync::oneshot::Sender<
-            std::result::Result<crate::daemon::proto::Response, String>,
-        >,
     },
     /// Explicitly opt into synthetic resume repair for a Responses session
     /// that strict replay opened read-only. The original transcript is not
@@ -6522,12 +6520,8 @@ impl Driver {
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);
             }
-            DriverControl::PromoteConversationRule {
-                rule_id,
-                respond_to,
-            } => {
-                let result = self.do_promote_conversation_rule(rule_id, tx).await;
-                let _ = respond_to.send(result);
+            DriverControl::PromoteConversationRule { rule_id } => {
+                self.do_promote_conversation_rule(rule_id, tx).await;
             }
             DriverControl::RepairResume {
                 root_agent,

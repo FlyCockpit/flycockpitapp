@@ -85,7 +85,10 @@ impl App {
                 },
             )? {
                 cockpit_proto::Response::ConversationRuleChanged { rule } => {
-                    Ok(AsyncActionPayload::RuleSet { rule })
+                    Ok(AsyncActionPayload::RuleSet {
+                        session_id: sid,
+                        rule,
+                    })
                 }
                 other => Err(format!("unexpected set-rule response: {other:?}")),
             },
@@ -130,14 +133,26 @@ impl App {
                 },
             )? {
                 cockpit_proto::Response::ConversationRuleRemoved { removed } => {
-                    Ok(AsyncActionPayload::RuleRemoved { rule_id, removed })
+                    Ok(AsyncActionPayload::RuleRemoved {
+                        session_id: sid,
+                        rule_id,
+                        removed,
+                    })
                 }
                 other => Err(format!("unexpected remove-rule response: {other:?}")),
             },
         );
     }
 
-    pub(super) fn apply_rule_removed(&mut self, rule_id: uuid::Uuid, removed: bool) {
+    pub(super) fn apply_rule_removed(
+        &mut self,
+        session_id: uuid::Uuid,
+        rule_id: uuid::Uuid,
+        removed: bool,
+    ) {
+        if self.current_session_id() != Some(session_id) {
+            return;
+        }
         if !removed {
             self.push_plain("/rules: rule already revoked".to_string());
             return;
@@ -150,7 +165,14 @@ impl App {
         self.push_plain("/rules: revoked".to_string());
     }
 
-    pub(super) fn apply_rule_set(&mut self, rule: cockpit_proto::ConversationRule) {
+    pub(super) fn apply_rule_set(
+        &mut self,
+        session_id: uuid::Uuid,
+        rule: cockpit_proto::ConversationRule,
+    ) {
+        if self.current_session_id() != Some(session_id) {
+            return;
+        }
         self.push_plain(format!("/rule: saved `{}`", rule.rule_id));
         if let Some(review) = self.rules_review.as_mut() {
             if let Some(existing) = review
@@ -190,24 +212,14 @@ impl App {
                     rule_id,
                 },
             )? {
-                cockpit_proto::Response::ConversationRulePromoted {
-                    target_path,
-                    report,
-                    ..
-                } => Ok(AsyncActionPayload::RulePromoted {
-                    target_path,
-                    report,
-                }),
+                cockpit_proto::Response::Ack => Ok(AsyncActionPayload::RulePromoteStarted),
                 other => Err(format!("unexpected promote-rule response: {other:?}")),
             },
         );
     }
 
-    pub(super) fn apply_rule_promoted(&mut self, target_path: String, report: String) {
-        self.push_plain(format!("/rules: promoted into {target_path}"));
-        if !report.trim().is_empty() {
-            self.push_plain(report);
-        }
+    pub(super) fn apply_rule_promote_started(&mut self) {
+        self.push_plain("/rules: promoting into instructions file…".to_string());
     }
 
     pub(super) fn close_rules_review(&mut self) {

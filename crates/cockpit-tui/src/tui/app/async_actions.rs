@@ -1806,22 +1806,25 @@ impl App {
                 Err(e) => self.push_plain(format!("/rules: {e}")),
             },
             AsyncActionKind::Internal("rules.set") => match result.payload {
-                Ok(AsyncActionPayload::RuleSet { rule }) => self.apply_rule_set(rule),
+                Ok(AsyncActionPayload::RuleSet { session_id, rule }) => {
+                    self.apply_rule_set(session_id, rule)
+                }
                 Ok(_) => self.push_plain("/rule: unexpected response".to_string()),
                 Err(e) => self.push_plain(format!("/rule: {e}")),
             },
             AsyncActionKind::Internal("rules.remove") => match result.payload {
-                Ok(AsyncActionPayload::RuleRemoved { rule_id, removed }) => {
-                    self.apply_rule_removed(rule_id, removed);
+                Ok(AsyncActionPayload::RuleRemoved {
+                    session_id,
+                    rule_id,
+                    removed,
+                }) => {
+                    self.apply_rule_removed(session_id, rule_id, removed);
                 }
                 Ok(_) => self.push_plain("/rules: unexpected response".to_string()),
                 Err(e) => self.push_plain(format!("/rules: {e}")),
             },
             AsyncActionKind::Internal("rules.promote") => match result.payload {
-                Ok(AsyncActionPayload::RulePromoted {
-                    target_path,
-                    report,
-                }) => self.apply_rule_promoted(target_path, report),
+                Ok(AsyncActionPayload::RulePromoteStarted) => self.apply_rule_promote_started(),
                 Ok(_) => self.push_plain("/rules: unexpected promote response".to_string()),
                 Err(e) => self.push_plain(format!("/rules: {e}")),
             },

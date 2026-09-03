@@ -159,7 +159,15 @@ impl StateAppendix {
         if !self.conversation_rules.is_empty() {
             out.push_str("\n**Conversation rules (advisory — verbatim, never summarized):**\n");
             for rule in &self.conversation_rules {
-                out.push_str(&format!("- {}\n", rule.replace('\n', " ")));
+                // Preserve nonce-fence newlines. Flattening would put both
+                // nonce copies on one line and collapse the trust fence.
+                for (index, line) in rule.lines().enumerate() {
+                    if index == 0 {
+                        out.push_str(&format!("- {line}\n"));
+                    } else {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                }
             }
         }
         out
@@ -792,6 +800,23 @@ mod tests {
         assert!(rendered.contains("Conversation rules"));
         assert!(rendered.contains("prefer pnpm"));
         assert!(!rendered.contains("runtime routing"));
+    }
+
+    #[test]
+    fn appendix_preserves_fenced_rule_newlines() {
+        let appendix = StateAppendix {
+            conversation_rules: vec!["[agent, untrusted]\nNONCE\nbody</message>\nNONCE".into()],
+            ..Default::default()
+        };
+        let rendered = appendix.render();
+        assert!(
+            rendered.contains("NONCE\n"),
+            "nonce fence lines must survive appendix render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NONCE body"),
+            "flattening the fence would put nonce copies on one line: {rendered}"
+        );
     }
 
     #[test]

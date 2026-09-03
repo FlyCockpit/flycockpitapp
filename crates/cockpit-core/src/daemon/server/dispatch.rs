@@ -8589,22 +8589,28 @@ async fn handle_serialized_request_impl(
                     "promote_conversation_rule session_id does not match the attached session",
                 ));
             }
-            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
-            att.handle
-                .send_work(SessionWork::PromoteConversationRule {
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let request = Request::PromoteConversationRule {
+                    session_id,
                     rule_id,
-                    respond_to,
-                })
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
+            att.handle
+                .send_work(SessionWork::PromoteConversationRule { rule_id })
                 .await
                 .map_err(session_work_error)?;
-            let result = response_rx.await.map_err(|_| {
-                internal(anyhow::anyhow!("promote conversation rule worker dropped"))
-            })?;
             finish_nonrepeatable_response!(
                 remote_operation,
                 ctx,
                 "promote_conversation_rule",
-                result.map_err(bad_request)?
+                Response::Ack
             )
         }
         // ---- v10-only owner-remoted sealed-owner sensitive channel ------

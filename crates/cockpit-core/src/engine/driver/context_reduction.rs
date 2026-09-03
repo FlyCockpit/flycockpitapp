@@ -186,6 +186,7 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
 pub(in crate::engine::driver) enum PrepareCompactionError {
     Budget(crate::engine::compact::CompactBudgetError),
     Draft(crate::engine::compact_draft::CompactDraftOutcome),
+    ConversationRules(String),
 }
 
 impl From<crate::engine::compact::CompactBudgetError> for PrepareCompactionError {
@@ -214,6 +215,9 @@ impl std::fmt::Display for PrepareCompactionError {
                 f.write_str("compact model returned an unusably short brief twice")
             }
             Self::Draft(O::Success(_)) => f.write_str("unexpected successful draft outcome"),
+            Self::ConversationRules(error) => {
+                write!(f, "listing conversation rules failed ({error})")
+            }
         }
     }
 }
@@ -1548,7 +1552,31 @@ impl Driver {
         &mut self,
         rule_id: uuid::Uuid,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> std::result::Result<crate::daemon::proto::Response, String> {
+    ) {
+        match self.promote_conversation_rule_inner(rule_id, tx).await {
+            Ok((target_path, report)) => {
+                let mut text = format!("/rules: promoted into {target_path}");
+                if !report.trim().is_empty() {
+                    text.push('\n');
+                    text.push_str(&report);
+                }
+                let _ = tx.send(TurnEvent::Notice { text }).await;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/rules: promote failed: {error}"),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn promote_conversation_rule_inner(
+        &mut self,
+        rule_id: uuid::Uuid,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(String, String), String> {
         let rule = crate::conversation_rules::load_rule_for_session(&self.session, rule_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -1558,7 +1586,7 @@ impl Driver {
         let target = crate::conversation_rules::resolve_instructions_target(&self.session)
             .await
             .map_err(|error| error.to_string())?;
-        let brief = crate::conversation_rules::promote_brief(&rule, &target);
+        let brief = crate::conversation_rules::promote_brief(&rule, &target, self.redact.as_ref());
         let mut args = self.spawn_args(false);
         args.write_scope = Some(target.write_scope.clone());
         args.delegated = true;
@@ -1585,12 +1613,7 @@ impl Driver {
         )
         .await
         .map_err(|error| error.to_string())?;
-        Ok(crate::daemon::proto::Response::ConversationRulePromoted {
-            rule_id,
-            target_path: target.path.display().to_string(),
-            write_scope: target.write_scope.display().to_string(),
-            report,
-        })
+        Ok((target.path.display().to_string(), report))
     }
 
     /// Compaction `preCompact` / `postCompact` hook contract (asymmetric BY
@@ -1788,12 +1811,21 @@ impl Driver {
             .await
             .unwrap_or_default();
         let pins = self.session.pinned_messages();
-        let conversation_rules = self
+        let conversation_rules = match self
             .session
             .db
             .list_active_conversation_rules(self.session.compaction_lineage_root())
             .await
-            .unwrap_or_default();
+        {
+            Ok(rules) => rules,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "conversation rules: listing active rules failed; aborting compact"
+                );
+                return Err(PrepareCompactionError::ConversationRules(error.to_string()));
+            }
+        };
         let active_goal = self
             .session
             .db
@@ -1815,8 +1847,10 @@ impl Driver {
                 )
             });
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
-        appendix.conversation_rules =
-            crate::conversation_rules::compact_appendix_lines(&conversation_rules);
+        appendix.conversation_rules = crate::conversation_rules::compact_appendix_lines(
+            &conversation_rules,
+            self.redact.as_ref(),
+        );
         if let Ok(overview) = self
             .session
             .db

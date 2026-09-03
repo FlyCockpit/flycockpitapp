@@ -3830,14 +3830,13 @@ async fn inject_volatile_context(
             .await;
     }
     if is_root {
-        let rules = session
+        let listing = session
             .db
             .list_active_conversation_rules(session.compaction_lineage_root())
-            .await
-            .unwrap_or_default();
-        crate::conversation_rules::inject_conversation_rules_into_history(
+            .await;
+        crate::conversation_rules::inject_conversation_rules_from_listing(
             history,
-            &rules,
+            listing,
             redact.as_ref(),
         );
     }

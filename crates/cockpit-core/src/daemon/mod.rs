@@ -188,6 +188,11 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
 /// policy differs.
 const DAEMON_LIFETIME_ENV: &str = "COCKPIT_DAEMON_LIFETIME";
 const EPHEMERAL_LIFETIME: &str = "ephemeral";
+/// Optional override for detached daemon spawn tests. Production callers use
+/// `current_exe()`; test builds also auto-discover
+/// [`sibling_daemon_spawn_harness_executable`].
+pub(crate) const DAEMON_SPAWN_EXECUTABLE_ENV: &str = "COCKPIT_DAEMON_SPAWN_EXECUTABLE";
+const DAEMON_SPAWN_HARNESS_BIN: &str = "cockpit-daemon-spawn-harness";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
@@ -1174,8 +1179,7 @@ pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeral
             };
         }
     };
-    let executable = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
+    let executable = resolve_daemon_spawn_executable()
         .context("capturing ephemeral child executable identity")?;
     let child = provisional.into_child()?;
     Ok(DetachedEphemeralChild {
@@ -1195,6 +1199,45 @@ fn spawn_detached_inner(
 }
 
 #[cfg(any(unix, windows))]
+fn canonicalize_spawn_executable(path: PathBuf) -> Result<PathBuf> {
+    if !path.is_file() {
+        anyhow::bail!(
+            "daemon spawn executable does not exist or is not a file: {}",
+            path.display()
+        );
+    }
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("canonicalizing daemon spawn executable {}", path.display()))
+}
+
+#[cfg(any(unix, windows))]
+fn resolve_daemon_spawn_executable() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var(DAEMON_SPAWN_EXECUTABLE_ENV) {
+        return canonicalize_spawn_executable(PathBuf::from(override_path));
+    }
+    #[cfg(test)]
+    if let Some(harness) = sibling_daemon_spawn_harness_executable() {
+        if harness.is_file() {
+            return canonicalize_spawn_executable(harness);
+        }
+    }
+    std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("locating daemon spawn executable")
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn sibling_daemon_spawn_harness_executable() -> Option<PathBuf> {
+    let test_exe = std::env::current_exe().ok()?;
+    let dir = test_exe.parent()?;
+    #[cfg(windows)]
+    let name = format!("{DAEMON_SPAWN_HARNESS_BIN}.exe");
+    #[cfg(not(windows))]
+    let name = DAEMON_SPAWN_HARNESS_BIN.to_string();
+    Some(dir.join(name))
+}
+
+#[cfg(any(unix, windows))]
 fn spawn_detached_child(
     ephemeral: Option<&DaemonPaths>,
     no_sandbox: bool,
@@ -1205,7 +1248,7 @@ fn spawn_detached_child(
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().context("locating own binary")?;
+    let exe = resolve_daemon_spawn_executable().context("locating daemon spawn executable")?;
     let mut command = Command::new(exe);
     command
         .arg("daemon")

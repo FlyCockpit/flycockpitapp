@@ -1820,7 +1820,7 @@ mod acp_wire_owner_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn acquire_acp_socket_daemon_spawns_wire_owner_when_absent() {
+    async fn acquire_acp_socket_daemon_spawns_ephemeral_wire_owner_when_absent() {
         let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let runtime = env.path().expect("isolated runtime root").join("runtime");
         env.set_var("XDG_RUNTIME_DIR", &runtime);
@@ -1833,7 +1833,7 @@ mod acp_wire_owner_tests {
 
         let client = acquire_acp_socket_daemon(false)
             .await
-            .expect("ACP must spawn a discoverable wire owner when none is running");
+            .expect("ACP must spawn a discoverable ephemeral wire owner when none is running");
         assert!(client.is_socket_backed());
         assert!(client.has_owner_capability());
         client
@@ -1849,6 +1849,50 @@ mod acp_wire_owner_tests {
         })
         .await
         .expect("spawned ephemeral wire owner must reap after the last ACP client disconnects");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_acp_socket_daemon_spawns_persistent_wire_owner_when_background_agents_enabled()
+    {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let runtime = env.path().expect("isolated runtime root").join("runtime");
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
+        assert!(
+            !paths.socket.exists() && !paths.pid_file.exists(),
+            "isolated home must not already host a daemon"
+        );
+
+        let client = acquire_acp_socket_daemon(true)
+            .await
+            .expect("ACP must spawn a discoverable persistent wire owner when none is running");
+        assert!(client.is_socket_backed());
+        assert!(client.has_owner_capability());
+        client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("spawned persistent wire owner answers DaemonStatus");
+
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            paths.socket.exists(),
+            "background_agents=true spawn must keep the wire owner after ACP disconnect"
+        );
+        assert!(
+            paths.pid_file.exists(),
+            "background_agents=true spawn must keep the pid receipt after ACP disconnect"
+        );
+
+        crate::daemon::stop(&paths).expect("stop spawned persistent wire owner");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while paths.socket.exists() || paths.pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stopped persistent wire owner must retire its metadata");
     }
 
     #[tokio::test(flavor = "current_thread")]

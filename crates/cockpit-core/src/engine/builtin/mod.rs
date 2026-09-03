@@ -7532,6 +7532,7 @@ pub(crate) mod tests {
 
         // CompactReady still carries a handoff string field (compaction).
         let compact_ready = TurnEvent::CompactReady {
+            predecessor_session_id: uuid::Uuid::nil(),
             new_session_id: uuid::Uuid::nil(),
             handoff: "brief".into(),
             brief: "brief body".into(),

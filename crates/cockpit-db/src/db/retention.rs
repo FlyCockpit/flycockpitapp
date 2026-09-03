@@ -31,6 +31,11 @@ pub struct RetentionConfig {
     /// Vacuum interval in days.
     #[serde(default = "default_retention_vacuum_interval_days")]
     pub vacuum_interval_days: u32,
+    /// Number of most-recent compaction windows in a lineage whose
+    /// transcripts stay verbatim. Older windows past the transcript
+    /// horizon may be rolled up. Zero means keep every window verbatim.
+    #[serde(default = "default_compaction_lineage_keep_windows")]
+    pub compaction_lineage_keep_windows: u32,
 }
 
 impl Default for RetentionConfig {
@@ -43,6 +48,7 @@ impl Default for RetentionConfig {
             sweep_interval_hours: default_retention_sweep_interval_hours(),
             vacuum_min_deletions: default_retention_vacuum_min_deletions(),
             vacuum_interval_days: default_retention_vacuum_interval_days(),
+            compaction_lineage_keep_windows: default_compaction_lineage_keep_windows(),
         }
     }
 }
@@ -73,6 +79,10 @@ fn default_retention_vacuum_min_deletions() -> u64 {
 
 fn default_retention_vacuum_interval_days() -> u32 {
     7
+}
+
+fn default_compaction_lineage_keep_windows() -> u32 {
+    3
 }
 
 /// `retention_meta` key for the last expiry pass's media-barrier skip count.
@@ -225,6 +235,7 @@ impl Db {
         transcript_cutoff_secs: i64,
         raw_wire_cutoff_secs: i64,
         terminal_evidence_cutoff_secs: i64,
+        compaction_lineage_keep_windows: u32,
     ) -> Result<(u64, u64, u64)> {
         if transcript_cutoff_secs <= 0
             && raw_wire_cutoff_secs <= 0
@@ -238,6 +249,7 @@ impl Db {
                 transcript_cutoff_secs,
                 raw_wire_cutoff_secs,
                 terminal_evidence_cutoff_secs,
+                compaction_lineage_keep_windows,
             )
         })
         .await
@@ -359,7 +371,12 @@ impl Db {
         let terminal_evidence_cutoff =
             retention_cutoff(now_secs, cfg.terminal_evidence_window_days);
         let (transcripts, raw_wire, terminal_evidence) = self
-            .prune_session_payloads(transcript_cutoff, raw_wire_cutoff, terminal_evidence_cutoff)
+            .prune_session_payloads(
+                transcript_cutoff,
+                raw_wire_cutoff,
+                terminal_evidence_cutoff,
+                cfg.compaction_lineage_keep_windows,
+            )
             .await?;
         outcome.transcript_rows_deleted = transcripts;
         outcome.raw_wire_rows_deleted_or_redacted = raw_wire;
@@ -467,6 +484,7 @@ fn prune_session_payloads_conn(
     transcript_cutoff_secs: i64,
     raw_wire_cutoff_secs: i64,
     terminal_evidence_cutoff_secs: i64,
+    compaction_lineage_keep_windows: u32,
 ) -> Result<(u64, u64, u64)> {
     let tx = conn
         .unchecked_transaction()
@@ -485,8 +503,38 @@ fn prune_session_payloads_conn(
     )";
     let mut transcripts = 0_u64;
     if transcript_cutoff_secs > 0 {
+        let recent_windows = if compaction_lineage_keep_windows == 0 {
+            String::new()
+        } else {
+            format!(
+                "AND (
+                     SELECT COUNT(*) FROM sessions newer
+                      WHERE COALESCE(newer.compaction_lineage_root_id, newer.session_id)
+                          = COALESCE(
+                                (SELECT COALESCE(compaction_lineage_root_id, session_id)
+                                   FROM sessions owner
+                                  WHERE owner.session_id = session_events.session_id),
+                                session_events.session_id
+                            )
+                        AND (
+                            newer.started_at_unix_ms > (
+                                SELECT started_at_unix_ms FROM sessions owner
+                                 WHERE owner.session_id = session_events.session_id
+                            )
+                            OR (
+                                newer.started_at_unix_ms = (
+                                    SELECT started_at_unix_ms FROM sessions owner
+                                     WHERE owner.session_id = session_events.session_id
+                                )
+                                AND newer.session_id >= session_events.session_id
+                            )
+                        )
+                 ) > {compaction_lineage_keep_windows}"
+            )
+        };
         let predicate = format!(
             "ts_ms < ?1 AND {closed}
+             {recent_windows}
              AND NOT EXISTS (
                  SELECT 1 FROM sessions child
                   WHERE child.parent_session_id=session_events.session_id
@@ -587,36 +635,19 @@ fn count_delete_candidates(
 
 fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
     let cutoff_unix_ms = cutoff_secs.saturating_mul(1000);
+    // Candidate conversation roots only. Liveness and pin guards must use
+    // the same cascade as `collect_subtree` / `delete_session_conn` so a
+    // fork's own compaction windows cannot be deleted while still live or
+    // pinned.
     let mut stmt = conn
         .prepare(
             "SELECT root.session_id
                FROM sessions root
               WHERE root.parent_session_id IS NULL
+                AND root.compaction_predecessor_session_id IS NULL
                 AND root.ended_at_unix_ms IS NOT NULL
                 AND root.ephemeral = 0
-                AND root.last_active_at_unix_ms < ?1
-                AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id, ended_at_unix_ms, last_active_at_unix_ms) AS (
-                        SELECT session_id, ended_at_unix_ms, last_active_at_unix_ms
-                          FROM sessions WHERE session_id = root.session_id
-                        UNION ALL
-                        SELECT child.session_id, child.ended_at_unix_ms, child.last_active_at_unix_ms
-                          FROM sessions child
-                          JOIN subtree parent ON child.parent_session_id = parent.session_id
-                    )
-                    SELECT 1 FROM subtree
-                     WHERE ended_at_unix_ms IS NULL OR last_active_at_unix_ms >= ?1
-                )
-                AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id) AS (
-                        SELECT session_id FROM sessions WHERE session_id = root.session_id
-                        UNION ALL
-                        SELECT child.session_id
-                          FROM sessions child
-                          JOIN subtree parent ON child.parent_session_id = parent.session_id
-                    )
-                    SELECT 1 FROM pins JOIN subtree USING (session_id)
-                )",
+                AND root.last_active_at_unix_ms < ?1",
         )
         .context("preparing old session roots")?;
     let rows = stmt
@@ -627,9 +658,50 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
         .context("querying old session roots")?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.context("decoding old session root")?);
+        let root = row.context("decoding old session root")?;
+        let subtree = crate::db::sessions::collect_subtree(conn, root)?;
+        if subtree_blocks_expiry(conn, &subtree, cutoff_unix_ms)? {
+            continue;
+        }
+        out.push(root);
     }
     Ok(out)
+}
+
+/// True when any member of the delete set is still open, recently active, or
+/// pinned. Uses the same id set `expire_old_sessions_conn` will pass to
+/// `delete_session_conn`.
+fn subtree_blocks_expiry(conn: &Connection, subtree: &[Uuid], cutoff_unix_ms: i64) -> Result<bool> {
+    for session_id in subtree {
+        let id = session_id.to_string();
+        let Some((ended_at_unix_ms, last_active_at_unix_ms)): Option<(Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT ended_at_unix_ms, last_active_at_unix_ms
+                   FROM sessions
+                  WHERE session_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("loading retention-guard session row")?
+        else {
+            continue;
+        };
+        if ended_at_unix_ms.is_none() || last_active_at_unix_ms >= cutoff_unix_ms {
+            return Ok(true);
+        }
+        let pinned: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pins WHERE session_id = ?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .context("checking retention-guard pin")?;
+        if pinned != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<SessionExpiryOutcome> {
@@ -638,23 +710,10 @@ fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<Sessi
     let mut cascade_rows_deleted = 0_u64;
     let mut sessions_expiry_skipped_media_barrier = 0_u64;
     for root in roots {
-        // Count the complete logical session cascade before deleting its root.
-        // `DELETE FROM sessions` reports only the root through `changes()`;
-        // descendant forks are removed by the self-FK cascade.
-        let subtree_rows: i64 = conn.query_row(
-            "WITH RECURSIVE subtree(session_id) AS (
-                 SELECT session_id FROM sessions WHERE session_id=?1
-                 UNION ALL
-                 SELECT child.session_id
-                   FROM sessions child
-                   JOIN subtree parent ON child.parent_session_id=parent.session_id
-             )
-             SELECT COUNT(*) FROM subtree",
-            [root.to_string()],
-            |row| row.get(0),
-        )?;
-        let subtree_rows =
-            u64::try_from(subtree_rows).context("negative session retention subtree row count")?;
+        // Count the complete logical session cascade before deleting its root,
+        // including compaction lineage windows and fork descendants.
+        let subtree_rows = u64::try_from(crate::db::sessions::collect_subtree(conn, root)?.len())
+            .context("session retention subtree row count exceeds u64")?;
         match crate::db::sessions::delete_session_conn(conn, root) {
             Ok(cascade_rows) => {
                 removed = removed.saturating_add(subtree_rows);
@@ -849,7 +908,7 @@ mod tests {
         insert_payload_rows(&db, open.session_id, "open", 10).await;
 
         assert_eq!(
-            db.prune_session_payloads(20, 20, 20).await.unwrap(),
+            db.prune_session_payloads(20, 20, 20, 0).await.unwrap(),
             (1, 2, 1)
         );
 
@@ -891,7 +950,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = db.prune_session_payloads(20, 20, 20).await.unwrap_err();
+        let err = db.prune_session_payloads(20, 20, 20, 0).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected payload prune failure"),
@@ -918,7 +977,7 @@ mod tests {
         insert_payload_rows(&db, old.session_id, "old", 99).await;
 
         assert_eq!(
-            db.prune_session_payloads(100, 100, 100).await.unwrap(),
+            db.prune_session_payloads(100, 100, 100, 0).await.unwrap(),
             (1, 2, 1)
         );
 
@@ -944,7 +1003,7 @@ mod tests {
         close_session(&db, s.session_id, 10).await;
         insert_payload_rows(&db, s.session_id, "closed", 10).await;
 
-        db.prune_session_payloads(20, 20, 20).await.unwrap();
+        db.prune_session_payloads(20, 20, 20, 0).await.unwrap();
 
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
@@ -975,7 +1034,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.prune_session_payloads(0, 20, 0).await.unwrap(),
+            db.prune_session_payloads(0, 20, 0, 0).await.unwrap(),
             (0, 6, 0)
         );
         assert_eq!(
@@ -1027,6 +1086,121 @@ mod tests {
         assert!(db.get_session(child.session_id).await.unwrap().is_none());
         assert!(
             db.get_session(grandchild.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_compacted_predecessor_while_successor_is_live() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/x", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        close_session(&db, window1.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(window1.session_id).await.unwrap().is_some());
+        assert!(db.get_session(window2.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn session_age_out_removes_an_idle_compaction_lineage_together() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/x", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        close_session(&db, window1.session_id, 10).await;
+        close_session(&db, window2.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 2);
+        assert!(db.get_session(window1.session_id).await.unwrap().is_none());
+        assert!(db.get_session(window2.session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_live_compaction_window_of_a_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(fork_window2.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_pinned_compaction_window_of_a_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+        close_session(&db, fork_window2.session_id, 10).await;
+        let successor_id = fork_window2.session_id;
+        let seq = db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                     VALUES (?1, 1, 'user_message', '{}')",
+                    params![successor_id.to_string()],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        assert!(db.pin_message(fork_window2.session_id, seq).await.unwrap());
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(fork_window2.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_removes_an_idle_fork_compaction_lineage_together() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+        close_session(&db, fork_window2.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 3);
+        assert!(db.get_session(root.session_id).await.unwrap().is_none());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_none());
+        assert!(
+            db.get_session(fork_window2.session_id)
                 .await
                 .unwrap()
                 .is_none()

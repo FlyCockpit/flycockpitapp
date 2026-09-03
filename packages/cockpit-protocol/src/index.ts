@@ -1079,6 +1079,7 @@ const requestParamSchemas = {
       project_id: z.string().nullable().optional(),
       parent_session_id: optionalUuidSchema,
       assistant_id: z.string().nullable().optional(),
+      compaction_lineage_root_id: optionalUuidSchema,
     })
     .strict(),
   read_history_page: z
@@ -3120,6 +3121,9 @@ export const sessionSummarySchema = z
     is_assistant_thread: z.boolean(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
+    compaction_predecessor_session_id: optionalUuidSchema,
+    compaction_lineage_root_id: optionalUuidSchema,
+    lineage_window_count: safeU64NumberSchema.optional(),
   })
   .passthrough();
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;

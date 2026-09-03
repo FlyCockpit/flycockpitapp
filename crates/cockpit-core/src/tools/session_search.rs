@@ -74,7 +74,11 @@ enum HistorySearchScope {
 
 impl HistorySearchScope {
     fn parse(args: &Value) -> Result<Self> {
-        match args.get("scope").and_then(Value::as_str).unwrap_or("past") {
+        Self::parse_with_default(args, "lineage")
+    }
+
+    fn parse_with_default(args: &Value, default: &'static str) -> Result<Self> {
+        match args.get("scope").and_then(Value::as_str).unwrap_or(default) {
             "past" => Ok(Self::Past),
             "lineage" => Ok(Self::Lineage),
             "current-artifacts" => Ok(Self::CurrentArtifacts),
@@ -105,8 +109,8 @@ impl Tool for HistorySearchTool {
         Some(
             "Search your earlier conversations (past sessions) by keyword and get back the most \
              relevant history, each with a bounded FTS snippet and a `cockpit://` target. Choose \
-             `past` for earlier sessions in this workspace, `lineage` for compaction predecessors \
-             plus the current session, `current-artifacts` for the current session's text artifacts, \
+             `lineage` (default) for this conversation's compaction windows, `past` to widen to \
+             earlier sessions in this workspace, `current-artifacts` for the current session's text artifacts, \
              or `all-projects` for consent-permitted cross-workspace recall. Choose `threads` to \
              list your assistant threads by recency, or search them by keyword. Read one returned \
              pseudofile for details; this tool never recursively scans transcripts. Narrow large \
@@ -120,7 +124,7 @@ impl Tool for HistorySearchTool {
             "type": "object",
             "properties": {
                 "query":      { "type": "string", "description": "FTS keyword search text" },
-                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects", "threads"], "description": "Recall area (default `past`); `threads` may omit query to list by recency" },
+                "scope": { "type": "string", "enum": ["past", "lineage", "current-artifacts", "all-projects", "threads"], "description": "Recall area (default `lineage`); `threads` may omit query to list by recency" },
                 "limit":      { "type": "integer", "description": "Max threads (default 10, max 50)" },
                 "since":      { "type": "string", "description": "RFC3339/`YYYY-MM-DD` lower bound on last activity; applies to past scopes" },
                 "include_tool_events": { "type": "boolean", "description": "For `lineage`, also scan bounded tool-event JSON" }
@@ -144,9 +148,8 @@ impl Tool for HistorySearchTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let scope = HistorySearchScope::parse(&args)?;
         crate::tools::history_scope::require_recall_permission(ctx)?;
-        crate::tools::history_scope::require_session_access(ctx, ctx.session.id).await?;
+        crate::tools::history_scope::require_session_access(ctx, ctx.session.live_id()).await?;
         // Keep consent stable across discovery, target-redaction union, and
         // output construction. Revocations acquire the exclusive side first.
         let _disclosure_permit = ctx.session.db.history_scope_disclosure_permit().await;
@@ -156,6 +159,15 @@ impl Tool for HistorySearchTool {
             .await
             .map_err(|e| crate::engine::tool::invalid_input(format!("{e:#}")))?;
 
+        let dream_scope = established_dream_read_scope(ctx)?;
+        let scope = HistorySearchScope::parse_with_default(
+            &args,
+            if dream_scope.is_some() {
+                "past"
+            } else {
+                "lineage"
+            },
+        )?;
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -165,7 +177,6 @@ impl Tool for HistorySearchTool {
             return Err(invalid_input("`query` is required outside `threads` scope"));
         }
 
-        let dream_scope = established_dream_read_scope(ctx)?;
         ensure!(
             dream_scope.is_none() || scope == HistorySearchScope::Past,
             "history_search denied: knowledge dreams may only search attached source sessions"
@@ -188,7 +199,7 @@ impl Tool for HistorySearchTool {
                 let session = ctx
                     .session
                     .db
-                    .get_session(ctx.session.id)
+                    .get_session(ctx.session.live_id())
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?
                     .ok_or_else(|| invalid_input("current session no longer exists"))?;
@@ -228,7 +239,7 @@ impl Tool for HistorySearchTool {
                     .db
                     .search_current_artifact_candidates_for_trust(
                         query,
-                        ctx.session.id,
+                        ctx.session.live_id(),
                         limit,
                         trust,
                     )
@@ -242,7 +253,7 @@ impl Tool for HistorySearchTool {
                 let mut out = format!("Current artifact matches for `{query}`:\n");
                 for hit in hits {
                     let snippet =
-                        redact_target_text(ctx, ctx.session.id, hit.snippet.trim()).await?;
+                        redact_target_text(ctx, ctx.session.live_id(), hit.snippet.trim()).await?;
                     out.push_str(&format!(
                         "cockpit://session/{}/artifacts/{}\n    {}\n",
                         ctx.session.short_id(),
@@ -257,7 +268,7 @@ impl Tool for HistorySearchTool {
                 let lineage = ctx
                     .session
                     .db
-                    .compaction_lineage_sessions(ctx.session.id)
+                    .compaction_lineage_sessions(ctx.session.live_id())
                     .await
                     .map_err(|e| anyhow::anyhow!("history_search: {e:#}"))?;
                 let hits = ctx
@@ -308,7 +319,7 @@ impl Tool for HistorySearchTool {
                         .search_candidates_in_sessions_for_trust(
                             query,
                             &session_ids,
-                            Some(ctx.session.id),
+                            Some(ctx.session.live_id()),
                             since,
                             limit,
                             trust,
@@ -325,7 +336,7 @@ impl Tool for HistorySearchTool {
                             .search_permitted_candidates_for_trust(
                                 query,
                                 &ctx.session.project_id,
-                                Some(ctx.session.id),
+                                Some(ctx.session.live_id()),
                                 since,
                                 limit,
                                 trust,
@@ -337,7 +348,7 @@ impl Tool for HistorySearchTool {
                             .search_candidates_for_trust(
                                 query,
                                 project_id,
-                                Some(ctx.session.id),
+                                Some(ctx.session.live_id()),
                                 since,
                                 limit,
                                 trust,
@@ -976,7 +987,7 @@ mod tests {
         );
         assert_eq!(
             HistorySearchScope::parse(&json!({})).unwrap(),
-            HistorySearchScope::Past
+            HistorySearchScope::Lineage
         );
         assert_eq!(
             HistorySearchScope::parse(&json!({ "scope": "threads" })).unwrap(),

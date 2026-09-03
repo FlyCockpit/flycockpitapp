@@ -317,6 +317,11 @@ pub struct ImageGenerationClockContext {
 struct WorkerState {
     live: HashMap<Uuid, WorkerEntry>,
     starting: HashMap<Uuid, Arc<StartSlot>>,
+    /// Successor id → current live map key of the worker being rekeyed.
+    /// Occupied before the successor row commits so `claim_attach` joins the
+    /// existing worker instead of spawning a second one on a published,
+    /// worker-less id.
+    rekeying: HashMap<Uuid, Uuid>,
     next_generation: WorkerGeneration,
 }
 
@@ -445,7 +450,6 @@ enum AttachClaim {
 /// generation before it can reactivate released locks.
 pub(crate) struct LiveAttachClaim {
     inner: Weak<Inner>,
-    session_id: Uuid,
     generation: WorkerGeneration,
     handle: SessionWorkerHandle,
     session_entry_mode: crate::daemon::proto::SessionEntryMode,
@@ -461,7 +465,12 @@ impl Drop for LiveAttachClaim {
         };
         let should_forget = {
             let mut workers = crate::sync::lock_or_recover(&inner.workers);
-            let Some(entry) = workers.live.get_mut(&self.session_id) else {
+            let Some(key) = live_map_key_for_generation(&workers, self.generation)
+                .or_else(|| live_map_key_for_handle(&workers, &self.handle))
+            else {
+                return;
+            };
+            let Some(entry) = workers.live.get_mut(&key) else {
                 return;
             };
             if entry.generation != self.generation {
@@ -474,7 +483,7 @@ impl Drop for LiveAttachClaim {
                     || entry.terminal_cleanup_complete.load(Ordering::Acquire))
         };
         if should_forget {
-            forget_generation_from_inner(&inner, self.session_id, self.generation);
+            forget_generation_from_inner(&inner, self.handle.session_id(), self.generation);
         }
     }
 }
@@ -640,21 +649,81 @@ fn next_generation(state: &mut WorkerState) -> WorkerGeneration {
     state.next_generation
 }
 
+fn live_map_key_for_generation(
+    workers: &WorkerState,
+    generation: WorkerGeneration,
+) -> Option<Uuid> {
+    workers
+        .live
+        .iter()
+        .find(|(_, entry)| entry.generation == generation)
+        .map(|(id, _)| *id)
+}
+
+fn live_map_key_for_session_id(workers: &WorkerState, session_id: Uuid) -> Option<Uuid> {
+    if workers.live.contains_key(&session_id) {
+        return Some(session_id);
+    }
+    workers
+        .rekeying
+        .get(&session_id)
+        .copied()
+        .filter(|from| workers.live.contains_key(from))
+}
+
+fn live_map_key_for_handle(workers: &WorkerState, handle: &SessionWorkerHandle) -> Option<Uuid> {
+    let live = handle.session_id();
+    if workers
+        .live
+        .get(&live)
+        .is_some_and(|entry| entry.handle.same_worker_as(handle))
+    {
+        return Some(live);
+    }
+    let spawn = handle.worker_session_id();
+    if workers
+        .live
+        .get(&spawn)
+        .is_some_and(|entry| entry.handle.same_worker_as(handle))
+    {
+        return Some(spawn);
+    }
+    workers
+        .live
+        .iter()
+        .find(|(_, entry)| entry.handle.same_worker_as(handle))
+        .map(|(id, _)| *id)
+}
+
+fn join_map_key_for_generation(
+    joins: &HashMap<Uuid, WorkerJoin>,
+    generation: WorkerGeneration,
+) -> Option<Uuid> {
+    joins
+        .iter()
+        .find(|(_, entry)| entry.generation == generation)
+        .map(|(id, _)| *id)
+}
+
 fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: WorkerGeneration) {
     let retained_by_activation = {
         let mut workers = crate::sync::lock_or_recover(&inner.workers);
-        if workers.live.get(&session_id).is_some_and(|entry| {
+        let key = live_map_key_for_generation(&workers, generation).unwrap_or(session_id);
+        workers
+            .rekeying
+            .retain(|to, from| *from != key && *to != key);
+        if workers.live.get(&key).is_some_and(|entry| {
             entry.generation == generation
                 && entry.activation_leases == 0
                 && (!entry.terminal_closing.load(Ordering::Acquire)
                     || entry.terminal_cleanup_complete.load(Ordering::Acquire))
         }) {
-            workers.live.remove(&session_id);
+            workers.live.remove(&key);
             false
         } else {
             workers
                 .live
-                .get(&session_id)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation)
         }
     };
@@ -662,18 +731,26 @@ fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: Wor
         return;
     }
     let mut joins = crate::sync::lock_or_recover(&inner.worker_joins);
+    let key = join_map_key_for_generation(&joins, generation).unwrap_or(session_id);
     if joins
-        .get(&session_id)
+        .get(&key)
         .is_some_and(|entry| entry.generation == generation)
     {
-        joins.remove(&session_id);
+        joins.remove(&key);
     }
 }
 
-fn cleanup_worker_on_exit(inner: Weak<Inner>, session_id: Uuid, generation: WorkerGeneration) {
+fn cleanup_worker_on_exit(
+    inner: Weak<Inner>,
+    spawn_session_id: Uuid,
+    live_session_id: Uuid,
+    generation: WorkerGeneration,
+) {
     if let Some(inner) = inner.upgrade() {
-        inner.image_generation_dispatch_registry.remove(session_id);
-        forget_generation_from_inner(&inner, session_id, generation);
+        inner
+            .image_generation_dispatch_registry
+            .remove(spawn_session_id);
+        forget_generation_from_inner(&inner, live_session_id, generation);
     }
 }
 
@@ -711,6 +788,7 @@ impl SessionRegistry {
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
                     starting: HashMap::new(),
+                    rekeying: HashMap::new(),
                     next_generation: 0,
                 }),
                 worker_publication: Arc::new(AsyncMutex::new(())),
@@ -1123,17 +1201,9 @@ impl SessionRegistry {
         );
         let keep_warm_job = crate::keep_warm::parse_job_id(&job.id)?;
 
-        let handle = self
-            .attach_existing(
-                keep_warm_job.session_id,
-                None,
-                false,
-                None,
-                crate::env_snapshot::EnvSnapshot::from_process(
-                    crate::daemon::proto::EnvSnapshotSource::DaemonStart,
-                ),
-            )
-            .await?;
+        let Some(handle) = self.live_keep_warm_handle(keep_warm_job.session_id).await? else {
+            return Ok("keep-warm skipped: no live worker".to_string());
+        };
         // `ProductionJobExecutor` cancels this future when its callback
         // deadline expires. The guard propagates that cancellation into the
         // delivered driver control so no paid refresh outlives the callback.
@@ -1425,7 +1495,10 @@ impl SessionRegistry {
     ) -> Result<Option<LiveAttachClaim>> {
         let claim = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
-            let Some(entry) = workers.live.get_mut(&session_id) else {
+            let Some(key) = live_map_key_for_session_id(&workers, session_id) else {
+                return Ok(None);
+            };
+            let Some(entry) = workers.live.get_mut(&key) else {
                 return Ok(None);
             };
             if entry.handle.is_closed() {
@@ -1434,7 +1507,6 @@ impl SessionRegistry {
             entry.activation_leases = entry.activation_leases.saturating_add(1);
             LiveAttachClaim {
                 inner: Arc::downgrade(&self.inner),
-                session_id,
                 generation: entry.generation,
                 session_entry_mode: entry.handle.session_entry_mode(),
                 project_root: entry.handle.project_root(),
@@ -1475,11 +1547,20 @@ impl SessionRegistry {
         if !self.live_claim_is_current(&claim) {
             return Ok(None);
         }
+        let spawn_id = claim.handle.worker_session_id();
+        let live_id = claim.handle.session_id();
         self.inner
             .locks
-            .resume_session(claim.session_id)
+            .resume_session(spawn_id)
             .await
             .context("re-acquiring session locks on generation-bound reattach")?;
+        if live_id != spawn_id {
+            self.inner
+                .locks
+                .resume_session(live_id)
+                .await
+                .context("re-acquiring live-window session locks on generation-bound reattach")?;
+        }
         if !self.live_claim_is_current(&claim) {
             return Ok(None);
         }
@@ -1494,22 +1575,36 @@ impl SessionRegistry {
         // single cleanup authority; abandoning it while its blocking session
         // end continues would permit a retry to overlap the same stores.
         let _gate = claim.terminal_lock_cleanup_gate.lock().await;
-        let needs_cleanup = crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&claim.session_id)
-            .is_some_and(|entry| {
+        let needs_cleanup = {
+            let workers = crate::sync::lock_or_recover(&self.inner.workers);
+            let Some(key) = live_map_key_for_generation(&workers, claim.generation)
+                .or_else(|| live_map_key_for_handle(&workers, &claim.handle))
+            else {
+                return Err(SessionTerminalCleanupRetry.into());
+            };
+            workers.live.get(&key).is_some_and(|entry| {
                 entry.generation == claim.generation
                     && entry.terminal_closing.load(Ordering::Acquire)
                     && !entry.terminal_cleanup_complete.load(Ordering::Acquire)
-            });
+            })
+        };
         if !needs_cleanup {
             return Err(SessionTerminalCleanupRetry.into());
         }
+        let session = claim.handle.session();
         self.inner
             .locks
-            .end_session(claim.session_id)
+            .end_session(session.id)
             .await
             .context("retrying generation-bound terminal session lock cleanup")?;
+        let live_id = session.live_id();
+        if live_id != session.id {
+            self.inner
+                .locks
+                .end_session(live_id)
+                .await
+                .context("retrying generation-bound terminal live-window lock cleanup")?;
+        }
         claim
             .handle
             .end_session_for_terminal_cleanup()
@@ -1985,22 +2080,100 @@ impl SessionRegistry {
         self.lookup_entry(session_id).map(|(_, handle)| handle)
     }
 
+    /// Occupy `to` as this worker's successor before the successor row is
+    /// committed. `claim_attach(to)` joins the existing worker until
+    /// [`Self::rekey_live_worker`] consumes the reservation.
+    pub fn begin_compaction_rekey(&self, from: Uuid, to: Uuid) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        anyhow::ensure!(
+            workers.live.contains_key(&from),
+            "compaction predecessor {from} has no live worker"
+        );
+        anyhow::ensure!(
+            !workers.live.contains_key(&to)
+                && !workers.starting.contains_key(&to)
+                && !workers.rekeying.contains_key(&to),
+            "compaction successor {to} already has a live, starting, or rekeying worker"
+        );
+        workers.rekeying.insert(to, from);
+        Ok(())
+    }
+
+    /// Drop a successor reservation after a failed seed. Idempotent if the
+    /// reservation was already consumed by [`Self::rekey_live_worker`].
+    pub fn abort_compaction_rekey(&self, from: Uuid, to: Uuid) {
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        if workers.rekeying.get(&to).copied() == Some(from) {
+            workers.rekeying.remove(&to);
+        }
+    }
+
+    /// Move a live worker from `from` to `to` after compaction seeds a
+    /// successor window. Lookups, drain, and join tracking follow the new id.
+    pub fn rekey_live_worker(&self, from: Uuid, to: Uuid) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        if let Some(reserved_from) = workers.rekeying.get(&to).copied() {
+            anyhow::ensure!(
+                reserved_from == from,
+                "compaction successor {to} is reserved for {reserved_from}, not {from}"
+            );
+        }
+        anyhow::ensure!(
+            !workers.starting.contains_key(&to),
+            "compaction successor {to} already has a starting worker"
+        );
+        if workers.live.contains_key(&to) {
+            let same_worker = workers.live.get(&to).is_some_and(|entry| {
+                entry.handle.worker_session_id() == from || entry.handle.session_id() == from
+            });
+            anyhow::ensure!(
+                same_worker,
+                "compaction successor {to} already has a live or starting worker"
+            );
+            workers.live.remove(&from);
+        } else {
+            let Some(entry) = workers.live.remove(&from) else {
+                workers.rekeying.remove(&to);
+                return Ok(());
+            };
+            workers.live.insert(to, entry);
+        }
+        workers.rekeying.remove(&to);
+        drop(workers);
+        let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
+        if let Some(join) = joins.remove(&from) {
+            joins.insert(to, join);
+        }
+        Ok(())
+    }
+
     fn lookup_entry(&self, session_id: Uuid) -> Option<(WorkerGeneration, SessionWorkerHandle)> {
-        crate::sync::lock_or_recover(&self.inner.workers)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers
             .live
-            .get(&session_id)
+            .get(&key)
             .map(|entry| (entry.generation, entry.handle.clone()))
     }
 
     fn live_claim_is_current(&self, claim: &LiveAttachClaim) -> bool {
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&claim.session_id)
-            .is_some_and(|entry| {
-                entry.generation == claim.generation
-                    && !entry.handle.is_closed()
-                    && !entry.terminal_closing.load(Ordering::Acquire)
-            })
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let Some(key) = live_map_key_for_generation(&workers, claim.generation)
+            .or_else(|| live_map_key_for_handle(&workers, &claim.handle))
+        else {
+            return false;
+        };
+        workers.live.get(&key).is_some_and(|entry| {
+            entry.generation == claim.generation
+                && !entry.handle.is_closed()
+                && !entry.terminal_closing.load(Ordering::Acquire)
+        })
     }
 
     /// Lease one exact already-published worker generation. This is used by
@@ -2020,7 +2193,6 @@ impl SessionRegistry {
         entry.activation_leases = entry.activation_leases.saturating_add(1);
         Some(LiveAttachClaim {
             inner: Arc::downgrade(&self.inner),
-            session_id,
             generation,
             session_entry_mode: entry.handle.session_entry_mode(),
             project_root: entry.handle.project_root(),
@@ -2032,12 +2204,12 @@ impl SessionRegistry {
 
     fn claim_attach(&self, session_id: Uuid) -> AttachClaim {
         let mut state = crate::sync::lock_or_recover(&self.inner.workers);
-        let closed_generation = if let Some(entry) = state.live.get_mut(&session_id) {
+        let resolved_id = live_map_key_for_session_id(&state, session_id).unwrap_or(session_id);
+        let closed_generation = if let Some(entry) = state.live.get_mut(&resolved_id) {
             if !entry.handle.is_closed() {
                 entry.activation_leases = entry.activation_leases.saturating_add(1);
                 return AttachClaim::Live(LiveAttachClaim {
                     inner: Arc::downgrade(&self.inner),
-                    session_id,
                     generation: entry.generation,
                     session_entry_mode: entry.handle.session_entry_mode(),
                     project_root: entry.handle.project_root(),
@@ -2052,7 +2224,6 @@ impl SessionRegistry {
                 entry.activation_leases = entry.activation_leases.saturating_add(1);
                 return AttachClaim::CleanupRequired(LiveAttachClaim {
                     inner: Arc::downgrade(&self.inner),
-                    session_id,
                     generation: entry.generation,
                     session_entry_mode: entry.handle.session_entry_mode(),
                     project_root: entry.handle.project_root(),
@@ -2069,14 +2240,20 @@ impl SessionRegistry {
             None
         };
         if let Some(generation) = closed_generation {
-            state.live.remove(&session_id);
+            state.live.remove(&resolved_id);
+            state
+                .rekeying
+                .retain(|to, from| *from != resolved_id && *to != resolved_id);
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
             if joins
-                .get(&session_id)
+                .get(&resolved_id)
                 .is_some_and(|join| join.generation == generation)
             {
-                joins.remove(&session_id);
+                joins.remove(&resolved_id);
             }
+        }
+        if state.rekeying.contains_key(&session_id) {
+            return AttachClaim::Activating;
         }
         if let Some(slot) = state.starting.get(&session_id) {
             return AttachClaim::Starting(slot.clone());
@@ -2277,8 +2454,15 @@ impl SessionRegistry {
         session.set_process_containment(self.process_containment());
         let session = Arc::new(session);
         let cleanup_inner = Arc::downgrade(&self.inner);
-        let cleanup =
-            Box::new(move || cleanup_worker_on_exit(cleanup_inner, session_id, generation));
+        let cleanup_session = session.clone();
+        let cleanup = Box::new(move || {
+            cleanup_worker_on_exit(
+                cleanup_inner,
+                cleanup_session.id,
+                cleanup_session.live_id(),
+                generation,
+            )
+        });
         let daemon_no_sandbox =
             session_worker::daemon_no_sandbox().context("reading COCKPIT_DAEMON_NO_SANDBOX")?;
         if let Some(staged_recovery) = staged_recovery {
@@ -2365,6 +2549,42 @@ impl SessionRegistry {
                     terminal_cleanup_complete,
                 },
             );
+        let registry = self.clone();
+        handle
+            .session()
+            .set_compaction_successor_begin_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.begin_compaction_rekey(from, to)
+            }));
+        handle
+            .session()
+            .set_compaction_successor_abort_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.abort_compaction_rekey(from, to)
+            }));
+        handle.session().set_compaction_successor_hook(Arc::new(move |from, to| {
+            if let Err(error) = registry.rekey_live_worker(from, to) {
+                tracing::warn!(
+                    error = %error,
+                    %from,
+                    %to,
+                    "compaction successor rekey failed; live worker may be unreachable under the new session id"
+                );
+            }
+            if let (Some(scheduler), Ok(runtime)) =
+                (registry.scheduler(), tokio::runtime::Handle::try_current())
+            {
+                runtime.spawn(async move {
+                    if let Err(error) = scheduler.cancel_keep_warm_jobs_for_session(from).await {
+                        tracing::warn!(
+                            error = %error,
+                            %from,
+                            "cancelling predecessor keep-warm jobs after compaction failed"
+                        );
+                    }
+                });
+            }
+        }));
         let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
             self.inner.db.clone(),
             self.inner.config_source.clone(),
@@ -2535,10 +2755,13 @@ impl SessionRegistry {
             if *d == ShutdownDispatch::Wedged {
                 any_wedged = true;
                 tracing::warn!(
-                    session_id = %h.session_id,
+                    session_id = %h.session_id(),
                     "daemon drain: worker did not accept shutdown within deadline (wedged queue); forcing abort"
                 );
-                if let Some(ah) = abort_handles_by_id.get(&h.session_id) {
+                if let Some(ah) = abort_handles_by_id
+                    .get(&h.session_id())
+                    .or_else(|| abort_handles_by_id.get(&h.worker_session_id()))
+                {
                     ah.abort();
                 }
             }
@@ -2649,7 +2872,7 @@ impl SessionRegistry {
             .inner
             .db
             .raise_interrupted_turn(
-                handle.session_id,
+                handle.session_id(),
                 &handle.active_agent_name,
                 "Daemon shutdown interrupted active work",
             )
@@ -2669,14 +2892,14 @@ impl SessionRegistry {
                     Ok(data_json) => data_json,
                     Err(error) => {
                         tracing::warn!(
-                            session_id = %handle.session_id,
+                            session_id = %handle.session_id(),
                             error = %error,
                             "serializing forced drain interruption event failed"
                         );
                         return;
                     }
                 };
-                let session_id = handle.session_id;
+                let session_id = handle.session_id();
                 let active_agent_name = handle.active_agent_name.clone();
                 if let Err(error) = self.inner.db.blocking_write_for_sync_event(move |conn| {
                     crate::db::Db::insert_session_event_json_conn(
@@ -2691,7 +2914,7 @@ impl SessionRegistry {
                     )
                 }) {
                     tracing::warn!(
-                        session_id = %handle.session_id,
+                        session_id = %handle.session_id(),
                         error = %error,
                         "record forced drain interruption event failed"
                     );
@@ -2699,7 +2922,7 @@ impl SessionRegistry {
             }
             Err(error) => {
                 tracing::warn!(
-                    session_id = %handle.session_id,
+                    session_id = %handle.session_id(),
                     error = %error,
                     "record forced drain interruption marker failed"
                 );
@@ -2770,9 +2993,11 @@ impl SessionRegistry {
     /// as not-processing / no-jobs). Lock-free read of the worker's
     /// shared atomics (GOALS §17f).
     pub fn live_status(&self, session_id: Uuid) -> Option<(bool, bool, bool)> {
-        crate::sync::lock_or_recover(&self.inner.workers)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers
             .live
-            .get(&session_id)
+            .get(&key)
             .map(|entry| entry.handle.live_status())
     }
 
@@ -2782,10 +3007,38 @@ impl SessionRegistry {
     /// the shared DB-backed resume path. No cross-process state may be cached
     /// across requests without an invalidation path.
     pub fn live_handle(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&session_id)
-            .map(|entry| entry.handle.clone())
+        self.lookup_entry(session_id).map(|(_, handle)| handle)
+    }
+
+    /// Find the live worker that owns this handle after a compaction rekey.
+    /// Session-id map keys move; the work channel does not.
+    pub(crate) fn live_handle_matching_worker(
+        &self,
+        handle: &SessionWorkerHandle,
+    ) -> Option<SessionWorkerHandle> {
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_handle(&workers, handle)?;
+        workers.live.get(&key).map(|entry| entry.handle.clone())
+    }
+
+    /// Keep-warm callbacks target the live conversation tip. They must never
+    /// spawn a worker on an ended predecessor window.
+    async fn live_keep_warm_handle(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<SessionWorkerHandle>> {
+        if let Some(handle) = self.live_handle(session_id) {
+            return Ok(Some(handle));
+        }
+        let lineage = self
+            .inner
+            .db
+            .compaction_lineage_sessions(session_id)
+            .await?;
+        Ok(lineage
+            .into_iter()
+            .rev()
+            .find_map(|id| self.live_handle(id)))
     }
 
     /// Stop a live session before archive/delete/discard. This is fail-closed:
@@ -2806,13 +3059,16 @@ impl SessionRegistry {
     ) -> Result<bool> {
         let generation = {
             let workers = crate::sync::lock_or_recover(&self.inner.workers);
-            let Some(entry) = workers.live.get(&handle.session_id) else {
+            let Some(key) = live_map_key_for_handle(&workers, handle) else {
+                return Ok(false);
+            };
+            let Some(entry) = workers.live.get(&key) else {
                 return Ok(false);
             };
             if !entry.handle.same_worker_as(handle) {
                 bail!(
                     "session {} worker identity changed; refusing to stop its successor",
-                    handle.session_id
+                    handle.session_id()
                 );
             }
             entry.generation
@@ -2848,11 +3104,14 @@ impl SessionRegistry {
         handle: &SessionWorkerHandle,
         deadline: tokio::time::Instant,
     ) -> Result<bool> {
-        let session_id = handle.session_id;
+        let session_id = handle.session_id();
         let stop_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         let terminal_cleanup_complete = {
             let workers = crate::sync::lock_or_recover(&self.inner.workers);
-            let Some(entry) = workers.live.get(&session_id) else {
+            let Some(key) = live_map_key_for_handle(&workers, handle) else {
+                return Ok(false);
+            };
+            let Some(entry) = workers.live.get(&key) else {
                 return Ok(false);
             };
             if entry.generation != generation || !entry.handle.same_worker_as(handle) {
@@ -2864,11 +3123,12 @@ impl SessionRegistry {
         };
         let join = {
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
+            let key = join_map_key_for_generation(&joins, generation).unwrap_or(session_id);
             if joins
-                .get(&session_id)
+                .get(&key)
                 .is_some_and(|entry| entry.generation == generation)
             {
-                joins.remove(&session_id).map(|entry| entry.join)
+                joins.remove(&key).map(|entry| entry.join)
             } else {
                 None
             }
@@ -2943,9 +3203,11 @@ impl SessionRegistry {
                 // retry path finish it under a fresh caller-owned deadline.
                 let terminal_closing = {
                     let workers = crate::sync::lock_or_recover(&self.inner.workers);
+                    let key = live_map_key_for_handle(&workers, handle)
+                        .context("exact worker disappeared before forced-abort ownership claim")?;
                     let entry = workers
                         .live
-                        .get(&session_id)
+                        .get(&key)
                         .context("exact worker disappeared before forced-abort ownership claim")?;
                     if entry.generation != generation || !entry.handle.same_worker_as(handle) {
                         bail!("session {session_id} worker changed before forced abort");
@@ -3023,12 +3285,37 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
+    fn install_compaction_rekey_hooks(&self, session: &Session) {
+        let registry = self.clone();
+        session.set_compaction_successor_begin_hook(Arc::new({
+            let registry = registry.clone();
+            move |from, to| registry.begin_compaction_rekey(from, to)
+        }));
+        session.set_compaction_successor_abort_hook(Arc::new({
+            let registry = registry.clone();
+            move |from, to| registry.abort_compaction_rekey(from, to)
+        }));
+        session.set_compaction_successor_hook(Arc::new(move |from, to| {
+            if let Err(error) = registry.rekey_live_worker(from, to) {
+                panic!("test compaction rekey failed: {error:#}");
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    fn activation_leases(&self, session_id: Uuid) -> Option<usize> {
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, session_id)?;
+        workers.live.get(&key).map(|entry| entry.activation_leases)
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_test_worker(
         &self,
         handle: SessionWorkerHandle,
         join: JoinHandle<()>,
     ) -> WorkerGeneration {
-        let id = handle.session_id;
+        let id = handle.session_id();
         let generation = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             let generation = next_generation(&mut workers);
@@ -3061,7 +3348,7 @@ impl SessionRegistry {
 
     #[cfg(test)]
     fn insert_test_worker_without_join(&self, handle: SessionWorkerHandle) -> WorkerGeneration {
-        let id = handle.session_id;
+        let id = handle.session_id();
         let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
         let generation = next_generation(&mut workers);
         workers.live.insert(
@@ -3080,19 +3367,19 @@ impl SessionRegistry {
 
     #[cfg(test)]
     fn live_generation(&self, id: Uuid) -> Option<WorkerGeneration> {
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .get(&id)
-            .map(|entry| entry.generation)
+        let workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let key = live_map_key_for_session_id(&workers, id)?;
+        workers.live.get(&key).map(|entry| entry.generation)
     }
 
     #[cfg(test)]
     fn insert_test_worker_with_exit_cleanup(&self, handle: SessionWorkerHandle) {
-        let id = handle.session_id;
+        let id = handle.session_id();
+        let spawn_id = handle.worker_session_id();
         let weak = Arc::downgrade(&self.inner);
         let generation = self.insert_test_worker(handle, tokio::spawn(async {}));
         let join = tokio::spawn(async move {
-            cleanup_worker_on_exit(weak, id, generation);
+            cleanup_worker_on_exit(weak, spawn_id, id, generation);
         });
         crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
             id,
@@ -3444,8 +3731,8 @@ mod tests {
             .await
             .expect("missing watch paths must not fail session start");
 
-        assert!(reg.lookup(handle.session_id).is_some());
-        reg.forget(handle.session_id);
+        assert!(reg.lookup(handle.session_id()).is_some());
+        reg.forget(handle.session_id());
     }
 
     #[tokio::test]
@@ -3552,7 +3839,7 @@ mod tests {
             .expect("create through preflight A");
         assert_preflight_model(&created, "model-a");
         assert!(
-            reg.interrupt_and_stop(created.session_id)
+            reg.interrupt_and_stop(created.session_id())
                 .await
                 .expect("stop created worker")
         );
@@ -3578,7 +3865,7 @@ mod tests {
             .expect("assistant creation through preflight A");
         assert_preflight_model(&assistant, "model-a");
         assert!(
-            reg.interrupt_and_stop(assistant.session_id)
+            reg.interrupt_and_stop(assistant.session_id())
                 .await
                 .expect("stop assistant worker")
         );
@@ -3610,7 +3897,7 @@ mod tests {
             .expect("resume through preflight A");
         assert_preflight_model(&resumed, "model-a");
         assert!(
-            reg.interrupt_and_stop(resumed.session_id)
+            reg.interrupt_and_stop(resumed.session_id())
                 .await
                 .expect("stop resumed worker")
         );
@@ -3879,7 +4166,7 @@ mod tests {
             .expect("explicit model should create a session without a configured default");
         assert_eq!(handle.active_model_selection(), Some(selection.clone()));
         handle.persist_if_needed().unwrap();
-        let session_id = handle.session_id;
+        let session_id = handle.session_id();
         reg.forget(session_id);
 
         let resumed = Session::resume_for_test(
@@ -3929,7 +4216,7 @@ mod tests {
             )
             .await
             .expect("explicit model should recover the same model-less session");
-        assert_eq!(recovered.session_id, legacy_id);
+        assert_eq!(recovered.session_id(), legacy_id);
         assert_eq!(recovered.active_model_selection(), Some(selection.clone()));
         reg.forget(legacy_id);
         let durable = Session::resume_for_test(
@@ -3999,7 +4286,7 @@ mod tests {
             .expect("structured model pin creates an aligned session");
         assert_eq!(pinned.active_model_selection(), Some(selection.clone()));
         pinned.persist_if_needed().unwrap();
-        let pinned_id = pinned.session_id;
+        let pinned_id = pinned.session_id();
         reg.forget(pinned_id);
         assert_eq!(
             Session::resume_for_test(
@@ -4102,8 +4389,8 @@ mod tests {
             );
 
         let waited = waiter.await.unwrap();
-        assert_eq!(waited.session_id, id);
-        assert_eq!(reg.lookup(id).unwrap().session_id, id);
+        assert_eq!(waited.session_id(), id);
+        assert_eq!(reg.lookup(id).unwrap().session_id(), id);
     }
 
     #[test]
@@ -4258,7 +4545,7 @@ mod tests {
         let new_generation = reg.insert_test_worker(new_handle, new_join);
         assert_ne!(old_generation, new_generation);
 
-        cleanup_worker_on_exit(Arc::downgrade(&reg.inner), id, old_generation);
+        cleanup_worker_on_exit(Arc::downgrade(&reg.inner), id, id, old_generation);
 
         assert_eq!(reg.live_generation(id), Some(new_generation));
         assert!(reg.lookup(id).is_some());
@@ -5786,5 +6073,116 @@ mod tests {
             None,
             "a foreign-owned command name must never be injected/expanded"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_rekey_reservation_joins_existing_worker_instead_of_spawning() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session.clone());
+        let generation = reg.insert_test_worker(handle.clone(), tokio::spawn(async {}));
+        reg.install_compaction_rekey_hooks(handle.session().as_ref());
+
+        let successor_id = Uuid::new_v4();
+        session.begin_compaction_successor(successor_id).unwrap();
+
+        let reserved = reg
+            .live_handle(successor_id)
+            .expect("successor id must resolve to the existing worker during rekey");
+        assert!(reserved.same_worker_as(&handle));
+        assert_eq!(reg.live_generation(successor_id), Some(generation));
+        assert!(
+            crate::sync::lock_or_recover(&reg.inner.workers)
+                .starting
+                .is_empty(),
+            "reservation must not open a start slot"
+        );
+        assert!(
+            matches!(reg.claim_attach(successor_id), AttachClaim::Live(_)),
+            "attach to the unpublished successor must join the live worker"
+        );
+
+        session.abort_compaction_successor(successor_id);
+        assert!(
+            reg.live_handle(successor_id).is_none(),
+            "abort must release the successor key so a later attach can start"
+        );
+        assert!(reg.live_handle(session.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn compaction_rekey_preserves_handle_stop_trust_and_keep_warm_identity() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let spawn_id = session.id;
+        let successor = reg
+            .inner
+            .db
+            .create_compaction_successor(spawn_id)
+            .await
+            .unwrap();
+        let successor_id = successor.session_id;
+        let successor_short = successor
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor_id.to_string());
+
+        let (handle, _rx) = test_handle_with_rx(&reg, session.clone());
+        let generation = reg.insert_test_worker(handle.clone(), tokio::spawn(async {}));
+        reg.install_compaction_rekey_hooks(handle.session().as_ref());
+        session.begin_compaction_successor(successor_id).unwrap();
+
+        let claim = reg
+            .claim_live_attach_if_present(successor_id)
+            .await
+            .unwrap()
+            .expect("reservation must be claimable by the successor id");
+        assert_eq!(reg.activation_leases(spawn_id), Some(1));
+        assert!(claim.handle().same_worker_as(&handle));
+
+        session.adopt_compaction_successor(successor_id, successor_short);
+        assert_eq!(session.live_id(), successor_id);
+        assert_eq!(handle.session_id(), successor_id);
+        assert!(
+            reg.live_handle(successor_id)
+                .is_some_and(|live| live.same_worker_as(&handle))
+        );
+        assert!(
+            reg.live_handle(spawn_id).is_none(),
+            "map key must move off the predecessor"
+        );
+        assert_eq!(reg.live_generation(successor_id), Some(generation));
+        assert_eq!(reg.activation_leases(successor_id), Some(1));
+        assert!(
+            reg.live_handle_matching_worker(&handle)
+                .is_some_and(|live| live.same_worker_as(&handle))
+        );
+        let keep_warm_tip = reg
+            .live_keep_warm_handle(successor_id)
+            .await
+            .unwrap()
+            .expect("keep-warm must target the live tip");
+        assert!(keep_warm_tip.same_worker_as(&handle));
+        let keep_warm_from_predecessor = reg
+            .live_keep_warm_handle(spawn_id)
+            .await
+            .unwrap()
+            .expect("keep-warm on the predecessor must retarget the live worker");
+        assert!(keep_warm_from_predecessor.same_worker_as(&handle));
+
+        drop(claim);
+        assert_eq!(
+            reg.activation_leases(successor_id),
+            Some(0),
+            "LiveAttachClaim drop must follow the rekeyed map entry"
+        );
+
+        assert!(
+            reg.interrupt_and_stop_exact(&handle)
+                .await
+                .expect("exact-stop after rekey")
+        );
+        assert!(reg.live_handle(successor_id).is_none());
+        assert!(reg.live_handle_matching_worker(&handle).is_none());
     }
 }

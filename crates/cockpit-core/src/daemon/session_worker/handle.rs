@@ -6,7 +6,6 @@ use super::{helpers::*, lifecycle::*, run::run_worker, *};
 /// clone — both channels inside are reference-counted.
 #[derive(Clone)]
 pub struct SessionWorkerHandle {
-    pub session_id: Uuid,
     pub project_root: PathBuf,
     pub active_agent_name: String,
     /// Current daemon-authoritative workspace policy.  This is shared with
@@ -1180,7 +1179,7 @@ pub(super) fn build_resume_repair_state(
 ) -> proto::ResumeRepairState {
     let (provider, model, wire_api) = active_wire_api_for_session(session, providers);
     proto::ResumeRepairState {
-        session_id: session.id,
+        session_id: session.live_id(),
         short_id: session.short_id(),
         provider,
         model,
@@ -1202,6 +1201,27 @@ pub(super) fn build_resume_repair_state(
 impl SessionWorkerHandle {
     pub(crate) fn forwarded_mcp_slot(&self) -> Arc<crate::mcp::forwarded::ForwardedCatalogSlot> {
         self.session.forwarded_mcp_slot()
+    }
+
+    /// Live conversation identity. Compaction successor adoption rewrites
+    /// this in place so every handle clone observes the current window.
+    /// Wire events, request-id guards, registry map keys, and keep-warm
+    /// targeting read this id — never a spawn-time copy.
+    pub fn session_id(&self) -> Uuid {
+        self.session.live_id()
+    }
+
+    /// Worker spawn identity. Locks, containers, agent-tree storage, and
+    /// image-dispatch stay on this id for the worker lifetime.
+    pub fn worker_session_id(&self) -> Uuid {
+        self.session.id
+    }
+
+    /// True when `session_id` names this live conversation or its spawn
+    /// window. Agent-tree and Code-root fences use this so a CompactReady
+    /// retarget does not look like a different worker.
+    pub fn owns_session_id(&self, session_id: Uuid) -> bool {
+        session_id == self.session_id() || session_id == self.worker_session_id()
     }
 
     /// Exact live-worker identity, independent of the reusable session id.
@@ -1265,7 +1285,6 @@ impl SessionWorkerHandle {
                 }
             });
         let handle = Self {
-            session_id: session.id,
             project_root: session.project_root.clone(),
             active_agent_name: "Build".to_string(),
             trust_policy: crate::config::trust::shared_workspace_trust_policy(
@@ -1439,7 +1458,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::SandboxState {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 mode: new,
                 enabled: new.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
@@ -1472,7 +1491,7 @@ impl SessionWorkerHandle {
                 &self.event_tx,
                 &self.redaction,
                 proto::Event::SandboxEscalationState {
-                    session_id: self.session_id,
+                    session_id: self.session_id(),
                     enabled,
                 },
             );
@@ -1492,7 +1511,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::ApprovalModeState {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 mode,
             },
         );
@@ -1518,12 +1537,12 @@ impl SessionWorkerHandle {
             lease: InteractiveAttachmentLease {
                 state: Arc::new(std::sync::Mutex::new(InteractiveAttachmentState {
                     live: true,
-                    session_id: self.session_id,
+                    session: self.session.clone(),
                     attachment_id: Uuid::new_v4(),
                 })),
             },
             counter: self.interactive_clients.clone(),
-            session_id: self.session_id,
+            session_id: self.worker_session_id(),
             locks: self.locks.clone(),
             live: self.live.clone(),
         }
@@ -1565,8 +1584,8 @@ impl SessionWorkerHandle {
 pub struct InteractiveClientGuard {
     pub(super) lease: InteractiveAttachmentLease,
     pub(super) counter: Arc<std::sync::atomic::AtomicUsize>,
-    /// Session this guard belongs to — used by the last-detach-while-idle
-    /// release edge (implementation note).
+    /// Worker spawn identity for lock/container release. Acquisitions key
+    /// under `Session::id`; this must not follow `live_id` after compaction.
     pub(super) session_id: Uuid,
     /// The daemon-wide lock authority, consulted on the last detach.
     pub(super) locks: Arc<LockManager>,
@@ -1594,29 +1613,50 @@ impl InteractiveAttachmentLease {
         let state = crate::sync::lock_or_recover(&self.state);
         state.live.then(|| InteractiveAttachmentPermit {
             _state: self.state.clone(),
-            session_id: state.session_id,
+            session: state.session.clone(),
             attachment_id: state.attachment_id,
         })
     }
 }
 
-#[derive(Debug)]
 pub(super) struct InteractiveAttachmentState {
     pub(super) live: bool,
-    pub(super) session_id: Uuid,
+    pub(super) session: Arc<Session>,
     pub(super) attachment_id: Uuid,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for InteractiveAttachmentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveAttachmentState")
+            .field("live", &self.live)
+            .field("session_id", &self.session.live_id())
+            .field("attachment_id", &self.attachment_id)
+            .finish()
+    }
+}
+
 pub struct InteractiveAttachmentPermit {
     _state: Arc<std::sync::Mutex<InteractiveAttachmentState>>,
-    session_id: Uuid,
+    session: Arc<Session>,
     attachment_id: Uuid,
 }
 
+impl std::fmt::Debug for InteractiveAttachmentPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveAttachmentPermit")
+            .field("session_id", &self.session.live_id())
+            .field("attachment_id", &self.attachment_id)
+            .finish()
+    }
+}
+
 impl InteractiveAttachmentPermit {
+    /// Conversation identity, not window identity. An interactive attachment
+    /// outlives compaction successor adoption, so the permit stays valid for
+    /// both the spawn window and the live tip of this worker.
     pub fn belongs_to(&self, session_id: Uuid) -> bool {
-        self.session_id == session_id && !self.attachment_id.is_nil()
+        !self.attachment_id.is_nil()
+            && (self.session.live_id() == session_id || self.session.id == session_id)
     }
 }
 
@@ -1765,11 +1805,10 @@ impl SessionWorkerHandle {
         // consumption are paired under the short read fence: if a transition
         // won while reserve was pending, its writer runs first and this work is
         // rejected without entering the worker queue.
-        let permit = self
-            .work_tx
-            .reserve()
-            .await
-            .map_err(|_| anyhow::anyhow!("session worker {} has shut down", self.session_id))?;
+        let permit =
+            self.work_tx.reserve().await.map_err(|_| {
+                anyhow::anyhow!("session worker {} has shut down", self.session_id())
+            })?;
         let _admission = if transition_bypass {
             None
         } else {
@@ -1781,7 +1820,7 @@ impl SessionWorkerHandle {
             // matching on a message. Every other `send_work` failure is a
             // genuine worker-lifetime error and stays `Internal`.
             return Err(anyhow::Error::new(SessionWorkTrustReconciling {
-                session_id: self.session_id,
+                session_id: self.session_id(),
             }));
         }
         permit.send(work);
@@ -1853,7 +1892,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::Notice {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 text,
             },
         );
@@ -1898,7 +1937,7 @@ impl SessionWorkerHandle {
         broadcast_workspace_trust_reconciliation(
             &self.event_tx,
             &self.redaction,
-            self.session_id,
+            self.session_id(),
             revision,
             state,
         );
@@ -1911,7 +1950,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::Notice {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 text,
             },
             NoticeSource::DaemonDirect,
@@ -1986,7 +2025,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::ModelSelectionResult {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 selection_id,
                 provider: requested.provider.clone(),
                 model: requested.model.clone(),
@@ -2010,7 +2049,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::DefaultModelUpdateResult {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 default_update_id,
                 outcome,
             },
@@ -2018,7 +2057,7 @@ impl SessionWorkerHandle {
     }
 
     pub fn broadcast_config_snapshot(&self) {
-        let snapshot = self.config_snapshot().to_proto(self.session_id);
+        let snapshot = self.config_snapshot().to_proto(self.session_id());
         send_current_event(
             &self.event_tx,
             &self.redaction,
@@ -2086,7 +2125,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::GitignoreAllow {
-                session_id: self.session_id,
+                session_id: self.session.live_id(),
                 allow: self.session.gitignore_session_allow(),
             },
         );
@@ -2099,7 +2138,12 @@ impl SessionWorkerHandle {
     }
 
     pub async fn broadcast_active_interrupt(&self) {
-        let Ok(open) = self.session.db.list_open_interrupts(self.session_id).await else {
+        let Ok(open) = self
+            .session
+            .db
+            .list_open_interrupts(self.session.live_id())
+            .await
+        else {
             return;
         };
         let Some(active) = open.first() else {
@@ -2120,7 +2164,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::InterruptRaised {
-                session_id: self.session_id,
+                session_id: self.session.live_id(),
                 interrupt_id: active.interrupt_id,
                 agent: active.agent_id.clone(),
                 description: active.description.clone(),
@@ -2141,7 +2185,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::SandboxState {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 mode,
                 enabled: mode.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
@@ -2158,7 +2202,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::SandboxEscalationState {
-                session_id: self.session_id,
+                session_id: self.session_id(),
                 enabled: self.session.sandbox_escalation_enabled(),
             },
         );
@@ -2196,7 +2240,7 @@ impl SessionWorkerHandle {
             send_sandbox_unavailable_notice(
                 &self.event_tx,
                 &self.redaction,
-                self.session_id,
+                self.session_id(),
                 &notice,
             );
             return;
@@ -2214,7 +2258,7 @@ impl SessionWorkerHandle {
         let project_root = self.project_root.clone();
         let event_tx = self.event_tx.clone();
         let redaction = self.redaction.clone();
-        let session_id = self.session_id;
+        let session_id = self.session_id();
         let notice_store = self.sandbox_unavailable_notice.clone();
         let armed = self.sandbox_notice_armed.clone();
         handle.spawn(async move {
@@ -2273,7 +2317,12 @@ impl SessionWorkerHandle {
         // Capability fail-closed must surface even when no live bwrap probe
         // runs. Send on this path first, then arm so later bash refusals do
         // not hide the original warning.
-        send_sandbox_unavailable_notice(&self.event_tx, &self.redaction, self.session_id, &notice);
+        send_sandbox_unavailable_notice(
+            &self.event_tx,
+            &self.redaction,
+            self.session_id(),
+            &notice,
+        );
         let _ = forward_sandbox_unavailable(&self.sandbox_notice_armed);
     }
 }
@@ -2780,7 +2829,6 @@ pub(crate) fn spawn(
 
     let trust_policy = crate::config::trust::shared_workspace_trust_policy(trust_policy);
     let handle = SessionWorkerHandle {
-        session_id,
         project_root: project_root.clone(),
         active_agent_name: initial_agent,
         trust_policy: trust_policy.clone(),

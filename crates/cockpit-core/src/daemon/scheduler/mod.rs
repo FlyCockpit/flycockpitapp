@@ -12,6 +12,7 @@ use chrono::{TimeZone, Utc};
 use croner::parser::{CronParser, Seconds};
 use serde_json::json;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot, watch};
+use uuid::Uuid;
 
 use crate::daemon::proto::{
     EnvSnapshotSource, MissedRunPolicy, ScheduledJobCreate, ScheduledJobLastResult,
@@ -259,6 +260,24 @@ impl DaemonSchedulerHandle {
             self.wake();
         }
         Ok(deleted)
+    }
+
+    /// Drop daemon-owned keep-warm callbacks for a compacted predecessor
+    /// window so they cannot resume a dead session id.
+    pub(crate) async fn cancel_keep_warm_jobs_for_session(&self, session_id: Uuid) -> Result<()> {
+        let jobs = self.list_system_jobs(Some("system:keep_warm")).await?;
+        for job in jobs {
+            let Ok(parsed) = crate::keep_warm::parse_job_id(&job.id) else {
+                continue;
+            };
+            if parsed.session_id != session_id {
+                continue;
+            }
+            if self.scheduler.delete_job(&job.id).await? {
+                self.wake();
+            }
+        }
+        Ok(())
     }
 
     pub async fn set_enabled(
@@ -1107,7 +1126,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
         match tokio::time::timeout(RUN_PROMPT_TIMEOUT, completion).await {
             Ok(Ok(TurnOutcome::Completed { .. })) => Ok(format!(
                 "assistant `{assistant}` completed scheduled turn in session {}",
-                handle.session_id
+                handle.session_id()
             )),
             // A settled watch is only a success when the turn completed:
             // a parked interrupt, a budget/usage limit, or a preflight
@@ -1115,7 +1134,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
             // failed run, never a silent success.
             Ok(Ok(TurnOutcome::DidNotComplete { reason })) => bail!(
                 "scheduled turn in session {} ended without completing: {reason:?}",
-                handle.session_id
+                handle.session_id()
             ),
             Ok(Ok(TurnOutcome::Failed { error })) => {
                 bail!("scheduled session driver failed: {error}")

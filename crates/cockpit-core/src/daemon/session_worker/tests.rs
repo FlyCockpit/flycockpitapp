@@ -2578,7 +2578,10 @@ async fn queue_updated_is_not_emitted_for_the_initial_empty_snapshot() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let forward = tokio::spawn(forward_queue_updates(
-        updates_rx, event_tx, redaction, session_id,
+        updates_rx,
+        event_tx,
+        redaction,
+        move || session_id,
     ));
 
     assert!(
@@ -2606,7 +2609,10 @@ async fn queue_updated_is_still_emitted_when_the_queue_is_emptied() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let forward = tokio::spawn(forward_queue_updates(
-        updates_rx, event_tx, redaction, session_id,
+        updates_rx,
+        event_tx,
+        redaction,
+        move || session_id,
     ));
 
     updates_tx
@@ -2629,7 +2635,7 @@ async fn turn_completion_is_delivered_through_the_lossless_channel() {
     let completion = handle.watch_turn("turn-1");
 
     handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
-        session_id: handle.session_id,
+        session_id: handle.session_id(),
         turn_id: Some("turn-1".to_string()),
         reason: crate::engine::IdleReason::Completed,
     });
@@ -2647,7 +2653,7 @@ async fn turn_completion_resolves_when_the_turn_finished_before_the_watcher_regi
     let handle = test_session_handle();
 
     handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
-        session_id: handle.session_id,
+        session_id: handle.session_id(),
         turn_id: Some("turn-before-watch".to_string()),
         reason: crate::engine::IdleReason::GoalComplete,
     });
@@ -2674,7 +2680,7 @@ async fn non_success_idle_reasons_resolve_watchers_as_did_not_complete() {
 
     let parked = handle.watch_turn("turn-parked");
     handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
-        session_id: handle.session_id,
+        session_id: handle.session_id(),
         turn_id: Some("turn-parked".to_string()),
         reason: crate::engine::IdleReason::NeedsIntervention {
             code: "parked_interrupt".to_string(),
@@ -2689,7 +2695,7 @@ async fn non_success_idle_reasons_resolve_watchers_as_did_not_complete() {
 
     let retracted = handle.watch_turn("turn-retracted");
     handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
-        session_id: handle.session_id,
+        session_id: handle.session_id(),
         turn_id: Some("turn-retracted".to_string()),
         reason: crate::engine::IdleReason::PreflightRejected,
     });
@@ -5086,7 +5092,7 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
             remedy: got_remedy,
             fix_command: got_fix_command,
         } => {
-            assert_eq!(session_id, handle.session_id);
+            assert_eq!(session_id, handle.session_id());
             assert_eq!(got_remedy, remedy);
             assert_eq!(got_fix_command.as_deref(), Some(fix_command.as_str()));
         }
@@ -5135,7 +5141,7 @@ async fn capability_refuse_probe_emits_visible_sandbox_unavailable_notice() {
         proto::Event::SandboxUnavailable {
             session_id, remedy, ..
         } => {
-            assert_eq!(session_id, handle.session_id);
+            assert_eq!(session_id, handle.session_id());
             assert!(
                 !remedy.is_empty(),
                 "fail-closed notice must carry a visible reason"
@@ -5315,11 +5321,22 @@ fn test_guard(
     live: Arc<LiveState>,
 ) -> InteractiveClientGuard {
     counter.fetch_add(1, Ordering::SeqCst);
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(
+        Session::create_for_test(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     InteractiveClientGuard {
         lease: InteractiveAttachmentLease {
             state: Arc::new(std::sync::Mutex::new(InteractiveAttachmentState {
                 live: true,
-                session_id,
+                session,
                 attachment_id: Uuid::new_v4(),
             })),
         },
@@ -6194,7 +6211,7 @@ async fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     assert!(matches!(
         events.try_recv().unwrap().event,
         proto::Event::ConfigSnapshot { snapshot }
-            if snapshot.session_id == handle.session_id && snapshot.generation == 1
+            if snapshot.session_id == handle.session_id() && snapshot.generation == 1
     ));
 }
 

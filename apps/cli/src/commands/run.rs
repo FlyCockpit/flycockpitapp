@@ -160,6 +160,7 @@ async fn resolve_requested_session_via_daemon(
                 project_id: None,
                 parent_session_id: None,
                 assistant_id: None,
+                compaction_lineage_root_id: None,
             })
             .await
             .context("looking up --session via daemon")?
@@ -208,6 +209,7 @@ async fn resolve_requested_session_via_daemon(
             project_id: Some(project_id),
             parent_session_id: None,
             assistant_id: None,
+            compaction_lineage_root_id: None,
         })
         .await
         .context("listing sessions for --continue via daemon")?
@@ -966,7 +968,7 @@ fn validate_prompt(prompt: &str) -> Result<()> {
 
 pub(crate) async fn pump_events(
     client: &ScopedDaemonClient<'_>,
-    session_id: Uuid,
+    mut session_id: Uuid,
     format: OutputFormat,
     verbose_json: bool,
     approve: &[GrantKind],
@@ -1040,9 +1042,14 @@ pub(crate) async fn pump_events(
         let Some(event) = event else {
             break;
         };
-        // Filter to this session's events.
+        // Filter to this session's events. CompactReady is stamped with the
+        // predecessor so it passes this check; retarget afterwards so later
+        // events (stamped with the successor) are not dropped.
         if event_session(&event) != Some(session_id) {
             continue;
+        }
+        if let proto::Event::CompactReady { new_session_id, .. } = &event {
+            session_id = *new_session_id;
         }
 
         let action = handle_run_event(

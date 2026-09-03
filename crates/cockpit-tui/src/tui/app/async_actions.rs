@@ -3168,7 +3168,7 @@ impl App {
         let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
-        let (project_id, parent) = pane.root_request();
+        let (project_id, parent, lineage_root) = pane.root_request();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
@@ -3176,8 +3176,13 @@ impl App {
             move || {
                 let endpoint = endpoint
                     .ok_or_else(|| "daemon endpoint unavailable for sessions.list".to_string())?;
-                crate::tui::agent_runner::list_sessions_blocking(&endpoint, project_id, parent)
-                    .map(AsyncActionPayload::Sessions)
+                crate::tui::agent_runner::list_sessions_blocking(
+                    &endpoint,
+                    project_id,
+                    parent,
+                    lineage_root,
+                )
+                .map(AsyncActionPayload::Sessions)
             },
         );
     }

@@ -96,6 +96,78 @@ mod governed_network_question_tests {
             "headless callers cannot manufacture a settleable network prompt"
         );
     }
+
+    #[tokio::test]
+    async fn noninteractive_approver_cannot_settle_media_egress() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            db.clone(),
+            ctx.session.id,
+        ));
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        );
+        let approver = Approver::new_for_session(
+            store,
+            db.clone(),
+            ctx.session.clone(),
+            redaction,
+            ctx.agent_id,
+            interrupts,
+        );
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+        let request_digest =
+            crate::audio_transcription::authorization::MediaEgressRequestDigest::from_raw_for_test(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+        let credential_fingerprint_digest =
+            crate::image_sidecar::CredentialFingerprintDigest::from_raw_for_test(
+                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            );
+        let decision = approver
+            .authorize(AuthorizationRequest::MediaEgress {
+                request_digest: &request_digest,
+                purpose: "transcription",
+                provider_id: "openai",
+                model_id: "gpt-transcribe",
+                credential_fingerprint_digest: &credential_fingerprint_digest,
+                origin: "api.openai.com",
+                resolved_location: "us-east-1",
+                project_digest: "project-digest",
+                session_id: "session-1",
+                attachment_id: "attachment-1",
+                attachment_checksum: "checksum-1",
+                interval_start_us: 0,
+                interval_end_us: 1_000_000,
+                prompt_present: false,
+                keyword_count: 0,
+                language_count: 0,
+                timestamps: "off",
+                diarization: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::NoninteractiveDeny);
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "headless callers cannot manufacture a settleable media-egress prompt"
+        );
+    }
 }
 
 impl Approver {

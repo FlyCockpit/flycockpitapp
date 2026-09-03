@@ -211,6 +211,12 @@ pub enum StoreError {
     /// (the cwd isn't inside a git worktree).
     #[error("no project root for the current directory; cannot store a project grant")]
     NoProjectRoot,
+    /// No live allow/reject row matched the exact purpose and digest tuple.
+    #[error("no active media-egress verdict for purpose `{purpose}` and digest `{request_digest}`")]
+    MediaEgressVerdictNotFound {
+        purpose: String,
+        request_digest: String,
+    },
     /// An I/O / serialization failure while reading or writing a grant.
     #[error(transparent)]
     Io(#[from] anyhow::Error),
@@ -1189,10 +1195,18 @@ impl GrantStore {
         purpose: &str,
         request_digest: &str,
     ) -> Result<(), StoreError> {
-        self.revoke_media_egress_grant(purpose, request_digest)
+        let grant_rows = self
+            .revoke_media_egress_grant(purpose, request_digest)
             .await?;
-        self.revoke_media_egress_reject(purpose, request_digest)
+        let reject_rows = self
+            .revoke_media_egress_reject(purpose, request_digest)
             .await?;
+        if grant_rows + reject_rows == 0 {
+            return Err(StoreError::MediaEgressVerdictNotFound {
+                purpose: purpose.to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -6590,5 +6604,18 @@ mod media_egress_grant_tests {
             .await
             .unwrap();
         assert!(store.list_media_egress_verdicts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_egress_revoke_unknown_digest_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, _project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::MediaEgressVerdictNotFound { .. }));
     }
 }

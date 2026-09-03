@@ -1674,6 +1674,7 @@ mod tests {
     use std::io;
     use std::sync::Mutex as StdMutex;
     use std::sync::RwLock;
+    use std::sync::atomic::AtomicUsize;
     use tracing::Level;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -2454,6 +2455,23 @@ mod tests {
         cwd: &std::path::Path,
         mode: crate::config::extended::ApprovalMode,
     ) -> Approver {
+        approver_with_mode_and_hub(cwd, mode, false)
+    }
+
+    /// Like [`approver_with_mode`], but attaches an interactive client counter
+    /// so media-egress and other headless-guarded prompts can be raised.
+    fn approver_with_mode_interactive(
+        cwd: &std::path::Path,
+        mode: crate::config::extended::ApprovalMode,
+    ) -> Approver {
+        approver_with_mode_and_hub(cwd, mode, true)
+    }
+
+    fn approver_with_mode_and_hub(
+        cwd: &std::path::Path,
+        mode: crate::config::extended::ApprovalMode,
+        interactive: bool,
+    ) -> Approver {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
             crate::session::Session::create_for_test(
@@ -2470,17 +2488,23 @@ mod tests {
             cwd.to_path_buf(),
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
-        let hub = Arc::new(InterruptHub::detached());
-        let approver = Approver::new_for_session(
-            store,
-            db,
-            session.clone(),
-            Arc::new(std::sync::RwLock::new(Arc::new(
-                crate::redact::RedactionTable::empty(),
-            ))),
-            "builder",
-            hub,
-        );
+        let redaction = Arc::new(RwLock::new(
+            Arc::new(crate::redact::RedactionTable::empty()),
+        ));
+        let hub = if interactive {
+            let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+            Arc::new(InterruptHub::new(
+                events,
+                redaction.clone(),
+                Arc::new(AtomicUsize::new(1)),
+                db.clone(),
+                session.id,
+            ))
+        } else {
+            Arc::new(InterruptHub::detached())
+        };
+        let approver =
+            Approver::new_for_session(store, db, session.clone(), redaction, "builder", hub);
         session.set_approval_mode(mode);
         approver
     }
@@ -3215,8 +3239,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_manual_no_grant_asks_then_allows() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let questions = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
         let decision = approver.authorize(scenario.request()).await.unwrap();
@@ -3261,8 +3287,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_different_digest_still_prompts() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let project_id = approver
             .session
@@ -3288,8 +3316,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_approved_once_persists_matching_grant() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
         assert_eq!(
@@ -3345,8 +3375,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_interactive_deny_persists_standing_reject() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let resolver = resolve_sequence(&approver, &[ID_REJECT]);
         assert_eq!(
@@ -3403,8 +3435,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_dismissed_prompt_does_not_persist_standing_reject() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let db = approver.db.clone();
         let session_id = approver.session_id;
@@ -3443,8 +3477,10 @@ mod tests {
     #[tokio::test]
     async fn media_egress_revoked_grant_reprompts() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver =
-            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let approver = approver_with_mode_interactive(
+            tmp.path(),
+            crate::config::extended::ApprovalMode::Manual,
+        );
         let scenario = MediaEgressScenario::base();
         let project_id = approver
             .session
@@ -3480,6 +3516,19 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn media_egress_headless_manual_denies_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = MediaEgressScenario::base();
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::NoninteractiveDeny
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
     }
 
     #[tokio::test]

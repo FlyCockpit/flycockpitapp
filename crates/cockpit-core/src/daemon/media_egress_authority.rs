@@ -6,7 +6,7 @@ use cockpit_proto::media_egress_authority::MediaEgressVerdictV1;
 use cockpit_proto::{ErrorCode, ErrorPayload, Response};
 use uuid::Uuid;
 
-use crate::approval::store::GrantStore;
+use crate::approval::store::{GrantStore, StoreError};
 use crate::daemon::server::DaemonContext;
 use crate::daemon::session_worker::SessionConfigHandle;
 
@@ -44,7 +44,13 @@ pub async fn revoke_verdict(
     store
         .revoke_media_egress_verdict(&purpose, &request_digest)
         .await
-        .map_err(|error| internal(error.to_string()))?;
+        .map_err(|error| match error {
+            StoreError::MediaEgressVerdictNotFound { .. } => ErrorPayload {
+                code: ErrorCode::NotFound,
+                message: error.to_string(),
+            },
+            other => internal(other.to_string()),
+        })?;
     Ok(Response::Ack)
 }
 

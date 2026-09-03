@@ -645,10 +645,17 @@ impl Tool for TranscribeAudioTool {
         let request_digest = request.digest();
         match request.authorize(approver).await? {
             crate::approval::Decision::Allow { .. } => {}
-            crate::approval::Decision::Deny
-            | crate::approval::Decision::StandingReject { .. }
-            | crate::approval::Decision::NoninteractiveDeny => {
+            crate::approval::Decision::Deny => {
                 bail!("transcription_denied: media egress was not authorized");
+            }
+            crate::approval::Decision::StandingReject { scope } => {
+                bail!(crate::approval::standing_reject_refusal(
+                    "transcribe_audio",
+                    scope
+                ));
+            }
+            crate::approval::Decision::NoninteractiveDeny => {
+                bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL);
             }
         }
 

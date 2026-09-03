@@ -8757,8 +8757,7 @@ mod tests {
         // any approval or dispatch.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let mut coordinator =
-            make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
+        let mut coordinator = make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
 
         let actions = vec![
             OpenAiComputerAction::KeyChord(KeyChord {
@@ -8793,8 +8792,7 @@ mod tests {
         // Both Anthropic computer contracts enforce the same policy.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let mut coordinator =
-            make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
+        let mut coordinator = make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
 
         let new_contract = Anthropic20251124ComputerAction::KeyChord(KeyChord {
             keys: vec!["ctrl".to_string(), "alt".to_string(), "t".to_string()],
@@ -8835,8 +8833,7 @@ mod tests {
         // the batch that opens the terminal contains no blocked chord.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let mut coordinator =
-            make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
+        let mut coordinator = make_coordinator(Box::new(backend.clone()), authorizer.clone()).await;
 
         let actions = vec![
             OpenAiComputerAction::Click {
@@ -8893,8 +8890,9 @@ mod tests {
             &artifacts.outcome,
             artifacts.live_frame.as_ref(),
         );
-        let NativeComputerContinuation::TextOnly { text, .. } = continuation else {
-            panic!("expected a text-only continuation, got {continuation:?}");
+        let text = match continuation {
+            NativeComputerContinuation::TextOnly { text, .. } => text,
+            other => panic!("expected a text-only continuation, got {other:?}"),
         };
         assert!(text.contains("computer action failed"));
         assert!(text.contains("computer action refused"));

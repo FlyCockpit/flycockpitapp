@@ -478,13 +478,11 @@ fn typed_text_is_terminal_command(text: &str) -> bool {
 /// Launch-scope refusal reason for a blocked terminal-launch key chord.
 /// Reaches the model verbatim through the failed-action continuation, so
 /// it names the sanctioned alternative.
-const TERMINAL_LAUNCH_CHORD_REFUSAL: &str =
-    "computer use cannot launch terminals at launch: terminal-launch key chords (super/meta, \
+const TERMINAL_LAUNCH_CHORD_REFUSAL: &str = "computer use cannot launch terminals at launch: terminal-launch key chords (super/meta, \
      ctrl+alt+t, ctrl+alt+Fn, alt+f2) are blocked; use the run tool for shell commands instead";
 
 /// Launch-scope refusal reason for terminal-typed command text.
-const TERMINAL_TYPING_REFUSAL: &str =
-    "computer use cannot type shell commands at launch: typed text classified as a shell command \
+const TERMINAL_TYPING_REFUSAL: &str = "computer use cannot type shell commands at launch: typed text classified as a shell command \
      is blocked; use the run tool, which applies command approval and classification, instead";
 
 /// Launch-scope terminal-input policy (issue #289): computer use must not
@@ -500,18 +498,14 @@ const TERMINAL_TYPING_REFUSAL: &str =
 /// refusal reason.
 pub(crate) fn check_terminal_input_policy(action: &ComputerAction) -> Result<(), ComputerError> {
     match action {
-        ComputerAction::KeyChord { chord } if chord_is_terminal_launch(chord) => {
-            Err(ComputerError::Refused(
-                TERMINAL_LAUNCH_CHORD_REFUSAL.to_string(),
-            ))
-        }
+        ComputerAction::KeyChord { chord } if chord_is_terminal_launch(chord) => Err(
+            ComputerError::Refused(TERMINAL_LAUNCH_CHORD_REFUSAL.to_string()),
+        ),
         ComputerAction::HoldKey { key, .. } if key_is_meta(key) => Err(ComputerError::Refused(
             TERMINAL_LAUNCH_CHORD_REFUSAL.to_string(),
         )),
         ComputerAction::TypeText { text } if typed_text_is_terminal_command(text) => {
-            Err(ComputerError::Refused(
-                TERMINAL_TYPING_REFUSAL.to_string(),
-            ))
+            Err(ComputerError::Refused(TERMINAL_TYPING_REFUSAL.to_string()))
         }
         _ => Ok(()),
     }
@@ -6588,9 +6582,7 @@ mod tests {
         // `ctrl+alt+Fn`: virtual-console switch.
         for number in 1..=12 {
             assert!(
-                chord_is_terminal_launch(&chord(&[
-                    "ctrl", "alt", &format!("F{number}")
-                ])),
+                chord_is_terminal_launch(&chord(&["ctrl", "alt", &format!("F{number}")])),
                 "ctrl+alt+F{number} must be blocked as a virtual-console chord"
             );
         }

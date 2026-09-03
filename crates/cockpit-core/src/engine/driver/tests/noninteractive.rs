@@ -6589,6 +6589,52 @@ fn durable_noninteractive_descriptors_persist_workspace_lease_for_recovery() {
     );
 }
 
+#[test]
+fn durable_descriptors_persist_per_delegation_budget_for_recovery() {
+    use cockpit_config::config::delegation_budget::{DelegationBudgetSpec, SpendLimit};
+
+    let (driver, _tmp) = test_driver(8);
+    let overlay = DelegationBudgetSpec {
+        max_rounds: Some(SpendLimit::Finite(4)),
+        ..DelegationBudgetSpec::default()
+    };
+    let mut task = single_task(&driver, "explore", "task-budget-json", None, None);
+    task.budget = Some(overlay.clone());
+    let args: serde_json::Value =
+        serde_json::from_str(&single_noninteractive_original_args_json(&task).unwrap()).unwrap();
+    let recovered = crate::engine::agent::task_budget_spec(&args).unwrap();
+    assert_eq!(
+        recovered,
+        Some(overlay.clone()),
+        "single original_args_json must persist task.budget for recovery allotment"
+    );
+
+    let mut entry = batch_entry("child", "explore", None);
+    entry.budget = Some(overlay.clone());
+    let batch = BatchNoninteractiveTask {
+        entries: vec![entry],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-budget-json".to_string(),
+        task_provider_item_id: None,
+        task_function_call_id: None,
+    };
+    let args: serde_json::Value =
+        serde_json::from_str(&batch_noninteractive_original_args_json(&batch).unwrap()).unwrap();
+    let recovered = args
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(|entry| crate::engine::agent::task_budget_spec(entry).ok())
+        .flatten();
+    assert_eq!(
+        recovered,
+        Some(overlay),
+        "batch original_args_json must persist per-entry task.budget for recovery allotment"
+    );
+}
+
 #[tokio::test]
 async fn persist_after_mint_refusal_retires_managed_row_from_active() {
     let (mut driver, _tmp) = test_driver(8);

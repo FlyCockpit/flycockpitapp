@@ -935,6 +935,12 @@ pub struct AgentSession {
     /// child charges the same ledger with a tighter local cap; the parent
     /// must not keep the child's local ceiling after the pop.
     parent_budget: Option<crate::engine::delegation_budget::BudgetPool>,
+    /// Per-delegation `task.budget` overlay that was intersected into this
+    /// frame's local cap at allotment. Part of the child's allotment identity:
+    /// any later allot of this same child (resume, recovery, remint) must
+    /// pass it. `None` on the root frame and on children spawned without an
+    /// overlay.
+    per_delegation_budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
     /// This child frame's own `subagentStop` continuation latch. Keeping it on
     /// the frame makes the 8-continuation budget independent per nested child
     /// and — because it is dropped on every pop / unwind / teardown of the
@@ -2322,6 +2328,7 @@ impl Driver {
                     // admitted by the clone use the shared registry below.
                     _vnext_child_admission: None,
                     parent_budget: frame.parent_budget.clone(),
+                    per_delegation_budget: frame.per_delegation_budget.clone(),
                     // Carry the child's continuation budget so a cloned frame
                     // cannot silently reset its 8-cap.
                     stop_gate: frame.stop_gate.clone(),
@@ -2724,6 +2731,7 @@ impl Driver {
                 late_user_steer_permit: None,
                 _vnext_child_admission: None,
                 parent_budget: None,
+                per_delegation_budget: None,
                 stop_gate: crate::engine::agent::hooks::StopGateState::default(),
             }],
             pending_late_user_steer_acks: std::collections::HashMap::new(),
@@ -3123,22 +3131,28 @@ impl Driver {
             .config
             .extended()
             .resolved_delegation_budget(root_name, None);
-        self.budget = crate::engine::delegation_budget::BudgetPool::new(resolved);
+        // Remint the session-live ledger in place. `BudgetPool::new` here
+        // would orphan in-flight swarm / background `task` / schedule clones
+        // and fail open on the hierarchical aggregate cap. Stacked children
+        // keep the handle allotted at spawn (overlay already baked into the
+        // local cap); re-allotting would drop `task.budget`.
+        let root = self.root_budget_handle();
+        root.remint_root(resolved);
         self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);
         self.budget.reset_retry_turn();
-        self.schedule.set_budget(self.budget.share());
-        if self.stack.len() > 1 {
-            let child_name = self
-                .stack
-                .last()
-                .map(|frame| frame.agent.name.clone())
-                .unwrap_or_else(|| "Build".to_string());
-            let parent = self.allot_child_budget(&child_name, None);
-            if let Some(frame) = self.stack.last_mut() {
-                frame.parent_budget = Some(parent);
-            }
-        }
+        self.schedule.set_budget(root.share());
         self.bind_active_retry_budget();
+    }
+
+    /// The session-root spend handle. Nested frames store the parent pool on
+    /// `parent_budget`; the driver's `budget` is the active (innermost) local
+    /// cap. Remint and schedule rebind must target the root so a stacked
+    /// child's overlay is not widened to the root ceiling.
+    fn root_budget_handle(&self) -> crate::engine::delegation_budget::BudgetPool {
+        self.stack
+            .iter()
+            .find_map(|frame| frame.parent_budget.clone())
+            .unwrap_or_else(|| self.budget.clone())
     }
 
     pub(crate) fn bind_active_retry_budget(&mut self) {
@@ -4435,7 +4449,11 @@ impl Driver {
             &self.spawn_args_delegated(true, granted_tools, model, child_recursion),
         )
         .context("loading recovered interactive task child")?;
-        let parent_budget = self.allot_child_budget(&recovery.child_agent, None);
+        let per_delegation_budget = crate::engine::agent::task_budget_spec(&args)
+            .map_err(anyhow::Error::msg)
+            .context("recovered interactive task has an invalid budget overlay")?;
+        let parent_budget =
+            self.allot_child_budget(&recovery.child_agent, per_delegation_budget.as_ref());
         let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
         let recovered_frame = AgentSession {
             queue_target: crate::engine::message::QueueTarget::child(
@@ -4464,6 +4482,7 @@ impl Driver {
             late_user_steer_permit: None,
             _vnext_child_admission: admission.pop(),
             parent_budget: Some(parent_budget),
+            per_delegation_budget,
             stop_gate: crate::engine::agent::hooks::StopGateState::default(),
         };
         self.mutate_live_stack(|stack| stack.push(recovered_frame));
@@ -14515,6 +14534,7 @@ impl Driver {
                         "function_call_id": &task_function_call_id,
                         "repair_notes": &repair_notes,
                         "interactive": true,
+                        "budget": &budget,
                     }))
                     .ok();
                     let model_display = model_selector_display(&model);
@@ -14851,6 +14871,7 @@ impl Driver {
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
                         parent_budget: Some(self.allot_child_budget(&child_agent, budget.as_ref())),
+                        per_delegation_budget: budget,
                         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
                     };
                     self.mutate_live_stack(|stack| stack.push(child_frame));

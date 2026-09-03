@@ -2275,6 +2275,33 @@ fn install_turn_budget_rebinds_schedule_to_the_driver_ledger() {
     );
 }
 
+#[test]
+fn install_turn_budget_does_not_orphan_in_flight_clones() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.install_turn_budget();
+    let in_flight = driver.budget.clone();
+    in_flight
+        .charge_round()
+        .expect("first turn can spend against the live ledger");
+    assert_eq!(driver.budget.snapshot().spent.rounds, 1);
+    driver.install_turn_budget();
+    let schedule_budget = driver.schedule.schedule_context_for_tests().budget;
+    assert!(
+        driver.budget.shares_ledger_with(&in_flight),
+        "a remint must not allocate a new ledger while background/swarm clones still charge"
+    );
+    assert!(driver.budget.shares_ledger_with(&schedule_budget));
+    assert_eq!(
+        in_flight.snapshot().spent.rounds,
+        0,
+        "turn remint resets spend on the shared ledger"
+    );
+    in_flight
+        .charge_round()
+        .expect("post-remint charge hits the new remaining");
+    assert_eq!(driver.budget.snapshot().spent.rounds, 1);
+}
+
 #[tokio::test]
 async fn turn_loop_terminal_inference_failure_ends_turn_cleanly() {
     let provider = ScriptedProvider::builder()

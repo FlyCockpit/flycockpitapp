@@ -83,8 +83,8 @@ pub use events::{
     AgentTreeExecutorRequest, AgentTreeResolverRequest, ControlRequestId,
     ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
 };
-pub(crate) use outcome::collapse_continue_without_injection;
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
+pub(crate) use outcome::{collapse_continue_without_injection, task_budget_spec};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;
 

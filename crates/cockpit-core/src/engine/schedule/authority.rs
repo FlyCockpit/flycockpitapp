@@ -651,9 +651,11 @@ impl ScheduleAuthority {
         self.ctx.update(|ctx| ctx.config = config);
     }
 
-    /// Rebind scheduled work to the driver's live spend ledger. Called when
-    /// the turn budget is reminted so schedule/swarm/goal loops cannot keep a
-    /// frozen defaults() pool disjoint from the foreground.
+    /// Publish the driver's live spend handle so newly spawned swarm/loop
+    /// work allots from the current turn remaining. Turn install remints that
+    /// ledger in place (same Arc); in-flight runners that already cloned a
+    /// handle keep charging it. `start_swarm_now` snapshots once for the
+    /// runner lifetime — it must not mint a disjoint ledger.
     pub fn set_budget(&mut self, budget: crate::engine::delegation_budget::BudgetPool) {
         self.ctx.update(|ctx| ctx.budget = budget);
     }
@@ -733,6 +735,10 @@ impl ScheduleAuthority {
 
         let cancel = self.session_work_cancel.child_for_generation(generation);
         let mut ctx = self.ctx.snapshot();
+        // Swarm `spawn` has no per-delegation overlay; the child's per-agent
+        // resolved ceiling is intersected with the live parent remaining.
+        // The allotted handle shares the session ledger, so a later turn
+        // remint cannot orphan this runner.
         ctx.budget = ctx.allot_child(spec.worker.agent_name(), None);
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),

@@ -1361,6 +1361,7 @@ pub(in crate::engine::driver) fn single_noninteractive_original_args_json(
         "provider_item_id": &task.task_provider_item_id,
         "function_call_id": &task.task_function_call_id,
         "interactive": false,
+        "budget": &task.budget,
     }))
     .ok()
 }
@@ -1385,6 +1386,7 @@ pub(in crate::engine::driver) fn batch_noninteractive_original_args_json(
             "workspace_lease": &entry.workspace_lease,
             "granted_tools": &entry.granted_tools,
             "todo_ids": &entry.todo_ids,
+            "budget": &entry.budget,
         })).collect::<Vec<_>>(),
         "why": &task.why,
         "repair_notes": &task.repair_notes,
@@ -2153,7 +2155,9 @@ impl Driver {
                 start_gate: None,
                 endpoint_collector: Some(endpoint_collector.clone()),
             }),
-            budget: None,
+            budget: crate::engine::agent::task_budget_spec(entry)
+                .map_err(anyhow::Error::msg)
+                .context("recovered noninteractive task has an invalid budget overlay")?,
         };
         self.launch_recovered_noninteractive_task(task, tx).await?;
         endpoint_attached
@@ -2313,7 +2317,9 @@ impl Driver {
                 start_gate: None,
                 endpoint_collector: Some(endpoint_collector),
             }),
-            budget: None,
+            budget: crate::engine::agent::task_budget_spec(entry)
+                .map_err(anyhow::Error::msg)
+                .context("recovered batch child has an invalid budget overlay")?,
         })
     }
 
@@ -4194,7 +4200,7 @@ impl Driver {
                 recovery.pending_recursive,
                 recovered_seed_reads,
                 Some(self.budget.clone()),
-                None,
+                budget,
             )
             .await;
             let retire = if let Some(lease) = recovered_workspace_lease.as_ref() {
@@ -9553,6 +9559,7 @@ struct PreparedRecoveredRecursiveExecutor {
     child: Agent,
     child_cwd: std::path::PathBuf,
     snapshot: NoninteractiveRecoverySnapshot,
+    budget: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 }
 
 async fn prepare_recovered_recursive_noninteractive_executor(
@@ -9585,6 +9592,9 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         .and_then(serde_json::Value::as_str)
         .context("recursive executor launch descriptor has no child agent")?
         .to_owned();
+    let budget = crate::engine::agent::task_budget_spec(&launch)
+        .map_err(anyhow::Error::msg)
+        .context("recursive executor launch descriptor has an invalid budget overlay")?;
     let model =
         crate::engine::model_roles::DelegationModelSelector::from_value(launch.get("model"))
             .map_err(anyhow::Error::msg)?;
@@ -9769,6 +9779,7 @@ async fn prepare_recovered_recursive_noninteractive_executor(
         child,
         child_cwd,
         snapshot,
+        budget,
     })
 }
 
@@ -9882,6 +9893,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         child,
         child_cwd,
         snapshot,
+        budget,
     } = prepare_recovered_recursive_noninteractive_executor(
         &descriptor,
         parent_agent,
@@ -9930,7 +9942,7 @@ async fn run_recovered_recursive_noninteractive_executor(
         snapshot.pending_recursive,
         Vec::new(),
         None,
-        None,
+        budget,
     )
     .await
     .map(|outcome| outcome.report)
@@ -10733,6 +10745,10 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .resolved_delegation_budget(&agent.name, per_delegation.as_ref());
     let budget = match parent_budget {
         Some(parent) => parent.allot(child_ceiling),
+        // Docs pipeline, fresh utility, and crash-recovery recursive (parent
+        // remainder is not persisted). The child's own overlay still bounds
+        // this mint via `child_ceiling`; sharing the parent ledger across a
+        // process restart is the deferred durable remainder.
         None => crate::engine::delegation_budget::BudgetPool::new(child_ceiling),
     };
     scheduled_lane_driver.budget = budget.clone();
@@ -12651,6 +12667,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                     "cwd": child_cwd.to_string_lossy(),
                                     "write_scope": &resolved_write_scope,
                                     "workspace_lease": durable_workspace_lease_id(live_lease.as_ref()),
+                                    "budget": &nested_budget,
                                 }));
                                 let snapshot_json = ready_noninteractive_recovery_snapshot(
                                     Vec::new(),
@@ -13271,6 +13288,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                             "cwd": child_cwd.to_string_lossy(),
                                             "write_scope": &entry.write_scope,
                                             "workspace_lease": durable_workspace_lease_id(child.workspace_lease.as_deref()),
+                                            "budget": &entry.budget,
                                         }))
                                         .context("serializing recursive batch child launch descriptor")?)?,
                                         snapshot: validated_recursive_noninteractive_snapshot(ready_noninteractive_recovery_snapshot(

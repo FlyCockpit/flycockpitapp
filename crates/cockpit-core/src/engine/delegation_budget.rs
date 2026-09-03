@@ -371,6 +371,35 @@ impl BudgetPool {
         Self::new(ResolvedDelegationBudget::schedule_run_defaults())
     }
 
+    /// Reconfigure the shared ledger and this handle's local ceiling in place.
+    ///
+    /// Turn install must never allocate a new shared ledger: clones held by
+    /// in-flight swarm, background `task`, and schedule runners would keep
+    /// charging the orphaned pool, and foreground + stale descendants could
+    /// each consume a full root cap. Lock order matches [`Self::charge`]:
+    /// ledger, then local.
+    ///
+    /// Allotted children's local caps are untouched (they keep the overlay
+    /// baked in at spawn). Compact progress and retry pacing are liveness
+    /// guards and are not reset here.
+    pub fn remint_root(&self, ceiling: ResolvedDelegationBudget) {
+        let now = Instant::now();
+        let mut ledger = lock_or_recover(&self.ledger);
+        let mut local = lock_or_recover(&self.local);
+        ledger.ceiling = ceiling;
+        ledger.spent_rounds = 0;
+        ledger.spent_input_tokens = 0;
+        ledger.spent_output_tokens = 0;
+        ledger.spent_cost_microusd = 0;
+        ledger.started_at = now;
+        local.ceiling = ceiling;
+        local.spent_rounds = 0;
+        local.spent_input_tokens = 0;
+        local.spent_output_tokens = 0;
+        local.spent_cost_microusd = 0;
+        local.started_at = now;
+    }
+
     /// Shared view of this pool (swarm fan-out). Children charge the same
     /// remaining budget; they also share the local cap so K children cannot
     /// each spend the full allotment.
@@ -814,5 +843,50 @@ mod tests {
         let text = pool.snapshot().render();
         assert!(text.contains("unlimited"), "{text}");
         assert!(text.contains("unlimited spend"), "{text}");
+    }
+
+    #[test]
+    fn remint_root_keeps_ledger_identity_and_resets_spend() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(2),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let in_flight = root.share();
+        in_flight.charge_round().unwrap();
+        assert_eq!(root.snapshot().spent.rounds, 1);
+        root.remint_root(ResolvedDelegationBudget {
+            max_rounds: Some(2),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        assert!(root.shares_ledger_with(&in_flight));
+        assert_eq!(in_flight.snapshot().spent.rounds, 0);
+        in_flight.charge_round().unwrap();
+        in_flight.charge_round().unwrap();
+        assert!(in_flight.charge_round().is_err());
+        assert_eq!(root.snapshot().spent.rounds, 2);
+    }
+
+    #[test]
+    fn remint_root_does_not_widen_allotted_child_overlay() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(8),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let child = root.allot(ResolvedDelegationBudget {
+            max_rounds: Some(1),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        root.remint_root(ResolvedDelegationBudget {
+            max_rounds: Some(8),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        assert!(root.shares_ledger_with(&child));
+        child.charge_round().unwrap();
+        assert!(
+            child.charge_round().is_err(),
+            "child overlay must survive a parent remint"
+        );
+        root.charge_round().unwrap();
+        assert_eq!(root.snapshot().spent.rounds, 2);
     }
 }

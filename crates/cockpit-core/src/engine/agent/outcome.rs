@@ -412,7 +412,7 @@ pub(super) fn task_todo_ids(args: &Value) -> Vec<uuid::Uuid> {
         .unwrap_or_default()
 }
 
-pub(super) fn task_budget_spec(
+pub(crate) fn task_budget_spec(
     args: &Value,
 ) -> Result<Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>, String> {
     let Some(value) = args.get("budget") else {

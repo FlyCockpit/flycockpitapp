@@ -35,7 +35,18 @@ pub(crate) fn computer_backend_open_remediation(
 ) -> &'static str {
     match error {
         ComputerError::MissingTool { .. } => {
-            "Install the missing host tools listed above on this Linux host"
+            #[cfg(target_os = "linux")]
+            {
+                "Install the missing host tools listed above on this Linux host"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "Install the missing host tools listed above on this Mac"
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                "Install the missing host tools listed above on this host"
+            }
         }
         ComputerError::UnsupportedPlatform { .. } => match target {
             DisplayTarget::Virtual => {
@@ -749,33 +760,42 @@ mod tests {
             tool: "Xvfb".to_string(),
             install_hint: "the `xvfb` package".to_string(),
         };
-        assert!(
-            computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool)
-                .contains("Install the missing host tools")
-        );
-        assert!(
-            !computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool)
-                .contains("computer_target")
-        );
+        let virtual_missing_hint =
+            computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool);
+        assert!(virtual_missing_hint.contains("Install the missing host tools"));
+        assert!(!virtual_missing_hint.contains("computer_target"));
+        #[cfg(target_os = "linux")]
+        assert!(virtual_missing_hint.contains("Linux host"));
+        #[cfg(target_os = "macos")]
+        assert!(virtual_missing_hint.contains("this Mac"));
+        #[cfg(target_os = "macos")]
+        assert!(!virtual_missing_hint.contains("Linux"));
 
         let real_desktop_missing_tool = ComputerError::MissingTool {
             tool: "xdotool".to_string(),
             install_hint: "the `xdotool` package".to_string(),
         };
-        assert!(
-            computer_backend_open_remediation(
-                DisplayTarget::RealDesktop,
-                &real_desktop_missing_tool
-            )
-            .contains("Install the missing host tools")
+        let real_desktop_missing_hint = computer_backend_open_remediation(
+            DisplayTarget::RealDesktop,
+            &real_desktop_missing_tool,
         );
-        assert!(
-            !computer_backend_open_remediation(
+        assert!(real_desktop_missing_hint.contains("Install the missing host tools"));
+        assert!(!real_desktop_missing_hint.contains("machine grant"));
+        #[cfg(target_os = "linux")]
+        assert!(real_desktop_missing_hint.contains("Linux host"));
+        #[cfg(target_os = "macos")]
+        {
+            let screencapture_missing = ComputerError::MissingTool {
+                tool: "/usr/sbin/screencapture".to_string(),
+                install_hint: "the system macOS screencapture utility".to_string(),
+            };
+            let mac_hint = computer_backend_open_remediation(
                 DisplayTarget::RealDesktop,
-                &real_desktop_missing_tool
-            )
-            .contains("machine grant")
-        );
+                &screencapture_missing,
+            );
+            assert!(mac_hint.contains("this Mac"));
+            assert!(!mac_hint.contains("Linux"));
+        }
 
         let command_failed = ComputerError::CommandFailed {
             program: "Xvfb".to_string(),

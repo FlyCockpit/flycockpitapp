@@ -2802,13 +2802,42 @@ pub(crate) fn linux_machine_grant_fingerprint_from_path(path: &std::path::Path) 
     linux_machine_grant_fingerprint_from_id(&machine_id)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+static LINUX_MACHINE_ID_PATH_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, target_os = "linux"))]
+fn linux_machine_id_path_override_for_tests() -> Option<std::path::PathBuf> {
+    LINUX_MACHINE_ID_PATH_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_linux_machine_id_path_override_for_tests(path: Option<std::path::PathBuf>) {
+    let mut guard = LINUX_MACHINE_ID_PATH_OVERRIDE
+        .lock()
+        .expect("linux machine-id path override mutex");
+    *guard = path;
+}
+
+#[cfg(target_os = "linux")]
+fn linux_machine_id_path_for_grant() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(path) = linux_machine_id_path_override_for_tests() {
+        return path;
+    }
+    std::path::PathBuf::from(LINUX_MACHINE_ID_PATH)
+}
+
 /// Grant comparison is bound to the OS-owned `/etc/machine-id` (hashed before
 /// storage). The value is not caller-settable and the check fails closed when
 /// it is inaccessible or empty. Cloned disk or container images that duplicate
 /// `/etc/machine-id` will share grant authorization.
 #[cfg(target_os = "linux")]
 fn current_machine_fingerprint() -> Option<String> {
-    linux_machine_grant_fingerprint_from_path(std::path::Path::new(LINUX_MACHINE_ID_PATH))
+    linux_machine_grant_fingerprint_from_path(&linux_machine_id_path_for_grant())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -5558,23 +5587,54 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    struct LinuxMachineIdPathOverrideGuard {
+        _env: crate::test_env::TestEnvGuard,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LinuxMachineIdPathOverrideGuard {
+        fn point_at(path: &std::path::Path) -> Self {
+            let env = crate::test_env::lock();
+            set_linux_machine_id_path_override_for_tests(Some(path.to_path_buf()));
+            Self { _env: env }
+        }
+
+        fn set_var<K, V>(&self, key: K, value: V)
+        where
+            K: AsRef<std::ffi::OsStr>,
+            V: AsRef<std::ffi::OsStr>,
+        {
+            self._env.set_var(key, value);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LinuxMachineIdPathOverrideGuard {
+        fn drop(&mut self) {
+            set_linux_machine_id_path_override_for_tests(None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_grant_fingerprint_reader_fails_closed_without_machine_id() {
+        let _env = crate::test_env::lock();
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("missing-machine-id");
         assert!(!missing.exists());
         // Regression guard: an env-derived fallback would authorize from HOSTNAME here.
-        std::env::set_var("HOSTNAME", "regression-hostname-fallback-trap");
+        _env.set_var("HOSTNAME", "regression-hostname-fallback-trap");
         assert_eq!(linux_machine_grant_fingerprint_from_path(&missing), None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_grant_fingerprint_reader_uses_only_machine_id_file() {
+        let _env = crate::test_env::lock();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("machine-id");
         fs::write(&path, "fixture-reader-seam-id\n").unwrap();
-        std::env::set_var("HOSTNAME", "different-from-file");
+        _env.set_var("HOSTNAME", "different-from-file");
         assert_eq!(
             linux_machine_grant_fingerprint_from_path(&path),
             linux_machine_grant_fingerprint_from_id("fixture-reader-seam-id")
@@ -5626,6 +5686,26 @@ mod tests {
         assert_eq!(
             current_machine_fingerprint(),
             linux_machine_grant_fingerprint_from_id(machine_id.trim())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_current_machine_grant_fails_closed_without_machine_id_despite_hostname_trap() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("missing-machine-id");
+        assert!(!missing.exists());
+        let _path = LinuxMachineIdPathOverrideGuard::point_at(&missing);
+        let hostname = "regression-hostname-fallback-trap";
+        _path.set_var("HOSTNAME", hostname);
+        let trap_grant =
+            linux_machine_grant_fingerprint_from_id(hostname).expect("hostname hashes for trap");
+        let grant_path = tmp.path().join("real-desktop-grant");
+        fs::write(&grant_path, trap_grant).unwrap();
+        let store = RealDesktopGrantStore::new(grant_path);
+        assert!(
+            !store.has_current_machine_grant(),
+            "production grant check must not authorize from HOSTNAME when machine-id is absent"
         );
     }
 

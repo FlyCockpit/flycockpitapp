@@ -12,6 +12,15 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+# Test instrumentation only, never a production edge: exposes the audited
+# DACL-apply test seam (`goal_scratch::apply_test_windows_dacl`) so upper
+# crates' Windows tests can inject a broad ACL and prove the private-verify
+# paths reject it. Mirrors the `test-support` feature convention of
+# `cockpit-core` / `cockpit-config` / `cockpit-db`.
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 rand = { workspace = true }

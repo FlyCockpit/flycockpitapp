@@ -347,7 +347,7 @@ impl LiveScheduleContext {
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // An in-place compaction refreshes this same root session. Its fork is
+        // Compaction seeds a linked successor window. Its fork is
         // still valid, including accumulated non-independent loop history.
         // Only a different root session retires that fork.
         if !Arc::ptr_eq(&state.ctx.session, &ctx.session) {
@@ -1286,7 +1286,7 @@ impl ScheduleAuthority {
     /// Emit the UI-only `started` signal.
     fn emit_started(&self, job_id: &str, label: &str, kind: ScheduleKind) {
         let _ = self.turn_tx.try_send(TurnEvent::ScheduleStarted {
-            session_id: self.ctx.snapshot().session.id,
+            session_id: self.ctx.snapshot().session.live_id(),
             job_id: job_id.to_string(),
             label: label.to_string(),
             kind: kind.as_str().to_string(),

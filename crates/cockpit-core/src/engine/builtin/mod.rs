@@ -6697,7 +6697,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_computer_provider_config(
             tmp.path(),
-            "{}",
+            r#"{"computer_target":"real_desktop"}"#,
             r#"{
                 "url": "http://localhost:1/v1",
                 "computer_use": "yolo",
@@ -7532,6 +7532,7 @@ pub(crate) mod tests {
 
         // CompactReady still carries a handoff string field (compaction).
         let compact_ready = TurnEvent::CompactReady {
+            predecessor_session_id: uuid::Uuid::nil(),
             new_session_id: uuid::Uuid::nil(),
             handoff: "brief".into(),
             brief: "brief body".into(),

@@ -1815,6 +1815,9 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         pin_count: _,
         assistant_inbox_unread: _,
         assistant_inbox_latest_source_session_id: _,
+        compaction_predecessor_session_id: _,
+        compaction_lineage_root_id: _,
+        lineage_window_count: _,
     } = summary;
     scrub_string(project_root, redact);
     scrub_option_string(title, redact);
@@ -5325,7 +5328,6 @@ pub(super) struct SharedClientState {
 
 #[derive(Clone)]
 pub(super) struct SharedAttachedSession {
-    session_id: Uuid,
     project_root: PathBuf,
     workspace_identity: Option<crate::daemon::agent_installation::AuthorizedWorkspaceRoot>,
     /// A concurrent request still has to enter the one attached session worker
@@ -5340,7 +5342,11 @@ pub(super) struct SharedAttachedSession {
 
 impl SharedAttachedSession {
     pub(super) fn session_id(&self) -> Uuid {
-        self.session_id
+        self.handle.session_id()
+    }
+
+    pub(super) fn handle(&self) -> &SessionWorkerHandle {
+        &self.handle
     }
 
     pub(super) fn config_snapshot(&self) -> crate::daemon::session_worker::SessionConfigSnapshot {
@@ -5439,7 +5445,6 @@ impl MutableClientState {
             terminal_host: self.terminal_host.clone(),
             terminal_views: self.terminal_views.clone(),
             attached: self.attached.as_ref().map(|att| SharedAttachedSession {
-                session_id: att.handle.session_id,
                 project_root: att.handle.project_root.clone(),
                 workspace_identity: att.workspace_identity.clone(),
                 handle: att.handle.clone(),
@@ -5728,7 +5733,7 @@ async fn run_in_process_client(
                             let session_id = state
                                 .attached
                                 .as_ref()
-                                .map(|attached| attached.handle.session_id);
+                                .map(|attached| attached.handle.session_id());
                             let event = envelope.event;
                             let delivered = try_send_in_process_event(
                                 &event_tx,
@@ -5754,7 +5759,7 @@ async fn run_in_process_client(
                             let session_id = state
                                 .attached
                                 .as_ref()
-                                .map(|attached| attached.handle.session_id);
+                                .map(|attached| attached.handle.session_id());
                             pending_lag.record_many(n, session_id);
                         }
                         Some(Err(broadcast::error::RecvError::Closed)) => {
@@ -5807,7 +5812,7 @@ async fn run_in_process_client(
                         let session_id = state
                             .attached
                             .as_ref()
-                            .map(|attached| attached.handle.session_id);
+                            .map(|attached| attached.handle.session_id());
                         for event in std::mem::take(&mut state.pending_replay) {
                             let delivered = try_send_in_process_event(&event_tx, event.clone(), session_id, &mut pending_lag);
                             if matches!(delivered, InProcessEventSend::Enqueued)
@@ -6749,7 +6754,7 @@ async fn handle_envelope(
                     let session_id = state
                         .attached
                         .as_ref()
-                        .map(|attached| attached.handle.session_id);
+                        .map(|attached| attached.handle.session_id());
                     if let Some(session_id) = session_id {
                         let rendered_interrupts = state
                             .attached

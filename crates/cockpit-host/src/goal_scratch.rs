@@ -240,8 +240,15 @@ fn set_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Apply the protected owner-only DACL to a directory or file and re-verify it
+/// through the written object.
+///
+/// `pub` (not `pub(crate)`): the audited DACL primitives are shared by
+/// `cockpit-core`'s spool guard, media storage, and their Windows tests, which
+/// sit in another crate; the graph has no inversion because they are leaf
+/// host-OS primitives of this crate.
 #[cfg(windows)]
-pub(crate) fn set_private(path: &Path) -> Result<()> {
+pub fn set_private(path: &Path) -> Result<()> {
     apply_windows_dacl(path, "D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_dir() {
@@ -302,8 +309,15 @@ fn apply_windows_dacl(path: &Path, descriptor_text: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(windows, test))]
-pub(crate) fn apply_test_windows_dacl(path: &Path, descriptor: &str) -> Result<()> {
+/// Apply an arbitrary test DACL to a path. Test instrumentation behind the
+/// explicit `test-support` cargo feature — mirroring `cockpit_core`'s
+/// convention — NOT `cfg(test)`: `cfg(test)` is only active while compiling
+/// this crate's own test target, so an upper crate's Windows tests (which link
+/// the normal rlib, e.g. `cockpit-core`'s spool-guard test) would not see the
+/// symbol and would fail to compile. Never a production edge: production
+/// code calls [`set_private`] / [`verify_private_dacl`].
+#[cfg(all(windows, any(test, feature = "test-support")))]
+pub fn apply_test_windows_dacl(path: &Path, descriptor: &str) -> Result<()> {
     apply_windows_dacl(path, descriptor)
 }
 
@@ -341,8 +355,11 @@ fn verify_no_reparse_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verify a path's security descriptor is the protected current-user-and-
+/// SYSTEM-only DACL. `pub` for the same cross-crate reason as
+/// [`set_private`].
 #[cfg(windows)]
-pub(crate) fn verify_private_dacl(path: &Path) -> Result<()> {
+pub fn verify_private_dacl(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 

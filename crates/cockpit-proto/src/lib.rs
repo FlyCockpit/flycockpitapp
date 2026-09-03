@@ -7574,6 +7574,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             },
         };
@@ -7601,6 +7602,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: None,
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,
@@ -7617,6 +7619,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,

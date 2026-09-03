@@ -5,7 +5,10 @@
 //! mutation composition for sessions.
 
 use super::authz::ClientPrincipal;
-use super::sessions::{btw_info_to_proto, stop_subtree};
+use super::sessions::{
+    btw_info_to_proto, detach_if_attached_to_discard_lineage, stop_ephemeral_discard_lineage,
+    stop_subtree,
+};
 use super::*;
 
 #[derive(Debug, thiserror::Error)]
@@ -316,21 +319,13 @@ pub(super) async fn discard_session(
         // Durable replay does not replay connection-local state. A client
         // which reissues discard on a new connection must still detach its
         // own handle before observing the cached success.
-        if state
-            .attached
-            .as_ref()
-            .is_some_and(|att| att.handle.session_id == session_id)
-        {
-            state.attached = None;
-        }
+        detach_if_attached_to_discard_lineage(state, ctx, session_id).await?;
         return Ok(cached);
     }
     // The ingress identity guard makes this worker stop exclusive with every
     // same-identity contender. The client-local detach remains post-commit.
-    ctx.registry
-        .interrupt_and_stop(session_id)
-        .await
-        .map_err(internal)?;
+    // Predecessor-addressed discard still has to stop the live tip.
+    let _ = stop_ephemeral_discard_lineage(ctx, session_id).await?;
     let response = commit_session_remote_mutation(ctx, ledger, "discard_session", move |conn| {
         let existed = crate::db::Db::discard_ephemeral_session_conn(conn, session_id)?;
         require_mutated(existed, session_id)?;
@@ -343,13 +338,7 @@ pub(super) async fn discard_session(
     if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&ctx.db).await {
         tracing::warn!(%error, %session_id, "ledgered discard text artifact cleanup remains pending");
     }
-    if state
-        .attached
-        .as_ref()
-        .is_some_and(|att| att.handle.session_id == session_id)
-    {
-        state.attached = None;
-    }
+    detach_if_attached_to_discard_lineage(state, ctx, session_id).await?;
     Ok(response)
 }
 

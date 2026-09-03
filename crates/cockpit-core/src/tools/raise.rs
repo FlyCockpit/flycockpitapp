@@ -87,7 +87,7 @@ impl Tool for RaiseTool {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("`raise` requires a tool-call correlation identity"))?;
         let durable_write = ctx.session.db.raise_assistant_inbox_item(
-            ctx.session.id,
+            ctx.session.live_id(),
             operation_scope,
             operation_id,
             summary,

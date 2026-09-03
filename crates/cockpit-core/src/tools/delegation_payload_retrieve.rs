@@ -68,7 +68,7 @@ impl Tool for DelegationPayloadRetrieveTool {
         let Some(payload) = ctx
             .session
             .db
-            .load_task_delegation_payload_by_hash(ctx.session.id, hash)
+            .load_task_delegation_payload_by_hash(ctx.session.live_id(), hash)
             .await?
         else {
             return Ok(ToolOutput::text(format!(

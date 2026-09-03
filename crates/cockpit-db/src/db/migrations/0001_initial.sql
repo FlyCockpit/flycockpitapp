@@ -245,6 +245,16 @@ CREATE TABLE sessions (
     btw_parent_session_id TEXT,
     btw_tangent INTEGER NOT NULL DEFAULT 0 CHECK (btw_tangent IN (0, 1)),
 
+    -- Typed linear compaction predecessor. Distinct from parent_session_id
+    -- (forks) and btw_parent_session_id (side conversations): a session is
+    -- one context window, and this edge links windows into a conversation
+    -- lineage. Forks keep their own lineage root.
+    compaction_predecessor_session_id TEXT,
+    -- Stable conversation id. Roots and forks use their own session_id
+    -- (filled by sessions_lineage_root_fill when omitted). Compaction
+    -- successors copy the predecessor's lineage root.
+    compaction_lineage_root_id TEXT,
+
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
     -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
@@ -290,14 +300,53 @@ CREATE TABLE sessions (
         AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
     )),
     CHECK (is_assistant_thread = 0 OR (
-        parent_session_id IS NOT NULL
-        AND fork_point_turn_id IS NOT NULL
+        (
+            (parent_session_id IS NOT NULL AND fork_point_turn_id IS NOT NULL)
+            OR compaction_predecessor_session_id IS NOT NULL
+        )
         AND ephemeral = 0
         AND btw_parent_session_id IS NULL
         AND assistant_name IS NOT NULL
         AND is_dream_session = 0
     )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
+    CHECK (
+        compaction_predecessor_session_id IS NULL
+        OR compaction_predecessor_session_id <> session_id
+    ),
+    -- A window is either a fork or a compaction successor, never both.
+    CHECK (
+        parent_session_id IS NULL
+        OR compaction_predecessor_session_id IS NULL
+    ),
+    CHECK (
+        compaction_predecessor_session_id IS NULL
+        OR compaction_lineage_root_id IS NOT NULL
+    ),
+    CHECK (
+        compaction_lineage_root_id IS NULL OR (
+            length(compaction_lineage_root_id) = 36
+            AND compaction_lineage_root_id = lower(compaction_lineage_root_id)
+            AND substr(compaction_lineage_root_id, 9, 1) = '-'
+            AND substr(compaction_lineage_root_id, 14, 1) = '-'
+            AND substr(compaction_lineage_root_id, 19, 1) = '-'
+            AND substr(compaction_lineage_root_id, 24, 1) = '-'
+            AND length(replace(compaction_lineage_root_id, '-', '')) = 32
+            AND replace(compaction_lineage_root_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        compaction_predecessor_session_id IS NULL OR (
+            length(compaction_predecessor_session_id) = 36
+            AND compaction_predecessor_session_id = lower(compaction_predecessor_session_id)
+            AND substr(compaction_predecessor_session_id, 9, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 14, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 19, 1) = '-'
+            AND substr(compaction_predecessor_session_id, 24, 1) = '-'
+            AND length(replace(compaction_predecessor_session_id, '-', '')) = 32
+            AND replace(compaction_predecessor_session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
     CHECK (last_viewed_at_unix_ms IS NULL OR last_viewed_at_unix_ms >= started_at_unix_ms),
     CHECK (archived_at_unix_ms IS NULL OR archived_at_unix_ms >= started_at_unix_ms),
@@ -305,7 +354,9 @@ CREATE TABLE sessions (
     FOREIGN KEY (parent_session_id, fork_point_turn_id)
         REFERENCES session_events(session_id, seq)
         ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (compaction_predecessor_session_id) REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (compaction_lineage_root_id) REFERENCES sessions(session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 -- ---- Monty governed network capability -----------------------------------
@@ -342,18 +393,23 @@ CREATE TABLE monty_network_agent_grants (
 -- cycle-safe if a pre-release database was externally corrupted before this
 -- trigger existed; valid mutations fail before introducing another cycle.
 CREATE TRIGGER sessions_parent_cycle_guard
-BEFORE UPDATE OF parent_session_id, btw_parent_session_id ON sessions
+BEFORE UPDATE OF parent_session_id, btw_parent_session_id, compaction_predecessor_session_id ON sessions
 WHEN EXISTS (
     WITH RECURSIVE ancestors(session_id) AS (
         SELECT NEW.parent_session_id WHERE NEW.parent_session_id IS NOT NULL
         UNION
         SELECT NEW.btw_parent_session_id WHERE NEW.btw_parent_session_id IS NOT NULL
         UNION
+        SELECT NEW.compaction_predecessor_session_id WHERE NEW.compaction_predecessor_session_id IS NOT NULL
+        UNION
         SELECT s.parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.parent_session_id IS NOT NULL
         UNION
         SELECT s.btw_parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.btw_parent_session_id IS NOT NULL
+        UNION
+        SELECT s.compaction_predecessor_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.compaction_predecessor_session_id IS NOT NULL
     )
     SELECT 1 FROM ancestors WHERE session_id=NEW.session_id
 )
@@ -372,16 +428,35 @@ WHEN EXISTS (
         UNION
         SELECT NEW.btw_parent_session_id WHERE NEW.btw_parent_session_id IS NOT NULL
         UNION
+        SELECT NEW.compaction_predecessor_session_id WHERE NEW.compaction_predecessor_session_id IS NOT NULL
+        UNION
         SELECT s.parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.parent_session_id IS NOT NULL
         UNION
         SELECT s.btw_parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
           WHERE s.btw_parent_session_id IS NOT NULL
+        UNION
+        SELECT s.compaction_predecessor_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.compaction_predecessor_session_id IS NOT NULL
     )
     SELECT 1 FROM ancestors WHERE session_id=NEW.session_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'session parent cycle');
+END;
+
+-- Roots and forks omitted from compaction_lineage_root_id are their own
+-- conversation. Compaction successors must set the column explicitly
+-- (CHECK above) so this backstop cannot mint a new lineage for a window.
+CREATE TRIGGER sessions_lineage_root_fill
+AFTER INSERT ON sessions
+FOR EACH ROW
+WHEN NEW.compaction_lineage_root_id IS NULL
+ AND NEW.compaction_predecessor_session_id IS NULL
+BEGIN
+    UPDATE sessions
+       SET compaction_lineage_root_id = NEW.session_id
+     WHERE session_id = NEW.session_id;
 END;
 
 -- ---- typed media attachments ----------------------------------------------
@@ -1175,6 +1250,13 @@ CREATE INDEX idx_sessions_btw_parent ON sessions (btw_parent_session_id);
 CREATE UNIQUE INDEX idx_sessions_one_live_btw
     ON sessions (btw_parent_session_id)
     WHERE btw_parent_session_id IS NOT NULL;
+CREATE INDEX idx_sessions_compaction_predecessor
+    ON sessions (compaction_predecessor_session_id);
+CREATE UNIQUE INDEX idx_sessions_one_compaction_successor
+    ON sessions (compaction_predecessor_session_id)
+    WHERE compaction_predecessor_session_id IS NOT NULL;
+CREATE INDEX idx_sessions_compaction_lineage_root
+    ON sessions (compaction_lineage_root_id, last_active_at_unix_ms DESC);
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;

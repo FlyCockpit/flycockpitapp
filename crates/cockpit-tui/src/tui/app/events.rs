@@ -2293,7 +2293,7 @@ impl App {
                 }
             }
             TurnEvent::CompactReady {
-                new_session_id: _,
+                new_session_id,
                 handoff,
                 brief: _,
                 source,
@@ -2314,8 +2314,12 @@ impl App {
                     Some(Ok(r)) => r.short_id.clone(),
                     _ => String::new(),
                 };
+                if let Some(Ok(runner)) = self.agent_runner.as_mut() {
+                    runner.adopt_live_session_id(new_session_id);
+                }
+                self.launch.session_id = Some(new_session_id);
                 self.history.push(HistoryEntry::CompactBoundary {
-                    predecessor_short_id,
+                    predecessor_short_id: predecessor_short_id.clone(),
                     seed_tool_count,
                     seed_tool_tokens,
                     source,
@@ -2330,7 +2334,7 @@ impl App {
                     result_offset: 0,
                 });
                 self.push_plain(format!(
-                        "/compact: applied in this session ({seed_tool_count} seed tool(s), ~{seed_tool_tokens} tokens staged).",
+                        "/compact: seeded a new linked window ({seed_tool_count} seed tool(s), ~{seed_tool_tokens} tokens staged; predecessor {predecessor_short_id}).",
                     ));
             }
             TurnEvent::SandboxState {

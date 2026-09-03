@@ -163,8 +163,16 @@ async fn export_policy(args: ConfigExportPolicyArgs) -> Result<()> {
 }
 
 async fn import_policy(args: ConfigImportPolicyArgs) -> Result<()> {
-    let raw = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("reading {}", args.file.display()))?;
+    // The bundle travels inline in one request frame, so bound the read at
+    // the wire frame cap: an oversized or non-regular policy file fails here
+    // instead of allocating or blocking the CLI before the frame cap runs.
+    let raw_bytes = cockpit_host::bounded::read_at_most(
+        &args.file,
+        crate::daemon::proto::MAX_NDJSON_FRAME_BYTES as u64,
+    )
+    .with_context(|| format!("reading {}", args.file.display()))?;
+    let raw =
+        String::from_utf8(raw_bytes).with_context(|| format!("reading {}", args.file.display()))?;
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let daemon = crate::daemon::client::ensure_persistent_daemon()
         .await

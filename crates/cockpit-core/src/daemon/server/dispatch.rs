@@ -10543,7 +10543,10 @@ async fn handle_serialized_request_impl(
             Ok(Response::RemoteOperationStatus { status })
         }
 
-        Request::ImportSessionArchive { transfer } => import_session_archive(ctx, &transfer).await,
+        Request::ImportSessionArchive {
+            transfer,
+            include_sensitive,
+        } => import_session_archive(ctx, &transfer, include_sensitive).await,
         Request::WriteBulkTransferChunk {
             transfer,
             chunk_index,
@@ -19515,7 +19518,10 @@ async fn handle_concurrent_request_impl(
             .await
         }
 
-        Request::ImportSessionArchive { transfer } => import_session_archive(&ctx, &transfer).await,
+        Request::ImportSessionArchive {
+            transfer,
+            include_sensitive,
+        } => import_session_archive(&ctx, &transfer, include_sensitive).await,
         Request::WriteBulkTransferChunk {
             transfer,
             chunk_index,
@@ -30909,6 +30915,7 @@ pub(super) async fn read_bulk_transfer_chunk(
 pub(super) async fn import_session_archive(
     ctx: &Arc<DaemonContext>,
     transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
+    include_sensitive: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The archive bytes were staged by prior WriteBulkTransferChunk calls; the
     // staging layer verified their length and SHA-256 before releasing them.
@@ -30918,7 +30925,20 @@ pub(super) async fn import_session_archive(
             code: ErrorCode::BadRequest,
             message: format!("invalid session import archive: {error:#}"),
         })?;
-    let result = crate::session::import::import_archive(&ctx.db, archive)
+    // Fail-closed raw gate: an unredacted archive restores raw secret material
+    // into destination events without reconstructable redaction custody, so it
+    // imports only behind the explicit `include_sensitive` acknowledgement (the
+    // import-side mirror of the export side's single raw opt-in).
+    if !archive.redacted && !include_sensitive {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "unredacted session archive: importing it restores raw secret material \
+                      without redaction custody; re-export a redacted archive, or pass \
+                      --include-sensitive to acknowledge importing raw secrets"
+                .to_owned(),
+        });
+    }
+    let result = crate::session::import::import_archive(&ctx.db, archive, include_sensitive)
         .await
         .map_err(internal)?;
     Ok(Response::ImportSessionArchive {

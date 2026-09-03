@@ -1382,7 +1382,7 @@ mod tests {
     #[test]
     fn discoverable_wire_owner_rejects_in_process_endpoint() {
         let (connections, _connection_rx) = tokio::sync::mpsc::channel(1);
-        let (_sensitive_tx, sensitive) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _sensitive_rx) = tokio::sync::mpsc::channel(1);
         let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
         assert!(!endpoint.is_discoverable_wire_owner());
     }

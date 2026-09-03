@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 84,
-    "request": 235,
-    "response": 157
+    "request": 239,
+    "response": 161
   },
   "messages": {
     "event": [
@@ -748,6 +748,30 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "pinned_message_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_conversation_rule"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remove_conversation_rule"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_conversation_rules"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "promote_conversation_rule"
       },
       {
         "class": "bounded_request_response",
@@ -2160,6 +2184,30 @@
         "inlinePayloadBound": "paged",
         "lane": "interactive",
         "tag": "pins_with_text"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "conversation_rules"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "conversation_rule_changed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "conversation_rule_removed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "conversation_rule_promoted"
       },
       {
         "class": "bounded_request_response",

@@ -535,6 +535,12 @@
     },
     "request": "list_pinned_messages_with_text"
   },
+  "list_conversation_rules": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "list_conversation_rules"
+  },
   "list_project_notes": {
     "params": {
       "project_root": "/tmp/project"
@@ -589,6 +595,13 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "pinned_message_state"
+  },
+  "promote_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "promote_conversation_rule"
   },
   "promote_resource": {
     "params": {
@@ -682,6 +695,13 @@
       }
     },
     "request": "refresh_env"
+  },
+  "remove_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "remove_conversation_rule"
   },
   "remove_editable_queued_user_messages": {
     "params": {
@@ -883,6 +903,15 @@
       "mode": "until_idle"
     },
     "request": "set_caffeinate"
+  },
+  "set_conversation_rule": {
+    "params": {
+      "rule_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source_trust": "untrusted",
+      "text": "text-fixture"
+    },
+    "request": "set_conversation_rule"
   },
   "set_default_model": {
     "params": {

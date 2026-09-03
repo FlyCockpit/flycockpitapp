@@ -818,6 +818,30 @@ pub enum Request {
     PinnedMessageState {
         session_id: Uuid,
     },
+    /// Create or replace an advisory conversation rule on the session's
+    /// compaction lineage. Distinct from `/pin`; no silent conversion.
+    SetConversationRule {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<Uuid>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_trust: Option<String>,
+    },
+    RemoveConversationRule {
+        session_id: Uuid,
+        rule_id: Uuid,
+    },
+    ListConversationRules {
+        session_id: Uuid,
+    },
+    /// Launch a write-scoped subagent that places the rule in the resolved
+    /// instructions file (AGENTS.md / SOUL.md / project guidance) or a linked
+    /// file in that directory subtree.
+    PromoteConversationRule {
+        session_id: Uuid,
+        rule_id: Uuid,
+    },
     // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
     // Every variant below is a NEW wire shape gated to protocol v10 by
     // `body_required_protocol_version`. The plaintext literal rides ONLY the
@@ -4372,6 +4396,10 @@ macro_rules! request_variants {
             (Request::ListPinnedMessageSeqs { .. }, "list_pinned_message_seqs");
             (Request::ListPinnedMessagesWithText { .. }, "list_pinned_messages_with_text");
             (Request::PinnedMessageState { .. }, "pinned_message_state");
+            (Request::SetConversationRule { .. }, "set_conversation_rule");
+            (Request::RemoveConversationRule { .. }, "remove_conversation_rule");
+            (Request::ListConversationRules { .. }, "list_conversation_rules");
+            (Request::PromoteConversationRule { .. }, "promote_conversation_rule");
             (Request::BeginSealedOwnerOperation { .. }, "begin_sealed_owner_operation");
             (Request::ApplySealedOwnerOperation { .. }, "apply_sealed_owner_operation");
             (Request::CancelSealedOwnerOperation { .. }, "cancel_sealed_owner_operation");
@@ -4710,6 +4738,10 @@ macro_rules! command {
             (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::SetConversationRule { session_id, rule_id, text, source_trust }, "set_conversation_rule", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|rule_id:Option<Uuid>|text:String|source_trust:Option<String>", [session_id: Uuid => session, rule_id: Option<Uuid> => param, text: String => param, source_trust: Option<String> => param]);
+            (Request::RemoveConversationRule { session_id, rule_id }, "remove_conversation_rule", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|rule_id:Uuid", [session_id: Uuid => session, rule_id: Uuid => param]);
+            (Request::ListConversationRules { session_id }, "list_conversation_rules", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::PromoteConversationRule { session_id, rule_id }, "promote_conversation_rule", session_row_writer(session_id), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|rule_id:Uuid", [session_id: Uuid => session, rule_id: Uuid => param]);
             (Request::BeginSealedOwnerOperation { disposition, record_id, name, description, scope_kind, scope_key }, "begin_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "disposition:String|record_id:Option<String>|name:Option<String>|description:Option<String>|scope_kind:Option<String>|scope_key:Option<String>", [disposition: String => param, record_id: Option<String> => param, name: Option<String> => param, description: Option<String> => param, scope_kind: Option<String> => param, scope_key: Option<String> => param]);
             (Request::ApplySealedOwnerOperation { capability_id, literal }, "apply_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String|literal:Option<SensitiveWireLiteral>", [capability_id: String => param, literal: Option<SensitiveWireLiteral> => param]);
             (Request::CancelSealedOwnerOperation { capability_id }, "cancel_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String", [capability_id: String => param]);
@@ -6665,6 +6697,43 @@ mod tests {
                 "list_pinned_message_seqs",
                 "list_pinned_messages_with_text",
                 "pinned_message_state",
+            ]
+        );
+        let command_tags = crate::command!(command_tags);
+        for tag in tags {
+            assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn conversation_rule_rpcs_are_registered_in_both_macro_tables() {
+        let session_id = Uuid::nil();
+        let rule_id = Uuid::nil();
+        let requests = [
+            Request::SetConversationRule {
+                session_id,
+                rule_id: None,
+                text: "prefer pnpm".into(),
+                source_trust: None,
+            },
+            Request::RemoveConversationRule {
+                session_id,
+                rule_id,
+            },
+            Request::ListConversationRules { session_id },
+            Request::PromoteConversationRule {
+                session_id,
+                rule_id,
+            },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "set_conversation_rule",
+                "remove_conversation_rule",
+                "list_conversation_rules",
+                "promote_conversation_rule",
             ]
         );
         let command_tags = crate::command!(command_tags);

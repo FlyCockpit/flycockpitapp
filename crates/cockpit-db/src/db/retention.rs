@@ -92,6 +92,9 @@ pub struct RetentionOutcome {
     pub terminal_evidence_rows_deleted: u64,
     pub goal_tombstones_purged: u64,
     pub local_authority_rows_purged: u64,
+    /// Verification envelopes transitioned to `retention_state = 'cleaned'`;
+    /// their rows survive digest-only, so they are not deletions.
+    pub verification_envelopes_cleaned: u64,
     pub vacuumed: bool,
 }
 
@@ -380,13 +383,18 @@ impl Db {
                 .await?;
         }
 
-        // Verification ledger envelopes currently have no GC path
-        // (`retention_state` never becomes `cleaned`). This hook is wired to
-        // the existing retention tick so a later media-retention-style sweep
-        // can mark cleaned envelopes without a new scheduler.
-        // TODO(media-retention): implement verification envelope cleaning
-        // (digest-only rows, same window as terminal evidence).
-        let _ = self.sweep_verification_retention_stub().await?;
+        // Verification envelopes carry the one payload-heavy verification row
+        // family. On the same window as terminal evidence they transition to
+        // `retention_state = 'cleaned'`: the row survives digest-only and its
+        // bounded model-visible payload is dropped. Zero means unlimited.
+        if terminal_evidence_cutoff > 0 {
+            outcome.verification_envelopes_cleaned = self
+                .sweep_verification_retention(
+                    terminal_evidence_cutoff.saturating_mul(1000),
+                    now_secs.saturating_mul(1000),
+                )
+                .await?;
+        }
 
         let deleted = outcome
             .session_cascade_rows_deleted

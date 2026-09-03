@@ -2783,15 +2783,32 @@ fn current_machine_fingerprint() -> Option<String> {
     }
 }
 
+/// Linux grant identity reader seam. Production uses [`LINUX_MACHINE_ID_PATH`].
+#[cfg(target_os = "linux")]
+const LINUX_MACHINE_ID_PATH: &str = "/etc/machine-id";
+
+/// Read the OS-owned machine id from `path`. Do not fall back to an environment
+/// variable or a shared sentinel.
+#[cfg(target_os = "linux")]
+fn read_linux_machine_id(path: &std::path::Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+/// Hash the machine id at `path` for grant comparison. Fails closed when the
+/// file is inaccessible or empty.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_machine_grant_fingerprint_from_path(path: &std::path::Path) -> Option<String> {
+    let machine_id = read_linux_machine_id(path)?;
+    linux_machine_grant_fingerprint_from_id(&machine_id)
+}
+
 /// Grant comparison is bound to the OS-owned `/etc/machine-id` (hashed before
 /// storage). The value is not caller-settable and the check fails closed when
 /// it is inaccessible or empty. Cloned disk or container images that duplicate
 /// `/etc/machine-id` will share grant authorization.
 #[cfg(target_os = "linux")]
 fn current_machine_fingerprint() -> Option<String> {
-    // Do not fall back to an environment variable or a shared sentinel.
-    let machine_id = fs::read_to_string("/etc/machine-id").ok()?;
-    linux_machine_grant_fingerprint_from_id(&machine_id)
+    linux_machine_grant_fingerprint_from_path(std::path::Path::new(LINUX_MACHINE_ID_PATH))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -5540,14 +5557,37 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_grant_fingerprint_uses_only_supplied_machine_id() {
-        // Regression guard: no env-derived fallback or shared sentinel for missing identity.
-        assert_ne!(
-            linux_machine_grant_fingerprint_from_id("id-a").unwrap(),
-            linux_machine_grant_fingerprint_from_id("id-b").unwrap()
+    fn linux_grant_fingerprint_reader_fails_closed_without_machine_id() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("missing-machine-id");
+        assert!(!missing.exists());
+        // Regression guard: an env-derived fallback would authorize from HOSTNAME here.
+        std::env::set_var("HOSTNAME", "regression-hostname-fallback-trap");
+        assert_eq!(linux_machine_grant_fingerprint_from_path(&missing), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_grant_fingerprint_reader_uses_only_machine_id_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("machine-id");
+        fs::write(&path, "fixture-reader-seam-id\n").unwrap();
+        std::env::set_var("HOSTNAME", "different-from-file");
+        assert_eq!(
+            linux_machine_grant_fingerprint_from_path(&path),
+            linux_machine_grant_fingerprint_from_id("fixture-reader-seam-id")
         );
-        assert_eq!(linux_machine_grant_fingerprint_from_id(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_grant_fingerprint_reader_fails_closed_on_empty_machine_id() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("machine-id");
+        fs::write(&path, "   \n").unwrap();
+        assert_eq!(linux_machine_grant_fingerprint_from_path(&path), None);
     }
 
     #[test]
@@ -5576,12 +5616,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn current_linux_fingerprint_matches_pure_function_from_machine_id() {
-        let machine_id =
-            fs::read_to_string("/etc/machine-id").expect("linux test host exposes /etc/machine-id");
+    fn current_linux_fingerprint_matches_reader_seam_from_machine_id() {
+        let path = std::path::Path::new("/etc/machine-id");
+        let machine_id = fs::read_to_string(path).expect("linux test host exposes /etc/machine-id");
         assert_eq!(
             current_machine_fingerprint(),
-            linux_machine_grant_fingerprint_from_id(&machine_id)
+            linux_machine_grant_fingerprint_from_path(path)
+        );
+        assert_eq!(
+            current_machine_fingerprint(),
+            linux_machine_grant_fingerprint_from_id(machine_id.trim())
         );
     }
 

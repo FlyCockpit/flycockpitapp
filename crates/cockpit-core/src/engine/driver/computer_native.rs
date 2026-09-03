@@ -33,29 +33,34 @@ pub(crate) fn computer_backend_open_remediation(
     target: DisplayTarget,
     error: &ComputerError,
 ) -> &'static str {
-    match target {
-        DisplayTarget::Virtual => match error {
-            ComputerError::MissingTool { .. } => {
-                "Install the missing host tools listed above on this Linux host"
-            }
-            ComputerError::UnsupportedPlatform { .. } => {
+    match error {
+        ComputerError::MissingTool { .. } => {
+            "Install the missing host tools listed above on this Linux host"
+        }
+        ComputerError::UnsupportedPlatform { .. } => match target {
+            DisplayTarget::Virtual => {
                 "The isolated virtual display is supported on Linux only; use a Linux host or explicitly opt into real-desktop control with a machine grant"
             }
-            _ => {
-                "Ensure this Linux host provides Xvfb, xdotool, and a capture tool (scrot or ImageMagick)"
-            }
-        },
-        DisplayTarget::RealDesktop => match error {
-            ComputerError::RealDesktopGrantMissing => {
-                "Real desktop control requires a stored machine-local grant for this host"
-            }
-            ComputerError::UnsupportedPlatform { .. } => {
+            DisplayTarget::RealDesktop => {
                 "Real desktop control is unavailable on this platform or session; set `computer_target` to `virtual` for the isolated display or use a supported desktop session"
             }
-            _ => {
-                "Set `computer_target` to `virtual` to use the isolated display instead, or obtain a machine grant for real-desktop control"
+        },
+        ComputerError::RealDesktopGrantMissing => {
+            "Real desktop control requires a stored machine-local grant for this host"
+        }
+        ComputerError::CommandFailed { .. } => match target {
+            DisplayTarget::Virtual => {
+                "Resolve the host setup error above (Cockpit data directory permissions, capture workspace, or virtual display startup)"
+            }
+            DisplayTarget::RealDesktop => {
+                "Resolve the host setup error above (Cockpit data directory permissions, input-state journal, or display session)"
             }
         },
+        ComputerError::InvalidCoordinates(_) => {
+            "The computer backend reported invalid coordinates during setup; see the error above"
+        }
+        ComputerError::Refused(_) => "The computer backend refused to open; see the error above",
+        ComputerError::Cancelled => "The computer backend open was cancelled; retry the session",
     }
 }
 
@@ -739,7 +744,7 @@ mod tests {
     };
 
     #[test]
-    fn computer_backend_open_remediation_is_target_aware() {
+    fn computer_backend_open_remediation_is_error_kind_aware() {
         let missing_tool = ComputerError::MissingTool {
             tool: "Xvfb".to_string(),
             install_hint: "the `xvfb` package".to_string(),
@@ -752,6 +757,35 @@ mod tests {
             !computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool)
                 .contains("computer_target")
         );
+
+        let real_desktop_missing_tool = ComputerError::MissingTool {
+            tool: "xdotool".to_string(),
+            install_hint: "the `xdotool` package".to_string(),
+        };
+        assert!(
+            computer_backend_open_remediation(
+                DisplayTarget::RealDesktop,
+                &real_desktop_missing_tool
+            )
+            .contains("Install the missing host tools")
+        );
+        assert!(
+            !computer_backend_open_remediation(
+                DisplayTarget::RealDesktop,
+                &real_desktop_missing_tool
+            )
+            .contains("machine grant")
+        );
+
+        let command_failed = ComputerError::CommandFailed {
+            program: "Xvfb".to_string(),
+            detail: "Permission denied".to_string(),
+        };
+        let virtual_command_hint =
+            computer_backend_open_remediation(DisplayTarget::Virtual, &command_failed);
+        assert!(virtual_command_hint.contains("Resolve the host setup error"));
+        assert!(!virtual_command_hint.contains("Xvfb"));
+        assert!(!virtual_command_hint.contains("Install"));
 
         let unsupported = ComputerError::UnsupportedPlatform {
             platform: "linux".to_string(),

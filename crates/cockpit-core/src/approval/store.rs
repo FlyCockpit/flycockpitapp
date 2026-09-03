@@ -2755,10 +2755,12 @@ fn open_approvals_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// the live path. Acquisition verifies, through the held handle, that
 /// the pathname still refers to the object just locked, and re-acquires
 /// from scratch (bounded) when it does not. A path that keeps being
-/// replaced fails closed.
+/// replaced fails closed. Creating `dir` refuses when it is the missing
+/// global Cockpit config directory: that layer is created only by
+/// [`crate::config::dirs::ensure_global_config_dir`].
 #[cfg(unix)]
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::config::dirs::create_dir_all_except_missing_global(dir)?;
     const ACQUIRE_ATTEMPTS: u32 = 8;
     for attempt in 0..ACQUIRE_ATTEMPTS {
         let file = open_approvals_dir(dir).with_context(|| format!("opening {}", dir.display()))?;
@@ -2794,7 +2796,7 @@ fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
 /// Non-unix exclusion: serialize on `approvals.json.lock` via `LockFileEx`.
 #[cfg(not(unix))]
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::config::dirs::create_dir_all_except_missing_global(dir)?;
     let lock_path = dir.join(APPROVALS_LOCK_FILE);
     const ACQUIRE_ATTEMPTS: u32 = 8;
     for attempt in 0..ACQUIRE_ATTEMPTS {
@@ -2843,6 +2845,20 @@ fn mutate_approvals<R>(
     dir: &Path,
     mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
 ) -> Result<R> {
+    if crate::config::dirs::path_is_under_missing_global_config_dir(dir) {
+        // The approvals store must not materialize `~/.config/cockpit` as a
+        // side effect of a grant, opposite-polarity clear, or permissions
+        // delete. A missing global layer is an empty store: no-op mutations
+        // succeed so session-scoped recording can clear a key that was never
+        // persisted; a write fails closed with the same refusal the mkdir
+        // layer uses.
+        let mut file = ApprovalsFile::default();
+        let (changed, value) = mutate(&mut file);
+        if changed {
+            anyhow::bail!("{}", crate::config::dirs::MISSING_GLOBAL_CONFIG_DIR_MESSAGE);
+        }
+        return Ok(value);
+    }
     let _lock = lock_approvals(dir)?;
     // The lock is already held here, so the load must take the locked
     // entry point directly (never [`load_approvals`], which would block
@@ -5982,6 +5998,88 @@ mod tests {
 
         // The static policy resolves to the same value on every read.
         assert_eq!(store.approval_policy(), store.approval_policy());
+    }
+
+    #[tokio::test]
+    async fn global_approvals_mutation_does_not_create_a_missing_global_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        let lock_error = lock_approvals(&global).unwrap_err();
+        assert!(
+            lock_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "lock_approvals must refuse a missing global layer: {lock_error:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "lock_approvals must not materialize the global config directory"
+        );
+
+        mutate_approvals(&global, |file| {
+            (file.commands.remove("absent").is_some(), ())
+        })
+        .expect("a no-op remove against a missing global store must not fail");
+        assert!(
+            !global.is_dir(),
+            "a no-op approvals mutation must not create the global layer"
+        );
+
+        let write_error = mutate_approvals(&global, |file| {
+            file.commands.insert(
+                "always-allow".to_string(),
+                CommandGrantRecord::new(RiskTier::Ordinary),
+            );
+            (true, ())
+        })
+        .unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "a global grant write must fail closed: {write_error:#}"
+        );
+        assert!(!global.is_dir());
+
+        let project = tmp.path().join("work");
+        std::fs::create_dir_all(&project).unwrap();
+        let (store, _) = test_store(&project, global.clone());
+        store
+            .record_command(
+                &cmd_info("ls", None, false),
+                RiskTier::Ordinary,
+                Scope::Session,
+            )
+            .await
+            .expect("session grants must not require creating the global layer");
+        assert!(
+            !global.is_dir(),
+            "clearing opposite polarity at the missing global scope must not mkdir it"
+        );
+
+        let global_error = store
+            .record_command(
+                &cmd_info("ls", None, false),
+                RiskTier::Ordinary,
+                Scope::Global,
+            )
+            .await
+            .expect_err("a global grant must fail closed when the layer is missing");
+        assert!(
+            global_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "global grant insert must surface the mkdir refusal: {global_error}"
+        );
+        assert!(!global.is_dir());
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 }
 

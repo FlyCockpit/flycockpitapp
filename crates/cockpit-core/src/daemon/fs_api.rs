@@ -282,15 +282,17 @@ pub async fn fs_write(
 /// mutation boundary. Unlike generic FsWrite this reloads and hashes the
 /// config while holding the cross-process config lock, then commits atomically.
 pub async fn save_extended_config(
+    ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
     path: String,
     content: String,
     base_hash: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let ephemeral = ctx.paths.ephemeral;
     join_fs_handler(
         "save_extended_config",
         tokio::task::spawn_blocking(move || {
-            save_extended_config_sync(&project_root, &path, &content, base_hash)
+            save_extended_config_sync(ephemeral, &project_root, &path, &content, base_hash)
         }),
     )
     .await
@@ -308,6 +310,7 @@ pub async fn get_extended_config_snapshot(
 ) -> Result<Response, ErrorPayload> {
     let root = settings_snapshot_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction();
+    let ephemeral = ctx.paths.ephemeral;
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
@@ -322,8 +325,21 @@ pub async fn get_extended_config_snapshot(
                 )));
             }
             for (kind, target) in discovered {
-                let guard =
-                    cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+                crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
+                // A missing global layer is a valid fresh-install read: do
+                // not take the mutation lock, which would otherwise have to
+                // create the directory. Ephemeral owners already failed
+                // closed above.
+                let guard = if cockpit_config::config::dirs::path_is_under_missing_global_config_dir(
+                    &target,
+                ) {
+                    None
+                } else {
+                    Some(
+                        cockpit_config::config::hold_config_mutation_lock(&target)
+                            .map_err(internal)?,
+                    )
+                };
                 let (raw, identity) = read_optional_config(&target)?;
                 if raw.len() > cockpit_proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES {
                     return Err(bad_request(format!(
@@ -695,6 +711,7 @@ pub async fn apply_extended_config_patch(
     let runtime = tokio::runtime::Handle::current();
     let settlement_owner = owner.clone();
     let settlement_operation = client_operation_id.clone();
+    let ephemeral = ctx.paths.ephemeral;
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
@@ -713,6 +730,11 @@ pub async fn apply_extended_config_patch(
                 {
                     return Err(conflict("settings snapshot is absent, expired, or stale"));
                 }
+                crate::daemon::server::refuse_ephemeral_missing_global_layer(
+                    ephemeral,
+                    &capability.target,
+                )?;
+                crate::daemon::server::ensure_authorized_global_layer(&capability.target)?;
                 // One apply consumes the complete snapshot group atomically.
                 // This prevents unused sibling layer capabilities from
                 // outliving the authority view against which the patch was
@@ -1176,9 +1198,7 @@ fn discovered_settings_layers(
 /// here: its config is user-owned and must remain writable without a trust
 /// decision for whichever workspace happened to launch onboarding.
 fn is_global_config_root(root: &Path) -> Result<bool, ErrorPayload> {
-    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
-    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
-    Ok(root == canonical_global)
+    cockpit_config::config::dirs::is_global_config_dir(root).map_err(internal)
 }
 
 fn read_optional_config(
@@ -1472,6 +1492,7 @@ fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
 }
 
 fn save_extended_config_sync(
+    ephemeral: bool,
     project_root: &str,
     path: &str,
     content: &str,
@@ -1482,6 +1503,8 @@ fn save_extended_config_sync(
     if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
         return Err(bad_request("extended config target must be config.json"));
     }
+    crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
+    crate::daemon::server::ensure_authorized_global_layer(&target)?;
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
     // Only a genuinely-absent file is an empty config. A non-NotFound read error
     // (EACCES/EIO/EMFILE/…, over-cap, non-regular) must NOT be coerced to empty:
@@ -2769,8 +2792,9 @@ mod tests {
             .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
             .unwrap();
         drop(handle);
-        let err = save_extended_config_sync(root.to_str().unwrap(), "config.json", "{}", None)
-            .expect_err("oversized config.json must fail closed rather than merge from empty");
+        let err =
+            save_extended_config_sync(false, root.to_str().unwrap(), "config.json", "{}", None)
+                .expect_err("oversized config.json must fail closed rather than merge from empty");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("existing file"), "{}", err.message);
         assert_eq!(
@@ -2910,8 +2934,8 @@ mod tests {
             "the redacted incoming payload must not carry the registry"
         );
 
-        let resp =
-            save_extended_config_sync(root_text, "config.json", &incoming_str, None).unwrap();
+        let resp = save_extended_config_sync(false, root_text, "config.json", &incoming_str, None)
+            .unwrap();
         assert!(matches!(resp, Response::ExtendedConfigWritten { .. }));
 
         // The registry is preserved AND the other change landed.
@@ -2949,7 +2973,7 @@ mod tests {
 
         let content = serde_json::json!({ "name": "Alpha" }).to_string();
         let before = crate::daemon::server::inventory::current_config_generation();
-        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
         let after_write = crate::daemon::server::inventory::current_config_generation();
         assert_eq!(
             after_write,
@@ -2958,7 +2982,7 @@ mod tests {
         );
 
         // Identical content renders to identical merged bytes -> no write.
-        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
         let after_noop = crate::daemon::server::inventory::current_config_generation();
         assert_eq!(
             after_noop, after_write,

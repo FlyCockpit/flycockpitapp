@@ -5588,8 +5588,11 @@ async fn dispatch_image_control_read(
     // config contract every other owner config read uses
     // (`resolve_workspace_trust_policy_from_db` + `load_effective_for_daemon`):
     // untrusted project layers are filtered out and remote `image_generation`
-    // is stripped before it can be projected. `project_root` is only a config
-    // cwd here, never authority — the RPC is already `owner_only`-gated.
+    // is stripped before it can be projected. This stays workspace-bound —
+    // unlike user-level provider/MCP onboarding it must not fall back to
+    // IgnoreConfig, because a fresh-install write scaffolds project
+    // `.cockpit/` (secret-bearing). `project_root` is only a config cwd here,
+    // never authority — the RPC is already `owner_only`-gated.
     let project_root = match &request {
         Request::ImageEndpointList { project_root, .. }
         | Request::ImageEndpointGet { project_root, .. }
@@ -11062,6 +11065,7 @@ async fn handle_serialized_request_impl(
             // reached disk) so a retry never rewrites the config a second time.
             let mutation = async {
                 let response = crate::daemon::fs_api::save_extended_config(
+                    ctx,
                     project_root,
                     path,
                     content,
@@ -15997,10 +16001,7 @@ async fn handle_serialized_request_impl(
             let server_config = match async {
                 purge_durable_oauth_flows(ctx, &owner).await?;
                 let cwd = std::path::PathBuf::from(&project_root);
-                let trust_policy =
-                    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-                        .await
-                        .map_err(workspace_trust_error)?;
+                let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
                 let server_config = if let Some(agent) = agent.as_deref() {
                     let def = crate::agents::resolve(&cwd, agent)
                         .map_err(bad_config)?
@@ -17456,6 +17457,9 @@ async fn handle_serialized_request_impl(
                 return Ok(response);
             }
             let mutation = async {
+                let global_config =
+                    cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+                prepare_user_level_write_target(ctx, &global_config)?;
                 if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
                     // Catalog I/O is deliberately outside the publication
                     // boundary. Once it is resolved, the config snapshot used
@@ -20526,25 +20530,14 @@ async fn daemon_provider_config_with_warnings(
         return Err(bad_request("project_root must not be empty"));
     }
     let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     if global_config_root(&cwd)? {
         let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
         let config = crate::config::providers::ConfigDoc::load(&global_config)
             .map_err(daemon_config_error)?
             .providers();
-        let root = crate::config::trust::resolve_trust_root(&cwd).map_err(internal)?;
-        return Ok((
-            cwd,
-            crate::config::trust::WorkspaceTrustPolicy {
-                root,
-                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-            },
-            config,
-            Vec::new(),
-        ));
+        return Ok((cwd, trust_policy, config, Vec::new()));
     }
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(internal)?;
     let (config, _, warnings) = ctx
         .config_source()
         .load_effective_for_daemon_with_provider_warnings(&cwd, &trust_policy)
@@ -20555,10 +20548,91 @@ async fn daemon_provider_config_with_warnings(
 /// A catalog rooted at the canonical global config directory is onboarding
 /// authority, not a workspace setting. It is intentionally the only
 /// trust-free root accepted by the provider mutation capability path.
+/// Comparison is symlink-safe and does not require the directory to exist.
 fn global_config_root(root: &std::path::Path) -> std::result::Result<bool, ErrorPayload> {
-    let global = cockpit_config::config::dirs::global_config_dir().map_err(internal)?;
-    let canonical_global = std::fs::canonicalize(global).map_err(internal)?;
-    Ok(root == canonical_global)
+    cockpit_config::config::dirs::is_global_config_dir(root).map_err(internal)
+}
+
+/// Resolve workspace trust for user-level configuration (providers, MCP,
+/// and other onboarding-capable user-owned layers). A catalog rooted at
+/// the canonical global config directory is accepted without a trust
+/// decision. An unset or untrusted workspace still serves the global layer
+/// (project `.cockpit/` stays excluded). Other trust-resolution failures
+/// stay fail-closed.
+///
+/// Workspace-bound mutations (sandbox intent, image-generation registry,
+/// policy import, attached-session config) must keep calling
+/// `resolve_workspace_trust_policy_from_db` directly so an untrusted root
+/// cannot author a project layer.
+async fn resolve_user_level_trust_policy(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    if global_config_root(cwd)? {
+        let root = crate::config::trust::resolve_trust_root(cwd).map_err(internal)?;
+        return Ok(crate::config::trust::WorkspaceTrustPolicy {
+            root,
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        });
+    }
+    match crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, cwd).await {
+        Ok(policy) => Ok(policy),
+        Err(error) => user_level_trust_policy(cwd, error),
+    }
+}
+
+/// User-level onboarding is independent of workspace trust: an unset or
+/// untrusted workspace still serves the global layer (project `.cockpit/`
+/// stays excluded). Other trust-resolution failures stay fail-closed.
+fn user_level_trust_policy(
+    cwd: &std::path::Path,
+    error: anyhow::Error,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    if error
+        .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
+        .is_none()
+    {
+        return Err(internal(error));
+    }
+    let root = crate::config::trust::resolve_trust_root(cwd).map_err(internal)?;
+    Ok(crate::config::trust::WorkspaceTrustPolicy {
+        root,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    })
+}
+
+/// Canonicalize a user-level write target without creating directories on
+/// this read path. Ephemeral/diagnostic owners fail closed when the global
+/// layer would have to be created — never a silent capability-less snapshot.
+fn canonical_user_level_write_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    super::refuse_ephemeral_missing_global_layer(ctx.paths.ephemeral, path)?;
+    canonical_mcp_target_path(path)
+}
+
+/// Gate, then create the missing global layer when this is an authorized
+/// write. Snapshot/read paths must keep using
+/// [`canonical_user_level_write_target`].
+fn prepare_user_level_write_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    let path = canonical_user_level_write_target(ctx, path)?;
+    super::ensure_authorized_global_layer(&path)?;
+    Ok(path)
+}
+
+/// Journal replay of a durable user-level target. Refuses ephemeral
+/// creation of the missing global layer, then creates it only for
+/// authorized persistent owners. Does not re-canonicalize a stored path.
+fn prepare_user_level_journal_target(
+    ctx: &DaemonContext,
+    path: &std::path::Path,
+) -> std::result::Result<(), ErrorPayload> {
+    super::refuse_ephemeral_missing_global_layer(ctx.paths.ephemeral, path)?;
+    super::ensure_authorized_global_layer(path)
 }
 
 /// Use the attached session's authenticated RefreshEnv overlay when one is
@@ -20608,23 +20682,16 @@ async fn provider_catalog_snapshot(
     }
     let config_generation = inventory::current_config_generation();
     let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
-    // A missing provider layer (e.g. a fresh install with no config directory
-    // yet) must not fail this read: the snapshot is still a valid projection,
-    // it just cannot mint an edit capability. Clients treat the absent
-    // capability fields as read-only and an empty `layer_id` as "no editable
-    // layer"; a later mutation attempt fails the capability lookup instead.
-    let target_path = if global_config_root(&cwd)? {
-        cockpit_config::config::dirs::global_config_file()
-            .ok()
-            .and_then(|config| {
-                crate::config::providers::provider_file_path_for_config(&config, "default").ok()
-            })
-    } else {
+    // User-level config always has a writable home: the resolver falls back
+    // to the global layer even when that directory does not yet exist, so
+    // this read mints an edit capability instead of returning a silent
+    // read-only snapshot. Stub config sources that intentionally have no
+    // write target still omit the capability.
+    let target_path =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
-        })
-    };
+        });
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -20636,7 +20703,7 @@ async fn provider_catalog_snapshot(
         })
         .unwrap_or_default();
     let target_path = match target_path {
-        Some(path) => Some(canonical_mcp_target_path(&path)?),
+        Some(path) => Some(canonical_user_level_write_target(ctx, &path)?),
         None => None,
     };
     let revision = if let Some(target_path) = target_path.as_ref() {
@@ -20658,27 +20725,36 @@ async fn provider_catalog_snapshot(
     } else {
         String::new()
     };
-    let (mcp, mcp_scope_targets) = if global_config_root(&cwd)? {
-        (None, std::collections::BTreeMap::new())
-    } else {
-        let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-        let targets = ["global", "workspace"]
-            .into_iter()
-            .filter_map(|scope| {
-                let target = crate::config::trust::with_workspace_trust_policy(
-                    trust_policy.clone(),
-                    || cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, scope),
-                )?;
-                let path = target
-                    .parent()?
-                    .join(cockpit_config::config::dirs::MCP_FILE);
-                let path = canonical_mcp_target_path(&path).ok()?;
-                let revision = mcp_target_layer_revision(&path).ok()?;
-                Some((scope.to_string(), (path, revision)))
-            })
-            .collect();
-        (mcp, targets)
-    };
+    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    let mut mcp_scope_targets = std::collections::BTreeMap::new();
+    if let Some(target) =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, "global")
+        })
+    {
+        let path = target
+            .parent()
+            .map(|parent| parent.join(cockpit_config::config::dirs::MCP_FILE))
+            .unwrap_or(target);
+        let path = canonical_mcp_target_path(&path)?;
+        let revision = mcp_target_layer_revision(&path)?;
+        mcp_scope_targets.insert("global".to_string(), (path, revision));
+    }
+    if let Some(target) =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::mcp_write_target_for_scope(&cwd, "workspace")
+        })
+    {
+        let path = target
+            .parent()
+            .map(|parent| parent.join(cockpit_config::config::dirs::MCP_FILE))
+            .unwrap_or(target);
+        if let Ok(path) = canonical_mcp_target_path(&path)
+            && let Ok(revision) = mcp_target_layer_revision(&path)
+        {
+            mcp_scope_targets.insert("workspace".to_string(), (path, revision));
+        }
+    }
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -22005,18 +22081,12 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
-    let target = if global_config_root(&cwd)? {
-        let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-        crate::config::providers::provider_file_path_for_config(&global, "default")
-            .map_err(internal)?
-    } else {
-        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            ctx.config_source()
-                .config_write_target_for_provider(&cwd, "default")
-        })
-        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
-    };
-    let target = canonical_mcp_target_path(&target)?;
+    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(&cwd, "default")
+    })
+    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = prepare_user_level_write_target(ctx, &target)?;
     if target != capability_target {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -22034,18 +22104,13 @@ async fn stage_and_recover_provider_batch(
                 .map(|delete| delete.provider_id.as_str()),
         )
     {
-        let provider_target = if global_config_root(&cwd)? {
-            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-            crate::config::providers::provider_file_path_for_config(&global, provider_id)
-                .map_err(internal)?
-        } else {
+        let provider_target =
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 ctx.config_source()
                     .config_write_target_for_provider(&cwd, provider_id)
             })
-            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?
-        };
-        let provider_target = canonical_mcp_target_path(&provider_target)?;
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+        let provider_target = prepare_user_level_write_target(ctx, &provider_target)?;
         if provider_target.parent() != target.parent() {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
@@ -22506,9 +22571,9 @@ struct RedactedMcpConfigSnapshot {
     revision: String,
 }
 
-/// `Ok(None)` means no Cockpit config layer exists to project MCP state from
-/// (a fresh install); the catalog snapshot then omits the MCP projection
-/// instead of failing the read.
+/// `Ok(None)` means the global config location itself cannot be resolved
+/// (no home/XDG). A fresh install with a resolvable global layer still
+/// returns an empty projection against that always-writable home.
 fn redacted_mcp_config_snapshot(
     ctx: &DaemonContext,
     cwd: &std::path::Path,
@@ -22624,7 +22689,7 @@ fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<Stri
 fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     let body = serde_json::to_string_pretty(&value)?;
-    cockpit_host::private_fs::ensure_parent_dir_private(path)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path)?;
     cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
 }
 
@@ -24466,6 +24531,7 @@ async fn recover_provider_journal_file_bounded(
         _ => return Err(bad_request("provider config journal has an invalid action")),
     };
     let target = action.target().to_path_buf();
+    prepare_user_level_journal_target(ctx, &target)?;
     let vault = ctx.secret_vault.clone();
     let classify_action = action.clone();
     let classify_vault = vault.clone();
@@ -24555,7 +24621,7 @@ fn classify_provider_journal_file(
             ..
         } => (path, consumed_revision, intended_revision),
     };
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     let doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
     let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
     Ok(if actual == *intended {
@@ -24576,7 +24642,7 @@ fn reconcile_provider_journal_file(
                      intended_revision: &str,
                      desired: Option<crate::config::providers::ProvidersConfig>|
      -> std::result::Result<(), ErrorPayload> {
-        cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+        cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
         let mut doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
         let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
         if actual == intended_revision {
@@ -24855,7 +24921,7 @@ async fn provider_config_save_under_lock(
             "provider header secret count does not match headers",
         ));
     }
-    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    let (cwd, trust_policy, config) = daemon_provider_config(ctx, project_root).await?;
     // Reference-only legacy upserts use absence as "unchanged". Resolve that
     // meaning only after whole-layer journal recovery and under the publication
     // lock; doing it in the outer dispatcher can resurrect the credential from
@@ -24954,16 +25020,12 @@ async fn provider_config_save_under_lock(
         .into_iter()
         .filter(|name| !staged_name_set.contains(name))
         .collect::<std::collections::BTreeSet<_>>();
-    let cwd = std::path::PathBuf::from(project_root);
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(internal)?;
     let config_path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
         ctx.config_source()
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-    let config_path = canonical_mcp_target_path(&config_path)?;
+    let config_path = prepare_user_level_write_target(ctx, &config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
         .providers();
@@ -25247,9 +25309,7 @@ async fn save_mcp_config(
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     let cwd = std::path::PathBuf::from(project_root);
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(workspace_trust_error)?;
+    let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
     for (name, value) in &secret_values {
         if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
@@ -25287,7 +25347,7 @@ async fn save_mcp_config(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
-    let path = canonical_mcp_target_path(&path)?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let authoritative_expected_revision = if let Some(scope) = target_scope {
         let (authorized_path, authorized_revision) =
             capability.mcp_scope_targets.get(scope).ok_or_else(|| {
@@ -25831,7 +25891,7 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
-    cockpit_host::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(&path).map_err(internal)?;
     let commit_path = path.clone();
     let commit_config = config_json_owned.clone();
     let commit_consumed = consumed_revision.clone();
@@ -26691,6 +26751,9 @@ async fn recover_mcp_config_journals_inner(
         );
         let cleanup_only = settlement_phase == "cleanup_pending";
         let path = std::path::PathBuf::from(path);
+        if !cleanup_only {
+            prepare_user_level_journal_target(ctx, &path)?;
+        }
         let reconcile_path = path.clone();
         let reconcile = move || {
             reconcile_mcp_journal_file(
@@ -26755,7 +26818,7 @@ fn reconcile_mcp_journal_file(
     consumed_revision: &str,
     intended_revision: &str,
 ) -> std::result::Result<(), ErrorPayload> {
-    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_config::config::files::ensure_config_parent_dir(path).map_err(internal)?;
     if canonical_mcp_target_path(path)? != path {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -27206,6 +27269,7 @@ fn persist_daemon_provider(
             .config_write_target_for_provider(cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.providers.insert(provider_id.to_string(), entry);
@@ -27240,6 +27304,7 @@ async fn provider_config_delete_under_lock(
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let layer = doc.providers();
     // Only a provider actually owned by this layer can be deleted here.  In
@@ -27366,6 +27431,7 @@ fn persist_provider_layer_metadata(
             .config_write_target_for_provider(cwd, "default")
     })
     .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let path = prepare_user_level_write_target(ctx, &path)?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
     let mut layer = doc.providers();
     layer.category_defaults = category_defaults;

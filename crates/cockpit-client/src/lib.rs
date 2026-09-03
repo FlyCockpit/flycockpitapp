@@ -593,7 +593,7 @@ pub trait DaemonRequestClient: Send + Sync {
 /// Public handle. Cheap to clone: every clone shares the same
 /// background reader/writer task; only the event-stream subscription
 /// differs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DaemonClient {
     backend: ClientBackend,
     negotiated: proto::NegotiatedProtocol,
@@ -615,7 +615,7 @@ struct Pending {
     reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ClientBackend {
     #[cfg(any(unix, windows))]
     Wire(mpsc::Sender<IoCommand>),
@@ -1454,7 +1454,7 @@ mod tests {
 
     async fn recv_request_id<S>(daemon: &mut ProtoStream<S>) -> Uuid
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
@@ -1531,7 +1531,7 @@ mod tests {
         daemon_version: impl Into<String>,
         protocol_version: u32,
     ) where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         daemon
             .send(&Envelope::response(
@@ -1544,7 +1544,7 @@ mod tests {
 
     async fn confirm_client_lifetime<S>(daemon: &mut ProtoStream<S>)
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         let id = match daemon.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(envelope) => match envelope.body {

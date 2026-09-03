@@ -3775,7 +3775,7 @@ mod windows_pipe_tests {
         daemon: &mut proto::ProtoStream<S>,
         daemon_version: impl Into<String>,
     ) where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         daemon
             .send(&Envelope::response(
@@ -3790,7 +3790,7 @@ mod windows_pipe_tests {
     /// is written. Receiving the confirmation request is not the handshake.
     async fn confirm_client_lifetime<S>(daemon: &mut proto::ProtoStream<S>)
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         let id = match daemon.recv().await.expect("recv").expect("frame") {
             RecvFrame::Envelope(envelope) => match envelope.body {

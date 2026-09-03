@@ -1520,6 +1520,86 @@ fn sandbox_escalation_defaults_enabled_and_round_trips() {
 }
 
 #[test]
+fn write_preserves_alias_only_setting_under_canonical_key() {
+    // Persist is canonical-only, but discarding the alternate spelling must
+    // never drop the setting it carries. An alias-only document whose typed
+    // value this caller did not change would otherwise lose the setting
+    // outright: `apply_object_delta` no-ops for unchanged values, the alias
+    // removal deletes the only copy, and the next load reverts
+    // `sandbox_escalation_enabled` to its default-true fail-open.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"sandboxEscalationEnabled":false}"#).unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    assert!(!doc.config().sandbox_escalation_enabled);
+
+    // Unrelated persist: only `gitignore_allow` changes.
+    let mut cfg = doc.config();
+    cfg.gitignore_allow.push("target/".to_string());
+    doc.write(&cfg).unwrap();
+
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false)),
+        "the alias-only setting must survive the write under the canonical key: {raw}"
+    );
+    assert!(raw.get("sandboxEscalationEnabled").is_none(), "{raw}");
+    assert_eq!(
+        raw.get("gitignore_allow"),
+        Some(&serde_json::json!(["target/"])),
+        "{raw}"
+    );
+
+    let doc = ExtendedConfigDoc::load(&path).unwrap();
+    assert!(!doc.config().sandbox_escalation_enabled);
+}
+
+#[test]
+fn canonicalize_document_aliases_gives_daemon_boundaries_one_setting() {
+    // The daemon's snapshot/patch RPCs decode and mutate raw config documents
+    // without passing through `ExtendedConfigDoc`'s funnels; they normalize via
+    // `canonicalize_extended_config_document_aliases` so a registered pair is
+    // ONE setting at those boundaries.
+
+    // Both spellings: the canonical one wins and the alias is dropped, so the
+    // typed decode never fails with serde `duplicate field`.
+    let mut both = serde_json::json!({
+        "sandboxEscalationEnabled": true,
+        "sandbox_escalation_enabled": false,
+    });
+    canonicalize_extended_config_document_aliases(&mut both);
+    assert_eq!(
+        both.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert!(both.get("sandboxEscalationEnabled").is_none());
+
+    // Alias-only: the value is re-seated under the canonical key (persist is
+    // canonical-only and must not drop the setting), and a canonical-path
+    // Unset can remove the one setting instead of leaving the alias in effect.
+    let mut alias_only = serde_json::json!({"sandboxEscalationEnabled": false});
+    canonicalize_extended_config_document_aliases(&mut alias_only);
+    assert_eq!(
+        alias_only.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert!(alias_only.get("sandboxEscalationEnabled").is_none());
+
+    // Untouched documents pass through unchanged, and a non-object root is a
+    // inert no-op (the daemon's own malformed-root rejection still applies).
+    let mut untouched =
+        serde_json::json!({"tui": {"mouse_capture": true}, "sandbox_escalation_enabled": true});
+    let expected = untouched.clone();
+    canonicalize_extended_config_document_aliases(&mut untouched);
+    assert_eq!(untouched, expected);
+
+    let mut not_object = serde_json::json!([1, 2, 3]);
+    canonicalize_extended_config_document_aliases(&mut not_object);
+    assert_eq!(not_object, serde_json::json!([1, 2, 3]));
+}
+
+#[test]
 fn approval_mode_defaults_to_manual_and_parses_all_values() {
     // Default + an omitted field both read `manual` (fail-safe default).
     assert_eq!(
@@ -3770,4 +3850,287 @@ fn computer_primary_target_defaults_real_and_allows_virtual_opt_in() {
     std::fs::write(&path, br#"{"computer_target":"virtual"}"#).unwrap();
     let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
     assert_eq!(cfg.computer_target, ComputerTarget::Virtual);
+}
+
+// ---------------------------------------------------------------------------
+// Typed round-trip deserialize path (issue #299)
+//
+// The hand-maintained per-section parse list in `config_with_warnings`
+// silently dropped `daemon`, `retention`, and `dream_model`, so documented
+// settings were inert. The loader now decodes through the real
+// `ExtendedConfig` type in one shot (with a per-section recovery pass for
+// malformed documents), and the tests below keep the coverage structural: a
+// section the typed path does not recognize must fail a test here.
+// ---------------------------------------------------------------------------
+
+fn doc_from_raw(raw: Value) -> ExtendedConfigDoc {
+    ExtendedConfigDoc {
+        path: PathBuf::from("<typed round-trip test>"),
+        raw,
+        origin: ConfigLayerOrigin::LocalTrusted,
+    }
+}
+
+#[test]
+fn daemon_retention_and_dream_model_take_effect_from_config() {
+    // The three sections the audit found silently dropped by the old parse
+    // list. Each must take effect through the typed decode path, both when
+    // read from a document and after a full write/reload round trip.
+    let doc = doc_from_raw(serde_json::json!({
+        "daemon": {
+            "uploads": {
+                "per_client_uploads": 2,
+                "global_uploads": 8,
+                "per_upload_bytes": 1024,
+                "global_bytes": 8192
+            },
+            "background_agents": false
+        },
+        "retention": {
+            "transcript_window_days": 90,
+            "raw_wire_window_days": 14,
+            "terminal_evidence_window_days": 60,
+            "session_window_days": 30,
+            "sweep_interval_hours": 12,
+            "vacuum_min_deletions": 10,
+            "vacuum_interval_days": 2
+        },
+        "dream_model": "anthropic:claude-opus-4-7"
+    }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(cfg.daemon.uploads.per_client_uploads, 2);
+    assert_eq!(cfg.daemon.uploads.global_uploads, 8);
+    assert_eq!(cfg.daemon.uploads.per_upload_bytes, 1024);
+    assert_eq!(cfg.daemon.uploads.global_bytes, 8192);
+    assert!(!cfg.daemon.background_agents);
+    assert_eq!(cfg.retention.transcript_window_days, 90);
+    assert_eq!(cfg.retention.raw_wire_window_days, 14);
+    assert_eq!(cfg.retention.terminal_evidence_window_days, 60);
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert_eq!(cfg.retention.sweep_interval_hours, 12);
+    assert_eq!(cfg.retention.vacuum_min_deletions, 10);
+    assert_eq!(cfg.retention.vacuum_interval_days, 2);
+    assert_eq!(
+        cfg.dream_model.as_deref(),
+        Some("anthropic:claude-opus-4-7")
+    );
+
+    // The same sections must survive a full write/reload round trip through
+    // the on-disk document.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut disk_doc = ExtendedConfigDoc::load(&path).unwrap();
+    disk_doc.write(&cfg).unwrap();
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(reloaded.daemon, cfg.daemon);
+    assert_eq!(reloaded.retention, cfg.retention);
+    assert_eq!(reloaded.dream_model, cfg.dream_model);
+}
+
+#[test]
+fn typed_decode_path_recognizes_every_serialized_section() {
+    // Structural completeness guard (issue #299): every top-level section the
+    // `ExtendedConfig` type serializes must be a section the loader
+    // recognizes. Recognition is proven by feeding each section a value
+    // malformed for its declared type and requiring a warning naming the
+    // section — a section the parse path silently drops produces no warning
+    // and fails here. One of the two sentinels is malformed for every real
+    // section shape: struct/bool/number/string/enum sections reject arrays,
+    // list sections reject strings, and the lenient string-decoding sections
+    // (`defaultPrimaryAgent`) reject arrays.
+    let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
+    let sections = default_doc.as_object().expect("serialized default config");
+    assert!(!sections.is_empty());
+    for key in sections.keys() {
+        let sentinels = [
+            Value::Array(Vec::new()),
+            Value::String("__malformed_sentinel__".into()),
+        ];
+        let recognized = sentinels.iter().any(|sentinel| {
+            let mut raw = serde_json::Map::new();
+            raw.insert(key.clone(), sentinel.clone());
+            let doc = doc_from_raw(Value::Object(raw));
+            doc.config_with_warnings()
+                .1
+                .iter()
+                .any(|warning| warning.contains(key.as_str()))
+        });
+        assert!(
+            recognized,
+            "config section `{key}` is not recognized by config_with_warnings; \
+             every serialized section must be honored by the typed decode path"
+        );
+    }
+}
+
+#[test]
+fn typed_decode_path_recognizes_sections_that_serialize_only_when_set() {
+    // `skip_serializing_if` sections are absent from the serialized default,
+    // so the structural guard above cannot see them. Pin each one here with
+    // the same malformed-sentinel probe. When adding a new
+    // serialize-only-when-set section to `ExtendedConfig`, add it to this
+    // list; removing a section from the struct fails this test, so a stale
+    // spelling cannot linger.
+    let pinned = [
+        "name",
+        "packages_directory",
+        "tools",
+        "web",
+        "computer_use",
+        "computer_target",
+        "allow_computer_guidance_proposals",
+        "utility_model",
+        "dream_model",
+        "translation_model",
+        "cheap_code",
+        "smart_code",
+        "reasoning",
+        "auto_title",
+        "skill_injection",
+        "predict_next_message_model",
+        "harness_report_summarization",
+        "compact_model",
+        "btw_model",
+        "embedding_model",
+        "compact_prompt",
+        "sandbox",
+        "goalSupervision",
+        "defaultAgent",
+        "agentRuntimeDefaults",
+        "sealedAcquisitionConsent",
+        "commandResourceProfiles",
+        "intel",
+    ];
+    for key in pinned {
+        let sentinels = [
+            Value::Array(Vec::new()),
+            Value::String("__malformed_sentinel__".into()),
+        ];
+        let recognized = sentinels.iter().any(|sentinel| {
+            let mut raw = serde_json::Map::new();
+            raw.insert(key.to_string(), sentinel.clone());
+            let doc = doc_from_raw(Value::Object(raw));
+            doc.config_with_warnings()
+                .1
+                .iter()
+                .any(|warning| warning.contains(key))
+        });
+        assert!(
+            recognized,
+            "config section `{key}` is not recognized by config_with_warnings; \
+             a serialize-only-when-set section must be honored by the typed \
+             decode path"
+        );
+    }
+}
+
+#[test]
+fn malformed_upper_layer_section_cannot_clobber_lower_layer_setting() {
+    // The old hand-maintained layer-merge sanitization list covered only a
+    // subset of sections, so a malformed upper-layer `retention` reached the
+    // merge and reset the effective window to defaults. The typed
+    // per-section sanitization must remove the malformed key from the upper
+    // layer so the lower layer's setting survives.
+    let home = doc_from_raw(serde_json::json!({
+        "retention": { "session_window_days": 30 }
+    }));
+    let project = doc_from_raw(serde_json::json!({
+        "retention": "not an object"
+    }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[home, project]);
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.contains("retention")),
+        "the lower layer's valid retention must load without warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn recovery_keeps_valid_sections_alongside_a_malformed_one() {
+    // The per-section recovery path (linear single-key probes plus one final
+    // union decode) must drop only the malformed key: every other section
+    // still loads, and the dropped key is named in exactly one warning.
+    let mut raw = serde_json::Map::new();
+    raw.insert(
+        "retention".into(),
+        serde_json::json!({ "session_window_days": 30 }),
+    );
+    raw.insert("predictNextMessage".into(), Value::Array(Vec::new()));
+    let (cfg, warnings) = doc_from_raw(Value::Object(raw)).config_with_warnings();
+    assert_eq!(cfg.retention.session_window_days, 30);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("predictNextMessage"), "{warnings:?}");
+}
+
+#[test]
+fn sandbox_alias_pair_is_one_setting_with_canonical_spelling_winning() {
+    // A rename/alias pair is ONE setting, not two sections: when a document
+    // carries both spellings, the canonical one wins and the typed decode
+    // still succeeds in one shot — the recovery path must never commit the
+    // alias first (it sorts before the canonical key) and drop the
+    // canonical value as a duplicate.
+    let doc = doc_from_raw(serde_json::json!({
+        "sandboxEscalationEnabled": true,
+        "sandbox_escalation_enabled": false
+    }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(!cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // The legacy spelling alone is still honored.
+    let doc = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
+    let (cfg, warnings) = doc.config_with_warnings();
+    assert!(!cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn layered_sandbox_spelling_does_not_affect_last_layer_wins() {
+    // Layered last-layer-wins must not depend on which spelling each layer
+    // used. Each layer is normalized to the canonical key before merge, so
+    // deep merge never sees two spellings of one setting and layer order
+    // alone decides. Before per-layer normalization, the lower layer's
+    // alias sorted first in recovery and silently beat the upper layer's
+    // canonical spelling.
+    let lower_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
+    let upper_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": true }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_alias, upper_canonical]);
+    assert!(cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let lower_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": false }));
+    let upper_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": true }));
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_canonical, upper_alias]);
+    assert!(cfg.sandbox_escalation_enabled);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn extended_config_key_alias_table_matches_serde() {
+    // Staleness guard for `EXTENDED_CONFIG_KEY_ALIASES`: the canonical key
+    // must be a key the type actually serializes, and the alias must be a
+    // real serde alias of it — carrying both spellings in one raw document
+    // must collide in the typed decode as a duplicate field. A stale table
+    // entry (alias removed from the struct, or pointing at a non-field)
+    // fails here instead of silently rewriting keys.
+    for (alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
+        let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
+        assert!(
+            default_doc.as_object().unwrap().contains_key(*canonical),
+            "`{canonical}` is not a serialized canonical config key"
+        );
+        let mut raw = serde_json::Map::new();
+        raw.insert(alias.to_string(), Value::Bool(true));
+        raw.insert(canonical.to_string(), Value::Bool(false));
+        let error = serde_json::from_value::<ExtendedConfig>(Value::Object(raw))
+            .expect_err("two spellings of one field must collide in the raw typed decode");
+        assert!(
+            error.to_string().contains("duplicate field"),
+            "unexpected error for `{alias}` vs `{canonical}`: {error}"
+        );
+    }
 }

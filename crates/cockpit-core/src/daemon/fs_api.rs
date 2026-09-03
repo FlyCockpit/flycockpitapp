@@ -333,11 +333,21 @@ pub async fn get_extended_config_snapshot(
                 }
                 let raw_revision = content_hash(&raw);
                 let revision = settings_revision(kind, &target, &raw_revision);
-                let raw_document: serde_json::Value =
+                let mut raw_document: serde_json::Value =
                     serde_json::from_slice(&raw).map_err(bad_request_config)?;
+                // A registered alias/canonical pair is ONE setting
+                // (`EXTENDED_CONFIG_KEY_ALIASES`): normalize before the typed
+                // decode and the authorship walk so a document carrying the
+                // legacy spelling decodes once under the canonical key
+                // (instead of failing the whole snapshot with serde
+                // `duplicate field`) and reports its authorship under the
+                // canonical key the client must patch.
+                cockpit_config::config::extended::canonicalize_extended_config_document_aliases(
+                    &mut raw_document,
+                );
                 let authored_paths = authored_typed_paths(&raw_document);
                 let mut config: cockpit_config::config::extended::ExtendedConfig =
-                    serde_json::from_slice(&raw).map_err(bad_request_config)?;
+                    serde_json::from_value(raw_document).map_err(bad_request_config)?;
                 let denylist_ids: Vec<String> = config
                     .redact
                     .denylist
@@ -732,6 +742,16 @@ pub async fn apply_extended_config_patch(
             }
             let mut document: serde_json::Value =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
+            // A registered alias/canonical pair is ONE setting: normalize the
+            // on-disk document before applying client operations so a
+            // canonical-path Set never lands beside a still-live legacy
+            // spelling (serde `duplicate field`) and a canonical-path Unset
+            // removes the one setting instead of leaving the legacy spelling
+            // in effect. Persistence is canonical-only, matching
+            // `ExtendedConfigDoc::merge_config_raw`'s re-seat.
+            cockpit_config::config::extended::canonicalize_extended_config_document_aliases(
+                &mut document,
+            );
             let mut operations = patch.operations;
             let mut selected_paths = std::collections::HashSet::new();
             for operation in &operations {
@@ -3032,5 +3052,242 @@ mod tests {
             .find("settle_interrupted_local_operations")
             .expect("generic interrupted settlement");
         assert!(recovery < generic);
+    }
+
+    /// Issue #299 companion: a registered alias/canonical pair is ONE setting
+    /// at the snapshot/patch boundary, not two JSON keys. A hand-edited
+    /// alias-only (or both-spellings) document must decode under the
+    /// canonical key and stay patchable through the canonical path.
+    fn write_project_settings(root: &Path, document: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+        let target = root.join(".cockpit").join("config.json");
+        std::fs::write(&target, document).unwrap();
+        target
+    }
+
+    async fn snapshot_project_layer(
+        ctx: &crate::daemon::server::DaemonContext,
+        root_text: &str,
+        owner: &str,
+        session: &str,
+        target: &Path,
+    ) -> cockpit_proto::ExtendedConfigLayerSnapshot {
+        let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = get_extended_config_snapshot(
+            ctx,
+            root_text.to_string(),
+            owner.to_string(),
+            session.to_string(),
+        )
+        .await
+        else {
+            panic!("expected an extended config snapshot");
+        };
+        layers
+            .into_iter()
+            .find(|layer| layer.display_path == target.display().to_string())
+            .expect("the project settings layer is discovered")
+    }
+
+    #[tokio::test]
+    async fn settings_snapshot_decodes_the_alias_pair_as_one_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        // Both spellings: the snapshot must not fail the whole RPC with serde
+        // `duplicate field`; the canonical spelling wins, and authorship is
+        // reported under the canonical key the client patches.
+        let target = write_project_settings(
+            &root,
+            r#"{"sandboxEscalationEnabled": true, "sandbox_escalation_enabled": false}"#,
+        );
+        let ctx = test_ctx(&root);
+        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let layer = snapshot_project_layer(
+            &ctx,
+            &root_text,
+            "settings-owner",
+            "snapshot-session",
+            &target,
+        )
+        .await;
+        assert!(
+            !layer.config.sandbox_escalation_enabled,
+            "the canonical spelling wins when a document carries both"
+        );
+        assert_eq!(
+            layer.authored_paths,
+            vec![vec!["sandbox_escalation_enabled".to_string()]],
+            "the alias pair is one setting authored under its canonical key"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_patch_sets_alias_only_setting_through_its_canonical_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let target = write_project_settings(&root, r#"{"sandboxEscalationEnabled": false}"#);
+        let ctx = test_ctx(&root);
+        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let layer = snapshot_project_layer(
+            &ctx,
+            &root_text,
+            "settings-owner",
+            "snapshot-session",
+            &target,
+        )
+        .await;
+        assert!(!layer.config.sandbox_escalation_enabled);
+        assert_eq!(
+            layer.authored_paths,
+            vec![vec!["sandbox_escalation_enabled".to_string()]],
+            "an alias-only document authors its setting under the canonical key"
+        );
+
+        let client_operation_id = Uuid::new_v4().to_string();
+        let request_hash = [3u8; 32];
+        let Ok(crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
+            fencing_generation,
+        }) = ctx
+            .db
+            .begin_local_operation(
+                "settings-owner".to_string(),
+                client_operation_id.clone(),
+                "apply_extended_config_patch".to_string(),
+                request_hash,
+            )
+            .await
+        else {
+            panic!("expected the local operation to dispatch");
+        };
+        let patch = cockpit_proto::ExtendedConfigPatch {
+            operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                path: vec!["sandbox_escalation_enabled".to_string()],
+                value: serde_json::json!(true),
+            }],
+            materialize: false,
+            denylist: Vec::new(),
+            redacted_mutations: Vec::new(),
+        };
+        let response = apply_extended_config_patch(
+            &ctx,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            root_text,
+            layer.layer_id.clone(),
+            patch,
+            layer.revision.clone(),
+            "settings-owner".to_string(),
+            "snapshot-session".to_string(),
+        )
+        .await
+        .expect("a canonical Set against an alias-only document commits");
+        assert!(matches!(
+            response,
+            Response::ExtendedConfigSaved {
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                ..
+            }
+        ));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            written.get("sandbox_escalation_enabled"),
+            Some(&serde_json::json!(true)),
+            "the one setting is persisted under its canonical key: {written}"
+        );
+        assert!(
+            written.get("sandboxEscalationEnabled").is_none(),
+            "the pair must not persist as two independent keys: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_patch_unset_removes_the_alias_only_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let target = write_project_settings(&root, r#"{"sandboxEscalationEnabled": false}"#);
+        let ctx = test_ctx(&root);
+        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let layer = snapshot_project_layer(
+            &ctx,
+            &root_text,
+            "settings-owner",
+            "snapshot-session",
+            &target,
+        )
+        .await;
+
+        let client_operation_id = Uuid::new_v4().to_string();
+        let request_hash = [5u8; 32];
+        let Ok(crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
+            fencing_generation,
+        }) = ctx
+            .db
+            .begin_local_operation(
+                "settings-owner".to_string(),
+                client_operation_id.clone(),
+                "apply_extended_config_patch".to_string(),
+                request_hash,
+            )
+            .await
+        else {
+            panic!("expected the local operation to dispatch");
+        };
+        let patch = cockpit_proto::ExtendedConfigPatch {
+            operations: vec![cockpit_proto::ExtendedConfigPathMutation::Unset {
+                path: vec!["sandbox_escalation_enabled".to_string()],
+            }],
+            materialize: false,
+            denylist: Vec::new(),
+            redacted_mutations: Vec::new(),
+        };
+        let response = apply_extended_config_patch(
+            &ctx,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            root_text.clone(),
+            layer.layer_id.clone(),
+            patch,
+            layer.revision.clone(),
+            "settings-owner".to_string(),
+            "snapshot-session".to_string(),
+        )
+        .await
+        .expect("a canonical Unset against an alias-only document commits");
+        assert!(matches!(
+            response,
+            Response::ExtendedConfigSaved {
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                ..
+            }
+        ));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(
+            written.get("sandbox_escalation_enabled").is_none()
+                && written.get("sandboxEscalationEnabled").is_none(),
+            "Unset removes the ONE setting, not just one spelling: {written}"
+        );
+
+        // The post-commit snapshot reports the setting at its default with no
+        // authored path, so the client's own authored-paths validator agrees.
+        let refreshed = snapshot_project_layer(
+            &ctx,
+            &root_text,
+            "settings-owner",
+            "snapshot-session-2",
+            &target,
+        )
+        .await;
+        assert!(refreshed.config.sandbox_escalation_enabled);
+        assert!(
+            !refreshed
+                .authored_paths
+                .iter()
+                .any(|path| path.first().map(String::as_str) == Some("sandbox_escalation_enabled")),
+            "the unset setting no longer authors any path: {:?}",
+            refreshed.authored_paths
+        );
     }
 }

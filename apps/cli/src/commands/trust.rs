@@ -18,15 +18,16 @@ pub async fn run(command: TrustCommand) -> Result<()> {
 }
 
 async fn history_scope(args: HistoryScopeArgs) -> Result<()> {
-    let path = path_or_current_dir(args.path)?;
-    let trust_root = crate::config::trust::resolve_trust_root(&path)?;
+    // The shared canonical key: the same `project_root` wire value that
+    // `config history-scope` sends for the same workspace (issue #299).
+    let project_root = super::history_scope_project_root(args.path)?;
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for workspace history scope")?;
     let response = daemon
         .client
         .request(Request::SetWorkspaceHistoryScope {
-            project_root: trust_root.root.display().to_string(),
+            project_root: project_root.clone(),
             outbound: args.outbound,
             inbound: args.inbound,
         })
@@ -38,8 +39,7 @@ async fn history_scope(args: HistoryScopeArgs) -> Result<()> {
     match response {
         Response::WorkspaceHistoryScope { outbound, inbound } => {
             print!(
-                "trust root: {}\nhistory outbound: {outbound}\nhistory inbound: {inbound}\n",
-                trust_root.root.display()
+                "trust root: {project_root}\nhistory outbound: {outbound}\nhistory inbound: {inbound}\n"
             );
             Ok(())
         }

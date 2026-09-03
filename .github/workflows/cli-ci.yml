@@ -375,6 +375,20 @@ jobs:
           --features
           cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
 
+      - name: Test remote-only profile matrix
+        run: >
+          cargo build --locked --tests
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote,tenant-authority/remote
+
+      - name: Test extended-only profile matrix
+        run: >
+          cargo build --locked --tests
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
+
       # `extended` is required so cfg-gated spend-policy variants stay in the
       # request_variants! set the exhaustive classification test compares.
       # Package-specific features: tenant-authority has `remote` only,

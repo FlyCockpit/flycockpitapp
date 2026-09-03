@@ -528,11 +528,9 @@ fn is_due(
     }
     #[cfg(not(feature = "extended"))]
     {
-        Ok(default_daily_is_due(
-            last_scheduled_at_unix_ms.div_euclid(1_000),
-            now_seconds,
-            kb_id,
-            consumer_id,
+        let schedule = schedule.expect("checked above");
+        Err(anyhow::anyhow!(
+            "custom dream_schedule `{schedule}` requires the opt-in extended local capability profile"
         ))
     }
 }
@@ -720,6 +718,18 @@ mod tests {
     fn empty_custom_schedule_is_the_local_midnight_default() {
         assert!(is_due(None, None, 1, "kb", "machine").unwrap());
         assert!(is_due(Some("   "), None, 1, "kb", "machine").unwrap());
+    }
+
+    #[test]
+    #[cfg(not(feature = "extended"))]
+    fn custom_cron_schedule_fails_closed_without_extended_profile() {
+        let error = is_due(Some("@hourly"), Some(1_704_067_230_000), 1, "kb", "machine")
+            .expect_err("custom cron must not downgrade to daily semantics");
+        assert!(
+            error
+                .to_string()
+                .contains("opt-in extended local capability profile")
+        );
     }
 
     #[test]

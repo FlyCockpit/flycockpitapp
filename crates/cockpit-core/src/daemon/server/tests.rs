@@ -8213,7 +8213,11 @@ async fn already_attached_client_promotes_busy_ephemeral_owner_in_place() {
         .registry
         .live_handle(session_id)
         .expect("live worker must survive in-place promotion");
-    assert_eq!(live_after.session_id, session_id);
+    assert!(
+        live_after.same_worker_as(&live_before),
+        "in-place promotion must keep the same live worker"
+    );
+    assert_eq!(live_after.session_id(), session_id);
     assert_eq!(live_after.live_status(), (false, true, false));
     assert!(ctx.registry.any_agent_running());
     assert_eq!(

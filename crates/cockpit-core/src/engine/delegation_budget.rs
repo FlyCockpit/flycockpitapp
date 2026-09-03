@@ -88,6 +88,32 @@ pub fn take_lane_forward_progress() -> bool {
         .unwrap_or(false)
 }
 
+/// Drain any residual lane-scoped usage into the owning budget when a
+/// noninteractive executor scope ends. Every recorded charge must land on
+/// exactly one drain; late utility paths such as explore fork seed-reads
+/// record after the per-round drain and must not escape the lane allotment.
+pub struct LaneBudgetExitDrain<'a> {
+    budget: &'a BudgetPool,
+}
+
+impl<'a> LaneBudgetExitDrain<'a> {
+    pub fn new(budget: &'a BudgetPool) -> Self {
+        Self { budget }
+    }
+}
+
+impl Drop for LaneBudgetExitDrain<'_> {
+    fn drop(&mut self) {
+        if !lane_budget_active() {
+            return;
+        }
+        let charge = take_lane_budget_charge();
+        if !charge.is_empty() {
+            let _ = self.budget.charge(charge);
+        }
+    }
+}
+
 use crate::sync::lock_or_recover;
 use crate::tokens::TokenUsage;
 

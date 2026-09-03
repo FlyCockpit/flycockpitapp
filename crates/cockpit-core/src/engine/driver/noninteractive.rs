@@ -10761,6 +10761,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     };
     scheduled_lane_driver.budget = budget.clone();
     scheduled_lane_driver.bind_active_retry_budget();
+    let _lane_exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {
             scheduled_lane_driver.set_guidance_proposal_service(service.clone());

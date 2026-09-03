@@ -11,8 +11,8 @@ pub(in crate::engine::driver) enum NoninteractiveAutoCompactOutcome {
 pub(in crate::engine::driver) enum CompactionAppendixScope {
     #[default]
     Session,
-    /// Subagent autocompact: appendix must not pull parent or sibling state.
-    ActiveAgentOnly,
+    /// Subagent autocompact: appendix scoped to one `(task_call_id, label)` lineage.
+    SubagentLineage(crate::session::SessionEventLineage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1790,7 +1790,7 @@ impl Driver {
                 self.active_model_context_length(),
                 self.resolve_context_config(),
             ),
-            CompactionAppendixScope::ActiveAgentOnly => (
+            CompactionAppendixScope::SubagentLineage(_) => (
                 self.frame_model_context_length(),
                 self.frame_context_config(),
             ),
@@ -1839,7 +1839,7 @@ impl Driver {
                     _ => None,
                 }
             }
-            CompactionAppendixScope::ActiveAgentOnly => {
+            CompactionAppendixScope::SubagentLineage(_) => {
                 match (Some(wire_token_total(&live_history)), context_window) {
                     (Some(used), Some(window)) if window > 0 => {
                         Some(used as f64 / f64::from(window) * 100.0)
@@ -1875,27 +1875,10 @@ impl Driver {
             100,
         )?;
         // 2. Deterministic appendix from the runtime ledger.
-        let active_agent = self.active_agent().to_string();
-        let calls = match appendix_scope {
-            CompactionAppendixScope::Session => self
-                .session
-                .db
-                .list_tool_calls_for_session(self.session.live_id())
-                .await
-                .unwrap_or_default(),
-            CompactionAppendixScope::ActiveAgentOnly => self
-                .session
-                .db
-                .list_tool_calls_for_session(self.session.live_id())
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|call| call.agent == active_agent)
-                .collect(),
-        };
+        let calls = self.compaction_appendix_tool_calls(appendix_scope).await;
         let pins = match appendix_scope {
             CompactionAppendixScope::Session => self.session.pinned_messages(),
-            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
         };
         let conversation_rules = match appendix_scope {
             CompactionAppendixScope::Session => match self
@@ -1913,7 +1896,7 @@ impl Driver {
                     return Err(PrepareCompactionError::ConversationRules(error.to_string()));
                 }
             },
-            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
         };
         let active_goal = match appendix_scope {
             CompactionAppendixScope::Session => self
@@ -1936,7 +1919,7 @@ impl Driver {
                         snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
                     )
                 }),
-            CompactionAppendixScope::ActiveAgentOnly => None,
+            CompactionAppendixScope::SubagentLineage(_) => None,
         };
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
         appendix.conversation_rules = match appendix_scope {
@@ -1944,7 +1927,7 @@ impl Driver {
                 &conversation_rules,
                 self.redact.as_ref(),
             ),
-            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
         };
         if matches!(appendix_scope, CompactionAppendixScope::Session)
             && let Ok(overview) = self
@@ -2296,6 +2279,46 @@ impl Driver {
     /// (#314). Compacts into a new linked window in the subagent's own
     /// `(task_call_id, label)` lineage without touching the parent session's
     /// compaction cadence or foreground history.
+    pub(in crate::engine::driver) async fn compaction_appendix_tool_calls(
+        &self,
+        appendix_scope: CompactionAppendixScope,
+    ) -> Vec<crate::db::tool_calls::ToolCallEvent> {
+        let all = self
+            .session
+            .db
+            .list_tool_calls_for_session(self.session.live_id())
+            .await
+            .unwrap_or_default();
+        match appendix_scope {
+            CompactionAppendixScope::Session => all,
+            CompactionAppendixScope::SubagentLineage(lineage) => {
+                let lineage_call_ids = self.lineage_tool_call_ids(&lineage).await;
+                all.into_iter()
+                    .filter(|call| lineage_call_ids.contains(&call.call_id))
+                    .collect()
+            }
+        }
+    }
+
+    async fn lineage_tool_call_ids(
+        &self,
+        lineage: &crate::session::SessionEventLineage,
+    ) -> std::collections::HashSet<String> {
+        self.session
+            .db
+            .list_session_events(self.session.live_id())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ev| {
+                ev.task_call_id.as_deref() == Some(lineage.task_call_id.as_str())
+                    && ev.label.as_deref() == Some(lineage.label.as_str())
+                    && ev.kind == "tool_call"
+            })
+            .filter_map(|ev| ev.call_id)
+            .collect()
+    }
+
     pub(in crate::engine::driver) async fn maybe_noninteractive_auto_compact(
         &mut self,
         history: &mut Vec<Message>,
@@ -2317,14 +2340,13 @@ impl Driver {
         if metrics.ctx_pct < f64::from(auto_compact_pct) {
             return Ok(NoninteractiveAutoCompactOutcome::NoOp);
         }
-        let tokens_after = input_tokens.unwrap_or(0);
-        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
-        if let Err(error) = budget.record_compaction(tokens_after, forward_progress) {
-            return Err(error);
-        }
         let saved_history = std::mem::replace(&mut self.stack[0].history, history.clone());
         let prepared = match self
-            .prepare_compaction_with_source(tx, "auto", CompactionAppendixScope::ActiveAgentOnly)
+            .prepare_compaction_with_source(
+                tx,
+                "auto",
+                CompactionAppendixScope::SubagentLineage(steer_target.lineage()),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -2339,7 +2361,7 @@ impl Driver {
             }
         };
         let outcome = self
-            .apply_subagent_prepared_compaction(prepared, steer_target, window_index, tx)
+            .apply_subagent_prepared_compaction(prepared, budget, steer_target, window_index, tx)
             .await;
         *history = self.stack[0].history.clone();
         self.stack[0].history = saved_history;
@@ -2349,6 +2371,7 @@ impl Driver {
     async fn apply_subagent_prepared_compaction(
         &mut self,
         prepared: PreparedCompaction,
+        budget: &crate::engine::delegation_budget::BudgetPool,
         steer_target: &super::NoninteractiveSteerTarget,
         window_index: &mut u32,
         tx: &mpsc::Sender<TurnEvent>,
@@ -2380,8 +2403,6 @@ impl Driver {
         .await;
 
         let predecessor_window_index = *window_index;
-        *window_index = window_index.saturating_add(1);
-        let successor_window_index = *window_index;
         let compaction_frame = (!prepared.authoring_provider_id.is_empty()
             && !prepared.authoring_model_id.is_empty())
         .then_some(crate::session::SessionEventModelFrame {
@@ -2393,7 +2414,7 @@ impl Driver {
         let tail_messages = prepared.history[1..].to_vec();
         let record = crate::session::SubagentCompactionRecord {
             predecessor_window_index,
-            successor_window_index,
+            successor_window_index: predecessor_window_index.saturating_add(1),
             seed_tool_count: prepared.seed_tags.len(),
             brief_text: &prepared.brief,
             handoff_text: &prepared.handoff,
@@ -2426,6 +2447,14 @@ impl Driver {
                 .await;
             return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
         }
+
+        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
+        if let Err(error) = budget.record_compaction(prepared.tokens_after, forward_progress) {
+            return Err(error);
+        }
+
+        *window_index = predecessor_window_index.saturating_add(1);
+        let successor_window_index = *window_index;
 
         self.stack[0].history = prepared.history.clone();
 

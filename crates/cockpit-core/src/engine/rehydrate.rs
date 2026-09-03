@@ -281,6 +281,7 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         &tool_calls,
         &scheduler_continuations,
         root_agent,
+        session_id,
         &mut heals,
         policy,
     )?;
@@ -411,7 +412,8 @@ fn apply_text_artifact_tool_projections(
     // `tool_call` / `context_pruned` projections must not be required to map
     // into it. Tail messages already carry the live frames for any retained
     // pre-compaction tool results.
-    let compact_seq = last_root_compaction_cursor(events, root_agent)?.map(|(seq, _prefix)| seq);
+    let compact_seq =
+        last_root_compaction_cursor(events, root_agent, session_id)?.map(|(seq, _prefix)| seq);
     let precedes_compaction = |seq: i64| compact_seq.is_some_and(|cursor| seq <= cursor);
     if let Some(seq) = compact_seq {
         artifacts_by_owner.retain(|(event_seq, _), _| *event_seq > seq);
@@ -872,28 +874,38 @@ fn compacted_model_history(event: &SessionEventRow) -> Result<Vec<Message>> {
     Ok(history)
 }
 
-/// Last in-place `/compact` boundary in `events`, if any.
+/// Last window-seed `/compact` boundary in `events`, if any.
 ///
-/// `rebuild_history` clears model history at a root `session_compacted` event
-/// and replaces it with [`compacted_model_history`]. `/compact` is in-place
-/// (`successor_session_id` is this session), so pre-compaction transcript
-/// rows remain in the log. Post-rebuild text-artifact projection must not
-/// replay those rows (`user_message`, `tool_call`, `context_pruned`) against
-/// the post-compact history.
+/// `rebuild_history` replaces model history with [`compacted_model_history`]
+/// at a root `session_compacted` event whose `successor_session_id` is this
+/// session (this window was seeded by compaction). A compact marker whose
+/// successor is a *different* session is a predecessor timeline event and
+/// must not clear history.
 ///
-/// Returns `(seq, history_prefix)`: `seq` is the last root compaction event;
+/// Returns `(seq, history_prefix)`: `seq` is the last seed event;
 /// `history_prefix` is the length of the prefix `rebuild_history` materializes
 /// so post-compaction turns still line up.
 fn last_root_compaction_cursor(
     events: &[SessionEventRow],
     root_agent: &str,
+    session_id: Uuid,
 ) -> Result<Option<(i64, usize)>> {
     let Some(event) = events.iter().rev().find(|event| {
-        event.kind == "session_compacted" && event.agent.as_deref() == Some(root_agent)
+        event.kind == "session_compacted"
+            && event.agent.as_deref() == Some(root_agent)
+            && compaction_successor_id(event) == Some(session_id)
     }) else {
         return Ok(None);
     };
     Ok(Some((event.seq, compacted_model_history(event)?.len())))
+}
+
+fn compaction_successor_id(event: &SessionEventRow) -> Option<Uuid> {
+    event
+        .data
+        .get("successor_session_id")
+        .and_then(|value| value.as_str())
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 /// Replace only the authored text part of materialized oversized-user events.
@@ -925,9 +937,10 @@ fn apply_text_artifact_user_projections(
         }
     }
 
-    let (compact_seq, mut next_history) = last_root_compaction_cursor(events, root_agent)?
-        .map(|(seq, prefix)| (Some(seq), prefix))
-        .unwrap_or((None, 0));
+    let (compact_seq, mut next_history) =
+        last_root_compaction_cursor(events, root_agent, session_id)?
+            .map(|(seq, prefix)| (Some(seq), prefix))
+            .unwrap_or((None, 0));
     let precedes_compaction = |seq: i64| compact_seq.is_some_and(|cursor| seq <= cursor);
     if let Some(seq) = compact_seq {
         by_event.retain(|event_seq, _| *event_seq > seq);
@@ -2171,6 +2184,7 @@ fn rebuild_history(
     tool_calls: &[ToolCallEvent],
     scheduler_continuations: &[crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow],
     root_agent: &str,
+    session_id: Uuid,
     heals: &mut Vec<Recovery>,
     policy: RehydratePolicy,
 ) -> Result<Vec<Message>> {
@@ -2535,8 +2549,10 @@ fn rebuild_history(
                 }
             }
             "session_compacted" if ev.agent.as_deref() == Some(root_agent) => {
-                std::mem::take(&mut pending).flush(&mut history);
-                history = compacted_model_history(ev)?;
+                if compaction_successor_id(ev) == Some(session_id) {
+                    std::mem::take(&mut pending).flush(&mut history);
+                    history = compacted_model_history(ev)?;
+                }
             }
             "subagent_spawned" if ev.agent.as_deref() == Some(root_agent) => {
                 let Some(call_id) = ev.call_id.as_deref() else {
@@ -7744,10 +7760,67 @@ mod tests {
         );
     }
 
-    /// REGRESSION (#276): `/compact` resets in-place history but leaves
-    /// pre-compaction `user_message` rows in the log. Rehydrate must skip
-    /// those rows when applying text-artifact projections; otherwise the
-    /// first historical user message hard-fails against the compacted handoff.
+    /// REGRESSION (#276, lineage model): a predecessor window keeps its
+    /// verbatim history. Compaction seeds a distinct successor; rehydrate of
+    /// the predecessor must not treat the compact marker as a history reset.
+    #[tokio::test]
+    async fn predecessor_window_keeps_verbatim_history_after_lineage_compact() {
+        let predecessor = root_session();
+        record_user(&predecessor, "first question").await;
+        record_assistant(&predecessor, "a1", "first answer").await;
+        record_user(&predecessor, "second question").await;
+        record_assistant(&predecessor, "a2", "second answer").await;
+        let successor_row = predecessor
+            .db
+            .create_compaction_successor(predecessor.id)
+            .await
+            .unwrap();
+        let tail = vec![
+            Message::user("recent user"),
+            Message::assistant("recent answer"),
+        ];
+        predecessor
+            .record_session_compacted_with_source(
+                "Build",
+                crate::session::SessionCompactionRecord {
+                    successor_session_id: successor_row.session_id,
+                    successor_short_id: successor_row.short_id.as_deref().unwrap_or("succ01"),
+                    seed_tool_count: 0,
+                    brief_text: "brief",
+                    handoff_text: "exact handoff",
+                    source: "manual",
+                    trigger_ctx_pct: None,
+                    tokens_before: 500,
+                    tokens_after: 100,
+                    turns_summarized: 3,
+                    tail_kept: 1,
+                    tail_trimmed: 0,
+                    tail_messages: &tail,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let restored = rehydrate_session(&predecessor.db, predecessor.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(user_text(&restored[0]), "first question");
+        assert_eq!(assistant_text(&restored[1]), "first answer");
+        assert_eq!(user_text(&restored[2]), "second question");
+        assert_eq!(assistant_text(&restored[3]), "second answer");
+        let dump = format!("{restored:?}");
+        assert!(
+            !dump.contains("exact handoff"),
+            "predecessor must not replay the successor handoff: {dump}"
+        );
+    }
+
+    /// REGRESSION (#276): a window-seed `session_compacted` event (successor
+    /// is this session) must skip pre-seed `user_message` rows when applying
+    /// text-artifact projections; otherwise the first historical user message
+    /// hard-fails against the compacted handoff.
     #[tokio::test]
     async fn compacted_model_history_with_prior_turns_rehydrates() {
         let s = root_session();

@@ -387,6 +387,10 @@ impl Drop for SeedReadReceiptClaim {
 /// connection is shared).
 pub struct Session {
     pub id: Uuid,
+    /// Live context-window id. Equals [`Self::id`] until compaction
+    /// successor adoption rewrites it so every `Arc<Session>` clone
+    /// records into the successor window.
+    live_id: std::sync::RwLock<Uuid>,
     pub project_id: String,
     pub project_root: PathBuf,
     pub assistant_name: Option<String>,
@@ -581,6 +585,15 @@ pub struct Session {
     pub btw_parent_session_id: Option<Uuid>,
     #[allow(dead_code)]
     pub btw_tangent: bool,
+    /// Immediate predecessor window when this session was seeded by
+    /// compaction. Distinct from [`Self::parent_session_id`].
+    pub compaction_predecessor_session_id: Option<Uuid>,
+    /// Stable conversation id for this compaction lineage. Forks keep
+    /// their own root.
+    pub compaction_lineage_root_id: Uuid,
+    /// Optional registry rekey installed by the session worker so a live
+    /// compaction successor remains reachable under its new session id.
+    on_compaction_successor: Mutex<Option<Arc<dyn Fn(Uuid, Uuid) + Send + Sync>>>,
     title: Mutex<Option<String>>,
     description: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
@@ -1194,6 +1207,52 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Live context-window identity. Compaction successor adoption rewrites
+    /// this in place so the worker, driver, and handle clones observe the
+    /// new window without replacing `Arc<Session>`.
+    pub fn live_id(&self) -> Uuid {
+        *self
+            .live_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn compaction_lineage_root(&self) -> Uuid {
+        self.compaction_lineage_root_id
+    }
+
+    /// Bind this in-memory session to a newly created compaction successor.
+    /// Subsequent event recording uses [`Self::live_id`].
+    pub fn adopt_compaction_successor(&self, successor_id: Uuid, successor_short_id: String) {
+        let from = self.live_id();
+        *self
+            .live_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_id;
+        *self
+            .short_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_short_id;
+        if let Some(hook) = self
+            .on_compaction_successor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(from, successor_id);
+        }
+    }
+
+    pub(crate) fn set_compaction_successor_hook(
+        &self,
+        hook: Arc<dyn Fn(Uuid, Uuid) + Send + Sync>,
+    ) {
+        *self
+            .on_compaction_successor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     pub(crate) fn set_external_journal(

@@ -347,7 +347,7 @@ impl LiveScheduleContext {
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // An in-place compaction refreshes this same root session. Its fork is
+        // Compaction seeds a linked successor window. Its fork is
         // still valid, including accumulated non-independent loop history.
         // Only a different root session retires that fork.
         if !Arc::ptr_eq(&state.ctx.session, &ctx.session) {

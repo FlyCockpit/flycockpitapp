@@ -1985,6 +1985,30 @@ impl SessionRegistry {
         self.lookup_entry(session_id).map(|(_, handle)| handle)
     }
 
+    /// Move a live worker from `from` to `to` after compaction seeds a
+    /// successor window. Lookups, drain, and join tracking follow the new id.
+    pub fn rekey_live_worker(&self, from: Uuid, to: Uuid) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        anyhow::ensure!(
+            !workers.live.contains_key(&to) && !workers.starting.contains_key(&to),
+            "compaction successor {to} already has a live or starting worker"
+        );
+        let Some(mut entry) = workers.live.remove(&from) else {
+            return Ok(());
+        };
+        entry.handle.session_id = to;
+        workers.live.insert(to, entry);
+        drop(workers);
+        let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
+        if let Some(join) = joins.remove(&from) {
+            joins.insert(to, join);
+        }
+        Ok(())
+    }
+
     fn lookup_entry(&self, session_id: Uuid) -> Option<(WorkerGeneration, SessionWorkerHandle)> {
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
@@ -2365,6 +2389,17 @@ impl SessionRegistry {
                     terminal_cleanup_complete,
                 },
             );
+        let registry = self.clone();
+        handle.session().set_compaction_successor_hook(Arc::new(move |from, to| {
+            if let Err(error) = registry.rekey_live_worker(from, to) {
+                tracing::warn!(
+                    error = %error,
+                    %from,
+                    %to,
+                    "compaction successor rekey failed; live worker may be unreachable under the new session id"
+                );
+            }
+        }));
         let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
             self.inner.db.clone(),
             self.inner.config_source.clone(),

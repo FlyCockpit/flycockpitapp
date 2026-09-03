@@ -1338,6 +1338,7 @@ impl Session {
         };
         Ok(Self {
             id: row.session_id,
+            live_id: std::sync::RwLock::new(row.session_id),
             project_id: row.project_id,
             project_root,
             assistant_name: row.assistant_name,
@@ -1367,6 +1368,9 @@ impl Session {
             fork_point_turn_id: row.fork_point_turn_id,
             btw_parent_session_id: row.btw_parent_session_id,
             btw_tangent: row.btw_tangent,
+            compaction_predecessor_session_id: row.compaction_predecessor_session_id,
+            compaction_lineage_root_id: row.compaction_lineage_root(),
+            on_compaction_successor: Mutex::new(None),
             title: Mutex::new(row.title),
             description: Mutex::new(row.description),
             user_renamed: Mutex::new(row.user_renamed),

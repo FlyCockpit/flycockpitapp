@@ -179,6 +179,7 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
     },
     #[cfg_attr(not(test), allow(dead_code))]
     StoreTextArtifacts(String),
+    SeedSuccessor(String),
 }
 
 #[derive(Debug)]
@@ -1531,8 +1532,8 @@ impl Driver {
 
     /// Assemble and apply a `/compact` handoff for the foreground agent.
     /// Prune-first (fixed ordering), draft the model brief, append the
-    /// deterministic appendix, derive context tags, then reset the foreground
-    /// context window in this same session.
+    /// deterministic appendix, derive context tags, then seed a new linked
+    /// session as the next context window.
     pub(in crate::engine::driver) async fn do_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         self.do_compact_with_source(tx, "manual").await;
     }
@@ -1618,6 +1619,11 @@ impl Driver {
                     PreparedCompactionApplyError::StoreTextArtifacts(error) => {
                         format!(
                             "/compact: recording prepared artifacts failed: {error}; history was left unchanged"
+                        )
+                    }
+                    PreparedCompactionApplyError::SeedSuccessor(error) => {
+                        format!(
+                            "/compact: seeding successor window failed: {error}; history was left unchanged"
                         )
                     }
                 };
@@ -1916,7 +1922,37 @@ impl Driver {
             });
         }
 
-        // 5. Reset the foreground model context in place.
+        // 5. Seed a new linked session (one context window) instead of
+        // resetting this session in place. The predecessor is preserved
+        // whole; the successor's event log starts at the handoff.
+        let predecessor_id = self.session.live_id();
+        let successor_id = uuid::Uuid::new_v4();
+        crate::session::lifecycle::copy_vault_session_secrets(
+            &self.session.db,
+            self.session.secret_vault(),
+            predecessor_id,
+            successor_id,
+        )
+        .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let successor_row = self
+            .session
+            .db
+            .transaction(move |conn| {
+                crate::db::Db::create_compaction_successor_conn(
+                    conn,
+                    predecessor_id,
+                    successor_id,
+                    now_unix_ms,
+                )
+            })
+            .await
+            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
+        let successor_short_id = successor_row
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor_row.session_id.to_string());
+
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers().await;
         // Keep the one live schedule authority attached to the compacted
@@ -1945,17 +1981,10 @@ impl Driver {
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 
-        // Timeline boundary: `/compact` reset this session in place. The record
-        // embeds the drafting model's brief/handoff text and the retained tail,
-        // so journal it through the frame-carrying path against the AUTHORING
-        // model's trust (K1, decision 10.3): a trusted author's session-table
-        // literal journals (or fail-closed scrubs) rather than persisting raw.
-        // A shadow written before the authoring id existed leaves both ids empty
-        // (`#[serde(default)]`); `resolve_trust` of an empty pair falls to the
-        // default (untrusted) so the frame journals nothing — the record still
-        // persists. `self.config` is the turn-pinned snapshot; `self.redact` is
-        // the session's pre-policy table (same shape the SubagentReport finalizer
-        // uses).
+        // Timeline boundary on the predecessor, then a window-seed event on
+        // the successor. The record embeds the drafting model's brief/handoff
+        // text and the retained tail, so journal it through the frame-carrying
+        // path against the AUTHORING model's trust (K1, decision 10.3).
         let compaction_frame = (!prepared.authoring_provider_id.is_empty()
             && !prepared.authoring_model_id.is_empty())
         .then_some(crate::session::SessionEventModelFrame {
@@ -1964,46 +1993,75 @@ impl Driver {
             config: &self.config,
             session_table: self.redact.as_ref(),
         });
+        let tail_messages = prepared.history[1..].to_vec();
+        let record = crate::session::SessionCompactionRecord {
+            successor_session_id: successor_row.session_id,
+            successor_short_id: &successor_short_id,
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
+        if let Err(e) = self
+            .session
+            .record_session_compacted_with_source(&prepared.agent_name, record, compaction_frame)
+            .await
+        {
+            tracing::warn!(error = %e, "record predecessor session_compacted event failed");
+        } else {
+            #[cfg(test)]
+            self.trace_compaction_apply("timeline_recorded");
+        }
+
+        self.session
+            .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone());
+
+        let seed_record = crate::session::SessionCompactionRecord {
+            successor_session_id: successor_row.session_id,
+            successor_short_id: &successor_short_id,
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
         if let Err(e) = self
             .session
             .record_session_compacted_with_source(
                 &prepared.agent_name,
-                crate::session::SessionCompactionRecord {
-                    successor_session_id: self.session.id,
-                    successor_short_id: &self.session.short_id(),
-                    seed_tool_count: prepared.seed_tags.len(),
-                    brief_text: &prepared.brief,
-                    handoff_text: &prepared.handoff,
-                    source: &prepared.source,
-                    trigger_ctx_pct: prepared.trigger_ctx_pct,
-                    tokens_before: prepared.tokens_before,
-                    tokens_after: prepared.tokens_after,
-                    turns_summarized: prepared.turns_summarized,
-                    tail_kept: prepared.tail_kept,
-                    tail_trimmed: prepared.tail_trimmed,
-                    tail_messages: &prepared.history[1..],
-                },
+                seed_record,
                 compaction_frame,
             )
             .await
         {
-            tracing::warn!(error = %e, "record session_compacted event failed");
-        } else {
-            #[cfg(test)]
-            self.trace_compaction_apply("timeline_recorded");
+            tracing::warn!(error = %e, "record successor window-seed event failed");
         }
 
         self.session.reset_compact_self_nudge_latch();
         // A retained rolling brief was intentionally cloned for a resume
         // offer. Once its prepared compaction has actually replaced history,
         // that source snapshot no longer describes the live conversation and
-        // must not survive to a later exactness check.
+        // must not survive to a later exactness check. The shadow stays on
+        // the predecessor row; the successor starts without one.
         self.shadow_brief = None;
         self.delete_durable_shadow_brief().await;
         self.auto_compact_gate.mark_committed();
         let _ = tx
             .send(TurnEvent::CompactReady {
-                new_session_id: self.session.id,
+                new_session_id: successor_row.session_id,
                 handoff: prepared.handoff,
                 brief: prepared.brief,
                 source: prepared.source,

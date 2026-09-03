@@ -4,6 +4,7 @@
 //! host-ID security. Required tests inject session/desktop/monitor answers.
 
 use crate::computer::host_identity::domain_hash;
+use crate::computer::target::OpaqueWindowId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSessionParts {
@@ -401,6 +402,89 @@ pub fn uia_focused_widget_roles(
     }
 }
 
+/// USER message delivered through a retained window object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsUserMessage {
+    pub msg: u32,
+    pub wparam: usize,
+    pub lparam: isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsWindowDeliveryError {
+    Mismatch,
+    MissingObject,
+    AmbiguousDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsWindowSendOutcome {
+    Delivered,
+    DestroyedDuringSend,
+    TimeoutWhileLive,
+}
+
+/// Host for UIA-object delivery. The irreversible send is
+/// [`WindowsWindowObjectDelivery::send_from_object`]; an HWND integer is not
+/// an operand of that call.
+pub trait WindowsWindowObjectDelivery {
+    fn object_is_live(&self) -> bool;
+    fn resolve_from_object(&self) -> Result<(isize, OpaqueWindowId), WindowsWindowDeliveryError>;
+    fn foreground_handle(&self) -> Option<isize>;
+    fn planted_identity_is_live(&self, hwnd: isize, opaque: OpaqueWindowId) -> bool;
+    fn send_from_object(
+        &mut self,
+        message: WindowsUserMessage,
+    ) -> Result<WindowsWindowSendOutcome, WindowsWindowDeliveryError>;
+}
+
+/// Authenticate the retained window object, then send to that held object.
+///
+/// A recycled HWND is a different object: `send_from_object` must resolve the
+/// retained object at send time, so a handle integer captured earlier cannot
+/// be the send operand.
+pub fn deliver_to_authenticated_window_object<H: WindowsWindowObjectDelivery>(
+    host: &mut H,
+    expected: OpaqueWindowId,
+    expected_hwnd: isize,
+    require_foreground: bool,
+    message: WindowsUserMessage,
+) -> Result<(), WindowsWindowDeliveryError> {
+    if !host.object_is_live() {
+        return Err(WindowsWindowDeliveryError::MissingObject);
+    }
+    let (hwnd, opaque) = host.resolve_from_object()?;
+    if hwnd != expected_hwnd || opaque != expected {
+        return Err(WindowsWindowDeliveryError::Mismatch);
+    }
+    if !host.planted_identity_is_live(hwnd, expected) {
+        return Err(WindowsWindowDeliveryError::Mismatch);
+    }
+    if require_foreground && host.foreground_handle() != Some(hwnd) {
+        return Err(WindowsWindowDeliveryError::Mismatch);
+    }
+    match host.send_from_object(message)? {
+        WindowsWindowSendOutcome::Delivered => {}
+        WindowsWindowSendOutcome::DestroyedDuringSend => return Ok(()),
+        WindowsWindowSendOutcome::TimeoutWhileLive => {
+            return Err(WindowsWindowDeliveryError::AmbiguousDelivery);
+        }
+    }
+    if !host.object_is_live() {
+        return Ok(());
+    }
+    match host.resolve_from_object() {
+        Ok((live_hwnd, live_opaque))
+            if live_hwnd == expected_hwnd
+                && live_opaque == expected
+                && host.planted_identity_is_live(live_hwnd, expected) =>
+        {
+            Ok(())
+        }
+        _ => Err(WindowsWindowDeliveryError::AmbiguousDelivery),
+    }
+}
+
 #[cfg(test)]
 mod uia_focused_widget_roles_tests {
     use super::{
@@ -526,5 +610,141 @@ mod uia_focused_widget_roles_tests {
         assert!(native_hwnd_belongs_to_foreground(false, true, false));
         assert!(native_hwnd_belongs_to_foreground(false, false, true));
         assert!(!native_hwnd_belongs_to_foreground(false, false, false));
+    }
+}
+
+#[cfg(test)]
+mod window_object_delivery_tests {
+    use super::{
+        WindowsUserMessage, WindowsWindowDeliveryError, WindowsWindowObjectDelivery,
+        WindowsWindowSendOutcome, deliver_to_authenticated_window_object,
+    };
+    use crate::computer::target::OpaqueWindowId;
+    use std::collections::HashMap;
+
+    const MSG: WindowsUserMessage = WindowsUserMessage {
+        msg: 0x0100,
+        wparam: 1,
+        lparam: 2,
+    };
+
+    struct RecordingUiaHost {
+        bound_hwnd: isize,
+        bound_opaque: OpaqueWindowId,
+        object_hwnd: isize,
+        object_opaque: OpaqueWindowId,
+        planted: HashMap<isize, OpaqueWindowId>,
+        foreground: Option<isize>,
+        live: bool,
+        recycle_on_send: bool,
+        recycled_hwnd: isize,
+        recycled_opaque: OpaqueWindowId,
+        sent: Vec<(isize, WindowsUserMessage)>,
+    }
+
+    impl WindowsWindowObjectDelivery for RecordingUiaHost {
+        fn object_is_live(&self) -> bool {
+            self.live
+        }
+
+        fn resolve_from_object(
+            &self,
+        ) -> Result<(isize, OpaqueWindowId), WindowsWindowDeliveryError> {
+            if !self.live {
+                return Err(WindowsWindowDeliveryError::MissingObject);
+            }
+            Ok((self.object_hwnd, self.object_opaque))
+        }
+
+        fn foreground_handle(&self) -> Option<isize> {
+            self.foreground
+        }
+
+        fn planted_identity_is_live(&self, hwnd: isize, opaque: OpaqueWindowId) -> bool {
+            self.planted.get(&hwnd).copied() == Some(opaque)
+        }
+
+        fn send_from_object(
+            &mut self,
+            message: WindowsUserMessage,
+        ) -> Result<WindowsWindowSendOutcome, WindowsWindowDeliveryError> {
+            if self.recycle_on_send {
+                self.object_hwnd = self.recycled_hwnd;
+                self.object_opaque = self.recycled_opaque;
+            }
+            let (hwnd, opaque) = self.resolve_from_object()?;
+            if hwnd != self.bound_hwnd || opaque != self.bound_opaque {
+                return Err(WindowsWindowDeliveryError::Mismatch);
+            }
+            if self.planted.get(&hwnd).copied() != Some(opaque) {
+                return Err(WindowsWindowDeliveryError::Mismatch);
+            }
+            self.sent.push((hwnd, message));
+            Ok(WindowsWindowSendOutcome::Delivered)
+        }
+    }
+
+    fn host(hwnd: isize, opaque: OpaqueWindowId) -> RecordingUiaHost {
+        let mut planted = HashMap::new();
+        planted.insert(hwnd, opaque);
+        RecordingUiaHost {
+            bound_hwnd: hwnd,
+            bound_opaque: opaque,
+            object_hwnd: hwnd,
+            object_opaque: opaque,
+            planted,
+            foreground: Some(hwnd),
+            live: true,
+            recycle_on_send: false,
+            recycled_hwnd: hwnd.wrapping_add(1),
+            recycled_opaque: OpaqueWindowId::from_bytes([0xff; 16]),
+            sent: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deliver_sends_only_through_the_retained_object() {
+        let opaque = OpaqueWindowId::from_bytes([7; 16]);
+        let mut live = host(0x1000, opaque);
+        assert_eq!(
+            deliver_to_authenticated_window_object(&mut live, opaque, 0x1000, true, MSG),
+            Ok(())
+        );
+        assert_eq!(live.sent, vec![(0x1000, MSG)]);
+    }
+
+    #[test]
+    fn deliver_refuses_a_recycled_hwnd_that_the_retained_object_no_longer_names() {
+        let opaque = OpaqueWindowId::from_bytes([7; 16]);
+        let recycled_opaque = OpaqueWindowId::from_bytes([8; 16]);
+        let mut recycled = host(0x1000, opaque);
+        recycled.recycle_on_send = true;
+        recycled.recycled_hwnd = 0x1000;
+        recycled.recycled_opaque = recycled_opaque;
+        assert_eq!(
+            deliver_to_authenticated_window_object(&mut recycled, opaque, 0x1000, true, MSG),
+            Err(WindowsWindowDeliveryError::Mismatch)
+        );
+        assert!(recycled.sent.is_empty());
+    }
+
+    #[test]
+    fn deliver_refuses_when_the_object_is_dead_or_not_foreground() {
+        let opaque = OpaqueWindowId::from_bytes([7; 16]);
+        let mut dead = host(0x1000, opaque);
+        dead.live = false;
+        assert_eq!(
+            deliver_to_authenticated_window_object(&mut dead, opaque, 0x1000, true, MSG),
+            Err(WindowsWindowDeliveryError::MissingObject)
+        );
+        assert!(dead.sent.is_empty());
+
+        let mut unfocused = host(0x1000, opaque);
+        unfocused.foreground = Some(0x2000);
+        assert_eq!(
+            deliver_to_authenticated_window_object(&mut unfocused, opaque, 0x1000, true, MSG),
+            Err(WindowsWindowDeliveryError::Mismatch)
+        );
+        assert!(unfocused.sent.is_empty());
     }
 }

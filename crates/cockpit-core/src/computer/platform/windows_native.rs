@@ -54,6 +54,10 @@ use crate::computer::ComputerAction;
 use crate::computer::host_identity::{
     RealHostIdentityFs, SysHostIdentityRng, domain_hash, load_or_create_host_installation_id,
 };
+use crate::computer::platform::windows::{
+    WindowsUserMessage, WindowsWindowDeliveryError, WindowsWindowObjectDelivery,
+    WindowsWindowSendOutcome, deliver_to_authenticated_window_object,
+};
 use crate::computer::target::{
     BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
     RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
@@ -626,12 +630,10 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    /// Sole irreversible input primitive. Delivery HWND is read from the
-    /// retained UI Automation window object (or re-acquired only after the
-    /// planted property authenticates a journal HWND). `SendMessageTimeoutW`
-    /// then runs that object's WndProc; a timeout while the HWND still names
-    /// a window is ownership-ambiguous and must not be treated as a known
-    /// non-effect.
+    /// Sole irreversible input primitive. Delivery is addressed to the
+    /// retained UI Automation window object through
+    /// [`deliver_to_authenticated_window_object`]; `SendMessageTimeoutW` runs
+    /// only inside [`LiveUiaDelivery::send_from_object`].
     fn post_to_target(
         &self,
         msg: u32,
@@ -646,60 +648,32 @@ impl WindowsDesktopBackend {
             .ok_or_else(|| {
                 ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
             })?;
-        let (hwnd, element) = hwnd_from_retained_window_object(bound)?;
-        if require_live_focus {
-            let foreground = unsafe { GetForegroundWindow() };
-            if foreground != hwnd {
-                return Err(ComputerError::Refused(
-                    EVIDENCED_WINDOW_MISMATCH.to_string(),
-                ));
-            }
-        }
-        let mut result = 0_usize;
-        // Reset the thread error so a zero return can distinguish timeout
-        // (ambiguous: WndProc may already be running) from a refused lookup.
-        unsafe { SetLastError(ERROR_SUCCESS) };
-        // SAFETY: `hwnd` was just produced by the retained UIA window object
-        // and matched the planted identity property. SendMessageTimeoutW
-        // validates that handle once, holds the USER object for the call,
-        // and SMTO_ERRORONEXIT fails if the object is destroyed mid-call.
-        let sent = unsafe {
-            SendMessageTimeoutW(
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-                SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_ERRORONEXIT.0),
-                WINDOW_DELIVERY_TIMEOUT_MS,
-                Some(&mut result),
-            )
+        let element = retained_uia_window_object(bound)?;
+        let mut delivery = LiveUiaDelivery {
+            element,
+            expected: bound.opaque,
+            expected_hwnd: bound.hwnd_bits,
         };
-        // SAFETY: `IsWindow` accepts any HWND-sized handle.
-        let still_live = unsafe { IsWindow(Some(hwnd)).as_bool() };
-        if sent.0 == 0 {
-            if still_live {
-                return Err(ambiguous_send_timeout());
-            }
-            // The evidenced object destroyed itself while processing (for
-            // example a close button). Delivery addressed that object.
-            return Ok(());
+        match deliver_to_authenticated_window_object(
+            &mut delivery,
+            bound.opaque,
+            bound.hwnd_bits,
+            require_live_focus,
+            WindowsUserMessage {
+                msg,
+                wparam: wparam.0,
+                lparam: lparam.0,
+            },
+        ) {
+            Ok(()) => Ok(()),
+            Err(WindowsWindowDeliveryError::AmbiguousDelivery) => Err(ambiguous_send_timeout()),
+            Err(WindowsWindowDeliveryError::MissingObject) => Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            )),
+            Err(WindowsWindowDeliveryError::Mismatch) => Err(ComputerError::Refused(
+                EVIDENCED_WINDOW_MISMATCH.to_string(),
+            )),
         }
-        if still_live {
-            let live_hwnd = unsafe { element.CurrentNativeWindowHandle() }
-                .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
-            if live_hwnd != hwnd || !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
-                return Err(ComputerError::Refused(
-                    EVIDENCED_WINDOW_MISMATCH.to_string(),
-                ));
-            }
-            let live = opaque_id_for_element(&element)?;
-            if live != bound.opaque {
-                return Err(ComputerError::Refused(
-                    EVIDENCED_WINDOW_MISMATCH.to_string(),
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn client_point(
@@ -861,6 +835,93 @@ fn hwnd_from_retained_window_object(
         ));
     }
     Ok((hwnd, element))
+}
+
+fn retained_uia_window_object(
+    bound: &EvidencedWindowsWindow,
+) -> Result<IUIAutomationElement, ComputerError> {
+    let (_, element) = hwnd_from_retained_window_object(bound)?;
+    Ok(element)
+}
+
+/// Retained UIA window as the send operand. `SendMessageTimeoutW` is reached
+/// only from [`Self::send_from_object`], which re-resolves the element at
+/// send time instead of using a previously extracted HWND.
+struct LiveUiaDelivery {
+    element: IUIAutomationElement,
+    expected: OpaqueWindowId,
+    expected_hwnd: isize,
+}
+
+impl WindowsWindowObjectDelivery for LiveUiaDelivery {
+    fn object_is_live(&self) -> bool {
+        self.resolve_from_object().is_ok()
+    }
+
+    fn resolve_from_object(&self) -> Result<(isize, OpaqueWindowId), WindowsWindowDeliveryError> {
+        let hwnd = unsafe { self.element.CurrentNativeWindowHandle() }
+            .map_err(|_| WindowsWindowDeliveryError::Mismatch)?;
+        if hwnd.is_invalid() || hwnd_bits(hwnd) != self.expected_hwnd {
+            return Err(WindowsWindowDeliveryError::Mismatch);
+        }
+        if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            return Err(WindowsWindowDeliveryError::Mismatch);
+        }
+        if !hwnd_identity_prop_is_live(hwnd, self.expected) {
+            return Err(WindowsWindowDeliveryError::Mismatch);
+        }
+        let live = opaque_id_for_element(&self.element)
+            .map_err(|_| WindowsWindowDeliveryError::Mismatch)?;
+        if live != self.expected {
+            return Err(WindowsWindowDeliveryError::Mismatch);
+        }
+        Ok((hwnd_bits(hwnd), live))
+    }
+
+    fn foreground_handle(&self) -> Option<isize> {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_invalid() {
+            None
+        } else {
+            Some(hwnd_bits(hwnd))
+        }
+    }
+
+    fn planted_identity_is_live(&self, hwnd: isize, opaque: OpaqueWindowId) -> bool {
+        hwnd_identity_prop_is_live(hwnd_from_bits(hwnd), opaque)
+    }
+
+    fn send_from_object(
+        &mut self,
+        message: WindowsUserMessage,
+    ) -> Result<WindowsWindowSendOutcome, WindowsWindowDeliveryError> {
+        let (hwnd_bits_now, opaque) = self.resolve_from_object()?;
+        if hwnd_bits_now != self.expected_hwnd || opaque != self.expected {
+            return Err(WindowsWindowDeliveryError::Mismatch);
+        }
+        let hwnd = hwnd_from_bits(hwnd_bits_now);
+        let mut result = 0_usize;
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                message.msg,
+                WPARAM(message.wparam),
+                LPARAM(message.lparam),
+                SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_ERRORONEXIT.0),
+                WINDOW_DELIVERY_TIMEOUT_MS,
+                Some(&mut result),
+            )
+        };
+        let still_live = unsafe { IsWindow(Some(hwnd)).as_bool() };
+        if sent.0 == 0 {
+            if still_live {
+                return Ok(WindowsWindowSendOutcome::TimeoutWhileLive);
+            }
+            return Ok(WindowsWindowSendOutcome::DestroyedDuringSend);
+        }
+        Ok(WindowsWindowSendOutcome::Delivered)
+    }
 }
 
 fn lparam_point(point: POINT) -> LPARAM {

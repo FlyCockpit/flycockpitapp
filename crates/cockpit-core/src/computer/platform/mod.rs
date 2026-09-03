@@ -16,10 +16,13 @@ pub(crate) use macos::MacActiveConsoleSession;
 #[cfg(target_os = "macos")]
 pub use macos::MacOsTargetEvidenceAdapter;
 pub use macos::{
-    AU_DEFAUDITSID, CgSessionKey, MacAxAttribute, MacAxNotification, MacCallbackGate,
-    MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,
-    TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
+    AU_DEFAUDITSID, CgSessionKey, MACOS_WINDOW_GENERATION_LEN, MacAxAttribute, MacAxNotification,
+    MacCallbackGate, MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic,
+    MacProducerKind, MacosAxDeliveryError, MacosAxWindowDelivery, MacosLiveWindowCandidate,
+    MacosWindowGenerationStore, TASK_AUDIT_TOKEN_COUNT_EXPECTED,
+    deliver_to_authenticated_ax_window, extract_audit_session_id, join_ax_to_cg_window,
     macos_injection_target_from_opaque, macos_window_identity_from_opaque, opaque_macos_window_id,
+    read_or_plant_macos_window_generation, restore_macos_window_object,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
@@ -32,7 +35,9 @@ pub use wayland::{
     WaylandTargetEvidenceProvider, evaluate_wayland_provider,
 };
 pub use windows::{
-    WindowsEvidenceLogic, WindowsSessionParts, windows_monitor_display_id, windows_session_id,
+    WindowsEvidenceLogic, WindowsSessionParts, WindowsUserMessage, WindowsWindowDeliveryError,
+    WindowsWindowObjectDelivery, WindowsWindowSendOutcome, deliver_to_authenticated_window_object,
+    windows_monitor_display_id, windows_session_id,
 };
 #[cfg(target_os = "windows")]
 pub(crate) use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdapter};

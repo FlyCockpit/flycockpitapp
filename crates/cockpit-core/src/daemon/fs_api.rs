@@ -282,15 +282,17 @@ pub async fn fs_write(
 /// mutation boundary. Unlike generic FsWrite this reloads and hashes the
 /// config while holding the cross-process config lock, then commits atomically.
 pub async fn save_extended_config(
+    ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
     path: String,
     content: String,
     base_hash: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let ephemeral = ctx.paths.ephemeral;
     join_fs_handler(
         "save_extended_config",
         tokio::task::spawn_blocking(move || {
-            save_extended_config_sync(&project_root, &path, &content, base_hash)
+            save_extended_config_sync(ephemeral, &project_root, &path, &content, base_hash)
         }),
     )
     .await
@@ -695,6 +697,7 @@ pub async fn apply_extended_config_patch(
     let runtime = tokio::runtime::Handle::current();
     let settlement_owner = owner.clone();
     let settlement_operation = client_operation_id.clone();
+    let ephemeral = ctx.paths.ephemeral;
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
@@ -713,6 +716,10 @@ pub async fn apply_extended_config_patch(
                 {
                     return Err(conflict("settings snapshot is absent, expired, or stale"));
                 }
+                crate::daemon::server::refuse_ephemeral_missing_global_layer(
+                    ephemeral,
+                    &capability.target,
+                )?;
                 // One apply consumes the complete snapshot group atomically.
                 // This prevents unused sibling layer capabilities from
                 // outliving the authority view against which the patch was
@@ -1470,6 +1477,7 @@ fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
 }
 
 fn save_extended_config_sync(
+    ephemeral: bool,
     project_root: &str,
     path: &str,
     content: &str,
@@ -1480,6 +1488,7 @@ fn save_extended_config_sync(
     if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
         return Err(bad_request("extended config target must be config.json"));
     }
+    crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
     // Only a genuinely-absent file is an empty config. A non-NotFound read error
     // (EACCES/EIO/EMFILE/…, over-cap, non-regular) must NOT be coerced to empty:
@@ -2767,8 +2776,9 @@ mod tests {
             .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
             .unwrap();
         drop(handle);
-        let err = save_extended_config_sync(root.to_str().unwrap(), "config.json", "{}", None)
-            .expect_err("oversized config.json must fail closed rather than merge from empty");
+        let err =
+            save_extended_config_sync(false, root.to_str().unwrap(), "config.json", "{}", None)
+                .expect_err("oversized config.json must fail closed rather than merge from empty");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("existing file"), "{}", err.message);
         assert_eq!(
@@ -2908,8 +2918,8 @@ mod tests {
             "the redacted incoming payload must not carry the registry"
         );
 
-        let resp =
-            save_extended_config_sync(root_text, "config.json", &incoming_str, None).unwrap();
+        let resp = save_extended_config_sync(false, root_text, "config.json", &incoming_str, None)
+            .unwrap();
         assert!(matches!(resp, Response::ExtendedConfigWritten { .. }));
 
         // The registry is preserved AND the other change landed.
@@ -2947,7 +2957,7 @@ mod tests {
 
         let content = serde_json::json!({ "name": "Alpha" }).to_string();
         let before = crate::daemon::server::inventory::current_config_generation();
-        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
         let after_write = crate::daemon::server::inventory::current_config_generation();
         assert_eq!(
             after_write,
@@ -2956,7 +2966,7 @@ mod tests {
         );
 
         // Identical content renders to identical merged bytes -> no write.
-        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
         let after_noop = crate::daemon::server::inventory::current_config_generation();
         assert_eq!(
             after_noop, after_write,

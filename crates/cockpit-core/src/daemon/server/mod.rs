@@ -2409,6 +2409,32 @@ pub(crate) enum EphemeralReapDecision {
     WaitingForLiveWork,
 }
 
+/// Ephemeral/diagnostic owners fail closed when a user-level write would
+/// create the global Cockpit config directory. Persistent daemons create
+/// that directory at boot; `cockpit doctor` and other ephemeral owners
+/// must not. Call this at every daemon-side write whose target can fall
+/// back to the (possibly missing) global layer.
+pub(crate) fn refuse_ephemeral_missing_global_layer(
+    ephemeral: bool,
+    path: &Path,
+) -> std::result::Result<(), ErrorPayload> {
+    if !ephemeral {
+        return Ok(());
+    }
+    let Ok(global) = cockpit_config::config::dirs::global_config_dir() else {
+        return Ok(());
+    };
+    if global.is_dir() {
+        return Ok(());
+    }
+    if !cockpit_host::path_containment::contained_under(&global, path) {
+        return Ok(());
+    }
+    Err(bad_request(
+        "ephemeral daemons cannot create the global Cockpit config directory; start a persistent daemon before onboarding",
+    ))
+}
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {

@@ -256,9 +256,15 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
         .or_else(|| global_provider_write_target(provider_id))
 }
 
-/// Most-specific runtime `config.json` write target for mutations that are not
-/// tied to one existing entity. Honors `COCKPIT_CONFIG` as the sole layer.
-pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
+/// Most-specific *discovered* runtime `config.json` write target.
+///
+/// Honors `COCKPIT_CONFIG` as the sole layer. Returns `None` when that
+/// override forbids the write, or when no config directory currently exists
+/// on disk. Workspace-bound mutations (per-project sandbox intent, the
+/// secret-bearing image-generation registry, policy import/export) use this
+/// so they can scaffold a project `.cockpit/` instead of silently writing
+/// to the global layer.
+pub fn most_specific_existing_config_write_target(cwd: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
         && !path.is_empty()
     {
@@ -271,14 +277,30 @@ pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
 
     // Nearest project layer wins (consistent with load precedence and the
     // gitignore write path); when no project layer applies, fall back to the
-    // most-specific non-project layer, else the canonical global layer even
-    // when that directory does not yet exist.
+    // most-specific non-project layer that already exists on disk.
     let dirs = discover_config_dirs(cwd);
     dirs.iter()
         .find(|d| d.kind == ConfigDirKind::Project)
         .or_else(|| dirs.last())
         .map(|d| d.path.join(CONFIG_FILE))
-        .or_else(|| global_config_file().ok())
+}
+
+/// Most-specific runtime `config.json` write target for **user-level**
+/// mutations that are not bound to a trusted workspace layer. Honors
+/// `COCKPIT_CONFIG` as the sole layer. When no discovered layer applies,
+/// falls back to the canonical global layer even when that directory does
+/// not yet exist.
+///
+/// Workspace-bound mutations must use
+/// [`most_specific_existing_config_write_target`] plus their own project
+/// scaffold, not this fallback.
+pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
+        && !path.is_empty()
+    {
+        return most_specific_existing_config_write_target(cwd);
+    }
+    most_specific_existing_config_write_target(cwd).or_else(|| global_config_file().ok())
 }
 
 /// Effective `mcp.json` files for runtime loading, ordered from least
@@ -974,6 +996,11 @@ mod tests {
             config_write_target_for_provider(&work, "default"),
             crate::config::providers::provider_file_path_for_dir(&global, "default").ok(),
             "provider create/first-write falls back to the global layer path"
+        );
+        assert_eq!(
+            most_specific_existing_config_write_target(&work),
+            None,
+            "workspace-bound mutations must see no discovered layer on a fresh install"
         );
         assert_eq!(
             most_specific_config_write_target(&work),

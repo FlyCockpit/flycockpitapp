@@ -10647,6 +10647,85 @@ async fn fresh_untrusted_mcp_global_add_commits_to_the_global_layer() {
     );
 }
 
+/// User-level onboarding writes share one trust-resolution funnel and one
+/// ephemeral-create-global gate. Workspace-bound config mutations must not
+/// join that funnel.
+#[test]
+fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
+    let source = include_str!("dispatch.rs");
+    assert!(
+        source.contains("async fn resolve_user_level_trust_policy("),
+        "user-level trust must be a shared helper, not a per-arm match"
+    );
+
+    let save_mcp = source
+        .split("async fn save_mcp_config(")
+        .last()
+        .expect("MCP save owner")
+        .split("async fn publish_mcp_journal_generation(")
+        .next()
+        .expect("MCP save body");
+    assert!(
+        save_mcp.contains("resolve_user_level_trust_policy"),
+        "SaveMcpConfig must use the user-level trust fallback"
+    );
+    assert!(
+        save_mcp.contains("canonical_user_level_write_target"),
+        "SaveMcpConfig must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !save_mcp.contains("resolve_workspace_trust_policy_from_db"),
+        "SaveMcpConfig must not resolve workspace trust independently"
+    );
+
+    let provider_save = source
+        .split("async fn provider_config_save_under_lock(")
+        .last()
+        .and_then(|tail| tail.split("async fn save_mcp_config(").next())
+        .expect("provider save body");
+    assert!(
+        provider_save.contains("canonical_user_level_write_target"),
+        "direct provider save must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !provider_save.contains("resolve_workspace_trust_policy_from_db"),
+        "direct provider save must reuse daemon_provider_config's user-level policy"
+    );
+
+    let persist_provider = source
+        .split("fn persist_daemon_provider(")
+        .last()
+        .and_then(|tail| tail.split("async fn provider_config_delete(").next())
+        .expect("persist_daemon_provider body");
+    assert!(
+        persist_provider.contains("canonical_user_level_write_target"),
+        "model-fetch persistence must refuse ephemeral creation of the global layer"
+    );
+
+    let persist_meta = source
+        .split("fn persist_provider_layer_metadata(")
+        .last()
+        .and_then(|tail| {
+            tail.split("pub(super) async fn attached_trust_policy(")
+                .next()
+        })
+        .expect("persist_provider_layer_metadata body");
+    assert!(
+        persist_meta.contains("canonical_user_level_write_target"),
+        "provider metadata persistence must refuse ephemeral creation of the global layer"
+    );
+
+    let begin_mcp = source
+        .split("Request::BeginMcpOAuth {")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::CompleteMcpOAuth {").next())
+        .expect("BeginMcpOAuth arm");
+    assert!(
+        begin_mcp.contains("resolve_user_level_trust_policy"),
+        "MCP OAuth begin must use the user-level trust fallback"
+    );
+}
+
 /// A trusted workspace that already defines a provider keeps writing that
 /// workspace layer (scope preservation).
 #[tokio::test]
@@ -12526,6 +12605,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     .to_string();
     assert!(!incoming.contains("openai-main"));
     let saved = crate::daemon::fs_api::save_extended_config(
+        &ctx,
         project_root.clone(),
         ".cockpit/config.json".into(),
         incoming,

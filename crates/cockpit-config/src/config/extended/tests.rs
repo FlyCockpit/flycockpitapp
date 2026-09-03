@@ -1556,6 +1556,50 @@ fn write_preserves_alias_only_setting_under_canonical_key() {
 }
 
 #[test]
+fn canonicalize_document_aliases_gives_daemon_boundaries_one_setting() {
+    // The daemon's snapshot/patch RPCs decode and mutate raw config documents
+    // without passing through `ExtendedConfigDoc`'s funnels; they normalize via
+    // `canonicalize_extended_config_document_aliases` so a registered pair is
+    // ONE setting at those boundaries.
+
+    // Both spellings: the canonical one wins and the alias is dropped, so the
+    // typed decode never fails with serde `duplicate field`.
+    let mut both = serde_json::json!({
+        "sandboxEscalationEnabled": true,
+        "sandbox_escalation_enabled": false,
+    });
+    canonicalize_extended_config_document_aliases(&mut both);
+    assert_eq!(
+        both.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert!(both.get("sandboxEscalationEnabled").is_none());
+
+    // Alias-only: the value is re-seated under the canonical key (persist is
+    // canonical-only and must not drop the setting), and a canonical-path
+    // Unset can remove the one setting instead of leaving the alias in effect.
+    let mut alias_only = serde_json::json!({"sandboxEscalationEnabled": false});
+    canonicalize_extended_config_document_aliases(&mut alias_only);
+    assert_eq!(
+        alias_only.get("sandbox_escalation_enabled"),
+        Some(&Value::Bool(false))
+    );
+    assert!(alias_only.get("sandboxEscalationEnabled").is_none());
+
+    // Untouched documents pass through unchanged, and a non-object root is a
+    // inert no-op (the daemon's own malformed-root rejection still applies).
+    let mut untouched =
+        serde_json::json!({"tui": {"mouse_capture": true}, "sandbox_escalation_enabled": true});
+    let expected = untouched.clone();
+    canonicalize_extended_config_document_aliases(&mut untouched);
+    assert_eq!(untouched, expected);
+
+    let mut not_object = serde_json::json!([1, 2, 3]);
+    canonicalize_extended_config_document_aliases(&mut not_object);
+    assert_eq!(not_object, serde_json::json!([1, 2, 3]));
+}
+
+#[test]
 fn approval_mode_defaults_to_manual_and_parses_all_values() {
     // Default + an omitted field both read `manual` (fail-safe default).
     assert_eq!(

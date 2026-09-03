@@ -577,7 +577,7 @@ fn extended_config_snapshot(root: &Path, session: &str) -> Result<Response, Stri
         };
         let raw_revision = content_hash(&raw);
         let revision = settings_revision(kind, &target, &raw_revision);
-        let raw_document: serde_json::Value = match serde_json::from_slice(&raw) {
+        let mut raw_document: serde_json::Value = match serde_json::from_slice(&raw) {
             Ok(document) => document,
             Err(_) if !requested => continue,
             Err(error) => {
@@ -587,8 +587,13 @@ fn extended_config_snapshot(root: &Path, session: &str) -> Result<Response, Stri
                 ));
             }
         };
+        // A registered alias/canonical pair is ONE setting: mirror the
+        // daemon's snapshot and normalize before the typed decode and the
+        // authorship walk, so tests observe the canonical-key behavior the
+        // daemon enforces.
+        cockpit_config::extended::canonicalize_extended_config_document_aliases(&mut raw_document);
         let authored_paths = authored_typed_paths(&raw_document);
-        let mut config: ExtendedConfig = match serde_json::from_slice(&raw) {
+        let mut config: ExtendedConfig = match serde_json::from_value(raw_document) {
             Ok(config) => config,
             Err(_) if !requested => continue,
             Err(error) => {
@@ -870,6 +875,11 @@ fn apply_extended_config_patch(
     }
     let mut document: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|error| format!("settings layer is not a valid JSON document: {error}"))?;
+    // A registered alias/canonical pair is ONE setting: mirror the daemon's
+    // patch apply and normalize before applying operations, so a
+    // canonical-path Set/Unset acts on the one setting under its canonical
+    // key and the persisted document is canonical-only.
+    cockpit_config::extended::canonicalize_extended_config_document_aliases(&mut document);
     let operations = patch.operations;
     let mut selected = HashSet::new();
     for operation in &operations {

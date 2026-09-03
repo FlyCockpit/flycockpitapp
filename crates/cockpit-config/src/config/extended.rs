@@ -2801,7 +2801,10 @@ pub(crate) fn strip_secret_store_key(raw: &mut Value) {
 /// The persist path ([`ExtendedConfigDoc::merge_config_raw`]) consults this
 /// table too: written documents are canonical-only, and the alternate
 /// spelling's value is re-seated under the canonical key, so an alias-only
-/// document never loses the setting on save.
+/// document never loses the setting on save. The daemon's settings
+/// snapshot/patch RPCs (which decode and mutate raw documents outside this
+/// crate) enforce the same one-setting view through
+/// [`canonicalize_extended_config_document_aliases`].
 const EXTENDED_CONFIG_KEY_ALIASES: &[(&str, &str)] =
     &[("sandboxEscalationEnabled", "sandbox_escalation_enabled")];
 
@@ -2825,6 +2828,23 @@ fn canonicalize_extended_config_key_aliases(raw: &mut Map<String, Value>) {
         {
             raw.insert(canonical.to_string(), value);
         }
+    }
+}
+
+/// Document-level form of [`canonicalize_extended_config_key_aliases`] for
+/// config boundaries outside this crate: the daemon's settings snapshot and
+/// patch RPCs (and their disk-backed test fake) decode and mutate raw config
+/// documents without passing through [`ExtendedConfigDoc`]'s load, merge, and
+/// persist funnels. Normalizing at those boundaries gives them the same
+/// ONE-setting view of a registered pair the funnels enforce: a canonical-path
+/// Set can never land beside a still-live legacy spelling (which serde's
+/// derived deserializer rejects as `duplicate field`), a canonical-path Unset
+/// removes the one setting instead of leaving the legacy spelling in effect,
+/// and an alias-only document is persisted under the canonical key, exactly
+/// like [`ExtendedConfigDoc::merge_config_raw`]'s re-seat.
+pub fn canonicalize_extended_config_document_aliases(document: &mut Value) {
+    if let Some(object) = document.as_object_mut() {
+        canonicalize_extended_config_key_aliases(object);
     }
 }
 

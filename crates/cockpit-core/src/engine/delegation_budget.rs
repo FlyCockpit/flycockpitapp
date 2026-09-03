@@ -62,14 +62,15 @@ pub(crate) fn lane_budget_active() -> bool {
 }
 
 pub(crate) fn note_lane_budget_usage(charge: BudgetCharge, forward_progress: bool) {
-    let Ok(cell) = LANE_BUDGET_ACCUMULATOR.try_with(|accumulator| accumulator) else {
+    let Ok(()) = LANE_BUDGET_ACCUMULATOR.try_with(|accumulator| {
+        let mut accumulator = accumulator.borrow_mut();
+        accumulator.uncharged += charge;
+        if forward_progress {
+            accumulator.forward_progress = true;
+        }
+    }) else {
         return;
     };
-    let mut accumulator = cell.borrow_mut();
-    accumulator.uncharged += charge;
-    if forward_progress {
-        accumulator.forward_progress = true;
-    }
 }
 
 pub fn take_lane_budget_charge() -> BudgetCharge {

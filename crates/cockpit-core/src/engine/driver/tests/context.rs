@@ -4424,7 +4424,7 @@ async fn lane_budget_exit_drain_charges_residual_lane_usage() {
     let budget = crate::engine::delegation_budget::BudgetPool::new(
         cockpit_config::config::delegation_budget::ResolvedDelegationBudget {
             max_input_tokens: Some(1_000_000),
-            ..Default::default()
+            ..cockpit_config::config::delegation_budget::ResolvedDelegationBudget::unlimited()
         },
     );
     crate::engine::delegation_budget::LaneBudgetScope::run(async {
@@ -4510,7 +4510,7 @@ async fn subagent_compaction_appendix_scopes_tool_calls_to_lineage() {
 
     let scoped = driver
         .compaction_appendix_tool_calls(
-            crate::engine::driver::CompactionAppendixScope::SubagentLineage(SessionEventLineage {
+            &crate::engine::driver::CompactionAppendixScope::SubagentLineage(SessionEventLineage {
                 task_call_id: "task-a".into(),
                 label: "default".into(),
             }),
@@ -4772,7 +4772,6 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
         None,
         None,
         None,
-        None,
         Vec::new(),
         Some(budget),
         None,
@@ -4907,7 +4906,6 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
             "task-budget-exec",
             "default",
         )),
-        None,
         None,
         None,
         None,

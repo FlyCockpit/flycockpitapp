@@ -1,13 +1,13 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::engine::driver) enum NoninteractiveAutoCompactOutcome {
+pub(crate) enum NoninteractiveAutoCompactOutcome {
     NoOp,
     PrepareFailed,
     Compacted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(in crate::engine::driver) enum CompactionAppendixScope {
     #[default]
     Session,
@@ -1877,7 +1877,7 @@ impl Driver {
             100,
         )?;
         // 2. Deterministic appendix from the runtime ledger.
-        let calls = self.compaction_appendix_tool_calls(appendix_scope).await;
+        let calls = self.compaction_appendix_tool_calls(&appendix_scope).await;
         let pins = match appendix_scope {
             CompactionAppendixScope::Session => self.session.pinned_messages(),
             CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
@@ -2283,7 +2283,7 @@ impl Driver {
     /// compaction cadence or foreground history.
     pub(in crate::engine::driver) async fn compaction_appendix_tool_calls(
         &self,
-        appendix_scope: CompactionAppendixScope,
+        appendix_scope: &CompactionAppendixScope,
     ) -> Vec<crate::db::tool_calls::ToolCallEvent> {
         let all = self
             .session
@@ -2294,7 +2294,7 @@ impl Driver {
         match appendix_scope {
             CompactionAppendixScope::Session => all,
             CompactionAppendixScope::SubagentLineage(lineage) => {
-                let lineage_call_ids = self.lineage_tool_call_ids(&lineage).await;
+                let lineage_call_ids = self.lineage_tool_call_ids(lineage).await;
                 all.into_iter()
                     .filter(|call| lineage_call_ids.contains(&call.call_id))
                     .collect()

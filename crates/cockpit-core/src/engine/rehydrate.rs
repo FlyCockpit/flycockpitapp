@@ -1748,7 +1748,7 @@ pub fn subagent_history_page_before_conn(
 
 /// Resumed noninteractive lane state derived from durable `subagent_compacted`
 /// rows for one `(task_call_id, label)` lineage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentLaneCompactionState {
     /// Successor window index of the latest durable compaction boundary.
     pub window_index: u32,

@@ -1048,7 +1048,11 @@ async fn durable_shadow_payload_round_trips_with_prepared_compaction() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     let payload = DurableCompactionShadow::PreparedCompaction(Box::new(prepared));
@@ -2055,7 +2059,11 @@ async fn prepare_commits_nothing() {
         .unwrap();
 
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
 
@@ -2100,7 +2108,11 @@ async fn prepared_compaction_round_trips_serde() {
     let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
 
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     let encoded = serde_json::to_string(&prepared).unwrap();
@@ -2114,7 +2126,11 @@ async fn apply_runs_no_inference() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     let before = compact_inference_purposes(&driver).await;
@@ -2152,7 +2168,11 @@ async fn compaction_preserves_bounded_idle_timer_and_activity_anchor() {
     assert_eq!(before[0].limit, Some(1));
 
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     driver
@@ -2182,7 +2202,11 @@ async fn apply_rejects_stale_prepared_compaction() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     driver.stack[0].history.push(Message::user("late turn"));
@@ -2228,7 +2252,11 @@ async fn apply_of_prepared_matches_synchronous_path() {
     let (sync_tx, mut sync_rx) = mpsc::channel::<TurnEvent>(64);
 
     let prepared = split_driver
-        .prepare_compaction_with_source(&split_tx, "manual")
+        .prepare_compaction_with_source(
+            &split_tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
     split_driver
@@ -2360,7 +2388,11 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
     let apply_trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     driver.test_compaction_apply_trace = Some(apply_trace.clone());
     let prepared = driver
-        .prepare_compaction_with_source(&tx, "manual")
+        .prepare_compaction_with_source(
+            &tx,
+            "manual",
+            crate::engine::driver::CompactionAppendixScope::Session,
+        )
         .await
         .expect("prepare succeeds");
 
@@ -2415,7 +2447,11 @@ async fn rollback_paths_are_gone_because_prepare_is_pure() {
 
     assert!(
         driver
-            .prepare_compaction_with_source(&tx, "manual")
+            .prepare_compaction_with_source(
+                &tx,
+                "manual",
+                crate::engine::driver::CompactionAppendixScope::Session
+            )
             .await
             .is_err(),
         "zero-window prepare fails before any apply-phase side effect"
@@ -4278,4 +4314,107 @@ async fn auto_compact_gate_restart_begins_eligible() {
         !restored.auto_compact_gate.suppresses(&coverage),
         "restart must begin Eligible — the gate is not serialized"
     );
+}
+
+#[tokio::test]
+async fn noninteractive_auto_compact_threshold_uses_local_history_not_session_usage() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::driver::{NoninteractiveAutoCompactOutcome, NoninteractiveSteerTarget};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            auto_compact_pct: Some(50),
+            ..ContextConfig::default()
+        },
+        10_000,
+    );
+    record_test_context_tokens(&driver, 9_000).await;
+    let mut history = vec![Message::user("still small")];
+    let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
+    let target = NoninteractiveSteerTarget::new("task-1", "default");
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let mut window_index = 0;
+
+    let outcome = driver
+        .maybe_noninteractive_auto_compact(&mut history, &budget, &target, &mut window_index, &tx)
+        .await
+        .unwrap();
+    assert_eq!(outcome, NoninteractiveAutoCompactOutcome::NoOp);
+}
+
+#[tokio::test]
+async fn noninteractive_auto_compact_prepare_failure_restores_history() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::driver::{NoninteractiveAutoCompactOutcome, NoninteractiveSteerTarget};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            auto_compact_pct: Some(50),
+            ..ContextConfig::default()
+        },
+        10_000,
+    );
+    let mut history = vec![Message::user("x".repeat(60_000))];
+    let saved = history.clone();
+    driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Prepare);
+    let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
+    let target = NoninteractiveSteerTarget::new("task-1", "default");
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
+    let mut window_index = 0;
+
+    let outcome = driver
+        .maybe_noninteractive_auto_compact(&mut history, &budget, &target, &mut window_index, &tx)
+        .await
+        .unwrap();
+    assert_eq!(outcome, NoninteractiveAutoCompactOutcome::PrepareFailed);
+    assert_eq!(history, saved);
+    drop(tx);
+    let notice = rx
+        .recv()
+        .await
+        .and_then(|event| match event {
+            TurnEvent::Notice { text } => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        notice.contains("history was left unchanged"),
+        "prepare failure must surface a fail-closed notice: {notice}"
+    );
+}
+
+#[tokio::test]
+async fn lane_budget_scope_routes_usage_off_session_global_slot() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    crate::engine::delegation_budget::LaneBudgetScope::run(async {
+        driver
+            .session
+            .record_usage(
+                uuid::Uuid::new_v4(),
+                crate::tokens::TokenUsage {
+                    input_tokens: 123,
+                    output_tokens: 4,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(driver.session.take_uncharged_budget_charge().is_empty());
+        let lane = crate::engine::delegation_budget::take_lane_budget_charge();
+        assert_eq!(lane.input_tokens, 123);
+        assert_eq!(lane.output_tokens, 4);
+        crate::engine::delegation_budget::note_lane_budget_usage(
+            crate::engine::delegation_budget::BudgetCharge::default(),
+            true,
+        );
+        assert!(crate::engine::delegation_budget::take_lane_forward_progress());
+    })
+    .await;
 }

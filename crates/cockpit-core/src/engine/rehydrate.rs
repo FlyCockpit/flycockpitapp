@@ -257,6 +257,16 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
             event.data = serde_json::from_str(&payload)
                 .context("decoding stored compaction payload for rehydration")?;
         }
+        if event.kind == "subagent_compacted"
+            && let Some(reference) = event
+                .data
+                .get("handoff_ref")
+                .and_then(|value| value.as_str())
+            && let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)?
+        {
+            event.data = serde_json::from_str(&payload)
+                .context("decoding stored subagent compaction payload for rehydration")?;
+        }
     }
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
@@ -1572,23 +1582,8 @@ pub(crate) fn history_snapshot_from_events_conn(
                 });
             }
             "subagent_compacted" if visible_lineage(ev) => {
-                snapshot.clear();
-                let handoff = ev
-                    .data
-                    .get("handoff_text")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-                snapshot.push(proto::HistoryEntry::User {
-                    text: handoff,
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    client_submission_ids: Vec::new(),
-                    ts_ms: ev.ts_ms,
-                    seq: ev.seq,
-                    origin_principal: ev.origin_principal.clone(),
-                });
+                let data = resolve_subagent_compaction_data(conn, session_id, &ev.data)?;
+                snapshot.push(subagent_compaction_compact_boundary(ev, &data));
             }
             "subagent_spawned" => {
                 let Some(active) = active_subagent else {
@@ -1700,12 +1695,17 @@ pub fn subagent_history_snapshot_conn(
         .map_err(|e| anyhow!("loading session events for subagent history snapshot: {e}"))?;
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for subagent history snapshot: {e}"))?;
-    let owned_events = events
+    let mut owned_events = events
         .into_iter()
         .filter(|ev| {
             ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
         })
         .collect::<Vec<_>>();
+    for event in &mut owned_events {
+        if event.kind == "subagent_compacted" {
+            event.data = resolve_subagent_compaction_data(conn, session_id, &event.data)?;
+        }
+    }
     Ok(subagent_history_entries_from_events(
         &owned_events,
         &tool_calls,
@@ -1732,10 +1732,91 @@ pub fn subagent_history_page_before_conn(
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for subagent history page: {e}"))?;
     Ok(HistoryPage {
-        entries: subagent_history_entries_from_events(&page.events, &tool_calls),
+        entries: {
+            let mut events = page.events;
+            for event in &mut events {
+                if event.kind == "subagent_compacted" {
+                    event.data = resolve_subagent_compaction_data(conn, session_id, &event.data)?;
+                }
+            }
+            subagent_history_entries_from_events(&events, &tool_calls)
+        },
         has_more: page.has_more,
         oldest_seq: page.oldest_seq,
     })
+}
+
+fn subagent_compaction_compact_boundary(
+    ev: &SessionEventRow,
+    data: &serde_json::Value,
+) -> proto::HistoryEntry {
+    let predecessor_window_index = data
+        .get("predecessor_window_index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let seed_tool_count = data
+        .get("seed_tool_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let brief = data
+        .get("brief_text")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let handoff = data
+        .get("handoff_text")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| brief.clone());
+    proto::HistoryEntry::CompactBoundary {
+        seq: ev.seq,
+        predecessor_short_id: format!("w{predecessor_window_index}"),
+        seed_tool_count,
+        seed_tool_tokens: 0,
+        source: data
+            .get("source")
+            .and_then(|value| value.as_str())
+            .unwrap_or("auto")
+            .to_string(),
+        trigger_ctx_pct: data
+            .get("trigger_ctx_pct")
+            .and_then(serde_json::Value::as_f64),
+        tokens_before: data
+            .get("tokens_before")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        tokens_after: data
+            .get("tokens_after")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        turns_summarized: data
+            .get("turns_summarized")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        tail_kept: data
+            .get("tail_kept")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        tail_trimmed: data
+            .get("tail_trimmed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        brief,
+        handoff,
+    }
+}
+
+fn resolve_subagent_compaction_data(
+    conn: &Connection,
+    session_id: Uuid,
+    data: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let Some(reference) = data.get("handoff_ref").and_then(serde_json::Value::as_str) else {
+        return Ok(data.clone());
+    };
+    let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)? else {
+        anyhow::bail!("missing stored subagent compaction payload for `{reference}`");
+    };
+    serde_json::from_str(&payload).context("decoding stored subagent compaction payload")
 }
 
 fn subagent_history_entries_from_events(
@@ -1935,23 +2016,7 @@ fn subagent_history_entries_from_events(
                 });
             }
             "subagent_compacted" => {
-                snapshot.clear();
-                let handoff = ev
-                    .data
-                    .get("handoff_text")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| ev.data.get("brief_text").and_then(|value| value.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-                snapshot.push(proto::HistoryEntry::User {
-                    text: handoff,
-                    display_text: None,
-                    tag_expansions: Vec::new(),
-                    client_submission_ids: Vec::new(),
-                    ts_ms: ev.ts_ms,
-                    seq: ev.seq,
-                    origin_principal: ev.origin_principal.clone(),
-                });
+                snapshot.push(subagent_compaction_compact_boundary(ev, &ev.data));
             }
             "subagent_spawned" => {
                 let parent = ev.data.get("parent").and_then(|v| v.as_str()).unwrap_or("");

@@ -1256,7 +1256,7 @@ pub enum Event {
 
     /// A noninteractive subagent autocompacted into a new linked window in its
     /// own delegation lineage. Parent-visible signal only; never enters model
-    /// context. TODO(#314): mirror in TypeScript protocol consumers post-launch.
+    /// context.
     SubagentCompacted {
         session_id: Uuid,
         agent: String,

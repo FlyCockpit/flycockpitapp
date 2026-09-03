@@ -821,19 +821,20 @@ impl Session {
         usage: crate::tokens::TokenUsage,
         is_utility: bool,
     ) -> Result<()> {
-        *self.last_usage.lock().unwrap() = Some(usage);
         let priced_cost = self.cost_microusd_for_usage(&usage);
-        {
-            let mut uncharged = self.uncharged_budget.lock().unwrap();
-            let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
-            if let Some(cost) = priced_cost {
-                charge = charge.with_cost(cost);
-            }
-            *uncharged += charge;
+        let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
+        if let Some(cost) = priced_cost {
+            charge = charge.with_cost(cost);
         }
-        if !is_utility {
-            self.pending_forward_progress
-                .store(true, std::sync::atomic::Ordering::Release);
+        if crate::engine::delegation_budget::lane_budget_active() {
+            crate::engine::delegation_budget::note_lane_budget_usage(charge, !is_utility);
+        } else {
+            *self.last_usage.lock().unwrap() = Some(usage);
+            *self.uncharged_budget.lock().unwrap() += charge;
+            if !is_utility {
+                self.pending_forward_progress
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
 
         let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {

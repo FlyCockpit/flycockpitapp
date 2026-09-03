@@ -7,6 +7,14 @@ pub(in crate::engine::driver) enum NoninteractiveAutoCompactOutcome {
     Compacted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::engine::driver) enum CompactionAppendixScope {
+    #[default]
+    Session,
+    /// Subagent autocompact: appendix must not pull parent or sibling state.
+    ActiveAgentOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::engine::driver) struct BoundaryKey {
     activity_epoch: u64,
@@ -1363,7 +1371,7 @@ impl Driver {
         if !exact {
             return Ok(None);
         }
-        self.prepare_compaction_with_source(tx, "resume")
+        self.prepare_compaction_with_source(tx, "resume", CompactionAppendixScope::Session)
             .await
             .map(Some)
     }
@@ -1676,7 +1684,10 @@ impl Driver {
             tracing::warn!("compact deferred: persist-on-re-entry owns keep-parked siblings");
             return;
         }
-        let prepared = match self.prepare_compaction_with_source(tx, source).await {
+        let prepared = match self
+            .prepare_compaction_with_source(tx, source, CompactionAppendixScope::Session)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 if source == "auto" {
@@ -1753,6 +1764,7 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
+        appendix_scope: CompactionAppendixScope,
     ) -> Result<PreparedCompaction, PrepareCompactionError> {
         use crate::engine::compact;
 
@@ -1773,8 +1785,16 @@ impl Driver {
             .clone();
         let coverage = prepared_compaction_coverage(&live_history);
         let tokens_before = wire_token_total(&live_history);
-        let context_window = self.active_model_context_length();
-        let ctx_cfg = self.resolve_context_config();
+        let (context_window, ctx_cfg) = match appendix_scope {
+            CompactionAppendixScope::Session => (
+                self.active_model_context_length(),
+                self.resolve_context_config(),
+            ),
+            CompactionAppendixScope::ActiveAgentOnly => (
+                self.frame_model_context_length(),
+                self.frame_context_config(),
+            ),
+        };
         // Resolve shadow ownership before mutating history with the private
         // prune. An unfinished task is cancelled and falls back to the full
         // synchronous path; a stale ready draft is discarded likewise.
@@ -1810,11 +1830,23 @@ impl Driver {
             && shadow.as_ref().is_some_and(|ready| {
                 ready.input_coverage == crate::engine::compact_draft::CompactInputCoverage::Full
             });
-        let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {
-            (Some(used), Some(window)) if window > 0 => {
-                Some(used as f64 / f64::from(window) * 100.0)
+        let trigger_ctx_pct = match appendix_scope {
+            CompactionAppendixScope::Session => {
+                match (self.context_input_tokens(context_window), context_window) {
+                    (Some(used), Some(window)) if window > 0 => {
+                        Some(used as f64 / f64::from(window) * 100.0)
+                    }
+                    _ => None,
+                }
             }
-            _ => None,
+            CompactionAppendixScope::ActiveAgentOnly => {
+                match (Some(wire_token_total(&live_history)), context_window) {
+                    (Some(used), Some(window)) if window > 0 => {
+                        Some(used as f64 / f64::from(window) * 100.0)
+                    }
+                    _ => None,
+                }
+            }
         };
 
         // 0. Prune-first (lossless; denser transcript → tighter brief). This
@@ -1843,58 +1875,83 @@ impl Driver {
             100,
         )?;
         // 2. Deterministic appendix from the runtime ledger.
-        let calls = self
-            .session
-            .db
-            .list_tool_calls_for_session(self.session.live_id())
-            .await
-            .unwrap_or_default();
-        let pins = self.session.pinned_messages();
-        let conversation_rules = match self
-            .session
-            .db
-            .list_conversation_rules(self.session.compaction_lineage_root())
-            .await
-        {
-            Ok(rules) => rules,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "conversation rules: listing rules failed; aborting compact"
-                );
-                return Err(PrepareCompactionError::ConversationRules(error.to_string()));
-            }
+        let active_agent = self.active_agent().to_string();
+        let calls = match appendix_scope {
+            CompactionAppendixScope::Session => self
+                .session
+                .db
+                .list_tool_calls_for_session(self.session.live_id())
+                .await
+                .unwrap_or_default(),
+            CompactionAppendixScope::ActiveAgentOnly => self
+                .session
+                .db
+                .list_tool_calls_for_session(self.session.live_id())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|call| call.agent == active_agent)
+                .collect(),
         };
-        let active_goal = self
-            .session
-            .db
-            .current_session_goal(self.session.live_id(), false)
-            .await
-            .ok()
-            .flatten()
-            .map(|g| {
-                let snapshot = g.compaction_snapshot();
-                format!(
-                    "- lifecycle: {} / {:?}\n- objective: {}\n- tokens: {}/{}\n- contract: {}\n- latest gap: {}",
-                    snapshot.disposition.as_str(),
-                    snapshot.phase,
-                    snapshot.objective,
-                    snapshot.tokens_used,
-                    snapshot.token_budget,
-                    snapshot.contract_reference.map(|id| id.to_string()).unwrap_or_else(|| "planning".to_string()),
-                    snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
-                )
-            });
+        let pins = match appendix_scope {
+            CompactionAppendixScope::Session => self.session.pinned_messages(),
+            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+        };
+        let conversation_rules = match appendix_scope {
+            CompactionAppendixScope::Session => match self
+                .session
+                .db
+                .list_conversation_rules(self.session.compaction_lineage_root())
+                .await
+            {
+                Ok(rules) => rules,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "conversation rules: listing rules failed; aborting compact"
+                    );
+                    return Err(PrepareCompactionError::ConversationRules(error.to_string()));
+                }
+            },
+            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+        };
+        let active_goal = match appendix_scope {
+            CompactionAppendixScope::Session => self
+                .session
+                .db
+                .current_session_goal(self.session.live_id(), false)
+                .await
+                .ok()
+                .flatten()
+                .map(|g| {
+                    let snapshot = g.compaction_snapshot();
+                    format!(
+                        "- lifecycle: {} / {:?}\n- objective: {}\n- tokens: {}/{}\n- contract: {}\n- latest gap: {}",
+                        snapshot.disposition.as_str(),
+                        snapshot.phase,
+                        snapshot.objective,
+                        snapshot.tokens_used,
+                        snapshot.token_budget,
+                        snapshot.contract_reference.map(|id| id.to_string()).unwrap_or_else(|| "planning".to_string()),
+                        snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
+                    )
+                }),
+            CompactionAppendixScope::ActiveAgentOnly => None,
+        };
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
-        appendix.conversation_rules = crate::conversation_rules::compact_appendix_lines(
-            &conversation_rules,
-            self.redact.as_ref(),
-        );
-        if let Ok(overview) = self
-            .session
-            .db
-            .task_todo_overview(self.session.live_id(), 24)
-            .await
+        appendix.conversation_rules = match appendix_scope {
+            CompactionAppendixScope::Session => crate::conversation_rules::compact_appendix_lines(
+                &conversation_rules,
+                self.redact.as_ref(),
+            ),
+            CompactionAppendixScope::ActiveAgentOnly => Vec::new(),
+        };
+        if matches!(appendix_scope, CompactionAppendixScope::Session)
+            && let Ok(overview) = self
+                .session
+                .db
+                .task_todo_overview(self.session.live_id(), 24)
+                .await
         {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
         }
@@ -2243,7 +2300,6 @@ impl Driver {
         &mut self,
         history: &mut Vec<Message>,
         budget: &crate::engine::delegation_budget::BudgetPool,
-        progress_since_compact: &mut bool,
         steer_target: &super::NoninteractiveSteerTarget,
         window_index: &mut u32,
         tx: &mpsc::Sender<TurnEvent>,
@@ -2251,25 +2307,26 @@ impl Driver {
         NoninteractiveAutoCompactOutcome,
         crate::engine::delegation_budget::CompactLoopExhausted,
     > {
-        let ctx_cfg = self.resolve_context_config();
-        let context_length = self.active_model_context_length();
-        let Some(metrics) =
-            context_metrics(context_length, self.context_input_tokens(context_length), 0)
-        else {
+        let ctx_cfg = self.frame_context_config();
+        let context_length = self.frame_model_context_length();
+        let input_tokens = Some(crate::engine::compact_draft::wire_token_total(history));
+        let Some(metrics) = context_metrics(context_length, input_tokens, 0) else {
             return Ok(NoninteractiveAutoCompactOutcome::NoOp);
         };
         let auto_compact_pct = self.effective_active_auto_compact_pct(&ctx_cfg);
         if metrics.ctx_pct < f64::from(auto_compact_pct) {
             return Ok(NoninteractiveAutoCompactOutcome::NoOp);
         }
-        let tokens_after = self.context_input_tokens(context_length).unwrap_or(0);
-        let forward_progress = *progress_since_compact;
-        *progress_since_compact = false;
+        let tokens_after = input_tokens.unwrap_or(0);
+        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
         if let Err(error) = budget.record_compaction(tokens_after, forward_progress) {
             return Err(error);
         }
         let saved_history = std::mem::replace(&mut self.stack[0].history, history.clone());
-        let prepared = match self.prepare_compaction_with_source(tx, "auto").await {
+        let prepared = match self
+            .prepare_compaction_with_source(tx, "auto", CompactionAppendixScope::ActiveAgentOnly)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.stack[0].history = saved_history;
@@ -2360,7 +2417,14 @@ impl Driver {
         )
         .await;
         if let Err(error) = record_result {
-            tracing::warn!(error = %error, "record subagent_compacted event failed");
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "/compact: recording subagent compaction failed: {error}; subagent history was left unchanged"
+                    ),
+                })
+                .await;
+            return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
         }
 
         self.stack[0].history = prepared.history.clone();

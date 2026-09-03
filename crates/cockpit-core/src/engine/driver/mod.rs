@@ -10405,6 +10405,42 @@ impl Driver {
         Self::context_config_from(self.active_providers_config().as_ref())
     }
 
+    /// Context-threshold config for the active stack frame's model.
+    pub(in crate::engine::driver) fn frame_context_config(
+        &self,
+    ) -> crate::config::providers::ContextConfig {
+        Self::context_config_from(self.frame_providers_config().as_ref())
+    }
+
+    /// Load providers config for the active stack frame's endpoint.
+    fn frame_providers_config(
+        &self,
+    ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_providers_override {
+            return Some(o.clone());
+        }
+        let frame = self.stack.last()?;
+        let providers = self.config.providers();
+        Some((
+            providers,
+            frame.agent.model.provider_id().to_string(),
+            frame.agent.model.model_id_ref().to_string(),
+        ))
+    }
+
+    /// Effective context window for the active stack frame's model.
+    pub(in crate::engine::driver) fn frame_model_context_length(&self) -> Option<u32> {
+        let (providers, provider, model) = self.frame_providers_config()?;
+        providers
+            .resolve_effective_model_capabilities(
+                &provider,
+                &model,
+                providers.resolution_generation,
+            )
+            .context_tokens
+    }
+
     /// Evaluate one observed-hit-gated keep-warm opportunity at an idle root
     /// boundary. The scheduler owns the later one-shot execution; this method
     /// only records the decision and never changes user activity.

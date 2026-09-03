@@ -2579,6 +2579,23 @@ impl App {
                     self.request_agent_tree_refresh();
                 }
             }
+            TurnEvent::SubagentCompacted {
+                agent,
+                window_index,
+                tokens_before,
+                tokens_after,
+                trigger_ctx_pct,
+                ..
+            } => {
+                let pct = trigger_ctx_pct
+                    .map(|pct| format!("{pct:.0}%"))
+                    .unwrap_or_else(|| "threshold".to_string());
+                self.apply_event(TurnEvent::Notice {
+                    text: format!(
+                        "Subagent `{agent}` autocompacted at {pct} context (window {window_index}; {tokens_before}→{tokens_after} tokens). Consider splitting the task via seed_reads or recursive subagents."
+                    ),
+                });
+            }
         }
     }
 

@@ -2045,7 +2045,9 @@ fn hydrate_compaction_payloads_conn(
     events: &mut [SessionEventRow],
 ) -> Result<()> {
     for event in events {
-        if event.kind != SessionEventKind::SessionCompacted.as_str() {
+        if event.kind != SessionEventKind::SessionCompacted.as_str()
+            && event.kind != SessionEventKind::SubagentCompacted.as_str()
+        {
             continue;
         }
         let Some(reference) = event.data.get("handoff_ref").and_then(Value::as_str) else {

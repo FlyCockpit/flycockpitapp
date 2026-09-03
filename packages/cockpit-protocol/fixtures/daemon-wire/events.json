@@ -1368,6 +1368,23 @@
     "kind": "evt",
     "v": 22
   },
+  "subagent_compacted": {
+    "data": {
+      "agent": "agent-fixture",
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source": "auto",
+      "successor_window_index": 1,
+      "task_call_id": "task_call_id-fixture",
+      "tokens_after": 1200,
+      "tokens_before": 9000,
+      "trigger_ctx_pct": 82.5,
+      "window_index": 1
+    },
+    "event": "subagent_compacted",
+    "kind": "evt",
+    "v": 22
+  },
   "tandem_state": {
     "data": {
       "models": ["model-fixture"],

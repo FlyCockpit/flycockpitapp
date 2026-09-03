@@ -20,6 +20,8 @@
 //! dimension `None`), not a bypass. The compact progress guard and retry
 //! pacing live on the same handle and are never lifted.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -28,6 +30,63 @@ use cockpit_config::config::delegation_budget::{
     BudgetSpend, DEFAULT_COMPACT_NO_PROGRESS_LIMIT, DEFAULT_MAX_RETRIES_PER_TURN,
     ResolvedDelegationBudget,
 };
+
+tokio::task_local! {
+    static LANE_BUDGET_ACCUMULATOR: RefCell<LaneBudgetAccumulator>;
+}
+
+#[derive(Debug, Default)]
+struct LaneBudgetAccumulator {
+    uncharged: BudgetCharge,
+    forward_progress: bool,
+}
+
+/// Isolate usage and compact-progress signals to one noninteractive executor
+/// task. Concurrent background subagents each install their own scope so
+/// session-global drains cannot cross node boundaries.
+pub struct LaneBudgetScope;
+
+impl LaneBudgetScope {
+    pub async fn run<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        LANE_BUDGET_ACCUMULATOR
+            .scope(RefCell::new(LaneBudgetAccumulator::default()), future)
+            .await
+    }
+}
+
+pub(crate) fn lane_budget_active() -> bool {
+    LANE_BUDGET_ACCUMULATOR.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn note_lane_budget_usage(charge: BudgetCharge, forward_progress: bool) {
+    let Ok(cell) = LANE_BUDGET_ACCUMULATOR.try_with(|accumulator| accumulator) else {
+        return;
+    };
+    let mut accumulator = cell.borrow_mut();
+    accumulator.uncharged += charge;
+    if forward_progress {
+        accumulator.forward_progress = true;
+    }
+}
+
+pub fn take_lane_budget_charge() -> BudgetCharge {
+    LANE_BUDGET_ACCUMULATOR
+        .try_with(|accumulator| std::mem::take(&mut accumulator.borrow_mut().uncharged))
+        .unwrap_or_default()
+}
+
+pub fn take_lane_forward_progress() -> bool {
+    LANE_BUDGET_ACCUMULATOR
+        .try_with(|accumulator| {
+            let progress = accumulator.borrow().forward_progress;
+            accumulator.borrow_mut().forward_progress = false;
+            progress
+        })
+        .unwrap_or(false)
+}
 
 use crate::sync::lock_or_recover;
 use crate::tokens::TokenUsage;

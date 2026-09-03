@@ -323,6 +323,12 @@
       },
       {
         "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "subagent_compacted"
+      },
+      {
+        "class": "bounded_event",
         "inlinePayloadBound": "truncated_by_cap",
         "lane": "interactive",
         "tag": "nested_turn"
@@ -3801,6 +3807,10 @@
     {
       "kind": "event",
       "tag": "subagent_report"
+    },
+    {
+      "kind": "event",
+      "tag": "subagent_compacted"
     },
     {
       "kind": "event",

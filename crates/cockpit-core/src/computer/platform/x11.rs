@@ -10,14 +10,257 @@
 use crate::computer::host_identity::domain_hash;
 #[cfg(target_os = "linux")]
 use crate::computer::host_identity::{
-    HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
+    HostIdentityRng, HostInstallationId, RealHostIdentityFs, SysHostIdentityRng,
+    load_or_create_host_installation_id,
 };
+use crate::computer::target::OpaqueWindowId;
 #[cfg(target_os = "linux")]
 use crate::computer::target::{
-    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
-    RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
-    TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, RedactedHint,
+    StableApplicationId, TargetEvidenceAdapter, TargetGeometry, TargetIdentityEvidence,
+    TargetUnavailableReason, empty_unavailable,
 };
+
+/// Length of the planted X11 window-generation token stored beside the XID.
+pub const X11_WINDOW_GENERATION_LEN: usize = 12;
+
+const X11_WINDOW_GENERATION_ATOM: &[u8] = b"_COCKPIT_WINDOW_GENERATION";
+
+/// Encode an X11 window object into the platform-neutral evidence identity.
+///
+/// The recyclable 32-bit XID occupies the first four little-endian bytes. The
+/// remaining twelve bytes are a generation token planted as a window property
+/// so a destroyed window and a later object that reuses the same XID compare
+/// unequal. Identities with a zero XID or an all-zero generation are not
+/// bindable X11 window objects.
+pub fn opaque_x11_window_id(
+    window: u32,
+    generation: [u8; X11_WINDOW_GENERATION_LEN],
+) -> OpaqueWindowId {
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&window.to_le_bytes());
+    bytes[4..].copy_from_slice(&generation);
+    OpaqueWindowId::from_bytes(bytes)
+}
+
+/// Inverse of [`opaque_x11_window_id`]. `None` when the identity is missing an
+/// XID or a generation token, so callers refuse rather than target a
+/// recyclable handle.
+pub fn x11_window_from_opaque(id: &OpaqueWindowId) -> Option<u32> {
+    let (window, generation) = x11_window_identity_from_opaque(id)?;
+    let _ = generation;
+    Some(window)
+}
+
+/// XID and planted generation stored by [`opaque_x11_window_id`].
+pub fn x11_window_identity_from_opaque(
+    id: &OpaqueWindowId,
+) -> Option<(u32, [u8; X11_WINDOW_GENERATION_LEN])> {
+    let bytes = id.as_bytes();
+    let window = u32::from_le_bytes(bytes[..4].try_into().ok()?);
+    let mut generation = [0_u8; X11_WINDOW_GENERATION_LEN];
+    generation.copy_from_slice(&bytes[4..]);
+    if window == 0 || generation.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some((window, generation))
+}
+
+/// Focused X11 client window on `display` (`_NET_ACTIVE_WINDOW`).
+///
+/// Virtual and physical injection both bind this identity. It is not the
+/// X server root and it is not a virtual-display UUID.
+#[cfg(target_os = "linux")]
+pub fn x11_net_active_window(display: &str) -> Result<u32, TargetUnavailableReason> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    let (connection, screen_index) = x11rb::connect(Some(display)).map_err(unavailable)?;
+    let screen = connection
+        .setup()
+        .roots
+        .get(screen_index)
+        .ok_or(TargetUnavailableReason::MissingCapability)?;
+    let root = screen.root;
+    let active_window_atom = connection
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .atom;
+    connection
+        .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .value32()
+        .and_then(|mut values| values.next())
+        .filter(|window| *window != x11rb::NONE && *window != 0)
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)
+}
+
+/// Live focused X11 window identity, including a planted generation token.
+///
+/// The token is stored as `_COCKPIT_WINDOW_GENERATION` on the window object
+/// so a later client that is assigned the same XID publishes a different
+/// opaque id. Evidence plants the token; bind and recheck only read it.
+#[cfg(target_os = "linux")]
+pub fn x11_active_window_identity(
+    display: &str,
+) -> Result<crate::computer::target::OpaqueWindowId, TargetUnavailableReason> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    let (connection, screen_index) = x11rb::connect(Some(display)).map_err(unavailable)?;
+    let screen = connection
+        .setup()
+        .roots
+        .get(screen_index)
+        .ok_or(TargetUnavailableReason::MissingCapability)?;
+    let root = screen.root;
+    let active_window_atom = connection
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .atom;
+    let window = connection
+        .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .value32()
+        .and_then(|mut values| values.next())
+        .filter(|window| *window != x11rb::NONE && *window != 0)
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let generation = x11_read_or_plant_generation(&connection, window)?;
+    Ok(opaque_x11_window_id(window, generation))
+}
+
+/// Read the planted generation on `window` without creating one.
+///
+/// A missing property, a destroyed window, or a mismatched token means this
+/// is not the evidenced object — including when the XID has been reused.
+#[cfg(target_os = "linux")]
+pub fn x11_window_generation_is_live(
+    display: &str,
+    window: u32,
+    generation: &[u8; X11_WINDOW_GENERATION_LEN],
+) -> Result<(), TargetUnavailableReason> {
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    let (connection, _) = x11rb::connect(Some(display)).map_err(unavailable)?;
+    let live = x11_read_generation(&connection, window)?
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+    if live != *generation {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn x11_generation_atom(
+    connection: &x11rb::rust_connection::RustConnection,
+) -> Result<x11rb::protocol::xproto::Atom, TargetUnavailableReason> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    let atom = connection
+        .intern_atom(false, X11_WINDOW_GENERATION_ATOM)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .atom;
+    if atom == x11rb::NONE {
+        return Err(TargetUnavailableReason::MissingCapability);
+    }
+    Ok(atom)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn x11_read_generation(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+) -> Result<Option<[u8; X11_WINDOW_GENERATION_LEN]>, TargetUnavailableReason> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    if window == 0 || window == x11rb::NONE {
+        return Err(TargetUnavailableReason::FocusIdentityUnavailable);
+    }
+    let atom = x11_generation_atom(connection)?;
+    let reply = connection
+        .get_property(
+            false,
+            window,
+            atom,
+            AtomEnum::ANY,
+            0,
+            X11_WINDOW_GENERATION_LEN as u32,
+        )
+        .map_err(unavailable)?
+        .reply()
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    if reply.value.len() != X11_WINDOW_GENERATION_LEN {
+        return Ok(None);
+    }
+    let mut generation = [0_u8; X11_WINDOW_GENERATION_LEN];
+    generation.copy_from_slice(&reply.value);
+    if generation.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    Ok(Some(generation))
+}
+
+#[cfg(target_os = "linux")]
+fn x11_read_or_plant_generation(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+) -> Result<[u8; X11_WINDOW_GENERATION_LEN], TargetUnavailableReason> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    if let Some(existing) = x11_read_generation(connection, window)? {
+        return Ok(existing);
+    }
+    let mut generation = [0_u8; X11_WINDOW_GENERATION_LEN];
+    let mut rng = SysHostIdentityRng;
+    rng.try_fill_bytes(&mut generation)
+        .map_err(|_| TargetUnavailableReason::MissingCapability)?;
+    if generation.iter().all(|byte| *byte == 0) {
+        return Err(TargetUnavailableReason::MissingCapability);
+    }
+    let atom = x11_generation_atom(connection)?;
+    connection
+        .change_property(
+            PropMode::REPLACE,
+            window,
+            atom,
+            AtomEnum::INTEGER,
+            8,
+            X11_WINDOW_GENERATION_LEN as u32,
+            &generation,
+        )
+        .map_err(unavailable)?
+        .check()
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let live =
+        x11_read_generation(connection, window)?.ok_or(TargetUnavailableReason::QueryMismatch)?;
+    if live != generation {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    Ok(generation)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X11SessionParts {
@@ -598,8 +841,7 @@ impl X11TargetEvidenceAdapter {
             .and_then(|reply| reply.value32().and_then(|mut values| values.next()));
         let title = x11_text_property(&connection, active_window, b"_NET_WM_NAME");
         let class = x11_text_property(&connection, active_window, b"WM_CLASS");
-        let mut window_bytes = [0_u8; 16];
-        window_bytes[..4].copy_from_slice(&active_window.to_le_bytes());
+        let generation = x11_read_or_plant_generation(&connection, active_window)?;
 
         // Close the synchronous-query bracket: neither focus nor the RandR
         // configuration may have changed while the component fields above
@@ -645,7 +887,7 @@ impl X11TargetEvidenceAdapter {
             EvidenceSource::X11Randr,
         );
         snapshot.focused_window_id = FieldEvidence::available(
-            OpaqueWindowId::from_bytes(window_bytes),
+            opaque_x11_window_id(active_window, generation),
             EvidenceSource::X11NetActiveWindow,
         );
         snapshot.process_id = process_id.map_or_else(
@@ -872,6 +1114,41 @@ pub fn authorized_x11rb_present() -> bool {
 pub fn authorized_atspi_present() -> bool {
     let _ = core::mem::size_of::<atspi::AccessibilityConnection>();
     true
+}
+
+#[cfg(test)]
+mod opaque_window_tests {
+    use super::{opaque_x11_window_id, x11_window_from_opaque};
+    use crate::computer::target::OpaqueWindowId;
+
+    #[test]
+    fn x11_window_id_round_trips_and_rejects_incomplete_identities() {
+        let generation = [0x11; 12];
+        let id = opaque_x11_window_id(0x00ab_cdef, generation);
+        assert_eq!(x11_window_from_opaque(&id), Some(0x00ab_cdef));
+        assert_eq!(
+            super::x11_window_identity_from_opaque(&id),
+            Some((0x00ab_cdef, generation))
+        );
+        assert_eq!(
+            x11_window_from_opaque(&opaque_x11_window_id(0x00ab_cdef, [0; 12])),
+            None,
+            "a recyclable XID without a generation is not a window object"
+        );
+        assert_eq!(
+            x11_window_from_opaque(&opaque_x11_window_id(0, generation)),
+            None
+        );
+    }
+
+    #[test]
+    fn x11_generation_distinguishes_recycled_xids() {
+        let first = opaque_x11_window_id(8, [1; 12]);
+        let recycled = opaque_x11_window_id(8, [2; 12]);
+        assert_ne!(first, recycled);
+        assert_eq!(x11_window_from_opaque(&first), Some(8));
+        assert_eq!(x11_window_from_opaque(&recycled), Some(8));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

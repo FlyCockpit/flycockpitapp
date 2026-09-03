@@ -135,14 +135,33 @@ pub(crate) async fn open_native_computer_for_delegation(
     };
     let owner_instance = crate::computer::coordinator::OwnerInstance(u64::from(std::process::id()));
     let (target_adapter, host_arbiter) = match candidate.target {
-        crate::computer::DisplayTarget::Virtual => (
-            Box::new(
-                crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
-                    *uuid::Uuid::new_v4().as_bytes(),
-                ),
-            ) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
-            None,
-        ),
+        crate::computer::DisplayTarget::Virtual => {
+            let display_id = *uuid::Uuid::new_v4().as_bytes();
+            let adapter = {
+                #[cfg(target_os = "linux")]
+                {
+                    match backend.x11_display_name() {
+                        Some(display) => {
+                            crate::computer::coordinator::VirtualTargetEvidenceAdapter::with_x11_display(
+                                display_id,
+                                display.to_string(),
+                            )
+                        }
+                        None => crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(
+                            display_id,
+                        ),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    crate::computer::coordinator::VirtualTargetEvidenceAdapter::new(display_id)
+                }
+            };
+            (
+                Box::new(adapter) as Box<dyn crate::computer::target::TargetEvidenceAdapter>,
+                None,
+            )
+        }
         crate::computer::DisplayTarget::RealDesktop => {
             #[cfg(target_os = "linux")]
             {
@@ -762,6 +781,10 @@ mod tests {
         DelegationId, FakeComputerAuthorizer, ModelId, NativeComputerContinuation, OwnerInstance,
         ProviderId,
     };
+    use crate::computer::target::{
+        EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence, OpaqueWindowId,
+        sample_virtual_evidence,
+    };
     use crate::computer::{
         ComputerActionOutcome, ComputerBackend, ComputerToolContract, DisplayGeometry,
         DisplayTarget, LogicalSize, NativeComputerCoordinatorConfig, NativeComputerToolConfig,
@@ -932,24 +955,39 @@ mod tests {
         }
     }
 
-    async fn make_coordinator() -> ComputerActionCoordinator {
-        let authorizer: Arc<dyn ComputerAuthorizer> =
-            Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = Box::new(CapturingFakeBackend::new());
-        let params = CoordinatorParams {
+    fn virtual_window_evidence() -> crate::computer::target::TargetIdentityEvidence {
+        let mut evidence = sample_virtual_evidence([0xAA; 16], 1);
+        evidence.focus_generation = 1;
+        evidence.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0x11; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        evidence
+    }
+
+    fn yolo_params(authorizer: Arc<dyn ComputerAuthorizer>) -> CoordinatorParams {
+        CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
             tier: ComputerApprovalTier::Yolo,
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: None,
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(
+                virtual_window_evidence(),
+            ))),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
-        };
-        ComputerActionCoordinator::open(backend, params)
+        }
+    }
+
+    async fn make_coordinator() -> ComputerActionCoordinator {
+        let authorizer: Arc<dyn ComputerAuthorizer> =
+            Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = Box::new(CapturingFakeBackend::new());
+        ComputerActionCoordinator::open(backend, yolo_params(authorizer))
             .await
             .expect("coordinator open")
     }
@@ -963,20 +1001,7 @@ mod tests {
             inner: CapturingFakeBackend::new(),
             releases,
         });
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: None,
-            target_adapter: None,
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-4o".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-        };
-        ComputerActionCoordinator::open(backend, params)
+        ComputerActionCoordinator::open(backend, yolo_params(authorizer))
             .await
             .expect("coordinator open")
     }

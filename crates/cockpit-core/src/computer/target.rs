@@ -133,7 +133,7 @@ pub enum EvidenceSource {
 }
 
 /// Opaque focused-window ID (platform-neutral bytes after adapter conversion).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpaqueWindowId {
     bytes: [u8; 16],
 }
@@ -268,6 +268,11 @@ pub struct TargetIdentityEvidence {
 }
 
 impl TargetIdentityEvidence {
+    /// Focused window identity when the snapshot actually observed one.
+    pub fn focused_window_id_value(&self) -> Option<OpaqueWindowId> {
+        field_value(&self.focused_window_id).copied()
+    }
+
     /// Build the physical target key when all three key fields are available.
     /// Virtual displays return `None` (they do not acquire a host-global lease).
     pub fn physical_target_key(&self) -> Result<PhysicalTargetKey, TargetUnavailableReason> {
@@ -957,10 +962,9 @@ pub fn sample_virtual_evidence(uuid: [u8; 16], generation: u64) -> TargetIdentit
         TargetUnavailableReason::VirtualDisplayNoPhysicalLease,
         Some(EvidenceSource::VirtualEngine),
     );
-    e.focused_window_id = FieldEvidence::available(
-        OpaqueWindowId::from_bytes(uuid),
-        EvidenceSource::VirtualEngine,
-    );
+    // Display UUID is `virtual_display_uuid`, not a window identity. A
+    // focused X11 window is captured by the production virtual adapter;
+    // fixtures that inject set `focused_window_id` explicitly.
     e.geometry = FieldEvidence::available(
         TargetGeometry {
             x: 0,

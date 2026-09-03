@@ -55,15 +55,16 @@ use super::observation::{
     GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
 };
 use super::target::{
-    BackendKind, FieldEvidence, PhysicalTargetKey, TargetEvidenceAdapter, TargetIdentityEvidence,
-    TargetUnavailableReason,
+    BackendKind, FieldEvidence, OpaqueWindowId, PhysicalTargetKey, TargetEvidenceAdapter,
+    TargetIdentityEvidence, TargetUnavailableReason,
 };
 use super::{
     Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
     ComputerActionOutcome, ComputerBackend, ComputerBatchReport, ComputerError, ComputerFailure,
-    ComputerToolContract, DisplayGeometry, NativeComputerWire, OpenAiComputerAction,
-    execute_backend_action, normalize_backend_batch, parse_anthropic_20250124_action,
-    parse_anthropic_20251124_action, parse_openai_computer_call,
+    ComputerToolContract, DisplayGeometry, EVIDENCED_WINDOW_MISMATCH, NativeComputerWire,
+    OpenAiComputerAction, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, execute_backend_action,
+    normalize_backend_batch, parse_anthropic_20250124_action, parse_anthropic_20251124_action,
+    parse_openai_computer_call,
 };
 
 /// Sole production physical/virtual backend construction factory. Physical
@@ -2071,9 +2072,9 @@ async fn acquire_host_lease(
                     b"cockpit.x11.input-arbiter.v1",
                     delegation.clone(),
                 ),
-                // SendInput controls session-global keyboard, pointer, focus,
-                // and absolute virtual-desktop coordinates. A monitor-specific
-                // evidence key must therefore not partition its host lease.
+                // Windows synthetic input still occupies the interactive
+                // session/desktop: a monitor-specific evidence key must
+                // therefore not partition its host lease.
                 BackendKind::RealDesktopWindows => arbiter.try_acquire_input_session(
                     physical_key,
                     b"cockpit.windows.input-arbiter.v1",
@@ -3722,6 +3723,31 @@ impl HandoffJournal for ExternalJournalHandoff {
     }
 }
 
+/// Why the last reversible dispatch fence refused a batch or item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreHandoffFence {
+    Identity(TargetUnavailableReason),
+    WidgetClass,
+}
+
+impl PreHandoffFence {
+    fn identity_reason(self) -> TargetUnavailableReason {
+        match self {
+            Self::Identity(reason) => reason,
+            Self::WidgetClass => TargetUnavailableReason::StaleTarget,
+        }
+    }
+
+    fn batch_error(self) -> ComputerError {
+        match self {
+            Self::Identity(_) => ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()),
+            Self::WidgetClass => ComputerError::Refused(
+                "focused widget risk class changed before dispatch".to_string(),
+            ),
+        }
+    }
+}
+
 /// The dispatch state of a coordinated action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchState {
@@ -3777,14 +3803,18 @@ pub struct ComputerActionCoordinator {
     /// The observation generation (display generation) from the opened backend.
     observation_generation: ObservationEpoch,
     /// Currently authorized live focus (window) generation. Together with
-    /// [`Self::virtual_display_uuid`] this is the complete live target
-    /// identity: initialized from the open-time planning capture and adopted
-    /// to the live snapshot the Ask gate accepts, so approval metadata,
-    /// host-approval effects, and pre-handoff validation share one
-    /// authority. Generation zero is part of that identity and is compared
-    /// exactly. A TOCTOU change after that adopt still invalidates at
-    /// [`Self::pre_handoff_check`].
+    /// [`Self::virtual_display_uuid`] and [`Self::authorized_window_id`] this
+    /// is the complete live target identity: initialized from the open-time
+    /// planning capture and adopted to the live snapshot the Ask gate accepts,
+    /// so approval metadata, host-approval effects, and pre-handoff
+    /// validation share one authority. Generation zero is part of that
+    /// identity and is compared exactly. A TOCTOU change after that adopt
+    /// still invalidates at [`Self::pre_handoff_check`]. Generation is not a
+    /// proxy for window identity.
     focus_generation: TargetGeneration,
+    /// Evidenced/approved focused window. Synthetic input is bound to this
+    /// identity; a live window that no longer matches aborts the batch.
+    authorized_window_id: Option<OpaqueWindowId>,
     /// The backend kind.
     backend_kind: BackendKind,
     /// Tracks dispatch state per call ID.
@@ -3919,6 +3949,11 @@ pub struct CoordinatorParams {
 pub struct VirtualTargetEvidenceAdapter {
     display_id: [u8; 16],
     generation: u64,
+    /// Isolated Xvfb `DISPLAY` when this adapter is composed with a live
+    /// virtual backend. Absent in hermetic tests, which must not invent a
+    /// window identity.
+    #[cfg(target_os = "linux")]
+    x11_display: Option<String>,
 }
 
 impl VirtualTargetEvidenceAdapter {
@@ -3926,6 +3961,17 @@ impl VirtualTargetEvidenceAdapter {
         Self {
             display_id,
             generation: 1,
+            #[cfg(target_os = "linux")]
+            x11_display: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_x11_display(display_id: [u8; 16], x11_display: impl Into<String>) -> Self {
+        Self {
+            display_id,
+            generation: 1,
+            x11_display: Some(x11_display.into()),
         }
     }
 }
@@ -3938,6 +3984,19 @@ impl TargetEvidenceAdapter for VirtualTargetEvidenceAdapter {
     fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         // Virtual displays have no accessibility tree. Role/subrole stay
         // unavailable so TypeText fail-closes as Credential (issue #290).
+        #[cfg(target_os = "linux")]
+        {
+            let mut evidence =
+                super::target::sample_virtual_evidence(self.display_id, self.generation);
+            if let Some(display) = &self.x11_display {
+                evidence.focused_window_id = FieldEvidence::available(
+                    super::platform::x11_active_window_identity(display)?,
+                    super::target::EvidenceSource::X11NetActiveWindow,
+                );
+            }
+            return Ok(evidence);
+        }
+        #[cfg(not(target_os = "linux"))]
         Ok(super::target::sample_virtual_evidence(
             self.display_id,
             self.generation,
@@ -4152,6 +4211,7 @@ impl ComputerActionCoordinator {
         let mut acquired_host_lease: Option<AcquiredHostLease> = None;
         let mut virtual_display_uuid: Option<[u8; 16]> = None;
         let mut authorized_widget = TargetWidgetContext::default();
+        let mut authorized_window_id = None;
 
         // Take ownership of the target adapter before using it.
         let mut target_adapter = params.target_adapter;
@@ -4199,6 +4259,7 @@ impl ComputerActionCoordinator {
                     // `None` (they scope by host lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
                     authorized_widget = TargetWidgetContext::from_evidence(&evidence);
+                    authorized_window_id = evidence.focused_window_id_value();
                     // Physical opens must take the host lock now and hold it
                     // for the coordinator lifetime. The production physical
                     // composition supplies a FileAdvisoryLock-backed arbiter;
@@ -4280,6 +4341,7 @@ impl ComputerActionCoordinator {
             invalidated: false,
             observation_generation,
             focus_generation,
+            authorized_window_id,
             backend_kind,
             dispatch_states: HashMap::new(),
             backend_dead: false,
@@ -4415,9 +4477,10 @@ impl ComputerActionCoordinator {
         self.capture_live_evidence_for_handoff().map(|_| ())
     }
 
-    /// Recapture live evidence and confirm window/UUID identity. Widget
+    /// Recapture live evidence and confirm window id / UUID identity. Widget
     /// role/subrole are intentionally omitted from this identity: they are
     /// compared as a risk-class fence in [`Self::pre_handoff_for_dispatch`].
+    /// Generation is not a proxy for the evidenced window.
     fn capture_live_evidence_for_handoff(
         &mut self,
     ) -> Result<Option<TargetIdentityEvidence>, TargetUnavailableReason> {
@@ -4449,8 +4512,10 @@ impl ComputerActionCoordinator {
         &mut self,
         actions: &[ComputerAction],
         class_offset: usize,
-    ) -> Result<(), TargetUnavailableReason> {
-        let evidence = self.capture_live_evidence_for_handoff()?;
+    ) -> Result<(), PreHandoffFence> {
+        let evidence = self
+            .capture_live_evidence_for_handoff()
+            .map_err(PreHandoffFence::Identity)?;
         if self.tier != ComputerApprovalTier::Ask {
             return Ok(());
         }
@@ -4467,11 +4532,24 @@ impl ComputerActionCoordinator {
                     ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget))
                 });
             if widget_risk_class_upgraded(action, prompted, &live_widget) {
-                return Err(TargetUnavailableReason::StaleTarget);
+                return Err(PreHandoffFence::WidgetClass);
             }
         }
         self.authorized_widget = live_widget;
         Ok(())
+    }
+
+    fn bind_backend_target_window(&mut self, action: &ComputerAction) -> Result<(), ComputerError> {
+        if !action.injects_synthetic_input() {
+            return self.backend.recheck_evidenced_window();
+        }
+        let Some(window) = self.authorized_window_id else {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        };
+        self.backend.bind_evidenced_window(window)?;
+        self.backend.recheck_evidenced_window()
     }
 
     /// Recapture focused widget evidence between authorization awaits.
@@ -4523,11 +4601,13 @@ impl ComputerActionCoordinator {
         // pre-handoff (zero input).  The `Dispatching` state is committed
         // only after every pre-handoff gate passes, immediately before the
         // backend handoff (AC10). Widget risk class is part of this fence.
-        if let Err(reason) = self.pre_handoff_for_dispatch(actions, 0) {
+        if let Err(fence) = self.pre_handoff_for_dispatch(actions, 0) {
             self.dispatch_states
                 .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
             return ExecuteArtifacts {
-                outcome: CoordinatedOutcome::Invalidated { reason },
+                outcome: CoordinatedOutcome::Invalidated {
+                    reason: fence.identity_reason(),
+                },
                 live_frame: None,
             };
         }
@@ -4611,11 +4691,13 @@ impl ComputerActionCoordinator {
                     // target/lease currency and widget risk class after it
                     // returns and before the journal's irreversible
                     // dispatching transition.
-                    if let Err(reason) = self.pre_handoff_for_dispatch(actions, 0) {
+                    if let Err(fence) = self.pre_handoff_for_dispatch(actions, 0) {
                         self.dispatch_states
                             .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
                         return ExecuteArtifacts {
-                            outcome: CoordinatedOutcome::Invalidated { reason },
+                            outcome: CoordinatedOutcome::Invalidated {
+                                reason: fence.identity_reason(),
+                            },
                             live_frame: None,
                         };
                     }
@@ -4662,8 +4744,10 @@ impl ComputerActionCoordinator {
 
         // Execute through the backend. Normalize the whole batch first so a
         // malformed tail cannot fail after an earlier host effect, then
-        // re-fence widget risk class immediately before each item — focus
-        // can move to a credential field without changing window generation.
+        // re-fence window identity and widget risk class immediately before
+        // each item — focus can move to another window or a credential field
+        // without the generation counter changing. Synthetic input is bound
+        // to the evidenced window; a mismatch aborts the remaining batch.
         let report: ComputerBatchReport = {
             match self.backend.geometry().await {
                 Err(error) => ComputerBatchReport {
@@ -4679,16 +4763,17 @@ impl ComputerActionCoordinator {
                         let mut completed = Vec::new();
                         let mut failure = None;
                         for (index, action) in normalized.iter().enumerate() {
-                            if let Err(_reason) =
+                            if let Err(fence) =
                                 self.pre_handoff_for_dispatch(&actions[index..], index)
                             {
                                 failure = Some(ComputerFailure {
                                     index,
-                                    error: ComputerError::Refused(
-                                        "focused widget risk class changed before dispatch"
-                                            .to_string(),
-                                    ),
+                                    error: fence.batch_error(),
                                 });
+                                break;
+                            }
+                            if let Err(error) = self.bind_backend_target_window(&actions[index]) {
+                                failure = Some(ComputerFailure { index, error });
                                 break;
                             }
                             match self.backend.as_mut().execute_normalized_one(action).await {
@@ -5195,8 +5280,16 @@ impl ComputerActionCoordinator {
         // install on evidence we cannot read.
         // Capture into locals first so the adapter borrow ends before any
         // `&mut self` fail-closed bookkeeping below.
-        type PreCaptureSnapshot =
-            Result<(u64, Option<[u8; 16]>, Option<String>, TargetWidgetContext), ()>;
+        type PreCaptureSnapshot = Result<
+            (
+                u64,
+                Option<[u8; 16]>,
+                Option<String>,
+                TargetWidgetContext,
+                Option<OpaqueWindowId>,
+            ),
+            (),
+        >;
         let pre_capture: Option<PreCaptureSnapshot> =
             if let Some(adapter) = self.target_adapter.as_mut() {
                 match adapter.capture_snapshot() {
@@ -5211,13 +5304,14 @@ impl ComputerActionCoordinator {
                         // Widget role/subrole only — never field contents
                         // (issue #290).
                         TargetWidgetContext::from_evidence(&evidence),
+                        evidence.focused_window_id_value(),
                     ))),
                     Err(_reason) => Some(Err(())),
                 }
             } else {
                 None
             };
-        let (live_focus_generation, live_uuid, prompt_target_window, live_widget) =
+        let (live_focus_generation, live_uuid, prompt_target_window, live_widget, live_window) =
             match pre_capture {
                 Some(Ok(baseline)) => baseline,
                 Some(Err(())) => {
@@ -5232,6 +5326,7 @@ impl ComputerActionCoordinator {
                     virtual_display_uuid,
                     None,
                     self.authorized_widget.clone(),
+                    self.authorized_window_id,
                 ),
             };
 
@@ -5264,7 +5359,12 @@ impl ComputerActionCoordinator {
         // target digests, and `pre_handoff_check` all observe the same
         // object. A later TOCTOU change is still caught by
         // `pre_handoff_check` against this adopted identity.
-        self.adopt_authorized_live_identity(live_focus_generation, live_uuid, live_widget);
+        self.adopt_authorized_live_identity(
+            live_focus_generation,
+            live_uuid,
+            live_widget,
+            live_window,
+        );
 
         let policy = AskLeasePolicy::for_actions(actions, Some(&self.authorized_widget));
         // Identical retry-safe payloads at this focus may consume one remaining
@@ -6198,33 +6298,38 @@ impl ComputerActionCoordinator {
         self.focus_generation
     }
 
-    /// Adopt `live_focus`, `live_uuid`, and widget identity as the currently
-    /// authorized live target. Every approval packet, host-approval effect,
-    /// journal target digest, risk class, and pre-handoff check reads these
-    /// fields, so the Ask gate must write the complete snapshot it accepted
-    /// before those consumers run. Generation is not a proxy for object
-    /// identity. Widget context is role/subrole only — never field contents.
+    /// Adopt `live_focus`, `live_uuid`, widget identity, and the evidenced
+    /// window as the currently authorized live target. Every approval packet,
+    /// host-approval effect, journal target digest, risk class, and
+    /// pre-handoff check reads these fields, so the Ask gate must write the
+    /// complete snapshot it accepted before those consumers run. Generation
+    /// is not a proxy for object identity. Widget context is role/subrole
+    /// only — never field contents.
     fn adopt_authorized_live_identity(
         &mut self,
         live_focus: u64,
         live_uuid: Option<[u8; 16]>,
         widget: TargetWidgetContext,
+        window: Option<OpaqueWindowId>,
     ) {
         self.focus_generation = TargetGeneration(live_focus);
         self.virtual_display_uuid = live_uuid;
         self.authorized_widget = widget;
+        self.authorized_window_id = window;
     }
 
     /// True when `evidence` is still the currently authorized live identity.
-    /// Focus generation and virtual-display UUID are compared exactly:
-    /// generation zero is a valid identity for non-focus-sensitive actions,
-    /// so a later focused window is not the same authorization. Generation
-    /// is not a proxy for object identity; the UUID is compared independently.
-    /// Widget role/subrole are not part of this identity: they are fenced
-    /// as a risk-class upgrade in [`Self::pre_handoff_for_dispatch`].
+    /// Focus generation, virtual-display UUID, and focused window id are
+    /// compared exactly: generation zero is a valid identity for
+    /// non-focus-sensitive actions, so a later focused window is not the
+    /// same authorization. Generation is not a proxy for object identity;
+    /// the UUID and window id are compared independently. Widget role/subrole
+    /// are not part of this identity: they are fenced as a risk-class upgrade
+    /// in [`Self::pre_handoff_for_dispatch`].
     fn authorized_live_identity_matches(&self, evidence: &TargetIdentityEvidence) -> bool {
         evidence.focus_generation == self.focus_generation.0
             && evidence.virtual_display_uuid == self.virtual_display_uuid
+            && evidence.focused_window_id_value() == self.authorized_window_id
     }
 
     /// The observation verification state machine (starts at Strict; live
@@ -6782,7 +6887,7 @@ mod tests {
     use super::super::host_identity::HostInstallationId;
     use super::super::platform::x11::{X11SessionParts, x11_session_or_seat_id};
     use super::super::target::{
-        BackendKind, EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence,
+        BackendKind, EvidenceSource, FakeTargetEvidenceAdapter, FieldEvidence, OpaqueWindowId,
         TargetEvidenceAdapter, TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
         sample_physical_evidence,
     };
@@ -6794,6 +6899,7 @@ mod tests {
         PixelSize, Point, ProviderPointerButton, Rect, ScaleFactor,
     };
     use super::*;
+    use super::{EVIDENCED_WINDOW_MISMATCH, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -6856,6 +6962,10 @@ mod tests {
         let mut evidence = virtual_evidence();
         evidence.focus_generation = 1;
         evidence.adapter_observed_epoch = 1;
+        evidence.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0xAA; 16]),
+            EvidenceSource::VirtualEngine,
+        );
         evidence
     }
 
@@ -6914,6 +7024,42 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ComputerBackend for WidgetShiftingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::VirtualDisplay
+        }
+
+        async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
+            self.inner.geometry().await
+        }
+
+        async fn execute_normalized_one(
+            &mut self,
+            action: &NormalizedComputerAction,
+        ) -> Result<ComputerActionOutcome, ComputerError> {
+            let outcome = self.inner.execute_normalized_one(action).await;
+            if self.inner.recorded.len() == 1 {
+                let mut adapter = self.adapter.lock().unwrap();
+                adapter.snapshot = self.after_first.clone();
+                adapter.snapshot_queue.clear();
+            }
+            outcome
+        }
+
+        fn release_all(&mut self) -> Result<(), ComputerError> {
+            self.inner.release_all()
+        }
+    }
+
+    /// Backend that switches the live focused window after the first executed
+    /// item, so intra-batch window rechecks can be driven hermetically.
+    struct WindowShiftingBackend {
+        inner: FakeBackend,
+        adapter: Arc<std::sync::Mutex<FakeTargetEvidenceAdapter>>,
+        after_first: TargetIdentityEvidence,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for WindowShiftingBackend {
         fn backend_kind(&self) -> BackendKind {
             BackendKind::VirtualDisplay
         }
@@ -7313,7 +7459,7 @@ mod tests {
         backend: Box<dyn ComputerBackend>,
         authorizer: Arc<dyn ComputerAuthorizer>,
     ) -> ComputerActionCoordinator {
-        let params = make_coordinator_params(authorizer);
+        let params = make_coordinator_params_with_focus(authorizer);
         ComputerActionCoordinator::open(backend, params)
             .await
             .expect("coordinator open")
@@ -10017,6 +10163,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computer_lease_install_reverifies_window_id() {
+        // Post-await focused window drifts while focus_generation stays put.
+        // Generation is not a proxy for window identity (issue #288).
+        let mut drifted = ask_virtual_evidence();
+        drifted.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0xBB; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        assert_eq!(
+            drifted.focus_generation,
+            ask_virtual_evidence().focus_generation
+        );
+        run_focus_reverify_drift(drifted).await;
+    }
+
+    #[tokio::test]
     async fn computer_lease_denial_terminal_for_delegation() {
         // One human Deny terminates the delegation's computer path: every
         // subsequent action on THIS coordinator returns Denied without
@@ -10817,7 +10979,7 @@ mod tests {
         };
         let _ = backend_recorded; // suppress unused
 
-        let params = make_coordinator_params(authorizer);
+        let params = make_coordinator_params_with_focus(authorizer);
         let mut coordinator = ComputerActionCoordinator::open(Box::new(counting), params)
             .await
             .expect("coordinator open");
@@ -11230,6 +11392,49 @@ mod tests {
             .execute_openai_call("call-type-no-focus", &actions)
             .await;
         assert!(matches!(outcome, CoordinatedOutcome::Invalidated { .. }));
+    }
+
+    #[tokio::test]
+    async fn computer_synthetic_input_without_evidenced_window_fails_closed() {
+        // Pointer actions do not use the type/key focus-generation gate.
+        // Adapter-less virtual coordinators must still refuse injection
+        // rather than targeting whatever currently has focus (issue #288).
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let params = make_coordinator_params(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-unbound-move",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Failed { .. }),
+            "adapter-less synthetic input must fail closed, got {outcome:?}"
+        );
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[BatchItemOutcome::Failed {
+                error: ComputerError::Refused(
+                    SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string()
+                )
+            }]
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input when no evidenced window is bound"
+        );
     }
 
     #[tokio::test]
@@ -11934,6 +12139,126 @@ mod tests {
                 ActionRiskClass::StateChanging,
                 ActionRiskClass::StateChanging,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_window_id_change_between_approval_and_execution_aborts() {
+        // Focus/window change between Allow and backend handoff, with the
+        // generation counter held constant, must not inject (issue #288).
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let approved = ask_virtual_evidence();
+        let mut drifted = approved.clone();
+        drifted.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0xBB; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        assert_eq!(drifted.focus_generation, approved.focus_generation);
+        let adapter = FakeTargetEvidenceAdapter::with_queue(
+            BackendKind::VirtualDisplay,
+            vec![approved.clone(), approved.clone(), approved, drifted],
+        );
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-window-handoff",
+                &[OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
+            "window change between approval and execution must not dispatch, got {outcome:?}"
+        );
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input after a window change between approval and execution"
+        );
+        assert!(
+            coordinator.is_invalidated(),
+            "window identity mismatch is sticky target drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_window_id_change_mid_batch_aborts_remaining() {
+        let approved = ask_virtual_evidence();
+        let mut drifted = approved.clone();
+        drifted.focused_window_id = FieldEvidence::available(
+            OpaqueWindowId::from_bytes([0xBB; 16]),
+            EvidenceSource::InjectedTest,
+        );
+        assert_eq!(drifted.focus_generation, approved.focus_generation);
+        let adapter = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            approved.clone(),
+        )));
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(SharedFakeAdapter {
+                inner: Arc::clone(&adapter),
+            })),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+        };
+        let backend = WindowShiftingBackend {
+            inner: FakeBackend::new(),
+            adapter: Arc::clone(&adapter),
+            after_first: drifted,
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-batch-window-change",
+                &[
+                    OpenAiComputerAction::TypeText("one".to_string()),
+                    OpenAiComputerAction::TypeText("two".to_string()),
+                ],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Failed { .. }),
+            "later batch item must stop on window change, got {outcome:?}"
+        );
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[
+                BatchItemOutcome::BackendCompleted,
+                BatchItemOutcome::Failed {
+                    error: ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string())
+                },
+            ]
+        );
+        assert!(
+            coordinator.is_invalidated(),
+            "mid-batch window mismatch is sticky target drift"
         );
     }
 
@@ -12829,6 +13154,9 @@ mod tests {
         let between = body
             .find("self.pre_handoff_for_dispatch(&actions[index..], index)")
             .expect("per-item widget class fence in dispatch_backend_batch");
+        let bind = body
+            .find("self.bind_backend_target_window(&actions[index])")
+            .expect("per-item evidenced window bind in dispatch_backend_batch");
         assert!(
             pre < dispatching,
             "pre_handoff_for_dispatch must run before Dispatching is committed"
@@ -12840,6 +13168,18 @@ mod tests {
         assert!(
             dispatching < between,
             "widget class must be re-fenced after Dispatching and before each item"
+        );
+        assert!(
+            between < bind && bind < execute,
+            "evidenced window must be bound after the per-item fence and before each item"
+        );
+        let bind_fn = src
+            .find("fn bind_backend_target_window")
+            .expect("bind_backend_target_window");
+        let bind_body = &src[bind_fn..bind_fn + 900];
+        assert!(
+            !bind_body.contains("if self.target_adapter.is_none()"),
+            "synthetic input must not skip window binding when the adapter is absent"
         );
     }
 
@@ -13086,7 +13426,7 @@ mod tests {
             },
         }];
         let mut first_params =
-            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+            make_coordinator_params_with_focus(Arc::new(FakeComputerAuthorizer::always_allow()));
         first_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         first_params.outcome_store = Some(store.clone());
         let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
@@ -13109,7 +13449,7 @@ mod tests {
         drop(first);
 
         let mut second_params =
-            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+            make_coordinator_params_with_focus(Arc::new(FakeComputerAuthorizer::always_allow()));
         second_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         second_params.outcome_store = Some(store);
         let mut second =

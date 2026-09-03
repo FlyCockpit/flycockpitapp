@@ -3839,17 +3839,17 @@ fn extended_config_has_no_image_spend_field() {
 }
 
 #[test]
-fn computer_primary_target_defaults_real_and_allows_virtual_opt_in() {
+fn computer_primary_target_defaults_virtual_and_allows_real_opt_in() {
     assert_eq!(
         ExtendedConfig::default().computer_target,
-        ComputerTarget::RealDesktop
+        ComputerTarget::Virtual
     );
 
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
-    std::fs::write(&path, br#"{"computer_target":"virtual"}"#).unwrap();
+    std::fs::write(&path, br#"{"computer_target":"real_desktop"}"#).unwrap();
     let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
-    assert_eq!(cfg.computer_target, ComputerTarget::Virtual);
+    assert_eq!(cfg.computer_target, ComputerTarget::RealDesktop);
 }
 
 // ---------------------------------------------------------------------------

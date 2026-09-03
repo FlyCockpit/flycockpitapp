@@ -11140,6 +11140,41 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
     let mut subagent_compaction_window_index = 0_u32;
+    if let Some(target) = steer_target.as_ref() {
+        match session
+            .db
+            .read({
+                let task_call_id = target.task_call_id().to_string();
+                let label = target.label().to_string();
+                let session_id = session.live_id();
+                move |conn| {
+                    crate::engine::rehydrate::subagent_lane_compaction_state_conn(
+                        conn,
+                        session_id,
+                        &task_call_id,
+                        &label,
+                    )
+                }
+            })
+            .await
+        {
+            Ok(state) => {
+                subagent_compaction_window_index = state.window_index;
+                budget.rehydrate_subagent_compact_guard(
+                    &state.compaction_forward_progress,
+                    state.forward_progress_since_last_compaction,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    task_call_id = %target.task_call_id(),
+                    label = %target.label(),
+                    "rehydrating subagent lane compaction state failed"
+                );
+            }
+        }
+    }
     'turns: for _ in 0..max_turns {
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the swarm/schedule loops.

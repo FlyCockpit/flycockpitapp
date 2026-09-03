@@ -295,6 +295,16 @@ impl CompactProgressGuard {
         self.consecutive_no_progress
     }
 
+    /// Replay one durable compaction boundary when rehydrating a resumed lane.
+    /// Never fails: restores guard depth, including at the no-progress cap.
+    pub fn replay_compaction(&mut self, forward_progress: bool) {
+        if forward_progress {
+            self.consecutive_no_progress = 0;
+            return;
+        }
+        self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
+    }
+
     /// Record a compaction. `tokens_after` is the post-compact token count
     /// (informational; shrinking context is not forward progress).
     /// `forward_progress` is true when the agent produced new tool results or
@@ -655,6 +665,24 @@ impl BudgetPool {
         lock_or_recover(&self.local)
             .compact_guard
             .consecutive_no_progress()
+    }
+
+    /// Restore compact-and-continue guard depth from durable subagent compaction
+    /// boundaries on lane resume. `compaction_forward_progress` is one flag per
+    /// `subagent_compacted` row in seq order; `forward_progress_since_last` resets
+    /// the guard when productive work occurred after the final boundary.
+    pub fn rehydrate_subagent_compact_guard(
+        &self,
+        compaction_forward_progress: &[bool],
+        forward_progress_since_last: bool,
+    ) {
+        let mut local = lock_or_recover(&self.local);
+        for &forward_progress in compaction_forward_progress {
+            local.compact_guard.replay_compaction(forward_progress);
+        }
+        if forward_progress_since_last {
+            local.compact_guard.replay_compaction(true);
+        }
     }
 
     pub fn allow_retry(&self) -> bool {

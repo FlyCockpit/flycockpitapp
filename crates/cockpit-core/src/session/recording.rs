@@ -1992,9 +1992,12 @@ impl Session {
         seed_tool_count: usize,
         brief_text: &str,
     ) -> Result<i64> {
+        let predecessor_short_id = self.short_id();
         self.record_session_compacted_with_source(
             agent,
             SessionCompactionRecord {
+                predecessor_session_id: self.live_id(),
+                predecessor_short_id: &predecessor_short_id,
                 successor_session_id,
                 successor_short_id,
                 seed_tool_count,
@@ -2043,8 +2046,8 @@ impl Session {
         );
         let data = serde_json::json!({
             "kind": "compaction",
-            "predecessor_session_id": self.id.to_string(),
-            "predecessor_short_id": self.short_id(),
+            "predecessor_session_id": record.predecessor_session_id.to_string(),
+            "predecessor_short_id": record.predecessor_short_id,
             "successor_session_id": record.successor_session_id.to_string(),
             "successor_short_id": record.successor_short_id,
             "seed_tool_count": record.seed_tool_count,
@@ -2068,8 +2071,8 @@ impl Session {
                 .await?;
             let trimmed = serde_json::json!({
                 "kind": "compaction",
-                "predecessor_session_id": self.live_id().to_string(),
-                "predecessor_short_id": self.short_id(),
+                "predecessor_session_id": record.predecessor_session_id.to_string(),
+                "predecessor_short_id": record.predecessor_short_id,
                 "successor_session_id": record.successor_session_id.to_string(),
                 "successor_short_id": record.successor_short_id,
                 "seed_tool_count": record.seed_tool_count,
@@ -2985,6 +2988,8 @@ mod trusted_journaling_tests {
         let sid = session.id.to_string();
 
         let record = |brief: &'static str| SessionCompactionRecord {
+            predecessor_session_id: session.id,
+            predecessor_short_id: "pred",
             successor_session_id: session.id,
             successor_short_id: "succ",
             seed_tool_count: 0,
@@ -3082,6 +3087,73 @@ mod trusted_journaling_tests {
         let stored = serde_json::to_string(&event.data).unwrap();
         assert!(!stored.contains(LIT), "matched literal must be scrubbed");
         assert!(stored.contains("[redacted]"), "generic placeholder present");
+    }
+
+    #[tokio::test]
+    async fn compacted_event_uses_record_predecessor_not_frozen_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let window1 = session.id;
+        let window2 = db.create_compaction_successor(window1).await.unwrap();
+        let window2_short = window2
+            .short_id
+            .clone()
+            .unwrap_or_else(|| window2.session_id.to_string());
+        session.adopt_compaction_successor(window2.session_id, window2_short.clone());
+        let window3 = db
+            .create_compaction_successor(window2.session_id)
+            .await
+            .unwrap();
+        let window3_short = window3
+            .short_id
+            .clone()
+            .unwrap_or_else(|| window3.session_id.to_string());
+        session
+            .record_session_compacted_with_source(
+                "Build",
+                SessionCompactionRecord {
+                    predecessor_session_id: session.live_id(),
+                    predecessor_short_id: &window2_short,
+                    successor_session_id: window3.session_id,
+                    successor_short_id: &window3_short,
+                    seed_tool_count: 0,
+                    brief_text: "brief",
+                    handoff_text: "handoff",
+                    source: "manual",
+                    trigger_ctx_pct: None,
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    turns_summarized: 0,
+                    tail_kept: 0,
+                    tail_trimmed: 0,
+                    tail_messages: &[],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let events = db.list_session_events(session.live_id()).await.unwrap();
+        let compacted = events
+            .iter()
+            .find(|event| event.kind == "session_compacted")
+            .expect("session_compacted recorded on the live window");
+        let expected_predecessor = window2.session_id.to_string();
+        let frozen_original = window1.to_string();
+        assert_eq!(
+            compacted.data["predecessor_session_id"].as_str(),
+            Some(expected_predecessor.as_str())
+        );
+        assert_ne!(
+            compacted.data["predecessor_session_id"].as_str(),
+            Some(frozen_original.as_str())
+        );
     }
 
     // -- AC10 ----------------------------------------------------------------

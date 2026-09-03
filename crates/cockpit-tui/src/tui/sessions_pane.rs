@@ -3050,6 +3050,57 @@ mod tests {
     }
 
     #[test]
+    fn drill_in_lineage_noop_for_a_single_window() {
+        let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)]);
+        pane.drill_in_lineage();
+        assert_eq!(pane.levels.len(), 1);
+    }
+
+    #[test]
+    fn drill_in_lineage_expands_windows_and_root_request_uses_lineage_id() {
+        let root = Uuid::new_v4();
+        let tip = Uuid::new_v4();
+        let mut card = summary(tip, 1);
+        card.compaction_lineage_root_id = Some(root);
+        card.lineage_window_count = 3;
+        let mut pane = test_pane(vec![(card, Tier::Idle)]);
+        assert!(pane.drill_in_lineage());
+        assert_eq!(pane.levels.len(), 2);
+        assert_eq!(pane.root_request(), (None, None, Some(root)));
+    }
+
+    #[test]
+    fn expand_key_loads_lineage_windows() {
+        let root = Uuid::new_v4();
+        let mut card = summary(Uuid::new_v4(), 1);
+        card.compaction_lineage_root_id = Some(root);
+        card.lineage_window_count = 2;
+        let mut pane = test_pane(vec![(card, Tier::Idle)]);
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Char('e'))),
+            Some(SessionsOutcome::LoadList)
+        ));
+        assert_eq!(pane.levels.len(), 2);
+        assert_eq!(pane.root_request(), (None, None, Some(root)));
+    }
+
+    #[test]
+    fn card_lines_prompt_to_expand_a_multi_window_lineage() {
+        let mut card = summary(Uuid::new_v4(), 1);
+        card.lineage_window_count = 3;
+        let lines = card_lines(&card, Tier::Idle, false, false, 40, false);
+        let joined = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains("press e to expand 3 windows"),
+            "expected expand hint, got {joined:?}"
+        );
+    }
+
+    #[test]
     fn sessions_pane_preview_resets_on_fork_drill_in_and_out() {
         let parent_id = Uuid::new_v4();
         let mut parent = summary(parent_id, 1);

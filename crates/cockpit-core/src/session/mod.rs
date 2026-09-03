@@ -97,6 +97,8 @@ pub(crate) struct BootedRootProfile {
 }
 
 pub struct SessionCompactionRecord<'a> {
+    pub predecessor_session_id: Uuid,
+    pub predecessor_short_id: &'a str,
     pub successor_session_id: Uuid,
     pub successor_short_id: &'a str,
     pub seed_tool_count: usize,
@@ -389,7 +391,11 @@ pub struct Session {
     pub id: Uuid,
     /// Live context-window id. Equals [`Self::id`] until compaction
     /// successor adoption rewrites it so every `Arc<Session>` clone
-    /// records into the successor window.
+    /// observes the new window. Durable recording, vault custody, shadow
+    /// briefs, row lifecycle, and wire events use this id. [`Self::id`]
+    /// remains the worker's original spawn identity. `CompactReady` is
+    /// the exception: it is stamped with the predecessor so clients can
+    /// retarget.
     live_id: std::sync::RwLock<Uuid>,
     pub project_id: String,
     pub project_root: PathBuf,
@@ -1211,7 +1217,9 @@ impl Session {
 
     /// Live context-window identity. Compaction successor adoption rewrites
     /// this in place so the worker, driver, and handle clones observe the
-    /// new window without replacing `Arc<Session>`.
+    /// new window without replacing `Arc<Session>`. One live conversation
+    /// has exactly this identity for recording, custody, lifecycle, and
+    /// post-handoff wire events.
     pub fn live_id(&self) -> Uuid {
         *self
             .live_id
@@ -1224,7 +1232,8 @@ impl Session {
     }
 
     /// Bind this in-memory session to a newly created compaction successor.
-    /// Subsequent event recording uses [`Self::live_id`].
+    /// Subsequent recording, custody, lifecycle, and wire events use
+    /// [`Self::live_id`].
     pub fn adopt_compaction_successor(&self, successor_id: Uuid, successor_short_id: String) {
         let from = self.live_id();
         *self

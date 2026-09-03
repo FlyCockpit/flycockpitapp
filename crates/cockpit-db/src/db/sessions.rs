@@ -1223,13 +1223,67 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
         .context("deleting session sealed-value vault items")?;
     }
     let changes_before = conn.total_changes();
-    conn.execute(
-        "DELETE FROM sessions WHERE session_id = ?1",
-        [session_id.to_string()],
-    )
-    .context("deleting session")?;
+    delete_subtree_rows_conn(conn, &subtree)?;
     verify_session_delete_cleanup_conn(conn, &subtree)?;
     Ok(conn.total_changes().saturating_sub(changes_before))
+}
+
+/// Delete every collected member. Compaction predecessor/lineage-root FKs are
+/// RESTRICT, so successors (and any other remaining referencers) are removed
+/// before the rows they point at. Fork children may CASCADE off a parent
+/// delete; a later DELETE of an already-cascaded id is a no-op.
+fn delete_subtree_rows_conn(conn: &Connection, subtree: &[Uuid]) -> Result<()> {
+    let mut remaining: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
+    while !remaining.is_empty() {
+        let candidates: Vec<Uuid> = remaining.iter().copied().collect();
+        let mut deleted_any = false;
+        for id in candidates {
+            if compaction_fk_blocks_delete(conn, id, &remaining)? {
+                continue;
+            }
+            conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [id.to_string()],
+            )
+            .with_context(|| format!("deleting session {id}"))?;
+            remaining.remove(&id);
+            deleted_any = true;
+        }
+        anyhow::ensure!(
+            deleted_any,
+            "compaction lineage delete could not make progress; remaining {remaining:?}"
+        );
+    }
+    Ok(())
+}
+
+fn compaction_fk_blocks_delete(
+    conn: &Connection,
+    id: Uuid,
+    remaining: &std::collections::HashSet<Uuid>,
+) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id FROM sessions
+              WHERE session_id != ?1
+                AND (compaction_predecessor_session_id = ?1
+                     OR compaction_lineage_root_id = ?1)",
+        )
+        .context("preparing compaction FK referencer scan")?;
+    let rows = stmt
+        .query_map([id.to_string()], |row| {
+            let raw: String = row.get(0)?;
+            parse_uuid(&raw)
+        })
+        .context("querying compaction FK referencers")?;
+    for row in rows {
+        let referencer = row.context("decoding compaction FK referencer")?;
+        if remaining.contains(&referencer) {
+            return Ok(true);
+        }
+        anyhow::bail!("session {id} is still referenced by {referencer} outside the delete set");
+    }
+    Ok(false)
 }
 
 /// Verify the deletion boundary after the session cascade has committed its
@@ -3010,7 +3064,8 @@ impl Db {
         Ok(affected > 0)
     }
 
-    /// Direct children of a session in the fork tree. Most-recent-first.
+    /// Tips of fork lineages whose parent is any window of the compaction
+    /// lineage that contains `parent_session_id`. Most-recent-first.
     pub async fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
         self.read(move |conn| Self::list_forks_conn(conn, parent_session_id))
             .await
@@ -3023,7 +3078,15 @@ impl Db {
                   WHERE ephemeral = 0
                     AND compaction_lineage_root_id IN (
                         SELECT session_id FROM sessions
-                         WHERE parent_session_id = ?1 AND ephemeral = 0
+                         WHERE parent_session_id IN (
+                             SELECT session_id FROM sessions
+                              WHERE COALESCE(compaction_lineage_root_id, session_id) = (
+                                  SELECT COALESCE(compaction_lineage_root_id, session_id)
+                                    FROM sessions
+                                   WHERE session_id = ?1
+                              )
+                         )
+                           AND ephemeral = 0
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM sessions nxt
@@ -3043,7 +3106,8 @@ impl Db {
     }
 
     /// Cheap fork count for the `[N forks]` chip in the `/sessions`
-    /// browser. Counts immediate children only (depth-1).
+    /// browser. Counts fork-lineage tips whose parent is any window of
+    /// the compaction lineage that contains `parent_session_id`.
     #[allow(dead_code)]
     pub async fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
         self.read(move |conn| Self::count_forks_for_conn(conn, parent_session_id))
@@ -3057,7 +3121,15 @@ impl Db {
                   WHERE ephemeral = 0
                     AND compaction_lineage_root_id IN (
                         SELECT session_id FROM sessions
-                         WHERE parent_session_id = ?1 AND ephemeral = 0
+                         WHERE parent_session_id IN (
+                             SELECT session_id FROM sessions
+                              WHERE COALESCE(compaction_lineage_root_id, session_id) = (
+                                  SELECT COALESCE(compaction_lineage_root_id, session_id)
+                                    FROM sessions
+                                   WHERE session_id = ?1
+                              )
+                         )
+                           AND ephemeral = 0
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM sessions nxt
@@ -5911,6 +5983,86 @@ mod tests {
         assert_eq!(lineage.len(), 2);
         assert_eq!(lineage[0].session_id, predecessor.session_id);
         assert_eq!(lineage[1].session_id, successor.session_id);
+    }
+
+    #[tokio::test]
+    async fn three_window_lineage_keeps_typed_predecessor_edges() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/proj", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        let window3 = db
+            .create_compaction_successor(window2.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            window2.compaction_predecessor_session_id,
+            Some(window1.session_id)
+        );
+        assert_eq!(
+            window3.compaction_predecessor_session_id,
+            Some(window2.session_id)
+        );
+        assert_eq!(window3.compaction_lineage_root(), window1.session_id);
+        let lineage_root = window1.compaction_lineage_root();
+        let lineage = db
+            .read(move |conn| Db::list_compaction_lineage_windows_conn(conn, lineage_root))
+            .await
+            .unwrap();
+        assert_eq!(lineage.len(), 3);
+        assert_eq!(lineage[0].session_id, window1.session_id);
+        assert_eq!(lineage[1].session_id, window2.session_id);
+        assert_eq!(lineage[2].session_id, window3.session_id);
+        let roots = db.list_root_sessions("p", 100).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].session_id, window3.session_id);
+    }
+
+    #[tokio::test]
+    async fn fork_from_later_window_is_visible_on_the_lineage_root() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/proj", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        let fork = db.create_fork(window2.session_id, None).await.unwrap();
+        let listed = db.list_forks(window1.session_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, fork.session_id);
+        let also_from_tip = db.list_forks(window2.session_id).await.unwrap();
+        assert_eq!(also_from_tip.len(), 1);
+        assert_eq!(also_from_tip[0].session_id, fork.session_id);
+        let summaries = db
+            .read(move |conn| Db::list_session_summaries_conn(conn, Some("p"), None, None, 100))
+            .await
+            .unwrap();
+        let tip = summaries
+            .iter()
+            .find(|summary| summary.session_id == window2.session_id)
+            .expect("collapsed card is the lineage tip");
+        assert_eq!(tip.fork_count, 1);
+        assert_eq!(tip.lineage_window_count, 2);
+    }
+
+    #[tokio::test]
+    async fn delete_any_lineage_window_removes_the_conversation() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/proj", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        let window3 = db
+            .create_compaction_successor(window2.session_id)
+            .await
+            .unwrap();
+        db.delete_session(window3.session_id).await.unwrap();
+        assert!(db.get_session(window1.session_id).await.unwrap().is_none());
+        assert!(db.get_session(window2.session_id).await.unwrap().is_none());
+        assert!(db.get_session(window3.session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

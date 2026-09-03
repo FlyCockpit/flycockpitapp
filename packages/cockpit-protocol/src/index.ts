@@ -1079,6 +1079,7 @@ const requestParamSchemas = {
       project_id: z.string().nullable().optional(),
       parent_session_id: optionalUuidSchema,
       assistant_id: z.string().nullable().optional(),
+      compaction_lineage_root_id: optionalUuidSchema,
     })
     .strict(),
   read_history_page: z

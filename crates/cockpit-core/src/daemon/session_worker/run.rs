@@ -4502,7 +4502,7 @@ pub(super) async fn forward_queue_updates(
     mut queue_update_rx: watch::Receiver<Vec<crate::engine::message::QueuedUserMessage>>,
     event_tx: EventSender,
     redaction: SharedRedactionTable,
-    session_id: Uuid,
+    live_session_id: impl Fn() -> Uuid + Send + 'static,
 ) {
     while queue_update_rx.changed().await.is_ok() {
         let queue = queue_update_rx.borrow_and_update().clone();
@@ -4510,7 +4510,7 @@ pub(super) async fn forward_queue_updates(
             &event_tx,
             &redaction,
             proto::Event::QueueUpdated {
-                session_id,
+                session_id: live_session_id(),
                 queue: queue.into_iter().map(queue_item_to_proto).collect(),
             },
         );
@@ -6841,7 +6841,10 @@ pub(super) async fn run_worker(
                             );
                         }
                         update_live_foreground(&foreground_for_forward, &event);
-                        for ev in proto::turn_event_to_proto(event, session_id) {
+                        for ev in proto::turn_event_to_proto(
+                            event,
+                            session_for_forward.live_id(),
+                        ) {
                             for ready in coalescer.push(ev) {
                                 send_event(ready);
                             }
@@ -6886,7 +6889,7 @@ pub(super) async fn run_worker(
                     );
                 }
                 update_live_foreground(&foreground_for_forward, &event);
-                for ev in proto::turn_event_to_proto(event, session_id) {
+                for ev in proto::turn_event_to_proto(event, session_for_forward.live_id()) {
                     for ready in coalescer.push(ev) {
                         send_event(ready);
                     }
@@ -6895,11 +6898,12 @@ pub(super) async fn run_worker(
         }
         close_pending_turn_completions(&turn_completions_for_forward);
     });
+    let queue_session = session.clone();
     let queue_forward = tokio::spawn(forward_queue_updates(
         queue_update_rx,
         event_tx_for_queue,
         redaction_for_queue,
-        session_id,
+        move || queue_session.live_id(),
     ));
 
     // Build the driver, then capture its async-job command sender (GOALS
@@ -14020,7 +14024,15 @@ pub(super) async fn run_worker(
             // side can clear locks installed by a successor incarnation.
             terminal_closing.store(true, std::sync::atomic::Ordering::Release);
             let _terminal_cleanup = terminal_lock_cleanup_gate.lock().await;
-            match locks.end_session(session_id).await {
+            let live_id = session.live_id();
+            let lock_end = async {
+                locks.end_session(session.id).await?;
+                if live_id != session.id {
+                    locks.end_session(live_id).await?;
+                }
+                anyhow::Ok(())
+            };
+            match lock_end.await {
                 Ok(()) => {
                     let terminal_session = session.clone();
                     match tokio::task::spawn_blocking(move || terminal_session.end()).await {
@@ -14057,7 +14069,7 @@ pub(super) async fn run_worker(
         &event_tx,
         &redaction,
         proto::Event::SessionEnded {
-            session_id,
+            session_id: session.live_id(),
             reason: stop.session_ended_reason().into(),
         },
     );

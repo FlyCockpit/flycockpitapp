@@ -629,28 +629,37 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
             "SELECT root.session_id
                FROM sessions root
               WHERE root.parent_session_id IS NULL
+                AND root.compaction_predecessor_session_id IS NULL
                 AND root.ended_at_unix_ms IS NOT NULL
                 AND root.ephemeral = 0
                 AND root.last_active_at_unix_ms < ?1
                 AND NOT EXISTS (
                     WITH RECURSIVE subtree(session_id, ended_at_unix_ms, last_active_at_unix_ms) AS (
                         SELECT session_id, ended_at_unix_ms, last_active_at_unix_ms
-                          FROM sessions WHERE session_id = root.session_id
+                          FROM sessions
+                         WHERE session_id = root.session_id
+                            OR compaction_lineage_root_id = root.session_id
                         UNION ALL
                         SELECT child.session_id, child.ended_at_unix_ms, child.last_active_at_unix_ms
                           FROM sessions child
-                          JOIN subtree parent ON child.parent_session_id = parent.session_id
+                          JOIN subtree parent
+                            ON child.parent_session_id = parent.session_id
+                            OR child.btw_parent_session_id = parent.session_id
                     )
                     SELECT 1 FROM subtree
                      WHERE ended_at_unix_ms IS NULL OR last_active_at_unix_ms >= ?1
                 )
                 AND NOT EXISTS (
                     WITH RECURSIVE subtree(session_id) AS (
-                        SELECT session_id FROM sessions WHERE session_id = root.session_id
+                        SELECT session_id FROM sessions
+                         WHERE session_id = root.session_id
+                            OR compaction_lineage_root_id = root.session_id
                         UNION ALL
                         SELECT child.session_id
                           FROM sessions child
-                          JOIN subtree parent ON child.parent_session_id = parent.session_id
+                          JOIN subtree parent
+                            ON child.parent_session_id = parent.session_id
+                            OR child.btw_parent_session_id = parent.session_id
                     )
                     SELECT 1 FROM pins JOIN subtree USING (session_id)
                 )",
@@ -675,23 +684,10 @@ fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<Sessi
     let mut cascade_rows_deleted = 0_u64;
     let mut sessions_expiry_skipped_media_barrier = 0_u64;
     for root in roots {
-        // Count the complete logical session cascade before deleting its root.
-        // `DELETE FROM sessions` reports only the root through `changes()`;
-        // descendant forks are removed by the self-FK cascade.
-        let subtree_rows: i64 = conn.query_row(
-            "WITH RECURSIVE subtree(session_id) AS (
-                 SELECT session_id FROM sessions WHERE session_id=?1
-                 UNION ALL
-                 SELECT child.session_id
-                   FROM sessions child
-                   JOIN subtree parent ON child.parent_session_id=parent.session_id
-             )
-             SELECT COUNT(*) FROM subtree",
-            [root.to_string()],
-            |row| row.get(0),
-        )?;
-        let subtree_rows =
-            u64::try_from(subtree_rows).context("negative session retention subtree row count")?;
+        // Count the complete logical session cascade before deleting its root,
+        // including compaction lineage windows and fork descendants.
+        let subtree_rows = u64::try_from(crate::db::sessions::collect_subtree(conn, root)?.len())
+            .context("session retention subtree row count exceeds u64")?;
         match crate::db::sessions::delete_session_conn(conn, root) {
             Ok(cascade_rows) => {
                 removed = removed.saturating_add(subtree_rows);
@@ -988,6 +984,37 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_compacted_predecessor_while_successor_is_live() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/x", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        close_session(&db, window1.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(window1.session_id).await.unwrap().is_some());
+        assert!(db.get_session(window2.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn session_age_out_removes_an_idle_compaction_lineage_together() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/x", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        close_session(&db, window1.session_id, 10).await;
+        close_session(&db, window2.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 2);
+        assert!(db.get_session(window1.session_id).await.unwrap().is_none());
+        assert!(db.get_session(window2.session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

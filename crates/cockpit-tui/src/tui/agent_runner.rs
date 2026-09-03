@@ -1858,8 +1858,25 @@ impl ClientEventState {
             self.trigger_skill_refresh();
         }
         let session_id = self.session_id();
+        let compact_successor = match &event {
+            proto::Event::CompactReady {
+                session_id: stamped,
+                new_session_id,
+                ..
+            } if *stamped == session_id => Some(*new_session_id),
+            _ => None,
+        };
         let incoming = self.incoming_context(session_id);
         apply_incoming_event(event, &incoming);
+        if let Some(new_session_id) = compact_successor {
+            *self
+                .session_id_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_session_id;
+            if let Ok(mut attach) = self.attach_context.try_write() {
+                attach.session_id = Some(new_session_id);
+            }
+        }
     }
 
     async fn handle_event_with_resync<F, Fut>(&mut self, event: proto::Event, resync: F) -> bool
@@ -1890,9 +1907,7 @@ impl ClientEventState {
         Fut: std::future::Future<Output = Result<AttachedPayload, ReconnectAttachError>>,
     {
         let attach_snapshot = self.attach_context.read().await.clone();
-        let Some(session_id) = attach_snapshot.session_id else {
-            return false;
-        };
+        let session_id = self.session_id();
         if lag_session_id.is_some_and(|lag_session_id| lag_session_id != session_id) {
             return true;
         }
@@ -3076,10 +3091,14 @@ async fn try_spawn_inner(
                     if !event_state
                         .handle_event_with_resync(
                             event,
-                            move |_session_id, attach_snapshot, last| async move {
-                                let attached =
-                                    reconnect_and_attach(&resync_driver, &attach_snapshot, &last)
-                                        .await?;
+                            move |session_id, attach_snapshot, last| async move {
+                                let attached = reconnect_and_attach(
+                                    &resync_driver,
+                                    session_id,
+                                    &attach_snapshot,
+                                    &last,
+                                )
+                                .await?;
                                 let (new_client, payload) = split_reconnect_attached(attached);
                                 *resync_current_client.write().await = new_client;
                                 Ok(payload)
@@ -3113,10 +3132,15 @@ async fn try_spawn_inner(
                     let transition_gate = event_state.transition_gate.clone();
                     let _transition_guard = transition_gate.lock_owned().await;
                     let attach_snapshot = attach_context.read().await.clone();
-                    let Some(session_id) = attach_snapshot.session_id else {
-                        return;
-                    };
-                    match reconnect_and_attach(&driver, &attach_snapshot, &last_applied_seq).await {
+                    let session_id = event_state.session_id();
+                    match reconnect_and_attach(
+                        &driver,
+                        session_id,
+                        &attach_snapshot,
+                        &last_applied_seq,
+                    )
+                    .await
+                    {
                         Ok(attached) => {
                             let (new_client, payload) = split_reconnect_attached(attached);
                             *current_client.write().await = new_client;
@@ -4022,14 +4046,10 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
 
 async fn reconnect_and_attach(
     driver: &LocalReconnectDriver,
+    session_id: Uuid,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<ReconnectAttach, ReconnectAttachError> {
-    let Some(session_id) = attach_context.session_id else {
-        return Err(ReconnectAttachError::Terminal(
-            "reconnect has no authoritative attached session".to_string(),
-        ));
-    };
     let client = driver
         .connect()
         .await
@@ -4204,6 +4224,15 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
     let source_is_global = is_global_event(&event);
     if !source_is_global && event_session(&event) != Some(ctx.session_id) {
         return;
+    }
+    if matches!(event, proto::Event::CompactReady { .. }) {
+        // Successor windows start a new per-row seq space. Drop the
+        // predecessor cursor or post-compact seq 1 is treated as a dup.
+        let mut guard = ctx
+            .last_applied_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
     }
     acknowledge_event_receipts(ctx.awaiting_durable, ctx.session_id, &event);
     let event_session_id = event_session(&event);

@@ -1505,11 +1505,20 @@ impl SessionRegistry {
         if !needs_cleanup {
             return Err(SessionTerminalCleanupRetry.into());
         }
+        let session = claim.handle.session();
         self.inner
             .locks
-            .end_session(claim.session_id)
+            .end_session(session.id)
             .await
             .context("retrying generation-bound terminal session lock cleanup")?;
+        let live_id = session.live_id();
+        if live_id != session.id {
+            self.inner
+                .locks
+                .end_session(live_id)
+                .await
+                .context("retrying generation-bound terminal live-window lock cleanup")?;
+        }
         claim
             .handle
             .end_session_for_terminal_cleanup()

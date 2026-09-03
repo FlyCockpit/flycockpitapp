@@ -204,12 +204,12 @@ impl Session {
             self.redaction_key_resolver().as_ref(),
         );
         let prepared = history
-            .prepare_append(&self.id.to_string(), protected)
+            .prepare_append(&self.live_id().to_string(), protected)
             .await?;
         let record = crate::db::sealed_scope::NewSealedValueRecord {
             record_id: record_id.to_owned(),
             scope: crate::db::sealed_scope::SealedScopeKind::Session,
-            scope_key: self.id.to_string(),
+            scope_key: self.live_id().to_string(),
             name: name.to_owned(),
             description: description.to_owned(),
             owner_principal: "agent-acquired".to_string(),
@@ -218,7 +218,7 @@ impl Session {
         let write_json = unioned.to_persisted_json()?;
         let cache_json = write_json.clone();
         let vault = self.secret_vault.clone();
-        let session_id = self.id;
+        let session_id = self.live_id();
         let item_id = crate::secure_key::session_sealed_item_id(&session_id.to_string(), name, 1);
         let literal = value.to_owned();
         let reason = description.to_owned();
@@ -357,7 +357,7 @@ impl Session {
         if self.unjournaled_inference_allowed() {
             self.persist_redaction_table(&unioned)?;
             let vault = self.secret_vault.clone();
-            let session_id = self.id;
+            let session_id = self.live_id();
             let value_id_owned = value_id.to_owned();
             let value_owned = value.to_owned();
             let reason_owned = reason.to_owned();
@@ -405,7 +405,7 @@ impl Session {
         // nothing back because nothing has persisted yet (fail closed): the union
         // is not persisted and the sealed row is not written.
         let prepared = history
-            .prepare_append(&self.id.to_string(), protected)
+            .prepare_append(&self.live_id().to_string(), protected)
             .await?;
         // F7: compose the legacy sealed-row upsert INTO the same transaction as
         // the redaction-table union and the journal append, so a failure of any
@@ -452,7 +452,7 @@ impl Session {
             self.redaction_key_resolver().as_ref(),
         );
         let prepared = history
-            .prepare_append(&self.id.to_string(), protected)
+            .prepare_append(&self.live_id().to_string(), protected)
             .await?;
         self.persist_redaction_table_with_sealed_journal(table, prepared, None)
             .await?;
@@ -479,7 +479,7 @@ impl Session {
         use crate::redact::protected_redaction_history::append_and_attach_conn;
 
         let json = table.to_persisted_json()?;
-        let session_id = self.id;
+        let session_id = self.live_id();
         let write_json = json.clone();
         let vault = self.secret_vault.clone();
         let metadata = self
@@ -551,7 +551,7 @@ impl Session {
         &self,
         _owner: crate::sealed::OwnerAuthority,
     ) -> Result<Vec<crate::db::sealed_values::SealedValueMetadata>> {
-        self.db.list_sealed_value_metadata(self.id).await
+        self.db.list_sealed_value_metadata(self.live_id()).await
     }
 
     /// Owner-only. See [`Session::set_sealed_value`].
@@ -568,7 +568,7 @@ impl Session {
     ) -> Result<bool> {
         self.db
             .delete_sealed_value_for_session(
-                self.id.to_string(),
+                self.live_id().to_string(),
                 value_id.to_owned(),
                 chrono::Utc::now().timestamp_millis(),
             )
@@ -584,7 +584,7 @@ impl Session {
         _owner: crate::sealed::OwnerAuthority,
         value_id: &str,
     ) -> Result<bool> {
-        self.db.sealed_value_exists(self.id, value_id).await
+        self.db.sealed_value_exists(self.live_id(), value_id).await
     }
 }
 

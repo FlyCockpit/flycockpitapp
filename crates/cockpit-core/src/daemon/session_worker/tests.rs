@@ -2578,7 +2578,10 @@ async fn queue_updated_is_not_emitted_for_the_initial_empty_snapshot() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let forward = tokio::spawn(forward_queue_updates(
-        updates_rx, event_tx, redaction, session_id,
+        updates_rx,
+        event_tx,
+        redaction,
+        move || session_id,
     ));
 
     assert!(
@@ -2606,7 +2609,10 @@ async fn queue_updated_is_still_emitted_when_the_queue_is_emptied() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let forward = tokio::spawn(forward_queue_updates(
-        updates_rx, event_tx, redaction, session_id,
+        updates_rx,
+        event_tx,
+        redaction,
+        move || session_id,
     ));
 
     updates_tx

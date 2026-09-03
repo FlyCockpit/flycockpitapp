@@ -3634,6 +3634,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 0,
@@ -7573,6 +7575,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 2,
@@ -7680,6 +7684,8 @@ mod tests {
             .record_session_compacted_with_source(
                 "Build",
                 crate::session::SessionCompactionRecord {
+                    predecessor_session_id: s.id,
+                    predecessor_short_id: &s.short_id(),
                     successor_session_id: s.id,
                     successor_short_id: &s.short_id(),
                     seed_tool_count: 0,
@@ -7731,6 +7737,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 0,
@@ -7783,6 +7791,8 @@ mod tests {
             .record_session_compacted_with_source(
                 "Build",
                 crate::session::SessionCompactionRecord {
+                    predecessor_session_id: predecessor.id,
+                    predecessor_short_id: &predecessor.short_id(),
                     successor_session_id: successor_row.session_id,
                     successor_short_id: successor_row.short_id.as_deref().unwrap_or("succ01"),
                     seed_tool_count: 0,
@@ -7835,6 +7845,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 0,
@@ -7879,6 +7891,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 0,
@@ -8093,6 +8107,8 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                predecessor_session_id: s.id,
+                predecessor_short_id: &s.short_id(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id(),
                 seed_tool_count: 0,

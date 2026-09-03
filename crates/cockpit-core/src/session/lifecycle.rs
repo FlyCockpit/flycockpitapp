@@ -42,6 +42,57 @@ fn copy_optional_sealed_vault_item(
     }
 }
 
+fn copy_optional_sealed_vault_item_on_conn(
+    vault: &crate::secure_key::SecretVault,
+    conn: &rusqlite::Connection,
+    from_id: &str,
+    to_id: &str,
+) -> Result<()> {
+    match vault.get_item_on_conn(
+        conn,
+        cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+        from_id,
+    ) {
+        Ok(secret) => vault
+            .put_item_on_conn(
+                conn,
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                to_id,
+                secret.as_slice(),
+            )
+            .map_err(|error| anyhow::anyhow!("copying session sealed vault item: {error}")),
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "reading parent session sealed vault item for fork: {error}"
+        )),
+    }
+}
+
+fn list_session_sealed_value_copy_ids_on_conn(
+    conn: &rusqlite::Connection,
+    parent_key: &str,
+) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare("SELECT value_id FROM sealed_values WHERE session_id = ?1")?;
+    let ids = stmt
+        .query_map(rusqlite::params![parent_key], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out = Vec::new();
+    for value_id in ids {
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(active_version, 1) FROM sealed_value_records
+                  WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
+                rusqlite::params![parent_key, value_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(anyhow::Error::from)?
+            .unwrap_or(1);
+        out.push((value_id, version.max(1)));
+    }
+    Ok(out)
+}
+
 fn copy_vault_redaction_table(
     vault: &crate::secure_key::SecretVault,
     parent: uuid::Uuid,
@@ -80,34 +131,41 @@ pub(crate) fn copy_vault_session_secrets(
     let sealed_ids: Vec<(String, i64)> = db
         .blocking_write_for_sync_maintenance({
             let parent_key = parent_key.clone();
-            move |conn| {
-                let mut stmt =
-                    conn.prepare("SELECT value_id FROM sealed_values WHERE session_id = ?1")?;
-                let ids = stmt
-                    .query_map(rusqlite::params![parent_key], |row| row.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let mut out = Vec::new();
-                for value_id in ids {
-                    let version: i64 = conn
-                        .query_row(
-                            "SELECT COALESCE(active_version, 1) FROM sealed_value_records
-                              WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
-                            rusqlite::params![parent_key, value_id],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(anyhow::Error::from)?
-                        .unwrap_or(1);
-                    out.push((value_id, version.max(1)));
-                }
-                Ok(out)
-            }
+            move |conn| list_session_sealed_value_copy_ids_on_conn(conn, &parent_key)
         })
         .context("listing parent sealed values for fork copy")?;
     for (value_id, version) in sealed_ids {
         let from = crate::secure_key::session_sealed_item_id(&parent_key, &value_id, version);
         let to = crate::secure_key::session_sealed_item_id(&child_key, &value_id, version);
         copy_optional_sealed_vault_item(vault, &from, &to)?;
+    }
+    Ok(())
+}
+
+/// Copy redaction-table and sealed-value vault items onto `conn` so a
+/// subsequent successor/fork insert in the same transaction cannot leave
+/// orphaned ciphertext if a later guard fails.
+pub(crate) fn copy_vault_session_secrets_on_conn(
+    conn: &rusqlite::Connection,
+    vault: &crate::secure_key::SecretVault,
+    parent: uuid::Uuid,
+    child: uuid::Uuid,
+) -> Result<()> {
+    let parent_key = parent.to_string();
+    let child_key = child.to_string();
+    copy_vault_redaction_table_on_conn(
+        vault,
+        conn,
+        parent,
+        child,
+        "copying parent redaction table for session fork",
+    )?;
+    let sealed_ids = list_session_sealed_value_copy_ids_on_conn(conn, &parent_key)
+        .context("listing parent sealed values for fork copy")?;
+    for (value_id, version) in sealed_ids {
+        let from = crate::secure_key::session_sealed_item_id(&parent_key, &value_id, version);
+        let to = crate::secure_key::session_sealed_item_id(&child_key, &value_id, version);
+        copy_optional_sealed_vault_item_on_conn(vault, conn, &from, &to)?;
     }
     Ok(())
 }
@@ -949,7 +1007,7 @@ impl Session {
                 .store(true, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let raw = captured.raw.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -1510,7 +1568,7 @@ impl Session {
     #[allow(dead_code)]
     pub fn rename(&self, new_title: &str) -> Result<()> {
         let title = new_title.to_string();
-        let session_id = self.id;
+        let session_id = self.live_id();
         // Route through the shared latch-clearing helper so a manual user rename
         // clears any pending title-recovery nudge (issue #23) — an already-named
         // session must never be nudged to name itself.
@@ -1533,7 +1591,7 @@ impl Session {
     /// committed table (persist-before-swap).
     pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
         let json = table.to_persisted_json()?;
-        persist_redaction_table_to_vault(&self.secret_vault, self.id, json.as_bytes())?;
+        persist_redaction_table_to_vault(&self.secret_vault, self.live_id(), json.as_bytes())?;
         *self.redaction_table_json.lock().unwrap() = Some(json);
         Ok(())
     }
@@ -1551,7 +1609,7 @@ impl Session {
                 .context("loading persisted session redaction table");
         }
         if !self.is_persisted() {
-            return match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
+            return match load_redaction_table_from_vault(&self.secret_vault, self.live_id())? {
                 Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
                     .map(Some)
                     .context("loading vault session redaction table"),
@@ -1560,7 +1618,7 @@ impl Session {
         }
         let json = require_redaction_table_json_from_vault(
             &self.secret_vault,
-            self.id,
+            self.live_id(),
             "loading persisted session redaction table",
         )?;
         crate::redact::RedactionTable::from_persisted_json(&json)
@@ -1587,7 +1645,7 @@ impl Session {
         reader_project: &str,
         session_id: uuid::Uuid,
     ) -> Result<Option<crate::redact::RedactionTable>> {
-        if session_id == self.id {
+        if session_id == self.live_id() {
             return self.persisted_redaction_table();
         }
         if !self
@@ -1612,7 +1670,7 @@ impl Session {
     pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {
         let json = match self.redaction_table_json.lock().unwrap().clone() {
             Some(json) => json,
-            None => match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
+            None => match load_redaction_table_from_vault(&self.secret_vault, self.live_id())? {
                 Some(json) => json,
                 None => return Ok(Vec::new()),
             },
@@ -1629,7 +1687,7 @@ impl Session {
         }) {
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
@@ -1651,7 +1709,7 @@ impl Session {
         }) {
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
@@ -1664,29 +1722,32 @@ impl Session {
             .context("marking session viewed")
     }
 
-    /// End the session — sets `ended_at_unix_ms` in the DB. Doesn't drop the
-    /// row; history stays queryable via `cockpit session list`. Also
-    /// removes the per-session tmp dir (sandboxing part 2): a session's
-    /// scratch space doesn't outlive it.
+    /// End the live context window — sets `ended_at_unix_ms` on
+    /// [`Self::live_id`]. Doesn't drop the row; history stays queryable via
+    /// `cockpit session list`. Also removes the per-session tmp dir
+    /// (sandboxing part 2): a session's scratch space doesn't outlive it.
+    /// Tool-media bindings stay keyed by the worker spawn identity
+    /// ([`Self::id`]) and are invalidated there.
     pub fn end(&self) -> Result<()> {
         self.remove_tmp_dir();
-        let session_id = self.id;
+        let live_id = self.live_id();
+        let spawn_id = self.id;
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 let now_ms = Utc::now().timestamp_millis();
                 cockpit_db::db::sealed_scope::purge_session_sealed_values_conn(
                     conn,
-                    &session_id.to_string(),
+                    &live_id.to_string(),
                     now_ms,
                 )?;
                 conn.execute(
                     "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
-                    params![now_ms, session_id.to_string()],
+                    params![now_ms, live_id.to_string()],
                 )
                 .context("ending session")?;
                 crate::db::tool_media_subject_bindings::invalidate_tool_media_authorization_epochs_for_session_conn(
                     conn,
-                    session_id,
+                    spawn_id,
                     now_ms,
                 )?;
                 Ok(())

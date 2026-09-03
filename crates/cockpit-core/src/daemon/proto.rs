@@ -608,6 +608,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             cache_break,
         }],
         TurnEvent::CompactReady {
+            predecessor_session_id,
             new_session_id,
             handoff,
             brief,
@@ -621,7 +622,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             seed_tool_count,
             seed_tool_tokens,
         } => vec![Event::CompactReady {
-            session_id,
+            session_id: predecessor_session_id,
             new_session_id,
             handoff,
             brief,

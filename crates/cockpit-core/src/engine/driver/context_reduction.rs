@@ -349,7 +349,7 @@ impl Driver {
         if let Err(error) = self
             .session
             .db
-            .delete_compaction_shadow(self.session.id)
+            .delete_compaction_shadow(self.session.live_id())
             .await
         {
             tracing::warn!(error = %error, "compact shadow: deleting durable shadow failed");
@@ -373,7 +373,7 @@ impl Driver {
         if let Err(error) = self
             .session
             .db
-            .upsert_compaction_shadow(self.session.id, &payload_json)
+            .upsert_compaction_shadow(self.session.live_id(), &payload_json)
             .await
         {
             tracing::warn!(error = %error, "compact shadow: persisting durable shadow failed");
@@ -387,7 +387,12 @@ impl Driver {
             self.delete_durable_shadow_brief().await;
             return;
         }
-        let row = match self.session.db.compaction_shadow(self.session.id).await {
+        let row = match self
+            .session
+            .db
+            .compaction_shadow(self.session.live_id())
+            .await
+        {
             Ok(row) => row,
             Err(error) => {
                 tracing::warn!(error = %error, "compact shadow: loading durable shadow failed");
@@ -466,7 +471,7 @@ impl Driver {
         }
         let Ok(entries) = crate::engine::rehydrate::history_snapshot(
             &self.session.db,
-            self.session.id,
+            self.session.live_id(),
             self.active_agent(),
         )
         .await
@@ -555,7 +560,7 @@ impl Driver {
         let mut projection_calls = match self
             .session
             .db
-            .text_artifact_projection_call_ids(self.session.id)
+            .text_artifact_projection_call_ids(self.session.live_id())
             .await
         {
             Ok(calls) => Some(calls),
@@ -1729,14 +1734,14 @@ impl Driver {
         let calls = self
             .session
             .db
-            .list_tool_calls_for_session(self.session.id)
+            .list_tool_calls_for_session(self.session.live_id())
             .await
             .unwrap_or_default();
         let pins = self.session.pinned_messages();
         let active_goal = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -1757,7 +1762,7 @@ impl Driver {
         if let Ok(overview) = self
             .session
             .db
-            .task_todo_overview(self.session.id, 24)
+            .task_todo_overview(self.session.live_id(), 24)
             .await
         {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
@@ -1926,19 +1931,20 @@ impl Driver {
         // resetting this session in place. The predecessor is preserved
         // whole; the successor's event log starts at the handoff.
         let predecessor_id = self.session.live_id();
+        let predecessor_short_id = self.session.short_id();
         let successor_id = uuid::Uuid::new_v4();
-        crate::session::lifecycle::copy_vault_session_secrets(
-            &self.session.db,
-            self.session.secret_vault(),
-            predecessor_id,
-            successor_id,
-        )
-        .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
+        let vault = self.session.secret_vault().clone();
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let successor_row = self
             .session
             .db
             .transaction(move |conn| {
+                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
+                    conn,
+                    &vault,
+                    predecessor_id,
+                    successor_id,
+                )?;
                 crate::db::Db::create_compaction_successor_conn(
                     conn,
                     predecessor_id,
@@ -1995,6 +2001,8 @@ impl Driver {
         });
         let tail_messages = prepared.history[1..].to_vec();
         let record = crate::session::SessionCompactionRecord {
+            predecessor_session_id: predecessor_id,
+            predecessor_short_id: &predecessor_short_id,
             successor_session_id: successor_row.session_id,
             successor_short_id: &successor_short_id,
             seed_tool_count: prepared.seed_tags.len(),
@@ -2024,6 +2032,8 @@ impl Driver {
             .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone());
 
         let seed_record = crate::session::SessionCompactionRecord {
+            predecessor_session_id: predecessor_id,
+            predecessor_short_id: &predecessor_short_id,
             successor_session_id: successor_row.session_id,
             successor_short_id: &successor_short_id,
             seed_tool_count: prepared.seed_tags.len(),
@@ -2054,13 +2064,15 @@ impl Driver {
         // A retained rolling brief was intentionally cloned for a resume
         // offer. Once its prepared compaction has actually replaced history,
         // that source snapshot no longer describes the live conversation and
-        // must not survive to a later exactness check. The shadow stays on
-        // the predecessor row; the successor starts without one.
+        // must not survive to a later exactness check. The predecessor keeps
+        // its own window's last shadow; this delete is keyed by live_id, so
+        // the successor starts without one.
         self.shadow_brief = None;
         self.delete_durable_shadow_brief().await;
         self.auto_compact_gate.mark_committed();
         let _ = tx
             .send(TurnEvent::CompactReady {
+                predecessor_session_id: predecessor_id,
                 new_session_id: successor_row.session_id,
                 handoff: prepared.handoff,
                 brief: prepared.brief,

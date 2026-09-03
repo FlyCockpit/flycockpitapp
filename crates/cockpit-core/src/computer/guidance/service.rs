@@ -14,15 +14,17 @@
 //! - accepted session/persistent rules are compiled into new model contexts via
 //!   [`super::compose_and_compile`] (AC9).
 //!
-//! ## Audit emission (blocked on `computer-audit-chain-completion`)
+//! ## Audit emission
 //!
 //! The four `guidance_proposal_*` audit events are emitted through the
-//! [`GuidanceAuditWriter`] trait. The real tamper-evident audit-chain writer is
-//! a separate pending decision (not yet filed as an issue); until it lands a
-//! Until the tamper-evident chain is installed, production uses
-//! [`StubGuidanceAuditWriter`] and proposal creation fails closed.
+//! [`GuidanceAuditWriter`] trait. Production installs
+//! [`ChainGuidanceAuditWriter`] (the tamper-evident computer-use audit chain)
+//! once the secure-key actor is attached. Until that install, the writer is
+//! unavailable and create/accept/reject fail closed.
 
 use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use super::enablement::resolve_guidance_enablement_pinned;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
@@ -30,11 +32,14 @@ use super::{
     ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, normalize_rationale,
     validate_proposal,
 };
-use crate::computer::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
+use crate::computer::audit::{
+    AuditEventKind, ComputerAuditChain, Disposition, GuidanceAppendError, GuidanceAuditAppend,
+    GuidanceScope, domain_digest, domains,
+};
 use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
     CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
-    GuidanceProposalReceiptInsert, GuidanceProposalReceiptState,
+    GuidanceProposalReceiptInsert, GuidanceProposalReceiptRow, GuidanceProposalReceiptState,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +111,23 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Create-path rollback is allowed only when the append API proves the
+/// event is durably absent. Writers that do not implement
+/// [`GuidanceAppendError`] have no pending-head protocol, so their errors
+/// stay fail-closed (rollback).
+fn guidance_append_is_durably_absent(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GuidanceAppendError>()
+        .map(GuidanceAppendError::is_durably_absent)
+        .unwrap_or(true)
+}
+
+fn guidance_append_is_identity_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GuidanceAppendError>()
+        .is_some_and(GuidanceAppendError::is_identity_mismatch)
+}
+
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     let bytes = decode_hex(s)?;
     if bytes.len() != 32 {
@@ -117,7 +139,7 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 }
 
 // ---------------------------------------------------------------------------
-// Audit writer (stub pending computer-audit-chain-completion)
+// Audit writer
 // ---------------------------------------------------------------------------
 
 /// The safe fields for a guidance-proposal audit event. Typed rule values and
@@ -137,11 +159,96 @@ pub struct GuidanceAuditEvent {
     pub scope: Option<GuidanceScope>,
 }
 
+impl From<&GuidanceAuditEvent> for GuidanceAuditAppend {
+    fn from(event: &GuidanceAuditEvent) -> Self {
+        Self {
+            kind: event.kind,
+            proposal_id: event.proposal_id,
+            session_id: event.session_id,
+            delegation_id: event.delegation_id,
+            canonical_project_digest: event.canonical_project_digest,
+            provider_digest: event.provider_digest,
+            model_digest: event.model_digest,
+            config_generation: event.config_generation,
+            rule_kind_bits: event.rule_kind_bits,
+            disposition: event.disposition,
+            scope: event.scope,
+        }
+    }
+}
+
+impl GuidanceAuditEvent {
+    /// Reconstruct an audit event from a durable receipt.
+    ///
+    /// Identity fields are cryptographic chain inputs. A malformed hex string
+    /// or out-of-range integer must fail closed — never coerce into a valid
+    /// zero identifier or a silently truncated generation/bitset.
+    fn try_from_receipt(
+        row: &GuidanceProposalReceiptRow,
+        event_state: GuidanceProposalReceiptState,
+        accepted_scope: Option<GuidanceProposalAcceptedScope>,
+    ) -> anyhow::Result<Self> {
+        let kind = match event_state {
+            GuidanceProposalReceiptState::Created => AuditEventKind::GuidanceProposalCreated,
+            GuidanceProposalReceiptState::Accepted => AuditEventKind::GuidanceProposalAccepted,
+            GuidanceProposalReceiptState::Rejected => AuditEventKind::GuidanceProposalRejected,
+            GuidanceProposalReceiptState::Expired
+            | GuidanceProposalReceiptState::ExpiredOnRestart => {
+                AuditEventKind::GuidanceProposalExpired
+            }
+        };
+        let proposal_id = parse_hex16(&row.proposal_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt proposal id"))?;
+        let session_id = parse_hex16(&row.session_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt session id"))?;
+        let delegation_id = parse_hex16(&row.delegation_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt delegation id"))?;
+        let canonical_project_digest = parse_hex32(&row.canonical_project_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt project digest"))?;
+        let provider_digest = parse_hex32(&row.provider_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt provider digest"))?;
+        let model_digest = parse_hex32(&row.model_digest)
+            .ok_or_else(|| anyhow::anyhow!("invalid receipt model digest"))?;
+        let config_generation = u64::try_from(row.config_generation)?;
+        let rule_kind_bits = u16::try_from(row.rule_kind_bits)?;
+        let (disposition, scope) = match event_state {
+            GuidanceProposalReceiptState::Created => (None, None),
+            GuidanceProposalReceiptState::Rejected => (Some(Disposition::Rejected), None),
+            GuidanceProposalReceiptState::Expired
+            | GuidanceProposalReceiptState::ExpiredOnRestart => (Some(Disposition::Expired), None),
+            GuidanceProposalReceiptState::Accepted => match accepted_scope {
+                Some(GuidanceProposalAcceptedScope::Session) => (
+                    Some(Disposition::AcceptedSession),
+                    Some(GuidanceScope::Session),
+                ),
+                Some(GuidanceProposalAcceptedScope::Persistent) => (
+                    Some(Disposition::AcceptedPersistent),
+                    Some(GuidanceScope::ProjectProviderModel),
+                ),
+                None => anyhow::bail!("accepted guidance audit lacks scope"),
+            },
+        };
+        Ok(Self {
+            kind,
+            proposal_id,
+            session_id,
+            delegation_id,
+            canonical_project_digest,
+            provider_digest,
+            model_digest,
+            config_generation,
+            rule_kind_bits,
+            disposition,
+            scope,
+        })
+    }
+}
+
 /// Append-only audit writer for the four `guidance_proposal_*` event kinds.
 ///
-/// The real implementation is the tamper-evident computer-audit chain from
-/// `computer-audit-chain-completion` (pending). Until it lands, the
-/// [`StubGuidanceAuditWriter`] is used.
+/// Production installs [`ChainGuidanceAuditWriter`]. Tests may inject a
+/// recording or fail-closed double.
+#[async_trait]
 pub trait GuidanceAuditWriter: Send + Sync {
     /// Whether the writer can currently accept an append. Lifecycle methods
     /// check this before changing durable state; `append` remains authoritative
@@ -160,23 +267,68 @@ pub trait GuidanceAuditWriter: Send + Sync {
     /// Append one guidance-proposal audit event. Returns `Err` when the writer
     /// is unavailable so the orchestrator can fail closed (no silent undurable
     /// proposals).
-    fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
 }
 
-/// Fail-closed writer used until the real audit-chain writer lands.
-///
-/// TODO(computer-audit-chain-completion): replace with the real tamper-evident
-/// writer. No lifecycle mutation may be presented as audited while the writer
-/// is unavailable.
+/// Production writer: HMAC-chained, sealed-head computer-use audit log.
+pub struct ChainGuidanceAuditWriter {
+    chain: Arc<ComputerAuditChain>,
+}
+
+impl ChainGuidanceAuditWriter {
+    pub fn new(chain: Arc<ComputerAuditChain>) -> Self {
+        Self { chain }
+    }
+
+    pub fn chain(&self) -> &Arc<ComputerAuditChain> {
+        &self.chain
+    }
+}
+
+#[async_trait]
+impl GuidanceAuditWriter for ChainGuidanceAuditWriter {
+    fn is_available(&self) -> bool {
+        self.chain.is_available()
+    }
+
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        self.chain.append_guidance(event.into()).await?;
+        Ok(())
+    }
+}
+
+/// Fail-closed placeholder used only between registry construction and
+/// secure-key attach. Production replaces this with
+/// [`ChainGuidanceAuditWriter`] before the socket is published.
+struct UninstalledGuidanceAuditWriter;
+
+#[async_trait]
+impl GuidanceAuditWriter for UninstalledGuidanceAuditWriter {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "computer guidance audit chain is not installed for {:?} proposal {}",
+            event.kind,
+            hex16(&event.proposal_id)
+        )
+    }
+}
+
+/// Fail-closed writer for tests that need an explicit unavailable audit
+/// adapter. Not used on the production path.
 #[derive(Debug, Default)]
 pub struct StubGuidanceAuditWriter;
 
+#[async_trait]
 impl GuidanceAuditWriter for StubGuidanceAuditWriter {
     fn is_available(&self) -> bool {
         false
     }
 
-    fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
         anyhow::bail!(
             "computer guidance audit writer unavailable for {:?} proposal {}",
             event.kind,
@@ -208,11 +360,10 @@ struct PersistentRuleKey {
     model_digest: [u8; 32],
 }
 
-/// In-memory custody of accepted rules. Session rules live until session end;
-/// persistent rules are machine-local and never roam.
-///
-/// TODO: durable persistence of persistent rules (a future local-only table) so
-/// they survive restart. Session rules are intentionally memory-only.
+/// In-memory custody of accepted rules. Session rules live until session end
+/// and are intentionally memory-only. Persistent rules are machine-local
+/// (`accepted_persistent_guidance_rules`), never roam, and are rehydrated
+/// into this map on daemon start via [`GuidanceProposalService::reload_persistent_rules`].
 #[derive(Debug, Default)]
 pub struct AcceptedRulesStore {
     session:
@@ -373,9 +524,9 @@ pub enum TransitionProposalError {
 /// memory store; the daemon coordinator holds it behind `&mut`-style
 /// serialization. Holds:
 /// - the daemon-memory pending-proposal store,
-/// - the in-memory accepted-rules store,
+/// - the in-memory accepted-rules store (persistent half rehydrated from SQLite),
 /// - a handle to the durable receipt/counter database,
-/// - the audit writer (stub until the real chain lands).
+/// - the audit writer (the tamper-evident chain after boot install).
 pub struct GuidanceProposalService {
     pending: PendingProposalStore,
     accepted: Arc<AcceptedRulesStore>,
@@ -514,18 +665,20 @@ impl GuidanceProposalService {
             }
         }
     }
-    /// Construct a service backed by `db` and the stub audit writer.
+    /// Construct a service backed by `db`. Production replaces the fail-closed
+    /// placeholder with [`ChainGuidanceAuditWriter`] via
+    /// [`Self::install_audit_writer`] after the secure-key actor attaches.
     pub fn new(db: Arc<Db>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
             accepted: Arc::new(AcceptedRulesStore::new()),
             db,
-            audit: Arc::new(StubGuidanceAuditWriter),
+            audit: Arc::new(UninstalledGuidanceAuditWriter),
         }
     }
 
-    /// Construct a service with an explicit audit writer (for tests / the real
-    /// writer when it lands).
+    /// Construct a service with an explicit audit writer (tests and the
+    /// production chain).
     pub fn with_audit_writer(db: Arc<Db>, audit: Arc<dyn GuidanceAuditWriter>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
@@ -533,6 +686,13 @@ impl GuidanceProposalService {
             db,
             audit,
         }
+    }
+
+    /// Install the production tamper-evident audit writer. Replaces the
+    /// fail-closed placeholder used between registry construction and
+    /// secure-key attach.
+    pub fn install_audit_writer(&mut self, audit: Arc<dyn GuidanceAuditWriter>) {
+        self.audit = audit;
     }
 
     pub fn compiler(
@@ -575,8 +735,9 @@ impl GuidanceProposalService {
     }
 
     /// Retry every audit event left in the durable outbox by an append error
-    /// or daemon crash. Delivery marking is idempotent; the audit writer must
-    /// use the proposal/state identity for append deduplication.
+    /// or daemon crash. Delivery marking is idempotent; append success is
+    /// proof that the authenticated chain body is this reconstructed event,
+    /// not merely that `(event_kind, proposal_id)` is occupied.
     pub async fn flush_audit_outbox(&self, now_unix_ms: i64) -> anyhow::Result<usize> {
         if !self.audit.delivers_immediately() {
             return Ok(0);
@@ -586,65 +747,53 @@ impl GuidanceProposalService {
         for item in pending {
             let row = &item.receipt;
             let accepted_scope = item.event_accepted_scope;
-            let kind = match item.event_state {
-                GuidanceProposalReceiptState::Created => AuditEventKind::GuidanceProposalCreated,
-                GuidanceProposalReceiptState::Accepted => AuditEventKind::GuidanceProposalAccepted,
-                GuidanceProposalReceiptState::Rejected => AuditEventKind::GuidanceProposalRejected,
-                GuidanceProposalReceiptState::Expired
-                | GuidanceProposalReceiptState::ExpiredOnRestart => {
-                    AuditEventKind::GuidanceProposalExpired
+            let event =
+                GuidanceAuditEvent::try_from_receipt(row, item.event_state, accepted_scope)?;
+            match self.audit.append(&event).await {
+                Ok(()) => {
+                    self.db
+                        .mark_guidance_proposal_audit_delivered(
+                            &row.proposal_id,
+                            item.event_state,
+                            now_unix_ms,
+                        )
+                        .await?;
+                    delivered += 1;
                 }
-            };
-            let event = GuidanceAuditEvent {
-                kind,
-                proposal_id: parse_hex16(&row.proposal_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt proposal id"))?,
-                session_id: parse_hex16(&row.session_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt session id"))?,
-                delegation_id: parse_hex16(&row.delegation_id)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt delegation id"))?,
-                canonical_project_digest: parse_hex32(&row.canonical_project_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt project digest"))?,
-                provider_digest: parse_hex32(&row.provider_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt provider digest"))?,
-                model_digest: parse_hex32(&row.model_digest)
-                    .ok_or_else(|| anyhow::anyhow!("invalid receipt model digest"))?,
-                config_generation: u64::try_from(row.config_generation)?,
-                rule_kind_bits: u16::try_from(row.rule_kind_bits)?,
-                disposition: match item.event_state {
-                    GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                        Some(GuidanceProposalAcceptedScope::Session) => {
-                            Some(Disposition::AcceptedSession)
-                        }
-                        Some(GuidanceProposalAcceptedScope::Persistent) => {
-                            Some(Disposition::AcceptedPersistent)
-                        }
-                        None => anyhow::bail!("accepted guidance audit lacks scope"),
-                    },
-                    GuidanceProposalReceiptState::Rejected => Some(Disposition::Rejected),
-                    GuidanceProposalReceiptState::Expired
-                    | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
-                    GuidanceProposalReceiptState::Created => None,
-                },
-                scope: match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => Some(GuidanceScope::Session),
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(GuidanceScope::ProjectProviderModel)
-                    }
-                    None => None,
-                },
-            };
-            self.audit.append(&event)?;
-            self.db
-                .mark_guidance_proposal_audit_delivered(
-                    &row.proposal_id,
-                    item.event_state,
-                    now_unix_ms,
-                )
-                .await?;
-            delivered += 1;
+                Err(error)
+                    if error
+                        .downcast_ref::<GuidanceAppendError>()
+                        .is_some_and(GuidanceAppendError::is_predecessor_missing) =>
+                {
+                    tracing::warn!(
+                        %error,
+                        proposal_id = %row.proposal_id,
+                        "guidance successor audit waiting for created predecessor"
+                    );
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<GuidanceAppendError>()
+                        .is_some_and(GuidanceAppendError::is_identity_mismatch) =>
+                {
+                    tracing::error!(
+                        %error,
+                        proposal_id = %row.proposal_id,
+                        "guidance audit outbox event does not match the authenticated chain body"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(delivered)
+    }
+
+    /// Deliver any undelivered `created` (and other predecessor) outbox rows
+    /// before appending a successor lifecycle event.
+    async fn flush_predecessor_audits(&self, now_unix_ms: i64) {
+        if let Err(error) = self.flush_audit_outbox(now_unix_ms).await {
+            tracing::warn!(%error, "guidance predecessor audit flush deferred");
+        }
     }
 
     /// Borrow the pending-proposal store (for the review UI to read typed
@@ -699,11 +848,12 @@ impl GuidanceProposalService {
     ///    work).
     /// 4. Insert the content-free receipt + increment counters (transactional,
     ///    cap-enforced). On any failure release the reservation and return.
-    /// 5. Append `guidance_proposal_created` via the audit writer (fail-closed
-    ///    on append failure: atomically delete the new receipt, its outbox row,
-    ///    and both counter increments; then release the memory reservation.
-    ///    If that rollback cannot complete, the reservation stays so a leftover
-    ///    `created` row cannot be shadowed by a second create).
+    /// 5. Append `guidance_proposal_created` via the audit writer. Rollback of
+    ///    the receipt/outbox/counters is permitted only when the append API
+    ///    proves the event is durably absent. An error after a pending head or
+    ///    database body is left recoverable (keep the receipt; outbox/recovery
+    ///    will commit). If a durably-absent rollback cannot complete, the
+    ///    reservation stays so a leftover `created` row cannot be shadowed.
     /// 6. Install typed values + rationale into memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
@@ -803,37 +953,51 @@ impl GuidanceProposalService {
             scope: None,
         };
         if self.audit.delivers_immediately() {
-            if let Err(audit_error) = self.audit.append(&audit_event) {
-                let proposal_id = hex16(&proposal_id);
-                let rollback = self
-                    .db
-                    .rollback_created_guidance_proposal_receipt(&proposal_id)
-                    .await;
-                return match rollback {
-                    Ok(true) => {
-                        self.pending.release(&key, pid);
-                        Err(CreateProposalError::AuditUnavailable(
-                            audit_error.to_string(),
-                        ))
+            match self.audit.append(&audit_event).await {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .db
+                        .mark_guidance_proposal_audit_delivered(
+                            &hex16(&proposal_id),
+                            GuidanceProposalReceiptState::Created,
+                            now_unix_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
                     }
-                    Ok(false) => Err(CreateProposalError::Storage(format!(
-                        "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
-                    ))),
-                    Err(rollback_error) => Err(CreateProposalError::Storage(format!(
-                        "guidance audit append failed and rollback failed: {audit_error}; {rollback_error}"
-                    ))),
-                };
-            }
-            if let Err(error) = self
-                .db
-                .mark_guidance_proposal_audit_delivered(
-                    &hex16(&proposal_id),
-                    GuidanceProposalReceiptState::Created,
-                    now_unix_ms,
-                )
-                .await
-            {
-                tracing::warn!(%error, "guidance created audit delivery mark remains retryable");
+                }
+                Err(audit_error) if guidance_append_is_identity_mismatch(&audit_error) => {
+                    self.pending.release(&key, pid);
+                    return Err(CreateProposalError::Storage(audit_error.to_string()));
+                }
+                Err(audit_error) if guidance_append_is_durably_absent(&audit_error) => {
+                    let proposal_id = hex16(&proposal_id);
+                    let rollback = self
+                        .db
+                        .rollback_created_guidance_proposal_receipt(&proposal_id)
+                        .await;
+                    return match rollback {
+                        Ok(true) => {
+                            self.pending.release(&key, pid);
+                            Err(CreateProposalError::AuditUnavailable(
+                                audit_error.to_string(),
+                            ))
+                        }
+                        Ok(false) => Err(CreateProposalError::Storage(format!(
+                            "guidance audit append failed and created receipt could not be rolled back: {audit_error}"
+                        ))),
+                        Err(rollback_error) => Err(CreateProposalError::Storage(format!(
+                            "guidance audit append failed and rollback failed: {audit_error}; {rollback_error}"
+                        ))),
+                    };
+                }
+                Err(audit_error) => {
+                    tracing::warn!(
+                        %audit_error,
+                        "guidance created audit remains recoverable; keeping receipt"
+                    );
+                }
             }
         }
 
@@ -852,7 +1016,6 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::Expired,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await;
             return Err(CreateProposalError::Storage(
@@ -999,32 +1162,17 @@ impl GuidanceProposalService {
             .ok_or(TransitionProposalError::NotFound)?;
 
         // Audit append.
-        let (disp, gscope) = match accepted_scope {
-            GuidanceProposalAcceptedScope::Session => {
-                (Disposition::AcceptedSession, GuidanceScope::Session)
-            }
-            GuidanceProposalAcceptedScope::Persistent => (
-                Disposition::AcceptedPersistent,
-                GuidanceScope::ProjectProviderModel,
-            ),
-        };
-        let audit_event = GuidanceAuditEvent {
-            kind: AuditEventKind::GuidanceProposalAccepted,
-            proposal_id,
-            session_id: scope.session_id,
-            delegation_id: scope.delegation_id,
-            canonical_project_digest: scope.project_digest,
-            provider_digest: scope.provider_digest,
-            model_digest: scope.model_digest,
-            config_generation: receipt.config_generation as u64,
-            rule_kind_bits: receipt.rule_kind_bits as u16,
-            disposition: Some(disp),
-            scope: Some(gscope),
-        };
+        let audit_event = GuidanceAuditEvent::try_from_receipt(
+            &receipt,
+            GuidanceProposalReceiptState::Accepted,
+            Some(accepted_scope),
+        )
+        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+        self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
-            match self.audit.append(&audit_event) {
+            match self.audit.append(&audit_event).await {
                 Ok(()) => {
                     if let Err(error) = self
                         .db
@@ -1112,23 +1260,17 @@ impl GuidanceProposalService {
             .await
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
             .ok_or(TransitionProposalError::NotFound)?;
-        let audit_event = GuidanceAuditEvent {
-            kind: AuditEventKind::GuidanceProposalRejected,
-            proposal_id,
-            session_id: scope.session_id,
-            delegation_id: scope.delegation_id,
-            canonical_project_digest: scope.project_digest,
-            provider_digest: scope.provider_digest,
-            model_digest: scope.model_digest,
-            config_generation: receipt.config_generation as u64,
-            rule_kind_bits: receipt.rule_kind_bits as u16,
-            disposition: Some(Disposition::Rejected),
-            scope: None,
-        };
+        let audit_event = GuidanceAuditEvent::try_from_receipt(
+            &receipt,
+            GuidanceProposalReceiptState::Rejected,
+            None,
+        )
+        .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+        self.flush_predecessor_audits(now_unix_ms).await;
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
-            match self.audit.append(&audit_event) {
+            match self.audit.append(&audit_event).await {
                 Ok(()) => {
                     if let Err(error) = self
                         .db
@@ -1174,7 +1316,6 @@ impl GuidanceProposalService {
                 GuidanceProposalReceiptState::Expired,
                 None,
                 now_unix_ms,
-                AuditEventKind::GuidanceProposalExpired,
             )
             .await?;
         if applied {
@@ -1207,7 +1348,6 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::Expired,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await
             {
@@ -1254,11 +1394,6 @@ impl GuidanceProposalService {
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
         let mut count = 0;
         for row in stale {
-            // The proposal id hex is already 32 lowercase chars.
-            let proposal_id = match parse_hex16(&row.proposal_id) {
-                Some(id) => id,
-                None => continue,
-            };
             let applied = self
                 .cas_and_audit(
                     &row.proposal_id,
@@ -1266,13 +1401,11 @@ impl GuidanceProposalService {
                     GuidanceProposalReceiptState::ExpiredOnRestart,
                     None,
                     now_unix_ms,
-                    AuditEventKind::GuidanceProposalExpired,
                 )
                 .await?;
             if applied {
                 // Exactly one audit append per stale receipt; no counter
                 // re-increment (creation already counted).
-                let _ = proposal_id;
                 count += 1;
             }
         }
@@ -1336,8 +1469,10 @@ impl GuidanceProposalService {
         to: GuidanceProposalReceiptState,
         accepted_scope: Option<GuidanceProposalAcceptedScope>,
         now_unix_ms: i64,
-        audit_kind: AuditEventKind,
     ) -> Result<bool, TransitionProposalError> {
+        if to != GuidanceProposalReceiptState::Created {
+            self.flush_predecessor_audits(now_unix_ms).await;
+        }
         let applied = self
             .db
             .cas_guidance_proposal_receipt_state(
@@ -1361,45 +1496,12 @@ impl GuidanceProposalService {
             .await
             .map_err(|e| TransitionProposalError::Storage(e.to_string()))?
             .ok_or(TransitionProposalError::NotFound)?;
-        let proposal_id = parse_hex16(&row.proposal_id).unwrap_or([0u8; 16]);
-        let event = GuidanceAuditEvent {
-            kind: audit_kind,
-            proposal_id,
-            session_id: parse_hex16(&row.session_id).unwrap_or([0u8; 16]),
-            delegation_id: parse_hex16(&row.delegation_id).unwrap_or([0u8; 16]),
-            canonical_project_digest: parse_hex32(&row.canonical_project_digest)
-                .unwrap_or([0u8; 32]),
-            provider_digest: parse_hex32(&row.provider_digest).unwrap_or([0u8; 32]),
-            model_digest: parse_hex32(&row.model_digest).unwrap_or([0u8; 32]),
-            config_generation: row.config_generation as u64,
-            rule_kind_bits: row.rule_kind_bits as u16,
-            disposition: match to {
-                GuidanceProposalReceiptState::Expired
-                | GuidanceProposalReceiptState::ExpiredOnRestart => Some(Disposition::Expired),
-                GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => {
-                        Some(Disposition::AcceptedSession)
-                    }
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(Disposition::AcceptedPersistent)
-                    }
-                    None => None,
-                },
-                GuidanceProposalReceiptState::Rejected => Some(Disposition::Rejected),
-                GuidanceProposalReceiptState::Created => None,
-            },
-            scope: match to {
-                GuidanceProposalReceiptState::Accepted => match accepted_scope {
-                    Some(GuidanceProposalAcceptedScope::Session) => Some(GuidanceScope::Session),
-                    Some(GuidanceProposalAcceptedScope::Persistent) => {
-                        Some(GuidanceScope::ProjectProviderModel)
-                    }
-                    None => None,
-                },
-                _ => None,
-            },
-        };
-        if self.audit.delivers_immediately() && self.audit.append(&event).is_ok() {
+        // Malformed durable identities must not become a signed zero-identity
+        // chain entry. Refuse delivery; the outbox stays pending and replay
+        // uses the same fail-closed reconstruction.
+        let event = GuidanceAuditEvent::try_from_receipt(&row, to, accepted_scope)
+            .map_err(|e| TransitionProposalError::Storage(e.to_string()))?;
+        if self.audit.delivers_immediately() && self.audit.append(&event).await.is_ok() {
             if let Err(error) = self
                 .db
                 .mark_guidance_proposal_audit_delivered(proposal_id_str, to, now_unix_ms)
@@ -1426,16 +1528,18 @@ mod tests {
 
     struct RecordingAuditWriter;
 
+    #[async_trait]
     impl GuidanceAuditWriter for RecordingAuditWriter {
-        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        async fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
             Ok(())
         }
     }
 
     struct FailingAuditWriter;
 
+    #[async_trait]
     impl GuidanceAuditWriter for FailingAuditWriter {
-        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        async fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
             anyhow::bail!("audit transport failed")
         }
     }
@@ -1833,8 +1937,9 @@ mod tests {
         // stale receipt.
         let recorded: Arc<Mutex<Vec<AuditEventKind>>> = Arc::new(Mutex::new(vec![]));
         struct Recording(Arc<Mutex<Vec<AuditEventKind>>>);
+        #[async_trait]
         impl GuidanceAuditWriter for Recording {
-            fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+            async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
                 self.0.lock().unwrap().push(event.kind);
                 Ok(())
             }
@@ -1858,21 +1963,594 @@ mod tests {
         );
         let n = svc2.reconcile_on_restart(9000).await.unwrap();
         assert_eq!(n, 1);
-        // Exactly one expired audit append.
+        // Lifecycle order: created before expired. Exactly one of each.
         let kinds = recorded.lock().unwrap();
-        assert!(
-            kinds
-                .iter()
-                .any(|k| *k == AuditEventKind::GuidanceProposalCreated)
-        );
         assert_eq!(
-            kinds
-                .iter()
-                .filter(|k| **k == AuditEventKind::GuidanceProposalExpired)
-                .count(),
-            1
+            kinds.as_slice(),
+            &[
+                AuditEventKind::GuidanceProposalCreated,
+                AuditEventKind::GuidanceProposalExpired,
+            ]
         );
         // No counter re-increment.
         assert_eq!(svc2.delegation_counter(&id16(2)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_flush_then_reconcile_chains_created_before_expired() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+        use cockpit_db::computer_audit::{GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        // Crash window: receipt+outbox exist, created was never appended.
+        // Production boot flushes the outbox before reconcile.
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+        let n = svc.reconcile_on_restart(9000).await.unwrap();
+        assert_eq!(n, 1);
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_kind, GUIDANCE_PROPOSAL_CREATED);
+        assert_eq!(rows[1].event_kind, GUIDANCE_PROPOSAL_EXPIRED);
+        assert_eq!(rows[0].proposal_id, id16(9));
+        assert_eq!(rows[1].proposal_id, id16(9));
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn flush_does_not_mark_delivered_when_authenticated_event_diverges() {
+        use crate::computer::audit::{AuditVerifyStatus, ComputerAuditEntryV1, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+
+        // Matching replay after a lost delivery mark is still the same event.
+        let proposal = hex16(&id16(9));
+        let proposal_for_clear = proposal.clone();
+        harness
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE guidance_proposal_audit_outbox
+                     SET delivered_at_unix_ms = NULL
+                     WHERE proposal_id = ?1",
+                    rusqlite::params![proposal_for_clear],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(svc.flush_audit_outbox(9000).await.unwrap(), 1);
+
+        // Replay window: delivery mark lost, receipt identity mutated.
+        let stolen_session = hex16(&id16(7));
+        let proposal_for_mutate = proposal;
+        harness
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE guidance_proposal_audit_outbox
+                     SET delivered_at_unix_ms = NULL
+                     WHERE proposal_id = ?1",
+                    rusqlite::params![proposal_for_mutate],
+                )?;
+                conn.execute(
+                    "UPDATE guidance_proposal_receipts
+                     SET session_id = ?1
+                     WHERE proposal_id = ?2",
+                    rusqlite::params![stolen_session, proposal_for_mutate],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.flush_audit_outbox(9001).await.unwrap(), 0);
+        assert_eq!(
+            harness
+                .db
+                .pending_guidance_proposal_audits()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let decoded = ComputerAuditEntryV1::decode(&rows[0].entry_bytes).unwrap();
+        assert_eq!(decoded.session_id, id16(1));
+        assert_ne!(decoded.session_id, id16(7));
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn restart_reconcile_without_flush_still_cannot_invert_lifecycle() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+        use cockpit_db::computer_audit::{GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        harness
+            .db
+            .insert_guidance_proposal_receipt(GuidanceProposalReceiptInsert {
+                proposal_id: &hex16(&id16(9)),
+                session_id: &hex16(&id16(1)),
+                delegation_id: &hex16(&id16(2)),
+                canonical_project_digest: &hex32(&create.project_digest),
+                provider_digest: &hex32(&create.provider_digest),
+                model_digest: &hex32(&create.model_digest),
+                config_generation: 1,
+                rule_kind_bits: 1,
+                created_at_unix_ms: 1000,
+                expires_at_unix_ms: 1000 + super::super::PROPOSAL_EXPIRY_SECS_MILLIS,
+            })
+            .await
+            .unwrap();
+
+        // Even if reconcile runs first, cas_and_audit flushes created before
+        // appending expired, and the chain refuses a successor without it.
+        let n = svc.reconcile_on_restart(9000).await.unwrap();
+        assert_eq!(n, 1);
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_kind, GUIDANCE_PROPOSAL_CREATED);
+        assert_eq!(rows[1].event_kind, GUIDANCE_PROPOSAL_EXPIRED);
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn create_rolls_back_when_pending_head_is_aborted() {
+        use crate::computer::audit::{AppendFault, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHead);
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        let err = svc
+            .create_proposal(
+                snapshot(&svc, &providers_enabled(), "m", b"proj"),
+                id16(1),
+                id16(2),
+                id16(9),
+                vec![rule()],
+                None,
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateProposalError::AuditUnavailable(_)));
+        assert!(svc.pending_store().is_empty());
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 0);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let handle = harness.handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        assert_eq!(reopened.verify().await.confirmed_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn create_keeps_receipt_when_pending_recovery_writes_body_then_fails_confirm() {
+        use crate::computer::audit::{
+            AppendFault, AuditVerifyStatus, GuidanceAuditAppend, TestAuditHarness,
+        };
+        use crate::computer::guidance::RuleKind;
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        let event = GuidanceAuditAppend {
+            kind: AuditEventKind::GuidanceProposalCreated,
+            proposal_id: id16(9),
+            session_id: id16(1),
+            delegation_id: id16(2),
+            canonical_project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+            config_generation: create.enablement.config_generation,
+            rule_kind_bits: RuleKind::ObservationCadence.bit_mask(),
+            disposition: None,
+            scope: None,
+        };
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterPendingHeadUnaborted);
+        let err = harness.chain.append_guidance(event).await.unwrap_err();
+        assert!(!err.is_durably_absent(), "{err}");
+
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterRecoverPendingBody);
+        svc.create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let handle = harness.handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn create_keeps_receipt_when_insert_is_durable_but_unconfirmed() {
+        use crate::computer::audit::{AppendFault, AuditVerifyStatus, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsert);
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        svc.create_proposal(
+            snapshot(&svc, &providers_enabled(), "m", b"proj"),
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let handle = harness.handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn create_keeps_receipt_when_retry_after_insert_cannot_reobserve() {
+        use crate::computer::audit::{
+            AppendFault, AppendObserveFault, AuditVerifyStatus, TestAuditHarness,
+        };
+
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .inject_append_fault(AppendFault::AfterDatabaseInsertConfirmConflict);
+        harness
+            .chain
+            .inject_append_fault(AppendFault::FailObserve(AppendObserveFault::SealedHeadLoad));
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc = GuidanceProposalService::with_audit_writer(harness.db.clone(), writer);
+        svc.create_proposal(
+            snapshot(&svc, &providers_enabled(), "m", b"proj"),
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![rule()],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(svc.pending_store().len(), 1);
+        assert_eq!(svc.session_counter(&id16(1)).await.unwrap(), 1);
+        assert!(
+            harness
+                .db
+                .guidance_proposal_receipt(&hex16(&id16(9)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            harness
+                .db
+                .list_computer_audit_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let handle = harness.handle();
+        let reopened =
+            crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
+                .await
+                .unwrap();
+        let result = reopened.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn production_chain_create_accept_reject_verifies() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc =
+            GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        assert!(svc.audit.is_available());
+
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        let scope = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
+            .await
+            .unwrap();
+        svc.accept_session(&scope, id16(9), 2000).await.unwrap();
+
+        let create = snapshot(&svc, &providers_enabled(), "m2", b"proj");
+        let scope2 = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(3),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(create, id16(1), id16(3), id16(8), vec![rule()], None, 3000)
+            .await
+            .unwrap();
+        svc.reject(&scope2, id16(8), 4000).await.unwrap();
+
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 4);
+        assert_eq!(result.entry_count, 4);
+    }
+
+    #[tokio::test]
+    async fn persistent_rule_survives_restart_session_rule_does_not() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut svc =
+            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(RecordingAuditWriter));
+        let project = canonical_project_digest(b"proj");
+        let provider = provider_digest("p");
+        let model = model_digest("p", "m");
+
+        let scope_session = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: project,
+            provider_digest: provider,
+            model_digest: model,
+        };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 2 }],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        svc.accept_session(&scope_session, id16(9), 2000)
+            .await
+            .unwrap();
+
+        let scope_persistent = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(3),
+            project_digest: project,
+            provider_digest: provider,
+            model_digest: model,
+        };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(3),
+            id16(8),
+            vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 5 }],
+            None,
+            3000,
+        )
+        .await
+        .unwrap();
+        svc.accept_persistent(&scope_persistent, id16(8), 4000)
+            .await
+            .unwrap();
+
+        let before = svc.compile_guidance_for_context(&id16(1), &project, &provider, &model);
+        let before_str = std::str::from_utf8(&before).unwrap();
+        assert!(before_str.contains("two"));
+        assert!(!before_str.contains("five"));
+
+        drop(svc);
+        let restarted =
+            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(RecordingAuditWriter));
+        assert!(
+            restarted
+                .compile_guidance_for_context(&id16(1), &project, &provider, &model)
+                .is_empty()
+        );
+        let loaded = restarted.reload_persistent_rules().await.unwrap();
+        assert_eq!(loaded, 1);
+        let after = restarted.compile_guidance_for_context(&id16(1), &project, &provider, &model);
+        let after_str = std::str::from_utf8(&after).unwrap();
+        assert!(after_str.contains("five"));
+        assert!(!after_str.contains("two"));
+    }
+
+    fn receipt_row(session_id: String, delegation_id: String) -> GuidanceProposalReceiptRow {
+        GuidanceProposalReceiptRow {
+            proposal_id: hex16(&id16(9)),
+            session_id,
+            delegation_id,
+            canonical_project_digest: hex32(&[1u8; 32]),
+            provider_digest: hex32(&[2u8; 32]),
+            model_digest: hex32(&[3u8; 32]),
+            config_generation: 1,
+            rule_kind_bits: 1,
+            created_at_unix_ms: 1000,
+            expires_at_unix_ms: 2000,
+            state: GuidanceProposalReceiptState::Created,
+            accepted_scope: None,
+            transitioned_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn audit_event_from_receipt_keeps_parsed_identities() {
+        let row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        let event =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap();
+        assert_eq!(event.proposal_id, id16(9));
+        assert_eq!(event.session_id, id16(1));
+        assert_eq!(event.delegation_id, id16(2));
+        assert_eq!(event.canonical_project_digest, [1u8; 32]);
+        assert_eq!(event.kind, AuditEventKind::GuidanceProposalExpired);
+        assert_eq!(event.disposition, Some(Disposition::Expired));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_session_id() {
+        let row = receipt_row("s1".into(), hex16(&id16(2)));
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("session id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_delegation_id() {
+        let row = receipt_row(hex16(&id16(1)), "d1".into());
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Expired, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("delegation id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_malformed_proposal_id() {
+        let mut row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        row.proposal_id = "not-hex".into();
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Created, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("proposal id"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_accepted_without_scope() {
+        let row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        let err = GuidanceAuditEvent::try_from_receipt(
+            &row,
+            GuidanceProposalReceiptState::Accepted,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("lacks scope"));
+    }
+
+    #[test]
+    fn audit_event_from_receipt_rejects_out_of_range_generation() {
+        let mut row = receipt_row(hex16(&id16(1)), hex16(&id16(2)));
+        row.config_generation = -1;
+        let err =
+            GuidanceAuditEvent::try_from_receipt(&row, GuidanceProposalReceiptState::Created, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }

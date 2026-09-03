@@ -25,7 +25,10 @@
 //! The confirmed-only form is exactly 110 bytes. The maximum
 //! confirmed-plus-pending form is exactly 626 bytes.
 
-#![allow(dead_code)] // Wired through the daemon coordinator in follow-up prompts.
+#![allow(dead_code)] // Extra event kinds and record digests are consumed as the live loop lands.
+
+mod chain;
+pub use chain::{ComputerAuditChain, GuidanceAppendError, GuidanceAuditAppend};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -1479,6 +1482,8 @@ pub struct AuditVerifyResult {
 
 #[derive(Clone, Debug)]
 pub struct ChainEntry {
+    /// Must equal the sequence encoded in `entry_bytes`; verify fails closed
+    /// on a mismatch.
     pub sequence: u64,
     pub entry_bytes: [u8; ENTRY_LEN],
     pub mac: [u8; 32],
@@ -1496,13 +1501,18 @@ fn corrupt_result(sealed: &ComputerAuditSealedHeadV1, entry_count: u64) -> Audit
 }
 
 /// Verify a chain of entries against a sealed head and a key resolver.
-pub fn verify_chain<F>(
+///
+/// The resolver must not copy HMAC key material into an unzeroized buffer.
+/// Production passes a borrow of the zeroizing key store; tests may return
+/// owned bytes because they are not the machine-local signing key.
+pub fn verify_chain<F, K>(
     sealed_head: Option<&ComputerAuditSealedHeadV1>,
     db_entries: Option<&[ChainEntry]>,
     keys: F,
 ) -> AuditVerifyResult
 where
-    F: Fn(u32) -> Option<Vec<u8>>,
+    F: Fn(u32) -> Option<K>,
+    K: AsRef<[u8]>,
 {
     let sealed = match sealed_head {
         None => {
@@ -1543,6 +1553,9 @@ where
             Ok(d) => d,
             Err(_) => return corrupt_result(sealed, last_valid_seq),
         };
+        if decoded.sequence != entry.sequence {
+            return corrupt_result(sealed, last_valid_seq);
+        }
         if decoded.sequence != prev_seq + 1 {
             return corrupt_result(sealed, last_valid_seq);
         }
@@ -1562,7 +1575,7 @@ where
                 };
             }
         };
-        let computed_mac = entry_mac(&key, &entry.entry_bytes);
+        let computed_mac = entry_mac(key.as_ref(), &entry.entry_bytes);
         if computed_mac != entry.mac {
             return corrupt_result(sealed, last_valid_seq);
         }
@@ -1602,7 +1615,7 @@ where
                 };
             }
         };
-        let computed_pending_mac = entry_mac(&pending_key, &sealed.pending_entry);
+        let computed_pending_mac = entry_mac(pending_key.as_ref(), &sealed.pending_entry);
         if computed_pending_mac != sealed.pending_mac {
             return corrupt_result(sealed, db_confirmed_seq);
         }
@@ -1709,3 +1722,5 @@ const _: () = {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use chain::{AppendFault, AppendObserveFault, TestAuditHarness};

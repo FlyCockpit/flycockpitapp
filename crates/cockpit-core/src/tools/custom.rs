@@ -427,7 +427,12 @@ impl Tool for CustomBashTool {
                 changed_after_build,
             ));
             if attached_knowledge_read {
-                crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &combined);
+                // Layered KB boundary (issue #273): deterministic floor
+                // first, then the utility-model second layer over the
+                // floor-clean KB-derived command output.
+                let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+                crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &combined, &guard)
+                    .await;
             }
             return Ok(out);
         }
@@ -435,7 +440,12 @@ impl Tool for CustomBashTool {
             self.provenance_sidecar(&selected, status.code(), changed_after_build),
         );
         if attached_knowledge_read {
-            crate::knowledge::fence_knowledge_tool_output_if_needed(&mut out, &combined);
+            // Layered KB boundary (issue #273): deterministic floor first,
+            // then the utility-model second layer over the floor-clean
+            // KB-derived command output.
+            let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+            crate::knowledge::fence_knowledge_tool_output_layered(&mut out, &combined, &guard)
+                .await;
         }
         Ok(out)
     }

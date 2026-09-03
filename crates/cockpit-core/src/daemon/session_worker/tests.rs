@@ -3487,7 +3487,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
     assert_eq!(profile.agent_name, "Computer");
     assert_eq!(profile.provider_id, "computer-provider");
     assert_eq!(profile.model_id, "computer-vision");
-    assert_eq!(native.target, crate::computer::DisplayTarget::RealDesktop);
+    assert_eq!(native.target, crate::computer::DisplayTarget::Virtual);
     assert!(native.require_backend);
     assert!(native.approval_required);
     assert!(profile.tool_names.iter().any(|name| name == "read"));

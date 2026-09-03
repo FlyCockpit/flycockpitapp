@@ -343,6 +343,11 @@ assert_cmd = { workspace = true }
 # seam so daemon-level tests can replay the same failures against real SQLite.
 # Dev-only: a normal build never enables it.
 cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
+# `test-support` exposes cockpit-host's audited Windows DACL-apply test seam so
+# this crate's Windows tests can inject broad ACLs and prove the private-verify
+# paths reject them (feature unification applies it only to test builds).
+# Dev-only: a normal build never enables it.
+cockpit-host = { path = "../cockpit-host", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

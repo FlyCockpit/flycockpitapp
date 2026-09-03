@@ -1746,7 +1746,6 @@ fn config_refreshed_is_exhaustively_redacted() {
     ));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn refresh_config_response_is_causally_terminal() {
     assert_worker_delivery_happy("refresh_config").await;
@@ -5556,7 +5555,6 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
     assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable() {
     use cockpit_db::media_attachments::{
@@ -6115,7 +6113,6 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
@@ -7983,6 +7980,48 @@ fn persistent_layered_test_ctx_with_credential_path(
     )
 }
 
+fn production_test_ctx(ephemeral: bool, credential_path: std::path::PathBuf) -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    Arc::new(
+        DaemonContext::new(
+            db,
+            locks,
+            unique_test_paths(ephemeral),
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::production(),
+        )
+        .with_credential_store_path(credential_path),
+    )
+}
+
+async fn set_workspace_trust_mode(
+    ctx: &DaemonContext,
+    path: &Path,
+    mode: crate::db::workspace_trust::WorkspaceTrustMode,
+) {
+    let normalized = path.canonicalize().unwrap().to_string_lossy().into_owned();
+    ctx.db
+        .write(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized,
+                mode,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .await
+        .unwrap();
+}
+
+fn onboard_provider_entry() -> crate::config::providers::ProviderEntry {
+    crate::config::providers::ProviderEntry {
+        url: "https://example.test/v1".to_string(),
+        name: Some("Onboard".to_string()),
+        ..crate::config::providers::ProviderEntry::default()
+    }
+}
+
 /// The daemon-derived MCP save authority a real `GetProviderCatalogSnapshot`
 /// minted: everything a `SaveMcpConfig` request must echo back.
 struct McpEditAuthority {
@@ -8159,11 +8198,10 @@ async fn owner_with_capability_is_allowed_secret_rpcs() {
     .expect("capability-bearing owner may call secret RPCs");
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
@@ -10255,12 +10293,9 @@ async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
     }
 }
 
-/// A catalog snapshot with no provider layer (a fresh install: no config
-/// directory exists anywhere) is still a successful read. No edit capability
-/// is minted — the view's capability/revision pair stays absent and
-/// `layer_id` is empty — but the redacted projection is returned instead of
-/// an error, so read surfaces (settings, `cockpit models`, `cockpit mcp`)
-/// keep working before first configuration.
+/// Stub config sources still omit a write target, so a catalog snapshot is a
+/// successful read without minting an edit capability. Production onboarding
+/// is covered by the tests below.
 #[tokio::test]
 async fn provider_catalog_snapshot_survives_missing_provider_layer() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
@@ -10288,9 +10323,670 @@ async fn provider_catalog_snapshot_survives_missing_provider_layer() {
     else {
         panic!("expected ProviderCatalogSnapshot response");
     };
-    assert_eq!(layer_id, "", "no editable layer may be advertised");
+    assert_eq!(layer_id, "", "stub sources advertise no editable layer");
     assert_eq!(view.mcp_edit_capability, None);
     assert_eq!(view.mcp_revision, None);
+}
+
+struct OnboardingCatalog {
+    snapshot_session_id: String,
+    layer_id: String,
+    base_revision: String,
+    view: cockpit_proto::ProviderConfigView,
+}
+
+async fn fresh_untrusted_workspace() -> (
+    crate::test_env::TestEnvGuard,
+    tempfile::TempDir,
+    Arc<DaemonContext>,
+    MutableClientState,
+    std::path::PathBuf,
+) {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+    )
+    .await;
+    let state = owner_state();
+    (env, tmp, ctx, state, workspace)
+}
+
+async fn take_onboarding_catalog(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    workspace: &Path,
+    snapshot_session_id: &str,
+) -> OnboardingCatalog {
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: snapshot_session_id.to_string(),
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("fresh-install catalog snapshot must succeed");
+    let Response::ProviderCatalogSnapshot {
+        config: view,
+        snapshot_session_id: returned_session,
+        layer_id,
+        base_revision,
+        ..
+    } = response
+    else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    assert_eq!(returned_session, snapshot_session_id);
+    assert!(
+        !layer_id.is_empty(),
+        "user-level config must mint an edit capability"
+    );
+    OnboardingCatalog {
+        snapshot_session_id: snapshot_session_id.to_string(),
+        layer_id,
+        base_revision,
+        view,
+    }
+}
+
+async fn apply_onboarding_mutation(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    catalog: &OnboardingCatalog,
+    client_operation_id: &str,
+    mutation: cockpit_proto::ProviderMutationBatch,
+) -> Response {
+    let mutation_intent_hash = mutation.sanitized_intent_hash().unwrap();
+    handle_request(
+        Request::ApplyProviderMutation {
+            snapshot_session_id: catalog.snapshot_session_id.clone(),
+            layer_id: catalog.layer_id.clone(),
+            expected_revision: catalog.base_revision.clone(),
+            client_operation_id: client_operation_id.into(),
+            mutation_intent_hash,
+            mutation,
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("onboarding provider mutation must commit")
+}
+
+fn global_provider_path(provider_id: &str) -> std::path::PathBuf {
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    crate::config::providers::provider_file_path_for_dir(&global, provider_id).unwrap()
+}
+
+/// Fresh machine, untrusted workspace: catalog snapshot mints an edit
+/// capability against the global layer, and a subsequent save commits there.
+#[tokio::test]
+async fn fresh_untrusted_provider_save_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    assert!(
+        !global.is_dir(),
+        "fresh-install fixture must not pre-create the global layer"
+    );
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-save",
+    )
+    .await;
+    assert!(
+        !global.is_dir(),
+        "catalog snapshot must not create the global layer"
+    );
+    assert!(
+        catalog.view.mcp_edit_capability.is_some(),
+        "MCP global scope must be editable during onboarding"
+    );
+    assert!(
+        catalog.view.mcp_scope_revisions.contains_key("global"),
+        "onboarding snapshot must advertise the global MCP write target"
+    );
+
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+
+    let saved = global_provider_path("onboard");
+    assert!(
+        saved.exists(),
+        "provider save must create the global layer file: {}",
+        saved.display()
+    );
+    assert!(
+        !workspace.join(".cockpit").exists(),
+        "untrusted onboarding must not create a workspace config layer"
+    );
+
+    let reread = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-reread",
+    )
+    .await;
+    assert!(
+        reread.view.providers.contains_key("onboard"),
+        "a second launch must read the saved global provider back"
+    );
+}
+
+/// Provider delete during onboarding removes the global-layer file, not a
+/// workspace overlay.
+#[tokio::test]
+async fn fresh_untrusted_provider_delete_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-delete-save",
+    )
+    .await;
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-delete-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+    assert!(global_provider_path("onboard").exists());
+
+    let catalog = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "fresh-untrusted-provider-delete",
+    )
+    .await;
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "fresh-untrusted-provider-delete",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: Vec::new(),
+            deletes: vec![cockpit_proto::ProviderMutationDelete {
+                provider_id: "onboard".into(),
+                delete_stored_secrets: false,
+            }],
+            metadata: None,
+        },
+    )
+    .await;
+    assert!(
+        !global_provider_path("onboard").exists(),
+        "provider delete must remove the global layer file"
+    );
+    assert!(!workspace.join(".cockpit").exists());
+}
+
+/// A pre-existing ephemeral daemon serving onboarding must fail closed with
+/// an actionable error — never a capability-less snapshot.
+#[tokio::test]
+async fn ephemeral_daemon_onboarding_fails_closed_when_global_layer_is_missing() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+    )
+    .await;
+    let mut state = owner_state();
+    let error = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: "ephemeral-onboarding".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("ephemeral onboarding must fail closed");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
+        "error must tell the user to start a persistent daemon: {}",
+        error.message
+    );
+    assert!(
+        !cockpit_config::config::dirs::global_config_dir()
+            .unwrap()
+            .is_dir(),
+        "ephemeral onboarding must not create the global config directory"
+    );
+}
+
+/// Durable journal replay of a first-write into the missing global layer
+/// must fail closed on an ephemeral daemon and create nothing.
+#[tokio::test]
+async fn ephemeral_provider_journal_replay_does_not_create_the_global_config_dir() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    let target = crate::config::providers::provider_file_path_for_dir(&global, "onboard").unwrap();
+    let consumed = provider_layer_revision_for_test(
+        &ctx,
+        &target,
+        &crate::config::providers::ProvidersConfig::default(),
+    );
+    let mut intended_layer = crate::config::providers::ProvidersConfig::default();
+    intended_layer.providers.insert(
+        "onboard".into(),
+        crate::config::providers::ProviderEntry {
+            url: "https://onboard.example.test/v1".into(),
+            ..Default::default()
+        },
+    );
+    let intended = provider_layer_revision_for_test(&ctx, &target, &intended_layer);
+    let root = workspace.to_string_lossy().into_owned();
+    let journal_id = Uuid::now_v7().to_string();
+    let entry_json =
+        serde_json::to_string(intended_layer.providers.get("onboard").unwrap()).unwrap();
+    {
+        let journal_id = journal_id.clone();
+        let root_owned = root.clone();
+        let config_path = target.to_string_lossy().into_owned();
+        let consumed = consumed.clone();
+        let intended = intended.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO provider_config_journals
+                     (journal_id, project_root, provider_id, action, config_path,
+                      consumed_revision, intended_revision, consumed_config_generation,
+                      intended_config_generation, entry_json,
+                      cleanup_named_json, cleanup_credential_json, created_at)
+                     VALUES (?1, ?2, 'onboard', 'save', ?3,
+                             ?4, ?5, 1, 2, ?6, '[]', '[]', ?7)",
+                    rusqlite::params![
+                        journal_id,
+                        root_owned,
+                        config_path,
+                        consumed,
+                        intended,
+                        entry_json,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    let error = recover_provider_config_journals(&ctx, &root, Some("onboard"))
+        .await
+        .expect_err("ephemeral journal replay must fail closed");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
+        "error must tell the user to start a persistent daemon: {}",
+        error.message
+    );
+    assert!(
+        !global.is_dir(),
+        "ephemeral journal replay must not create the global config directory"
+    );
+}
+
+/// Engine/tool-side `config.json` writers share the mkdir primitive that
+/// cannot create a missing global layer.
+#[test]
+fn engine_global_config_write_does_not_create_the_global_config_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let global = cockpit_config::config::dirs::global_config_dir().unwrap();
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    assert!(
+        !global.is_dir(),
+        "fresh-install fixture must not pre-create the global layer"
+    );
+    let mut doc = crate::config::extended::ExtendedConfigDoc::load(&path).unwrap();
+    let cfg = doc.config();
+    let error = doc.write(&cfg).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+        "engine-style global writes must fail closed: {error:#}"
+    );
+    assert!(
+        !global.is_dir(),
+        "engine/tool writers must not create the global config directory"
+    );
+}
+
+/// MCP add with explicit global scope during onboarding writes mcp.json in
+/// the global layer.
+#[tokio::test]
+async fn fresh_untrusted_mcp_global_add_commits_to_the_global_layer() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let root = workspace.to_string_lossy().into_owned();
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "fresh-untrusted-mcp-global").await;
+    let config = serde_json::json!({
+        "servers": {"onboard-global": {
+            "transport": "streamable",
+            "endpoint": "https://mcp.example.test"
+        }}
+    });
+    let patch = mcp_patch(&config);
+    let mutation_intent_hash =
+        cockpit_proto::mcp_mutation_intent_hash_for_scope(&root, &patch, Some("global"));
+    handle_request(
+        Request::SaveMcpConfig {
+            client_operation_id: "fresh-untrusted-mcp-global".into(),
+            project_root: root,
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
+            mutation_intent_hash,
+            patch,
+            secret_values_json: "{}".into(),
+            target_scope: Some("global".into()),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("onboarding MCP global add must succeed");
+
+    let mcp_path = cockpit_config::config::dirs::global_config_dir()
+        .unwrap()
+        .join(cockpit_config::config::dirs::MCP_FILE);
+    let wire = std::fs::read_to_string(&mcp_path).unwrap();
+    assert!(
+        wire.contains("onboard-global"),
+        "MCP add must persist to the global layer: {wire}"
+    );
+    assert!(
+        !workspace.join(".cockpit").exists(),
+        "untrusted MCP add must not create a workspace config layer"
+    );
+}
+
+/// User-level onboarding writes share one trust-resolution funnel and one
+/// ephemeral-create-global gate. Workspace-bound config mutations must not
+/// join that funnel.
+#[test]
+fn user_level_config_writes_share_trust_and_ephemeral_funnels() {
+    let source = include_str!("dispatch.rs");
+    assert!(
+        source.contains("async fn resolve_user_level_trust_policy("),
+        "user-level trust must be a shared helper, not a per-arm match"
+    );
+
+    let save_mcp = source
+        .split("async fn save_mcp_config(")
+        .last()
+        .expect("MCP save owner")
+        .split("async fn publish_mcp_journal_generation(")
+        .next()
+        .expect("MCP save body");
+    assert!(
+        save_mcp.contains("resolve_user_level_trust_policy"),
+        "SaveMcpConfig must use the user-level trust fallback"
+    );
+    assert!(
+        save_mcp.contains("prepare_user_level_write_target"),
+        "SaveMcpConfig must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !save_mcp.contains("resolve_workspace_trust_policy_from_db"),
+        "SaveMcpConfig must not resolve workspace trust independently"
+    );
+
+    let provider_save = source
+        .split("async fn provider_config_save_under_lock(")
+        .last()
+        .and_then(|tail| tail.split("async fn save_mcp_config(").next())
+        .expect("provider save body");
+    assert!(
+        provider_save.contains("prepare_user_level_write_target"),
+        "direct provider save must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !provider_save.contains("resolve_workspace_trust_policy_from_db"),
+        "direct provider save must reuse daemon_provider_config's user-level policy"
+    );
+
+    let persist_provider = source
+        .split("fn persist_daemon_provider(")
+        .last()
+        .and_then(|tail| tail.split("async fn provider_config_delete(").next())
+        .expect("persist_daemon_provider body");
+    assert!(
+        persist_provider.contains("prepare_user_level_write_target"),
+        "model-fetch persistence must refuse ephemeral creation of the global layer"
+    );
+
+    let persist_meta = source
+        .split("fn persist_provider_layer_metadata(")
+        .last()
+        .and_then(|tail| {
+            tail.split("pub(super) async fn attached_trust_policy(")
+                .next()
+        })
+        .expect("persist_provider_layer_metadata body");
+    assert!(
+        persist_meta.contains("prepare_user_level_write_target"),
+        "provider metadata persistence must refuse ephemeral creation of the global layer"
+    );
+
+    let begin_mcp = source
+        .split("Request::BeginMcpOAuth {")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::CompleteMcpOAuth {").next())
+        .expect("BeginMcpOAuth arm");
+    assert!(
+        begin_mcp.contains("resolve_user_level_trust_policy"),
+        "MCP OAuth begin must use the user-level trust fallback"
+    );
+
+    assert!(
+        source.contains("fn prepare_user_level_write_target("),
+        "authorized writes must share one create-after-gate helper"
+    );
+    assert!(
+        source.contains("fn prepare_user_level_journal_target("),
+        "journal replay must share the ephemeral-create-global gate"
+    );
+    assert!(
+        !source.contains("ensure_parent_dir_private"),
+        "daemon config writers must not mkdir through the generic host helper"
+    );
+
+    let snapshot = source
+        .split("async fn provider_catalog_snapshot(")
+        .nth(1)
+        .and_then(|tail| tail.split("fn provider_config_revision(").next())
+        .expect("provider catalog snapshot body");
+    assert!(
+        snapshot.contains("canonical_user_level_write_target"),
+        "catalog reads must refuse ephemeral creation of the global layer"
+    );
+    assert!(
+        !snapshot.contains("prepare_user_level_write_target"),
+        "catalog reads must not create the global layer"
+    );
+
+    let recover_provider = source
+        .split("async fn recover_provider_journal_file_bounded(")
+        .last()
+        .and_then(|tail| {
+            tail.split("fn settle_journaled_local_success_on_conn(")
+                .next()
+        })
+        .expect("provider journal recovery body");
+    assert!(
+        recover_provider.contains("prepare_user_level_journal_target"),
+        "provider journal replay must refuse ephemeral creation of the global layer"
+    );
+
+    let recover_mcp = source
+        .split("async fn recover_mcp_config_journals_inner(")
+        .last()
+        .and_then(|tail| tail.split("fn reconcile_mcp_journal_file(").next())
+        .expect("MCP journal recovery body");
+    assert!(
+        recover_mcp.contains("prepare_user_level_journal_target"),
+        "MCP journal replay must refuse ephemeral creation of the global layer"
+    );
+
+    let write_mcp = source
+        .split("fn write_mcp_raw_private(")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn provider_models_fetch(").next())
+        .expect("MCP raw writer");
+    assert!(
+        write_mcp.contains("ensure_config_parent_dir"),
+        "MCP file writes must use the config-layer mkdir that cannot create a missing global dir"
+    );
+}
+
+/// A trusted workspace that already defines a provider keeps writing that
+/// workspace layer (scope preservation).
+#[tokio::test]
+async fn trusted_workspace_provider_definition_is_preserved_on_save() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let cockpit_dir = workspace.join(".cockpit");
+    std::fs::create_dir_all(cockpit_dir.join("providers")).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let workspace_provider =
+        crate::config::providers::provider_file_path_for_dir(&cockpit_dir, "existing").unwrap();
+    std::fs::write(
+        &workspace_provider,
+        r#"{"url":"https://example.test/v1","name":"Workspace"}"#,
+    )
+    .unwrap();
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await;
+    let mut state = owner_state();
+    let catalog =
+        take_onboarding_catalog(&ctx, &mut state, &workspace, "trusted-workspace-scope").await;
+    let mut entry = onboard_provider_entry();
+    entry.name = Some("Workspace Updated".into());
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "trusted-workspace-scope",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "existing".into(),
+                entry,
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+
+    let workspace_wire = std::fs::read_to_string(&workspace_provider).unwrap();
+    assert!(
+        workspace_wire.contains("Workspace Updated"),
+        "trusted workspace definition must be updated in place: {workspace_wire}"
+    );
+    assert!(
+        !global_provider_path("existing").exists(),
+        "trusted workspace save must not copy the provider into the global layer"
+    );
+}
+
+/// `GetDoctorSnapshot` is a diagnostic read: it creates no global config
+/// directory.
+#[tokio::test]
+async fn doctor_snapshot_does_not_create_the_global_config_dir() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let ctx = production_test_ctx(true, tmp.path().join("credentials.json"));
+    let mut state = owner_state();
+    handle_request(
+        Request::GetDoctorSnapshot {
+            project_root: Some(workspace.to_string_lossy().into_owned()),
+            no_sandbox: true,
+            offline: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("doctor snapshot is a read");
+    assert!(
+        !cockpit_config::config::dirs::global_config_dir()
+            .unwrap()
+            .is_dir(),
+        "cockpit doctor must not create the global config directory"
+    );
+}
+
+#[test]
+fn doctor_snapshot_handler_does_not_ensure_the_global_config_dir() {
+    let source = include_str!("dispatch.rs");
+    let body = source
+        .split("async fn get_doctor_snapshot_response(")
+        .nth(1)
+        .and_then(|tail| tail.split("\nasync fn ").next())
+        .expect("doctor snapshot handler");
+    assert!(
+        !body.contains("ensure_global_config_dir"),
+        "doctor must not create the global config layer"
+    );
 }
 
 // `#[tokio::test]`: `persistent_test_ctx` spawns the daemon scheduler loop,
@@ -12072,6 +12768,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     .to_string();
     assert!(!incoming.contains("openai-main"));
     let saved = crate::daemon::fs_api::save_extended_config(
+        &ctx,
         project_root.clone(),
         ".cockpit/config.json".into(),
         incoming,
@@ -12970,6 +13667,10 @@ fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded()
             < bounded_lock.find("file.try_lock()").unwrap(),
         "an expired recovery deadline must be checked before lock acquisition",
     );
+    assert!(
+        !bounded_lock.contains("ensure_config_parent_dir"),
+        "bounded publication lock must not create the target parent"
+    );
 
     let vault = include_str!("../../secure_key/vault.rs");
     let delete = vault
@@ -13047,18 +13748,56 @@ fn oauth_stored_token_debug_and_drop_are_secret_safe() {
 #[test]
 fn authority_recovery_precedes_both_socket_binds() {
     let daemon = include_str!("../mod.rs");
-    let recovery = daemon
+    let boot_attr_end = daemon
+        .find("async fn run_foreground_inner_with_boot_db")
+        .expect("foreground boot must exist");
+    let boot_attr = daemon[boot_attr_end.saturating_sub(80)..boot_attr_end].trim();
+    assert!(
+        boot_attr.contains("#[cfg(any(unix, windows))]"),
+        "foreground boot must compile on Windows; found {boot_attr:?}"
+    );
+    let boot = daemon[boot_attr_end..]
+        .split("#[cfg(not(any(unix, windows)))]")
+        .next()
+        .expect("foreground boot body");
+    let recovery = boot
         .find("server::recover_before_socket_publish(&ctx).await?")
         .expect("foreground boot must await authority recovery");
-    let control_bind = daemon[recovery..]
+    let nearest_cfg = boot[..recovery]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("#[cfg("));
+    assert!(
+        nearest_cfg.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
+        "recovery call must not be unix-only inside windows-compiled boot; found {nearest_cfg:?}"
+    );
+    let control_bind = boot[recovery..]
         .find("bind_private_socket(&paths.socket)")
         .expect("control socket bind must follow recovery");
-    let reveal_bind = daemon[recovery..]
+    let reveal_bind = boot[recovery..]
         .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
         .expect("reveal socket bind must follow recovery");
     assert!(control_bind < reveal_bind);
 
     let server = include_str!("mod.rs");
+    let recover_prefix = server
+        .split("async fn run_boot_housekeeping")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn recover_before_socket_publish")
+                .next()
+        })
+        .expect("attrs between boot housekeeping and recovery");
+    let recover_attr = recover_prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#[cfg("))
+        .last();
+    assert!(
+        recover_attr.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
+        "recover_before_socket_publish is transport-neutral publication-barrier work and must compile on Windows; found {recover_attr:?}"
+    );
     let recovery_body = server
         .split("pub async fn recover_before_socket_publish")
         .nth(1)
@@ -18392,7 +19131,20 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     ]
 }
 
-#[cfg(unix)]
+fn test_stream_pair() -> (
+    impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+) {
+    #[cfg(unix)]
+    {
+        UnixStream::pair().expect("socket pair")
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES)
+    }
+}
+
 async fn dispatch_matrix_request(
     ctx: &Arc<DaemonContext>,
     request: Request,
@@ -18400,7 +19152,6 @@ async fn dispatch_matrix_request(
     dispatch_matrix_request_after(ctx, Vec::new(), request).await
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_request_after(
     ctx: &Arc<DaemonContext>,
     prelude: Vec<Request>,
@@ -18435,7 +19186,6 @@ async fn dispatch_matrix_request_after(
     result
 }
 
-#[cfg(unix)]
 async fn dispatch_authz_request_after(
     ctx: &Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -18444,7 +19194,7 @@ async fn dispatch_authz_request_after(
     worker_rx_to_drop_after_prelude: Option<tokio::sync::mpsc::Receiver<SessionWork>>,
     request: Request,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     // Owner matrix cells keep the capability so they exercise the 284-row
     // table rather than the pre-launch capability fence. Remote principals
@@ -18509,7 +19259,10 @@ async fn dispatch_authz_request_after(
                 assert!(
                     text.contains("Connection reset by peer")
                         || text.contains("Connection reset")
-                        || text.contains("ended unexpectedly"),
+                        || text.contains("ended unexpectedly")
+                        || text.contains("broken pipe")
+                        || text.contains("Broken pipe")
+                        || text.contains("early eof"),
                     "server task succeeds: {text}"
                 );
             }
@@ -18519,7 +19272,6 @@ async fn dispatch_authz_request_after(
     result
 }
 
-#[cfg(unix)]
 async fn recv_dispatch_matrix_response_or_server<S>(
     client: &mut ProtoStream<S>,
     request_id: Uuid,
@@ -18542,7 +19294,6 @@ where
     }
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_request_after_collect_events(
     ctx: &Arc<DaemonContext>,
     prelude: Vec<Request>,
@@ -18551,7 +19302,7 @@ async fn dispatch_matrix_request_after_collect_events(
     std::result::Result<Response, ErrorPayload>,
     Vec<proto::Event>,
 ) {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -18622,7 +19373,10 @@ async fn dispatch_matrix_request_after_collect_events(
             assert!(
                 text.contains("Connection reset by peer")
                     || text.contains("Connection reset")
-                    || text.contains("ended unexpectedly"),
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
                 "server task succeeds: {text}"
             );
         }
@@ -18631,13 +19385,12 @@ async fn dispatch_matrix_request_after_collect_events(
     (result, events)
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_raw_line(
     ctx: &Arc<DaemonContext>,
     request_id: Uuid,
     line: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -18653,14 +19406,25 @@ async fn dispatch_matrix_raw_line(
         .expect("send raw dispatch request");
     let result = recv_dispatch_matrix_response(&mut client, request_id).await;
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("Connection reset by peer")
+                    || text.contains("Connection reset")
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
+                "server task succeeds: {text}"
+            );
+        }
+        Err(error) => panic!("server task joins: {error}"),
+    }
     result
 }
 
-#[cfg(unix)]
 async fn recv_dispatch_matrix_response<S>(
     proto: &mut ProtoStream<S>,
     request_id: Uuid,
@@ -18786,7 +19550,6 @@ async fn dispatch_matrix_readonly_coverage_is_complete() {
     assert_dispatch_matrix_coverage_complete();
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_matrix_readonly_cases_traverse_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18798,7 +19561,6 @@ async fn dispatch_matrix_readonly_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18810,7 +19572,7 @@ async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     assert_dispatch_matrix_coverage_complete();
@@ -18840,7 +19602,6 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
 // through the same socket transport and central authorization path. The
 // readonly/mutating matrix tests above retain the corresponding malformed and
 // invalid-state traversal for every dispatchable command.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18893,7 +19654,7 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 struct AuthzSocketScenario {
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -18905,7 +19666,7 @@ struct AuthzSocketScenario {
     _tmp: tempfile::TempDir,
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 fn assert_authz_matrix_result(
     case: &AuthzDispatchCase,
     level: AuthzLevel,
@@ -18936,7 +19697,6 @@ fn assert_authz_matrix_result(
     }
 }
 
-#[cfg(unix)]
 fn assert_authz_allowed_outcome(
     kind: &str,
     level: AuthzLevel,
@@ -18965,7 +19725,7 @@ fn assert_authz_allowed_outcome(
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
     let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level).await;
     let result = dispatch_authz_request_after(
@@ -19011,7 +19771,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -19070,7 +19830,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn authz_cross_session_paused_work_scenario(
     kind: &'static str,
     level: AuthzLevel,
@@ -19128,7 +19888,7 @@ async fn authz_cross_session_paused_work_scenario(
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) -> ClientPrincipal {
     let project_root = project_root.to_string_lossy().into_owned();
     match level {
@@ -19199,7 +19959,6 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
     }
 }
 
-#[cfg(unix)]
 fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
     matches!(
         kind,
@@ -19279,7 +20038,6 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             && level.can_write())
 }
 
-#[cfg(unix)]
 fn authz_media_mutation_request(kind: &str) -> Request {
     use cockpit_db::media_attachments::{
         AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
@@ -19355,13 +20113,11 @@ fn authz_media_mutation_request(kind: &str) -> Request {
     }
 }
 
-#[cfg(unix)]
 fn authz_opaque_id() -> proto::OpaqueAsciiId128V1 {
     proto::OpaqueAsciiId128V1::new(Uuid::now_v7().to_string())
         .expect("generated authz matrix id is valid opaque ASCII")
 }
 
-#[cfg(unix)]
 fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
     proto::AcpForwardedMcpIngressV1 {
         version: proto::ACP_FORWARDED_MCP_VERSION_V1,
@@ -19371,7 +20127,6 @@ fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
     }
 }
 
-#[cfg(unix)]
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
@@ -20777,7 +21532,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
     }
 }
 
-#[cfg(unix)]
 impl ReadonlyDispatchCaseKind {
     async fn assert_happy_socket_case(self) {
         match self {
@@ -21668,7 +22422,6 @@ impl ReadonlyDispatchCaseKind {
     }
 }
 
-#[cfg(unix)]
 async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
     match case.effect_class {
         DispatchEffectClass::Durable
@@ -21941,7 +22694,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
     match case.kind {
         "attach" => {
@@ -22262,7 +23014,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
     }
 }
 
-#[cfg(unix)]
 async fn live_worker_with_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
@@ -22335,7 +23086,6 @@ async fn live_worker_with_receiver(
     (row.session_id, work_rx)
 }
 
-#[cfg(unix)]
 async fn dispatch_attached_worker_request(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
@@ -22344,7 +23094,7 @@ async fn dispatch_attached_worker_request(
     request: Request,
     observe: impl FnOnce(SessionWork),
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -22412,7 +23162,10 @@ async fn dispatch_attached_worker_request(
             assert!(
                 text.contains("Connection reset by peer")
                     || text.contains("Connection reset")
-                    || text.contains("ended unexpectedly"),
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
                 "server task succeeds: {text}"
             );
         }
@@ -22421,7 +23174,6 @@ async fn dispatch_attached_worker_request(
     result
 }
 
-#[cfg(unix)]
 fn proto_queue_item(text: &str) -> proto::QueueItem {
     proto::QueueItem {
         id: Uuid::new_v4(),
@@ -22434,7 +23186,6 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
     }
 }
 
-#[cfg(unix)]
 async fn assert_worker_delivery_happy(kind: &str) {
     let state_root = tempfile::tempdir().unwrap();
     let ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
@@ -22976,7 +23727,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn send_user_message_propagates_exact_pre_acceptance_failure() {
     let ctx = test_ctx();
@@ -23036,7 +23786,6 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
     assert_eq!(error.message, "resume repair is required");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn remove_queued_message_propagates_terminal_receipt_failure() {
     let ctx = test_ctx();
@@ -23075,25 +23824,21 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
     assert_eq!(error.message, "queued payload was restored; retry removal");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_preflight_returns_preflight_state() {
     assert_worker_delivery_happy("set_preflight").await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_redaction_returns_redaction_state() {
     assert_worker_delivery_happy("set_redaction").await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_longcache_returns_longcache_state() {
     assert_worker_delivery_happy("set_longcache").await;
 }
 
-#[cfg(unix)]
 async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -23240,7 +23985,6 @@ async fn assert_attached_required_malformed(kind: &str) {
     assert_eq!(err.code, ErrorCode::NotAttached);
 }
 
-#[cfg(unix)]
 async fn assert_steer_delegation_malformed() {
     let ctx = test_ctx();
     let response = dispatch_matrix_request(
@@ -23260,7 +24004,6 @@ async fn assert_steer_delegation_malformed() {
     assert_eq!(result.status, proto::DelegationSteerStatus::NotSteerable);
 }
 
-#[cfg(unix)]
 async fn assert_fs_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23293,7 +24036,6 @@ async fn assert_fs_mutating_malformed(kind: &str) {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
-#[cfg(unix)]
 async fn assert_attachment_mutating_happy(kind: &str) {
     let mut ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23313,7 +24055,7 @@ async fn assert_attachment_mutating_happy(kind: &str) {
     let png = sample_png();
     let sha = sha256_hex(&png);
     let data = base64::engine::general_purpose::STANDARD.encode(&png);
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -23442,7 +24184,6 @@ async fn assert_attachment_mutating_happy(kind: &str) {
         .expect("server task succeeds");
 }
 
-#[cfg(unix)]
 async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -23494,7 +24235,6 @@ async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_assistant_inbox_human_read_happy() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -23513,7 +24253,6 @@ async fn assert_assistant_inbox_human_read_happy() {
     assert!(matches!(response, Response::Ack));
 }
 
-#[cfg(unix)]
 async fn assert_attachment_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23575,7 +24314,6 @@ async fn assert_attachment_mutating_malformed(kind: &str) {
 /// drives the production `handle_request` dispatch path exactly as the
 /// `media_upload_production_dispatch_cancel_finalize_and_status` reference test
 /// does, so the coverage cases exercise the real durable media flow.
-#[cfg(unix)]
 struct MediaUploadHarness {
     ctx: Arc<DaemonContext>,
     state: MutableClientState,
@@ -23588,7 +24326,6 @@ struct MediaUploadHarness {
     _media_tmp: tempfile::TempDir,
 }
 
-#[cfg(unix)]
 async fn media_upload_harness() -> MediaUploadHarness {
     use sha2::{Digest as _, Sha256};
     let tmp = tempfile::tempdir().unwrap();
@@ -23634,7 +24371,6 @@ async fn media_upload_harness() -> MediaUploadHarness {
     }
 }
 
-#[cfg(unix)]
 impl MediaUploadHarness {
     async fn begin(&mut self, draft: Uuid) -> (Uuid, u64) {
         use cockpit_db::media_attachments::{
@@ -23877,7 +24613,6 @@ impl MediaUploadHarness {
 
 /// A fully materialized durable media attachment plus the handles needed to
 /// exercise every media read command against it.
-#[cfg(unix)]
 struct MaterializedMedia {
     harness: MediaUploadHarness,
     draft: Uuid,
@@ -23890,7 +24625,6 @@ struct MaterializedMedia {
     preview: cockpit_db::media_attachments::MediaAttachmentPreviewSummaryV1,
 }
 
-#[cfg(unix)]
 async fn fully_materialize_media() -> MaterializedMedia {
     use cockpit_db::media_attachments::{MediaAttachmentStatusDetailV1, MediaUploadStateDetailV1};
     let mut harness = media_upload_harness().await;
@@ -23942,7 +24676,6 @@ async fn fully_materialize_media() -> MaterializedMedia {
     }
 }
 
-#[cfg(unix)]
 fn media_read_request(kind: ReadonlyDispatchCaseKind) -> Request {
     use cockpit_db::media_attachments::{
         GetMediaAttachmentPreviewV1, GetMediaAttachmentStatusV1, GetMediaUploadStatusV1,
@@ -23985,7 +24718,6 @@ fn media_read_request(kind: ReadonlyDispatchCaseKind) -> Request {
     }
 }
 
-#[cfg(unix)]
 async fn assert_media_mutating_happy(kind: &str) {
     match kind {
         "begin_media_upload" => {
@@ -24053,7 +24785,6 @@ async fn assert_media_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_media_mutating_malformed(kind: &str) {
     // Each media mutation calls `require_attached` up front; a detached socket
     // connection therefore reaches the handler and is rejected with a typed
@@ -24138,7 +24869,6 @@ async fn assert_media_mutating_malformed(kind: &str) {
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn open_terminal_on_socket(
     ctx: &Arc<DaemonContext>,
     cwd: Option<String>,
@@ -24164,7 +24894,6 @@ async fn open_terminal_on_socket(
     (terminal_id, binding)
 }
 
-#[cfg(unix)]
 async fn assert_terminal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     match kind {
@@ -24182,7 +24911,7 @@ async fn assert_terminal_mutating_happy(kind: &str) {
         "close_terminal" => {
             // Open and close on the same connection so the dispatch layer
             // has the binding in terminal_views.
-            let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+            let (server_stream, client_stream) = test_stream_pair();
             let mut client = ProtoStream::new(client_stream);
             let server = tokio::spawn(handle_client_transport_as(
                 server_stream,
@@ -24235,7 +24964,6 @@ async fn assert_terminal_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_terminal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -24258,11 +24986,10 @@ async fn assert_terminal_mutating_malformed(kind: &str) {
     ));
 }
 
-#[cfg(unix)]
 async fn assert_terminal_ingress_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
@@ -24401,7 +25128,6 @@ async fn assert_terminal_ingress_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -24459,7 +25185,6 @@ async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
     let _ = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id }).await;
 }
 
-#[cfg(unix)]
 fn sha256_hex_terminal(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(bytes);
@@ -24470,7 +25195,6 @@ fn sha256_hex_terminal(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(unix)]
 async fn assert_paused_work_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24510,7 +25234,6 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_goal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24569,7 +25292,6 @@ async fn assert_goal_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_goal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24642,7 +25364,6 @@ async fn create_test_assistant(
     .expect("create assistant")
 }
 
-#[cfg(unix)]
 async fn assert_create_assistant_session_happy() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
@@ -24689,7 +25410,6 @@ async fn assert_create_assistant_session_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24758,7 +25478,6 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -24797,7 +25516,6 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
     let _ = dispatch_matrix_request(&ctx, request).await;
 }
 
-#[cfg(unix)]
 async fn assert_auto_title_mutating_happy() {
     let project = tempfile::tempdir().unwrap();
     let url = auto_title_model_server(Some("Matrix Title".to_string())).await;
@@ -24838,7 +25556,6 @@ async fn assert_auto_title_mutating_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_auto_title_mutating_malformed() {
     let project = tempfile::tempdir().unwrap();
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
@@ -24876,7 +25593,6 @@ async fn assert_auto_title_mutating_malformed() {
     assert!(!row.user_renamed);
 }
 
-#[cfg(unix)]
 fn minimal_import_archive_base64() -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
@@ -24970,7 +25686,6 @@ fn archive_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
 }
 
 /// A staged chunk is retained and acknowledged with its next index.
-#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_happy() {
     let ctx = test_ctx();
     let body = b"bulk-transfer-chunk-body".to_vec();
@@ -25012,7 +25727,6 @@ async fn assert_write_bulk_transfer_chunk_happy() {
 }
 
 /// A chunk whose body is not valid base64 is refused.
-#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(
@@ -25028,7 +25742,6 @@ async fn assert_write_bulk_transfer_chunk_malformed() {
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn assert_import_session_archive_happy() {
     let ctx = test_ctx();
     let (session_id, archive_base64) = minimal_import_archive_base64();
@@ -25054,7 +25767,6 @@ async fn assert_import_session_archive_happy() {
     assert!(ctx.db.get_session(imported).await.unwrap().is_some());
 }
 
-#[cfg(unix)]
 async fn assert_import_session_archive_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(
@@ -25069,7 +25781,6 @@ async fn assert_import_session_archive_malformed() {
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn assert_curator_mutating_happy() {
     let project = tempfile::tempdir().unwrap();
     let skill_root = project.path().join(".agents").join("skills");
@@ -25109,7 +25820,6 @@ async fn assert_curator_mutating_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_session_db_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25344,7 +26054,6 @@ async fn assert_session_db_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_session_db_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -25417,7 +26126,6 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_promote_resource_happy() {
     let ctx = persistent_test_ctx();
     let scheduler = ctx
@@ -25453,7 +26161,6 @@ async fn assert_promote_resource_happy() {
     assert_eq!(status, proto::ResourcePromoteStatus::Promoted);
 }
 
-#[cfg(unix)]
 async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25469,7 +26176,6 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25525,7 +26231,6 @@ async fn assert_scheduler_dispatch_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
     match kind {
         "set_approval_mode" => {
@@ -25891,7 +26596,6 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
@@ -25991,7 +26695,6 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
 /// through the real dispatch path receives the `ConfigSnapshot` event
 /// without a separate request — the attach flow broadcasts it and the
 /// event traverses the socket to the client.
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_attach_delivers_config_snapshot_event() {
     let project = tempfile::tempdir().unwrap();
@@ -26047,7 +26750,6 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
 /// over a malformed layer, a dispatched client still holds the last good
 /// snapshot (no new `ConfigSnapshot` event) and receives a terminal error. Driven
 /// through the real `RefreshConfig` dispatch path.
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26122,14 +26824,12 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     );
 }
 
-#[cfg(unix)]
 fn git_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     run_git(tmp.path(), &["init"]);
     tmp
 }
 
-#[cfg(unix)]
 fn run_git(cwd: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)
@@ -31200,7 +31900,6 @@ async fn set_model_favorite_idempotent_rejects_external_durable_drift() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_model_favorite_idempotent_rejects_replaced_workspace_authority() {
     let home = tempfile::tempdir().unwrap();
@@ -36809,12 +37508,17 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
     assert_eq!(active.generation, 0, "attach starts a new client epoch");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_answers_too_new_request_with_protocol_version_error() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.
@@ -36875,7 +37579,6 @@ async fn client_transport_only_accepts_clean_reader_exit() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_helper_reports_server_failure_before_client_eof() {
     let (_server_stream, client_stream) = tokio::io::duplex(64);
@@ -36921,12 +37624,17 @@ async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit()
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_responses_use_negotiated_client_protocol_version() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client =
         ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
 
@@ -36966,12 +37674,17 @@ async fn server_responses_use_negotiated_client_protocol_version() {
     server.await.unwrap().unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.
@@ -37028,12 +37741,17 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
     server.await.unwrap().unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_event_is_dropped_and_connection_survives() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.

@@ -102,6 +102,9 @@ pub struct RetentionOutcome {
     pub terminal_evidence_rows_deleted: u64,
     pub goal_tombstones_purged: u64,
     pub local_authority_rows_purged: u64,
+    /// Verification envelopes transitioned to `retention_state = 'cleaned'`;
+    /// their rows survive digest-only, so they are not deletions.
+    pub verification_envelopes_cleaned: u64,
     pub vacuumed: bool,
 }
 
@@ -397,13 +400,21 @@ impl Db {
                 .await?;
         }
 
-        // Verification ledger envelopes currently have no GC path
-        // (`retention_state` never becomes `cleaned`). This hook is wired to
-        // the existing retention tick so a later media-retention-style sweep
-        // can mark cleaned envelopes without a new scheduler.
-        // TODO(media-retention): implement verification envelope cleaning
-        // (digest-only rows, same window as terminal evidence).
-        let _ = self.sweep_verification_retention_stub().await?;
+        // Verification envelopes carry the one payload-heavy verification row
+        // family. On the same window as terminal evidence they transition to
+        // `retention_state = 'cleaned'`: the row survives digest-only and its
+        // bounded model-visible payload is dropped. The sweep applies the
+        // same whole-session pin hold as the payload windows above, so a
+        // pinned session's envelopes keep their payload. Zero means
+        // unlimited.
+        if terminal_evidence_cutoff > 0 {
+            outcome.verification_envelopes_cleaned = self
+                .sweep_verification_retention(
+                    terminal_evidence_cutoff.saturating_mul(1000),
+                    now_secs.saturating_mul(1000),
+                )
+                .await?;
+        }
 
         let deleted = outcome
             .session_cascade_rows_deleted
@@ -802,6 +813,86 @@ mod tests {
                 |row| row.get(0),
             )
             .context("counting payload rows")
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Seeds one terminal-owned, retained verification envelope with
+    /// `created_at_unix_ms = ts_ms`, mirroring the durable writer shape
+    /// (`reserve_verification_dispatch` INSERT plus terminal settlement).
+    /// The verification clean window is a payload window like the four
+    /// DELETE windows, so the pass-level pin invariant test needs one.
+    async fn insert_retained_envelope(db: &Db, session_id: Uuid, ts_ms: i64) -> Uuid {
+        let agent_instance_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let envelope_id = Uuid::new_v4();
+        let projection_id = Uuid::new_v4();
+        let digest64 = "1".repeat(64);
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_instances (
+                    agent_instance_id, session_id, state, revision,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, 'completed', 0, ?3, ?3)",
+                params![agent_instance_id.to_string(), session_id.to_string(), ts_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO verification_operations (
+                    operation_id, session_id, agent_instance_id,
+                    requested_candidate_count, effective_candidate_count,
+                    total_token_ceiling, estimated_cost_ceiling_microunits,
+                    cost_unit, collection_deadline_unix_ms, collection_duration_ms,
+                    conservative_token_reservation,
+                    conservative_cost_reservation_microunits,
+                    estimate_state, original_operation_digest,
+                    pretool_context_capability_digest, state, revision,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 2, 2, 100, 100, 'microusd', 0, 0, 10, 10,
+                           'available', ?4, ?4, 'succeeded', 0, ?5, ?5)",
+                params![
+                    operation_id.to_string(),
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    digest64,
+                    ts_ms
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO verification_projection_envelopes (
+                    envelope_id, operation_id, session_id, prepared_projection_id,
+                    prepared_projection_digest, batch_digest, surrogate_kind,
+                    model_visible_projection_json, retention_state, revision,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'selected_call', ?6,
+                           'retained', 0, ?7, ?7)",
+                params![
+                    envelope_id.to_string(),
+                    operation_id.to_string(),
+                    session_id.to_string(),
+                    projection_id.to_string(),
+                    digest64,
+                    r#"{"operation":"call","arguments":{"path":"src/lib.rs"}}"#,
+                    ts_ms
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        operation_id
+    }
+
+    async fn envelope_retention(db: &Db, operation_id: Uuid) -> (String, String) {
+        db.read(move |conn| {
+            conn.query_row(
+                "SELECT retention_state, model_visible_projection_json
+                   FROM verification_projection_envelopes
+                  WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .context("reading verification envelope retention fixture")
         })
         .await
         .unwrap()
@@ -1352,6 +1443,9 @@ mod tests {
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, session.session_id, 10).await;
         insert_payload_rows(&db, session.session_id, "preserved", 10).await;
+        // One terminal-owned, past-window verification envelope: the one
+        // payload window that cleans (UPDATE) instead of deleting.
+        let operation_id = insert_retained_envelope(&db, session.session_id, 10_000).await;
         assert!(db.pin_message(session.session_id, 1).await.unwrap());
         let cfg = RetentionConfig {
             transcript_window_days: 1,
@@ -1364,6 +1458,7 @@ mod tests {
         let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
 
         assert_eq!(outcome.payload_rows_deleted, 0);
+        assert_eq!(outcome.verification_envelopes_cleaned, 0);
         for table in [
             "session_events",
             "inference_requests",
@@ -1372,6 +1467,22 @@ mod tests {
         ] {
             assert_eq!(payload_count(&db, table, session.session_id).await, 1);
         }
+        let (state, payload) = envelope_retention(&db, operation_id).await;
+        assert_eq!(state, "retained");
+        assert_eq!(
+            payload,
+            r#"{"operation":"call","arguments":{"path":"src/lib.rs"}}"#
+        );
+
+        // Releasing the hold re-arms every window, including the envelope
+        // clean: this control proves the fixture was sweepable all along and
+        // the pin hold was what held it back.
+        assert!(db.unpin_message(session.session_id, 1).await.unwrap());
+        let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
+        assert_eq!(outcome.verification_envelopes_cleaned, 1);
+        let (state, payload) = envelope_retention(&db, operation_id).await;
+        assert_eq!(state, "cleaned");
+        assert_eq!(payload, "{}");
     }
 
     #[tokio::test]

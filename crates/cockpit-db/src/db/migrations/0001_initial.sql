@@ -7965,10 +7965,19 @@ CREATE TABLE guidance_proposal_receipts (
         AND proposal_id = lower(proposal_id)
         AND proposal_id NOT GLOB '*[^0-9a-f]*'
     ),
-    -- The session UUID text (matches sessions.session_id spelling) — no FK
-    -- because a receipt may outlive its session row during retention.
-    session_id               TEXT    NOT NULL CHECK (length(session_id) BETWEEN 1 AND 64),
-    delegation_id            TEXT    NOT NULL CHECK (length(delegation_id) BETWEEN 1 AND 64),
+    -- 16-byte session/delegation identifiers as 32 lowercase hex characters
+    -- (the same spelling the producer writes). No FK: a receipt may outlive
+    -- its session row during retention.
+    session_id               TEXT    NOT NULL CHECK (
+        length(session_id) = 32
+        AND session_id = lower(session_id)
+        AND session_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    delegation_id            TEXT    NOT NULL CHECK (
+        length(delegation_id) = 32
+        AND delegation_id = lower(delegation_id)
+        AND delegation_id NOT GLOB '*[^0-9a-f]*'
+    ),
     canonical_project_digest TEXT    NOT NULL CHECK (
         length(canonical_project_digest) = 64
         AND canonical_project_digest = lower(canonical_project_digest)
@@ -8034,7 +8043,13 @@ CREATE UNIQUE INDEX uq_guidance_proposal_receipts_one_created_per_scope
 -- does NOT re-increment these counters.
 CREATE TABLE guidance_proposal_counters (
     scope_kind TEXT    NOT NULL CHECK (scope_kind IN ('session', 'delegation')),
-    scope_id   TEXT    NOT NULL CHECK (length(scope_id) BETWEEN 1 AND 64),
+    -- Session or delegation identifier; same 32 lowercase hex spelling as the
+    -- matching receipt column.
+    scope_id   TEXT    NOT NULL CHECK (
+        length(scope_id) = 32
+        AND scope_id = lower(scope_id)
+        AND scope_id NOT GLOB '*[^0-9a-f]*'
+    ),
     count      INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
     PRIMARY KEY (scope_kind, scope_id)
 );
@@ -8044,9 +8059,21 @@ CREATE TABLE guidance_proposal_counters (
 -- deliberately isolated from config/export tables and keyed only by opaque
 -- local scope digests.  Session-scoped accepted rules never enter SQLite.
 CREATE TABLE accepted_persistent_guidance_rules (
-    canonical_project_digest TEXT NOT NULL CHECK (length(canonical_project_digest) = 64),
-    provider_digest          TEXT NOT NULL CHECK (length(provider_digest) = 64),
-    model_digest             TEXT NOT NULL CHECK (length(model_digest) = 64),
+    canonical_project_digest TEXT NOT NULL CHECK (
+        length(canonical_project_digest) = 64
+        AND canonical_project_digest = lower(canonical_project_digest)
+        AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    provider_digest          TEXT NOT NULL CHECK (
+        length(provider_digest) = 64
+        AND provider_digest = lower(provider_digest)
+        AND provider_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    model_digest             TEXT NOT NULL CHECK (
+        length(model_digest) = 64
+        AND model_digest = lower(model_digest)
+        AND model_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     rule_kind                INTEGER NOT NULL CHECK (rule_kind BETWEEN 1 AND 6),
     encoded_rule             BLOB NOT NULL CHECK (length(encoded_rule) = 3),
     updated_at_unix_ms       INTEGER NOT NULL,
@@ -8066,6 +8093,59 @@ CREATE TABLE guidance_proposal_audit_outbox (
     PRIMARY KEY (proposal_id, terminal_state),
     FOREIGN KEY (proposal_id) REFERENCES guidance_proposal_receipts(proposal_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+
+-- ---- computer_audit_entries (issue #271) -----------------------------------
+-- Append-only bodies of the daemon-only tamper-evident computer-use audit
+-- chain. The HMAC signing key and signed/checkpointed chain head live in the
+-- machine-local protected secret store, not here. SQLite mutation, reorder,
+-- insertion, or tail deletion is detected by verifying this log against that
+-- sealed head; verification fails closed (no silent re-anchor). Entries never
+-- contain pixels, typed rule values, rationale, OCR, or raw target text.
+--
+-- `sequence` is the chain sequence (1-based). `entry_bytes` is the canonical
+-- 424-byte ComputerAuditEntryV1 encoding. `mac` is HMAC-SHA-256 over that
+-- body. `event_kind` / `proposal_id` / `key_version` are projections of that
+-- body for indexes and idempotent outbox replay — never independent identity.
+-- Offsets are 0-indexed ComputerAuditEntryV1 layout (SQLite substr is
+-- 1-indexed): event_kind at byte 5, sequence at bytes 10-17, proposal_id at
+-- 114-129, key_version at 420-423. CHECK plus insert-time proof reject a
+-- row whose columns do not match; uniqueness is on the authenticated body
+-- so an offline column relabel cannot occupy another event's identity.
+CREATE TABLE computer_audit_entries (
+    sequence     INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    entry_bytes  BLOB    NOT NULL CHECK (typeof(entry_bytes) = 'blob' AND length(entry_bytes) = 424),
+    mac          BLOB    NOT NULL CHECK (typeof(mac) = 'blob' AND length(mac) = 32),
+    event_kind   INTEGER NOT NULL CHECK (event_kind BETWEEN 1 AND 29),
+    proposal_id  BLOB    NOT NULL CHECK (typeof(proposal_id) = 'blob' AND length(proposal_id) = 16),
+    key_version  INTEGER NOT NULL CHECK (key_version >= 1),
+    CHECK (printf('%016X', sequence) = hex(substr(entry_bytes, 11, 8))),
+    CHECK (printf('%02X', event_kind) = hex(substr(entry_bytes, 6, 1))),
+    CHECK (proposal_id = substr(entry_bytes, 115, 16)),
+    CHECK (printf('%08X', key_version) = hex(substr(entry_bytes, 421, 4)))
+);
+
+-- At most one guidance-proposal audit event per authenticated (kind, proposal)
+-- taken from entry_bytes. The uniqueness key prevents a fork; it is not event
+-- identity. Replay may succeed only when the canonical body is the requested
+-- event. Kinds 20..=23 are X'14'..X'17'.
+CREATE UNIQUE INDEX uq_computer_audit_entries_guidance_proposal
+    ON computer_audit_entries(
+        substr(entry_bytes, 6, 1),
+        substr(entry_bytes, 115, 16)
+    )
+    WHERE substr(entry_bytes, 6, 1) IN (X'14', X'15', X'16', X'17');
+
+CREATE TRIGGER computer_audit_entries_immutable_update
+BEFORE UPDATE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
+
+CREATE TRIGGER computer_audit_entries_immutable_delete
+BEFORE DELETE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
 
 -- Local image-sidecar destination grants are daemon-owned durable authority.
 -- There is intentionally no global scope. Invocation audit rows are added

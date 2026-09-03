@@ -20,7 +20,12 @@ use futures::FutureExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+
+#[cfg(any(unix, windows))]
+use crate::daemon::{DaemonListener, DaemonStream};
 #[cfg(feature = "remote")]
 use tokio::sync::watch;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
@@ -2412,6 +2417,41 @@ pub(crate) enum EphemeralReapDecision {
     WaitingForLiveWork,
 }
 
+/// Ephemeral/diagnostic owners fail closed when a user-level write would
+/// create the global Cockpit config directory. Persistent daemons create
+/// that directory at boot; `cockpit doctor` and other ephemeral owners
+/// must not. Call this at every daemon-side write whose target can fall
+/// back to the (possibly missing) global layer.
+pub(crate) fn refuse_ephemeral_missing_global_layer(
+    ephemeral: bool,
+    path: &Path,
+) -> std::result::Result<(), ErrorPayload> {
+    if !ephemeral {
+        return Ok(());
+    }
+    if !cockpit_config::config::dirs::path_is_under_missing_global_config_dir(path) {
+        return Ok(());
+    }
+    Err(bad_request(
+        cockpit_config::config::dirs::MISSING_GLOBAL_CONFIG_DIR_MESSAGE,
+    ))
+}
+
+/// Create the global config directory when `path` is under that missing
+/// layer. Callers must have already passed
+/// [`refuse_ephemeral_missing_global_layer`]; file-write helpers will not
+/// create the directory themselves.
+pub(crate) fn ensure_authorized_global_layer(path: &Path) -> std::result::Result<(), ErrorPayload> {
+    if !cockpit_config::config::dirs::path_is_under_missing_global_config_dir(path) {
+        return Ok(());
+    }
+    cockpit_config::config::dirs::ensure_global_config_dir().map_err(|error| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: error.to_string(),
+    })?;
+    Ok(())
+}
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {
@@ -4430,10 +4470,16 @@ async fn run_boot_housekeeping(db: &Db) {
     // gets a chance to run.
 }
 
-/// Complete fail-closed local authority recovery before either daemon socket
-/// is bound. A published socket promises an immediately responsive protocol;
-/// recovery therefore belongs to boot, never the accept loop.
-#[cfg(unix)]
+/// Complete fail-closed local authority recovery before either daemon
+/// endpoint is bound. A published control socket or named pipe promises an
+/// immediately responsive protocol; recovery therefore belongs to boot,
+/// never the accept loop.
+///
+/// This is transport-neutral publication-barrier work. Do not gate it on
+/// `unix`: every platform that can publish an endpoint (`run_foreground_inner`
+/// on Unix or Windows) must compile and run this before bind. Dropping the
+/// call on a new transport would publish without reconciling durable
+/// authority.
 pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // Every file-backed recovery family shares one bounded startup deadline.
@@ -4536,14 +4582,41 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
     // every receipt still `created` has unrecoverable memory-only values, so
     // CAS each to `expired_on_restart` with exactly one expired audit append
-    // and no counter re-increment (creation already counted). The audit
-    // writer is stubbed until computer-audit-chain-completion lands.
+    // and no counter re-increment (creation already counted). The tamper-evident
+    // audit chain must be installed first, and the durable outbox flushed,
+    // so `guidance_proposal_created` is on the chain before any expired
+    // successor is appended.
+    if let Some(handle) = ctx.secure_key.clone() {
+        let chain =
+            crate::computer::audit::ComputerAuditChain::open(Arc::new(ctx.db.clone()), handle)
+                .await;
+        let writer = Arc::new(
+            crate::computer::guidance::service::ChainGuidanceAuditWriter::new(Arc::new(chain)),
+        );
+        if !writer.chain().is_available() {
+            tracing::error!(
+                "computer audit chain failed closed; guidance proposals remain unavailable"
+            );
+        }
+        ctx.guidance_proposals
+            .lock()
+            .await
+            .install_audit_writer(writer);
+    } else {
+        tracing::warn!("computer audit chain not installed: secure-key actor is not attached");
+    }
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let guidance_svc = ctx.guidance_proposals.lock().await;
     guidance_svc
         .reload_persistent_rules()
         .await
         .context("loading machine-local persistent guidance rules")?;
+    if let Err(error) = guidance_svc.flush_audit_outbox(now_unix_ms).await {
+        tracing::warn!(
+            %error,
+            "guidance proposal audit outbox flush deferred before restart reconciliation"
+        );
+    }
     let reconciled_guidance = guidance_svc
         .reconcile_on_restart(now_unix_ms)
         .await
@@ -4561,8 +4634,8 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
 /// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
 /// a detached client task. Breaking the loop hands control back to
 /// [`crate::daemon::run_foreground_inner`], which drains the workers.
-#[cfg(unix)]
-pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
+#[cfg(any(unix, windows))]
+pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListener) -> Result<()> {
     // Wiring invariant (debug/CI): the transactional ledger-site registry must
     // exactly cover the remotely-admissible transactional_mutation commands.
     #[cfg(feature = "remote")]
@@ -4621,9 +4694,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                     }
                 }
             }
-            accepted = listener.accept() => {
+            accepted = accept_daemon_stream(&mut listener) => {
                 match accepted {
-                    Ok((stream, _peer)) => {
+                    Ok(stream) => {
                         if let Err(e) = validate_peer_owner(&stream) {
                             tracing::warn!(error = %e, "rejected daemon socket peer");
                             continue;
@@ -4660,6 +4733,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
         || outcome.sessions_expiry_skipped_media_barrier > 0
         || outcome.payload_rows_deleted > 0
         || outcome.local_authority_rows_purged > 0
+        || outcome.verification_envelopes_cleaned > 0
         || outcome.vacuumed
     {
         tracing::info!(
@@ -4671,6 +4745,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
             raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
             terminal_evidence_rows_deleted = outcome.terminal_evidence_rows_deleted,
             local_authority_rows_purged = outcome.local_authority_rows_purged,
+            verification_envelopes_cleaned = outcome.verification_envelopes_cleaned,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"
         );
@@ -4715,7 +4790,23 @@ async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
+async fn accept_daemon_stream(listener: &mut DaemonListener) -> Result<DaemonStream> {
+    #[cfg(unix)]
+    {
+        listener
+            .accept()
+            .await
+            .map(|(stream, _peer)| stream)
+            .context("accepting daemon unix socket")
+    }
+    #[cfg(windows)]
+    {
+        listener.accept().await
+    }
+}
+
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
@@ -4725,13 +4816,13 @@ async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
 }
 
 /// Injected-clock retention tick: media sweep first, then session payload expiry.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_unix_ms: i64) {
     run_media_retention_periodic(ctx, now_unix_ms).await;
     run_retention_pass(ctx.db.clone(), cfg, now_unix_ms.div_euclid(1000)).await;
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     let now_secs = chrono::Utc::now().timestamp();
     run_retention_pass(db, cfg, now_secs).await;
@@ -4741,6 +4832,12 @@ async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
 /// dedicated leak-reveal socket accept loop — one shared policy, never a
 /// hand-rolled second `SO_PEERCRED`/`getpeereid` path. Elevated to `pub(crate)`
 /// so the reveal accept loop (a sibling `daemon` module) reuses it.
+#[cfg(windows)]
+pub(crate) fn validate_peer_owner(stream: &NamedPipeServer) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    cockpit_host::named_pipe::named_pipe_peer_is_current_user(stream.as_raw_handle())
+}
+
 #[cfg(unix)]
 pub(crate) fn validate_peer_owner(stream: &UnixStream) -> Result<()> {
     let peer_uid = peer_uid(stream)?;
@@ -5449,8 +5546,8 @@ fn try_send_in_process_event(
     }
 }
 
-#[cfg(unix)]
-async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
+#[cfg(any(unix, windows))]
+async fn handle_client(stream: DaemonStream, ctx: Arc<DaemonContext>) -> Result<()> {
     // Issue #296: socket peers are still Owner (follow-up #337) but start
     // without the daemon-private capability. Secret RPCs fail closed until
     // the peer presents the token a confined child cannot read.

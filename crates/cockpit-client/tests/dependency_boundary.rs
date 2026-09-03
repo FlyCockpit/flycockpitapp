@@ -34,8 +34,8 @@ fn client_manifest_stays_below_application_and_storage_layers() {
     }
     assert_eq!(
         local_dependencies,
-        BTreeSet::from(["cockpit-proto"]),
-        "cockpit-client production workspace dependencies must be exactly cockpit-proto"
+        BTreeSet::from(["cockpit-host", "cockpit-proto"]),
+        "cockpit-client production workspace dependencies must be exactly cockpit-host and cockpit-proto"
     );
 
     let feature_mappings = manifest

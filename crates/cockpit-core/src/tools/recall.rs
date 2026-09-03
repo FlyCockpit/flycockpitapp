@@ -87,11 +87,12 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     // cannot leave a prefix or suffix in a later continuation.
     let source = redactor.scrub(&content);
     let mut output = render_page(&source, path, args)?;
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &source,
-    )?;
+    )
+    .await?;
     Ok(output)
 }
 
@@ -190,11 +191,12 @@ pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Op
         }
     };
     let source = output.content.model_text().to_string();
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &source,
-    )?;
+    )
+    .await?;
     Ok(Some(output))
 }
 
@@ -255,11 +257,12 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             || !append_capped_record(&mut out, &format!("{path}:{}: {text}\n", line + 1))
         {
             let mut output = truncated_search_output(out);
-            crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+            crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
                 ctx,
                 &mut output,
                 &content,
-            )?;
+            )
+            .await?;
             return Ok(Some(output));
         }
     }
@@ -269,11 +272,12 @@ pub async fn grep(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
     } else {
         out
     });
-    crate::tools::session_search::fence_dream_read_scope_tool_output_if_needed(
+    crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
         &content,
-    )?;
+    )
+    .await?;
     Ok(Some(output))
 }
 

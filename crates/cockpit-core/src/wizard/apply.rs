@@ -183,6 +183,7 @@ pub fn prepare_onboarding_agent_answers_for_catalog(
 pub fn persist_onboarding_agent_plan(
     plan: &crate::onboarding_agent::OnboardingAgentPlan,
 ) -> Result<OnboardingConfigRollback> {
+    ensure_global_layer_for_write()?;
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let model_target = crate::config::providers::provider_file_path_for_config(
         &global_config,
@@ -450,6 +451,12 @@ pub async fn apply_setup_wizard_answers_authoritative(
     ))
 }
 
+fn ensure_global_layer_for_write() -> Result<()> {
+    crate::config::dirs::ensure_global_config_dir()
+        .context("creating global Cockpit config directory for onboarding")?;
+    Ok(())
+}
+
 fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
     let target = global_config_file().context("resolving global config for onboarding profile")?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
@@ -459,6 +466,7 @@ fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> 
         return Ok(None);
     }
     config.name = next;
+    ensure_global_layer_for_write()?;
     doc.write(&config)?;
     Ok(Some(target))
 }
@@ -473,6 +481,7 @@ fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>>
         return Ok(None);
     }
     config.daemon.background_agents = background_agents;
+    ensure_global_layer_for_write()?;
     doc.write(&config)?;
     // TODO(#274): a live ephemeral owner is not promoted in place when this
     // setting changes to persistent; the choice applies to later acquisition.
@@ -524,6 +533,7 @@ pub fn apply_security_answers_with_caps(
     if !changed {
         return Ok(None);
     }
+    ensure_global_layer_for_write()?;
     doc.write(&cfg)?;
     Ok(Some(target))
 }
@@ -775,6 +785,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         return Ok(ModelAnswersOutcome::default());
     }
 
+    ensure_global_layer_for_write()?;
     if model_changed {
         model_doc.write_model_wizard_fields(&provider_id, model)?;
     }

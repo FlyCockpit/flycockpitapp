@@ -10448,6 +10448,10 @@ async fn fresh_untrusted_provider_save_commits_to_the_global_layer() {
     )
     .await;
     assert!(
+        !global.is_dir(),
+        "catalog snapshot must not create the global layer"
+    );
+    assert!(
         catalog.view.mcp_edit_capability.is_some(),
         "MCP global scope must be editable during onboarding"
     );
@@ -13666,6 +13670,10 @@ fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded()
         bounded_lock.find("Instant::now() >= deadline").unwrap()
             < bounded_lock.find("file.try_lock()").unwrap(),
         "an expired recovery deadline must be checked before lock acquisition",
+    );
+    assert!(
+        !bounded_lock.contains("ensure_config_parent_dir"),
+        "bounded publication lock must not create the target parent"
     );
 
     let vault = include_str!("../../secure_key/vault.rs");

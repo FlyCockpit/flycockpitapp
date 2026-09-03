@@ -518,9 +518,11 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
 /// underflowing on drop. Keeping the guard pinned to its acquiring thread
 /// makes that class of corruption unrepresentable.
 pub(crate) struct ConfigMutationLock {
-    /// `None` is a same-thread re-entrant guard for this exact lock identity.
-    /// The outer guard owns the OS lock; a different target never shares this
-    /// shortcut and therefore cannot slip past the lock.
+    /// `None` means this guard does not own an OS lock leaf: either this
+    /// thread already holds the matching identity (re-entrant), or the
+    /// target parent does not exist yet so no sibling lock leaf can be
+    /// held. Creating that parent is reserved for the creating acquire
+    /// paths; a different target never shares this shortcut.
     _file: Option<std::fs::File>,
     identity: String,
     _not_send: std::marker::PhantomData<*const ()>,
@@ -596,12 +598,26 @@ impl ConfigMutationLock {
     /// `Ok(None)` when the deadline elapses without acquiring the lock (it
     /// remained busy). Re-entrant acquisition on the same thread succeeds
     /// immediately regardless of the deadline.
+    ///
+    /// A missing parent directory is uncontended (`Ok(Some(_))`) and is not
+    /// created. First-write targets for onboarding reads and pre-socket
+    /// publication must survive a fresh install; only the creating acquire
+    /// paths and authorized write helpers may mkdir the parent.
     pub(crate) fn acquire_until(
         target: &Path,
         deadline: std::time::Instant,
     ) -> Result<Option<Self>> {
         let target_identity = mutation_lock_identity(target);
-        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
+        let Some((parent, lock_leaf, display_path)) = try_open_mutation_lock_parent(target)? else {
+            // No sibling lock leaf can exist until a creating acquire (or
+            // write helper) mkdirs the parent. Treat the first-write target
+            // as uncontended rather than failing the publication lock, and
+            // rather than creating the global layer as a read side-effect.
+            return Ok(Some(Self::enter(
+                None,
+                missing_parent_mutation_lock_identity(&target_identity),
+            )));
+        };
         let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
         if Self::is_held_identity(&identity) {
             return Ok(Some(Self::enter(None, identity)));
@@ -716,9 +732,15 @@ impl ConfigMutationLock {
     /// True while this thread already owns the exact target's mutation lock.
     pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
         let target_identity = mutation_lock_identity(target);
-        let (parent, _, _) = open_mutation_lock_parent(target)?;
-        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
-        Ok(Self::is_held_identity(&identity))
+        match try_open_mutation_lock_parent(target)? {
+            None => Ok(Self::is_held_identity(
+                &missing_parent_mutation_lock_identity(&target_identity),
+            )),
+            Some((parent, _, _)) => {
+                let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+                Ok(Self::is_held_identity(&identity))
+            }
+        }
     }
 
     fn is_held_identity(identity: &str) -> bool {
@@ -755,6 +777,13 @@ fn mutation_lock_identity(target: &Path) -> String {
 
 fn mutation_lock_identity_from_canonical(canonical_target: &Path) -> String {
     canonical_target.to_string_lossy().into_owned()
+}
+
+/// Re-entrancy identity when the target parent does not exist, so no
+/// directory inode can be paired with the path. Distinct from a runtime
+/// identity taken after a creating acquire mkdirs the parent.
+fn missing_parent_mutation_lock_identity(target_identity: &str) -> String {
+    format!("missing-parent:{target_identity}")
 }
 
 /// Pair the canonical config-leaf identity with the actual directory object
@@ -857,6 +886,19 @@ fn open_mutation_lock_parent(
     let leaf = mutation_lock_leaf(target);
     let display = parent_path.join(&leaf);
     Ok((parent, leaf, display))
+}
+
+/// Open the target's parent for a sibling lock leaf. `Ok(None)` means the
+/// parent is absent — the bounded wait treats that as uncontended rather
+/// than creating the directory or failing the publication lock.
+fn try_open_mutation_lock_parent(
+    target: &Path,
+) -> Result<Option<(std::fs::File, std::ffi::OsString, PathBuf)>> {
+    match open_mutation_lock_parent(target) {
+        Ok(parts) => Ok(Some(parts)),
+        Err(error) if root_cause_is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Read a file without ever traversing a symlink or reparse point in its final
@@ -2314,7 +2356,6 @@ fn read_all_bounded(file: &mut std::fs::File, path: &Path, max_bytes: usize) -> 
     Ok(bytes)
 }
 
-#[cfg(any(unix, windows))]
 fn root_cause_is_not_found(error: &anyhow::Error) -> bool {
     error
         .root_cause()
@@ -4215,5 +4256,92 @@ mod mutation_lock_tests {
             !target.exists(),
             "locking must not create or replace the config leaf itself"
         );
+    }
+
+    #[test]
+    fn bounded_lock_treats_a_missing_parent_as_uncontended_without_creating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("providers");
+        let target = parent.join("default.json");
+        assert!(
+            !parent.exists(),
+            "fixture must start without the lock parent"
+        );
+        let guard = super::ConfigMutationLock::acquire_until(
+            &target,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .expect("missing parent must not fail the bounded lock")
+        .expect("missing parent is uncontended");
+        assert!(
+            !parent.exists(),
+            "bounded lock must not mkdir a missing parent"
+        );
+        assert!(
+            super::ConfigMutationLock::is_held_by_current_thread(&target).unwrap(),
+            "the vacuous first-write guard is held on this thread"
+        );
+        drop(guard);
+        assert!(
+            !super::ConfigMutationLock::is_held_by_current_thread(&target).unwrap(),
+            "dropping the vacuous guard releases the missing-parent identity"
+        );
+
+        let _write = super::ConfigMutationLock::acquire(&target).unwrap();
+        assert!(
+            parent.is_dir(),
+            "the creating acquire path still mkdirs the parent"
+        );
+    }
+
+    #[test]
+    fn bounded_lock_does_not_create_a_missing_global_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        let target = crate::config::providers::provider_file_path_for_dir(&global, "default")
+            .expect("valid provider id");
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        let guard = super::ConfigMutationLock::acquire_until(
+            &target,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .expect("fresh-install first-write target must pass the bounded lock")
+        .expect("missing global parent is uncontended");
+        assert!(
+            !global.is_dir(),
+            "bounded lock must not create the global config directory"
+        );
+        drop(guard);
+
+        crate::config::dirs::ensure_global_config_dir().unwrap();
+        assert!(global.is_dir());
+        assert!(
+            !global.join("providers").exists(),
+            "ensuring the global dir must not create providers/"
+        );
+        let guard = super::ConfigMutationLock::acquire_until(
+            &target,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap()
+        .expect("missing providers/ under an existing global layer is uncontended");
+        assert!(
+            !global.join("providers").exists(),
+            "bounded lock must not create providers/ as a read side-effect"
+        );
+        drop(guard);
+
+        let _write = super::ConfigMutationLock::acquire(&target).unwrap();
+        assert!(
+            global.join("providers").is_dir(),
+            "the creating acquire path still mkdirs providers/"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

@@ -2783,6 +2783,7 @@ mod tests {
             store
                 .mcp_tool_grant_scope("external", "echo")
                 .await
+                .unwrap()
                 .is_none()
         );
 

@@ -263,12 +263,30 @@ async fn evaluate_for_gate(
         .await
 }
 
+/// Auto-mode pre-model gate over standing rejects. This path never goes
+/// through [`crate::approval::Approver::authorize`] before the utility
+/// model judges the call, so it carries its own issue #297 fail-closed
+/// store health gate: a corrupt/unreadable approvals store (or
+/// unrepaired quarantine residue) blocks the gated call with the
+/// repair-oriented refusal instead of dropping standing rejects and
+/// letting the utility-model path judge the call with them missing.
 async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {
     let approver = ctx.approver.as_ref()?;
+    if let Err(error) = approver.store().approvals_store_health() {
+        return Some(corrupt_approvals_store_gate_block(error));
+    }
     match tool {
         "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let scope = approver.command_standing_reject_scope(command).await?;
+            let scope = match approver.command_standing_reject_scope(command).await {
+                Ok(scope) => scope,
+                // The store went corrupt between the health gate and this
+                // lookup: fail the decision closed, never as "no rejects".
+                Err(error) => return Some(corrupt_approvals_store_gate_block(error)),
+            };
+            let Some(scope) = scope else {
+                return None;
+            };
             approver
                 .record_standing_reject_decision("bash", command, scope)
                 .await;
@@ -277,11 +295,15 @@ async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> 
         "mcp" => {
             let script = args.get("script").and_then(Value::as_str)?;
             for invocation in static_mcp_invocations(script) {
-                if let Some(scope) = approver
+                let scope = match approver
                     .store()
                     .mcp_tool_reject_scope(&invocation.server, &invocation.tool)
                     .await
                 {
+                    Ok(scope) => scope,
+                    Err(error) => return Some(corrupt_approvals_store_gate_block(error)),
+                };
+                if let Some(scope) = scope {
                     let target =
                         crate::approval::store::mcp_tool_key(&invocation.server, &invocation.tool);
                     approver
@@ -293,6 +315,17 @@ async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> 
             None
         }
         _ => None,
+    }
+}
+
+/// Refusal block for a corrupt/unreadable approvals store detected on the
+/// Auto-mode pre-model gate (issue #297). Fail closed with the repair-
+/// oriented message so the corrupt store is visible, never a silent
+/// empty-reject read.
+fn corrupt_approvals_store_gate_block(error: anyhow::Error) -> GateBlock {
+    GateBlock {
+        message: format!("{error:#}"),
+        status: "blocked_corrupt_approvals_store",
     }
 }
 
@@ -842,6 +875,39 @@ mod safety_gate_tests {
             }
             GateOutcome::Run { .. } => panic!("standing reject must block before dispatch"),
             GateOutcome::Parked => panic!("standing reject must not park"),
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_store_blocks_the_auto_gate_fail_closed() {
+        // Issue #297: this pre-model gate reads standing rejects from the
+        // approvals store without going through `Approver::authorize`, so
+        // it carries its own fail-closed store health gate — a corrupt
+        // store blocks the call with the repair-oriented refusal instead
+        // of dropping standing rejects and letting the utility-model path
+        // judge with them missing.
+        let env = tempfile::tempdir().unwrap();
+        cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let ctx = gate_ctx(env.path(), ApprovalMode::Auto, true);
+        let global = crate::approval::store::global_approvals_dir().unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("approvals.json"), b"not json at all").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        let outcome =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+
+        match outcome {
+            GateOutcome::Block(block) => {
+                assert_eq!(block.status, "blocked_corrupt_approvals_store");
+                assert!(block.message.contains("corrupt"), "{}", block.message);
+            }
+            GateOutcome::Run { .. } => panic!("corrupt approvals store must block the gate"),
+            GateOutcome::Parked => panic!("corrupt approvals store must not park"),
         }
         assert_eq!(safety_gate_evaluate_calls(), 0);
     }

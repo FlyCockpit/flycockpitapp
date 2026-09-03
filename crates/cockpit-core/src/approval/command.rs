@@ -327,10 +327,13 @@ impl Approver {
         // deny (§14). A wrapper is never persistable, so it can't be rejected.
         let mut standing_reject = None;
         for info in &simple_commands {
-            if !info.wrapper
-                && !info.execution_bearing_option
-                && let Some(scope) = self.store.command_reject_scope(&info.key).await
-            {
+            if info.wrapper || info.execution_bearing_option {
+                continue;
+            }
+            // A corrupt approvals store fails the whole decision closed
+            // (issue #297): the lookup's error is the decision's refusal,
+            // never a silent "no standing reject".
+            if let Some(scope) = self.store.command_reject_scope(&info.key).await? {
                 standing_reject = Some(scope);
                 break;
             }
@@ -356,7 +359,7 @@ impl Approver {
         // "M = constituents that actually trigger a prompt".
         let mut prompting: Vec<(&SimpleCommandInfo, &ApprovalPromptPolicy)> = Vec::new();
         for (info, policy) in simple_commands.iter().zip(policies.iter()) {
-            if compound || self.will_prompt(info, policy).await {
+            if compound || self.will_prompt(info, policy).await? {
                 prompting.push((info, policy));
             }
         }
@@ -404,7 +407,7 @@ impl Approver {
         let mut step: u32 = 0;
         for (idx, info) in simple_commands.iter().enumerate() {
             let policy = &policies[idx];
-            let prompts = compound || self.will_prompt(info, policy).await;
+            let prompts = compound || self.will_prompt(info, policy).await?;
             if prompts {
                 step += 1;
             }
@@ -543,17 +546,23 @@ impl Approver {
     /// Whether this constituent will raise a prompt rather than being
     /// allowed silently: a wrapper (never persistable) always prompts;
     /// otherwise it prompts only when not already granted at a scope and
-    /// issue tier that cover this invocation.
-    async fn will_prompt(&self, info: &SimpleCommandInfo, policy: &ApprovalPromptPolicy) -> bool {
-        info.wrapper
-            || info.execution_bearing_option
-            || !self
-                .store
-                .command_grant(&info.key)
-                .await
-                .is_some_and(|grant| {
-                    grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
-                })
+    /// issue tier that cover this invocation. Fails closed on a corrupt
+    /// approvals store (issue #297).
+    async fn will_prompt(
+        &self,
+        info: &SimpleCommandInfo,
+        policy: &ApprovalPromptPolicy,
+    ) -> Result<bool> {
+        if info.wrapper || info.execution_bearing_option {
+            return Ok(true);
+        }
+        Ok(!self
+            .store
+            .command_grant(&info.key)
+            .await?
+            .is_some_and(|grant| {
+                grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
+            }))
     }
 
     /// Decide one simple command: granted → allow; else prompt. `step` /
@@ -571,22 +580,23 @@ impl Approver {
         // Standing reject short-circuit (checked before allow; the two are
         // mutually exclusive, so order is a safety belt). A wrapper is never
         // persistable in either polarity, so it can never carry a standing
-        // reject — only non-wrappers are queried.
-        if !info.wrapper
-            && !info.execution_bearing_option
-            && let Some(scope) = self.store.command_reject_scope(&info.key).await
-        {
-            // Auto-deny with no prompt; the caller surfaces the terse guidance
-            // error. The `StandingReject` source is recorded by the chain
-            // driver (`approve_command_inner`).
-            return Ok(CommandStepDecision::Decision(Decision::StandingReject {
-                scope,
-            }));
+        // reject — only non-wrappers are queried. A corrupt approvals store
+        // fails the decision closed (issue #297): the lookup's error is the
+        // refusal, never a silent "no standing reject".
+        if !info.wrapper && !info.execution_bearing_option {
+            if let Some(scope) = self.store.command_reject_scope(&info.key).await? {
+                // Auto-deny with no prompt; the caller surfaces the terse guidance
+                // error. The `StandingReject` source is recorded by the chain
+                // driver (`approve_command_inner`).
+                return Ok(CommandStepDecision::Decision(Decision::StandingReject {
+                    scope,
+                }));
+            }
         }
         let stored_grant = if info.wrapper || info.execution_bearing_option {
             None
         } else {
-            self.store.command_grant(&info.key).await
+            self.store.command_grant(&info.key).await?
         };
         if !force_prompt
             && let Some(grant) = stored_grant

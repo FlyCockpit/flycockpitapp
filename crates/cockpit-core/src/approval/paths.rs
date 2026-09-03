@@ -20,11 +20,16 @@ impl Approver {
         required: SandboxPathAccess,
         detail: Option<CommandDetail>,
     ) -> Result<Decision> {
+        // Issue #297 fail-closed store health gate: path decisions consult
+        // the approvals files for standing grants/rejects, and this entry is
+        // also reached directly (outside `Approver::authorize`) by the
+        // native sandbox path choke.
+        self.ensure_approvals_store_healthy()?;
         let target = path.display().to_string();
         // Standing reject short-circuit (checked before allow). A rejected
         // path auto-denies the out-of-cwd access with no prompt; recorded with
         // the `StandingReject` source so the timeline reflects the reject.
-        if self.store.is_path_rejected(path).await {
+        if self.store.is_path_rejected(path).await? {
             self.record_permission_decision(
                 "path",
                 &target,
@@ -35,7 +40,7 @@ impl Approver {
             .await;
             return Ok(Decision::Deny);
         }
-        if self.store.is_path_granted_for(path, required).await {
+        if self.store.is_path_granted_for(path, required).await? {
             let decision = Decision::Allow {
                 scope: Scope::Session,
             };
@@ -613,14 +618,14 @@ impl Approver {
     ) -> Result<Decision> {
         const FILE_SESSION: &str = "write_grant_file_session";
         const DIRECTORY_SESSION: &str = "write_grant_directory_session";
-        if self.store.is_path_rejected(path).await {
+        if self.store.is_path_rejected(path).await? {
             return Ok(Decision::Deny);
         }
         if !is_workspace_cockpit_path(self.store.cwd(), path)
             && self
                 .store
                 .is_path_granted_for(path, SandboxPathAccess::ReadWrite)
-                .await
+                .await?
         {
             return Ok(Decision::Allow {
                 scope: Scope::Session,

@@ -23,7 +23,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::approval::Decision;
-#[cfg(test)]
 use crate::config::extended::ApprovalMode;
 use crate::config::extended::{ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
@@ -439,23 +438,37 @@ impl Tool for HarnessInvokeTool {
         // is the active primary.
         let policy = write_override.unwrap_or_else(|| WritePolicy::for_primary(&ctx.agent_id));
 
-        if let Some(approver) = &ctx.approver
-            && !hc.always_allow
-            && !approver.store().is_harness_granted(&harness_name).await
-        {
-            match approver
-                .approve_harness_invoke(&harness_name, model.as_deref(), policy)
-                .await?
-            {
-                Decision::Allow { .. } => {}
-                Decision::NoninteractiveDeny => {
-                    return Err(anyhow::anyhow!(crate::approval::NONINTERACTIVE_RUN_DENIAL));
-                }
-                Decision::Deny | Decision::StandingReject { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "harness invocation denied: the user declined to run external harness `{}`",
-                        harness_selector(&harness_name)
-                    ));
+        // Approval gate. An external harness runs outside cockpit's sandbox
+        // with its own permission prompts disabled, so it requires an
+        // explicit decision unless the harness config already carries a
+        // durable `always_allow` or the session is yolo. A missing approver
+        // fails closed (issue #297): the invocation is blocked with a visible
+        // error — matching the MCP approver-missing path — never silently
+        // skipped.
+        if !hc.always_allow && !matches!(ctx.session.approval_mode(), ApprovalMode::Yolo) {
+            let Some(approver) = &ctx.approver else {
+                return Err(anyhow::anyhow!(
+                    "harness invocation blocked: `{}` runs outside cockpit's sandbox with \
+                     its own permission prompts disabled, and no approval client is \
+                     attached to this session",
+                    harness_selector(&harness_name)
+                ));
+            };
+            if !approver.store().is_harness_granted(&harness_name).await {
+                match approver
+                    .approve_harness_invoke(&harness_name, model.as_deref(), policy)
+                    .await?
+                {
+                    Decision::Allow { .. } => {}
+                    Decision::NoninteractiveDeny => {
+                        return Err(anyhow::anyhow!(crate::approval::NONINTERACTIVE_RUN_DENIAL));
+                    }
+                    Decision::Deny | Decision::StandingReject { .. } => {
+                        return Err(anyhow::anyhow!(
+                            "harness invocation denied: the user declined to run external harness `{}`",
+                            harness_selector(&harness_name)
+                        ));
+                    }
                 }
             }
         }
@@ -1336,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn harness_invoke_without_approver_opens_no_interrupt_and_reaches_preflight() {
+    async fn harness_invoke_without_approver_blocks_fail_closed() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
@@ -1349,9 +1362,14 @@ mod tests {
         })
         .await;
 
+        // Issue #297: a missing harness approver must fail closed — the
+        // invocation is blocked with a visible error, matching the MCP
+        // approver-missing path. The approval step is never silently
+        // skipped, and no interrupt is parked (nothing can answer it).
         let msg = err.to_string();
-        assert!(msg.contains("not found on PATH"), "{msg}");
-        assert!(!msg.contains("harness invocation denied"), "{msg}");
+        assert!(msg.contains("harness invocation blocked"), "{msg}");
+        assert!(msg.contains("no approval client"), "{msg}");
+        assert!(!msg.contains("not found on PATH"), "{msg}");
         assert!(
             ctx.session
                 .db

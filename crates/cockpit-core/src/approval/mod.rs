@@ -608,9 +608,21 @@ pub struct Approver {
 }
 
 impl Approver {
+    /// Fail-closed approvals-store gate (issue #297), checked at every
+    /// approval-decision boundary before any grant/reject lookup: a corrupt
+    /// `approvals.json` refuses the action with a repair-oriented error
+    /// instead of silently dropping standing allow/reject decisions.
+    fn ensure_approvals_store_healthy(&self) -> Result<()> {
+        self.store.approvals_store_health()
+    }
+
     // Central authorization chokepoint for every executable tool effect.
     // Exhaustive by design: no `_` arm is permitted here.
     pub async fn authorize(&self, request: AuthorizationRequest<'_>) -> Result<Decision> {
+        // Every decision past this point consults the approvals store
+        // (standing grants and rejects) or persists into it, so the
+        // fail-closed store health gate runs first.
+        self.ensure_approvals_store_healthy()?;
         match request {
             AuthorizationRequest::Command { command } => {
                 self.approve_command_inner(command, None).await
@@ -1591,24 +1603,25 @@ pub(crate) async fn command_grant_allowed_by_policy(
 ) -> bool {
     command_grant_scope_allowed_by_policy(store, info)
         .await
+        .expect("approvals store must be healthy in tests")
         .is_some()
 }
 
 pub(crate) async fn command_grant_scope_allowed_by_policy(
     store: &GrantStore,
     info: &SimpleCommandInfo,
-) -> Option<Scope> {
+) -> Result<Option<Scope>> {
     if info.wrapper || info.execution_bearing_option {
-        return None;
+        return Ok(None);
     }
     let policy_cfg = store.approval_policy();
     let mut info = info.clone();
     apply_dangerous_flag_policy(&mut info, &policy_cfg);
     let policy = approval_policy_for(&info, &policy_cfg);
-    store.command_grant(&info.key).await.and_then(|grant| {
+    Ok(store.command_grant(&info.key).await?.and_then(|grant| {
         (grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier)
             .then_some(grant.scope)
-    })
+    }))
 }
 
 fn default_max_scope_for_risk(tier: RiskTier) -> Scope {
@@ -2619,7 +2632,8 @@ mod tests {
             approver
                 .store
                 .is_path_granted_for(&path, crate::tools::shell_sandbox::SandboxPathAccess::Read)
-                .await,
+                .await
+                .unwrap(),
             "session path grant recorded"
         );
         assert!(
@@ -2629,7 +2643,8 @@ mod tests {
                     &path,
                     crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
                 )
-                .await,
+                .await
+                .unwrap(),
             "read grant must not imply write"
         );
     }
@@ -2659,7 +2674,8 @@ mod tests {
                     &path,
                     crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
                 )
-                .await,
+                .await
+                .unwrap(),
             "run-once must not record durable path grants"
         );
     }
@@ -3265,7 +3281,8 @@ mod tests {
                     std::path::Path::new("/dev/null"),
                     crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
                 )
-                .await,
+                .await
+                .unwrap(),
             "the pre-existing global grant must cover /dev/null",
         );
         let resolver =
@@ -3355,6 +3372,7 @@ mod tests {
             .store
             .command_grant(&info.key)
             .await
+            .expect("approvals store must be healthy in tests")
             .expect("session grant recorded");
         assert_eq!(grant.scope, Scope::Session);
         assert_eq!(grant.granted_tier, info.risk.tier);
@@ -3445,6 +3463,7 @@ mod tests {
             .store
             .command_grant(&ordinary.key)
             .await
+            .expect("approvals store must be healthy in tests")
             .expect("grant upgraded");
         assert_eq!(grant.scope, Scope::Session);
         assert_eq!(grant.granted_tier, RiskTier::Destructive);
@@ -4529,7 +4548,7 @@ mod tests {
         assert_eq!(decision, RepeatDecision::Accept);
         // Accept-once records no rule: a fresh query still has none.
         let sig = GrantStore::loop_signature("read", &input);
-        assert!(approver.store.loop_rule(&sig).await.is_none());
+        assert!(approver.store.loop_rule(&sig).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4566,7 +4585,7 @@ mod tests {
         // no prompt.
         let sig = GrantStore::loop_signature("bash", &input);
         assert_eq!(
-            approver.store.loop_rule(&sig).await,
+            approver.store.loop_rule(&sig).await.unwrap(),
             Some(LoopVerdict::Reject)
         );
         let again = approver
@@ -4574,6 +4593,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, RepeatDecision::Reject);
+    }
+
+    #[tokio::test]
+    async fn yolo_repeat_with_corrupt_approvals_store_fails_closed() {
+        // Issue #297: the loop guard's standing rules are persisted
+        // approval state, and yolo mode auto-accepts a repeat when no rule
+        // is found — so a corrupt approvals store must refuse the repeat
+        // decision with a repair-oriented error instead of reading as "no
+        // rule" and running the repeated effect unattended.
+        let env = tempfile::tempdir().unwrap();
+        cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let approver = approver_with_mode(env.path(), crate::config::extended::ApprovalMode::Yolo);
+        let global = crate::approval::store::global_approvals_dir().unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("approvals.json"), b"not json at all").unwrap();
+
+        let input = serde_json::json!({"command": "spin"});
+        let err = approver
+            .approve_repeat("bash", &input, false)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("corrupt"), "{msg}");
+        assert!(msg.contains("approvals.json"), "{msg}");
     }
     fn shape_info(command: &str) -> SimpleCommandInfo {
         classify::classify(command).simple_commands()[0].clone()

@@ -17,8 +17,40 @@
 //!
 //! Persistence honors cockpit's existing config discovery
 //! ([`crate::config::dirs`], [`crate::git::find_worktree_root`]) — no new
-//! location scheme. Project/Global are plain JSON files written
-//! atomically (temp + rename); Session lives in SQLite.
+//! location scheme. Project/Global are plain JSON files written atomically
+//! (an unnamed owner-only inode + fsync + fd-bound publish + directory
+//! fsync) under a flock on the approvals directory itself; Session lives
+//! in SQLite. A corrupt or unreadable
+//! `approvals.json` fails closed (issue #297): the corrupt bytes are
+//! quarantined for diagnosis — copied aside to a fresh owner-only file,
+//! never deleted, never overwriting, never touching the live path — and
+//! every read fails closed with a repair-oriented error. That covers the
+//! decision-boundary health gate and every grant/reject lookup alike, so
+//! corruption observed at any point in a decision refuses it, rather than
+//! silently dropping every standing allow/reject entry. A quarantine copy
+//! from an earlier detection keeps every read failed closed until the
+//! store is repaired — a live path that is missing, and an approvals
+//! directory whose residue status cannot be established, are both read
+//! as "unrepaired", never as "no approval state" — quarantine always
+//! preserves exactly the bytes that failed validation (copied aside to a
+//! fresh owner-only file, never deleted, never overwriting, never
+//! touching the live path), and every successful read enforces the
+//! owner-only posture on the store it consumed: a store whose
+//! permissions cannot be inspected or tightened to owner-only is
+//! refused, never consumed. Every effect on store state is bound to a
+//! held file descriptor, not to a pathname looked up after a separate
+//! identity proof. Staging is an unnamed inode (`O_TMPFILE`) or an
+//! exclusive temp whose only later use is as a name for that held inode;
+//! a failed write drops the handle and never unlinks a destination name,
+//! so a replacement at a known path is never destroyed. Publication
+//! names the held inode (`linkat(AT_EMPTY_PATH)`) or exchanges that name
+//! with the live entry, then proves the live entry is the held inode — a
+//! substitute is rolled back to the previous store, never left
+//! installed. The cross-process lock is the approvals directory itself
+//! (flock on the held dir fd); publish syscalls are
+//! `openat`/`linkat`/`renameat` relative to that same fd, so an obsolete
+//! writer whose directory was replaced publishes into the detached
+//! directory and cannot overwrite the live store.
 //!
 //! ## Wrappers are never persisted (priority #1)
 //!
@@ -413,41 +445,81 @@ impl GrantStore {
         scopes
     }
 
+    /// Fail-closed health gate over the approvals files (issue #297),
+    /// checked at approval-decision boundaries before any grant/reject
+    /// lookup. A missing store file with no quarantine residue is the
+    /// normal first-run state (healthy). A corrupt or unreadable file is
+    /// quarantined by the load and fails closed with a repair-oriented
+    /// error — a corrupt `approvals.json` can never silently drop standing
+    /// rejects and proceed as if nothing were saved. The gate also refuses
+    /// while a quarantine copy from an earlier detection is still present
+    /// (the store has not been repaired yet), including one left by
+    /// another process.
+    ///
+    /// Every lookup below this gate consumes the same fail-closed load, so
+    /// corruption that lands between the gate and a decision's lookup —
+    /// or a quarantine that happened before this gate ran — still refuses
+    /// that decision: no read of the store ever resolves to empty approval
+    /// state while the store is corrupt or unrepaired.
+    pub fn approvals_store_health(&self) -> Result<()> {
+        for dir in [
+            self.project_approvals_dir.as_deref(),
+            self.global_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(error) = load_approvals(dir) {
+                return Err(approvals_load_refusal_error(error));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a command key is already **allowed** at *any* scope that
     /// applies to this session (Session, Project, or Global). `Once`
     /// grants are never stored, so they never show up here.
     #[cfg(test)]
     pub async fn is_command_granted(&self, key: &ApprovalKey) -> bool {
-        self.command_grant(key).await.is_some()
+        self.command_grant(key)
+            .await
+            .expect("approvals store must be healthy in tests")
+            .is_some()
     }
 
-    pub async fn command_grant(&self, key: &ApprovalKey) -> Option<CommandGrant> {
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a load error is the decision's refusal, never a silent "no grants".
+    pub async fn command_grant(&self, key: &ApprovalKey) -> Result<Option<CommandGrant>> {
+        // The durable files load first so a corrupt/unreadable store fails
+        // this decision closed even when a session grant would have matched:
+        // the lookup and the health check are one fail-closed operation,
+        // never a split "check health, then read as empty".
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let s = key.as_storage_str();
         if let Some(granted_tier) = self.session_command_grant_tier(&s).await {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier,
-            });
+            }));
         }
-        if let Some(granted_tier) = self
-            .project_file()
-            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        if let Some(granted_tier) =
+            project.and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
         {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Project,
                 granted_tier,
-            });
+            }));
         }
-        if let Some(granted_tier) = self
-            .global_file()
-            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        if let Some(granted_tier) =
+            global.and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
         {
-            return Some(CommandGrant {
+            return Ok(Some(CommandGrant {
                 scope: Scope::Global,
                 granted_tier,
-            });
+            }));
         }
-        None
+        Ok(None)
     }
 
     /// Whether a command key is **rejected** at any applicable scope — the
@@ -455,84 +527,77 @@ impl GrantStore {
     /// without prompting (`DecisionSource::StandingReject`).
     #[cfg(test)]
     pub async fn is_command_rejected(&self, key: &ApprovalKey) -> bool {
-        self.command_reject_scope(key).await.is_some()
+        self.command_reject_scope(key)
+            .await
+            .expect("approvals store must be healthy in tests")
+            .is_some()
     }
 
-    pub async fn command_reject_scope(&self, key: &ApprovalKey) -> Option<Scope> {
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a corrupt file can never read as "no standing rejects".
+    pub async fn command_reject_scope(&self, key: &ApprovalKey) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let s = key.as_storage_str();
         if self
             .session_has(GrantKind::Command, &s, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.commands_reject.contains(&s))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.commands_reject.contains(&s)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.commands_reject.contains(&s))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.commands_reject.contains(&s)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
-    pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Result<Option<Scope>> {
         self.mcp_tool_grant_scope_for_key(&mcp_tool_key(server, tool))
             .await
     }
 
-    pub async fn mcp_tool_grant_scope_for_key(&self, key: &str) -> Option<Scope> {
+    pub async fn mcp_tool_grant_scope_for_key(&self, key: &str) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Allow)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.mcp_tools.contains(key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.mcp_tools.contains(key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.mcp_tools.contains(key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.mcp_tools.contains(key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
-    pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Result<Option<Scope>> {
         self.mcp_tool_reject_scope_for_key(&mcp_tool_key(server, tool))
             .await
     }
 
-    pub async fn mcp_tool_reject_scope_for_key(&self, key: &str) -> Option<Scope> {
+    pub async fn mcp_tool_reject_scope_for_key(&self, key: &str) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|f| f.mcp_tools_reject.contains(key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|f| f.mcp_tools_reject.contains(key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|f| f.mcp_tools_reject.contains(key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     /// Scope of the persisted connection grant for one exact server identity.
@@ -542,54 +607,46 @@ impl GrantStore {
         &self,
         server: &str,
         identity: &str,
-    ) -> Option<Scope> {
+    ) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let key = mcp_server_connect_key(server, identity);
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Allow)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|file| file.mcp_tools.contains(&key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|file| file.mcp_tools.contains(&key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|file| file.mcp_tools.contains(&key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|file| file.mcp_tools.contains(&key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     pub async fn mcp_server_connect_reject_scope(
         &self,
         server: &str,
         identity: &str,
-    ) -> Option<Scope> {
+    ) -> Result<Option<Scope>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let key = mcp_server_connect_key(server, identity);
         if self
             .session_has(GrantKind::McpTool, &key, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Ok(Some(Scope::Session));
         }
-        if self
-            .project_file()
-            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
-        {
-            return Some(Scope::Project);
+        if project.is_some_and(|file| file.mcp_tools_reject.contains(&key)) {
+            return Ok(Some(Scope::Project));
         }
-        if self
-            .global_file()
-            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
-        {
-            return Some(Scope::Global);
+        if global.is_some_and(|file| file.mcp_tools_reject.contains(&key)) {
+            return Ok(Some(Scope::Global));
         }
-        None
+        Ok(None)
     }
 
     pub async fn record_mcp_server_connect(
@@ -657,33 +714,44 @@ impl GrantStore {
     async fn is_path_granted(&self, path: &Path) -> bool {
         self.is_path_granted_for(path, SandboxPathAccess::Read)
             .await
+            .expect("approvals store must be healthy in tests")
     }
 
-    pub async fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
-        self.effective_path_grant_access(path)
-            .await
-            .is_some_and(|access| access >= required)
+    /// Fail closed on a corrupt/unreadable approvals store (issue #297):
+    /// a load error is the decision's refusal, never a silent "not granted".
+    pub async fn is_path_granted_for(
+        &self,
+        path: &Path,
+        required: SandboxPathAccess,
+    ) -> Result<bool> {
+        Ok(self
+            .effective_path_grant_access(path)
+            .await?
+            .is_some_and(|access| access >= required))
     }
 
-    pub async fn effective_path_grant_access(&self, path: &Path) -> Option<SandboxPathAccess> {
+    pub async fn effective_path_grant_access(
+        &self,
+        path: &Path,
+    ) -> Result<Option<SandboxPathAccess>> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        if self.path_reject_matches(matches).await {
-            return None;
+        if self.path_reject_matches(matches).await? {
+            return Ok(None);
         }
         let mut access: Option<SandboxPathAccess> = None;
-        for (key, grant_access) in self.path_allow_entries().await {
+        for (key, grant_access) in self.path_allow_entries().await? {
             if path_covers(&key, &candidate) {
                 access = Some(access.map_or(grant_access, |current| current.max(grant_access)));
             }
         }
-        access
+        Ok(access)
     }
 
-    pub async fn effective_path_grants(&self) -> Vec<EffectivePathGrant> {
-        let rejects = self.path_reject_entries().await;
+    pub async fn effective_path_grants(&self) -> Result<Vec<EffectivePathGrant>> {
+        let rejects = self.path_reject_entries().await?;
         let mut by_path: BTreeMap<String, SandboxPathAccess> = BTreeMap::new();
-        for (key, access) in self.path_allow_entries().await {
+        for (key, access) in self.path_allow_entries().await? {
             if rejects
                 .iter()
                 .any(|(reject, _)| paths_overlap(reject, &key))
@@ -712,16 +780,17 @@ impl GrantStore {
                 access: *access,
             });
         }
-        grants
+        Ok(grants)
     }
 
     /// Whether a path is **rejected** at any applicable scope — the allow
     /// path query's mirror (same prefix-match semantics). A standing path
-    /// reject auto-denies the out-of-cwd access without prompting.
-    pub async fn is_path_rejected(&self, path: &Path) -> bool {
+    /// reject auto-denies the out-of-cwd access without prompting. Fail
+    /// closed on a corrupt/unreadable approvals store (issue #297).
+    pub async fn is_path_rejected(&self, path: &Path) -> Result<bool> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        self.path_reject_matches(matches).await
+        Ok(self.path_reject_matches(matches).await?)
     }
 
     /// Record a command-shape **allow** grant at `scope`. Rejects wrappers and
@@ -1060,19 +1129,19 @@ impl GrantStore {
     ///
     /// Order checked: session → project → global. Within a scope a
     /// `reject` and an `accept` cannot coexist (recording one clears the
-    /// other), so the first scope with *any* rule decides.
-    pub async fn loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+    /// other), so the first scope with *any* rule decides. Fail closed on
+    /// a corrupt/unreadable approvals store (issue #297): a corrupt
+    /// persisted loop reject can never read as "no rule" (which would let
+    /// yolo mode auto-accept the repeat).
+    pub async fn loop_rule(&self, signature: &str) -> Result<Option<LoopVerdict>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         if let Some(v) = self.session_loop_rule(signature).await {
-            return Some(v);
+            return Ok(Some(v));
         }
-        if let Some(v) = self
-            .project_file()
+        Ok(project
             .and_then(|f| file_loop_rule(&f, signature))
-        {
-            return Some(v);
-        }
-        self.global_file()
-            .and_then(|f| file_loop_rule(&f, signature))
+            .or_else(|| global.and_then(|f| file_loop_rule(&f, signature))))
     }
 
     /// Record a loop-guard rule for `signature` at `scope`. Recording one
@@ -1168,20 +1237,21 @@ impl GrantStore {
         signature: &str,
         verdict: LoopVerdict,
     ) -> Result<()> {
-        let mut file = load_approvals(dir).unwrap_or_default();
-        // Clear the opposite verdict so the file never carries a
-        // contradictory pair for one signature.
-        match verdict {
-            LoopVerdict::Accept => {
-                file.loop_reject.remove(signature);
-                file.loop_accept.insert(signature.to_string());
+        mutate_approvals(dir, |file| {
+            // Clear the opposite verdict so the file never carries a
+            // contradictory pair for one signature.
+            match verdict {
+                LoopVerdict::Accept => {
+                    file.loop_reject.remove(signature);
+                    file.loop_accept.insert(signature.to_string());
+                }
+                LoopVerdict::Reject => {
+                    file.loop_accept.remove(signature);
+                    file.loop_reject.insert(signature.to_string());
+                }
             }
-            LoopVerdict::Reject => {
-                file.loop_accept.remove(signature);
-                file.loop_reject.insert(signature.to_string());
-            }
-        }
-        store_approvals(dir, &file)
+            (true, ())
+        })
     }
 
     // ---- internals --------------------------------------------------------
@@ -1333,36 +1403,41 @@ impl GrantStore {
             .unwrap_or_default()
     }
 
-    async fn path_allow_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+    async fn path_allow_entries(&self) -> Result<Vec<(String, SandboxPathAccess)>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let mut entries = self.session_path_entries(Verdict::Allow).await;
-        if let Some(file) = self.project_file() {
+        if let Some(file) = project {
             entries.extend(file.paths);
         }
-        if let Some(file) = self.global_file() {
+        if let Some(file) = global {
             entries.extend(file.paths);
         }
-        entries
+        Ok(entries)
     }
 
-    async fn path_reject_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+    async fn path_reject_entries(&self) -> Result<Vec<(String, SandboxPathAccess)>> {
+        let project = self.project_file()?;
+        let global = self.global_file()?;
         let mut entries = self.session_path_entries(Verdict::Reject).await;
-        if let Some(file) = self.project_file() {
+        if let Some(file) = project {
             entries.extend(file.paths_reject);
         }
-        if let Some(file) = self.global_file() {
+        if let Some(file) = global {
             entries.extend(file.paths_reject);
         }
-        entries
+        Ok(entries)
     }
 
-    async fn path_reject_matches<F>(&self, matches: F) -> bool
+    async fn path_reject_matches<F>(&self, matches: F) -> Result<bool>
     where
         F: Fn(&str) -> bool,
     {
-        self.path_reject_entries()
-            .await
+        Ok(self
+            .path_reject_entries()
+            .await?
             .iter()
-            .any(|(key, _)| matches(key))
+            .any(|(key, _)| matches(key)))
     }
 
     async fn session_insert(
@@ -1423,16 +1498,27 @@ impl GrantStore {
 
     // ---- project / global scope (JSON files) ------------------------------
 
-    fn project_file(&self) -> Option<ApprovalsFile> {
-        let dir = self.project_approvals_dir.as_ref()?;
-        load_approvals(dir)
+    /// Load the project `approvals.json`, failing closed (issue #297): a
+    /// corrupt/unreadable store — or a not-yet-repaired quarantine residue
+    /// from an earlier detection — is an error carrying the repair-oriented
+    /// refusal (the load already quarantined the corrupt bytes) — never a
+    /// silent `None` that would drop every standing entry for this
+    /// decision. The decision-boundary health gate and every lookup
+    /// consume the same fail-closed load.
+    fn project_file(&self) -> Result<Option<ApprovalsFile>> {
+        scoped_approvals_file(self.project_approvals_dir.as_deref())
     }
 
-    fn global_file(&self) -> Option<ApprovalsFile> {
-        let dir = self.global_dir.as_ref()?;
-        load_approvals(dir)
+    /// Load the global `approvals.json`, mirroring [`Self::project_file`].
+    fn global_file(&self) -> Result<Option<ApprovalsFile>> {
+        scoped_approvals_file(self.global_dir.as_deref())
     }
 
+    /// Insert a grant into the `approvals.json` in `dir` via one locked
+    /// read-modify-write cycle. A corrupt store fails closed — the corrupt
+    /// bytes were already quarantined by the load and this refuses instead
+    /// of recreating a fresh store that silently drops every standing
+    /// entry.
     fn file_insert(
         &self,
         dir: &Path,
@@ -1442,27 +1528,25 @@ impl GrantStore {
         access: Option<SandboxPathAccess>,
         risk_tier: Option<RiskTier>,
     ) -> Result<()> {
-        let mut file = load_approvals(dir).unwrap_or_default();
-        // Clear the opposite polarity within this same file too, so one
-        // `approvals.json` never lists a key in both an allow and a reject
-        // set (belt-and-braces with `clear_key_everywhere`, which already
-        // visited this scope — but this keeps `file_insert` self-consistent).
-        verdict_remove(&mut file, kind, verdict.opposite(), key);
-        verdict_insert(&mut file, kind, verdict, key, access, risk_tier);
-        store_approvals(dir, &file)
+        mutate_approvals(dir, |file| {
+            // Clear the opposite polarity within this same file too, so one
+            // `approvals.json` never lists a key in both an allow and a reject
+            // set (belt-and-braces with `clear_key_everywhere`, which already
+            // visited this scope — but this keeps `file_insert`
+            // self-consistent).
+            verdict_remove(file, kind, verdict.opposite(), key);
+            verdict_insert(file, kind, verdict, key, access, risk_tier);
+            (true, ())
+        })
     }
 
     /// Remove a grant of `verdict` polarity for an exact `key` from the
     /// `approvals.json` in `dir`. A missing file / missing key is a no-op
-    /// (no write). Used to clear the opposite polarity before writing.
+    /// (no write). A corrupt store fails closed with the quarantine
+    /// refusal instead of being silently treated as empty. Used to clear
+    /// the opposite polarity before writing.
     fn file_remove(&self, dir: &Path, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
-        let Some(mut file) = load_approvals(dir) else {
-            return Ok(());
-        };
-        if verdict_remove(&mut file, kind, verdict, key) {
-            store_approvals(dir, &file)?;
-        }
-        Ok(())
+        mutate_approvals(dir, |file| (verdict_remove(file, kind, verdict, key), ()))
     }
 }
 
@@ -1709,12 +1793,27 @@ impl ManagedGrants {
 }
 
 /// Read every persisted grant from the `approvals.json` in `dir` (the
-/// machine-local project approvals dir or the global config dir). A missing or
-/// unparseable file reads as no grants — the management UI shows an empty
-/// scope, never an error. Entries come out sorted by the on-disk `BTreeMap`
-/// / `BTreeSet` ordering, so the listing is stable.
+/// machine-local project approvals dir or the global config dir). A missing
+/// file reads as no grants — the management UI shows an empty scope, never an
+/// error. A corrupt file is quarantined (copied aside to a fresh owner-only
+/// file, never deleted) and
+/// reads as no grants here, as does a store with an unrepaired quarantine
+/// residue; the approval-decision health gate refuses approval-dependent
+/// actions while the quarantine copy exists, so the corruption surfaces there
+/// with a repair-oriented error. Entries come out
+/// sorted by the on-disk `BTreeMap` / `BTreeSet` ordering, so the listing is
+/// stable.
 pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
-    let file = load_approvals(dir).unwrap_or_default();
+    let file = match load_approvals(dir) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(
+                refusal = %error.refusal_message(),
+                "approvals store failed the load closed; listing as empty on this informational surface"
+            );
+            ApprovalsFile::default()
+        }
+    };
     ManagedGrants {
         commands: file
             .commands
@@ -1738,58 +1837,1296 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
 }
 
 /// Remove a single grant `key` of `kind` from the `approvals.json` in
-/// `dir`, rewriting the file via the same load→mutate→atomic-store path
-/// the approval store uses to *record* grants. Reloading first means a
-/// concurrent edit to a different entry is preserved (we only drop the one
-/// key, never clobber the whole file from a stale snapshot). Returns `true`
-/// if the key was present and removed; `false` (no write) if it wasn't —
-/// so a double-delete or a vanished entry is a harmless no-op. The change
-/// takes effect on the next approval check, which re-reads the file.
+/// `dir`, rewriting the file via the same locked load→mutate→atomic-store
+/// path the approval store uses to *record* grants. Holding the approvals
+/// lock across the whole cycle means a concurrent edit to a different
+/// entry is preserved (we only drop the one key, never clobber the whole
+/// file from a stale snapshot). A corrupt store fails closed with the
+/// quarantine refusal — it is never silently treated as empty and
+/// rewritten. Returns `true` if the key was present and removed; `false`
+/// (no write) if it wasn't — so a double-delete or a vanished entry is a
+/// harmless no-op. The change takes effect on the next approval check,
+/// which re-reads the file.
 pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
-    let mut file = load_approvals(dir).unwrap_or_default();
-    let removed = match kind {
-        ManagedGrantKind::Command => {
-            if file.commands.remove(key).is_some() {
-                true
-            } else {
-                let stored = file
-                    .commands
-                    .keys()
-                    .find(|stored| command_shape_display(stored) == key)
-                    .cloned();
-                stored.is_some_and(|stored| file.commands.remove(&stored).is_some())
+    mutate_approvals(dir, |file| {
+        let removed = match kind {
+            ManagedGrantKind::Command => {
+                if file.commands.remove(key).is_some() {
+                    true
+                } else {
+                    let stored = file
+                        .commands
+                        .keys()
+                        .find(|stored| command_shape_display(stored) == key)
+                        .cloned();
+                    stored.is_some_and(|stored| file.commands.remove(&stored).is_some())
+                }
             }
-        }
-        ManagedGrantKind::Path => file.paths.remove(key).is_some(),
-        ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
-        ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
-        ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
-    };
-    if !removed {
-        return Ok(false);
-    }
-    store_approvals(dir, &file)?;
-    Ok(true)
+            ManagedGrantKind::Path => file.paths.remove(key).is_some(),
+            ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
+            ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
+            ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
+        };
+        (removed, removed)
+    })
 }
 
 /// File name for the per-scope approvals store inside an approvals dir.
 const APPROVALS_FILE: &str = "approvals.json";
 
-fn load_approvals(dir: &Path) -> Option<ApprovalsFile> {
-    let path = dir.join(APPROVALS_FILE);
-    let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Cross-process advisory lock file used on non-unix platforms, where a
+/// directory `flock` is not the native exclusion primitive (issue #297).
+/// Unix serializes on the approvals directory fd itself; see
+/// [`lock_approvals`].
+#[cfg(not(unix))]
+const APPROVALS_LOCK_FILE: &str = "approvals.json.lock";
+
+/// Name prefix of the quarantine copies a corrupt approvals file is renamed
+/// aside to — `approvals.json.corrupt-<unix_ms>[-<n>]` — so the original
+/// bytes survive for diagnosis. Never deleted.
+const APPROVALS_QUARANTINE_PREFIX: &str = "approvals.json.corrupt";
+
+/// A corrupt/unreadable approvals store detected at load time (issue #297).
+/// The store fails closed around one of these: the corrupt bytes are
+/// preserved for diagnosis by copying them aside to a fresh owner-only
+/// file — never deleted or overwritten, and never touching the live path —
+/// and approval-dependent decisions are refused with a repair-oriented
+/// error instead of silently dropping every standing allow/reject entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptApprovalsStore {
+    /// The store file that failed to load.
+    pub path: PathBuf,
+    /// Where the corrupt bytes were preserved (copied aside to a fresh
+    /// owner-only file; the live path is never vacated, renamed, or
+    /// deleted by quarantine). `None` when nothing was quarantined: an
+    /// unreadable file, the cross-process lock could not be taken to
+    /// re-read under, or every preservation candidate failed. The
+    /// original file is then left in place, still never deleted.
+    pub preserved: Option<PathBuf>,
+    /// Why the load failed (read or JSON parse error).
+    pub error: String,
 }
 
-/// Write `file` to `<dir>/approvals.json` atomically (temp + rename) so a
-/// crash mid-write can't corrupt the store. Creates `dir` if needed.
-fn store_approvals(dir: &Path, file: &ApprovalsFile) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+impl CorruptApprovalsStore {
+    /// Repair-oriented refusal: what was found, where the original bytes
+    /// are preserved, and how to recover. Surfaced verbatim to the user
+    /// at the approval-decision boundary.
+    pub fn refusal_message(&self) -> String {
+        match &self.preserved {
+            Some(preserved) => format!(
+                "approval store `{}` is corrupt ({}) and its original bytes are preserved \
+                 for diagnosis at `{}`; nothing was deleted or overwritten. This action \
+                 is refused rather than silently dropping saved allow/reject decisions. \
+                 Restore `{}` from the preserved copy as valid JSON and remove the `{}` \
+                 copy, then re-run the action.",
+                self.path.display(),
+                self.error,
+                preserved.display(),
+                self.path.display(),
+                preserved.display(),
+            ),
+            None => format!(
+                "approval store `{}` could not be read ({}) and its contents are \
+                 untrustworthy. This action is refused rather than silently dropping \
+                 saved allow/reject decisions. Repair the file to valid JSON, then \
+                 re-run the action.",
+                self.path.display(),
+                self.error,
+            ),
+        }
+    }
+}
+
+/// Why an approvals-file load failed closed (issue #297). Every read of the
+/// store — the decision-boundary health gate, every grant/reject lookup,
+/// and every locked read-modify-write cycle — resolves to `Ok` only on a
+/// healthy, fully repaired store; corruption and unrepaired quarantine
+/// residue alike surface as one of these refusals instead of empty
+/// approval state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalsLoadError {
+    /// The live `approvals.json` itself failed to load. A parse failure
+    /// quarantined the corrupt bytes (copied aside to a fresh owner-only
+    /// file, never deleted); `preserved` is `None` when nothing was
+    /// quarantined (an unreadable file, the cross-process lock could not
+    /// be taken, or every preservation candidate failed).
+    Corrupt(CorruptApprovalsStore),
+    /// A quarantine copy from an earlier detection is still present: the
+    /// store has not been repaired yet. Reads fail closed with the
+    /// repair-oriented refusal instead of treating a missing (or
+    /// restored-but-unverified) live file as the whole story.
+    QuarantineResidue(PathBuf),
+    /// The approvals directory could not be inspected for preserved
+    /// quarantine copies, so a clear quarantine fence could not be
+    /// established. The read fails closed instead of treating "residue
+    /// status unknown" as "no residue" (issue #297): a preserved copy
+    /// from an earlier detection may be hiding behind the enumeration
+    /// failure.
+    ResidueUnknown { dir: PathBuf, error: String },
+    /// The store's contents parsed, but its owner-only posture could not
+    /// be established: permissions could not be inspected through the
+    /// open handle, or could not be tightened to owner-only. The parsed
+    /// policy is refused rather than consumed while the file may stay
+    /// readable beyond its owner (issue #297: the approval file must not
+    /// be world-readable).
+    NotOwnerOnly { path: PathBuf, error: String },
+}
+
+impl ApprovalsLoadError {
+    /// Repair-oriented refusal, surfaced verbatim to the user at the
+    /// approval-decision boundary.
+    pub fn refusal_message(&self) -> String {
+        match self {
+            Self::Corrupt(corrupt) => corrupt.refusal_message(),
+            Self::QuarantineResidue(residue) => quarantine_residue_refusal(residue),
+            Self::ResidueUnknown { dir, error } => format!(
+                "earlier quarantined approvals copies could not be ruled out: `{}` \
+                 could not be searched ({}). This action is refused rather than assume \
+                 the store was repaired. Restore read access to the directory and \
+                 remove any preserved `{}-*` copy it contains, then re-run the action.",
+                dir.display(),
+                error,
+                APPROVALS_QUARANTINE_PREFIX,
+            ),
+            Self::NotOwnerOnly { path, error } => format!(
+                "approval store `{}` may be readable beyond its owner and could not \
+                 be tightened to owner-only ({}). This action is refused rather than \
+                 expose saved allow/reject decisions. Repair the file to owner-only \
+                 (chmod 600) and re-run the action.",
+                path.display(),
+                error,
+            ),
+        }
+    }
+}
+
+/// Load the `approvals.json` in `dir` (issue #297 fail-closed contract):
+///
+/// - a missing live file with no quarantine residue is `Ok(None)` — the
+///   normal first-run state;
+/// - a corrupt/unreadable file fails closed: the corrupt bytes are
+///   quarantined for diagnosis — copied aside to a fresh owner-only file,
+///   never deleted, never overwriting — and the error carries the
+///   repair-oriented refusal; never a silent `Ok(None)` that drops every
+///   standing entry;
+/// - a quarantine copy from an earlier detection keeps the read failed
+///   closed until the store is repaired — including one left by another
+///   process, and including a directory whose residue status cannot be
+///   established;
+/// - a parsed store whose owner-only posture cannot be inspected or
+///   enforced through the read handle is refused, never consumed.
+///
+/// The healthy path is a pure read: no lock, no side effects beyond
+/// enforcing the owner-only posture on the file it read. Any failure
+/// escalates under the same cross-process lock the read-modify-write
+/// writers hold, so quarantine is serialized against concurrent store
+/// replacement and always preserves exactly the bytes that failed
+/// validation (see [`quarantine_corrupt_approvals`]).
+fn load_approvals(dir: &Path) -> std::result::Result<Option<ApprovalsFile>, ApprovalsLoadError> {
+    match probe_approvals(dir) {
+        Ok(file) => Ok(file),
+        Err(probe_error) => {
+            // Re-read under the cross-process lock before preserving a
+            // diagnosis: the object the probe read may have been replaced
+            // by a writer or an external repair since, and what is
+            // preserved must be diagnosed under the same ordering the
+            // writers hold — never a stale snapshot of an object that no
+            // longer occupies the live path.
+            match lock_approvals(dir) {
+                Ok(_lock) => load_approvals_locked(dir),
+                Err(lock_error) => {
+                    tracing::error!(
+                        dir = %dir.display(),
+                        error = %lock_error,
+                        "cannot acquire the approvals lock to quarantine a failing store; failing the read closed without quarantining"
+                    );
+                    Err(probe_error)
+                }
+            }
+        }
+    }
+}
+
+/// Lock-free probe of the live `approvals.json`. Deliberately **does not
+/// quarantine**: a failure here is escalated by [`load_approvals`] to a
+/// locked re-read, so what is preserved is diagnosed under the same
+/// ordering the writers hold — quarantining the probe's bytes without
+/// the lock could preserve a stale diagnosis of an object a writer has
+/// since replaced (issue #297).
+fn probe_approvals(dir: &Path) -> std::result::Result<Option<ApprovalsFile>, ApprovalsLoadError> {
     let path = dir.join(APPROVALS_FILE);
-    let tmp = dir.join(format!("{APPROVALS_FILE}.tmp"));
+    let Some(live) = read_live_approvals_bytes(&path)? else {
+        // A missing live file is healthy only when no quarantine residue
+        // lingers: a live file removed during repair — with a preserved
+        // copy still present — means "unrepaired", not "no approval
+        // state" (issue #297). A directory that cannot be inspected has
+        // not established absence either, so the fence fails the read
+        // closed.
+        ensure_no_quarantine_residue(dir)?;
+        return Ok(None);
+    };
+    match serde_json::from_slice(&live.bytes) {
+        Ok(file) => {
+            ensure_no_quarantine_residue(dir)?;
+            enforce_owner_only(&live.file, &path)?;
+            Ok(Some(file))
+        }
+        Err(error) => Err(ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
+            path,
+            preserved: None,
+            error: error.to_string(),
+        })),
+    }
+}
+
+/// The live approvals bytes plus the open handle they were read through.
+struct LiveApprovalsBytes {
+    file: std::fs::File,
+    bytes: Vec<u8>,
+}
+
+/// Read the live `approvals.json` through an open handle so the bytes
+/// validated, the owner-only enforcement, and any quarantine preservation
+/// all bind the same file object (issue #297) — never whatever a
+/// concurrent replacement leaves at the path. `Ok(None)` for a missing
+/// live path (the healthy first-run state); open/read failures fail the
+/// load closed as corrupt.
+fn read_live_approvals_bytes(
+    path: &Path,
+) -> std::result::Result<Option<LiveApprovalsBytes>, ApprovalsLoadError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
+                path: path.to_path_buf(),
+                preserved: None,
+                error: error.to_string(),
+            }));
+        }
+    };
+    let mut bytes = Vec::new();
+    let read = {
+        use std::io::Read as _;
+        file.read_to_end(&mut bytes)
+    };
+    if let Err(error) = read {
+        return Err(ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
+            path: path.to_path_buf(),
+            preserved: None,
+            error: error.to_string(),
+        }));
+    }
+    Ok(Some(LiveApprovalsBytes { file, bytes }))
+}
+
+/// Locked half of [`load_approvals`]: assumes the caller holds the
+/// cross-process approvals lock, so the bytes validated, the bytes
+/// preserved, and any concurrent writer's replacement are strictly
+/// ordered. Quarantine here is copy-aside preservation — the failing
+/// bytes are written to a fresh owner-only copy through the same handle
+/// they were read from, never a path-based rename, which cannot be
+/// proven to act on the inspected object at the moment it takes effect
+/// (issue #297).
+fn load_approvals_locked(
+    dir: &Path,
+) -> std::result::Result<Option<ApprovalsFile>, ApprovalsLoadError> {
+    // A residue from an earlier detection means "unrepaired": refuse
+    // before even reading the live path, so a fresh corruption never piles
+    // up additional quarantine copies and the standing-refusal semantics
+    // hold. A directory that cannot be inspected is refused the same way
+    // — absence of residue must be established, not assumed.
+    ensure_no_quarantine_residue(dir)?;
+    let path = dir.join(APPROVALS_FILE);
+    let Some(live) = read_live_approvals_bytes(&path)? else {
+        return Ok(None);
+    };
+    match serde_json::from_slice(&live.bytes) {
+        Ok(parsed) => {
+            enforce_owner_only(&live.file, &path)?;
+            Ok(Some(parsed))
+        }
+        Err(error) => {
+            let preserved = quarantine_corrupt_approvals(&path, &live.file, &live.bytes);
+            Err(ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
+                path,
+                preserved,
+                error: error.to_string(),
+            }))
+        }
+    }
+}
+
+/// Load the scoped `approvals.json` for one approvals dir, mapping any
+/// fail-closed load refusal into the store-wide error type. A `None` dir
+/// is `Ok(None)` — the scope is not reachable for this session.
+fn scoped_approvals_file(dir: Option<&Path>) -> Result<Option<ApprovalsFile>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    match load_approvals(dir) {
+        Ok(file) => Ok(file),
+        Err(error) => Err(approvals_load_refusal_error(error)),
+    }
+}
+
+/// Log and convert a fail-closed approvals load (issue #297) into the
+/// decision refusal. The single logging point for every approvals-file
+/// load failure: the decision-boundary health gate and every query-time
+/// load route through here, so a corrupt or unrepaired store surfaces as
+/// a visible, repair-oriented refusal wherever it is first read — never
+/// as empty approval state.
+fn approvals_load_refusal_error(error: ApprovalsLoadError) -> anyhow::Error {
+    match &error {
+        ApprovalsLoadError::Corrupt(corrupt) => tracing::error!(
+            path = %corrupt.path.display(),
+            preserved = ?corrupt.preserved,
+            error = %corrupt.error,
+            "corrupt approvals store detected; failing the approval decision closed"
+        ),
+        ApprovalsLoadError::QuarantineResidue(residue) => tracing::error!(
+            residue = %residue.display(),
+            "unrepaired approvals quarantine residue; failing the approval decision closed"
+        ),
+        ApprovalsLoadError::ResidueUnknown { dir, error } => tracing::error!(
+            dir = %dir.display(),
+            error = %error,
+            "could not inspect the approvals directory for quarantine residue; failing the approval decision closed"
+        ),
+        ApprovalsLoadError::NotOwnerOnly { path, error } => tracing::error!(
+            path = %path.display(),
+            error = %error,
+            "approvals store could not be enforced owner-only; failing the approval decision closed"
+        ),
+    }
+    anyhow::Error::msg(error.refusal_message())
+}
+
+/// Preserve the corrupt approvals bytes for diagnosis and leave the live
+/// path untouched (issue #297). The `bytes` are the exact bytes read from
+/// the open `inspected` handle whose contents failed validation, so
+/// preservation never depends on pathname identity: a rename or unlink
+/// by path cannot be proven to act on the inspected object at the moment
+/// it takes effect, so quarantine performs none. Instead the diagnosed
+/// bytes are written to a fresh owner-only quarantine copy via
+/// [`write_private_file`] (`create_new`, so an existing artifact is never
+/// overwritten), and the live path is left exactly as found for the owner
+/// to repair — including when a concurrent replacement now occupies it,
+/// since those contents were never diagnosed.
+///
+/// The live object's owner-only posture is tightened best-effort through
+/// the inspected handle: nothing is consumed from it either way (the
+/// caller fails the read closed), so a tightening failure is logged, not
+/// propagated. Collision-tolerant and best-effort overall: on failure the
+/// original is left in place (the caller still fails closed) and `None`
+/// is returned.
+fn quarantine_corrupt_approvals(
+    path: &Path,
+    inspected: &std::fs::File,
+    bytes: &[u8],
+) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let stem = path.file_name()?.to_str()?.to_string();
+    let millis = chrono::Utc::now().timestamp_millis();
+    tighten_owner_only_best_effort(inspected, path);
+    for attempt in 0..16u32 {
+        let candidate = if attempt == 0 {
+            dir.join(format!("{stem}.corrupt-{millis}"))
+        } else {
+            dir.join(format!("{stem}.corrupt-{millis}-{attempt}"))
+        };
+        match write_private_file(&candidate, bytes) {
+            Ok(()) => return Some(candidate),
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    error = %error,
+                    attempt,
+                    "quarantine copy-aside attempt failed"
+                );
+            }
+        }
+    }
+    tracing::error!(
+        path = %path.display(),
+        "quarantining the corrupt approvals store failed; refusing without preserving a copy"
+    );
+    None
+}
+
+/// Whether `path`'s directory entry still refers to the same filesystem
+/// object as the open `file` handle (issue #297). Used to prove the
+/// flocked approvals directory path still names the held directory fd
+/// this cycle locked — a replacement directory is a different object,
+/// and publish syscalls relative to the held fd cannot overwrite the
+/// live path. Identity is probed through the held handle (`fstat`) and
+/// through the entry itself (`lstat`, never a follow). A missing entry
+/// is `Ok(false)`: the name no longer refers to the held object.
+///
+/// Non-unix exemption: stable std exposes no object-identity comparison
+/// primitive on those targets (`windows_by_handle`'s `file_index` /
+/// `volume_serial_number` are still unstable), so a mismatch cannot be
+/// proven there and the probe reports `Ok(true)`, preserving the
+/// platform's existing behavior instead of stubbing a false refusal —
+/// the same platform-honesty matrix `cockpit_host::private_fs` reports
+/// through `PRIVATE_FS_POLICY`. The races this probe guards against are
+/// pathname unlink-and-replace races; on Windows a name whose object is
+/// held open through a std handle cannot be replaced underneath it (no
+/// `FILE_SHARE_DELETE`), so the exposure is unix-shaped.
+#[cfg(unix)]
+fn same_object_at_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(named) => Ok(held.dev() == named.dev() && held.ino() == named.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// See the unix arm; the non-unix platform cannot prove a mismatch, so
+/// the probe passes and the caller keeps its existing behavior.
+#[cfg(not(unix))]
+fn same_object_at_path(_file: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// A fully-written private file whose inode this process holds. Linux
+/// stages with `O_TMPFILE` (no directory entry until publish). Other
+/// Unix stages an exclusive random name that already refers to this
+/// inode. Failed writes drop the handle: there is no destination-name
+/// unlink, so a replacement at a known path cannot be destroyed.
+#[cfg(unix)]
+struct StagedPrivate {
+    file: std::fs::File,
+    /// Exclusive directory entry already naming this inode. `None` on
+    /// Linux `O_TMPFILE` until publish gives the inode a name.
+    named: Option<std::ffi::CString>,
+}
+
+/// Open the approvals directory with `O_DIRECTORY | O_NOFOLLOW` so a
+/// planted symlink at the directory path cannot redirect the lock or
+/// any later `openat`/`linkat`/`renameat` relative to this fd.
+#[cfg(unix)]
+fn open_approvals_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+}
+
+#[cfg(unix)]
+fn pin_owner_only_mode(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(unix)]
+fn unique_store_temp_name() -> std::ffi::CString {
+    std::ffi::CString::new(format!("{APPROVALS_FILE}.tmp-{}", random_hex()))
+        .expect("hex temp name has no NUL")
+}
+
+/// Create the staging object for one private write, relative to a held
+/// directory fd. Linux: unnamed `O_TMPFILE` inode (failed writes vanish
+/// when the handle drops — no pathname unlink). Other Unix: exclusive
+/// `O_CREAT|O_EXCL` temp whose name is not a quarantine or live-store
+/// destination, so a failed write never unlinks a diagnostic artifact.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn create_staged_private(dir: &std::fs::File) -> std::io::Result<StagedPrivate> {
+    use std::os::fd::AsRawFd as _;
+    let file = cockpit_host::private_fs::held_fd::openat_tmpfile(dir.as_raw_fd(), 0o600)?;
+    pin_owner_only_mode(&file)?;
+    Ok(StagedPrivate { file, named: None })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn create_staged_private(dir: &std::fs::File) -> std::io::Result<StagedPrivate> {
+    use std::os::fd::AsRawFd as _;
+    const ATTEMPTS: u8 = 32;
+    for _ in 0..ATTEMPTS {
+        let name = unique_store_temp_name();
+        match cockpit_host::private_fs::held_fd::openat_mode(
+            dir.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        ) {
+            Ok(file) => {
+                if let Err(error) = pin_owner_only_mode(&file) {
+                    return Err(error);
+                }
+                return Ok(StagedPrivate {
+                    file,
+                    named: Some(name),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique staged private file",
+    ))
+}
+
+/// Whether `name` beneath the held directory still refers to `file`'s inode.
+#[cfg(unix)]
+fn same_object_in_dir(
+    file: &std::fs::File,
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    match cockpit_host::private_fs::held_fd::openat(
+        dir.as_raw_fd(),
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(named) => {
+            let named = named.metadata()?;
+            Ok(held.dev() == named.dev() && held.ino() == named.ino())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn open_live_in_dir(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd as _;
+    match cockpit_host::private_fs::held_fd::openat(
+        dir.as_raw_fd(),
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// How [`publish_staged_store`] installed the held inode.
+#[cfg(unix)]
+enum PublishKind {
+    /// `linkat(AT_EMPTY_PATH)` created the destination from the held inode.
+    /// There was no source name to substitute.
+    LinkedDirect,
+    /// The destination was exchanged with `tmp`. `tmp` now names whatever
+    /// previously occupied the destination (the previous store, which a
+    /// substituted publish can restore by exchanging again).
+    Exchanged { tmp: std::ffi::CString },
+}
+
+/// Install the held staged inode as `dest` relative to the flocked
+/// directory fd. First write on Linux names the inode directly at
+/// `dest` (`linkat(AT_EMPTY_PATH)`) — the source is the fd, so a
+/// staged-name substitution cannot be installed. Replace gives the
+/// inode a unique name and `RENAME_EXCHANGE`s it with `dest`, keeping
+/// the previous store named at that unique name for rollback.
+#[cfg(unix)]
+fn publish_staged_store(
+    dir: &std::fs::File,
+    staged: &StagedPrivate,
+    dest: &std::ffi::CStr,
+) -> std::io::Result<PublishKind> {
+    use std::os::fd::AsRawFd as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if staged.named.is_none() {
+        match cockpit_host::private_fs::held_fd::linkat_held_inode(
+            staged.file.as_raw_fd(),
+            dir.as_raw_fd(),
+            dest,
+        ) {
+            Ok(()) => return Ok(PublishKind::LinkedDirect),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let tmp = match &staged.named {
+        Some(name) => name.clone(),
+        None => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let tmp = unique_store_temp_name();
+                cockpit_host::private_fs::held_fd::linkat_held_inode(
+                    staged.file.as_raw_fd(),
+                    dir.as_raw_fd(),
+                    &tmp,
+                )?;
+                tmp
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                return Err(std::io::Error::other(
+                    "staged store has no directory entry to publish",
+                ));
+            }
+        }
+    };
+
+    run_before_publish_rename_hook();
+    cockpit_host::private_fs::held_fd::rename_exchange(
+        dir.as_raw_fd(),
+        &tmp,
+        dir.as_raw_fd(),
+        dest,
+    )?;
+    Ok(PublishKind::Exchanged { tmp })
+}
+
+#[cfg(unix)]
+fn rollback_exchanged_publish(
+    dir: &std::fs::File,
+    dest: &std::ffi::CStr,
+    tmp: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    cockpit_host::private_fs::held_fd::rename_exchange(dir.as_raw_fd(), tmp, dir.as_raw_fd(), dest)
+}
+
+/// Unlink `tmp` only when it is not the staged object — after a successful
+/// exchange it names the previous store. A mismatch is left as found.
+#[cfg(unix)]
+fn discard_consumed_tmp(dir: &std::fs::File, tmp: &std::ffi::CStr, staged: &std::fs::File) {
+    use std::os::fd::AsRawFd as _;
+    match same_object_in_dir(staged, dir, tmp) {
+        Ok(false) => {
+            let _ = cockpit_host::private_fs::held_fd::unlinkat(dir.as_raw_fd(), tmp, 0);
+        }
+        Ok(true) | Err(_) => {}
+    }
+}
+
+/// Best-effort pathname unlink of a failed exclusive temp on non-unix
+/// platforms. Unix never unlinks a destination name on the failure path:
+/// staging is unnamed or a random exclusive name that is simply dropped.
+#[cfg(not(unix))]
+fn discard_partial_private_candidate(_out: std::fs::File, path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "removing a failed private-file candidate failed; leaving any \
+                 residue for the next cycle"
+            );
+        }
+    }
+}
+
+/// Open a fresh exclusive file at `path` (`create_new`). Non-unix staging
+/// for quarantine copies and the atomic store temp: an existing artifact
+/// is never overwritten.
+#[cfg(not(unix))]
+fn open_new_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+}
+
+/// Write `bytes` to a fresh owner-only file at `path`: quarantine's
+/// preservation mechanism (issue #297). The payload is written to a
+/// held inode that has no destination name yet (`O_TMPFILE`, or an
+/// exclusive random temp), then published with no-replace `linkat` /
+/// `rename_noreplace`. An existing artifact therefore cannot be
+/// overwritten, a failed write never unlinks the destination (so a
+/// replacement at that name is never destroyed), and no incomplete
+/// quarantine artifact is left fencing the store.
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "write target has no parent directory",
+        )
+    })?;
+    let dir = open_approvals_dir(parent)?;
+    let name = {
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "write target has no file name",
+            )
+        })?;
+        std::ffi::CString::new(file_name.as_encoded_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name")
+        })?
+    };
+    let mut staged = create_staged_private(&dir)?;
+    staged.file.write_all(bytes)?;
+    staged.file.sync_all()?;
+    match &staged.named {
+        None => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                cockpit_host::private_fs::held_fd::linkat_held_inode(
+                    staged.file.as_raw_fd(),
+                    dir.as_raw_fd(),
+                    &name,
+                )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                Err(std::io::Error::other("unnamed staged file is linux-only"))
+            }
+        }
+        Some(tmp) => cockpit_host::private_fs::held_fd::rename_noreplace(
+            dir.as_raw_fd(),
+            tmp,
+            dir.as_raw_fd(),
+            &name,
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = open_new_private_file(path)?;
+    if let Err(error) = out.write_all(bytes) {
+        discard_partial_private_candidate(out, path);
+        return Err(error);
+    }
+    if let Err(error) = out.sync_all() {
+        discard_partial_private_candidate(out, path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Enforce the owner-only posture on the open approvals file (unix)
+/// through the read handle (issue #297: the saved approval state must
+/// never stay readable beyond the owner). The live `approvals.json` can
+/// pre-date the owner-only writer (an older version created it under an
+/// ambient umask), so the read path must repair it on sight — and the
+/// mode is both inspected and tightened through the handle, so the
+/// enforced object is exactly the one whose bytes are being consumed,
+/// never a concurrent replacement at the path. Inspection or tightening
+/// failure fails the read closed instead of consuming policy that may
+/// stay world-readable.
+#[cfg(unix)]
+fn enforce_owner_only(
+    file: &std::fs::File,
+    path: &Path,
+) -> std::result::Result<(), ApprovalsLoadError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let not_owner_only = |error: std::io::Error| ApprovalsLoadError::NotOwnerOnly {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    };
+    let mode = file
+        .metadata()
+        .map_err(not_owner_only)?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode == 0o600 {
+        return Ok(());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(not_owner_only)
+}
+
+/// Off unix there are no owner/group/other mode bits to inspect or
+/// tighten, so there is no owner-only posture to enforce; the read stays
+/// valid.
+#[cfg(not(unix))]
+fn enforce_owner_only(
+    _file: &std::fs::File,
+    _path: &Path,
+) -> std::result::Result<(), ApprovalsLoadError> {
+    Ok(())
+}
+
+/// Best-effort owner-only tightening for a file whose contents are never
+/// consumed: the corrupt live store during quarantine (the read fails
+/// closed regardless, and the preserved copy is owner-only by
+/// construction). Inspection or tightening failure is logged, never
+/// propagated.
+#[cfg(unix)]
+fn tighten_owner_only_best_effort(file: &std::fs::File, path: &Path) {
+    if let Err(refusal) = enforce_owner_only(file, path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %refusal.refusal_message(),
+            "could not tighten the corrupt approvals store to owner-only; nothing is \
+             consumed from it and the read stays failed closed"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_owner_only_best_effort(_file: &std::fs::File, _path: &Path) {}
+
+/// Find a preserved quarantine copy in `dir`, if any. Its presence keeps
+/// approval-dependent actions refused (the store has not been repaired
+/// yet), including a quarantine left by another process.
+///
+/// Fails closed on enumeration failure (issue #297): an unreadable
+/// directory or entry has not established absence of residue, so `Err`
+/// lets callers refuse instead of treating an unestablishable fence as a
+/// clear one. A missing directory is the healthy first-run state — no
+/// residue can exist there.
+fn find_quarantine_residue(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        // An entry that cannot be read may be the residue itself: fail
+        // the scan rather than silently skip it.
+        let path = entry?.path();
+        let is_residue = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(APPROVALS_QUARANTINE_PREFIX));
+        if is_residue {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Fail-closed quarantine-fence check: verifies that no preserved
+/// quarantine copy lingers in `dir`. `Ok(())` means the fence is
+/// established clear; a found residue — or a directory that cannot be
+/// inspected to rule one out — fails the load closed (issue #297).
+fn ensure_no_quarantine_residue(dir: &Path) -> std::result::Result<(), ApprovalsLoadError> {
+    match find_quarantine_residue(dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(residue)) => Err(ApprovalsLoadError::QuarantineResidue(residue)),
+        Err(error) => Err(ApprovalsLoadError::ResidueUnknown {
+            dir: dir.to_path_buf(),
+            error: error.to_string(),
+        }),
+    }
+}
+
+/// Refusal for a store whose corruption was already quarantined earlier
+/// (a live file may parse again — or be missing — but the owner has not
+/// resolved the preserved copy yet). Fail closed until the residue is
+/// resolved.
+fn quarantine_residue_refusal(residue: &Path) -> String {
+    format!(
+        "a corrupt approvals store was quarantined earlier; its original bytes are \
+         preserved at `{}` (never deleted). Approval-dependent actions are refused \
+         until the store is repaired: restore or repair `{}` to valid JSON and \
+         remove the preserved copy, then re-run the action.",
+        residue.display(),
+        residue.with_file_name(APPROVALS_FILE).display(),
+    )
+}
+
+/// Open the `approvals.json.lock` object (creating it if absent). Non-unix
+/// exclusion: a directory flock is not the native primitive, so writers
+/// serialize on this file. Never truncates: the lock file holds no data.
+#[cfg(not(unix))]
+fn open_approvals_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+}
+
+/// Open the cross-process advisory lock guarding `<dir>/approvals.json`
+/// and block until it is held exclusively (issue #297: concurrent writers
+/// used to be able to clobber the store with a stale read-modify-write
+/// snapshot). The lock is released when the returned file is dropped.
+///
+/// Unix serializes on the approvals **directory** itself: the returned
+/// handle is a no-follow directory fd this process has `flock`ed, and
+/// every publish syscall (`openat`/`linkat`/`renameat`) is relative to
+/// that same fd. A directory replaced after acquire is a different
+/// object — publish lands in the detached directory and cannot overwrite
+/// the live path. Acquisition verifies, through the held handle, that
+/// the pathname still refers to the object just locked, and re-acquires
+/// from scratch (bounded) when it does not. A path that keeps being
+/// replaced fails closed.
+#[cfg(unix)]
+fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    const ACQUIRE_ATTEMPTS: u32 = 8;
+    for attempt in 0..ACQUIRE_ATTEMPTS {
+        let file = open_approvals_dir(dir).with_context(|| format!("opening {}", dir.display()))?;
+        // `File::lock` is the std blocking exclusive advisory lock (flock on
+        // unix): cross-process and cross-thread, and it works on a directory.
+        file.lock()
+            .with_context(|| format!("locking {}", dir.display()))?;
+        match same_object_at_path(&file, dir) {
+            Ok(true) => return Ok(file),
+            Ok(false) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    attempt,
+                    "the approvals directory was replaced while the lock was being \
+                     acquired; retrying against the current directory object"
+                );
+                drop(file);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!("verifying the approvals directory at {}", dir.display())
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "the approvals directory at {} kept being replaced while it was being \
+         acquired; refusing to serialize on an unstable directory object",
+        dir.display()
+    );
+}
+
+/// Non-unix exclusion: serialize on `approvals.json.lock` via `LockFileEx`.
+#[cfg(not(unix))]
+fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock_path = dir.join(APPROVALS_LOCK_FILE);
+    const ACQUIRE_ATTEMPTS: u32 = 8;
+    for attempt in 0..ACQUIRE_ATTEMPTS {
+        let file = open_approvals_lock_file(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", lock_path.display()))?;
+        match same_object_at_path(&file, &lock_path) {
+            Ok(true) => return Ok(file),
+            Ok(false) => {
+                tracing::warn!(
+                    path = %lock_path.display(),
+                    attempt,
+                    "the approvals lock path was replaced while the lock was being \
+                     acquired; retrying against the current lock object"
+                );
+                drop(file);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!("verifying the lock object at {}", lock_path.display())
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "the approvals lock at {} kept being replaced while it was being acquired; \
+         refusing to serialize on an unstable lock object",
+        lock_path.display()
+    );
+}
+
+/// Run one read-modify-write cycle on `<dir>/approvals.json` under the
+/// cross-process lock (load → mutate → atomic store while holding the
+/// flocked approvals directory), so concurrent writers serialize instead
+/// of clobbering each other's entries with stale snapshots. The closure
+/// returns `(changed, value)`; the file is rewritten only when `changed`.
+/// A corrupt/unreadable store — or one with an unrepaired quarantine
+/// residue — fails closed with [`ApprovalsLoadError::refusal_message`]:
+/// never a silent `unwrap_or_default()` that would overwrite the corrupt
+/// bytes and drop every standing entry. The lock is the held directory
+/// fd ([`lock_approvals`]); publish is relative to that same fd
+/// ([`store_approvals`]), so a directory replaced mid-cycle cannot
+/// overwrite the live store.
+fn mutate_approvals<R>(
+    dir: &Path,
+    mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
+) -> Result<R> {
+    let _lock = lock_approvals(dir)?;
+    // The lock is already held here, so the load must take the locked
+    // entry point directly (never [`load_approvals`], which would block
+    // re-acquiring the lock it already holds).
+    let mut file = match load_approvals_locked(dir) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(error) => return Err(anyhow::Error::msg(error.refusal_message())),
+    };
+    let (changed, value) = mutate(&mut file);
+    if changed {
+        store_approvals(dir, &_lock, &file)?;
+    }
+    Ok(value)
+}
+
+/// A directory fsync is not a meaningful operation on non-unix platforms;
+/// the atomic write relies on the rename's own ordering guarantees there.
+/// Unix fsyncs the flocked directory fd in [`store_approvals`].
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Create the staging temp for one atomic store publish on non-unix
+/// platforms, where `O_TMPFILE` is unavailable: a fresh `create_new` file
+/// under an unpredictable `approvals.json.tmp-<hex>` name.
+#[cfg(not(unix))]
+fn create_private_store_temp(dir: &Path) -> Result<(std::fs::File, PathBuf)> {
+    const ATTEMPTS: u8 = 32;
+    for _ in 0..ATTEMPTS {
+        let candidate = dir.join(format!("{APPROVALS_FILE}.tmp-{}", random_hex()));
+        match open_new_private_file(&candidate) {
+            Ok(out) => return Ok((out, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not create a unique private temp file in {}",
+        dir.display()
+    )
+}
+
+/// Sixteen random bytes as lowercase hex: the unpredictable staging-name
+/// entropy for exclusive temps.
+fn random_hex() -> String {
+    use rand::Rng as _;
+    use std::fmt::Write as _;
+    let mut raw = [0_u8; 16];
+    rand::rng().fill_bytes(&mut raw);
+    let mut out = String::with_capacity(raw.len() * 2);
+    for byte in raw {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+// Deterministic seam for the publish-boundary race tests (issue #297):
+// fires immediately after the staged inode is written and synced, before
+// the directory-identity fence, so a test can replace the approvals
+// directory in the exact window the fence must catch.
+#[cfg(test)]
+thread_local! {
+    static AFTER_STAGING_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Deterministic seam for the publish-boundary race tests (issue #297):
+// fires after the staged inode has a unique directory entry and
+// immediately before `RENAME_EXCHANGE`, so a test can substitute that
+// entry in the window rollback must close.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLISH_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_staging_hook() {
+    if let Some(hook) = AFTER_STAGING_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_staging_hook() {}
+
+#[cfg(test)]
+fn run_before_publish_rename_hook() {
+    if let Some(hook) = BEFORE_PUBLISH_RENAME_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_before_publish_rename_hook() {}
+
+/// Write `file` to `<dir>/approvals.json` atomically (unnamed owner-only
+/// inode + fsync + fd-bound publish + directory fsync) so a crash
+/// mid-write can't corrupt the store, a crash after publish can't lose
+/// it, and the file is never world-readable. Called with the flocked
+/// approvals directory held; `lock` is that directory fd.
+///
+/// Two invariants bind the publish (issue #297) to held descriptors, not
+/// to a pathname looked up after a separate identity proof:
+///
+/// - **The installed store is the object that was written.** Staging is
+///   `O_TMPFILE` (no directory entry). First write
+///   `linkat(AT_EMPTY_PATH)`s the held inode onto `approvals.json` — the
+///   source is the fd, so a staged-name substitution cannot be
+///   installed. Replace names the inode uniquely and `RENAME_EXCHANGE`s
+///   it with the live entry; if the live entry is then not the held
+///   inode, the exchange is reversed and the previous store is restored.
+///   A failed write drops the unnamed handle: no destination name is
+///   unlinked, so a replacement at a known path is never destroyed.
+/// - **Publish only while the held lock is current.** The lock is this
+///   directory fd; every publish syscall is relative to it. A directory
+///   replaced mid-cycle is a different object — the obsolete writer
+///   publishes into the detached directory and cannot overwrite the live
+///   store. After the act the directory path must still name this fd.
+#[cfg(unix)]
+fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Result<()> {
     let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
-    std::fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    let dest = std::ffi::CString::new(APPROVALS_FILE).expect("APPROVALS_FILE has no NUL");
+    let mut staged = create_staged_private(lock)
+        .with_context(|| format!("creating a staged approvals file in {}", dir.display()))?;
+    {
+        use std::io::Write as _;
+        if let Err(error) = staged
+            .file
+            .write_all(&json)
+            .and_then(|()| staged.file.sync_all())
+        {
+            return Err(anyhow::Error::from(error).context("writing staged approvals"));
+        }
+    }
+    run_after_staging_hook();
+    match same_object_at_path(lock, dir) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals directory at {} no longer refers to the directory object \
+             held for this write; the store was left untouched",
+            dir.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error)).with_context(|| {
+                format!("verifying the approvals directory at {}", dir.display())
+            });
+        }
+    }
+    let _previous = open_live_in_dir(lock, &dest)
+        .with_context(|| format!("opening the live store in {}", dir.display()))?;
+    let published = publish_staged_store(lock, &staged, &dest)
+        .with_context(|| format!("publishing the approvals store in {}", dir.display()))?;
+    match same_object_at_path(lock, dir) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals directory at {} was replaced while the store was being \
+             published; the live store was left untouched",
+            dir.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error)).with_context(|| {
+                format!("verifying the approvals directory at {}", dir.display())
+            });
+        }
+    }
+    match same_object_in_dir(&staged.file, lock, &dest) {
+        Ok(true) => {
+            if let PublishKind::Exchanged { tmp } = published {
+                discard_consumed_tmp(lock, &tmp, &staged.file);
+            }
+        }
+        Ok(false) => {
+            if let PublishKind::Exchanged { tmp } = published {
+                rollback_exchanged_publish(lock, &dest, &tmp).context(
+                    "restoring the previous approvals store after a substituted publish",
+                )?;
+                anyhow::bail!(
+                    "the approvals store write would have installed an entry that is \
+                     not the staged object this process wrote and synced; the previous \
+                     store was restored"
+                );
+            }
+            anyhow::bail!(
+                "the approvals store write did not install the staged object this \
+                 process wrote and synced; the live path was left as found"
+            );
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the published store in {}", dir.display()));
+        }
+    }
+    lock.sync_all()
+        .with_context(|| format!("syncing {}", dir.display()))?;
+    Ok(())
+}
+
+/// Non-unix publish: exclusive named temp + rename. Windows cannot replace
+/// a name whose object is held open without `FILE_SHARE_DELETE`, so the
+/// unix substitution races do not apply.
+#[cfg(not(unix))]
+fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Result<()> {
+    let path = dir.join(APPROVALS_FILE);
+    let lock_path = dir.join(APPROVALS_LOCK_FILE);
+    let json = serde_json::to_vec_pretty(file).context("serializing approvals")?;
+    let (mut out, tmp) = create_private_store_temp(dir)?;
+    {
+        use std::io::Write as _;
+        if let Err(error) = out.write_all(&json).and_then(|()| out.sync_all()) {
+            let write_error =
+                anyhow::Error::from(error).context(format!("writing {}", tmp.display()));
+            discard_partial_private_candidate(out, &tmp);
+            return Err(write_error);
+        }
+    }
+    run_after_staging_hook();
+    match same_object_at_path(&out, &tmp) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "aborting the approvals store write: the staged temp at {} was \
+             substituted before the rename; the store was left untouched",
+            tmp.display()
+        ),
+        Err(error) => {
+            discard_partial_private_candidate(out, &tmp);
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the staged temp at {}", tmp.display()));
+        }
+    }
+    match same_object_at_path(lock, &lock_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            discard_partial_private_candidate(out, &tmp);
+            anyhow::bail!(
+                "the approvals lock at {} no longer refers to the lock object held \
+                 for this write; the store was left untouched",
+                lock_path.display()
+            );
+        }
+        Err(error) => {
+            discard_partial_private_candidate(out, &tmp);
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
+        }
+    }
+    run_before_publish_rename_hook();
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let rename_error =
+            anyhow::Error::from(error).context(format!("renaming into {}", path.display()));
+        discard_partial_private_candidate(out, &tmp);
+        return Err(rename_error);
+    }
+    match same_object_at_path(&out, &path) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals store write installed an entry at {} that is not the \
+             staged object this process wrote and synced (the staged temp was \
+             substituted during the rename); reporting the publish as failed",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the published store at {}", path.display()));
+        }
+    }
+    match same_object_at_path(lock, &lock_path) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "the approvals lock at {} was replaced while the store was being \
+             published; the serialization boundary this write relied on is gone, \
+             so the write is reported as failed",
+            lock_path.display()
+        ),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("verifying the lock object at {}", lock_path.display()));
+        }
+    }
+    sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
     Ok(())
 }
 
@@ -2021,7 +3358,7 @@ mod tests {
 
         assert!(store.is_command_granted(&info.key).await);
         assert_eq!(
-            store.command_grant(&info.key).await,
+            store.command_grant(&info.key).await.unwrap(),
             Some(CommandGrant {
                 scope: Scope::Project,
                 granted_tier: RiskTier::Mutating,
@@ -2039,7 +3376,7 @@ mod tests {
         let cancelled = store.record_command(&info, RiskTier::Ordinary, Scope::Session);
         drop(cancelled);
 
-        assert_eq!(store.command_grant(&info.key).await, None);
+        assert_eq!(store.command_grant(&info.key).await.unwrap(), None);
         assert!(!store.is_command_granted(&info.key).await);
 
         store
@@ -2068,10 +3405,10 @@ mod tests {
             store.command_grant(&info.key),
         );
 
-        assert_eq!(first, Some(Scope::Session));
-        assert_eq!(second, Some(Scope::Session));
+        assert_eq!(first.unwrap(), Some(Scope::Session));
+        assert_eq!(second.unwrap(), Some(Scope::Session));
         assert!(third);
-        assert_eq!(grant, None);
+        assert_eq!(grant.unwrap(), None);
     }
 
     fn column_type(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<String> {
@@ -2119,7 +3456,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.command_grant(&info.key).await,
+            store.command_grant(&info.key).await.unwrap(),
             Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier: RiskTier::Destructive,
@@ -2155,8 +3492,10 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("git", Some("push"), false);
 
+        let _lock = lock_approvals(test_project_dir(&store)).unwrap();
         store_approvals(
             test_project_dir(&store),
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     info.key.as_storage_str(),
@@ -2169,7 +3508,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(store.command_grant(&info.key).await, None);
+        assert_eq!(store.command_grant(&info.key).await.unwrap(), None);
         assert!(!store.is_command_granted(&info.key).await);
     }
 
@@ -2187,7 +3526,7 @@ mod tests {
         info.risk.tier = RiskTier::Destructive;
 
         assert_eq!(
-            store.command_reject_scope(&info.key).await,
+            store.command_reject_scope(&info.key).await.unwrap(),
             Some(Scope::Session)
         );
     }
@@ -2281,8 +3620,10 @@ mod tests {
         let repo_dir = tmp.path().join(".cockpit");
         let command = cmd_info("cargo", Some("test"), false);
         let granted_dir = tmp.path().join("secrets");
+        let _lock = lock_approvals(&repo_dir).unwrap();
         store_approvals(
             &repo_dir,
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     command.key.as_storage_str(),
@@ -2346,8 +3687,10 @@ mod tests {
         );
         let project_dir = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&project_dir).unwrap();
+        let _lock = lock_approvals(&project_dir).unwrap();
         store_approvals(
             &project_dir,
+            &_lock,
             &ApprovalsFile {
                 commands: BTreeMap::from([(
                     "cargo test".to_string(),
@@ -2473,11 +3816,13 @@ mod tests {
                 store
                     .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::Read)
                     .await
+                    .unwrap()
             );
             assert!(
                 !store
                     .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::ReadWrite)
-                    .await,
+                    .await
+                    .unwrap(),
                 "read grant must not satisfy read-write at {scope:?}"
             );
 
@@ -2525,6 +3870,7 @@ mod tests {
                 store
                     .mcp_tool_grant_scope("external", "search/query")
                     .await
+                    .unwrap()
                     .is_none()
             );
             store
@@ -2532,7 +3878,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                store.mcp_tool_grant_scope("external", "search/query").await,
+                store
+                    .mcp_tool_grant_scope("external", "search/query")
+                    .await
+                    .unwrap(),
                 Some(scope),
                 "scope {scope:?}"
             );
@@ -2540,6 +3889,7 @@ mod tests {
                 store
                     .mcp_tool_grant_scope("external/search", "query")
                     .await
+                    .unwrap()
                     .is_none(),
                 "escaped key must not collide with a different server/tool split"
             );
@@ -2587,7 +3937,8 @@ mod tests {
             assert_eq!(
                 reloaded
                     .mcp_tool_grant_scope("external", "search/query")
-                    .await,
+                    .await
+                    .unwrap(),
                 Some(scope),
                 "reload {scope:?}"
             );
@@ -2624,7 +3975,7 @@ mod tests {
             .await
             .unwrap();
 
-        let grants = store.effective_path_grants().await;
+        let grants = store.effective_path_grants().await.unwrap();
         assert!(grants.iter().any(|grant| {
             grant.path == read_dir && grant.access == SandboxPathAccess::ReadWrite
         }));
@@ -2826,11 +4177,11 @@ mod tests {
             let global = tempfile::tempdir().unwrap();
             let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
             let dir = tmp.path().join("secret");
-            assert!(!store.is_path_rejected(&dir.join("k.txt")).await);
+            assert!(!store.is_path_rejected(&dir.join("k.txt")).await.unwrap());
             store.record_path_reject(&dir, scope).await.unwrap();
             // A file under the rejected dir is covered (prefix match).
             assert!(
-                store.is_path_rejected(&dir.join("k.txt")).await,
+                store.is_path_rejected(&dir.join("k.txt")).await.unwrap(),
                 "scope {scope:?}"
             );
             assert!(
@@ -2900,7 +4251,7 @@ mod tests {
             .record_path_reject(&dir, Scope::Session)
             .await
             .unwrap();
-        assert!(store.is_path_rejected(&dir.join("x")).await);
+        assert!(store.is_path_rejected(&dir.join("x")).await.unwrap());
         assert!(
             !store.is_path_granted(&dir.join("x")).await,
             "reject cleared allow"
@@ -2912,7 +4263,7 @@ mod tests {
             .unwrap();
         assert!(store.is_path_granted(&dir.join("x")).await);
         assert!(
-            !store.is_path_rejected(&dir.join("x")).await,
+            !store.is_path_rejected(&dir.join("x")).await.unwrap(),
             "allow cleared reject"
         );
     }
@@ -2928,7 +4279,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search").await,
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Project)
         );
 
@@ -2937,13 +4291,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_reject_scope("external", "search").await,
+            store
+                .mcp_tool_reject_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Session)
         );
         assert!(
             store
                 .mcp_tool_grant_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
 
@@ -2952,13 +4310,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search").await,
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .unwrap(),
             Some(Scope::Global)
         );
         assert!(
             store
                 .mcp_tool_reject_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -3032,7 +4394,7 @@ mod tests {
             store.record_path_reject(&p, Scope::Once).await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(!store.is_path_rejected(&p).await);
+        assert!(!store.is_path_rejected(&p).await.unwrap());
     }
 
     #[tokio::test]
@@ -3111,19 +4473,25 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
-        assert!(store.loop_rule(&sig).await.is_none());
+        assert!(store.loop_rule(&sig).await.unwrap().is_none());
         store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Reject)
+        );
         // Recording the opposite verdict at the same scope flips it (no
         // contradictory pair persists).
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3147,7 +4515,10 @@ mod tests {
         );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
-        assert_eq!(reloaded.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            reloaded.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3168,7 +4539,10 @@ mod tests {
             .await
             .unwrap();
         // Session (reject) wins over project (accept).
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Reject)
+        );
     }
 
     #[tokio::test]
@@ -3186,7 +4560,10 @@ mod tests {
             .await
             .unwrap();
         // Project (accept) wins over global (reject).
-        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
+        assert_eq!(
+            store.loop_rule(&sig).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
     }
 
     #[tokio::test]
@@ -3201,7 +4578,7 @@ mod tests {
                 .await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(store.loop_rule(&sig).await.is_none());
+        assert!(store.loop_rule(&sig).await.unwrap().is_none());
     }
 
     // ---- management API (`/permissions`) ---------------------------------
@@ -3457,6 +4834,7 @@ mod tests {
             store
                 .mcp_tool_grant_scope("external", "search")
                 .await
+                .unwrap()
                 .is_none()
         );
     }
@@ -3467,6 +4845,811 @@ mod tests {
         // No file at all: deleting an absent key returns false, writes nothing.
         assert!(!delete_managed_grant(dir.path(), ManagedGrantKind::Command, "nope").unwrap());
         assert!(!dir.path().join(APPROVALS_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn approvals_store_missing_files_are_healthy_first_run_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        // No approvals.json anywhere: the normal first-run state, not a
+        // refusal.
+        store.approvals_store_health().unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_store_fails_closed_instead_of_dropping_standing_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("rm", Some("-rf"), false);
+
+        // Seed a standing project-scope reject.
+        store
+            .record_command_reject(&info, Scope::Project)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.command_reject_scope(&info.key).await.unwrap(),
+            Some(Scope::Project)
+        );
+
+        // Corrupt the persisted store (as a partial write or disk damage
+        // would).
+        let dir = test_project_dir(&store).to_path_buf();
+        let store_path = dir.join(APPROVALS_FILE);
+        let valid_bytes = std::fs::read(&store_path).unwrap();
+        let corrupt_bytes = b"{\"commands_reject\": ".as_slice();
+        std::fs::write(&store_path, corrupt_bytes).unwrap();
+
+        // The health gate fails closed with a visible, repair-oriented
+        // error — the standing reject is not silently dropped.
+        let err = store.approvals_store_health().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("corrupt"), "{msg}");
+        assert!(msg.contains("approvals.json"), "{msg}");
+        assert!(msg.contains("Restore"), "{msg}");
+
+        // The corrupt bytes were preserved for diagnosis — copied aside,
+        // never deleted — and the live path is left exactly as found for
+        // the owner to repair (never vacated, renamed, or deleted).
+        assert_eq!(std::fs::read(&store_path).unwrap(), corrupt_bytes);
+        let residue = find_quarantine_residue(&dir)
+            .expect("residue enumeration")
+            .expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
+
+        // Still refusing: the store has not been repaired yet.
+        assert!(store.approvals_store_health().is_err());
+
+        // Repair: restore the valid store and remove the quarantine copy.
+        std::fs::write(&store_path, &valid_bytes).unwrap();
+        std::fs::remove_file(&residue).unwrap();
+        store.approvals_store_health().unwrap();
+
+        // The standing reject is honored again.
+        assert_eq!(
+            store.command_reject_scope(&info.key).await.unwrap(),
+            Some(Scope::Project)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_store_fails_the_lookup_itself_closed() {
+        // Issue #297: the health check and the authorization lookup are one
+        // fail-closed operation. A store that goes corrupt between a
+        // decision-boundary health gate and the decision's own lookup must
+        // fail that decision at the lookup — never be consumed as empty
+        // approval state (which would silently drop the standing reject).
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("rm", Some("-rf"), false);
+        store
+            .record_command_reject(&info, Scope::Project)
+            .await
+            .unwrap();
+
+        // Corrupt the persisted store (the TOCTOU window: this lands after
+        // any earlier health check passed). Each detection quarantines the
+        // corrupt copy aside and the residue keeps later reads failed
+        // closed, so both are cleared before re-corrupting for each query
+        // surface.
+        let dir = test_project_dir(&store).to_path_buf();
+        let store_path = dir.join(APPROVALS_FILE);
+        let corrupt_bytes = b"{\"commands_reject\": ".as_slice();
+        let re_corrupt = || {
+            if let Some(residue) = find_quarantine_residue(&dir).expect("residue enumeration") {
+                std::fs::remove_file(residue).unwrap();
+            }
+            std::fs::write(&store_path, corrupt_bytes).unwrap();
+        };
+
+        // The lookup itself refuses with the repair-oriented error — no
+        // separate health check is required for the decision to see the
+        // corruption.
+        re_corrupt();
+        let err = match store.command_reject_scope(&info.key).await {
+            Ok(scope) => panic!("corrupt store must fail the lookup closed, got {scope:?}"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("approvals.json"), "{err}");
+
+        // The first detection quarantined the corrupt bytes and the residue
+        // keeps every later read failed closed. A consecutive lookup must
+        // stay failed closed on its own — the lookup API can never read a
+        // post-quarantine store as healthy approval state, which would
+        // silently drop the standing reject (issue #297).
+        let err = match store.command_reject_scope(&info.key).await {
+            Ok(scope) => panic!("post-quarantine lookup must stay failed closed, got {scope:?}"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("approvals.json"), "{err}");
+        assert!(err.contains("quarantined earlier"), "{err}");
+
+        // The same fail-closed read holds for every other file-backed
+        // query surface.
+        let loop_sig = GrantStore::loop_signature("bash", &serde_json::json!({"command": "ls"}));
+        re_corrupt();
+        assert!(store.loop_rule(&loop_sig).await.is_err());
+        re_corrupt();
+        assert!(
+            store
+                .is_path_granted_for(&tmp.path().join("x"), SandboxPathAccess::Read)
+                .await
+                .is_err()
+        );
+        re_corrupt();
+        assert!(
+            store
+                .mcp_tool_reject_scope("external", "search")
+                .await
+                .is_err()
+        );
+
+        // The corrupt bytes were preserved for diagnosis — copied aside,
+        // never deleted — and the live path was left exactly as found.
+        assert_eq!(std::fs::read(&store_path).unwrap(), corrupt_bytes);
+        let residue = find_quarantine_residue(&dir)
+            .expect("residue enumeration")
+            .expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
+    }
+
+    #[tokio::test]
+    async fn corrupt_global_approvals_store_refuses_the_health_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        std::fs::write(global.path().join(APPROVALS_FILE), b"not json at all").unwrap();
+
+        let err = store.approvals_store_health().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("corrupt"), "{msg}");
+        // The corrupt global store was quarantined, not deleted.
+        let residue = find_quarantine_residue(global.path())
+            .expect("residue enumeration")
+            .expect("global quarantine copy preserved");
+        assert_eq!(
+            std::fs::read(&residue).unwrap(),
+            b"not json at all".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_into_corrupt_approvals_store_fails_closed_without_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("gh", Some("pr"), false);
+
+        // Corrupt the project store before any record.
+        let dir = test_project_dir(&store).to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join(APPROVALS_FILE);
+        let corrupt_bytes = b"{".as_slice();
+        std::fs::write(&store_path, corrupt_bytes).unwrap();
+
+        // A record at project scope must fail closed rather than recreate a
+        // fresh store that silently drops every standing entry.
+        let err = match store
+            .record_command(&info, RiskTier::Mutating, Scope::Project)
+            .await
+        {
+            Ok(()) => panic!("recording into a corrupt store must fail closed"),
+            Err(StoreError::Io(error)) => format!("{error:#}"),
+            Err(other) => panic!("unexpected store error: {other}"),
+        };
+        assert!(err.contains("corrupt"), "{err}");
+
+        // The corrupt bytes are preserved (copied aside, never deleted) and
+        // the active store path was NOT rewritten with a fresh file — it
+        // still holds the corrupt bytes, exactly as found.
+        assert_eq!(std::fs::read(&store_path).unwrap(), corrupt_bytes);
+        let residue = find_quarantine_residue(&dir)
+            .expect("residue enumeration")
+            .expect("quarantine copy preserved");
+        assert_eq!(std::fs::read(&residue).unwrap(), corrupt_bytes);
+    }
+
+    /// Child-probe writer id for the cross-process lock test: the parent
+    /// re-executes this test binary as a separate child process with this
+    /// variable (and the dir variable below) set, and the probe performs
+    /// one locked read-modify-write cycle before returning.
+    const APPROVALS_LOCK_PROBE_WRITER: &str = "COCKPIT_TEST_APPROVALS_LOCK_WRITER";
+    /// Child-probe approvals dir for the cross-process lock test.
+    const APPROVALS_LOCK_PROBE_DIR: &str = "COCKPIT_TEST_APPROVALS_LOCK_DIR";
+
+    #[test]
+    fn approvals_writes_are_serialized_and_owner_private() {
+        // Child-probe mode: run one locked read-modify-write cycle and
+        // return. This keeps the serialization test on the real
+        // cross-process boundary (issue #297) instead of only the
+        // intra-process one: a regression that keeps threads serialized
+        // but loses inter-process exclusion fails the parent's assertions.
+        if let (Ok(writer), Ok(dir)) = (
+            std::env::var(APPROVALS_LOCK_PROBE_WRITER),
+            std::env::var(APPROVALS_LOCK_PROBE_DIR),
+        ) {
+            mutate_approvals(Path::new(&dir), move |file| {
+                file.commands_reject.insert(format!("key-{writer}"));
+                (true, ())
+            })
+            .expect("probe approvals write");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join(APPROVALS_FILE);
+
+        // Stale fixed-name temp, as an earlier crash would leave behind
+        // (issue #297): a staged publish must never consume it — Linux
+        // stages an unnamed inode, and a leftover `.tmp` is not a
+        // destination name.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = dir.path().join(format!("{APPROVALS_FILE}.tmp"));
+            std::fs::write(&tmp, b"stale").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        // Seed one entry.
+        mutate_approvals(dir.path(), |file| {
+            file.commands_reject.insert("seed".to_string());
+            (true, ())
+        })
+        .unwrap();
+
+        // Concurrent read-modify-write cycles must serialize under the
+        // cross-process lock: every writer's entry survives. The writers
+        // are real child processes (the probe mode above) spawned
+        // together, so the lock is exercised across overlapping
+        // processes — a regression that keeps threads serialized but
+        // loses inter-process exclusion clobbers entries here.
+        const WRITERS: u32 = 8;
+        let exe = std::env::current_exe().unwrap();
+        // Libtest test names are the module path from the crate root
+        // (`approval::store::tests::…`) — they are never crate-qualified,
+        // so a `cockpit_core::…` filter matches zero tests and the children
+        // exit successfully without ever entering the probe above. The
+        // current test thread's name is exactly the full libtest test
+        // name, so the child filter self-maintains through renames.
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest names the test thread")
+            .to_string();
+        let mut children = Vec::new();
+        for writer in 0..WRITERS {
+            let child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg(&test_name)
+                .env(APPROVALS_LOCK_PROBE_WRITER, writer.to_string())
+                .env(APPROVALS_LOCK_PROBE_DIR, dir.path().as_os_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawning approvals writer probe");
+            children.push((writer, child));
+        }
+        for (writer, child) in children {
+            let output = child
+                .wait_with_output()
+                .expect("waiting for approvals writer probe");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "writer {writer} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            // The probe must actually run in the child: a filter that
+            // matched zero tests still exits 0, and the entry assertions
+            // below would then prove nothing about the cross-process
+            // boundary.
+            assert!(
+                stdout.contains("1 passed"),
+                "writer {writer} ran no matching test — the libtest filter \
+                 matched nothing\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        for writer in 0..WRITERS {
+            assert!(
+                file.commands_reject.contains(&format!("key-{writer}")),
+                "writer {writer}'s entry was clobbered"
+            );
+        }
+        assert!(file.commands_reject.contains("seed"));
+        assert!(store_path.exists());
+
+        // The store file is never world-readable, and a stale fixed-name
+        // temp is never consumed by a publish (issue #297).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "approvals.json must be owner-only");
+            let stale_tmp = dir.path().join(format!("{APPROVALS_FILE}.tmp"));
+            assert_eq!(
+                std::fs::read(&stale_tmp).unwrap(),
+                b"stale".as_slice(),
+                "a stale fixed-name temp must never be consumed by a publish"
+            );
+            let stale_mode = std::fs::metadata(&stale_tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                stale_mode, 0o666,
+                "an unconsumed stale temp is never touched"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_copies_the_diagnosed_bytes_aside_and_tightens_the_original() {
+        // Quarantine never mutates the live path: a path-based rename
+        // cannot be proven to act on the inspected object at the moment it
+        // takes effect, so the diagnosed bytes are copied aside to a
+        // fresh owner-only copy, and the world-readable corrupt original
+        // is tightened best-effort through the inspected handle
+        // (issue #297).
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APPROVALS_FILE);
+        std::fs::write(&path, b"{corrupt").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut inspected = std::fs::File::open(&path).unwrap();
+        let mut bytes = Vec::new();
+        inspected.read_to_end(&mut bytes).unwrap();
+
+        let preserved = quarantine_corrupt_approvals(&path, &inspected, &bytes)
+            .expect("quarantine preserves the diagnosed bytes");
+        // The live path is left exactly as found — never vacated, renamed,
+        // or deleted — for the owner to repair in place.
+        assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt".as_slice());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"{corrupt".as_slice());
+        let mode = std::fs::metadata(&preserved).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the quarantine copy must be owner-only");
+        let live_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            live_mode, 0o600,
+            "the corrupt original is tightened through the inspected handle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_preserves_the_inspected_object_not_whatever_occupies_the_live_path() {
+        // The bytes are read through an open handle, and by quarantine
+        // time an external repair (or any non-cooperating writer) has
+        // replaced the live path with a valid store. Quarantine must
+        // preserve the object it diagnosed and never touch the
+        // replacement at the live path (issue #297).
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APPROVALS_FILE);
+        std::fs::write(&path, b"{corrupt").unwrap();
+        let mut inspected = std::fs::File::open(&path).unwrap();
+        let mut bytes = Vec::new();
+        inspected.read_to_end(&mut bytes).unwrap();
+        // Replace the path entry (rename, not truncate — the handle keeps
+        // pointing at the corrupt object).
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"{}").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let preserved = quarantine_corrupt_approvals(&path, &inspected, &bytes)
+            .expect("quarantine preserves the inspected object");
+        // The diagnosed bytes are what got preserved, by copy, while the
+        // live path keeps its never-diagnosed replacement.
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"{corrupt".as_slice());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}".as_slice());
+        let mode = std::fs::metadata(&preserved).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the quarantine copy must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_world_readable_approvals_store_repairs_it_to_owner_only() {
+        // A live approvals.json created by the previous ambient-umask
+        // writer can stay world-readable indefinitely on an installation
+        // that only ever reads: the read path itself must tighten it
+        // (issue #297), not just a later durable write.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APPROVALS_FILE);
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        // A plain read, as every lookup performs — no write involved.
+        load_approvals(dir.path()).unwrap().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a healthy read must tighten the live store to owner-only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_preservation_never_overwrites_an_existing_copy() {
+        // The preservation primitive is `create_new`: a colliding
+        // quarantine name fails with `AlreadyExists` instead of replacing
+        // the existing artifact, so a preserved diagnostic copy can never
+        // be destroyed by a later quarantine attempt (issue #297).
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("approvals.json.corrupt-1");
+        write_private_file(&candidate, b"first").unwrap();
+        let err = write_private_file(&candidate, b"second").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"first".as_slice());
+    }
+
+    /// Swap `dir` for a freshly created replacement directory. The held
+    /// directory fd a caller already flocked keeps pointing at the old
+    /// object (renamed aside); the live path names the replacement.
+    #[cfg(unix)]
+    fn replace_approvals_directory(dir: &Path, competing_store: &[u8]) {
+        let parent = dir.parent().expect("approvals dir has a parent");
+        let aside = parent.join(format!("aside-{}", random_hex()));
+        let replacement = parent.join(format!("repl-{}", random_hex()));
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join(APPROVALS_FILE), competing_store).unwrap();
+        std::fs::rename(dir, &aside).unwrap();
+        std::fs::rename(&replacement, dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_never_deletes_a_replacement_at_the_destination() {
+        // Failed-candidate cleanup (issue #297): `write_private_file` is
+        // the production quarantine path. The payload is written to a
+        // held inode with no destination name, then published no-replace.
+        // An occupant at the destination is left exactly as found — never
+        // unlinked, never overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("approvals.json.corrupt-1");
+        std::fs::write(&candidate, b"replacement artifact").unwrap();
+
+        let err = write_private_file(&candidate, b"new diagnostic").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&candidate).unwrap(),
+            b"replacement artifact".as_slice(),
+            "a failed private write must never destroy an object it did not create"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_store_write_never_unlinks_foreign_entries() {
+        // A failed publish drops the unnamed staged handle; it never
+        // pathname-unlinks a destination or a planted diagnostic
+        // (issue #297). Drive the production abort: replace the flocked
+        // directory after staging so the write fails closed.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        AFTER_STAGING_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(dir_path.join("foreign-diagnostic"), b"keep me").unwrap();
+                replace_approvals_directory(&dir_path, br#"{"commands_reject":["competitor"]}"#);
+                std::fs::write(dir_path.join("foreign-diagnostic"), b"keep me").unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["never-landed".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no longer refers to the directory object"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            br#"{"commands_reject":["competitor"]}"#.as_slice(),
+            "the live store in the replacement directory must be left untouched"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("foreign-diagnostic")).unwrap(),
+            b"keep me".as_slice(),
+            "cleanup must never destroy a foreign entry"
+        );
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn store_staging_creates_no_named_temp_before_publish() {
+        // Linux stages with O_TMPFILE: after write+sync there is no
+        // directory entry a non-cooperating writer can substitute
+        // (issue #297). The production AFTER_STAGING seam is the moment
+        // the old named-temp race used to occupy.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        let dir_path = dir.path().to_path_buf();
+        AFTER_STAGING_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                for entry in std::fs::read_dir(&dir_path).unwrap() {
+                    let name = entry.unwrap().file_name();
+                    let name = name.to_string_lossy();
+                    assert!(
+                        !name.starts_with(&format!("{APPROVALS_FILE}.tmp-")),
+                        "O_TMPFILE staging must not create a named temp (found {name})"
+                    );
+                }
+            }));
+        });
+
+        store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["from-unnamed".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap();
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(file.commands_reject.contains("from-unnamed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_aborts_when_the_held_directory_is_replaced() {
+        // The lock is the approvals directory fd (issue #297): if that
+        // directory is replaced while a cycle holds it, publish is
+        // relative to the detached fd and cannot overwrite the live
+        // path. A later cycle converges on the current directory.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        replace_approvals_directory(dir.path(), br#"{"commands_reject":["competitor"]}"#);
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["stolen-boundary".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no longer refers to the directory object"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            br#"{"commands_reject":["competitor"]}"#.as_slice()
+        );
+        drop(lock);
+        mutate_approvals(dir.path(), |file| {
+            file.commands_reject.insert("fresh".to_string());
+            (true, ())
+        })
+        .unwrap();
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(
+            file.commands_reject.contains("fresh"),
+            "a fresh cycle must serialize on the current directory object"
+        );
+        assert!(file.commands_reject.contains("competitor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_aborts_when_the_directory_is_replaced_after_staging() {
+        // Directory-identity fence at the publication boundary, after the
+        // staged inode exists (issue #297): a directory replaced between
+        // staging and publish aborts with the live store untouched. The
+        // unnamed staged handle is dropped — no destination unlink.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        AFTER_STAGING_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                replace_approvals_directory(&dir_path, br#"{"commands_reject":["competitor"]}"#);
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["stolen-boundary".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no longer refers to the directory object"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            br#"{"commands_reject":["competitor"]}"#.as_slice()
+        );
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(&format!("{APPROVALS_FILE}.tmp-")),
+                "a fence abort must not leak a named temp into the live directory (found {name})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_restores_the_previous_store_when_the_exchange_source_is_substituted() {
+        // Replace path (issue #297): after the held inode is given a
+        // unique name, that name can still be substituted in the instant
+        // before RENAME_EXCHANGE. Exchange would install the substitute;
+        // the post-act proof rolls the exchange back so the live store is
+        // the previous object, never attacker-supplied policy — even when
+        // the substitute is valid approval JSON.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let attacker = br#"{"commands_reject":["pwned"]}"#;
+        BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let staged = find_staged_store_temp(&dir_path);
+                std::fs::remove_file(&staged).unwrap();
+                std::fs::write(&staged, attacker).unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["never-reported-success".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("previous store was restored"), "{message}");
+        assert_eq!(
+            std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+            b"{}".as_slice(),
+            "a substituted publish must restore the previous store, not leave \
+             attacker bytes installed"
+        );
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(
+            file.commands_reject.is_empty(),
+            "later reads must not consume attacker-supplied policy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_does_not_overwrite_the_live_store_when_the_directory_is_replaced_in_the_publish_window()
+     {
+        // Publish syscalls are relative to the flocked directory fd
+        // (issue #297): a directory replaced in the unique-name→exchange
+        // window sends the obsolete writer's exchange into the detached
+        // directory. The live path's competing store is not overwritten,
+        // and the write is reported as failed — not a serialized success.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                replace_approvals_directory(&dir_path, br#"{"commands_reject":["competitor"]}"#);
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["boundary-replaced-midact".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("was replaced while the store was being published"),
+            "{message}"
+        );
+        let file = load_approvals(dir.path()).unwrap().unwrap();
+        assert!(
+            file.commands_reject.contains("competitor"),
+            "the competing writer's live store must not be overwritten"
+        );
+        assert!(
+            !file.commands_reject.contains("boundary-replaced-midact"),
+            "the obsolete writer must not install into the live path"
+        );
+    }
+
+    /// The unique name given to the held inode just before exchange, found
+    /// by enumeration: the prefix is fixed, exactly how a non-cooperating
+    /// writer discovers it (issue #297). Test-only.
+    #[cfg(unix)]
+    fn find_staged_store_temp(dir: &Path) -> PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&format!("{APPROVALS_FILE}.tmp-")))
+            })
+            .expect("the unique publish name exists while the publish is in flight")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_acquisition_fails_closed_on_a_symlinked_approvals_directory() {
+        // A planted symlink at the approvals directory must never be
+        // followed (issue #297): acquisition opens with O_NOFOLLOW and
+        // refuses instead of flocking the symlink's target.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join(APPROVALS_FILE), b"{}").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = lock_approvals(&link).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("link"),
+            "refusal must name the symlinked path: {message}"
+        );
+        assert_eq!(
+            std::fs::read(real.join(APPROVALS_FILE)).unwrap(),
+            b"{}".as_slice(),
+            "the symlink's target store must be left untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unenumerable_approvals_dir_fails_the_read_closed_not_open() {
+        // When the approvals directory cannot be inspected, absence of a
+        // preserved quarantine copy has NOT been established: the read
+        // fails closed instead of proceeding as though the fence were
+        // clear (issue #297).
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+        // Traversable but not enumerable (no read bit): the live file can
+        // still be opened, but the residue scan cannot run.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let err = load_approvals(dir.path()).unwrap_err();
+        let msg = err.refusal_message();
+        assert!(msg.contains("could not be searched"), "{msg}");
+        let dir_display = dir.path().display().to_string();
+        assert!(msg.contains(&dir_display), "{msg}");
+
+        // Restore enumerability and the same store reads healthy again.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        load_approvals(dir.path()).unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -3482,8 +5665,11 @@ mod tests {
             .record_loop_rule(&sig_a, LoopVerdict::Accept, Scope::Session)
             .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig_a).await, Some(LoopVerdict::Accept));
-        assert!(store.loop_rule(&sig_b).await.is_none());
+        assert_eq!(
+            store.loop_rule(&sig_a).await.unwrap(),
+            Some(LoopVerdict::Accept)
+        );
+        assert!(store.loop_rule(&sig_b).await.unwrap().is_none());
     }
 
     // ---- live approval-policy reload (approval-policy-live-reload) --------
@@ -3817,17 +6003,25 @@ mod mcp_server_connect_grant_tests {
         assert_eq!(
             store
                 .mcp_server_connect_grant_scope("server", original)
-                .await,
+                .await
+                .unwrap(),
             Some(Scope::Project)
         );
         assert_eq!(
             store
                 .mcp_server_connect_grant_scope("server", changed)
-                .await,
+                .await
+                .unwrap(),
             None
         );
         // A server-connect grant cannot become an external tool grant.
-        assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
+        assert_eq!(
+            store
+                .mcp_tool_grant_scope("server", original)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
 

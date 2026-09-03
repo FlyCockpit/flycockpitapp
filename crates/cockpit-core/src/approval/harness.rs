@@ -15,6 +15,10 @@ impl Approver {
         {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
+        // Issue #297 fail-closed store health gate: this is an
+        // approval-dependent decision, so a corrupt approvals store refuses
+        // with a repair-oriented error instead of proceeding.
+        self.ensure_approvals_store_healthy()?;
         let offered = [Scope::Once, Scope::Session];
         let writes = match policy {
             crate::harness::run::WritePolicy::Direct => "directly into this project",

@@ -229,6 +229,18 @@ async fn approval_for_escalation(
     row: &crate::db::tool_calls::ToolCallEvent,
     grant_offer: Option<&crate::approval::SandboxEscalationGrantOffer>,
 ) -> Result<EscalationApproval> {
+    // Issue #297 fail-closed store health gate: Auto and Manual escalations
+    // consult the approvals store for standing rejects before deciding (and
+    // in Auto mode a dropped reject could otherwise fall through to an
+    // unconfined run). A corrupt store refuses with a repair-oriented error.
+    // Yolo consults nothing, so it skips the gate.
+    if matches!(
+        ctx.session.approval_mode(),
+        ApprovalMode::Manual | ApprovalMode::Auto
+    ) && let Some(approver) = ctx.approver.as_ref()
+    {
+        approver.store().approvals_store_health()?;
+    }
     match ctx.session.approval_mode() {
         ApprovalMode::Yolo => Ok(EscalationApproval::RunUnconfinedOnce),
         ApprovalMode::Manual => prompt_user(ctx, command, row, grant_offer).await,
@@ -236,7 +248,7 @@ async fn approval_for_escalation(
             let standing_reject = if let Some(approver) = ctx.approver.as_ref() {
                 approver
                     .command_standing_reject_scope(command)
-                    .await
+                    .await?
                     .map(|scope| (approver, scope))
             } else {
                 None
@@ -275,7 +287,7 @@ async fn prompt_user(
     let Some(approver) = ctx.approver.as_ref() else {
         return Ok(EscalationApproval::Deny);
     };
-    if let Some(scope) = approver.command_standing_reject_scope(command).await {
+    if let Some(scope) = approver.command_standing_reject_scope(command).await? {
         approver
             .record_standing_reject_decision("bash", command, scope)
             .await;
@@ -447,7 +459,8 @@ mod tests {
             !approver
                 .store()
                 .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
-                .await,
+                .await
+                .unwrap(),
             "yolo must not record grants"
         );
 
@@ -470,7 +483,8 @@ mod tests {
             approver
                 .store()
                 .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
-                .await,
+                .await
+                .unwrap(),
             "manual human grant records path"
         );
 

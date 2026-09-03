@@ -82,6 +82,13 @@ impl Approver {
         wire_input: &serde_json::Value,
         interactive: bool,
     ) -> Result<RepeatDecision> {
+        // Issue #297 fail-closed store health gate: the standing loop rule
+        // below is persisted approval state, so a corrupt store (or
+        // unrepaired quarantine residue) refuses the repeat decision with
+        // a repair-oriented error — including in yolo mode, where a
+        // dropped persisted loop reject would otherwise auto-accept the
+        // repeated effect.
+        self.ensure_approvals_store_healthy()?;
         let signature = GrantStore::loop_signature(tool, wire_input);
         // The decision target is the canonical wire call (what repeated).
         let target = wire_input.to_string();
@@ -89,8 +96,11 @@ impl Approver {
         // Global for loop rules.
         let loop_offered = [Scope::Once, Scope::Session, Scope::Project];
 
-        // 1. Standing rule wins, at any scope.
-        if let Some(verdict) = self.store.loop_rule(&signature).await {
+        // 1. Standing rule wins, at any scope. The lookup itself fails
+        // closed on a corrupt store (issue #297): corruption landing after
+        // the health gate above still refuses this decision instead of
+        // reading as "no rule".
+        if let Some(verdict) = self.store.loop_rule(&signature).await? {
             let repeat = match verdict {
                 LoopVerdict::Accept => RepeatDecision::Accept,
                 LoopVerdict::Reject => RepeatDecision::Reject,

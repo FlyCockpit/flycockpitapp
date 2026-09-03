@@ -264,17 +264,21 @@ impl Approver {
         &self.store
     }
 
-    pub async fn command_standing_reject_scope(&self, command: &str) -> Option<Scope> {
+    /// Standing command reject lookup for pre-decision gates (the Auto-mode
+    /// safety gate and the escalation path). Fail closed on a
+    /// corrupt/unreadable approvals store (issue #297): the caller surfaces
+    /// the refusal instead of treating a corrupt store as "no rejects".
+    pub async fn command_standing_reject_scope(&self, command: &str) -> Result<Option<Scope>> {
         let classification = crate::approval::classify::classify(command);
         for info in classification.simple_commands() {
-            if !info.wrapper
-                && !info.execution_bearing_option
-                && let Some(scope) = self.store.command_reject_scope(&info.key).await
-            {
-                return Some(scope);
+            if info.wrapper || info.execution_bearing_option {
+                continue;
+            }
+            if let Some(scope) = self.store.command_reject_scope(&info.key).await? {
+                return Ok(Some(scope));
             }
         }
-        None
+        Ok(None)
     }
 
     pub async fn record_standing_reject_decision(&self, tool: &str, target: &str, scope: Scope) {
@@ -626,7 +630,7 @@ impl Approver {
         if let Some(scope) = self
             .store
             .mcp_tool_reject_scope_for_key(&grant_target)
-            .await
+            .await?
         {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
@@ -639,7 +643,11 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&grant_target).await {
+        if let Some(scope) = self
+            .store
+            .mcp_tool_grant_scope_for_key(&grant_target)
+            .await?
+        {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -768,7 +776,7 @@ impl Approver {
         let agent = self.agent_id.as_str();
         let target = crate::approval::store::mcp_tool_key(agent, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope(agent, tool).await {
+        if let Some(scope) = self.store.mcp_tool_reject_scope(agent, tool).await? {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "custom_tool",
@@ -780,7 +788,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope(agent, tool).await {
+        if let Some(scope) = self.store.mcp_tool_grant_scope(agent, tool).await? {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "custom_tool",
@@ -902,7 +910,7 @@ impl Approver {
         let target =
             crate::approval::store::mcp_server_connect_key_for(agent, profile, server, identity);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await {
+        if let Some(scope) = self.store.mcp_tool_reject_scope_for_key(&target).await? {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_server_connect",
@@ -914,7 +922,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await {
+        if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await? {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_server_connect",

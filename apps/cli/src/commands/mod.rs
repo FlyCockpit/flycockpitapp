@@ -6,6 +6,55 @@ use std::fmt;
 pub const USAGE_EXIT_CODE: u8 = 64;
 pub const REMOVED_COMMAND_EXIT_CODE: u8 = 2;
 
+/// Canonical workspace key for the cross-workspace history-recall consent
+/// stored under the daemon's `workspace_history_scopes` ledger (issue #299).
+///
+/// `config history-scope` and `trust history-scope` read and write the same
+/// privacy setting, so both commands must send the identical `project_root`
+/// wire key: the resolved workspace trust root for the opened path. The
+/// daemon re-resolves whatever key it receives, but resolving it here as
+/// well makes the shared key explicit and identical by construction
+/// instead of an accident of daemon-side re-resolution.
+pub(crate) fn history_scope_project_root(
+    path: Option<std::path::PathBuf>,
+) -> anyhow::Result<String> {
+    let opened = match path {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+    let trust_root = crate::config::trust::resolve_trust_root(&opened)?;
+    Ok(trust_root.root.display().to_string())
+}
+
+#[cfg(test)]
+mod history_scope_tests {
+    use super::*;
+
+    #[test]
+    fn history_scope_key_is_shared_by_config_and_trust_commands() {
+        // Both commands derive the key through `history_scope_project_root`,
+        // so one path's setting can never become invisible to the other. The
+        // key must be the workspace trust root regardless of which directory
+        // inside the workspace the command was invoked from.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["init"])
+            .output()
+            .expect("run git init");
+        assert!(status.success, "git init failed in {}", repo.display());
+        let subdir = repo.join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let from_root = history_scope_project_root(Some(repo.clone())).unwrap();
+        let from_subdir = history_scope_project_root(Some(subdir)).unwrap();
+        assert_eq!(from_root, from_subdir);
+        assert!(std::path::Path::new(&from_root).is_dir());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandUsageError {
     message: String,

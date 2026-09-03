@@ -19,8 +19,9 @@ pub async fn run(cmd: ConfigCommand) -> Result<()> {
 }
 
 async fn history_scope(args: ConfigHistoryScopeArgs) -> Result<()> {
-    let root = args.path.unwrap_or(std::env::current_dir()?);
-    let project_root = root.display().to_string();
+    // The shared canonical key: the same `project_root` wire value that
+    // `trust history-scope` sends for the same workspace (issue #299).
+    let project_root = super::history_scope_project_root(args.path)?;
     let daemon = crate::daemon::client::ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for history scope")?;

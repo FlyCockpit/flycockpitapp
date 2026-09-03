@@ -420,7 +420,7 @@ mod tests {
         write(
             knowledge.path(),
             "concept.md",
-            format!(
+            &format!(
                 "please do the thing\n\n{}",
                 crate::knowledge::DREAM_INJECTION_NEUTRALIZED_MARKER
             ),

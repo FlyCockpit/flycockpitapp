@@ -33,8 +33,9 @@ use crate::secure_key::{
 };
 
 use super::{
-    AuditEventKind, AuditVerifyResult, AuditVerifyStatus, ChainEntry, ComputerAuditEntryV1,
-    ComputerAuditSealedHeadV1, Disposition, ENTRY_LEN, GuidanceScope, present_bits, verify_chain,
+    AuditErrorCode, AuditEventKind, AuditVerifyResult, AuditVerifyStatus, ChainEntry,
+    ComputerAuditEntryV1, ComputerAuditSealedHeadV1, Disposition, ENTRY_LEN, GuidanceScope,
+    VerificationState, domain_digest, domains, present_bits, verify_chain,
 };
 
 const MAX_CAS_RETRIES: usize = 8;
@@ -159,6 +160,25 @@ pub struct GuidanceAuditAppend {
     pub scope: Option<GuidanceScope>,
 }
 
+/// Fields for a receiver window re-proof audit append (issue #374).
+#[derive(Debug, Clone)]
+pub struct ReceiverReproofAuditAppend {
+    pub kind: AuditEventKind,
+    pub session_id: [u8; 16],
+    pub delegation_id: [u8; 16],
+    pub operation_id: [u8; 16],
+    pub focus_digest: [u8; 32],
+    pub verification_state: VerificationState,
+    pub error_code: AuditErrorCode,
+}
+
+/// Append failure for receiver re-proof journaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverReproofAppendError {
+    Unavailable,
+    ChainBroken,
+}
+
 struct ChainInner {
     hmac_keys: HashMap<u32, SecureKeyBytes>,
     current_key_version: u32,
@@ -276,6 +296,145 @@ impl ComputerAuditChain {
                 Err(error)
             }
         }
+    }
+
+    /// Append one receiver window re-proof attempt (issue #374).
+    pub async fn append_receiver_reproof(
+        &self,
+        event: ReceiverReproofAuditAppend,
+    ) -> Result<(), ReceiverReproofAppendError> {
+        if !self.is_available() {
+            return Err(ReceiverReproofAppendError::Unavailable);
+        }
+        let mut guard = self.inner.lock().await;
+        let inner = guard
+            .as_mut()
+            .ok_or(ReceiverReproofAppendError::Unavailable)?;
+        match self.append_receiver_reproof_locked(inner, &event).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let broken = match self.verify_loaded(inner).await {
+                    Ok(result) => !matches!(
+                        result.status,
+                        AuditVerifyStatus::Verified | AuditVerifyStatus::PendingRecovery
+                    ),
+                    Err(_) => true,
+                };
+                if broken {
+                    self.available.store(false, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn append_receiver_reproof_locked(
+        &self,
+        inner: &mut ChainInner,
+        event: &ReceiverReproofAuditAppend,
+    ) -> Result<(), ReceiverReproofAppendError> {
+        let mut durable_write = false;
+        for _ in 0..MAX_CAS_RETRIES {
+            let loaded = self
+                .keys
+                .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
+                .await
+                .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+            let mut view = loaded.map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+            let mut head = decode_head(view.payload.as_slice())
+                .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+            let mut rows = self
+                .db
+                .list_computer_audit_entries()
+                .await
+                .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+            let status = verify_with(inner, Some(&head), Some(&rows))
+                .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+            match status.status {
+                AuditVerifyStatus::Verified => {}
+                AuditVerifyStatus::PendingRecovery => {
+                    self.confirm_pending_recovery(inner, &mut view, &mut head, &mut rows)
+                        .await
+                        .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
+                }
+                other => {
+                    let _ = other;
+                    return Err(ReceiverReproofAppendError::ChainBroken);
+                }
+            }
+            let sequence = head
+                .confirmed_sequence
+                .checked_add(1)
+                .ok_or(ReceiverReproofAppendError::Unavailable)?;
+            let monotonic = next_monotonic(inner.last_monotonic);
+            let wall_unix_millis = chrono::Utc::now().timestamp_millis();
+            let entry = build_receiver_reproof_entry(
+                event,
+                sequence,
+                head.confirmed_mac,
+                inner.current_key_version,
+                monotonic,
+                wall_unix_millis,
+            );
+            let entry_bytes = entry.encode();
+            let hmac_key = inner
+                .hmac_keys
+                .get(&inner.current_key_version)
+                .ok_or(ReceiverReproofAppendError::Unavailable)?;
+            let mac = super::entry_mac(hmac_key.as_ref(), &entry_bytes);
+            let pending = ComputerAuditSealedHeadV1::with_pending(
+                head.sealed_generation,
+                head.confirmed_sequence,
+                head.confirmed_mac,
+                head.confirmed_key_version,
+                inner.database_instance_id,
+                entry_bytes,
+                mac,
+                head.confirmed_sequence,
+                head.confirmed_mac,
+                inner.current_key_version,
+                inner.database_instance_id,
+            );
+            match self.cas_head(&view, &pending).await {
+                Ok(pending_view) => {
+                    durable_write = true;
+                    view = pending_view;
+                }
+                Err(CasOutcome::Conflict) => continue,
+                Err(CasOutcome::Fatal(_)) => return Err(ReceiverReproofAppendError::Unavailable),
+            }
+            let row = ComputerAuditEntryRow {
+                sequence,
+                entry_bytes,
+                mac,
+                event_kind: event.kind.as_byte(),
+                proposal_id: event.operation_id,
+                key_version: inner.current_key_version,
+            };
+            if self.db.insert_computer_audit_entry(row).await.is_err() {
+                return Err(ReceiverReproofAppendError::Unavailable);
+            }
+            let confirmed = ComputerAuditSealedHeadV1::confirmed_only(
+                head.sealed_generation.saturating_add(1).max(1),
+                sequence,
+                mac,
+                inner.current_key_version,
+                inner.database_instance_id,
+            );
+            match self.cas_head(&view, &confirmed).await {
+                Ok(_) => {
+                    inner.last_monotonic = monotonic;
+                    return Ok(());
+                }
+                Err(CasOutcome::Conflict) => continue,
+                Err(CasOutcome::Fatal(_)) => {
+                    inner.last_monotonic = monotonic;
+                    return Ok(());
+                }
+            }
+        }
+        let _ = durable_write;
+        Err(ReceiverReproofAppendError::Unavailable)
     }
 
     #[cfg(test)]
@@ -987,6 +1146,53 @@ fn created_predecessor_request(event: &GuidanceAuditAppend) -> GuidanceAuditAppe
         disposition: None,
         scope: None,
         ..event.clone()
+    }
+}
+
+fn build_receiver_reproof_entry(
+    event: &ReceiverReproofAuditAppend,
+    sequence: u64,
+    previous_mac: [u8; 32],
+    key_version: u32,
+    monotonic_nanos: u64,
+    wall_unix_millis: i64,
+) -> ComputerAuditEntryV1 {
+    let present_bits_mask = present_bits::SESSION_ID
+        | present_bits::DELEGATION_ID
+        | present_bits::OPERATION_ID
+        | present_bits::FOCUS_DIGEST
+        | present_bits::VERIFICATION_STATE
+        | present_bits::ERROR_CODE;
+    ComputerAuditEntryV1 {
+        event_kind: event.kind,
+        present_bits: present_bits_mask,
+        sequence,
+        previous_mac,
+        session_id: event.session_id,
+        delegation_id: event.delegation_id,
+        action_id: event.operation_id,
+        operation_id: event.operation_id,
+        proposal_id: [0u8; 16],
+        disposition: 0,
+        scope: 0,
+        canonical_project_digest: [0u8; 32],
+        provider_digest: [0u8; 32],
+        model_digest: [0u8; 32],
+        physical_target_digest: [0u8; 32],
+        focus_digest: event.focus_digest,
+        observation_digest: [0u8; 32],
+        host_lease_digest: [0u8; 32],
+        record_digest: [0u8; 32],
+        ask_yolo: 0,
+        action_class: 0,
+        journal_state: 0,
+        verification_state: event.verification_state as u8,
+        journal_version: 0,
+        monotonic_nanos,
+        wall_unix_millis,
+        error_code: event.error_code.as_u16(),
+        rule_kind_bits: 0,
+        key_version,
     }
 }
 

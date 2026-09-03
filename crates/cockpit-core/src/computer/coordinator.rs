@@ -44,6 +44,10 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use super::audit::{
+    AuditErrorCode, AuditEventKind, ComputerAuditChain, ReceiverReproofAuditAppend,
+    VerificationState, domain_digest, domains,
+};
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
     MediaReservationHandle, ObservationId, ProviderMediaVariant, SanitizedComputerFrame,
@@ -54,6 +58,12 @@ use super::host_identity::HostInstallationId;
 use super::observation::{
     GeometryGeneration, ObservationEpoch, TargetGeneration, VerificationStateMachine,
 };
+use super::receiver_reproof::{
+    JournaledReceiverProof, ReceiverReproofFailure, ReceiverReproofOutcome,
+    batch_would_refuse_unproven_receiver_enter, emit_receiver_reproof_telemetry,
+    evidence_matches_journaled_proof, journal_receiver_reproof_attempt, line_clear_action,
+    reproof_operation_id,
+};
 use super::target::{
     BackendKind, FieldEvidence, OpaqueWindowId, PhysicalTargetKey, TargetEvidenceAdapter,
     TargetIdentityEvidence, TargetUnavailableReason,
@@ -63,8 +73,8 @@ use super::{
     ComputerActionOutcome, ComputerBackend, ComputerBatchReport, ComputerError, ComputerFailure,
     ComputerToolContract, DisplayGeometry, EVIDENCED_WINDOW_MISMATCH, NativeComputerWire,
     OpenAiComputerAction, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, TypedInputLineModel,
-    execute_backend_action, normalize_backend_batch, parse_anthropic_20250124_action,
-    parse_anthropic_20251124_action, parse_openai_computer_call,
+    execute_backend_action, normalize_action, normalize_backend_batch,
+    parse_anthropic_20250124_action, parse_anthropic_20251124_action, parse_openai_computer_call,
 };
 
 /// Sole production physical/virtual backend construction factory. Physical
@@ -934,6 +944,13 @@ mod computer_action_prompt_summary_tests {
             Some("(window 0909090909090909…)")
         );
     }
+}
+
+fn audit_id_bytes(label: &str) -> [u8; 16] {
+    let digest = Sha256::digest(label.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
 }
 
 fn canonicalization_failure(index: usize, error: ComputerError) -> CoordinatedOutcome {
@@ -3878,6 +3895,7 @@ pub struct ComputerActionCoordinator {
     outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
     /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
     handoff_journal: Option<Arc<dyn HandoffJournal>>,
+    audit_chain: None,
     /// Per-item outcomes from the most recent batch dispatch (AC12). One
     /// `BatchItemOutcome` per canonical backend item, including
     /// `NotDispatched` tails on early stop.
@@ -3894,6 +3912,15 @@ pub struct ComputerActionCoordinator {
     /// focused receiver and does not rebind (issue #289 remaining
     /// finding 2).
     typed_input_line: TypedInputLineModel,
+    /// Receiver window identity journaled at coordinator open (issue #374).
+    journaled_receiver_proof: Option<JournaledReceiverProof>,
+    /// True after identity-changing keyboard input since the last proof.
+    keyboard_identity_dirty_since_proof: bool,
+    /// When set, the next Enter-class commit requires Ask even on Yolo so a
+    /// human confirms tab/pane residual after window-level re-proof (#374).
+    receiver_enter_requires_terminal_ask: bool,
+    /// Optional audit chain for receiver re-proof evidence receipts (#374).
+    audit_chain: Option<Arc<ComputerAuditChain>>,
 }
 
 impl Drop for ComputerActionCoordinator {
@@ -3951,10 +3978,12 @@ pub struct CoordinatorParams {
     /// physical targets; virtual/test coordinators may inject a memory store
     /// or leave `None` (AC13/AC14).
     pub outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
-    /// Handoff journal for ambiguous physical handoff lifecycle (ExternalJournal
-    /// prepare→dispatching→complete). Required for physical targets; virtual/test
-    /// coordinators may inject a no-op journal or leave `None` (AC15/AC16).
+    /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
     pub handoff_journal: Option<Arc<dyn HandoffJournal>>,
+    audit_chain: None,
+    /// Optional tamper-evident audit chain for receiver re-proof receipts
+    /// (issue #374). Production daemon wiring is deferred post-launch.
+    pub audit_chain: Option<Arc<ComputerAuditChain>>,
 }
 
 /// Evidence adapter owned by one freshly-created virtual display delegation.
@@ -4370,6 +4399,7 @@ impl ComputerActionCoordinator {
             last_live_frame: None,
             outcome_store: params.outcome_store,
             handoff_journal: params.handoff_journal,
+            audit_chain: None,
             batch_item_outcomes: Vec::new(),
             // Review cycle 2, finding 4: a receiver that predates this
             // coordinator — every real desktop, which survives coordinator
@@ -4386,6 +4416,13 @@ impl ComputerActionCoordinator {
             } else {
                 TypedInputLineModel::untracked()
             },
+            journaled_receiver_proof: JournaledReceiverProof::from_open(
+                authorized_window_id,
+                focus_generation.0,
+            ),
+            keyboard_identity_dirty_since_proof: false,
+            receiver_enter_requires_terminal_ask: false,
+            audit_chain: params.audit_chain,
         };
 
         // Ownership crosses exactly once, immediately when the coordinator is
@@ -4609,6 +4646,11 @@ impl ComputerActionCoordinator {
                 ActionRiskClass::classify_with_widget(action, Some(&self.authorized_widget))
             })
             .collect();
+        if self.receiver_enter_requires_terminal_ask
+            && actions.iter().any(ComputerAction::is_enter_class_commit)
+        {
+            self.receiver_enter_requires_terminal_ask = false;
+        }
     }
 
     /// Execute a batch of backend actions through the coordinator. This is
@@ -5294,7 +5336,7 @@ impl ComputerActionCoordinator {
         // creates no approval grant. No Ask lease is required. Focus-sensitive
         // actions still evaluate the identity this dispatch accepts (the
         // open-time pin); they must not skip the gate because Ask is unused.
-        if self.tier == ComputerApprovalTier::Yolo {
+        if self.tier == ComputerApprovalTier::Yolo && !self.receiver_enter_requires_terminal_ask {
             self.refuse_unfocused_dispatch(call_id, actions, self.focus_generation.0)?;
             self.remember_authorized_action_classes(actions);
             return Ok(());
@@ -5458,6 +5500,9 @@ impl ComputerActionCoordinator {
                                     .ask_lease_store
                                     .cancel_pending(&lease_key);
                                 ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                ask_wait
+                                    .coordinator
+                                    .remember_authorized_action_classes(actions);
                                 ask_wait.keep_pending = true;
                                 Ok(())
                             }
@@ -5470,6 +5515,9 @@ impl ComputerActionCoordinator {
                                     AskAuthorizationOutcome::Installed
                                     | AskAuthorizationOutcome::ReusedExisting => {
                                         ask_wait.coordinator.forget_ask_wait_for_key(&lease_key);
+                                        ask_wait
+                                            .coordinator
+                                            .remember_authorized_action_classes(actions);
                                         ask_wait.keep_pending = true;
                                         Ok(())
                                     }
@@ -5962,6 +6010,28 @@ impl ComputerActionCoordinator {
                 .await;
         }
 
+        // Receiver window re-proof (issue #374): evidence-based
+        // re-authentication before Enter on an unproven receiver. Runs before
+        // the typed-line gate so a successful proof clears `receiver_unproven`
+        // and the Enter simulation can proceed.
+        if batch_would_refuse_unproven_receiver_enter(&self.typed_input_line, &backend_actions) {
+            if let Err(failure) = self.receiver_window_reproof_before_enter(call_id).await {
+                let outcome = CoordinatedOutcome::Failed {
+                    failure: ComputerFailure {
+                        index: backend_actions
+                            .iter()
+                            .position(|action| action.is_enter_class_commit())
+                            .unwrap_or(0),
+                        error: ComputerError::Refused(failure.refusal_message().to_string()),
+                    },
+                    screenshot: None,
+                };
+                return self
+                    .persist_pre_dispatch_terminal(call_id, &receipts, outcome, &action_label)
+                    .await;
+            }
+        }
+
         // Typed-input line gate (issue #289, review cycle 1): the per-action
         // canonicalization policy cannot see across actions, so fragmented
         // `TypeText`, single-key chord spelling, and untracked-line commits
@@ -5996,6 +6066,9 @@ impl ComputerActionCoordinator {
         // no approval grant. Focus-sensitive actions are gated inside that
         // path against the identity this dispatch accepts (live Ask snapshot
         // or Yolo's open-time pin), never a stale coordinator generation.
+        // Window-level receiver re-proof alone is never sufficient for an
+        // unattended Enter: [`Self::receiver_enter_requires_terminal_ask`]
+        // forces Ask even on Yolo (#374).
         if let Err(outcome) = self
             .check_ask_lease_for_dispatch(
                 call_id,
@@ -6050,6 +6123,9 @@ impl ComputerActionCoordinator {
                     if self.typed_input_line.absorb_action(action).is_err() {
                         self.typed_input_line.mark_untracked();
                     }
+                    if action.marks_keyboard_identity_dirty() {
+                        self.keyboard_identity_dirty_since_proof = true;
+                    }
                 }
                 Some(BatchItemOutcome::Failed { .. })
                 | Some(BatchItemOutcome::SubmissionUnknown) => {
@@ -6067,11 +6143,151 @@ impl ComputerActionCoordinator {
                     if action.can_change_receiver_identity() {
                         self.typed_input_line.mark_receiver_unproven();
                     }
+                    if action.marks_keyboard_identity_dirty() {
+                        self.keyboard_identity_dirty_since_proof = true;
+                    }
                     break;
                 }
                 _ => break,
             }
         }
+    }
+
+    /// Evidence-based window re-proof before an Enter-class commit on an
+    /// unproven receiver (issue #374). Clears [`TypedInputLineModel`]'s
+    /// `receiver_unproven` only through [`TypedInputLineModel::prove_receiver_on_evidence`].
+    async fn receiver_window_reproof_before_enter(
+        &mut self,
+        call_id: &str,
+    ) -> Result<(), ReceiverReproofFailure> {
+        let operation_id = reproof_operation_id(call_id);
+        let Some(journaled) = self.journaled_receiver_proof else {
+            let failure = ReceiverReproofFailure::EvidenceUnavailable;
+            self.finish_receiver_reproof_attempt(call_id, operation_id, Err(failure));
+            return Err(failure);
+        };
+        if self.keyboard_identity_dirty_since_proof {
+            let failure = ReceiverReproofFailure::KeyboardIdentityDirty;
+            self.finish_receiver_reproof_attempt(call_id, operation_id, Err(failure));
+            return Err(failure);
+        }
+        let evidence = match self.capture_receiver_reproof_evidence() {
+            Ok(evidence) => evidence,
+            Err(failure) => {
+                self.finish_receiver_reproof_attempt(call_id, operation_id, Err(failure));
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = evidence_matches_journaled_proof(&evidence, &journaled) {
+            self.finish_receiver_reproof_attempt(call_id, operation_id, Err(failure));
+            return Err(failure);
+        }
+        if let Err(failure) = self.deliver_receiver_reproof_line_clear().await {
+            self.finish_receiver_reproof_attempt(call_id, operation_id, Err(failure));
+            return Err(failure);
+        }
+        self.typed_input_line.prove_receiver_on_evidence();
+        self.keyboard_identity_dirty_since_proof = false;
+        self.receiver_enter_requires_terminal_ask = true;
+        self.finish_receiver_reproof_attempt(call_id, operation_id, Ok(()));
+        Ok(())
+    }
+
+    fn finish_receiver_reproof_attempt(
+        &self,
+        call_id: &str,
+        operation_id: [u8; 16],
+        result: Result<(), ReceiverReproofFailure>,
+    ) {
+        let (outcome, reason, audit) = match result {
+            Ok(()) => (
+                ReceiverReproofOutcome::Proven,
+                "proven",
+                self.receiver_reproof_audit_append(
+                    call_id,
+                    operation_id,
+                    AuditEventKind::ActionVerified,
+                    VerificationState::Verified,
+                    AuditErrorCode::None,
+                ),
+            ),
+            Err(failure) => (
+                ReceiverReproofOutcome::Refused,
+                failure.refusal_message(),
+                self.receiver_reproof_audit_append(
+                    call_id,
+                    operation_id,
+                    AuditEventKind::ActionVerificationFailed,
+                    VerificationState::Mismatch,
+                    failure.audit_error_code(),
+                ),
+            ),
+        };
+        emit_receiver_reproof_telemetry(
+            &self.session_id,
+            &self.delegation_id.0,
+            call_id,
+            outcome,
+            reason,
+        );
+        let chain = self.audit_chain.clone();
+        tokio::spawn(async move {
+            journal_receiver_reproof_attempt(chain.as_ref(), audit).await;
+        });
+    }
+
+    fn receiver_reproof_audit_append(
+        &self,
+        _call_id: &str,
+        operation_id: [u8; 16],
+        kind: AuditEventKind,
+        verification_state: VerificationState,
+        error_code: AuditErrorCode,
+    ) -> ReceiverReproofAuditAppend {
+        let window = self
+            .journaled_receiver_proof
+            .map(|proof| *proof.window.as_bytes())
+            .unwrap_or([0u8; 16]);
+        ReceiverReproofAuditAppend {
+            kind,
+            session_id: audit_id_bytes(&self.session_id),
+            delegation_id: audit_id_bytes(&self.delegation_id.0),
+            operation_id,
+            focus_digest: domain_digest(domains::FOCUS_GENERATION, &window),
+            verification_state,
+            error_code,
+        }
+    }
+
+    fn capture_receiver_reproof_evidence(
+        &mut self,
+    ) -> Result<TargetIdentityEvidence, ReceiverReproofFailure> {
+        if self.invalidated || self.backend_dead || !self.check_host_lease() {
+            return Err(ReceiverReproofFailure::EvidenceUnavailable);
+        }
+        let Some(adapter) = self.target_adapter.as_mut() else {
+            return Err(ReceiverReproofFailure::EvidenceUnavailable);
+        };
+        adapter
+            .capture_snapshot()
+            .map_err(|_reason| ReceiverReproofFailure::EvidenceUnavailable)
+    }
+
+    async fn deliver_receiver_reproof_line_clear(&mut self) -> Result<(), ReceiverReproofFailure> {
+        if !self.typed_input_line.needs_line_clear_for_reproof() {
+            return Ok(());
+        }
+        let action = line_clear_action();
+        let normalized = normalize_action(&action, &self.geometry)
+            .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
+        self.backend
+            .execute_normalized_one(&normalized)
+            .await
+            .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
+        self.typed_input_line
+            .absorb_action(&action)
+            .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
+        Ok(())
     }
 
     /// Execute a [`NativeComputerCall`] through the coordinator, returning
@@ -7320,6 +7536,7 @@ mod tests {
     struct PhysicalTestSinks {
         outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore>,
         handoff_journal: Arc<dyn HandoffJournal>,
+        audit_chain: None,
         // Declared last so the live DB/journal handles above close before the
         // temporary directory attempts removal.
         _root: tempfile::TempDir,
@@ -7390,6 +7607,7 @@ mod tests {
                 model_id: ModelId("gpt-5".to_string()),
                 outcome_store: Some(self.outcome_store.clone()),
                 handoff_journal: Some(self.handoff_journal.clone()),
+                audit_chain: None,
             }
         }
     }
@@ -7559,6 +7777,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         }
     }
 
@@ -7592,6 +7811,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         }
     }
 
@@ -8503,6 +8723,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: Some(outcome_store.clone()),
             handoff_journal: Some(handoff_journal.clone()),
+            audit_chain: None,
         };
         let mut coordinator_a = ComputerActionCoordinator::open(
             Box::new(PhysicalFakeBackend(FakeBackend::new())),
@@ -8527,6 +8748,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: Some(outcome_store),
             handoff_journal: Some(handoff_journal),
+            audit_chain: None,
         };
         let mut opening_b = Box::pin(ComputerActionCoordinator::open(
             Box::new(PhysicalFakeBackend(FakeBackend::new())),
@@ -10452,6 +10674,298 @@ mod tests {
     }
 
     // =====================================================================
+    // Issue #374: receiver window re-proof + Ask fallback
+    // =====================================================================
+
+    fn ask_coordinator_params(
+        authorizer: Arc<dyn ComputerAuthorizer>,
+        adapter: Box<dyn TargetEvidenceAdapter>,
+    ) -> CoordinatorParams {
+        CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: Some(adapter),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            outcome_store: None,
+            handoff_journal: None,
+            audit_chain: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_after_screenshot_allows_enter_with_ask() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(FakeTargetEvidenceAdapter::new(ask_virtual_evidence())),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call(
+                        "call-reproof-type",
+                        &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+                    )
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "typing stays usable before re-proof"
+        );
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call(
+                        "call-reproof-capture",
+                        &vec![OpenAiComputerAction::Screenshot]
+                    )
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "capture stays usable but unproves the receiver"
+        );
+        let authorized_before_enter = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-reproof-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "re-proof plus Ask must allow a benign Enter, got {outcome:?}"
+        );
+        assert!(
+            authorizer.call_count() > authorized_before_enter,
+            "Enter after window re-proof must still go through Ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_generation_mismatch_refuses_enter() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let adapter = Arc::new(std::sync::Mutex::new(FakeTargetEvidenceAdapter::new(
+            ask_virtual_evidence(),
+        )));
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(SharedFakeAdapter {
+                inner: Arc::clone(&adapter),
+            }),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-mismatch-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-mismatch-capture",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        adapter.lock().unwrap().mutate_window([0xBB; 16]);
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-mismatch-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!("generation mismatch must refuse Enter, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                &failure.error,
+                ComputerError::Refused(reason)
+                if reason.contains("generation token")
+            ),
+            "the refusal must name generation mismatch: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_ask_denial_is_sticky() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::with_decisions(vec![
+            ComputerAuthorizationDecision::Allow,
+            ComputerAuthorizationDecision::Allow,
+            ComputerAuthorizationDecision::Deny {
+                reason: "wrong terminal".to_string(),
+            },
+        ]));
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(FakeTargetEvidenceAdapter::new(ask_virtual_evidence())),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-deny-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call("call-deny-capture", &vec![OpenAiComputerAction::Screenshot])
+            .await;
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-deny-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Denied { .. }),
+            "human deny on post-re-proof Enter must refuse: {outcome:?}"
+        );
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-deny-retry",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Denied { .. }),
+            "Ask denial must stay sticky per delegation: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_identity_changing_chord_unproves_again() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(FakeTargetEvidenceAdapter::new(ask_virtual_evidence())),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-chord-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-chord-capture",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call(
+                        "call-chord-enter",
+                        &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                            keys: vec!["enter".to_string()],
+                        })],
+                    )
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "re-proof plus Ask must restore commits"
+        );
+        coordinator
+            .execute_openai_call(
+                "call-chord-tab",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["TAB".to_string()],
+                })],
+            )
+            .await;
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-chord-enter-again",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => {
+                panic!("identity-changing chord must unprove the receiver again, got {other:?}")
+            }
+        };
+        assert!(
+            matches!(
+                &failure.error,
+                ComputerError::Refused(reason)
+                if reason.contains("identity-changing keyboard input")
+                    || reason.contains("receiving object")
+            ),
+            "the refusal must name receiver re-proof failure: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_forces_ask_on_yolo_enter() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut params = make_coordinator_params_with_focus(authorizer.clone());
+        params.tier = ComputerApprovalTier::Yolo;
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-yolo-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call("call-yolo-capture", &vec![OpenAiComputerAction::Screenshot])
+            .await;
+        let authorized_before_enter = authorizer.call_count();
+        assert!(
+            matches!(
+                coordinator
+                    .execute_openai_call(
+                        "call-yolo-enter",
+                        &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                            keys: vec!["enter".to_string()],
+                        })],
+                    )
+                    .await,
+                CoordinatedOutcome::Completed { .. }
+            ),
+            "Yolo Enter after re-proof must complete once the human confirms"
+        );
+        assert!(
+            authorizer.call_count() > authorized_before_enter,
+            "window-level re-proof alone must not bypass Ask on Yolo Enter"
+        );
+    }
+
+    // =====================================================================
     // Acceptance criterion 5: Duplicate IDs, reconnect, both cancel/handoff
     // orders, backend death, partial batch, host-lock loss, and provider-
     // continuation failure produce at most one backend call and one terminal
@@ -10938,6 +11452,7 @@ mod tests {
             model_id: ModelId("claude-3-5-sonnet".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -11270,6 +11785,7 @@ mod tests {
             model_id: ModelId(model.to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         }
     }
 
@@ -11633,6 +12149,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -11677,6 +12194,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -11797,6 +12315,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -12420,6 +12939,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -12464,6 +12984,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -12898,6 +13419,7 @@ mod tests {
             model_id: ModelId("claude-3-5-sonnet".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13176,6 +13698,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13214,6 +13737,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13261,6 +13785,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(
             Box::new(CountingBackend::new(input_actions.clone())),
@@ -13314,6 +13839,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13354,6 +13880,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13470,6 +13997,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13520,6 +14048,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13610,6 +14139,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13666,6 +14196,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13718,6 +14249,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -13772,6 +14304,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -13827,6 +14360,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let backend = WidgetShiftingBackend {
             inner: FakeBackend::new(),
@@ -13899,6 +14433,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -13952,6 +14487,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let backend = WindowShiftingBackend {
             inner: FakeBackend::new(),
@@ -14017,6 +14553,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -14069,6 +14606,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -14201,6 +14739,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -14281,6 +14820,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -14370,6 +14910,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -14429,6 +14970,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -15004,6 +15546,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -15058,6 +15601,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut coordinator = ComputerActionCoordinator::open(
@@ -15114,6 +15658,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut coordinator = ComputerActionCoordinator::open(

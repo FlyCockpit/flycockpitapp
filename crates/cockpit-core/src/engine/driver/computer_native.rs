@@ -256,6 +256,7 @@ pub(crate) async fn open_native_computer_for_delegation(
             crate::computer::outcome_store::SqliteOutcomeStore::new(session.db.clone()),
         )),
         handoff_journal,
+        audit_chain: None, // TODO(#374): wire daemon `ComputerAuditChain` for production re-proof receipts.
     };
     match ComputerActionCoordinator::open(backend, params).await {
         Ok(coordinator) => {
@@ -980,6 +981,7 @@ mod tests {
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         }
     }
 
@@ -1036,6 +1038,7 @@ mod tests {
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         ComputerActionCoordinator::open(Box::new(CapturingFakeBackend::new()), params)
             .await

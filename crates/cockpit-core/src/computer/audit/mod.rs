@@ -28,7 +28,10 @@
 #![allow(dead_code)] // Extra event kinds and record digests are consumed as the live loop lands.
 
 mod chain;
-pub use chain::{ComputerAuditChain, GuidanceAppendError, GuidanceAuditAppend};
+pub use chain::{
+    ComputerAuditChain, GuidanceAppendError, GuidanceAuditAppend, ReceiverReproofAppendError,
+    ReceiverReproofAuditAppend,
+};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};

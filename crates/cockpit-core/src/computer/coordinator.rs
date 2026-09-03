@@ -9493,10 +9493,7 @@ mod tests {
             self.inner.release_all()
         }
 
-        fn bind_evidenced_window(
-            &mut self,
-            window: target::OpaqueWindowId,
-        ) -> Result<(), ComputerError> {
+        fn bind_evidenced_window(&mut self, window: OpaqueWindowId) -> Result<(), ComputerError> {
             self.inner.bind_evidenced_window(window)
         }
     }

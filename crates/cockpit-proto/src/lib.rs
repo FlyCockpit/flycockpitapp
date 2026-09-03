@@ -2646,6 +2646,10 @@ pub use cockpit_db::wire::{
     SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
+pub use cockpit_db::db::conversation_rules::{
+    ConversationRule, ConversationRuleCreatedBy, ConversationRuleSourceTrust,
+    MAX_CONVERSATION_RULE_TEXT_BYTES, MAX_CONVERSATION_RULES_PER_LINEAGE,
+};
 pub use cockpit_db::db::session_goals::{
     GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };

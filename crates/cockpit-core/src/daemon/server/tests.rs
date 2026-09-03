@@ -744,6 +744,92 @@ fn pin_rpc_registration_tiers_match_spec() {
     }
 }
 
+#[test]
+fn conversation_rule_rpc_registration_tiers_match_spec() {
+    let rows = proto::command!(pin_registration_rows_from_command_table);
+    for kind in [
+        "set_conversation_rule",
+        "remove_conversation_rule",
+        "promote_conversation_rule",
+    ] {
+        let row = rows.iter().find(|row| row.0 == kind).copied();
+        assert!(
+            matches!(row, Some((_, "session_row_writer", "serialized"))),
+            "{kind}: {row:?}"
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.0 == "list_conversation_rules")
+            .copied(),
+        Some((
+            "list_conversation_rules",
+            "session_row_reader",
+            "concurrent"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn conversation_rule_rpc_parity_with_direct_db_calls() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::SetConversationRule {
+            session_id: session.session_id,
+            rule_id: None,
+            text: "prefer pnpm".into(),
+            source_trust: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ConversationRuleChanged { rule } = response else {
+        panic!("expected ConversationRuleChanged, got {response:?}");
+    };
+    assert_eq!(rule.text, "prefer pnpm");
+    assert_eq!(rule.created_by, proto::ConversationRuleCreatedBy::User);
+
+    let response = handle_request(
+        Request::ListConversationRules {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ConversationRules { rules } = response else {
+        panic!("expected ConversationRules, got {response:?}");
+    };
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].rule_id, rule.rule_id);
+
+    let response = handle_request(
+        Request::RemoveConversationRule {
+            session_id: session.session_id,
+            rule_id: rule.rule_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        response,
+        Response::ConversationRuleRemoved { removed: true }
+    ));
+    let listed = ctx
+        .db
+        .list_conversation_rules(session.session_id)
+        .await
+        .unwrap();
+    assert!(listed.is_empty());
+}
+
 #[tokio::test]
 async fn project_note_rpc_parity_with_direct_db_calls() {
     let ctx = test_ctx();
@@ -17869,6 +17955,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_pinned_messages_with_text", "session_row_reader", false)
         | ("list_media_egress_verdicts", "session_row_reader", false)
         | ("pinned_message_state", "session_row_reader", false)
+        | ("list_conversation_rules", "session_row_reader", false)
         | ("read_assistant_inbox", "session_row_reader", false)
         | ("read_agent_tree", "session_row_reader", false)
         | ("read_agent_attention", "session_row_reader", false)
@@ -18488,6 +18575,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: DriverForwarded,
             observation: "SessionWork::Pin delivered to attached worker",
         },
+        MutatingDispatchCase {
+            kind: "promote_conversation_rule",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::PromoteConversationRule delivered to attached worker",
+        },
         #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "store_flycockpit_credential",
@@ -18867,6 +18959,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
+        | "list_conversation_rules"
+        | "set_conversation_rule"
+        | "remove_conversation_rule"
         | "list_project_notes"
         | "create_project_note" => AuthzAllowedOutcome::Response,
         // v10-only owner-remoted sealed-owner channel. The matrix daemon has
@@ -18987,7 +19082,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "prune"
         | "compact"
         | "resume_from_compaction"
-        | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "pin"
+        | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -19243,6 +19339,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("list_pinned_messages_with_text"),
         authz_session_reader("list_media_egress_verdicts"),
         authz_session_reader("pinned_message_state"),
+        authz_session_writer("set_conversation_rule"),
+        authz_session_writer("remove_conversation_rule"),
+        authz_session_reader("list_conversation_rules"),
+        authz_session_writer("promote_conversation_rule"),
         authz_owner_only("begin_sealed_owner_operation"),
         authz_owner_only("apply_sealed_owner_operation"),
         authz_owner_only("cancel_sealed_owner_operation"),
@@ -20774,6 +20874,21 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_pinned_message_seqs" => Request::ListPinnedMessageSeqs { session_id },
         "list_pinned_messages_with_text" => Request::ListPinnedMessagesWithText { session_id },
         "pinned_message_state" => Request::PinnedMessageState { session_id },
+        "set_conversation_rule" => Request::SetConversationRule {
+            session_id,
+            rule_id: None,
+            text: "prefer pnpm".into(),
+            source_trust: None,
+        },
+        "remove_conversation_rule" => Request::RemoveConversationRule {
+            session_id,
+            rule_id: Uuid::nil(),
+        },
+        "list_conversation_rules" => Request::ListConversationRules { session_id },
+        "promote_conversation_rule" => Request::PromoteConversationRule {
+            session_id,
+            rule_id: Uuid::nil(),
+        },
         "begin_sealed_owner_operation" => Request::BeginSealedOwnerOperation {
             disposition: "recover".into(),
             record_id: Some(crate::sealed::identity::SealedRecordId::generate().to_string()),
@@ -22978,6 +23093,8 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "rename_project_note"
         | "delete_project_note"
         | "list_project_notes"
+        | "set_conversation_rule"
+        | "remove_conversation_rule"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
@@ -23038,7 +23155,8 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "prune"
         | "compact"
         | "resume_from_compaction"
-        | "pin" => assert_worker_delivery_happy(case.kind).await,
+        | "pin"
+        | "promote_conversation_rule" => assert_worker_delivery_happy(case.kind).await,
         "cancel_run_invocation" => {
             let ctx = test_ctx();
             let id = Uuid::new_v4();
@@ -23206,6 +23324,8 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "rename_project_note"
         | "delete_project_note"
         | "list_project_notes"
+        | "set_conversation_rule"
+        | "remove_conversation_rule"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
             let ctx = test_ctx();
@@ -23303,7 +23423,8 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "prune"
         | "compact"
         | "resume_from_compaction"
-        | "pin" => assert_attached_required_malformed(case.kind).await,
+        | "pin"
+        | "promote_conversation_rule" => assert_attached_required_malformed(case.kind).await,
         "steer_delegation" => assert_steer_delegation_malformed().await,
         "set_caffeinate" => {
             let ctx = test_ctx();
@@ -23728,6 +23849,10 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
+        "promote_conversation_rule" => Request::PromoteConversationRule {
+            session_id,
+            rule_id: Uuid::nil(),
+        },
         other => panic!("unexpected worker case {other}"),
     };
     let response =
@@ -24046,6 +24171,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(job_id, "job-1");
                 }
                 ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                ("promote_conversation_rule", SessionWork::PromoteConversationRule { rule_id }) => {
+                    assert_eq!(rule_id, Uuid::nil());
+                }
                 ("resume_from_compaction", SessionWork::ResumeFromCompaction { respond_to }) => {
                     respond_to
                         .send(Ok(()))
@@ -24368,6 +24496,10 @@ async fn assert_attached_required_malformed(kind: &str) {
         "compact" => Request::Compact,
         "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin { text: "x".into() },
+        "promote_conversation_rule" => Request::PromoteConversationRule {
+            session_id: Uuid::new_v4(),
+            rule_id: Uuid::nil(),
+        },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("PATH".into(), "/bin".into())]),
         },
@@ -25841,6 +25973,16 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
             session_id: session.session_id,
             seq,
         },
+        "set_conversation_rule" => Request::SetConversationRule {
+            session_id: session.session_id,
+            rule_id: None,
+            text: "prefer pnpm".into(),
+            source_trust: None,
+        },
+        "remove_conversation_rule" => Request::RemoveConversationRule {
+            session_id: session.session_id,
+            rule_id: Uuid::nil(),
+        },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
             name: "new".into(),
@@ -25910,6 +26052,16 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
             name: "a".into(),
             description: "assistant".into(),
             prompt: "help".into(),
+        },
+        "set_conversation_rule" => Request::SetConversationRule {
+            session_id: Uuid::new_v4(),
+            rule_id: None,
+            text: "x".into(),
+            source_trust: None,
+        },
+        "remove_conversation_rule" => Request::RemoveConversationRule {
+            session_id: Uuid::new_v4(),
+            rule_id: Uuid::new_v4(),
         },
         _ => unreachable!(),
     };
@@ -27356,6 +27508,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_leak_reports",
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
+        "list_conversation_rules",
         "list_scheduled_jobs",
         "sealed_owner_inventory",
         "list_sealed_actions",
@@ -28833,6 +28986,45 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: Some(session_id),
             audit_path: None,
             mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::SetConversationRule {
+                session_id,
+                rule_id: None,
+                text: "prefer pnpm".into(),
+                source_trust: None,
+            },
+            kind: "set_conversation_rule",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RemoveConversationRule {
+                session_id,
+                rule_id: Uuid::nil(),
+            },
+            kind: "remove_conversation_rule",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ListConversationRules { session_id },
+            kind: "list_conversation_rules",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::PromoteConversationRule {
+                session_id,
+                rule_id: Uuid::nil(),
+            },
+            kind: "promote_conversation_rule",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
         },
         CommandMetadataCase {
             request: Request::BeginSealedOwnerOperation {

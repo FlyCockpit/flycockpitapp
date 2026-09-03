@@ -109,6 +109,13 @@ pub enum ClientEndpoint {
 }
 
 impl ClientEndpoint {
+    /// True when the endpoint is a discoverable OS transport owner: a Unix
+    /// control socket or a Windows named-pipe identity path. Multi-window hosts
+    /// such as ACP require this and reject the in-process optimization.
+    pub fn is_discoverable_wire_owner(&self) -> bool {
+        matches!(self, Self::Wire(_))
+    }
+
     /// Exchange one opaque, zeroizing payload over the endpoint's dedicated
     /// sensitive channel. The wire pathname and framing transport remain
     /// private to this client layer; presentation code cannot select or
@@ -1368,6 +1375,19 @@ mod tests {
     }
 
     #[test]
+    fn discoverable_wire_owner_matches_wire_endpoint() {
+        assert!(ClientEndpoint::Wire(PathBuf::from("daemon.sock")).is_discoverable_wire_owner());
+    }
+
+    #[test]
+    fn discoverable_wire_owner_rejects_in_process_endpoint() {
+        let (connections, _connection_rx) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _sensitive_rx) = tokio::sync::mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        assert!(!endpoint.is_discoverable_wire_owner());
+    }
+
+    #[test]
     fn owner_capability_path_is_a_pure_function_of_the_control_socket() {
         assert_eq!(
             owner_capability_path(Path::new("/run/user/1000/cockpit/cockpit.sock")),
@@ -1606,6 +1626,29 @@ mod tests {
         DaemonClient::connect(&dir.path().join("missing.sock"))
             .await
             .expect_err("absent endpoint must fail closed");
+    }
+
+    #[tokio::test]
+    async fn wire_connect_loads_owner_capability_for_acp_ingress() {
+        let (dir, socket, mut listener) = bind_test_socket();
+        let capability_path = owner_capability_path(&socket);
+        std::fs::write(&capability_path, b"test-owner-capability-token").unwrap();
+
+        let server = tokio::spawn(async move {
+            let stream = accept_test(&mut listener).await;
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.capability", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
+        });
+
+        let client = DaemonClient::connect(&socket).await.unwrap();
+
+        assert!(client.is_socket_backed());
+        assert!(client.has_owner_capability());
+        assert!(ClientEndpoint::Wire(socket).is_discoverable_wire_owner());
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
     }
 
     #[tokio::test]

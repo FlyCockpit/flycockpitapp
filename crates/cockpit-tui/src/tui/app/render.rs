@@ -1624,6 +1624,9 @@ impl App {
         if self.pins_review.is_some() {
             self.render_pins_review(frame, rects.body);
         }
+        if self.rules_review.is_some() {
+            self.render_rules_review(frame, rects.body);
+        }
 
         // Context menu overlay renders LAST so it sits on top of
         // every other pane. The Clear widget inside the renderer
@@ -1812,6 +1815,27 @@ impl App {
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(crate::tui::pins_overlay::PIN_YELLOW));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    fn render_rules_review(&self, frame: &mut ratatui::Frame, body: Rect) {
+        let Some(review) = self.rules_review.as_ref() else {
+            return;
+        };
+        let inner_w = body.width.saturating_sub(2);
+        let lines = review.render_lines(inner_w);
+        let want = (lines.len() as u16) + 2;
+        let h = want.min(body.height.max(3));
+        let w = body.width;
+        let y = body.y + body.height.saturating_sub(h);
+        let rect = Rect::new(body.x, y, w, h);
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(crate::tui::rules_overlay::RULES_YELLOW));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

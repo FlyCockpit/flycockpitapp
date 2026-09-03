@@ -3826,7 +3826,19 @@ async fn inject_volatile_context(
     // their names/descriptions and frozen `last_dreamed_at` snapshot belong to
     // the spawn-time stable prefix.
     if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
-        inject_live_project_guidance_change(history, cwd, config, redact, tx, &message).await;
+        inject_live_project_guidance_change(history, cwd, config, redact.clone(), tx, &message)
+            .await;
+    }
+    if is_root {
+        let listing = session
+            .db
+            .list_conversation_rules(session.compaction_lineage_root())
+            .await;
+        crate::conversation_rules::inject_conversation_rules_from_listing(
+            history,
+            listing,
+            redact.as_ref(),
+        );
     }
     Ok(())
 }

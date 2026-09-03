@@ -53,6 +53,7 @@ pub mod computer_audit;
 pub mod computer_outcomes;
 #[cfg(feature = "remote")]
 pub mod connector;
+pub mod conversation_rules;
 pub mod execution_containments;
 pub mod external_journal;
 mod files;

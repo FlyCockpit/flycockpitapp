@@ -2,6 +2,10 @@
 
 Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctrl+K` closes it.
 
+## Rules
+
+Conversation rules are lineage-scoped advisory directives. `/rules` opens the panel; `/rule text` creates a user-attributed rule. `d` / `Space` revokes; `p` promotes the rule into the instructions file via a write-scoped subagent.
+
 ## Global
 
 | Key | Action | Description |

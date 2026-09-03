@@ -372,6 +372,505 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
         .collect()
 }
 
+/// Maximum batch actions summarized in one approval prompt (issue #286).
+/// Larger batches summarize the first actions and count the rest.
+const MAX_PROMPT_BATCH_ACTIONS: usize = 8;
+
+/// Render a [`std::time::Duration`] for the human approval prompt.
+fn prompt_duration(duration: std::time::Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
+}
+
+/// Render a [`super::Point`] for the human approval prompt.
+fn prompt_point(point: super::Point) -> String {
+    format!("({}, {})", point.x, point.y)
+}
+
+/// Render mouse modifiers (`ctrl+shift`) for the human approval prompt.
+fn prompt_modifiers(modifiers: super::Modifiers) -> Option<String> {
+    let mut names = Vec::new();
+    if modifiers.shift {
+        names.push("shift");
+    }
+    if modifiers.control {
+        names.push("ctrl");
+    }
+    if modifiers.alt {
+        names.push("alt");
+    }
+    if modifiers.meta {
+        names.push("meta");
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join("+"))
+    }
+}
+
+/// Render a [`super::MouseButton`] for the human approval prompt.
+fn prompt_mouse_button(button: super::MouseButton) -> &'static str {
+    match button {
+        super::MouseButton::Left => "left",
+        super::MouseButton::Right => "right",
+        super::MouseButton::Middle => "middle",
+    }
+}
+
+/// Render a [`super::ClickCount`] for the human approval prompt.
+fn prompt_click_count(count: super::ClickCount) -> &'static str {
+    match count {
+        super::ClickCount::Single => "single",
+        super::ClickCount::Double => "double",
+        super::ClickCount::Triple => "triple",
+    }
+}
+
+/// Render one canonical action as a short human-readable summary for the
+/// approval prompt (issue #286). Typed text is never included here: it
+/// travels in the dedicated [`computer_typed_text_for_prompt`] field so the
+/// approval seam can redact it, and secret-shaped text is withheld outright.
+pub(crate) fn computer_action_summary(action: &ComputerAction) -> String {
+    match action {
+        ComputerAction::CaptureFull => "capture full screen".to_string(),
+        ComputerAction::CaptureRegion { rect } => format!(
+            "capture region at ({}, {}) {}x{} px",
+            rect.x, rect.y, rect.width, rect.height
+        ),
+        ComputerAction::CaptureNativeZoom { rect, scale } => format!(
+            "capture zoomed region at ({}, {}) {}x{} px (scale {})",
+            rect.x, rect.y, rect.width, rect.height, scale.0
+        ),
+        ComputerAction::MoveCursor { to, .. } => {
+            format!("move cursor to {}", prompt_point(*to))
+        }
+        ComputerAction::Click {
+            button,
+            count,
+            modifiers,
+        } => {
+            let mut summary = format!(
+                "click {} {}",
+                prompt_mouse_button(*button),
+                prompt_click_count(*count)
+            );
+            if let Some(mods) = prompt_modifiers(*modifiers) {
+                summary.push_str(&format!(" with {mods}"));
+            }
+            summary
+        }
+        ComputerAction::MouseDown { button } => {
+            format!("press {} mouse button", prompt_mouse_button(*button))
+        }
+        ComputerAction::MouseUp { button } => {
+            format!("release {} mouse button", prompt_mouse_button(*button))
+        }
+        ComputerAction::Drag {
+            button,
+            path,
+            modifiers,
+        } => {
+            let mut summary = match path.first() {
+                Some(first) => format!(
+                    "drag {} from {}",
+                    prompt_mouse_button(*button),
+                    prompt_point(first.point)
+                ),
+                None => format!("drag {}", prompt_mouse_button(*button)),
+            };
+            if path.len() > 1 {
+                summary.push_str(&format!(" along {} points", path.len()));
+            }
+            if let Some(mods) = prompt_modifiers(*modifiers) {
+                summary.push_str(&format!(" with {mods}"));
+            }
+            summary
+        }
+        ComputerAction::TypeText { text } => {
+            // The typed text itself never enters this summary (issue #286):
+            // it travels only in the dedicated redaction-bound field, and
+            // secret-shaped text is withheld outright.
+            if ActionRiskClass::classify(action) == ActionRiskClass::CredentialEntry {
+                format!(
+                    "type text ({} chars, secret-shaped: withheld)",
+                    text.chars().count()
+                )
+            } else {
+                format!("type text ({} chars)", text.chars().count())
+            }
+        }
+        ComputerAction::KeyChord { chord } => {
+            let keys = chord
+                .keys()
+                .iter()
+                .map(|key| key.as_str().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("+");
+            format!("press keys {keys}")
+        }
+        ComputerAction::HoldKey { key, duration } => format!(
+            "hold key {} for {}",
+            key.as_str().to_ascii_lowercase(),
+            prompt_duration(*duration)
+        ),
+        ComputerAction::Scroll {
+            delta_x,
+            delta_y,
+            modifiers,
+        } => {
+            let mut summary = format!("scroll ({delta_x}, {delta_y})");
+            if let Some(mods) = prompt_modifiers(*modifiers) {
+                summary.push_str(&format!(" with {mods}"));
+            }
+            summary
+        }
+        ComputerAction::Wait { duration } => format!("wait {}", prompt_duration(*duration)),
+    }
+}
+
+/// One bounded line for a whole provider action batch in the approval prompt
+/// (issue #286: batches summarize each action). `None` for single-action
+/// batches; typed text appears as a character count only.
+pub(crate) fn computer_batch_summary(actions: &[ComputerAction]) -> Option<String> {
+    if actions.len() <= 1 {
+        return None;
+    }
+    let mut parts: Vec<String> = actions
+        .iter()
+        .take(MAX_PROMPT_BATCH_ACTIONS)
+        .map(computer_action_summary)
+        .collect();
+    if actions.len() > MAX_PROMPT_BATCH_ACTIONS {
+        parts.push(format!(
+            "and {} more",
+            actions.len() - MAX_PROMPT_BATCH_ACTIONS
+        ));
+    }
+    Some(parts.join("; "))
+}
+
+/// The typed text of a TypeText action, carried to the approval seam so the
+/// prompt can render it after redaction (issue #286). The **full**,
+/// untruncated text travels: the seam must scrub registered literals before
+/// it bounds the rendered copy, so any earlier truncation could leak the
+/// surviving prefix of a registered secret that spans the bound. `None` for
+/// every other action kind and for secret-shaped text — novel credential
+/// shapes (`ghp_…`, `sk-…`, JWTs, opaque token runs) or prose naming a
+/// credential — which is never shown in a prompt at all.
+pub(crate) fn computer_typed_text_for_prompt(action: &ComputerAction) -> Option<String> {
+    match action {
+        ComputerAction::TypeText { text } if !crate::redact::text_is_secret_shaped(text) => {
+            Some(text.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Prompt-safe summary of the focused target window (issue #286): the
+/// adapter-redacted title hint plus a short prefix of the opaque window id.
+/// Never a raw title or a full window identity.
+pub(crate) fn target_window_summary(evidence: &TargetIdentityEvidence) -> Option<String> {
+    let title = match &evidence.title_hint {
+        FieldEvidence::Available { value, .. } => Some(value.redacted.as_str()),
+        FieldEvidence::Unavailable { .. } => None,
+    };
+    let id = match &evidence.focused_window_id {
+        FieldEvidence::Available { value, .. } => Some(value.as_bytes()),
+        FieldEvidence::Unavailable { .. } => None,
+    };
+    let id_prefix = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    match (title, id) {
+        (Some(title), Some(id)) => Some(format!("{title} (window {}…)", id_prefix(id))),
+        (Some(title), None) => Some(format!("{title} (window id unavailable)")),
+        (None, Some(id)) => Some(format!("(window {}…)", id_prefix(id))),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod computer_action_prompt_summary_tests {
+    use super::super::host_identity::HostInstallationId;
+    use super::super::target::{
+        BackendKind, EvidenceSource, FieldEvidence, OpaqueWindowId, RedactedHint,
+        empty_unavailable, sample_physical_evidence,
+    };
+    use super::super::{
+        CanonicalKeyChord, ClickCount, ComputerAction, CoordinateSpace, Easing, KeyCode, Modifiers,
+        MouseButton, Point, Rect, TimedPoint,
+    };
+    use super::*;
+    use std::time::Duration;
+
+    fn point(x: f64, y: f64) -> Point {
+        Point {
+            x,
+            y,
+            space: CoordinateSpace::Physical,
+        }
+    }
+
+    #[test]
+    fn action_summary_renders_kind_and_coordinates() {
+        let move_cursor = ComputerAction::MoveCursor {
+            to: point(512.0, 384.0),
+            duration: Duration::from_millis(100),
+            easing: Easing::Linear,
+        };
+        assert_eq!(
+            computer_action_summary(&move_cursor),
+            "move cursor to (512, 384)"
+        );
+
+        let click = ComputerAction::Click {
+            button: MouseButton::Left,
+            count: ClickCount::Double,
+            modifiers: Modifiers {
+                shift: false,
+                control: true,
+                alt: false,
+                meta: false,
+            },
+        };
+        assert_eq!(
+            computer_action_summary(&click),
+            "click left double with ctrl"
+        );
+
+        let capture = ComputerAction::CaptureRegion {
+            rect: Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 800.0,
+                height: 600.0,
+                space: CoordinateSpace::Physical,
+            },
+        };
+        assert_eq!(
+            computer_action_summary(&capture),
+            "capture region at (10, 20) 800x600 px"
+        );
+
+        let drag = ComputerAction::Drag {
+            button: MouseButton::Left,
+            path: vec![
+                TimedPoint {
+                    point: point(1.0, 2.0),
+                    duration: Duration::from_millis(5),
+                    easing: Easing::Linear,
+                },
+                TimedPoint {
+                    point: point(3.0, 4.0),
+                    duration: Duration::from_millis(5),
+                    easing: Easing::Linear,
+                },
+            ],
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(
+            computer_action_summary(&drag),
+            "drag left from (1, 2) along 2 points"
+        );
+
+        let chord = ComputerAction::KeyChord {
+            chord: CanonicalKeyChord::new(vec![
+                KeyCode::parse("ctrl").unwrap(),
+                KeyCode::parse("shift").unwrap(),
+                KeyCode::parse("t").unwrap(),
+            ])
+            .unwrap(),
+        };
+        assert_eq!(
+            computer_action_summary(&chord),
+            "press keys control+shift+t"
+        );
+
+        let hold = ComputerAction::HoldKey {
+            key: KeyCode::parse("enter").unwrap(),
+            duration: Duration::from_millis(500),
+        };
+        assert_eq!(computer_action_summary(&hold), "hold key enter for 500ms");
+
+        let scroll = ComputerAction::Scroll {
+            delta_x: 0,
+            delta_y: -320,
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(computer_action_summary(&scroll), "scroll (0, -320)");
+
+        let wait = ComputerAction::Wait {
+            duration: Duration::from_millis(1500),
+        };
+        assert_eq!(computer_action_summary(&wait), "wait 1.5s");
+    }
+
+    #[test]
+    fn typed_text_secret_shaped_withheld_and_plain_text_carried_in_full() {
+        let plain = ComputerAction::TypeText {
+            text: "hello world".to_string(),
+        };
+        assert_eq!(computer_action_summary(&plain), "type text (11 chars)");
+        assert_eq!(
+            computer_typed_text_for_prompt(&plain).as_deref(),
+            Some("hello world")
+        );
+
+        // Credential words withhold even without a recognizable token
+        // shape: an unknown password typed into a password field must
+        // never render.
+        let secret_words = ComputerAction::TypeText {
+            text: "my password is hunter2".to_string(),
+        };
+        assert!(
+            computer_action_summary(&secret_words).contains("secret-shaped: withheld"),
+            "credential-shaped typed text must never render in the summary"
+        );
+        assert!(
+            computer_typed_text_for_prompt(&secret_words).is_none(),
+            "credential-shaped typed text must never travel to the prompt seam"
+        );
+
+        // Detector-shaped fixtures are assembled from fragments so the
+        // source never contains a contiguous token for the CI secret
+        // scanner to flag; the fence sees the assembled value exactly as
+        // the provider would send it.
+        let novel_shapes = [
+            ["ghp", "_", "16CharMinimumTokenAbCdEfGhIjKlMn"].concat(),
+            ["sk-live-", "0123456789abcdefghijklmnopqrstuv"].concat(),
+            [
+                "eyJ",
+                "hbGciOiJIUzI1NiJ9",
+                ".",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ".",
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6JVQ",
+            ]
+            .concat(),
+            ["dQw4w9WgXcQ", "dQw4w9WgXcQ", "dQw4w9"].concat(),
+        ];
+        for novel in &novel_shapes {
+            let action = ComputerAction::TypeText {
+                text: novel.clone(),
+            };
+            assert!(
+                computer_action_summary(&action).contains("secret-shaped: withheld"),
+                "novel credential-shaped typed text ({novel}) must never render in the summary"
+            );
+            assert!(
+                computer_typed_text_for_prompt(&action).is_none(),
+                "novel credential-shaped typed text ({novel}) must never travel to the prompt seam"
+            );
+        }
+
+        // Long non-secret text is carried in full and untruncated: the
+        // approval seam must scrub before it bounds, so any earlier
+        // truncation could leak the prefix of a registered secret
+        // spanning the render bound.
+        let long_text = "lorem ipsum dolor sit amet. ".repeat(10);
+        let long = ComputerAction::TypeText {
+            text: long_text.clone(),
+        };
+        let carried = computer_typed_text_for_prompt(&long).expect("plain text is carried");
+        assert_eq!(carried, long_text);
+
+        let not_text = ComputerAction::Wait {
+            duration: Duration::from_millis(1),
+        };
+        assert!(computer_typed_text_for_prompt(&not_text).is_none());
+    }
+
+    #[test]
+    fn batch_summary_lists_each_action_and_is_bounded() {
+        let single = [ComputerAction::Wait {
+            duration: Duration::from_millis(1),
+        }];
+        assert!(computer_batch_summary(&single).is_none());
+
+        let pair = [
+            ComputerAction::Wait {
+                duration: Duration::from_millis(10),
+            },
+            ComputerAction::CaptureFull,
+        ];
+        assert_eq!(
+            computer_batch_summary(&pair).as_deref(),
+            Some("wait 10ms; capture full screen")
+        );
+
+        let large: Vec<ComputerAction> = (0..MAX_PROMPT_BATCH_ACTIONS + 2)
+            .map(|index| ComputerAction::Scroll {
+                delta_x: i32::try_from(index).expect("index fits in i32"),
+                delta_y: 0,
+                modifiers: Modifiers::default(),
+            })
+            .collect();
+        let summary = computer_batch_summary(&large).expect("batch summary present");
+        assert!(
+            summary.contains(&format!("and {} more", 2)),
+            "oversized batches count the tail: {summary}"
+        );
+        assert_eq!(
+            summary.matches("; ").count() + 1,
+            MAX_PROMPT_BATCH_ACTIONS + 1
+        );
+    }
+
+    #[test]
+    fn target_window_summary_renders_redacted_title_and_window_id_prefix() {
+        let evidence = sample_physical_evidence(
+            HostInstallationId([1u8; 32]),
+            [2u8; 32],
+            [3u8; 32],
+            [4u8; 16],
+            1234,
+        );
+        // `sample_physical_evidence` titles are adapter-redacted hints, never
+        // the raw window title.
+        assert_eq!(
+            target_window_summary(&evidence).as_deref(),
+            Some("Secr… (window 0404040404040404…)")
+        );
+
+        assert!(target_window_summary(&empty_unavailable(BackendKind::VirtualDisplay)).is_none());
+
+        let title_only = {
+            let mut evidence = empty_unavailable(BackendKind::RealDesktopX11);
+            evidence.title_hint = FieldEvidence::available(
+                RedactedHint::from_raw("Terminal — zsh"),
+                EvidenceSource::InjectedTest,
+            );
+            evidence
+        };
+        assert_eq!(
+            target_window_summary(&title_only).as_deref(),
+            Some("Term… (window id unavailable)")
+        );
+
+        let id_only = {
+            let mut evidence = empty_unavailable(BackendKind::RealDesktopX11);
+            evidence.focused_window_id = FieldEvidence::available(
+                OpaqueWindowId::from_bytes([9u8; 16]),
+                EvidenceSource::InjectedTest,
+            );
+            evidence
+        };
+        assert_eq!(
+            target_window_summary(&id_only).as_deref(),
+            Some("(window 0909090909090909…)")
+        );
+    }
+}
+
 fn canonicalization_failure(index: usize, error: ComputerError) -> CoordinatedOutcome {
     CoordinatedOutcome::Failed {
         failure: ComputerFailure { index, error },
@@ -1621,8 +2120,15 @@ pub enum ComputerApprovalTier {
 ///
 /// Every canonical action goes through this variant. It carries only
 /// engine-owned session/delegation/action IDs, tier, host lease token,
-/// target/focus/observation generations, and safe metadata. No pixel bytes,
-/// raw titles, or provider request payloads are carried.
+/// target/focus/observation generations, and safe metadata. No pixel bytes
+/// or raw titles are carried. The one deliberate payload fragment is the
+/// typed text of a pending TypeText action (issue #286), which travels
+/// in memory solely so the approval seam can render it after the
+/// disclosure fence: secret-shaped text is withheld, registered literals
+/// are scrubbed against the live redaction table, control characters are
+/// flattened, and only then is the render bounded. The raw text never
+/// enters interrupt metadata or a durable record; the rendered, redacted
+/// copy in the approval prompt is what persists with the interrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerActionAuthorization {
     /// Engine-owned session ID.
@@ -1666,6 +2172,25 @@ pub struct ComputerActionAuthorization {
     /// This is intentionally present even for virtual displays, which do not
     /// carry a host lease but still need an exact approval binding.
     pub target_evidence_binding_digest: String,
+    /// Human-readable summary of this concrete action for the approval
+    /// prompt (issue #286): action kind, coordinates, keys, scroll deltas.
+    /// Typed text is excluded; it travels in `typed_text`.
+    pub action_detail: String,
+    /// Typed text of a pending TypeText action, for prompt rendering at the
+    /// approval seam (issue #286). The full, untruncated text travels so the
+    /// seam can scrub registered literals before bounding the render;
+    /// truncating here would leak the surviving prefix of a registered
+    /// secret spanning the render bound. `None` for every other action kind
+    /// and for secret-shaped text, which is never shown in a prompt. The
+    /// raw text never enters interrupt metadata or durable records — only
+    /// the seam's withheld-or-scrubbed, flattened, bounded render does.
+    pub typed_text: Option<String>,
+    /// One bounded line summarizing every action of the batch (issue #286),
+    /// present only for multi-action batches.
+    pub batch_detail: Option<String>,
+    /// Prompt-safe focused target window summary (redacted title hint plus
+    /// an opaque window id prefix), when target evidence is available.
+    pub target_window: Option<String>,
 }
 
 /// The central authorizer trait for computer actions. The real implementation
@@ -1817,14 +2342,14 @@ impl ActionRiskClass {
             | ComputerAction::HoldKey { .. } => Self::StateChanging,
             ComputerAction::TypeText { text } => {
                 // Heuristic advisory classification: never used for denial.
+                // Credential entry reuses the shared secret-shape detector
+                // (novel credential shapes plus credential words) so the
+                // audit class and the prompt disclosure fence
+                // (`computer_typed_text_for_prompt`) agree on what counts as
+                // a credential instead of carrying two divergent keyword
+                // lists.
                 let lower = text.to_ascii_lowercase();
-                if lower.contains("password")
-                    || lower.contains("passwd")
-                    || lower.contains("token")
-                    || lower.contains("secret")
-                    || lower.contains("api_key")
-                    || lower.contains("apikey")
-                {
+                if crate::redact::text_is_secret_shaped(text) {
                     Self::CredentialEntry
                 } else if lower.contains("rm -rf")
                     || lower.contains("delete")
@@ -3777,11 +4302,15 @@ impl ComputerActionCoordinator {
     }
 
     /// Authorize a computer action through the central authorizer.
+    ///
+    /// `target_window` is the prompt-safe focused target window summary
+    /// (issue #286) captured with the pre-await evidence baseline.
     async fn authorize_action(
         &self,
         call_id: &str,
         action_label: &str,
         actions: &[ComputerAction],
+        target_window: Option<&str>,
     ) -> Result<ComputerAuthorizationDecision, ComputerError> {
         let lease_binding_digest = self.host_lease.as_ref().map(host_lease_binding_digest);
         let target_binding_digest = target_evidence_binding_digest(
@@ -3794,6 +4323,9 @@ impl ComputerActionCoordinator {
                 "empty computer action batch".to_string(),
             ));
         }
+        // Prompt-level batch summary (issue #286): each per-action approval
+        // prompt also summarizes the whole pending batch.
+        let batch_detail = computer_batch_summary(actions);
         for (batch_index, action) in actions.iter().enumerate() {
             let request = ComputerActionAuthorization {
                 session_id: self.session_id.clone(),
@@ -3815,6 +4347,10 @@ impl ComputerActionCoordinator {
                 ),
                 lease_binding_digest: lease_binding_digest.clone(),
                 target_evidence_binding_digest: target_binding_digest.clone(),
+                action_detail: computer_action_summary(action),
+                typed_text: computer_typed_text_for_prompt(action),
+                batch_detail: batch_detail.clone(),
+                target_window: target_window.map(str::to_string),
             };
             match self.authorizer.authorize(&request).await? {
                 ComputerAuthorizationDecision::Allow => {}
@@ -3955,25 +4491,30 @@ impl ComputerActionCoordinator {
         // cannot read.
         // Capture into locals first so the adapter borrow ends before any
         // `&mut self` fail-closed bookkeeping below.
-        type PreCaptureSnapshot = Result<(u64, Option<[u8; 16]>), ()>;
+        type PreCaptureSnapshot = Result<(u64, Option<[u8; 16]>, Option<String>), ()>;
         let pre_capture: Option<PreCaptureSnapshot> =
             if let Some(adapter) = self.target_adapter.as_mut() {
                 match adapter.capture_snapshot() {
                     Ok(evidence) => Some(Ok((
                         evidence.focus_generation,
                         evidence.virtual_display_uuid,
+                        // Prompt-safe focused target window summary
+                        // (issue #286): redacted title hint plus an opaque
+                        // window id prefix, captured from the same coherent
+                        // snapshot the pre-await baseline pins.
+                        target_window_summary(&evidence),
                     ))),
                     Err(_reason) => Some(Err(())),
                 }
             } else {
                 None
             };
-        let (pre_await_focus_generation, pre_await_uuid) = match pre_capture {
+        let (pre_await_focus_generation, pre_await_uuid, prompt_target_window) = match pre_capture {
             Some(Ok(baseline)) => baseline,
             Some(Err(())) => {
                 return Err(self.discard_answer_nonsticky(call_id, &lease_key));
             }
-            None => (self.focus_generation.0, virtual_display_uuid),
+            None => (self.focus_generation.0, virtual_display_uuid, None),
         };
         let host_present_pre_await = self.host_lease.is_some();
 
@@ -3981,7 +4522,15 @@ impl ComputerActionCoordinator {
         let approval_version = self.ask_lease_store.begin_approval_wait(&lease_key);
 
         // Authorize through the central authorizer (raises the human prompt).
-        match self.authorize_action(call_id, action_label, actions).await {
+        match self
+            .authorize_action(
+                call_id,
+                action_label,
+                actions,
+                prompt_target_window.as_deref(),
+            )
+            .await
+        {
             Ok(ComputerAuthorizationDecision::Allow) => {
                 // Re-verify live currency AFTER the human answers Allow and
                 // BEFORE install. Two drift classes have different outcomes.

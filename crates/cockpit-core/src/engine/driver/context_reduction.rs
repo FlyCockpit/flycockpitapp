@@ -2390,6 +2390,11 @@ impl Driver {
             return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
         }
 
+        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
+        if let Err(error) = budget.record_compaction(prepared.tokens_after, forward_progress) {
+            return Err(error);
+        }
+
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PreCompact,
             &prepared.source,
@@ -2446,11 +2451,6 @@ impl Driver {
                 })
                 .await;
             return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
-        }
-
-        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
-        if let Err(error) = budget.record_compaction(prepared.tokens_after, forward_progress) {
-            return Err(error);
         }
 
         *window_index = predecessor_window_index.saturating_add(1);

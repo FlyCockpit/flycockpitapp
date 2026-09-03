@@ -4623,11 +4623,309 @@ async fn noninteractive_auto_compact_success_records_boundary_and_signal() {
 }
 
 #[tokio::test]
+async fn noninteractive_auto_compact_guard_trip_leaves_no_durable_boundary() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::driver::NoninteractiveSteerTarget;
+
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            auto_compact_pct: Some(50),
+            ..ContextConfig::default()
+        },
+        10_000,
+    );
+    Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(50),
+        inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
+    });
+    crate::sync::lock_or_recover(driver.test_compact_brief_script.as_ref().unwrap())
+        .push_back(TestCompactSample::Success("compact synthesis ".repeat(40)));
+
+    let mut history = vec![Message::user("x".repeat(60_000))];
+    let saved = history.clone();
+    let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
+    budget.record_compaction(100, false).unwrap();
+    budget.record_compaction(100, false).unwrap();
+    let target = NoninteractiveSteerTarget::new("task-guard", "default");
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let mut window_index = 0;
+
+    let outcome = driver
+        .maybe_noninteractive_auto_compact(&mut history, &budget, &target, &mut window_index, &tx)
+        .await;
+    assert!(outcome.is_err());
+    assert_eq!(history, saved);
+    assert_eq!(window_index, 0);
+    assert_eq!(budget.compact_guard_consecutive(), 3);
+
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.live_id())
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|ev| ev.kind == "subagent_compacted"),
+        "guard trip must not record a durable compaction boundary"
+    );
+}
+
+#[tokio::test]
+async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::driver::{
+        NestedLaneTestHooks, NoninteractiveSteerTarget, nested_lane_test_hooks,
+        run_noninteractive_resumable,
+    };
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect};
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::ToolCall {
+            id: "read-guard".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "seed.txt" }),
+        })
+        .with_usage(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            use_alias_names: false,
+        })
+        .turn(Turn::Text("never reached".into()))
+        .start()
+        .await;
+
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            auto_compact_pct: Some(50),
+            ..ContextConfig::default()
+        },
+        10_000,
+    );
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .url = provider.base_url();
+    Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(50),
+        inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
+    });
+    crate::sync::lock_or_recover(driver.test_compact_brief_script.as_ref().unwrap())
+        .push_back(TestCompactSample::Success("compact synthesis ".repeat(40)));
+
+    nested_lane_test_hooks::set(NestedLaneTestHooks {
+        test_compact_brief_script: driver.test_compact_brief_script.clone(),
+        test_providers_override: driver.test_providers_override.clone(),
+    });
+
+    let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
+    budget.record_compaction(100, false).unwrap();
+    budget.record_compaction(100, false).unwrap();
+
+    let args = driver.spawn_args_delegated_in_cwd(
+        &driver.cwd,
+        false,
+        Vec::new(),
+        None,
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let child = crate::engine::builtin::load("explore", &args).unwrap();
+    let outcome = run_noninteractive_resumable(
+        child,
+        Message::user("continue the delegated task"),
+        vec![Message::user("x".repeat(60_000))],
+        driver.session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.config.clone(),
+        None,
+        driver.interrupts.clone(),
+        tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+        3,
+        64,
+        driver.vnext_local_installation_resolver.clone(),
+        None,
+        None,
+        Some(NoninteractiveSteerTarget::new("task-guard-exec", "default")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(budget),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        outcome.report.contains(
+            "compact-and-continue blocked after repeated compactions with no forward progress"
+        ),
+        "executor must return the guard-trip partial surface: {}",
+        outcome.report
+    );
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.live_id())
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|ev| ev.kind == "subagent_compacted"
+            && ev.task_call_id.as_deref() == Some("task-guard-exec")),
+        "guard trip must not leave a phantom durable boundary"
+    );
+}
+
+#[tokio::test]
+async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_budget() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    use crate::engine::driver::{
+        NestedLaneTestHooks, NoninteractiveSteerTarget, nested_lane_test_hooks,
+        run_noninteractive_resumable,
+    };
+    use cockpit_config::config::delegation_budget::ResolvedDelegationBudget;
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect};
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::ToolCall {
+            id: "read-budget".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "seed.txt" }),
+        })
+        .with_usage(Usage {
+            prompt_tokens: 90,
+            completion_tokens: 1,
+            total_tokens: 91,
+            use_alias_names: true,
+        })
+        .turn(Turn::Text("compact synthesis ".repeat(40)))
+        .with_usage(Usage {
+            prompt_tokens: 15,
+            completion_tokens: 1,
+            total_tokens: 16,
+            use_alias_names: true,
+        })
+        .turn(Turn::Text("never reached".into()))
+        .start()
+        .await;
+
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig {
+            auto_compact_pct: Some(50),
+            ..ContextConfig::default()
+        },
+        10_000,
+    );
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .url = provider.base_url();
+    Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
+        auto_compact_pct: Some(50),
+        inline_caps: None,
+        artifact_spill_bytes: None,
+        artifact_preview_lines: None,
+    });
+
+    nested_lane_test_hooks::set(NestedLaneTestHooks {
+        test_compact_brief_script: None,
+        test_providers_override: driver.test_providers_override.clone(),
+    });
+
+    let budget = crate::engine::delegation_budget::BudgetPool::new(ResolvedDelegationBudget {
+        max_input_tokens: Some(100),
+        ..ResolvedDelegationBudget::unlimited()
+    });
+
+    let args = driver.spawn_args_delegated_in_cwd(
+        &driver.cwd,
+        false,
+        Vec::new(),
+        None,
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let child = crate::engine::builtin::load("explore", &args).unwrap();
+    let outcome = run_noninteractive_resumable(
+        child,
+        Message::user("continue the delegated task"),
+        vec![Message::user("x".repeat(60_000))],
+        driver.session.clone(),
+        driver.locks.clone(),
+        driver.redact.clone(),
+        driver.cwd.clone(),
+        driver.config.clone(),
+        None,
+        driver.interrupts.clone(),
+        tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+        3,
+        64,
+        driver.vnext_local_installation_resolver.clone(),
+        None,
+        None,
+        Some(NoninteractiveSteerTarget::new(
+            "task-budget-exec",
+            "default",
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(budget),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        outcome.report.contains("budget exhausted (input_tokens)"),
+        "post-compaction budget charge must return the partial surface: {}",
+        outcome.report
+    );
+}
+
+#[tokio::test]
 async fn noninteractive_auto_compact_threshold_uses_frame_context_window() {
     use crate::config::providers::{CacheMode, ContextConfig};
     use crate::engine::driver::{NoninteractiveAutoCompactOutcome, NoninteractiveSteerTarget};
 
-    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4643,8 +4941,11 @@ async fn noninteractive_auto_compact_threshold_uses_frame_context_window() {
         },
         1_000,
     );
-    record_test_context_tokens(&driver, 900).await;
-    let mut history = vec![Message::user("x".repeat(600))];
+    record_test_context_tokens(&driver, 100).await;
+    crate::sync::lock_or_recover(driver.test_compact_brief_script.as_ref().unwrap())
+        .push_back(TestCompactSample::Success("compact synthesis ".repeat(40)));
+
+    let mut history = vec![Message::user("x".repeat(60_000))];
     let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
     let target = NoninteractiveSteerTarget::new("task-1", "default");
     let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
@@ -4655,5 +4956,6 @@ async fn noninteractive_auto_compact_threshold_uses_frame_context_window() {
         .maybe_noninteractive_auto_compact(&mut history, &budget, &target, &mut window_index, &tx)
         .await
         .unwrap();
-    assert_eq!(outcome, NoninteractiveAutoCompactOutcome::NoOp);
+    assert_eq!(outcome, NoninteractiveAutoCompactOutcome::Compacted);
+    assert_eq!(window_index, 1);
 }

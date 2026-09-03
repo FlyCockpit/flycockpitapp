@@ -1683,6 +1683,34 @@ pub(in crate::engine::driver) enum CompactForceFailure {
 
 #[cfg(test)]
 #[derive(Clone)]
+pub(in crate::engine::driver) struct NestedLaneTestHooks {
+    pub test_compact_brief_script:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    pub test_providers_override:
+        Option<(crate::config::providers::ProvidersConfig, String, String)>,
+}
+
+#[cfg(test)]
+pub(in crate::engine::driver) mod nested_lane_test_hooks {
+    use std::cell::RefCell;
+
+    use super::NestedLaneTestHooks;
+
+    thread_local! {
+        static HOOKS: RefCell<Option<NestedLaneTestHooks>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(hooks: NestedLaneTestHooks) {
+        HOOKS.with(|slot| *slot.borrow_mut() = Some(hooks));
+    }
+
+    pub fn take() -> Option<NestedLaneTestHooks> {
+        HOOKS.with(|slot| slot.borrow_mut().take())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 enum TestCompactSample {
     Success(String),
     Cancelled,

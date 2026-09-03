@@ -10762,6 +10762,15 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     scheduled_lane_driver.budget = budget.clone();
     scheduled_lane_driver.bind_active_retry_budget();
     let _lane_exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);
+    #[cfg(test)]
+    if let Some(hooks) = super::nested_lane_test_hooks::take() {
+        if let Some(script) = hooks.test_compact_brief_script {
+            scheduled_lane_driver.test_compact_brief_script = Some(script);
+        }
+        if let Some(override_) = hooks.test_providers_override {
+            scheduled_lane_driver.test_providers_override = Some(override_);
+        }
+    }
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {
             scheduled_lane_driver.set_guidance_proposal_service(service.clone());

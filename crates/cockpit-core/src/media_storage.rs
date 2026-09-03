@@ -8962,6 +8962,15 @@ mod tests {
                 use std::os::unix::fs::PermissionsExt as _;
                 assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
             }
+            #[cfg(windows)]
+            {
+                // Windows twin of the 0600 assertion: a stored media component
+                // must carry the protected owner-only DACL.
+                cockpit_host::goal_scratch::verify_private_dacl(
+                    &recovery.owned_root.path().join(id),
+                )
+                .expect("stored media component must be owner-only");
+            }
         }
         let orphan_json = serde_json::to_string(&orphan_ids).unwrap();
         let intent_job = job_id.clone();
@@ -9015,6 +9024,30 @@ mod tests {
                         & 0o777,
                     0o600
                 );
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Windows twin of the 0600 assertion: every retained media
+            // component written for the attachment must carry the protected
+            // owner-only DACL.
+            let storage_ids = db
+                .read(move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1 ORDER BY component_kind",
+                    )?;
+                    Ok(statement
+                        .query_map([attachment_id.to_string()], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(storage_ids.len(), 3);
+            for storage_id in storage_ids {
+                cockpit_host::goal_scratch::verify_private_dacl(
+                    temp.path().join("media").join(storage_id),
+                )
+                .expect("retained media component must be owner-only");
             }
         }
         assert_eq!(
@@ -10579,6 +10612,14 @@ mod tests {
                     std::fs::Permissions::from_mode(0o600),
                 )
                 .unwrap();
+            }
+            #[cfg(windows)]
+            {
+                // Windows twin of the 0600 fixture setup: the manually staged
+                // media object must be made owner-only before the storage
+                // layer verifies it.
+                cockpit_host::goal_scratch::set_private(&root.join(storage_id.to_string()))
+                    .unwrap();
             }
             let file = File::open(root.join(storage_id.to_string())).unwrap();
             let identity = stable_identity_digest(&file).unwrap();

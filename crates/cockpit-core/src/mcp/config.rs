@@ -489,7 +489,7 @@ impl McpConfig {
     }
 
     pub fn write_private(&self, path: &Path) -> Result<()> {
-        cockpit_host::private_fs::ensure_parent_dir_private(path)?;
+        crate::config::files::ensure_config_parent_dir(path)?;
         let body = serde_json::to_string_pretty(self).context("serializing mcp.json")?;
         cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
     }

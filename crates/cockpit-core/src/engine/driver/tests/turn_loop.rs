@@ -2293,13 +2293,13 @@ fn install_turn_budget_does_not_orphan_in_flight_clones() {
     assert!(driver.budget.shares_ledger_with(&schedule_budget));
     assert_eq!(
         in_flight.snapshot().spent.rounds,
-        0,
-        "turn remint resets spend on the shared ledger"
+        1,
+        "turn remint must not forgive spend already charged by in-flight clones"
     );
     in_flight
         .charge_round()
-        .expect("post-remint charge hits the new remaining");
-    assert_eq!(driver.budget.snapshot().spent.rounds, 1);
+        .expect("post-remint charge hits the remaining live ledger");
+    assert_eq!(driver.budget.snapshot().spent.rounds, 2);
 }
 
 #[tokio::test]

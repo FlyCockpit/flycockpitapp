@@ -3133,9 +3133,11 @@ impl Driver {
             .resolved_delegation_budget(root_name, None);
         // Remint the session-live ledger in place. `BudgetPool::new` here
         // would orphan in-flight swarm / background `task` / schedule clones
-        // and fail open on the hierarchical aggregate cap. Stacked children
-        // keep the handle allotted at spawn (overlay already baked into the
-        // local cap); re-allotting would drop `task.budget`.
+        // and fail open on the hierarchical aggregate cap. Remint updates the
+        // ceiling only: spend and the wall-clock origin stay monotonic so
+        // descendants that survived the turn boundary cannot be forgiven.
+        // Stacked children keep the handle allotted at spawn (overlay already
+        // baked into the local cap); re-allotting would drop `task.budget`.
         let root = self.root_budget_handle();
         root.remint_root(resolved);
         self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);

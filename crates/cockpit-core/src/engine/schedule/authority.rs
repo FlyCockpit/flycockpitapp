@@ -652,10 +652,10 @@ impl ScheduleAuthority {
     }
 
     /// Publish the driver's live spend handle so newly spawned swarm/loop
-    /// work allots from the current turn remaining. Turn install remints that
-    /// ledger in place (same Arc); in-flight runners that already cloned a
-    /// handle keep charging it. `start_swarm_now` snapshots once for the
-    /// runner lifetime — it must not mint a disjoint ledger.
+    /// work allots from the current remaining. Turn install remints that
+    /// ledger in place (same Arc, spend kept); in-flight runners that already
+    /// cloned a handle keep charging it. `start_swarm_now` snapshots once for
+    /// the runner lifetime — it must not mint a disjoint ledger.
     pub fn set_budget(&mut self, budget: crate::engine::delegation_budget::BudgetPool) {
         self.ctx.update(|ctx| ctx.budget = budget);
     }

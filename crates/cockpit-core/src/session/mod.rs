@@ -691,7 +691,8 @@ pub struct Session {
     /// briefs must not count as compact-and-continue forward progress.
     pending_forward_progress: std::sync::atomic::AtomicBool,
     /// Catalog prices used to convert usage into `cost_microusd`. Missing
-    /// file yields an empty table (cost dimension stays 0 until prices exist).
+    /// file or model row leaves usage unpriced; a finite cost ceiling then
+    /// fails closed rather than treating unknown cost as free.
     price_table: OnceLock<crate::db::stats::PriceTable>,
     /// Configured endpoints that reported a real prompt-cache hit. This is
     /// deliberately separate from `last_usage`: context chrome may use a

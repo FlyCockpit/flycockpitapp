@@ -3,7 +3,10 @@
 //! One mechanism: a shared remaining pool plus a per-node local cap. Children
 //! charge the same ledger as their parent so a subtree cannot exceed the root
 //! allotment; swarm fan-out shares one pool so K children cannot each spend
-//! the parent's full budget.
+//! the parent's full budget. Remint rebinds the live ceiling in place and
+//! never forgives spend or the wall-clock origin while any handle still
+//! charges that ledger. Unpriced token usage is not free: a finite cost
+//! ceiling rejects it.
 //!
 //! Unlimited is a budget *value* (`ResolvedDelegationBudget` with every
 //! dimension `None`), not a bypass. The compact progress guard and retry
@@ -58,12 +61,19 @@ impl BudgetExhaustion {
 }
 
 /// One charge against the pool.
+///
+/// Token usage without a catalog price is **unpriced**, not free. [`Self::from_usage`]
+/// marks any non-zero token mix unpriced until [`Self::with_cost`] records a
+/// known amount (including a legitimate `$0` row). A finite cost ceiling
+/// rejects unpriced charges; unlimited cost admits them without accumulating
+/// cost spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BudgetCharge {
     pub rounds: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_microusd: u64,
+    unpriced_cost: bool,
 }
 
 impl BudgetCharge {
@@ -75,21 +85,29 @@ impl BudgetCharge {
     }
 
     pub fn from_usage(usage: TokenUsage) -> Self {
+        let input_tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        let output_tokens = usage.output_tokens;
         Self {
             rounds: 0,
             // `input_tokens` already includes cached reads. Cache-creation
             // tokens are billed in addition (Anthropic cache writes).
-            input_tokens: usage
-                .input_tokens
-                .saturating_add(usage.cache_creation_input_tokens),
-            output_tokens: usage.output_tokens,
+            input_tokens,
+            output_tokens,
             cost_microusd: 0,
+            unpriced_cost: input_tokens > 0 || output_tokens > 0,
         }
     }
 
     pub fn with_cost(mut self, cost_microusd: u64) -> Self {
         self.cost_microusd = cost_microusd;
+        self.unpriced_cost = false;
         self
+    }
+
+    pub fn is_unpriced(self) -> bool {
+        self.unpriced_cost
     }
 
     pub fn is_empty(self) -> bool {
@@ -103,6 +121,7 @@ impl AddAssign for BudgetCharge {
         self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
         self.cost_microusd = self.cost_microusd.saturating_add(rhs.cost_microusd);
+        self.unpriced_cost |= rhs.unpriced_cost;
     }
 }
 
@@ -325,8 +344,9 @@ struct LocalState {
 /// Hierarchical spend pool. Clone is cheap (shared ledger + per-node local
 /// cap). Swarm children should [`BudgetPool::share`] so they spend one pool.
 /// Liveness guards (compact progress, retry pacing) live beside the spend
-/// ledger: reminting spend does not have to reset them, and retry pacing is
-/// exposable to inference without a pool handle.
+/// ledger: reminting the ceiling does not reset them, and retry pacing is
+/// exposable to inference without a pool handle. Spend on a live ledger is
+/// monotonic — remint never forgives it.
 #[derive(Clone)]
 pub struct BudgetPool {
     ledger: Arc<Mutex<SharedLedger>>,
@@ -379,25 +399,17 @@ impl BudgetPool {
     /// each consume a full root cap. Lock order matches [`Self::charge`]:
     /// ledger, then local.
     ///
-    /// Allotted children's local caps are untouched (they keep the overlay
-    /// baked in at spawn). Compact progress and retry pacing are liveness
-    /// guards and are not reset here.
+    /// Spend and the wall-clock origin are monotonic on a live ledger. A new
+    /// user turn may raise or lower the ceiling; it must not forgive charges
+    /// already made by descendants that survived the turn boundary. Allotted
+    /// children's local caps are untouched (they keep the overlay baked in at
+    /// spawn). Compact progress and retry pacing are liveness guards and are
+    /// not reset here.
     pub fn remint_root(&self, ceiling: ResolvedDelegationBudget) {
-        let now = Instant::now();
         let mut ledger = lock_or_recover(&self.ledger);
         let mut local = lock_or_recover(&self.local);
         ledger.ceiling = ceiling;
-        ledger.spent_rounds = 0;
-        ledger.spent_input_tokens = 0;
-        ledger.spent_output_tokens = 0;
-        ledger.spent_cost_microusd = 0;
-        ledger.started_at = now;
         local.ceiling = ceiling;
-        local.spent_rounds = 0;
-        local.spent_input_tokens = 0;
-        local.spent_output_tokens = 0;
-        local.spent_cost_microusd = 0;
-        local.started_at = now;
     }
 
     /// Shared view of this pool (swarm fan-out). Children charge the same
@@ -484,10 +496,16 @@ impl BudgetPool {
         self.charge(BudgetCharge::round())
     }
 
+    /// Charge provider-reported tokens. Cost is unpriced until the caller
+    /// applies [`BudgetCharge::with_cost`]; a finite cost ceiling rejects
+    /// that as exhaustion rather than treating unknown cost as free.
     pub fn charge_usage(&self, usage: TokenUsage) -> Result<(), BudgetExhaustion> {
         self.charge(BudgetCharge::from_usage(usage))
     }
 
+    /// Admit `charge` against both the shared ledger and this handle's local
+    /// cap. Unpriced token usage (`BudgetCharge::is_unpriced`) is exhaustion
+    /// on any finite cost ceiling; it is not recorded as free.
     pub fn charge(&self, charge: BudgetCharge) -> Result<(), BudgetExhaustion> {
         let mut ledger = lock_or_recover(&self.ledger);
         let mut local = lock_or_recover(&self.local);
@@ -535,6 +553,16 @@ impl BudgetPool {
             drop(ledger);
             return Err(BudgetExhaustion {
                 dimension,
+                snapshot: self.snapshot(),
+            });
+        }
+        if charge.unpriced_cost
+            && (unpriced_cost_blocked(ledger.ceiling) || unpriced_cost_blocked(local.ceiling))
+        {
+            drop(local);
+            drop(ledger);
+            return Err(BudgetExhaustion {
+                dimension: BudgetDimension::Cost,
                 snapshot: self.snapshot(),
             });
         }
@@ -638,6 +666,10 @@ fn would_exceed(ceiling: ResolvedDelegationBudget, spent: BudgetSpend) -> Option
         return Some(BudgetDimension::WallClock);
     }
     None
+}
+
+fn unpriced_cost_blocked(ceiling: ResolvedDelegationBudget) -> bool {
+    ceiling.max_cost_microusd.is_some()
 }
 
 /// Partial-result prefix used at every exhaustion seam.
@@ -771,10 +803,14 @@ mod tests {
             cached_input_tokens: 4,
             cache_creation_input_tokens: 7,
         };
-        let charge = BudgetCharge::from_usage(usage).with_cost(42);
+        let unpriced = BudgetCharge::from_usage(usage);
+        assert!(unpriced.is_unpriced());
+        assert_eq!(unpriced.cost_microusd, 0);
+        let charge = unpriced.with_cost(42);
         assert_eq!(charge.input_tokens, 17);
         assert_eq!(charge.output_tokens, 3);
         assert_eq!(charge.cost_microusd, 42);
+        assert!(!charge.is_unpriced());
     }
 
     #[test]
@@ -846,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn remint_root_keeps_ledger_identity_and_resets_spend() {
+    fn remint_root_keeps_ledger_identity_and_spend() {
         let root = BudgetPool::new(ResolvedDelegationBudget {
             max_rounds: Some(2),
             ..ResolvedDelegationBudget::unlimited()
@@ -859,10 +895,35 @@ mod tests {
             ..ResolvedDelegationBudget::unlimited()
         });
         assert!(root.shares_ledger_with(&in_flight));
-        assert_eq!(in_flight.snapshot().spent.rounds, 0);
-        in_flight.charge_round().unwrap();
+        assert_eq!(
+            in_flight.snapshot().spent.rounds,
+            1,
+            "remint must not forgive in-flight spend on the live ledger"
+        );
+        assert_eq!(
+            in_flight.snapshot().local_spent.rounds,
+            1,
+            "remint must not rewind the reminted handle's local spend"
+        );
         in_flight.charge_round().unwrap();
         assert!(in_flight.charge_round().is_err());
+        assert_eq!(root.snapshot().spent.rounds, 2);
+    }
+
+    #[test]
+    fn remint_root_lowering_ceiling_below_spent_exhausts() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(4),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        root.charge_round().unwrap();
+        root.charge_round().unwrap();
+        root.remint_root(ResolvedDelegationBudget {
+            max_rounds: Some(1),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let err = root.charge_round().unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::Rounds);
         assert_eq!(root.snapshot().spent.rounds, 2);
     }
 
@@ -888,5 +949,105 @@ mod tests {
         );
         root.charge_round().unwrap();
         assert_eq!(root.snapshot().spent.rounds, 2);
+    }
+
+    #[test]
+    fn remint_root_does_not_reset_allotted_child_local_spent() {
+        let root = BudgetPool::new(ResolvedDelegationBudget {
+            max_rounds: Some(8),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let child = root.allot(ResolvedDelegationBudget {
+            max_rounds: Some(3),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        child.charge_round().unwrap();
+        child.charge_round().unwrap();
+        root.remint_root(ResolvedDelegationBudget {
+            max_rounds: Some(8),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        assert_eq!(child.snapshot().local_spent.rounds, 2);
+        child.charge_round().unwrap();
+        assert!(child.charge_round().is_err());
+        assert_eq!(root.snapshot().spent.rounds, 3);
+        for _ in 0..5 {
+            root.charge_round().unwrap();
+        }
+        assert!(root.charge_round().is_err());
+        assert_eq!(root.snapshot().spent.rounds, 8);
+    }
+
+    #[test]
+    fn unpriced_token_usage_exhausts_finite_cost_ceiling() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_cost_microusd: Some(10_000_000),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let err = pool
+            .charge_usage(TokenUsage {
+                input_tokens: 8,
+                output_tokens: 2,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+            .unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::Cost);
+        assert_eq!(pool.snapshot().spent.cost_microusd, 0);
+        assert_eq!(pool.snapshot().spent.input_tokens, 0);
+    }
+
+    #[test]
+    fn unpriced_usage_allowed_when_cost_is_unlimited() {
+        let pool = BudgetPool::unlimited();
+        pool.charge_usage(TokenUsage {
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap();
+        assert_eq!(pool.snapshot().spent.cost_microusd, 0);
+        assert_eq!(pool.snapshot().spent.input_tokens, 8);
+        assert_eq!(pool.snapshot().spent.output_tokens, 2);
+    }
+
+    #[test]
+    fn priced_zero_cost_does_not_exhaust_finite_cap() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_cost_microusd: Some(10),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        pool.charge(
+            BudgetCharge::from_usage(TokenUsage {
+                input_tokens: 4,
+                ..TokenUsage::default()
+            })
+            .with_cost(0),
+        )
+        .unwrap();
+        assert_eq!(pool.snapshot().spent.cost_microusd, 0);
+        assert_eq!(pool.snapshot().spent.input_tokens, 4);
+    }
+
+    #[test]
+    fn mixed_priced_and_unpriced_usage_fails_closed() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget {
+            max_cost_microusd: Some(10_000_000),
+            ..ResolvedDelegationBudget::unlimited()
+        });
+        let mut charge = BudgetCharge::from_usage(TokenUsage {
+            input_tokens: 3,
+            ..TokenUsage::default()
+        })
+        .with_cost(5);
+        charge += BudgetCharge::from_usage(TokenUsage {
+            input_tokens: 2,
+            ..TokenUsage::default()
+        });
+        let err = pool.charge(charge).unwrap_err();
+        assert_eq!(err.dimension, BudgetDimension::Cost);
+        assert_eq!(pool.snapshot().spent.cost_microusd, 0);
+        assert_eq!(pool.snapshot().spent.input_tokens, 0);
     }
 }

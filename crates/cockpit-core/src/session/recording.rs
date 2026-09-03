@@ -821,11 +821,14 @@ impl Session {
         is_utility: bool,
     ) -> Result<()> {
         *self.last_usage.lock().unwrap() = Some(usage);
-        let cost_microusd = self.cost_microusd_for_usage(&usage);
+        let priced_cost = self.cost_microusd_for_usage(&usage);
         {
             let mut uncharged = self.uncharged_budget.lock().unwrap();
-            *uncharged += crate::engine::delegation_budget::BudgetCharge::from_usage(usage)
-                .with_cost(cost_microusd);
+            let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
+            if let Some(cost) = priced_cost {
+                charge = charge.with_cost(cost);
+            }
+            *uncharged += charge;
         }
         if !is_utility {
             self.pending_forward_progress
@@ -847,7 +850,7 @@ impl Session {
             output_tokens: usage.output_tokens as i64,
             cached_input_tokens: usage.cached_input_tokens as i64,
             cache_creation_input_tokens: usage.cache_creation_input_tokens as i64,
-            cost_usd_micros: (cost_microusd > 0).then_some(cost_microusd as i64),
+            cost_usd_micros: priced_cost.filter(|&c| c > 0).map(|c| c as i64),
             is_utility,
         };
         self.db
@@ -2381,7 +2384,9 @@ impl Session {
     }
 
     /// Drain usage recorded since the last charge. Callers must charge the
-    /// returned amount against the live [`BudgetPool`] exactly once.
+    /// returned amount against the live [`BudgetPool`] exactly once. Unpriced
+    /// usage (no active model or no catalog row) is marked on the charge so a
+    /// finite cost ceiling fails closed.
     pub fn take_uncharged_budget_charge(&self) -> crate::engine::delegation_budget::BudgetCharge {
         std::mem::take(&mut *self.uncharged_budget.lock().unwrap())
     }
@@ -2397,22 +2402,21 @@ impl Session {
         let _ = self.price_table.set(table);
     }
 
-    fn cost_microusd_for_usage(&self, usage: &crate::tokens::TokenUsage) -> u64 {
-        let Some(model) = self.active_model() else {
-            return 0;
-        };
+    /// Catalog cost for this usage, or `None` when the active model is missing
+    /// or has no price row. Callers must not treat `None` as `$0`: a finite
+    /// delegation cost ceiling fails closed on unpriced usage.
+    fn cost_microusd_for_usage(&self, usage: &crate::tokens::TokenUsage) -> Option<u64> {
+        let model = self.active_model()?;
         let table = self
             .price_table
             .get_or_init(crate::db::stats::PriceTable::load_default);
-        table
-            .cost_microusd(
-                &model,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_input_tokens,
-                usage.cache_creation_input_tokens,
-            )
-            .unwrap_or(0)
+        table.cost_microusd(
+            &model,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        )
     }
 
     /// Record a real cache hit against the concrete endpoint that dispatched

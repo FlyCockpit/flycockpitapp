@@ -375,6 +375,16 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "list_media_egress_verdicts",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "revoke_media_egress_verdict",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
     // v10-only owner-remoted sealed-owner sensitive channel. Small, bounded
     // params. The apply request carries at most one MAX_SENSITIVE_FRAME_BYTES
     // (16 KiB) literal, well within the bounded inline payload cap.

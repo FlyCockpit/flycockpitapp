@@ -331,6 +331,16 @@ pub struct GrantStore {
     last_good_policy: Mutex<ApprovalPolicyConfig>,
 }
 
+/// One live session-scoped media-egress verdict row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaEgressVerdictRow {
+    pub grant_id: String,
+    pub purpose: String,
+    pub request_digest: String,
+    pub verdict: String,
+    pub granted_at_unix_ms: i64,
+}
+
 /// Whether an approval policy is well-formed enough to adopt. Scope *values*
 /// are already enum-validated at parse time; the only closed-domain **keys**
 /// are the risk-tier caps (`riskMaxScope`). An unrecognized risk key silently
@@ -1141,9 +1151,40 @@ impl GrantStore {
             .map_err(StoreError::Io)
     }
 
+    /// List every live session-scoped media-egress verdict for this store's
+    /// session. Revoked allows and deleted rejects are omitted.
+    pub async fn list_media_egress_verdicts(
+        &self,
+    ) -> Result<Vec<MediaEgressVerdictRow>, StoreError> {
+        let session_id = self.session_id.to_string();
+        self.db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT grant_id, purpose, request_digest, verdict, granted_at_unix_ms \
+                     FROM media_egress_grants \
+                     WHERE session_id = ?1 AND revoked_at_unix_ms IS NULL \
+                     ORDER BY granted_at_unix_ms DESC",
+                )?;
+                let rows = stmt
+                    .query_map([session_id], |row| {
+                        Ok(MediaEgressVerdictRow {
+                            grant_id: row.get(0)?,
+                            purpose: row.get(1)?,
+                            request_digest: row.get(2)?,
+                            verdict: row.get(3)?,
+                            granted_at_unix_ms: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
     /// Clear every live standing verdict for one exact session/purpose/digest
     /// tuple so the next authorization re-prompts the human.
-    pub(super) async fn revoke_media_egress_verdict(
+    pub async fn revoke_media_egress_verdict(
         &self,
         purpose: &str,
         request_digest: &str,
@@ -6528,5 +6569,26 @@ mod media_egress_grant_tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn media_egress_list_verdicts_omits_revoked_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        let listed = store.list_media_egress_verdicts().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_digest, digest);
+        assert_eq!(listed[0].verdict, "allow");
+        store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap();
+        assert!(store.list_media_egress_verdicts().await.unwrap().is_empty());
     }
 }

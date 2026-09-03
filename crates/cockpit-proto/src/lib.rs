@@ -78,6 +78,7 @@ pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
 pub mod image_sidecar_authority;
+pub mod media_egress_authority;
 pub use image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
@@ -3998,6 +3999,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_org_sync_status"
                 | "list_failed_tool_calls"
                 | "get_session_compactions"
+                | "list_media_egress_verdicts"
+                | "revoke_media_egress_verdict"
                 | "purge_ended_sessions"
                 | "get_assistant"
                 | "diagnose_media_reservation"

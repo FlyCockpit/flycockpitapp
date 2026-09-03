@@ -1927,6 +1927,20 @@
     },
     "request": "get_session_compactions"
   },
+  "list_media_egress_verdicts": {
+    "params": {
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "list_media_egress_verdicts"
+  },
+  "revoke_media_egress_verdict": {
+    "params": {
+      "purpose": "transcription",
+      "request_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "revoke_media_egress_verdict"
+  },
   "purge_ended_sessions": {
     "params": {
       "before": 1700000000

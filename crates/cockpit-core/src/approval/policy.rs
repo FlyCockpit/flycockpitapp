@@ -1249,14 +1249,17 @@ impl Approver {
     /// grant identity is destination/project/purpose policy, never a blanket
     /// allow. The layers:
     ///
-    /// 1. **Yolo** opens no human prompt and allows once after reaching this seam
-    ///    (agent discretion; no grant persisted).
-    /// 2. **Manual/Auto** short-circuit on a matching standing reject (see
-    ///    [`Self::media_egress_reject_matches`]) or grant (see
-    ///    [`Self::media_egress_grant_matches`]) without re-prompting; else ask
-    ///    the human, disclosing only the redacted provider/model/interval facts
-    ///    and the digest prefix. Approving records session-standing consent for
-    ///    the exact digest; denying records a standing reject for it.
+    /// 1. **Standing reject** short-circuits every mode (including Yolo) with
+    ///    no prompt — see [`Self::media_egress_reject_matches`].
+    /// 2. **Standing grant** short-circuits every mode with no prompt — see
+    ///    [`Self::media_egress_grant_matches`].
+    /// 3. **Yolo** allows once with no prompt and no persistence.
+    /// 4. **Manual/Auto** without a matching grant: fail closed with
+    ///    [`Decision::NoninteractiveDeny`] when no interactive client is
+    ///    attached; else ask the human, disclosing only the redacted
+    ///    provider/model/interval facts and the digest prefix. Approving
+    ///    records session-standing consent for the exact digest; denying
+    ///    records a standing reject for it.
     ///
     /// Fail-closed everywhere: a missing grant never fakes an allow.
     pub(super) async fn approve_media_egress_inner(
@@ -1288,41 +1291,39 @@ impl Approver {
             request_digest = facts.request_digest.as_str(),
             "authorizing transcription media egress"
         );
-        match self.approval_mode() {
-            crate::config::extended::ApprovalMode::Yolo => {
-                Ok(Decision::Allow { scope: Scope::Once })
-            }
-            crate::config::extended::ApprovalMode::Manual
-            | crate::config::extended::ApprovalMode::Auto => {
-                if self.media_egress_reject_matches(&facts).await {
-                    let decision = Decision::StandingReject {
-                        scope: Scope::Session,
-                    };
-                    self.record_permission_decision(
-                        "media_egress",
-                        facts.request_digest.as_str(),
-                        &[Scope::Session],
-                        decision,
-                        crate::approval::DecisionSource::StandingReject,
-                    )
-                    .await;
-                    Ok(decision)
-                } else if self.media_egress_grant_matches(&facts).await {
-                    let decision = Decision::Allow { scope: Scope::Once };
-                    self.record_permission_decision(
-                        "media_egress",
-                        facts.request_digest.as_str(),
-                        &[Scope::Session],
-                        decision,
-                        crate::approval::DecisionSource::AlreadyGranted,
-                    )
-                    .await;
-                    Ok(decision)
-                } else {
-                    self.raise_media_egress_prompt(&facts).await
-                }
-            }
+        if self.media_egress_reject_matches(&facts).await {
+            let decision = Decision::StandingReject {
+                scope: Scope::Session,
+            };
+            self.record_permission_decision(
+                "media_egress",
+                facts.request_digest.as_str(),
+                &[Scope::Session],
+                decision,
+                crate::approval::DecisionSource::StandingReject,
+            )
+            .await;
+            return Ok(decision);
         }
+        if self.media_egress_grant_matches(&facts).await {
+            let decision = Decision::Allow { scope: Scope::Once };
+            self.record_permission_decision(
+                "media_egress",
+                facts.request_digest.as_str(),
+                &[Scope::Session],
+                decision,
+                crate::approval::DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
+        if self.yolo_mode() {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
+        if !self.interrupts.is_interactive_attached() {
+            return Ok(Decision::NoninteractiveDeny);
+        }
+        self.raise_media_egress_prompt(&facts).await
     }
 
     /// Grant-matching hook for transcription media egress. A matching persisted

@@ -1477,6 +1477,32 @@ pub enum SessionCommand {
     },
     /// Answer a pending question or approval interrupt.
     Answer(SessionAnswerArgs),
+    /// List or revoke remembered transcription media-egress verdicts.
+    #[command(subcommand, name = "media-egress")]
+    MediaEgress(SessionMediaEgressCommand),
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum SessionMediaEgressCommand {
+    /// List live remembered transcription media-egress verdicts for a session.
+    List {
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Emit one JSON document instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear a remembered allow or deny for one exact transcription digest.
+    Revoke {
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Exact 64-hex transcription request digest.
+        #[arg(long, value_name = "DIGEST")]
+        digest: String,
+        /// Media-egress purpose (currently only `transcription`).
+        #[arg(long, default_value = "transcription")]
+        purpose: String,
+    },
 }
 
 #[derive(Debug, Clone, clap::Args)]

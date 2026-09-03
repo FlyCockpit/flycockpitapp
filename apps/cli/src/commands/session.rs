@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
+use crate::cli::{
+    OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs, SessionMediaEgressCommand,
+};
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, ResolveResponse, Response};
 
@@ -20,6 +22,7 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
             dry_run,
             yes,
         } => purge(&before, dry_run, yes).await,
+        SessionCommand::MediaEgress(cmd) => media_egress(cmd).await,
     }
 }
 
@@ -146,6 +149,80 @@ async fn list(args: SessionListArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn media_egress(cmd: SessionMediaEgressCommand) -> Result<()> {
+    match cmd {
+        SessionMediaEgressCommand::List { session_id, json } => {
+            media_egress_list(&session_id, json).await
+        }
+        SessionMediaEgressCommand::Revoke {
+            session_id,
+            digest,
+            purpose,
+        } => media_egress_revoke(&session_id, &purpose, &digest).await,
+    }
+}
+
+async fn media_egress_list(session: &str, json_mode: bool) -> Result<()> {
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for media-egress list")?;
+    let response = daemon
+        .client
+        .request(Request::ListMediaEgressVerdicts { session_id })
+        .await
+        .context("requesting media-egress verdicts from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected media-egress list: {error}"))?;
+    let Response::MediaEgressVerdicts { verdicts, .. } = response else {
+        bail!("daemon returned unexpected response to media-egress list: {response:?}");
+    };
+    if json_mode {
+        return emit_json(&json!({
+            "session_id": session_id,
+            "verdicts": verdicts,
+        }));
+    }
+    if verdicts.is_empty() {
+        println!("no remembered media-egress verdicts for session {session_id}");
+        return Ok(());
+    }
+    for verdict in verdicts {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            verdict.grant_id,
+            verdict.purpose,
+            verdict.verdict,
+            verdict.request_digest,
+            verdict.granted_at_unix_ms,
+        );
+    }
+    Ok(())
+}
+
+async fn media_egress_revoke(session: &str, purpose: &str, digest: &str) -> Result<()> {
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for media-egress revoke")?;
+    match daemon
+        .client
+        .request(Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose: purpose.to_string(),
+            request_digest: digest.to_string(),
+        })
+        .await
+        .context("requesting media-egress revoke from daemon")?
+    {
+        Ok(Response::Ack) => {
+            println!("revoked remembered media-egress verdict for {digest}");
+            Ok(())
+        }
+        Ok(other) => bail!("daemon returned unexpected response to media-egress revoke: {other:?}"),
+        Err(error) => bail!("{error}"),
+    }
 }
 
 /// Projection of one `session_compacted` event as returned by the daemon's

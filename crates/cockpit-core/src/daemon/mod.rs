@@ -60,6 +60,7 @@ pub mod leak_reveal_frame;
 #[cfg(any(unix, windows))]
 pub mod leak_reveal_socket;
 pub mod lsp;
+pub mod media_egress_authority;
 #[cfg(feature = "remote")]
 pub mod org_sync;
 pub(crate) mod owner_capability;

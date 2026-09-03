@@ -10370,6 +10370,22 @@ async fn handle_serialized_request_impl(
         Request::GetSessionCompactions { session_id } => {
             get_session_compactions_response(ctx, session_id).await
         }
+        Request::ListMediaEgressVerdicts { session_id } => {
+            crate::daemon::media_egress_authority::list_verdicts(ctx, session_id).await
+        }
+        Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose,
+            request_digest,
+        } => {
+            crate::daemon::media_egress_authority::revoke_verdict(
+                ctx,
+                session_id,
+                purpose,
+                request_digest,
+            )
+            .await
+        }
         Request::GetAssistant { name } => get_assistant_response(ctx, name).await,
         Request::DiagnoseMediaReservation { scope, id } => {
             diagnose_media_reservation_response(ctx, scope, id).await
@@ -20208,6 +20224,22 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetSessionCompactions { session_id } => {
             get_session_compactions_response(&ctx, session_id).await
+        }
+        Request::ListMediaEgressVerdicts { session_id } => {
+            crate::daemon::media_egress_authority::list_verdicts(&ctx, session_id).await
+        }
+        Request::RevokeMediaEgressVerdict {
+            session_id,
+            purpose,
+            request_digest,
+        } => {
+            crate::daemon::media_egress_authority::revoke_verdict(
+                &ctx,
+                session_id,
+                purpose,
+                request_digest,
+            )
+            .await
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
         Request::ListAssistants => {

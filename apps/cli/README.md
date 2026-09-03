@@ -798,7 +798,7 @@ Cockpit is built around explicit trust and scoped execution:
 - Command approval and safety-gate decisions are recorded.
 - Write-capable tools acquire daemon-managed path locks.
 - Credentials are stored outside project config and written with private file permissions on Unix.
-- Session exports are redacted by default; sensitive-record recovery normally occurs only through the authenticated per-record `/sealed` or `/leaks` channel, never through archive generation. The single unredacted path is the explicit local `cockpit export --include-sensitive` opt-in, and `cockpit import` refuses such an archive unless `--include-sensitive` is passed again. Neither flag is reachable through model trust or the TUI, and the daemon rejects `include_sensitive` from any non-local caller.
+- Session exports are redacted by default; sensitive-record recovery normally occurs only through the authenticated per-record `/sealed` or `/leaks` channel, never through archive generation. The single unredacted path is the explicit local `cockpit export --include-sensitive` opt-in, and `cockpit import` refuses such an archive unless `--include-sensitive` is passed again. Neither flag is reachable through model trust or the TUI, and the daemon rejects a raw `include_sensitive` export from any non-local caller.
 
 ## What Leaves Your Machine
 

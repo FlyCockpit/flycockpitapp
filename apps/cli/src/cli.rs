@@ -2173,11 +2173,59 @@ mod tests {
             other => panic!("expected export command, got {other:?}"),
         }
 
-        // No other subcommand accepts the raw opt-in — it is export-local.
+        // The raw opt-in is custody-pair-local: it parses on `cockpit export`
+        // (raw opt-in) and on `cockpit import` (the raw-import acknowledgement,
+        // covered by `import_include_sensitive_flag_parses` below) and on no
+        // other subcommand.
         assert!(
-            Cli::try_parse_from(["cockpit", "import", "some.zip", "--include-sensitive"]).is_err(),
-            "`--include-sensitive` must be rejected outside `cockpit export`"
+            Cli::try_parse_from(["cockpit", "doctor", "--include-sensitive"]).is_err(),
+            "`--include-sensitive` must be rejected outside `cockpit export`/`cockpit import`"
         );
+    }
+
+    #[test]
+    fn import_include_sensitive_flag_parses() {
+        // `--include-sensitive` on `cockpit import` is the explicit raw-import
+        // acknowledgement: an archive written by `cockpit export
+        // --include-sensitive` restores raw secret material into the
+        // destination session, so importing one requires passing the flag
+        // again. Without it an unredacted archive is refused.
+        let cli =
+            Cli::try_parse_from(["cockpit", "import", "some.zip", "--include-sensitive"]).unwrap();
+        match cli.command {
+            Some(Command::Import(args)) => {
+                assert_eq!(args.file, PathBuf::from("some.zip"));
+                assert!(
+                    args.include_sensitive,
+                    "--include-sensitive must set the import acknowledgement flag"
+                );
+            }
+            other => panic!("expected import command, got {other:?}"),
+        }
+
+        // Absent by default: the unredacted archive is refused without the ack.
+        let cli = Cli::try_parse_from(["cockpit", "import", "some.zip"]).unwrap();
+        match cli.command {
+            Some(Command::Import(args)) => assert!(
+                !args.include_sensitive,
+                "a default import must leave include_sensitive false"
+            ),
+            other => panic!("expected import command, got {other:?}"),
+        }
+
+        // The production binary parses the public shape; the acknowledgement
+        // must parse on that real enter path too.
+        assert!(matches!(
+            Cli::from(
+                PublicCli::try_parse_from(["cockpit", "import", "some.zip", "--include-sensitive"])
+                    .unwrap()
+            )
+            .command,
+            Some(Command::Import(ImportArgs {
+                include_sensitive: true,
+                ..
+            }))
+        ));
     }
 
     #[test]

@@ -1681,9 +1681,9 @@ fn cg_window_number_for_ax_window(
 /// Live focused window the input backend can address and recheck.
 ///
 /// This is the same AX/CG join the evidence adapter uses for targeting
-/// fields. The adapter additionally mixes the AX lifetime epoch into the
-/// opaque id; the backend retains the AX object so a recycled PID/window
-/// number pair cannot match at delivery.
+/// fields. The backend retains the AX object and authenticates delivery with
+/// the CGS-planted generation token so a recycled PID/window number pair
+/// cannot match at delivery.
 #[cfg(target_os = "macos")]
 pub(crate) struct MacLiveInjectionTarget {
     pub window: MacLiveFocusedWindow,
@@ -1878,6 +1878,9 @@ fn plant_macos_window_generation(
         return Err(TargetUnavailableReason::MissingCapability);
     };
     let cid = cgs_main_connection_id().ok_or(TargetUnavailableReason::MissingCapability)?;
+    use objc2_core_foundation::CFType;
+    use std::convert::AsRef;
+
     let key = objc2_core_foundation::CFString::from_static_str(MACOS_WINDOW_GENERATION_KEY);
     let value = objc2_core_foundation::CFData::from_bytes(&generation);
     // SAFETY: `key`/`value` are live CF objects for the call; CGS copies them.
@@ -1885,8 +1888,8 @@ fn plant_macos_window_generation(
         set(
             cid,
             window_number,
-            key.as_ref() as *const _ as *const std::ffi::c_void,
-            value.as_ref() as *const _ as *const std::ffi::c_void,
+            AsRef::<CFType>::as_ref(&key) as *const _ as *const std::ffi::c_void,
+            AsRef::<CFType>::as_ref(&value) as *const _ as *const std::ffi::c_void,
         )
     };
     if status != 0 {
@@ -1910,15 +1913,18 @@ fn read_macos_window_generation(
     let Some(cid) = cgs_main_connection_id() else {
         return Ok(None);
     };
+    use objc2_core_foundation::CFType;
+    use std::convert::AsRef;
+
     let key = objc2_core_foundation::CFString::from_static_str(MACOS_WINDOW_GENERATION_KEY);
-    let mut raw: *const objc2_core_foundation::CFType = std::ptr::null();
+    let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `raw` is a writable out pointer. On success CGS returns a +1 CF object.
     let status = unsafe {
         copy(
             cid,
             window_number,
-            key.as_ref() as *const _ as *const std::ffi::c_void,
-            (&mut raw as *mut *const objc2_core_foundation::CFType).cast(),
+            AsRef::<CFType>::as_ref(&key) as *const _ as *const std::ffi::c_void,
+            (&mut raw as *mut *const CFType).cast(),
         )
     };
     if status != 0 || raw.is_null() {
@@ -1928,9 +1934,11 @@ fn read_macos_window_generation(
         std::ptr::NonNull::new(raw.cast_mut()).ok_or(TargetUnavailableReason::QueryMismatch)?;
     // SAFETY: CGSCopyWindowProperty transferred a +1 CF object.
     let value = unsafe { objc2_core_foundation::CFRetained::from_raw(raw) };
-    let data = value
-        .downcast::<objc2_core_foundation::CFData>()
-        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let Ok(data) = value.downcast::<objc2_core_foundation::CFData>() else {
+        // Prior development cycles stored CFNumber tokens under this key; treat
+        // any non-CFData value as unplanted so a new generation can be written.
+        return Ok(None);
+    };
     // SAFETY: `data` is an immutable local retain; the slice is copied below.
     let bytes = unsafe { data.as_bytes_unchecked() };
     if bytes.len() != MACOS_WINDOW_GENERATION_LEN {

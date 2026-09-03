@@ -1178,7 +1178,10 @@ fn macos_address_error(
             MacosAxDeliveryError::QueryMismatch
         }
         crate::computer::target::TargetUnavailableReason::MissingCapability => {
-            MacosAxDeliveryError::MissingWindowLocationSetter
+            // `address_macos_injection_window` only surfaces this when
+            // `CGWindowListCopyWindowInfo` is unavailable, not when the
+            // window-local location setter is missing.
+            MacosAxDeliveryError::QueryMismatch
         }
         _ => MacosAxDeliveryError::StaleTarget,
     }

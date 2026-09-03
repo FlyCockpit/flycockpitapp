@@ -366,7 +366,11 @@ impl Approver {
                 return;
             }
         };
-        let session_id = self.session_id;
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.live_id())
+            .unwrap_or(self.session_id);
         let agent_id = self.agent_id.clone();
         if let Err(e) = self
             .db

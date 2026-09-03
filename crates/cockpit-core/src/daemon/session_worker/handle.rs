@@ -2086,7 +2086,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::GitignoreAllow {
-                session_id: self.session_id,
+                session_id: self.session.live_id(),
                 allow: self.session.gitignore_session_allow(),
             },
         );
@@ -2099,7 +2099,12 @@ impl SessionWorkerHandle {
     }
 
     pub async fn broadcast_active_interrupt(&self) {
-        let Ok(open) = self.session.db.list_open_interrupts(self.session_id).await else {
+        let Ok(open) = self
+            .session
+            .db
+            .list_open_interrupts(self.session.live_id())
+            .await
+        else {
             return;
         };
         let Some(active) = open.first() else {
@@ -2120,7 +2125,7 @@ impl SessionWorkerHandle {
             &self.event_tx,
             &self.redaction,
             proto::Event::InterruptRaised {
-                session_id: self.session_id,
+                session_id: self.session.live_id(),
                 interrupt_id: active.interrupt_id,
                 agent: active.agent_id.clone(),
                 description: active.description.clone(),

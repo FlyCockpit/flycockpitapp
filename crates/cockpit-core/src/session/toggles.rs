@@ -302,7 +302,7 @@ impl Session {
             *self.tool_surface_override_json.lock().unwrap() = override_json;
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let persisted_override_json = override_json.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -340,7 +340,7 @@ impl Session {
         }) {
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
@@ -383,7 +383,7 @@ impl Session {
             *active = Some(selection);
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let persisted_provider = provider.clone();
         let persisted_model = model.clone();
         self.db
@@ -420,7 +420,7 @@ impl Session {
         if let Some(row) = self.pending_row.lock().unwrap().as_ref() {
             return Ok(row.active_model_revision);
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         self.db
             .blocking_read_for_sync_ui(move |conn| {
                 crate::db::Db::active_model_revision_conn(conn, session_id)?
@@ -456,7 +456,7 @@ impl Session {
                 return Ok(true);
             }
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let persisted_provider = provider.clone();
         let persisted_model = model.clone();
         let selection_json_for_db = selection_json.clone();
@@ -506,7 +506,7 @@ impl Session {
             *self.active_agent.lock().unwrap() = agent.to_string();
             return Ok(());
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let active_agent = agent.to_string();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -575,5 +575,54 @@ mod tests {
         );
         drop(permit);
         mutation.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_compact_settings_writes_land_on_the_live_window() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/settings-live-id"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let spawn_id = session.id;
+        let successor = db.create_compaction_successor(spawn_id).await.unwrap();
+        let successor_short = successor
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor.session_id.to_string());
+        let live_id = successor.session_id;
+        session.adopt_compaction_successor(live_id, successor_short);
+
+        session.set_active_agent("Explore").unwrap();
+        session
+            .set_active_model_ref(crate::config::providers::ActiveModelRef {
+                provider: "grok".to_string(),
+                model: "grok-4".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            })
+            .unwrap();
+        session
+            .set_tool_surface_override_json(Some("{}".to_string()))
+            .unwrap();
+        session
+            .set_goal_settings_override_json(Some("{}".to_string()))
+            .unwrap();
+        assert!(session.set_auto_title("live-window-title").unwrap());
+
+        let live = db.get_session(live_id).await.unwrap().unwrap();
+        let spawn = db.get_session(spawn_id).await.unwrap().unwrap();
+        assert_eq!(live.active_agent, "Explore");
+        assert_eq!(live.provider.as_deref(), Some("grok"));
+        assert_eq!(live.model.as_deref(), Some("grok-4"));
+        assert_eq!(live.tool_surface_override_json.as_deref(), Some("{}"));
+        assert_eq!(live.goal_settings_override_json.as_deref(), Some("{}"));
+        assert_eq!(live.title.as_deref(), Some("live-window-title"));
+        assert_eq!(spawn.active_agent, "Build");
+        assert_ne!(spawn.title.as_deref(), Some("live-window-title"));
     }
 }

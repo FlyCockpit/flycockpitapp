@@ -624,6 +624,10 @@ fn count_delete_candidates(
 
 fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
     let cutoff_unix_ms = cutoff_secs.saturating_mul(1000);
+    // Candidate conversation roots only. Liveness and pin guards must use
+    // the same cascade as `collect_subtree` / `delete_session_conn` so a
+    // fork's own compaction windows cannot be deleted while still live or
+    // pinned.
     let mut stmt = conn
         .prepare(
             "SELECT root.session_id
@@ -632,37 +636,7 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
                 AND root.compaction_predecessor_session_id IS NULL
                 AND root.ended_at_unix_ms IS NOT NULL
                 AND root.ephemeral = 0
-                AND root.last_active_at_unix_ms < ?1
-                AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id, ended_at_unix_ms, last_active_at_unix_ms) AS (
-                        SELECT session_id, ended_at_unix_ms, last_active_at_unix_ms
-                          FROM sessions
-                         WHERE session_id = root.session_id
-                            OR compaction_lineage_root_id = root.session_id
-                        UNION ALL
-                        SELECT child.session_id, child.ended_at_unix_ms, child.last_active_at_unix_ms
-                          FROM sessions child
-                          JOIN subtree parent
-                            ON child.parent_session_id = parent.session_id
-                            OR child.btw_parent_session_id = parent.session_id
-                    )
-                    SELECT 1 FROM subtree
-                     WHERE ended_at_unix_ms IS NULL OR last_active_at_unix_ms >= ?1
-                )
-                AND NOT EXISTS (
-                    WITH RECURSIVE subtree(session_id) AS (
-                        SELECT session_id FROM sessions
-                         WHERE session_id = root.session_id
-                            OR compaction_lineage_root_id = root.session_id
-                        UNION ALL
-                        SELECT child.session_id
-                          FROM sessions child
-                          JOIN subtree parent
-                            ON child.parent_session_id = parent.session_id
-                            OR child.btw_parent_session_id = parent.session_id
-                    )
-                    SELECT 1 FROM pins JOIN subtree USING (session_id)
-                )",
+                AND root.last_active_at_unix_ms < ?1",
         )
         .context("preparing old session roots")?;
     let rows = stmt
@@ -673,9 +647,50 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
         .context("querying old session roots")?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.context("decoding old session root")?);
+        let root = row.context("decoding old session root")?;
+        let subtree = crate::db::sessions::collect_subtree(conn, root)?;
+        if subtree_blocks_expiry(conn, &subtree, cutoff_unix_ms)? {
+            continue;
+        }
+        out.push(root);
     }
     Ok(out)
+}
+
+/// True when any member of the delete set is still open, recently active, or
+/// pinned. Uses the same id set `expire_old_sessions_conn` will pass to
+/// `delete_session_conn`.
+fn subtree_blocks_expiry(conn: &Connection, subtree: &[Uuid], cutoff_unix_ms: i64) -> Result<bool> {
+    for session_id in subtree {
+        let id = session_id.to_string();
+        let Some((ended_at_unix_ms, last_active_at_unix_ms)): Option<(Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT ended_at_unix_ms, last_active_at_unix_ms
+                   FROM sessions
+                  WHERE session_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("loading retention-guard session row")?
+        else {
+            continue;
+        };
+        if ended_at_unix_ms.is_none() || last_active_at_unix_ms >= cutoff_unix_ms {
+            return Ok(true);
+        }
+        let pinned: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pins WHERE session_id = ?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .context("checking retention-guard pin")?;
+        if pinned != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<SessionExpiryOutcome> {
@@ -1015,6 +1030,90 @@ mod tests {
         assert_eq!(db.expire_old_sessions(20).await.unwrap(), 2);
         assert!(db.get_session(window1.session_id).await.unwrap().is_none());
         assert!(db.get_session(window2.session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_live_compaction_window_of_a_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(fork_window2.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_skips_pinned_compaction_window_of_a_fork() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+        close_session(&db, fork_window2.session_id, 10).await;
+        let successor_id = fork_window2.session_id;
+        let seq = db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO session_events (session_id, ts_ms, type, data_json)
+                     VALUES (?1, 1, 'user_message', '{}')",
+                    params![successor_id.to_string()],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        assert!(db.pin_message(fork_window2.session_id, seq).await.unwrap());
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_some());
+        assert!(
+            db.get_session(fork_window2.session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_age_out_removes_an_idle_fork_compaction_lineage_together() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let fork_window2 = db
+            .create_compaction_successor(fork.session_id)
+            .await
+            .unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, fork.session_id, 10).await;
+        close_session(&db, fork_window2.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 3);
+        assert!(db.get_session(root.session_id).await.unwrap().is_none());
+        assert!(db.get_session(fork.session_id).await.unwrap().is_none());
+        assert!(
+            db.get_session(fork_window2.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -3122,7 +3122,7 @@ async fn relay_agent_tree_events(
         // transaction committed, which would make an old event describe a
         // later state.
         let payload = proto::Event::AgentTreeChanged {
-            session_id,
+            session_id: session.live_id(),
             session_event_seq: row.session_event_seq,
             transition,
             subject_kind,
@@ -3540,7 +3540,7 @@ async fn deliver_terminal_agent_tree_interrupt(
                 event_tx,
                 redaction,
                 proto::Event::InterruptResolved {
-                    session_id,
+                    session_id: session.live_id(),
                     interrupt_id,
                     decision: Some(decision),
                     seq,
@@ -4214,7 +4214,7 @@ pub(super) fn record_interrupt_decision_event(
             return None;
         }
     };
-    let session_id = session.id;
+    let session_id = session.live_id();
     session
         .db
         .blocking_write_for_sync_event(move |conn| {
@@ -4327,7 +4327,7 @@ pub(super) async fn finish_parked_replay_completion(
         event_tx,
         redaction,
         proto::Event::InterruptResolved {
-            session_id,
+            session_id: session.live_id(),
             interrupt_id: completion.interrupt_id,
             decision: completion.decision,
             seq,
@@ -7034,6 +7034,7 @@ pub(super) async fn run_worker(
             session.db.clone(),
             session_id,
         )
+        .with_live_session(session.clone())
         // Wire the shared park-commit rendezvous
         // (`daemon-lifecycle-replay-timing-robustness.md`) so this worker's
         // waiter registration and `SessionWork::Shutdown` park land the
@@ -12180,7 +12181,7 @@ pub(super) async fn run_worker(
                     let row = session.db.get_interrupt(interrupt_id).await.ok().flatten();
                     let was_active = session
                         .db
-                        .list_open_interrupts(session_id)
+                        .list_open_interrupts(session.live_id())
                         .await
                         .ok()
                         .and_then(|open| open.first().map(|row| row.interrupt_id))
@@ -12535,7 +12536,7 @@ pub(super) async fn run_worker(
                         &event_tx,
                         &redaction,
                         proto::Event::InterruptResolved {
-                            session_id,
+                            session_id: session.live_id(),
                             interrupt_id,
                             decision,
                             seq,
@@ -13895,7 +13896,7 @@ pub(super) async fn run_worker(
         {
             let pending = session
                 .db
-                .list_open_interrupts(session_id)
+                .list_open_interrupts(session.live_id())
                 .await
                 .map(|rows| rows.len() as i64)
                 .unwrap_or(*pending_tool_count);
@@ -14253,7 +14254,7 @@ pub(super) async fn shutdown_activity_snapshot(
     let sweep = interrupts.park_all_registered_collect().await;
     let pending_tool_count = session
         .db
-        .list_open_interrupts(session_id)
+        .list_open_interrupts(session.live_id())
         .await
         .map(|rows| rows.len() as i64)
         .unwrap_or(sweep.count as i64);

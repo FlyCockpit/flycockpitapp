@@ -3121,6 +3121,9 @@ export const sessionSummarySchema = z
     is_assistant_thread: z.boolean(),
     created_by_principal: z.string().nullable().optional(),
     shared_with_collaborators: z.boolean().optional(),
+    compaction_predecessor_session_id: optionalUuidSchema,
+    compaction_lineage_root_id: optionalUuidSchema,
+    lineage_window_count: safeU64NumberSchema.optional(),
   })
   .passthrough();
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;

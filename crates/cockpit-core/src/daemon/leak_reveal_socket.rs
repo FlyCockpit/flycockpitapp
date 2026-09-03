@@ -1,22 +1,23 @@
-//! Unix peer-authenticated leak-reveal socket: the production reveal transport
-//! for a socket-attached TUI. A dedicated 0600 socket (path a pure function of
+//! Peer-authenticated leak-reveal transport: the production reveal path for a
+//! socket-attached TUI. A dedicated owner-only endpoint (path a pure function of
 //! the control socket, [`crate::daemon::DaemonPaths::leak_reveal_socket`]) that
 //! carries **only** the closed reveal frame ([`crate::daemon::leak_reveal_frame`]),
-//! never ordinary proto. On accept it runs the **same** same-uid peer check the
+//! never ordinary proto. On accept it runs the **same** owner peer check the
 //! control socket uses ([`crate::daemon::server::validate_peer_owner`]) — no
-//! second hand-rolled `SO_PEERCRED`/`getpeereid` path — then hands the presented
-//! capability to the channel-agnostic consumption core.
+//! second hand-rolled `SO_PEERCRED`/`getpeereid`/SID path — then hands the
+//! presented capability to the channel-agnostic consumption core.
 //!
-//! Windows has no external socket transport; there the in-process handoff is the
-//! production path and this module does not compile.
+//! On Windows the control identity file names a per-user private pipe; the
+//! reveal sibling is `{control_pipe}-leak-reveal` with the same owner ACL.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
+
+use crate::daemon::{DaemonListener, DaemonStream};
 
 use crate::daemon::leak_reveal::{LeakRevealDenied, RevealedLeakSecret, consume_leak_reveal};
 use crate::daemon::leak_reveal_frame::{
@@ -41,7 +42,10 @@ const LEAK_REVEAL_SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration
 /// Serve the dedicated reveal socket until the daemon begins draining. Each
 /// accepted connection is peer-checked and handled independently; a peer-uid
 /// mismatch or malformed frame closes with no content (no oracle).
-pub async fn run_reveal_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
+pub async fn run_reveal_accept_loop(
+    ctx: Arc<DaemonContext>,
+    mut listener: DaemonListener,
+) -> Result<()> {
     let mut shutdown = ctx.shutdown_signal().subscribe();
     if ctx.shutdown_signal().is_draining() {
         return Ok(());
@@ -55,9 +59,9 @@ pub async fn run_reveal_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListe
                     break;
                 }
             }
-            accepted = listener.accept() => {
+            accepted = accept_reveal(&mut listener) => {
                 match accepted {
-                    Ok((stream, _peer)) => {
+                    Ok(stream) => {
                         if validate_peer_owner(&stream).is_err() {
                             // Wrong-uid peer: close with no content.
                             continue;
@@ -77,7 +81,22 @@ pub async fn run_reveal_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListe
     Ok(())
 }
 
-async fn handle_reveal_connection(mut stream: UnixStream, ctx: Arc<DaemonContext>) {
+async fn accept_reveal(listener: &mut DaemonListener) -> Result<DaemonStream> {
+    #[cfg(unix)]
+    {
+        listener
+            .accept()
+            .await
+            .map(|(stream, _peer)| stream)
+            .context("accepting leak-reveal socket")
+    }
+    #[cfg(windows)]
+    {
+        listener.accept().await
+    }
+}
+
+async fn handle_reveal_connection(mut stream: DaemonStream, ctx: Arc<DaemonContext>) {
     // Bound the request read so a stalled/short-writing peer can't pin this
     // spawned handler forever.
     let request = match tokio::time::timeout(
@@ -120,7 +139,10 @@ async fn handle_reveal_connection(mut stream: UnixStream, ctx: Arc<DaemonContext
 /// EOF or an extra byte (the client keeps the connection open to read the
 /// response, so waiting for more would deadlock). Returns `None` on a short
 /// read, connection error, or malformed frame.
-async fn read_request_frame(stream: &mut UnixStream) -> Option<LeakRevealSocketRequest> {
+async fn read_request_frame<S>(stream: &mut S) -> Option<LeakRevealSocketRequest>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = [0u8; LEAK_REVEAL_REQUEST_FRAME_LEN];
     stream.read_exact(&mut buf).await.ok()?;
     // Reject trailing bytes: a well-behaved client half-closes its write side
@@ -155,7 +177,7 @@ pub(crate) async fn reveal_leak_secret_over_socket(
     // hang the caller. On timeout, fail closed. The read is length-exact (read
     // the header, then `read_exact` the declared body) — it never waits for EOF.
     let exchange = async {
-        let mut stream = UnixStream::connect(reveal_socket)
+        let mut stream = connect_reveal(reveal_socket)
             .await
             .map_err(|_| LeakRevealDenied::UnavailablePlatform)?;
         stream
@@ -206,7 +228,23 @@ pub(crate) async fn reveal_leak_secret_over_socket(
 /// for [`decode_response`]. Returns `None` on any short read, oversize field,
 /// or connection error. Never waits for EOF, so the exchange terminates as soon
 /// as a full frame is received.
-async fn read_response_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+async fn connect_reveal(reveal_socket: &Path) -> Result<impl AsyncRead + AsyncWrite + Unpin> {
+    #[cfg(unix)]
+    {
+        Ok(tokio::net::UnixStream::connect(reveal_socket).await?)
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe = cockpit_host::named_pipe::read_pipe_identity(reveal_socket)?;
+        Ok(ClientOptions::new().open(pipe.as_str())?)
+    }
+}
+
+async fn read_response_frame<S>(stream: &mut S) -> Option<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await.ok()?;
     if header[0] != LEAK_REVEAL_FRAME_VERSION {
@@ -255,9 +293,22 @@ async fn read_response_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
 /// Bind the dedicated 0600 reveal socket at the instance's derived path. Clears
 /// any stale socket file first (a previous crash may have left one). Refuses a
 /// path that is not owner-only (enforced by [`crate::daemon::bind_private_socket`]).
-pub fn bind_reveal_socket(ctx: &DaemonContext) -> Result<UnixListener> {
+pub fn bind_reveal_socket(ctx: &DaemonContext) -> Result<DaemonListener> {
     let path = ctx.paths.leak_reveal_socket();
     let _ = std::fs::remove_file(&path);
-    crate::daemon::bind_private_socket(&path)
-        .with_context(|| format!("binding leak-reveal socket {}", path.display()))
+    #[cfg(unix)]
+    {
+        crate::daemon::bind_private_socket(&path)
+            .with_context(|| format!("binding leak-reveal socket {}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        let control = cockpit_host::named_pipe::read_pipe_identity(&ctx.paths.socket)
+            .context("reading control pipe identity for leak-reveal sibling")?;
+        let reveal = control
+            .leak_reveal_sibling()
+            .context("deriving leak-reveal pipe name")?;
+        crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal, true)
+            .with_context(|| format!("binding leak-reveal pipe {}", path.display()))
+    }
 }

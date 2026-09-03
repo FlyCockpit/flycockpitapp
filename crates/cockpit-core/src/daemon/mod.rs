@@ -16,7 +16,9 @@
 //! - PID file at `$XDG_STATE_HOME/cockpit/daemon.pid`.
 //! - Unix socket at `$XDG_RUNTIME_DIR/cockpit/cockpit.sock`, fallback
 //!   to `$XDG_STATE_HOME/cockpit/daemon.sock`. Socket file mode is
-//!   0600.
+//!   0600. On Windows the same path is an owner-only identity file naming a
+//!   per-user private named pipe (`\\.\pipe\cockpit-<sid-fp>-<nonce>`), never
+//!   a well-known unprotected global pipe.
 //! - First `cockpit` invocation auto-promotes via setsid + double-fork
 //!   (GOALS §8b); the foreground terminal becomes a TUI client attached
 //!   to the freshly spawned daemon. `cockpit daemon {start, stop,
@@ -55,7 +57,7 @@ pub mod image_runtime;
 pub mod image_sidecar_authority;
 pub mod leak_reveal;
 pub mod leak_reveal_frame;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod leak_reveal_socket;
 pub mod lsp;
 #[cfg(feature = "remote")]
@@ -89,8 +91,10 @@ pub(crate) mod test_harness;
 pub mod transport_selection;
 #[cfg(feature = "remote")]
 pub mod turn_socket_provider;
+#[cfg(windows)]
+pub(crate) mod windows_pipe;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,7 +103,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 #[cfg(all(test, target_os = "macos"))]
 use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
@@ -107,7 +111,7 @@ use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
 use cockpit_host::daemon_lifecycle::split_proc_cmdline;
 #[cfg(test)]
 use cockpit_host::daemon_lifecycle::write_pid_file;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use cockpit_host::daemon_lifecycle::{
     DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, retire_metadata_if_receipt_matches,
     with_lifecycle_lock,
@@ -115,12 +119,23 @@ use cockpit_host::daemon_lifecycle::{
 use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
 #[cfg(target_os = "linux")]
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
 use cockpit_host::private_fs::ensure_private_dir;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+
+#[cfg(unix)]
+pub(crate) type DaemonListener = UnixListener;
+#[cfg(windows)]
+pub(crate) type DaemonListener = windows_pipe::NamedPipeListener;
+#[cfg(unix)]
+pub(crate) type DaemonStream = UnixStream;
+#[cfg(windows)]
+pub(crate) type DaemonStream = tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::broadcast;
 
 use crate::redact::RedactionTable;
@@ -599,6 +614,11 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListen
     Ok(listener)
 }
 
+#[cfg(windows)]
+pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<DaemonListener> {
+    windows_pipe::NamedPipeListener::bind(socket)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonStatus {
     /// Daemon is running and completed a valid current-protocol hello.
@@ -636,7 +656,7 @@ fn status_for_socket_response(response: &SocketHelloResponse) -> DaemonStatus {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn parse_socket_hello_line(socket: &Path, line: &str) -> Option<proto::DaemonHello> {
     match proto::parse_daemon_hello_line(line) {
         Ok(hello) => hello,
@@ -672,11 +692,53 @@ async fn socket_responds(socket: &Path) -> Option<SocketHelloResponse> {
     }
 }
 
-/// A recorded endpoint can only name a Unix-domain socket. Keep the discovery
-/// path intact on platforms without that transport, but honestly report that
-/// no daemon is reachable rather than attempting to interpret the path as a
-/// different kind of endpoint.
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn socket_responds(socket: &Path) -> Option<SocketHelloResponse> {
+    let pipe = cockpit_host::named_pipe::read_pipe_identity_if_present(socket).ok()??;
+    if !cockpit_host::named_pipe::pipe_is_listening(&pipe) {
+        // Identity file without a listening server is a stale owner, not a
+        // running daemon. Do not hang on connect.
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(500), connect_windows_identity(socket)).await {
+        Ok(Ok(stream)) => {
+            let mut proto_stream = proto::ProtoStream::new(stream);
+            match tokio::time::timeout(Duration::from_millis(500), proto_stream.recv_raw_line())
+                .await
+            {
+                Ok(Ok(Some(line))) if !line.is_empty() => Some(SocketHelloResponse {
+                    hello: parse_socket_hello_line(socket, &line),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+async fn connect_windows_identity(socket: &Path) -> anyhow::Result<NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let pipe = cockpit_host::named_pipe::read_pipe_identity(socket)?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match ClientOptions::new().open(pipe.as_str()) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Platforms without a local daemon transport keep discovery intact but
+/// honestly report that no daemon is reachable.
+#[cfg(not(any(unix, windows)))]
 async fn socket_responds(_socket: &Path) -> Option<SocketHelloResponse> {
     None
 }
@@ -705,12 +767,34 @@ fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
+    let pipe = cockpit_host::named_pipe::read_pipe_identity_if_present(socket).ok()??;
+    if !cockpit_host::named_pipe::pipe_is_listening(&pipe) {
+        return None;
+    }
+    match cockpit_host::named_pipe::open_client_pipe_blocking(&pipe) {
+        Ok(s) => {
+            let mut buf = String::new();
+            let mut r = BufReader::new(&s);
+            if r.read_line(&mut buf).is_ok() && !buf.is_empty() {
+                Some(SocketHelloResponse {
+                    hello: parse_socket_hello_line(socket, &buf),
+                })
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
     let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return DaemonStatus::Stale;
@@ -722,7 +806,7 @@ fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
     status_for_pid_identity(identity)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn status_for_pid_identity(identity: PidIdentity) -> DaemonStatus {
     match identity {
         PidIdentity::VerifiedDaemon => DaemonStatus::LivePidSocketUnreachable,
@@ -731,7 +815,7 @@ fn status_for_pid_identity(identity: PidIdentity) -> DaemonStatus {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn status_for_unreachable_pid(_paths: &DaemonPaths) -> DaemonStatus {
     DaemonStatus::Stale
 }
@@ -864,7 +948,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
     probe_direct_blocking(&canonical)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
     if let Some(response) = socket_responds(&paths.socket).await {
         return DaemonProbe::with_hello(
@@ -880,7 +964,7 @@ async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
     if paths.pid_file.exists() {
         DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
@@ -889,7 +973,7 @@ async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
     if let Some(response) = socket_responds_blocking(&paths.socket) {
         return DaemonProbe::with_hello(
@@ -905,7 +989,7 @@ fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
     if paths.pid_file.exists() {
         DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
@@ -1026,7 +1110,7 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
     // process exits; spawning the replacement then fails with
     // `database already has a live exclusive owner`.
     let process_released = expected_pid.is_none_or(|pid| {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             if !cockpit_host::daemon_lifecycle::process_exists(pid) {
                 return true;
@@ -1046,7 +1130,7 @@ fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> 
                 _ => false,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
             true
@@ -1118,7 +1202,7 @@ pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<DetachedEphemeral
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_detached_inner(
     ephemeral: Option<&DaemonPaths>,
     no_sandbox: bool,
@@ -1127,7 +1211,7 @@ fn spawn_detached_inner(
     Ok(spawn_detached_child(ephemeral, no_sandbox, resume_all_sessions)?.id())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_detached_child(
     ephemeral: Option<&DaemonPaths>,
     no_sandbox: bool,
@@ -1135,6 +1219,8 @@ fn spawn_detached_child(
 ) -> Result<std::process::Child> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locating own binary")?;
     let mut command = Command::new(exe);
@@ -1163,10 +1249,16 @@ fn spawn_detached_child(
     }
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
     command.spawn().context("spawning daemon child")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn open_detach_child_log() -> Option<std::fs::File> {
     let dir = dirs::cache_dir()?.join("cockpit");
     cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
@@ -1177,7 +1269,7 @@ fn open_detach_child_log() -> Option<std::fs::File> {
         .ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn spawn_detached_inner(
     _ephemeral: Option<&DaemonPaths>,
     _no_sandbox: bool,
@@ -1186,7 +1278,7 @@ fn spawn_detached_inner(
     anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn spawn_detached_child(
     _ephemeral: Option<&DaemonPaths>,
     _no_sandbox: bool,
@@ -1832,7 +1924,7 @@ pub(crate) async fn boot_in_process_with_db(
 /// Like [`run_foreground`] but with injectable drain grace for lifecycle
 /// tests. `drain_grace` bounds how long teardown awaits in-flight work before
 /// force-aborting it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub async fn run_foreground_inner(
     paths: DaemonPaths,
     drain_grace: Duration,
@@ -1849,7 +1941,7 @@ pub async fn run_foreground_inner(
     .await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn run_foreground_inner_with_boot_db(
     paths: DaemonPaths,
     drain_grace: Duration,
@@ -2044,7 +2136,7 @@ async fn run_foreground_inner_with_boot_db(
     // reveal frame — never ordinary proto — and accepts only after the same
     // same-uid peer check the control socket uses. A bind failure is non-fatal
     // for daemon boot: reveal-over-socket is simply unavailable then.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let leak_reveal_task = match leak_reveal_socket::bind_reveal_socket(&ctx) {
         Ok(reveal_listener) => {
             let ctx = ctx.clone();
@@ -2108,11 +2200,11 @@ async fn run_foreground_inner_with_boot_db(
     connector_task.abort();
     #[cfg(feature = "remote")]
     remote_outbox_task.abort();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Some(task) = leak_reveal_task {
         task.abort();
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _ = std::fs::remove_file(paths.leak_reveal_socket());
     let mut failures = Vec::new();
     if let Err(error) = result {
@@ -2131,7 +2223,7 @@ async fn run_foreground_inner_with_boot_db(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub async fn run_foreground_inner(
     _paths: DaemonPaths,
     _drain_grace: Duration,
@@ -2141,7 +2233,7 @@ pub async fn run_foreground_inner(
     anyhow::bail!("daemon socket transport is not supported on this platform")
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
     for row in db.paused_session_work_all().await? {
         if let Err(e) = db.mark_paused_session_work_resumed(row.session_id).await {
@@ -2159,7 +2251,7 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 /// request teardown as soon as the reference count returns to zero. The gate
 /// prevents a freshly spawned daemon from racing its creator's initial
 /// handshake or a hello-only reachability probe.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
     mut try_reap: impl FnMut() -> server::EphemeralReapDecision,
@@ -2204,7 +2296,9 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
     return stop_linux(paths, record);
     #[cfg(all(unix, not(target_os = "linux")))]
     return stop_unix_without_stable_handle(paths, record);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    return stop_windows(paths, record);
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, record);
         anyhow::bail!(
@@ -2224,7 +2318,9 @@ pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Re
     return stop_linux(paths, DaemonPidRecord::Receipt(expected.clone()));
     #[cfg(all(unix, not(target_os = "linux")))]
     return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    return stop_windows(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, expected);
         anyhow::bail!("exact daemon process teardown is unsupported on this platform")
@@ -2329,7 +2425,77 @@ fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    match record {
+        DaemonPidRecord::LegacyNumeric(pid) => match legacy_pid_identity(pid) {
+            PidIdentity::Missing => {
+                cleanup_receipt_metadata_legacy(paths)?;
+                Ok(false)
+            }
+            PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
+                anyhow::bail!(
+                    "legacy numeric-only daemon PID {pid} is live; refusing unbound numeric signaling"
+                )
+            }
+        },
+        DaemonPidRecord::Receipt(receipt) => {
+            match verify_cockpit_daemon_receipt_identity(&receipt) {
+                PidIdentity::Missing | PidIdentity::NotDaemon => {
+                    cleanup_receipt_metadata(paths, &receipt)?;
+                    Ok(false)
+                }
+                PidIdentity::Unverified => {
+                    anyhow::bail!("refusing to signal daemon: PID receipt could not be verified")
+                }
+                PidIdentity::VerifiedDaemon => {
+                    crate::daemon::ephemeral_guard::stop_daemon_blocking(&paths.socket);
+                    let deadline = std::time::Instant::now() + restart_release_timeout(None);
+                    while std::time::Instant::now() < deadline {
+                        if !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
+                            || matches!(
+                                verify_cockpit_daemon_receipt_identity(&receipt),
+                                PidIdentity::Missing | PidIdentity::NotDaemon
+                            )
+                        {
+                            cleanup_receipt_metadata(paths, &receipt)?;
+                            return Ok(true);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&receipt)?;
+                    cleanup_receipt_metadata(paths, &receipt)?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_receipt_metadata_legacy(paths: &DaemonPaths) -> Result<()> {
+    let endpoint = paths.pid_file.parent().map(endpoint_file_for_state);
+    match std::fs::remove_file(&paths.socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing stale named-pipe identity"),
+    }
+    if let Some(endpoint) = endpoint {
+        match std::fs::remove_file(&endpoint) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("removing stale endpoint record"),
+        }
+    }
+    match std::fs::remove_file(&paths.pid_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing stale pid file"),
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
 fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> Result<bool> {
     let endpoint = Some(endpoint_file_for_state(
         paths.pid_file.parent().context("PID file has no parent")?,
@@ -3590,7 +3756,101 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, windows))]
+mod windows_pipe_tests {
+    use super::*;
+    use cockpit_proto::{Body, Envelope, RecvFrame};
+
+    #[test]
+    fn identity_file_without_a_listening_pipe_is_stale_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let sid = cockpit_host::named_pipe::current_user_sid().expect("sid");
+        let pipe = cockpit_host::named_pipe::allocate_pipe_name(&sid).expect("pipe");
+        cockpit_host::named_pipe::write_pipe_identity(&socket, &pipe).expect("identity");
+        let paths = DaemonPaths {
+            socket,
+            pid_file: dir.path().join("daemon.pid"),
+            ephemeral: false,
+        };
+
+        let probe = discover_blocking_with_canonical(paths);
+
+        assert_eq!(probe.status, DaemonStatus::NotRunning);
+        assert!(probe.hello.is_none());
+        assert!(
+            !cockpit_host::named_pipe::pipe_is_listening(&pipe),
+            "stale-owner discovery must observe a missing pipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_pipe_bind_accept_hello_and_client_connect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let mut listener = bind_private_socket(&socket).expect("bind pipe");
+        let pipe = listener.pipe_name().clone();
+        assert!(cockpit_host::named_pipe::pipe_is_listening(&pipe));
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            cockpit_host::named_pipe::named_pipe_peer_is_current_user(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&stream),
+            )
+            .expect("owner ACL peer");
+            let mut proto = proto::ProtoStream::new(stream);
+            proto
+                .send(&Envelope::response(
+                    uuid::Uuid::nil(),
+                    proto::Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 0,
+                        active_sessions: 0,
+                        socket_path: "test".into(),
+                        daemon_version: "0.1.pipe".into(),
+                        protocol_version: proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: "test.db".into(),
+                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                    },
+                ))
+                .await
+                .expect("hello");
+            match proto.recv().await.expect("recv").expect("frame") {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        request: proto::Request::DaemonStatus,
+                        ..
+                    } => {}
+                    other => panic!("expected lifetime confirmation, got {other:?}"),
+                },
+                other => panic!("expected envelope, got {other:?}"),
+            }
+        });
+
+        let client = cockpit_client::DaemonClient::connect(&socket)
+            .await
+            .expect("client connect over named pipe");
+        assert_eq!(client.negotiated().daemon_version, "0.1.pipe");
+        assert!(client.is_socket_backed());
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn leak_reveal_sibling_pipe_is_derived_from_control_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("daemon.sock");
+        let listener = bind_private_socket(&control).expect("bind control");
+        let reveal = listener.pipe_name().leak_reveal_sibling().expect("sibling");
+        let reveal_path = DaemonPaths::leak_reveal_socket_path(&control);
+        windows_pipe::NamedPipeListener::bind_named(&reveal_path, reveal.clone(), true)
+            .expect("bind reveal");
+        assert!(cockpit_host::named_pipe::pipe_is_listening(&reveal));
+        drop(listener);
+    }
+}
+
+#[cfg(all(test, not(any(unix, windows))))]
 mod non_unix_tests {
     use super::*;
 

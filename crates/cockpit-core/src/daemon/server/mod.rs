@@ -20,7 +20,12 @@ use futures::FutureExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+
+#[cfg(any(unix, windows))]
+use crate::daemon::{DaemonListener, DaemonStream};
 #[cfg(feature = "remote")]
 use tokio::sync::watch;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
@@ -4558,8 +4563,8 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
 /// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
 /// a detached client task. Breaking the loop hands control back to
 /// [`crate::daemon::run_foreground_inner`], which drains the workers.
-#[cfg(unix)]
-pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
+#[cfg(any(unix, windows))]
+pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListener) -> Result<()> {
     // Wiring invariant (debug/CI): the transactional ledger-site registry must
     // exactly cover the remotely-admissible transactional_mutation commands.
     #[cfg(feature = "remote")]
@@ -4618,9 +4623,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                     }
                 }
             }
-            accepted = listener.accept() => {
+            accepted = accept_daemon_stream(&mut listener) => {
                 match accepted {
-                    Ok((stream, _peer)) => {
+                    Ok(stream) => {
                         if let Err(e) = validate_peer_owner(&stream) {
                             tracing::warn!(error = %e, "rejected daemon socket peer");
                             continue;
@@ -4712,7 +4717,23 @@ async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
+async fn accept_daemon_stream(listener: &mut DaemonListener) -> Result<DaemonStream> {
+    #[cfg(unix)]
+    {
+        listener
+            .accept()
+            .await
+            .map(|(stream, _peer)| stream)
+            .context("accepting daemon unix socket")
+    }
+    #[cfg(windows)]
+    {
+        listener.accept().await
+    }
+}
+
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
@@ -4722,13 +4743,13 @@ async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
 }
 
 /// Injected-clock retention tick: media sweep first, then session payload expiry.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_unix_ms: i64) {
     run_media_retention_periodic(ctx, now_unix_ms).await;
     run_retention_pass(ctx.db.clone(), cfg, now_unix_ms.div_euclid(1000)).await;
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     let now_secs = chrono::Utc::now().timestamp();
     run_retention_pass(db, cfg, now_secs).await;
@@ -4738,6 +4759,12 @@ async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
 /// dedicated leak-reveal socket accept loop — one shared policy, never a
 /// hand-rolled second `SO_PEERCRED`/`getpeereid` path. Elevated to `pub(crate)`
 /// so the reveal accept loop (a sibling `daemon` module) reuses it.
+#[cfg(windows)]
+pub(crate) fn validate_peer_owner(stream: &NamedPipeServer) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    cockpit_host::named_pipe::named_pipe_peer_is_current_user(stream.as_raw_handle())
+}
+
 #[cfg(unix)]
 pub(crate) fn validate_peer_owner(stream: &UnixStream) -> Result<()> {
     let peer_uid = peer_uid(stream)?;
@@ -5444,8 +5471,8 @@ fn try_send_in_process_event(
     }
 }
 
-#[cfg(unix)]
-async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
+#[cfg(any(unix, windows))]
+async fn handle_client(stream: DaemonStream, ctx: Arc<DaemonContext>) -> Result<()> {
     // Issue #296: socket peers are still Owner (follow-up #337) but start
     // without the daemon-private capability. Secret RPCs fail closed until
     // the peer presents the token a confined child cannot read.

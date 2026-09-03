@@ -28,14 +28,14 @@ crates/cockpit-proto     -> cockpit-config, cockpit-db
 crates/cockpit-config    -> cockpit-host, cockpit-tokenizer, cockpit-db
 crates/cockpit-tokenizer -> (none)
 crates/cockpit-db        -> (none)
-crates/cockpit-client    -> cockpit-proto
+crates/cockpit-client    -> cockpit-proto, cockpit-host
 crates/cockpit-host      -> (none)
 crates/cockpit-noise     -> (none)
 crates/cockpit-test-support -> (none)
 crates/relay-protocol    -> (none)
 ```
 
-Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, core, and config; it must not depend on application, protocol, config, or storage crates. Config loaders use `cockpit_host::bounded` with an explicit domain cap because they sit below `cockpit-core` and cannot import `resource_limits`. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
+Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, core, config, and the local daemon client; it must not depend on application, protocol, config, or storage crates. Config loaders use `cockpit_host::bounded` with an explicit domain cap because they sit below `cockpit-core` and cannot import `resource_limits`. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
 
 Rules that follow from the graph:
 

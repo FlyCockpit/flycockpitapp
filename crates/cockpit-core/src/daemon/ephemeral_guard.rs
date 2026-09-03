@@ -397,7 +397,7 @@ fn request_owned_graceful_stop(
     {
         anyhow::bail!("daemon receipt changed before owner graceful-stop request");
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         #[cfg(test)]
         if let Some(succeed) = INJECT_OWNER_GRACEFUL_STOP.with(|value| value.replace(None)) {
@@ -418,14 +418,14 @@ fn request_owned_graceful_stop(
             || {},
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (cleanup, expected);
         anyhow::bail!("owner graceful-stop transport is unavailable on this platform")
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn request_owned_graceful_stop_async(
     cleanup: &ProcessCleanup,
     expected: &DaemonPidReceipt,
@@ -813,7 +813,20 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
             let _ = stream.read(&mut sink);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::io::{Read as _, Write as _};
+        if let Ok(pipe) = cockpit_host::named_pipe::read_pipe_identity(socket)
+            && let Ok(mut stream) = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe)
+        {
+            let _ = stream.write_all(envelope.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+            let mut sink = [0u8; 256];
+            let _ = stream.read(&mut sink);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (socket, envelope);
     }

@@ -18,18 +18,25 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use cockpit_proto::{self as proto, ErrorPayload, Request, Response};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
+
+#[cfg(unix)]
+type WireStream = UnixStream;
+#[cfg(windows)]
+type WireStream = NamedPipeClient;
 
 pub mod bulk_upload;
 pub mod image_upload;
@@ -113,7 +120,7 @@ impl ClientEndpoint {
         match self {
             Self::InProcess(endpoint) => endpoint.sensitive_request(payload).await,
             Self::Wire(control_socket) => {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
                     let stem = control_socket
@@ -125,7 +132,7 @@ impl ClientEndpoint {
                         .map_or_else(PathBuf::new, Path::to_path_buf)
                         .join(format!("{stem}-leak-reveal.sock"));
                     let exchange = async move {
-                        let mut stream = UnixStream::connect(socket).await?;
+                        let mut stream = connect_wire(&socket).await?;
                         stream.write_all(&payload).await?;
                         stream.flush().await?;
                         stream.shutdown().await?;
@@ -154,7 +161,7 @@ impl ClientEndpoint {
                         .await
                         .map_err(|_| anyhow!("sensitive endpoint exchange timed out"))?
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 {
                     let _ = (control_socket, payload);
                     anyhow::bail!("wire sensitive transport is unavailable on this platform")
@@ -522,11 +529,11 @@ pub struct InProcessConnection {
     pub events: mpsc::Receiver<proto::Event>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// Outbound queue depth. Generous — request payloads are tiny.
 const REQUEST_QUEUE: usize = 64;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// Inbound event queue depth. Lagging consumers drop incoming events and get a
 /// typed lag marker once capacity returns. If the TUI cannot keep up, the
 /// right answer is "reattach" (the server re-sends the current session state
@@ -545,7 +552,7 @@ pub const RETRY_LATER_ATTEMPTS: usize = 3;
 /// wait is bounded by the daemon's own reconciliation, not by contention this
 /// client can back off from.
 pub const RETRY_LATER_BACKOFF: Duration = Duration::from_millis(200);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
 #[cfg(feature = "test-support")]
@@ -601,7 +608,7 @@ pub struct DaemonClient {
     owner_capability: Option<proto::OwnerCapabilityToken>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Pending {
     id: Uuid,
     request: Request,
@@ -610,12 +617,12 @@ struct Pending {
 
 #[derive(Clone)]
 enum ClientBackend {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Wire(mpsc::Sender<IoCommand>),
     InProcess(mpsc::Sender<InProcessRequest>),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum IoCommand {
     Request(Box<Pending>),
     Cancel { id: Uuid },
@@ -632,11 +639,9 @@ impl DaemonClient {
     pub async fn connect(socket: &Path) -> Result<Self> {
         #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            let stream = UnixStream::connect(socket)
-                .await
-                .with_context(|| format!("connecting to {}", socket.display()))?;
+            let stream = connect_wire(socket).await?;
             let mut proto = ProtoStream::new(stream);
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
@@ -648,7 +653,7 @@ impl DaemonClient {
                 load_owner_capability(socket),
             ))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(anyhow!(
                 "daemon socket transport is not supported on this platform"
@@ -680,14 +685,17 @@ impl DaemonClient {
     pub fn has_owner_capability(&self) -> bool {
         match &self.backend {
             ClientBackend::InProcess(_) => true,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             ClientBackend::Wire(_) => self.owner_capability.is_some(),
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[cfg(test)]
-    fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
+    fn from_proto<S>(proto: ProtoStream<S>) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         Self::from_proto_negotiated(
             proto,
             proto::NegotiatedProtocol::current(),
@@ -696,13 +704,16 @@ impl DaemonClient {
         )
     }
 
-    #[cfg(unix)]
-    fn from_proto_negotiated(
-        proto: ProtoStream<UnixStream>,
+    #[cfg(any(unix, windows))]
+    fn from_proto_negotiated<S>(
+        proto: ProtoStream<S>,
         negotiated: proto::NegotiatedProtocol,
         initial_events: Vec<proto::Event>,
         owner_capability: Option<proto::OwnerCapabilityToken>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
         for event in initial_events {
@@ -755,10 +766,10 @@ impl DaemonClient {
         response_timeout: Duration,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let id = Uuid::now_v7();
         match &self.backend {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             ClientBackend::Wire(request_tx) => {
                 request_tx
                     .send(IoCommand::Request(Box::new(Pending {
@@ -866,11 +877,11 @@ impl DaemonClient {
     }
 
     pub fn is_socket_backed(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             matches!(self.backend, ClientBackend::Wire(_))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -886,10 +897,60 @@ impl DaemonRequestClient for DaemonClient {
     }
 }
 
-#[cfg(unix)]
-async fn negotiate_hello(
-    proto_stream: &mut ProtoStream<UnixStream>,
-) -> Result<proto::NegotiatedProtocol> {
+#[cfg(any(unix, windows))]
+async fn connect_wire(socket: &Path) -> Result<WireStream> {
+    #[cfg(unix)]
+    {
+        UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connecting to {}", socket.display()))
+    }
+    #[cfg(windows)]
+    {
+        connect_named_pipe(socket).await
+    }
+}
+
+#[cfg(windows)]
+async fn connect_named_pipe(identity: &Path) -> Result<NamedPipeClient> {
+    use std::time::Instant;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+
+    let pipe = cockpit_host::named_pipe::read_pipe_identity(identity)
+        .with_context(|| format!("reading named-pipe identity {}", identity.display()))?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match ClientOptions::new().open(pipe.as_str()) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => {
+                return Err(error).context(format!(
+                    "stale named-pipe owner: identity {} names {}, but no server is listening",
+                    identity.display(),
+                    pipe.as_str()
+                ));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("connecting to {} ({})", identity.display(), pipe.as_str())
+                });
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn negotiate_hello<S>(proto_stream: &mut ProtoStream<S>) -> Result<proto::NegotiatedProtocol>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let line = match tokio::time::timeout(Duration::from_millis(500), proto_stream.recv_raw_line())
         .await
     {
@@ -930,11 +991,14 @@ async fn negotiate_hello(
 /// This happens before `run_io` owns the transport, so a returned
 /// [`DaemonClient`] is already a live reference even if its caller is
 /// immediately cancelled or dropped without making an application request.
-#[cfg(unix)]
-async fn confirm_client_lifetime(
-    proto_stream: &mut ProtoStream<UnixStream>,
+#[cfg(any(unix, windows))]
+async fn confirm_client_lifetime<S>(
+    proto_stream: &mut ProtoStream<S>,
     version: u32,
-) -> Result<Vec<proto::Event>> {
+) -> Result<Vec<proto::Event>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let id = Uuid::now_v7();
     proto_stream
         .send(&Envelope::request_at(version, id, Request::DaemonStatus))
@@ -985,7 +1049,7 @@ async fn confirm_client_lifetime(
         .map_err(|_| protocol_handshake_error("daemon lifetime confirmation timed out"))?
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(proto::ErrorPayload {
         code: proto::ErrorCode::ProtocolVersion,
@@ -995,13 +1059,15 @@ fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
     })
 }
 
-#[cfg(unix)]
-async fn run_io(
-    mut proto: ProtoStream<UnixStream>,
+#[cfg(any(unix, windows))]
+async fn run_io<S>(
+    mut proto: ProtoStream<S>,
     mut request_rx: mpsc::Receiver<IoCommand>,
     event_tx: mpsc::Sender<proto::Event>,
     owner_capability: Option<proto::OwnerCapabilityToken>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
         HashMap::new();
     let mut inbound_burst = InboundBurst::default();
@@ -1185,7 +1251,7 @@ async fn run_io(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn emit_lag_marker_on_close(event_tx: &mpsc::Sender<proto::Event>, dropped: u64) {
     if dropped == 0 {
         return;
@@ -1198,7 +1264,7 @@ async fn emit_lag_marker_on_close(event_tx: &mpsc::Sender<proto::Event>, dropped
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn try_forward_event(
     event_tx: &mpsc::Sender<proto::Event>,
     event: proto::Event,
@@ -1216,13 +1282,13 @@ fn try_forward_event(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct InboundBurst {
     frames: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl InboundBurst {
     fn record_inbound(&mut self) {
         self.frames = self.frames.saturating_add(1);
@@ -1237,13 +1303,16 @@ impl InboundBurst {
     }
 }
 
-#[cfg(unix)]
-async fn handle_io_command(
+#[cfg(any(unix, windows))]
+async fn handle_io_command<S>(
     cmd: IoCommand,
-    proto: &mut ProtoStream<UnixStream>,
+    proto: &mut ProtoStream<S>,
     pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
     owner_capability: Option<&proto::OwnerCapabilityToken>,
-) -> bool {
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     match cmd {
         IoCommand::Cancel { id } => {
             if remove_pending_request(pending, id).is_some() {
@@ -1272,7 +1341,7 @@ async fn handle_io_command(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn remove_pending_request(
     pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
     id: Uuid,
@@ -1280,7 +1349,7 @@ fn remove_pending_request(
     pending.remove(&id)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_nil_daemon_status_hello(id: Uuid, response: &Response) -> bool {
     id.is_nil() && matches!(response, Response::DaemonStatus { .. })
 }
@@ -1299,7 +1368,7 @@ pub fn owner_capability_path(control_socket: &Path) -> PathBuf {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn load_owner_capability(socket: &Path) -> Option<proto::OwnerCapabilityToken> {
     let path = owner_capability_path(socket);
     let bytes = std::fs::read(&path).ok()?;
@@ -1312,9 +1381,10 @@ fn load_owner_capability(socket: &Path) -> Option<proto::OwnerCapabilityToken> {
     }
 }
 #[cfg(test)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     fn lsp_event(text: impl Into<String>) -> proto::Event {
@@ -1406,7 +1476,10 @@ mod tests {
         }
     }
 
-    async fn recv_request_id(daemon: &mut ProtoStream<UnixStream>) -> Uuid {
+    async fn recv_request_id<S>(daemon: &mut ProtoStream<S>) -> Uuid
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
                 Body::Request { id, .. } => id,
@@ -1416,6 +1489,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn bind_test_socket() -> (tempfile::TempDir, PathBuf, UnixListener) {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
@@ -1423,11 +1497,66 @@ mod tests {
         (dir, socket, listener)
     }
 
-    async fn send_daemon_hello(
-        daemon: &mut ProtoStream<UnixStream>,
+    #[cfg(windows)]
+    struct TestPipeListener {
+        pending: tokio::net::windows::named_pipe::NamedPipeServer,
+        name: String,
+    }
+
+    #[cfg(windows)]
+    impl TestPipeListener {
+        async fn accept(&mut self) -> tokio::net::windows::named_pipe::NamedPipeServer {
+            self.pending.connect().await.expect("pipe connect");
+            let connected = std::mem::replace(
+                &mut self.pending,
+                tokio::net::windows::named_pipe::ServerOptions::new()
+                    .create(&self.name)
+                    .expect("next pipe instance"),
+            );
+            connected
+        }
+    }
+
+    #[cfg(windows)]
+    fn bind_test_socket() -> (tempfile::TempDir, PathBuf, TestPipeListener) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let sid = cockpit_host::named_pipe::current_user_sid().expect("sid");
+        let pipe = cockpit_host::named_pipe::allocate_pipe_name(&sid).expect("pipe name");
+        cockpit_host::named_pipe::write_pipe_identity(&socket, &pipe).expect("identity");
+        let pending = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(pipe.as_str())
+            .expect("bind named pipe");
+        (
+            dir,
+            socket,
+            TestPipeListener {
+                pending,
+                name: pipe.as_str().to_string(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    async fn accept_test(listener: &UnixListener) -> UnixStream {
+        listener.accept().await.expect("accept").0
+    }
+
+    #[cfg(windows)]
+    async fn accept_test(
+        listener: &mut TestPipeListener,
+    ) -> tokio::net::windows::named_pipe::NamedPipeServer {
+        listener.accept().await
+    }
+
+    async fn send_daemon_hello<S>(
+        daemon: &mut ProtoStream<S>,
         daemon_version: impl Into<String>,
         protocol_version: u32,
-    ) {
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         daemon
             .send(&Envelope::response(
                 Uuid::nil(),
@@ -1437,7 +1566,10 @@ mod tests {
             .unwrap();
     }
 
-    async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
+    async fn confirm_client_lifetime<S>(daemon: &mut ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let id = match daemon.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(envelope) => match envelope.body {
                 Body::Request {
@@ -1493,10 +1625,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_fails_when_the_endpoint_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        DaemonClient::connect(&dir.path().join("missing.sock"))
+            .await
+            .expect_err("absent endpoint must fail closed");
+    }
+
+    #[tokio::test]
     async fn negotiation_parses_daemon_hello_on_connect() {
-        let (_dir, socket, listener) = bind_test_socket();
+        let (_dir, socket, mut listener) = bind_test_socket();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
             confirm_client_lifetime(&mut daemon).await;
@@ -1515,9 +1655,9 @@ mod tests {
 
     #[tokio::test]
     async fn negotiation_preserves_typed_protocol_version_mismatch() {
-        let (_dir, socket, listener) = bind_test_socket();
+        let (_dir, socket, mut listener) = bind_test_socket();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
         });
@@ -1540,9 +1680,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
-        let (_dir, socket, listener) = bind_test_socket();
+        let (_dir, socket, mut listener) = bind_test_socket();
         let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
+            let _stream = accept_test(&mut listener).await;
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
         let connect = tokio::spawn({
@@ -1567,10 +1707,10 @@ mod tests {
 
     #[tokio::test]
     async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
-        let (_dir, socket, listener) = bind_test_socket();
+        let (_dir, socket, mut listener) = bind_test_socket();
         let session_id = Uuid::new_v4();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(
                 &mut daemon,
@@ -1648,7 +1788,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn full_event_queue_does_not_block_pending_requests() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 
@@ -1677,7 +1817,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn caller_selected_request_timeout_outlives_the_default_deadline() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
         let (received_tx, received_rx) = oneshot::channel();
@@ -1722,7 +1862,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropped_events_emit_exactly_one_lag_marker() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
         const DROPPED: usize = 7;
@@ -1787,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_band_lag_error_is_surfaced_not_discarded() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
         let session_id = Uuid::new_v4();
@@ -1828,7 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_attach_out_of_band_error_is_surfaced_not_discarded() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 
@@ -1852,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_routes_protocol_version_error_to_pending_attach() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 
@@ -1904,7 +2044,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_frame_response_resolves_pending_request_with_error() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 
@@ -1981,7 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_frame_error_resolves_pending_request_with_error() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 
@@ -2028,7 +2168,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_frame_event_does_not_close_client_io_loop() {
-        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let (client_stream, daemon_stream) = tokio::io::duplex(1024 * 1024);
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
         let mut daemon = ProtoStream::new(daemon_stream);
 

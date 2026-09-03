@@ -2668,6 +2668,9 @@ pub struct DaemonContext {
     /// "external dispatch is not enabled".
     pub external_journal: Option<std::sync::Arc<crate::external_journal::ExternalJournal>>,
     /// Boot-held authority for the fixed private media component root.
+    /// Runtime admission, recovery, retention, and deletion must call
+    /// [`Self::active_media_storage_recovery`]: in-place promotion publishes
+    /// storage on the promotion bundle and never assigns this field.
     pub(crate) media_storage_recovery:
         Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
     /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
@@ -2986,13 +2989,17 @@ impl DaemonContext {
         }
     }
 
+    /// Currently published durable media authority. This is the only
+    /// production read path: boot-time persistent owners serve
+    /// `media_storage_recovery`, and in-place promotion serves the bundle
+    /// installed by [`Self::activate_persistent_services`]. Prepared
+    /// promotion services stay private until lifetime publication. An
+    /// explicitly installed authority on an ephemeral owner remains valid
+    /// for in-process attachment flows; do not hide it behind the boot-time
+    /// path marker.
     pub(crate) fn active_media_storage_recovery(
         &self,
     ) -> Option<Arc<crate::media_storage::MediaStorageRecovery>> {
-        // Prepared promotion services stay private until lifetime publication.
-        // An explicitly installed authority on an ephemeral owner remains valid
-        // for in-process attachment flows; do not hide it behind the boot-time
-        // path marker.
         if !self.is_ephemeral_lifetime() {
             return crate::sync::lock_or_recover(&self.promoted_persistent_services)
                 .media_storage_recovery
@@ -3392,7 +3399,7 @@ impl DaemonContext {
                 handle.clone(),
             ));
         self.registry.set_redaction_key_resolver(resolver.clone());
-        if let Some(storage) = self.media_storage_recovery.clone() {
+        if let Some(storage) = self.active_media_storage_recovery() {
             self.registry.set_tool_media_runtime(Arc::new(
                 crate::tool_media_authority::runtime::ToolMediaRuntime::new(
                     handle.clone(),
@@ -4446,7 +4453,7 @@ pub(crate) async fn boot_with_db(
     db.reconcile_delegation_sidecar_cleanup_intents()
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
-    if let Some(storage) = &ctx.media_storage_recovery {
+    if let Some(storage) = ctx.active_media_storage_recovery() {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         storage
             .reconcile_abandoned_component_leases(now_unix_ms)
@@ -5155,7 +5162,7 @@ async fn run_media_retention_sweep(
 }
 
 async fn run_media_retention_periodic(ctx: &DaemonContext, now_unix_ms: i64) {
-    let Some(storage) = ctx.media_storage_recovery.as_ref() else {
+    let Some(storage) = ctx.active_media_storage_recovery() else {
         return;
     };
     if let Err(error) = run_media_retention_sweep(storage, now_unix_ms).await {

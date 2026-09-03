@@ -7954,6 +7954,10 @@ fn preparing_ephemeral_promotion_keeps_persistent_services_private() {
     assert!(ctx.scheduler().is_none());
     assert!(ctx.registry.scheduler().is_none());
     assert!(ctx.registry.resource_scheduler().is_none());
+    assert!(
+        ctx.active_media_storage_recovery().is_none(),
+        "prepared media must stay unpublished until lifetime publication"
+    );
     drop(prepared);
 }
 
@@ -8049,6 +8053,14 @@ fn in_place_promotion_is_idempotent_and_holds_the_reaper() {
         ctx.paths.ephemeral,
         "in-place promotion must not rewrite the boot-time path marker"
     );
+    assert!(
+        ctx.media_storage_recovery.is_none(),
+        "in-place promotion must not assign the boot-time media field"
+    );
+    assert!(
+        ctx.active_media_storage_recovery().is_some(),
+        "lifetime publication must expose the promoted media authority"
+    );
     assert_eq!(
         ctx.reap_ephemeral_last_client(),
         super::EphemeralReapDecision::Persistent
@@ -8062,6 +8074,88 @@ fn in_place_promotion_is_idempotent_and_holds_the_reaper() {
     assert_eq!(
         ctx.reap_ephemeral_last_client(),
         super::EphemeralReapDecision::Persistent
+    );
+}
+
+#[tokio::test]
+async fn in_place_promotion_makes_durable_media_upload_available() {
+    use cockpit_db::media_attachments::{
+        LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationTransitionV1,
+        LocalMediaMutationV1, RequestedLocalPathMediaKind,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    let env = crate::test_env::lock_async().await;
+    let data = tempfile::tempdir().expect("temporary XDG data directory");
+    env.set_var("XDG_DATA_HOME", data.path());
+    let ctx = test_ctx();
+    assert!(
+        ctx.media_storage_recovery.is_none(),
+        "ephemeral boot must not install durable media on the boot field"
+    );
+    assert!(
+        ctx.active_media_storage_recovery().is_none(),
+        "ephemeral boot must not publish durable media"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id) = attached_state(&ctx, project.path()).await;
+    let changed = ctx
+        .promote_to_persistent(&ClientPrincipal::owner())
+        .expect("owner promotion publishes persistent lifetime");
+    assert!(changed, "first promotion must change lifetime");
+    assert!(
+        ctx.media_storage_recovery.is_none(),
+        "promotion must not back-fill the boot-time media field"
+    );
+    assert!(
+        ctx.active_media_storage_recovery().is_some(),
+        "post-promotion dispatch must observe media through the gated accessor"
+    );
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let png = sample_png();
+    let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+    let reservation_digest =
+        crate::media_storage::media_upload_reservation_digest(&policy, png.len() as u64).unwrap();
+    let begin = LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload: LocalMediaMutationPayloadV1::Begin {
+            session_id,
+            canonical_project_digest: project_digest,
+            client_draft_id: Uuid::now_v7(),
+            media_kind: RequestedLocalPathMediaKind::Image,
+            declared_total_bytes: png.len() as u64,
+            reservation_digest,
+        },
+    };
+    let Response::LocalMediaMutation(receipt) =
+        handle_request(Request::BeginMediaUpload(begin), &mut state, &ctx)
+            .await
+            .expect("durable media upload must succeed after in-place promotion")
+    else {
+        panic!("expected LocalMediaMutation from begin");
+    };
+    assert!(
+        matches!(
+            receipt.transition,
+            LocalMediaMutationTransitionV1::Upload { .. }
+        ),
+        "promoted ephemeral owner must admit a real media upload, got {:?}",
+        receipt.transition
     );
 }
 
@@ -8104,6 +8198,14 @@ async fn already_attached_client_promotes_busy_ephemeral_owner_in_place() {
         .expect("already-attached client can promote without re-acquire");
     assert!(matches!(response, Response::Ack));
     assert!(!ctx.is_ephemeral_lifetime());
+    assert!(
+        ctx.media_storage_recovery.is_none(),
+        "busy-owner promotion must keep the boot-time media field empty"
+    );
+    assert!(
+        ctx.active_media_storage_recovery().is_some(),
+        "busy-owner promotion must publish durable media through the gated accessor"
+    );
     assert_eq!(ctx.paths.socket, socket);
     assert_eq!(ctx.paths.pid_file, pid_file);
     assert_eq!(std::process::id(), pid);

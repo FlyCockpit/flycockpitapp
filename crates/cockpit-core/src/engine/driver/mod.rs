@@ -1587,6 +1587,10 @@ pub struct Driver {
     /// fail — but are not reachable from a black-box unit test).
     #[cfg(test)]
     test_compact_force_failure: Option<CompactForceFailure>,
+    #[cfg(test)]
+    test_compaction_ignore_forward_progress: bool,
+    #[cfg(test)]
+    test_compact_brief_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -1682,12 +1686,19 @@ pub(in crate::engine::driver) enum CompactForceFailure {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(in crate::engine::driver) struct NestedLaneTestHooks {
     pub test_compact_brief_script:
         Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
     pub test_providers_override:
         Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    /// No-progress compaction charges applied to the lane budget after allot.
+    pub lane_compact_guard_precharge: u32,
+    /// When true, subagent compaction apply ignores lane forward progress.
+    pub compaction_ignore_forward_progress: bool,
+    /// Usage recorded into the lane when a test compact brief succeeds without
+    /// a provider call.
+    pub compact_brief_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
 }
 
 #[cfg(test)]
@@ -2497,6 +2508,10 @@ impl Driver {
             test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
             #[cfg(test)]
             test_compact_force_failure: self.test_compact_force_failure,
+            #[cfg(test)]
+            test_compaction_ignore_forward_progress: self.test_compaction_ignore_forward_progress,
+            #[cfg(test)]
+            test_compact_brief_lane_charge: self.test_compact_brief_lane_charge,
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -2888,6 +2903,10 @@ impl Driver {
             test_compaction_apply_trace: None,
             #[cfg(test)]
             test_compact_force_failure: None,
+            #[cfg(test)]
+            test_compaction_ignore_forward_progress: false,
+            #[cfg(test)]
+            test_compact_brief_lane_charge: None,
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,

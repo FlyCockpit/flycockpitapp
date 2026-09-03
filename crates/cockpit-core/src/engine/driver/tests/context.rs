@@ -4732,11 +4732,12 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
     nested_lane_test_hooks::set(NestedLaneTestHooks {
         test_compact_brief_script: driver.test_compact_brief_script.clone(),
         test_providers_override: driver.test_providers_override.clone(),
+        lane_compact_guard_precharge: 2,
+        compaction_ignore_forward_progress: true,
+        ..Default::default()
     });
 
     let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
-    budget.record_compaction(100, false).unwrap();
-    budget.record_compaction(100, false).unwrap();
 
     let args = driver.spawn_args_delegated_in_cwd(
         &driver.cwd,
@@ -4786,6 +4787,11 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
         "executor must return the guard-trip partial surface: {}",
         outcome.report
     );
+    assert!(
+        !outcome.report.contains("never reached"),
+        "guard trip must stop before the next scripted turn: {}",
+        outcome.report
+    );
     let events = driver
         .session
         .db
@@ -4822,14 +4828,6 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
             total_tokens: 91,
             use_alias_names: true,
         })
-        .turn(Turn::Text("compact synthesis ".repeat(40)))
-        .with_usage(Usage {
-            prompt_tokens: 15,
-            completion_tokens: 1,
-            total_tokens: 16,
-            use_alias_names: true,
-        })
-        .turn(Turn::Text("never reached".into()))
         .start()
         .await;
 
@@ -4862,6 +4860,15 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
     nested_lane_test_hooks::set(NestedLaneTestHooks {
         test_compact_brief_script: None,
         test_providers_override: driver.test_providers_override.clone(),
+        compact_brief_lane_charge: Some(
+            crate::engine::delegation_budget::BudgetCharge::from_usage(crate::tokens::TokenUsage {
+                input_tokens: 15,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+        ),
+        ..Default::default()
     });
 
     let budget = crate::engine::delegation_budget::BudgetPool::new(ResolvedDelegationBudget {
@@ -4916,6 +4923,11 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
     assert!(
         outcome.report.contains("budget exhausted (input_tokens)"),
         "post-compaction budget charge must return the partial surface: {}",
+        outcome.report
+    );
+    assert!(
+        !outcome.report.contains("never reached"),
+        "post-compaction exhaustion must stop before the next scripted turn: {}",
         outcome.report
     );
 }

@@ -252,6 +252,8 @@ pub(in crate::engine::driver) struct CompactBriefDraft {
     test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
     #[cfg(test)]
     test_script: Option<Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    #[cfg(test)]
+    test_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
 }
 
 #[derive(Debug, Default)]
@@ -2390,7 +2392,20 @@ impl Driver {
             return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
         }
 
-        let forward_progress = crate::engine::delegation_budget::take_lane_forward_progress();
+        let forward_progress = {
+            #[cfg(test)]
+            {
+                if self.test_compaction_ignore_forward_progress {
+                    false
+                } else {
+                    crate::engine::delegation_budget::take_lane_forward_progress()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                crate::engine::delegation_budget::take_lane_forward_progress()
+            }
+        };
         if let Err(error) = budget.record_compaction(prepared.tokens_after, forward_progress) {
             return Err(error);
         }
@@ -2571,6 +2586,8 @@ impl Driver {
             test_calls: self.test_compact_brief_calls.clone(),
             #[cfg(test)]
             test_script: self.test_compact_brief_script.clone(),
+            #[cfg(test)]
+            test_lane_charge: self.test_compact_brief_lane_charge,
         }
     }
 
@@ -2813,6 +2830,15 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
         CompactDraftOutcome as O, CompactDraftSuccess, CompactSampleClass,
         MAX_WIRE_SAMPLES_PER_NODE,
     };
+
+    #[cfg(test)]
+    fn maybe_record_test_compact_lane_charge(draft: &CompactBriefDraft) {
+        if let Some(charge) = draft.test_lane_charge
+            && !charge.is_empty()
+        {
+            crate::engine::delegation_budget::note_lane_budget_usage(charge, false);
+        }
+    }
     if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_node() {
         return O::ContextOverflow { diagnostic };
     }
@@ -2855,6 +2881,8 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                     &draft, purpose, attempt, fit_rung, "success", None,
                 )
                 .await;
+                #[cfg(test)]
+                maybe_record_test_compact_lane_charge(&draft);
                 return O::Success(CompactDraftSuccess {
                     brief: "test compact brief".to_string(),
                     fit_rung,
@@ -2886,6 +2914,8 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         &draft, purpose, attempt, fit_rung, "success", None,
                     )
                     .await;
+                    #[cfg(test)]
+                    maybe_record_test_compact_lane_charge(&draft);
                     return O::Success(CompactDraftSuccess {
                         brief: text,
                         fit_rung,

@@ -10770,6 +10770,12 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         if let Some(override_) = hooks.test_providers_override {
             scheduled_lane_driver.test_providers_override = Some(override_);
         }
+        for _ in 0..hooks.lane_compact_guard_precharge {
+            let _ = budget.record_compaction(100, false);
+        }
+        scheduled_lane_driver.test_compaction_ignore_forward_progress =
+            hooks.compaction_ignore_forward_progress;
+        scheduled_lane_driver.test_compact_brief_lane_charge = hooks.compact_brief_lane_charge;
     }
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {

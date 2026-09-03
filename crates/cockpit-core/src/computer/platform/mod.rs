@@ -23,8 +23,8 @@ pub use macos::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MacFocusedWindowWitness, MacLiveFocusedWindow, ax_window_element_is_live,
-    live_focused_macos_injection_target,
+    MacFocusedWindowWitness, MacLiveFocusedWindow, address_macos_injection_window,
+    ax_window_element_is_live, live_focused_macos_injection_target, restore_macos_injection_target,
 };
 pub use wayland::{
     WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,

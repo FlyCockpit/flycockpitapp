@@ -24,8 +24,9 @@ use super::{
     click_repetitions, eased_progress, scale_png,
 };
 use crate::computer::platform::{
-    MacFocusedWindowWitness, MacLiveFocusedWindow, ax_window_element_is_live,
-    live_focused_macos_injection_target, macos_injection_target_from_opaque,
+    MacFocusedWindowWitness, MacLiveFocusedWindow, address_macos_injection_window,
+    ax_window_element_is_live, live_focused_macos_injection_target,
+    macos_injection_target_from_opaque, restore_macos_injection_target,
 };
 use crate::computer::target::{BackendKind, OpaqueWindowId};
 
@@ -45,6 +46,7 @@ pub(super) struct MacOsComputerBackend {
     physical_capability: Option<super::coordinator::PhysicalDispatchCapability>,
     input_authority: MacHostInputAuthority,
     evidenced_window: Option<EvidencedMacWindow>,
+    cleanup_window: Option<OpaqueWindowId>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,10 @@ impl MacOsComputerBackend {
                 )
             })?;
         let input_authority = MacHostInputAuthority::open(&active_console_session)?;
+        let cleanup_window = input_authority
+            .state
+            .window
+            .map(crate::computer::target::OpaqueWindowId::from_bytes);
         Ok(Self {
             source,
             geometry: query_geometry()?,
@@ -111,6 +117,7 @@ impl MacOsComputerBackend {
             outstanding_buttons: input_authority.state.buttons.iter().copied().collect(),
             input_authority,
             evidenced_window: None,
+            cleanup_window,
         })
     }
 
@@ -276,6 +283,13 @@ impl MacOsComputerBackend {
         })
     }
 
+    fn held_input_window_bytes(&self) -> Option<[u8; 16]> {
+        self.evidenced_window
+            .as_ref()
+            .map(|window| *window.opaque.as_bytes())
+            .or_else(|| self.cleanup_window.map(|window| *window.as_bytes()))
+    }
+
     fn require_live_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
         let bound = self.require_evidenced_window()?;
         let live = live_focused_macos_injection_target()
@@ -295,13 +309,22 @@ impl MacOsComputerBackend {
     }
 
     fn require_cleanup_injection_window(&self) -> Result<EvidencedMacWindow, ComputerError> {
-        let bound = self.require_evidenced_window()?;
-        if !ax_window_element_is_live(bound.ax.element()) {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
+        if let Some(bound) = self.evidenced_window.clone() {
+            if ax_window_element_is_live(bound.ax.element()) {
+                return Ok(bound);
+            }
         }
-        Ok(bound)
+        let opaque = self.cleanup_window.ok_or_else(|| {
+            ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+        })?;
+        let live = restore_macos_injection_target(&opaque)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+        Ok(EvidencedMacWindow {
+            opaque,
+            pid: live.window.pid,
+            window_number: live.window.window_number,
+            ax: live.ax,
+        })
     }
 
     fn execute_action(
@@ -480,10 +503,11 @@ impl MacOsComputerBackend {
 
     /// Sole irreversible CoreGraphics post primitive. Every event, including
     /// cleanup releases, must pass the retained active-console-session rebound
-    /// and the evidenced AX window-object check immediately before posting.
-    /// CoreGraphics cannot accept a CGWindowID, so delivery is process-directed
-    /// (`post_to_pid`) only after the retained AX object still names the
-    /// evidenced window — a recycled PID/window-number pair compares unequal.
+    /// and then be addressed through the retained AX window object. CoreGraphics
+    /// has no CGWindowID destination, so the AX object is installed as the
+    /// application's focused window and the pid is read from that live object
+    /// immediately before `post_to_pid`. A stored pid/window-number pair is
+    /// never the destination operand.
     fn post_event(
         &mut self,
         event: &CGEvent,
@@ -527,7 +551,7 @@ impl MacOsComputerBackend {
                 Err(error) => return self.rollback_known_pre_post_refusal(prepared, error),
             }
         };
-        let pid = match libc::pid_t::try_from(bound.pid) {
+        let pid = match address_macos_injection_window(&bound.ax) {
             Ok(pid) => pid,
             Err(_) => {
                 return self.rollback_known_pre_post_refusal(
@@ -536,6 +560,21 @@ impl MacOsComputerBackend {
                 );
             }
         };
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::EventTargetUnixProcessID,
+            i64::from(pid),
+        );
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventWindowUnderMousePointer,
+            i64::from(bound.window_number),
+        );
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+            i64::from(bound.window_number),
+        );
         CGEvent::post_to_pid(pid, Some(event));
 
         // From the post onward this backend owns the transition even if the
@@ -558,8 +597,11 @@ impl MacOsComputerBackend {
             None => {}
         }
         if transition.is_some() {
-            self.input_authority
-                .commit(&self.outstanding_keys, &self.outstanding_buttons)?;
+            self.input_authority.commit(
+                &self.outstanding_keys,
+                &self.outstanding_buttons,
+                self.held_input_window_bytes(),
+            )?;
         }
         let identity_after = if require_live_window {
             self.require_live_injection_window()
@@ -607,6 +649,10 @@ struct MacHostInputState {
     pending: bool,
     keys: Vec<u16>,
     buttons: Vec<MouseButton>,
+    /// Opaque window identity that received the matching downs. Cleanup must
+    /// address this object; a missing identity with leftover keys fails closed.
+    #[serde(default)]
+    window: Option<[u8; 16]>,
 }
 
 /// Protected host-wide authority for exact Cockpit-owned down transitions.
@@ -654,6 +700,7 @@ impl MacHostInputAuthority {
                 pending: false,
                 keys: Vec::new(),
                 buttons: Vec::new(),
+                window: None,
             };
             let bytes = serde_json::to_vec(&initial).map_err(authority_unavailable)?;
             let mut create = std::fs::OpenOptions::new();
@@ -683,6 +730,11 @@ impl MacHostInputAuthority {
             serde_json::from_slice(&bytes).map_err(authority_unavailable)?;
         if state.version != 1
             || state.pending
+            || !super::platform::macos::mac_held_input_identity_is_complete(
+                &state.keys,
+                !state.buttons.is_empty(),
+                state.window,
+            )
             || ((state.owner_uid, state.console_set, state.audit_session_id)
                 != (owner_uid, console_set, audit_session_id)
                 && (!state.keys.is_empty() || !state.buttons.is_empty()))
@@ -730,6 +782,7 @@ impl MacHostInputAuthority {
         &mut self,
         keys: &HashSet<u16>,
         buttons: &HashSet<MouseButton>,
+        window: Option<[u8; 16]>,
     ) -> Result<(), ComputerError> {
         self.state.keys = keys.iter().copied().collect();
         self.state.keys.sort_unstable();
@@ -739,6 +792,20 @@ impl MacHostInputAuthority {
             MouseButton::Right => 1,
             MouseButton::Middle => 2,
         });
+        self.state.window = if self.state.keys.is_empty() && self.state.buttons.is_empty() {
+            None
+        } else {
+            window
+        };
+        if !super::platform::macos::mac_held_input_identity_is_complete(
+            &self.state.keys,
+            !self.state.buttons.is_empty(),
+            self.state.window,
+        ) {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
         self.state.pending = false;
         self.store()
     }
@@ -872,9 +939,31 @@ impl ComputerBackend for MacOsComputerBackend {
         self.input_authority = MacHostInputAuthority::open(&self.active_console_session)?;
         self.outstanding_keys = self.input_authority.state.keys.iter().copied().collect();
         self.outstanding_buttons = self.input_authority.state.buttons.iter().copied().collect();
+        if let Some(bytes) = self.input_authority.state.window {
+            self.cleanup_window = Some(OpaqueWindowId::from_bytes(bytes));
+        }
+        if self.evidenced_window.is_none()
+            && let Some(opaque) = self.cleanup_window
+        {
+            let live = restore_macos_injection_target(&opaque)
+                .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
+            self.evidenced_window = Some(EvidencedMacWindow {
+                opaque,
+                pid: live.window.pid,
+                window_number: live.window.window_number,
+                ax: live.ax,
+            });
+        }
+        if self.evidenced_window.is_none()
+            && (!self.outstanding_keys.is_empty() || !self.outstanding_buttons.is_empty())
+        {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        }
         let keys: Vec<_> = self.outstanding_keys.iter().copied().collect();
         for code in keys {
-            // Releases stay addressed to the evidenced process even if focus
+            // Releases stay addressed to the evidenced window even if focus
             // has moved: a live-window refusal would leave keys down in the
             // window that received the matching downs.
             self.post_key(code, false, CGEventFlags::empty(), false)?;
@@ -926,6 +1015,7 @@ impl ComputerBackend for MacOsComputerBackend {
             window_number,
             ax: live.ax,
         });
+        self.cleanup_window = Some(window);
         self.require_live_injection_window().map(|_| ())
     }
 

@@ -859,7 +859,20 @@ fn physical_backend_irreversible_primitive_inventory() {
         .expect("post_event source");
     assert!(
         mac_post_src.contains("post_to_pid"),
-        "post_event must deliver to the evidenced process after AX object identity matches"
+        "post_event must still use process-directed CGEvent delivery after the AX window is installed as the destination"
+    );
+    assert!(
+        mac_post_src.contains("address_macos_injection_window"),
+        "post_event must address the retained AX window object, not a stored pid"
+    );
+    assert!(
+        mac_post_src.contains("MouseEventWindowUnderMousePointer")
+            && mac_post_src.contains("MouseEventWindowUnderMousePointerThatCanHandleThisEvent"),
+        "post_event must name the evidenced CGWindowID on the event"
+    );
+    assert!(
+        !mac_post_src.contains("try_from(bound.pid)"),
+        "post_event must not post using a stored pid that can be reused"
     );
     assert!(
         mac_post_src.contains("require_live_injection_window")
@@ -904,8 +917,24 @@ fn physical_backend_irreversible_primitive_inventory() {
     let mut windows_post = StructuralCallAudit::default();
     windows_post.visit_impl_item_fn(impl_method(&windows_syntax, "post_to_target"));
     assert!(
-        windows_post.0.iter().any(|call| call == "PostMessageW"),
-        "Windows post_to_target must post to the evidenced HWND: {:?}",
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "SendMessageTimeoutW"),
+        "Windows post_to_target must deliver synchronously to the locked HWND: {:?}",
+        windows_post.0
+    );
+    assert!(
+        windows_post
+            .0
+            .iter()
+            .any(|call| call == "acquire" || call.ends_with("::acquire")),
+        "Windows post_to_target must hold the USER window object across identity and delivery: {:?}",
+        windows_post.0
+    );
+    assert!(
+        !windows_post.0.iter().any(|call| call == "PostMessageW"),
+        "Windows post_to_target must not queue input that cannot be retracted: {:?}",
         windows_post.0
     );
     assert!(
@@ -922,6 +951,15 @@ fn physical_backend_irreversible_primitive_inventory() {
         !windows_source.contains("SendInput("),
         "Windows must not use session-global SendInput"
     );
+    assert!(
+        windows_source.contains("struct HwndObjectLock")
+            && windows_source.contains("GetDC(Some(hwnd))"),
+        "Windows must lock the USER window object so HWND recycling cannot race delivery"
+    );
+    assert!(
+        !windows_source.contains("PostMessageW("),
+        "Windows must not PostMessage; queued delivery cannot prove HWND identity"
+    );
     let mut windows_release = StructuralCallAudit::default();
     windows_release.visit_impl_item_fn(impl_method(&windows_syntax, "release_all"));
     assert!(
@@ -931,6 +969,21 @@ fn physical_backend_irreversible_primitive_inventory() {
             .any(|call| call == "windows_owned_cleanup_buttons"),
         "Windows cleanup must release only owned buttons: {:?}",
         windows_release.0
+    );
+    let mut mac_release = StructuralCallAudit::default();
+    mac_release.visit_impl_item_fn(impl_method(&mac_syntax, "release_all"));
+    assert!(
+        mac_release
+            .0
+            .iter()
+            .any(|call| call == "restore_macos_injection_target"
+                || call.ends_with("::restore_macos_injection_target")),
+        "macOS cleanup must restore the persisted AX window identity: {:?}",
+        mac_release.0
+    );
+    assert!(
+        mac.contains("window: Option<[u8; 16]>"),
+        "macOS held-input authority must persist the window that received the downs"
     );
 
     let driver = std::fs::read_to_string(core.join("engine/driver/computer_native.rs")).unwrap();

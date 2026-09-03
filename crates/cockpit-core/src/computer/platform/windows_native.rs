@@ -12,7 +12,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT,
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, ClientToScreen,
     CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DISPLAY_DEVICEW, DeleteDC,
-    DeleteObject, EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW, HGDIOBJ,
+    DeleteObject, EnumDisplayDevicesW, GetDC, GetDIBits, GetMonitorInfoW, HDC, HGDIOBJ,
     MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY,
     ScreenToClient, SelectObject,
 };
@@ -38,10 +38,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT, GetAncestor, GetClassNameW, GetClientRect,
     GetForegroundWindow, GetPropW, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
-    IsChild, IsWindow, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SetPropW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP,
+    IsChild, IsWindow, SEND_MESSAGE_TIMEOUT_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SendMessageTimeoutW,
+    SetPropW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -509,10 +509,11 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    /// Sole irreversible input primitive. Identity is re-resolved from the
-    /// planted HWND property and UIA runtime id immediately before
-    /// `PostMessageW`; a recycled handle does not carry the evidenced property
-    /// and is refused rather than named.
+    /// Sole irreversible input primitive. A `GetDC` lock holds the USER window
+    /// object so the HWND slot cannot be recycled across identity proof and
+    /// delivery; `SendMessageTimeoutW` then runs the target WndProc before this
+    /// call returns. Checking the planted property after an asynchronous
+    /// `PostMessageW` cannot retract a queued message to a recycled handle.
     fn post_to_target(
         &self,
         msg: u32,
@@ -526,15 +527,7 @@ impl WindowsDesktopBackend {
             .ok_or_else(|| {
                 ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
             })?;
-        if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
-            return Err(ComputerError::Refused(
-                EVIDENCED_WINDOW_MISMATCH.to_string(),
-            ));
-        }
-        // SAFETY: `hwnd` just matched the planted identity property of the
-        // evidenced UIA object. The property is absent on a recycled handle.
-        unsafe { PostMessageW(Some(hwnd), msg, wparam, lparam) }
-            .map_err(|_| win32_error("PostMessageW"))?;
+        let _lock = HwndObjectLock::acquire(hwnd)?;
         if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
             return Err(ComputerError::Refused(
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
@@ -545,6 +538,45 @@ impl WindowsDesktopBackend {
             return Err(ComputerError::Refused(
                 EVIDENCED_WINDOW_MISMATCH.to_string(),
             ));
+        }
+        let mut result = 0_usize;
+        // SAFETY: `hwnd` is locked by `_lock` and just matched the planted
+        // identity property. SendMessageTimeoutW calls that window object's
+        // WndProc before returning; SMTO_ERRORONEXIT fails if the object is
+        // destroyed mid-call instead of delivering to a recycled slot.
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+                SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_ERRORONEXIT.0),
+                WINDOW_DELIVERY_TIMEOUT_MS,
+                Some(&mut result),
+            )
+        };
+        // SAFETY: `IsWindow` accepts any HWND-sized handle.
+        let still_live = unsafe { IsWindow(Some(hwnd)).as_bool() };
+        if sent.0 == 0 {
+            if still_live {
+                return Err(win32_error("SendMessageTimeoutW"));
+            }
+            // The evidenced object destroyed itself while processing (for
+            // example a close button). Delivery addressed that object.
+            return Ok(());
+        }
+        if still_live {
+            if !hwnd_identity_prop_is_live(hwnd, bound.opaque) {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
+            let live = opaque_id_for_hwnd(hwnd)?;
+            if live != bound.opaque {
+                return Err(ComputerError::Refused(
+                    EVIDENCED_WINDOW_MISMATCH.to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -636,6 +668,35 @@ impl WindowsDesktopBackend {
             return Ok(());
         }
         self.post_to_target(WM_CHAR, WPARAM(usize::from(unit)), LPARAM(1))
+    }
+}
+
+const WINDOW_DELIVERY_TIMEOUT_MS: u32 = 5_000;
+
+/// Holds a USER window-object reference (`GetDC`) so the HWND handle table
+/// slot cannot be reused until drop. This is the Windows analog of X11
+/// `grab_server` for identity-fenced delivery.
+struct HwndObjectLock {
+    hwnd: HWND,
+    dc: HDC,
+}
+
+impl HwndObjectLock {
+    fn acquire(hwnd: HWND) -> Result<Self, ComputerError> {
+        // SAFETY: `GetDC` accepts any HWND-sized handle; failure is an
+        // invalid HDC which we refuse rather than proceeding unlocked.
+        let dc = unsafe { GetDC(Some(hwnd)) };
+        if dc.is_invalid() {
+            return Err(win32_error("GetDC"));
+        }
+        Ok(Self { hwnd, dc })
+    }
+}
+
+impl Drop for HwndObjectLock {
+    fn drop(&mut self) {
+        // SAFETY: `dc` was obtained from GetDC on `hwnd` and is released once.
+        let _ = unsafe { ReleaseDC(Some(self.hwnd), self.dc) };
     }
 }
 

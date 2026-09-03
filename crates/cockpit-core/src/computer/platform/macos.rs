@@ -34,6 +34,17 @@ pub(in crate::computer) fn rollback_known_pre_post<T>(state: &mut T, previous: T
     *state = previous;
 }
 
+/// Durable held-input ownership is only known when the window that received
+/// the downs is recorded with it. A journal that lists keys or buttons and
+/// omits that identity cannot be recovered into a window-addressed release.
+pub(in crate::computer) fn mac_held_input_identity_is_complete(
+    keys: &[u16],
+    buttons_held: bool,
+    window: Option<[u8; 16]>,
+) -> bool {
+    (keys.is_empty() && !buttons_held) || window.is_some()
+}
+
 #[cfg(target_os = "macos")]
 use crate::computer::host_identity::{
     HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
@@ -95,6 +106,7 @@ pub enum MacAxAttribute {
     Title,
     Position,
     Size,
+    Windows,
 }
 
 impl MacAxAttribute {
@@ -108,6 +120,7 @@ impl MacAxAttribute {
             Self::Title => "AXTitle",
             Self::Position => "AXPosition",
             Self::Size => "AXSize",
+            Self::Windows => "AXWindows",
         }
     }
 
@@ -121,6 +134,7 @@ impl MacAxAttribute {
             Self::Title,
             Self::Position,
             Self::Size,
+            Self::Windows,
         ]
     }
 }
@@ -1572,6 +1586,89 @@ pub(crate) fn ax_window_element_is_live(element: &objc2_application_services::AX
     ax_attribute(element, MacAxAttribute::Role).is_ok()
 }
 
+/// Re-acquire the AX window object named by a persisted opaque id.
+///
+/// Crash recovery has no retained CF witness. The pid/window-number pair is
+/// joined against the live AX window list of that process; a recycled pair
+/// that does not uniquely match is refused rather than guessed.
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_macos_injection_target(
+    opaque: &OpaqueWindowId,
+) -> Result<MacLiveInjectionTarget, TargetUnavailableReason> {
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::{CFArray, CFRetained};
+
+    let (pid, window_number) =
+        macos_injection_target_from_opaque(opaque).ok_or(TargetUnavailableReason::QueryMismatch)?;
+    let pid_t = libc::pid_t::try_from(pid).map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    // SAFETY: AXUIElementCreateApplication is documented to return a retained
+    // application element for any pid; a dead pid fails subsequent queries.
+    let application = unsafe { AXUIElement::new_application(pid_t) };
+    let windows = ax_attribute(&application, MacAxAttribute::Windows)?;
+    // AXWindows is documented as an array of AXUIElementRef. The cast only
+    // supplies that element type; each window is still joined by CG number.
+    let windows: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(windows) };
+    let mut matches = Vec::new();
+    for window in windows.iter() {
+        let Ok((position, size)) = ax_window_rect(&window) else {
+            continue;
+        };
+        if cg_window_number_for_ax_window(pid, position, size).ok() == Some(window_number) {
+            matches.push(window);
+        }
+    }
+    let window = match matches.len() {
+        1 => matches.swap_remove(0),
+        0 => return Err(TargetUnavailableReason::FocusIdentityUnavailable),
+        _ => return Err(TargetUnavailableReason::AmbiguousOutput),
+    };
+    Ok(MacLiveInjectionTarget {
+        window: MacLiveFocusedWindow { pid, window_number },
+        ax: MacFocusedWindowWitness::new(window),
+    })
+}
+
+/// Install the retained AX window as the destination of the owning
+/// application's input. CoreGraphics cannot accept a CGWindowID; the window
+/// object itself is made the key window, and the pid used for posting is
+/// read from that live object rather than a stored integer.
+#[cfg(target_os = "macos")]
+pub(crate) fn address_macos_injection_window(
+    witness: &MacFocusedWindowWitness,
+) -> Result<libc::pid_t, TargetUnavailableReason> {
+    use objc2_application_services::{AXError, AXUIElement};
+    use objc2_core_foundation::{CFString, CFType};
+
+    let window = witness.element();
+    if !ax_window_element_is_live(window) {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
+    let mut pid: libc::pid_t = 0;
+    let pid_status = unsafe { window.pid(std::ptr::NonNull::from(&mut pid)) };
+    if pid_status != AXError::Success || pid <= 0 {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    // SAFETY: `pid` was just read from a live AX window object.
+    let application = unsafe { AXUIElement::new_application(pid) };
+    let raise = CFString::from_static_str("AXRaise");
+    // Raise is best-effort: some windows do not implement the action. The
+    // focused-window write below is the addressing that must succeed.
+    let _ = unsafe { window.perform_action(&raise) };
+    let focused = CFString::from_static_str(MacAxAttribute::FocusedWindow.as_static_str());
+    let window_type: &CFType = window.as_ref();
+    let set_status = unsafe { application.set_attribute_value(&focused, window_type) };
+    if set_status != AXError::Success {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    let live = ax_attribute(&application, MacAxAttribute::FocusedWindow)?
+        .downcast::<AXUIElement>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    if !witness.same_element(&live) {
+        return Err(TargetUnavailableReason::StaleTarget);
+    }
+    Ok(pid)
+}
+
 #[cfg(target_os = "macos")]
 fn cg_dictionary_value<'a>(
     dictionary: &'a objc2_core_foundation::CFDictionary,
@@ -1807,6 +1904,22 @@ mod authority_transaction_tests {
         pending: bool,
         keys: Vec<u16>,
         generation: u64,
+    }
+
+    #[test]
+    fn held_input_without_a_window_identity_is_incomplete() {
+        assert!(super::mac_held_input_identity_is_complete(&[], false, None));
+        assert!(!super::mac_held_input_identity_is_complete(
+            &[12],
+            false,
+            None
+        ));
+        assert!(!super::mac_held_input_identity_is_complete(&[], true, None));
+        assert!(super::mac_held_input_identity_is_complete(
+            &[12],
+            true,
+            Some([7u8; 16])
+        ));
     }
 
     #[test]

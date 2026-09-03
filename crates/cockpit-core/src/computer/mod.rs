@@ -2657,9 +2657,7 @@ fn x11_send_motion(
     x: u32,
     y: u32,
 ) -> Result<(), ComputerError> {
-    use x11rb::protocol::xproto::{
-        ConnectionExt as _, EventMask, MOTION_NOTIFY_EVENT, Motion, MotionNotifyEvent,
-    };
+    use x11rb::protocol::xproto::{EventMask, MOTION_NOTIFY_EVENT, Motion, MotionNotifyEvent};
     let event_x = i16::try_from(x).map_err(x11_delivery_error)?;
     let event_y = i16::try_from(y).map_err(x11_delivery_error)?;
     let (origin_x, origin_y, _, _) = x11_window_root_geometry(connection, window)?;
@@ -2679,11 +2677,7 @@ fn x11_send_motion(
         state: Default::default(),
         same_screen: true,
     };
-    connection
-        .send_event(true, window, EventMask::POINTER_MOTION, event)
-        .map_err(x11_delivery_error)?
-        .check()
-        .map_err(x11_delivery_error)
+    x11_send_to_evidenced_window(connection, window, EventMask::POINTER_MOTION, event)
 }
 
 #[cfg(target_os = "linux")]
@@ -2694,7 +2688,7 @@ fn x11_send_button(
     up: bool,
 ) -> Result<(), ComputerError> {
     use x11rb::protocol::xproto::{
-        BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ButtonPressEvent, ConnectionExt as _, EventMask,
+        BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ButtonPressEvent, EventMask,
     };
     let (root_x, root_y, event_x, event_y, root) = x11_pointer_location(connection, window)?;
     let event = ButtonPressEvent {
@@ -2721,11 +2715,7 @@ fn x11_send_button(
     } else {
         EventMask::BUTTON_PRESS
     };
-    connection
-        .send_event(true, window, mask, event)
-        .map_err(x11_delivery_error)?
-        .check()
-        .map_err(x11_delivery_error)
+    x11_send_to_evidenced_window(connection, window, mask, event)
 }
 
 #[cfg(target_os = "linux")]
@@ -2822,9 +2812,7 @@ fn x11_send_keysym_raw(
     keycode: u8,
     down: bool,
 ) -> Result<(), ComputerError> {
-    use x11rb::protocol::xproto::{
-        ConnectionExt as _, EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, KeyPressEvent,
-    };
+    use x11rb::protocol::xproto::{EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, KeyPressEvent};
     let (root_x, root_y, event_x, event_y, root) = x11_pointer_location(connection, window)?;
     let event = KeyPressEvent {
         response_type: if down {
@@ -2850,8 +2838,33 @@ fn x11_send_keysym_raw(
     } else {
         EventMask::KEY_RELEASE
     };
+    x11_send_to_evidenced_window(connection, window, mask, event)
+}
+
+/// Deliver a core event to `window` and nowhere else. `propagate = true` would
+/// let X11 redirect to an ancestor when the evidenced window has no client
+/// selecting `mask`; refuse that case instead of sending input to a different
+/// object.
+#[cfg(target_os = "linux")]
+fn x11_send_to_evidenced_window(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    mask: x11rb::protocol::xproto::EventMask,
+    event: impl Into<[u8; 32]>,
+) -> Result<(), ComputerError> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let attributes = connection
+        .get_window_attributes(window)
+        .map_err(x11_delivery_error)?
+        .reply()
+        .map_err(x11_delivery_error)?;
+    if u32::from(attributes.all_event_masks) & u32::from(mask) != u32::from(mask) {
+        return Err(ComputerError::Refused(
+            CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
+        ));
+    }
     connection
-        .send_event(true, window, mask, event)
+        .send_event(false, window, mask, event)
         .map_err(x11_delivery_error)?
         .check()
         .map_err(x11_delivery_error)
@@ -6714,7 +6727,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn x11_bind_refuses_non_x11_window_identities_instead_of_pinning_focus() {
         let src = include_str!("mod.rs");
         let start = src
@@ -6757,6 +6769,45 @@ mod tests {
             !body.contains("run_xdotool"),
             "delivery must not pass a recyclable XID to another process"
         );
+        let send = src
+            .split("fn x11_send_to_evidenced_window")
+            .nth(1)
+            .expect("x11_send_to_evidenced_window");
+        let send = send
+            .split("\nfn ")
+            .next()
+            .expect("x11_send_to_evidenced_window body");
+        assert!(
+            send.contains("send_event(false, window, mask, event)"),
+            "core events must address the evidenced window, not propagate to an ancestor"
+        );
+        assert!(
+            !send.contains("send_event(true,"),
+            "propagating SendEvent would deliver to a different window object"
+        );
+        assert!(
+            send.contains("all_event_masks"),
+            "delivery must refuse when the evidenced window cannot receive the event"
+        );
+        for primitive in [
+            "fn x11_send_motion",
+            "fn x11_send_button",
+            "fn x11_send_keysym_raw",
+        ] {
+            let body = src
+                .split(primitive)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{primitive}"));
+            let body = body.split("\nfn ").next().expect("primitive body");
+            assert!(
+                body.contains("x11_send_to_evidenced_window"),
+                "{primitive} must enter the non-propagating delivery helper"
+            );
+            assert!(
+                !body.contains("send_event("),
+                "{primitive} must not call send_event directly"
+            );
+        }
         let targeted = src
             .split("fn run_targeted_xdotool")
             .nth(1)

@@ -566,6 +566,13 @@ pub trait ComputerBackend: backend_seal::Sealed + Send + Sync {
     fn real_x11_display(&self) -> Option<&str> {
         None
     }
+    /// X11 `DISPLAY` this backend injects into, including isolated virtual
+    /// servers. Production virtual evidence uses this to capture the focused
+    /// X11 window rather than the display UUID.
+    #[cfg(target_os = "linux")]
+    fn x11_display_name(&self) -> Option<&str> {
+        self.real_x11_display()
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError>;
     #[doc(hidden)]
     async fn execute_normalized_one(
@@ -881,9 +888,9 @@ pub(crate) struct VirtualDisplayBackend {
     /// [`private_capture_root`].
     capture_root: PathBuf,
     physical_capability: Option<coordinator::PhysicalDispatchCapability>,
-    /// Evidenced window this backend will inject into. Physical X11 stores
-    /// the decoded window id; virtual displays pin `getactivewindow` to the
-    /// evidenced identity and never follow a later focus change.
+    /// Evidenced window this backend will inject into. Both physical X11 and
+    /// virtual displays store the decoded X11 id from evidence; they never
+    /// pin whichever window happens to be active at bind time.
     evidenced_injection_window: Option<EvidencedX11Window>,
 }
 
@@ -1184,52 +1191,16 @@ impl VirtualDisplayBackend {
         {
             return Ok(());
         }
-        let x11 = if self.backend_kind == target::BackendKind::RealDesktopX11 {
-            crate::computer::platform::x11_window_from_opaque(&window).ok_or_else(|| {
+        let x11 = crate::computer::platform::x11_window_from_opaque(&window)
+            .filter(|window| *window != 0)
+            .ok_or_else(|| {
                 ComputerError::Refused(CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string())
-            })?
-        } else if let Some(decoded) = crate::computer::platform::x11_window_from_opaque(&window) {
-            decoded
-        } else {
-            // Virtual display evidence uses a UUID, not an X11 id. Pin the
-            // active window on this DISPLAY to that identity and never follow
-            // a later focus change of the same opaque id.
-            self.query_active_x11_window()?
-        };
-        if x11 == 0 {
-            return Err(ComputerError::Refused(
-                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
-            ));
-        }
+            })?;
         self.evidenced_injection_window = Some(EvidencedX11Window {
             opaque: window,
             x11,
         });
         Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn query_active_x11_window(&self) -> Result<u32, ComputerError> {
-        let output = self.run_xdotool_output(&[OsString::from("getactivewindow")])?;
-        if !output.status.success() {
-            return Err(ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-        let parsed = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| ComputerError::CommandFailed {
-                program: "xdotool".to_string(),
-                detail: "getactivewindow did not return a window id".to_string(),
-            })?;
-        if parsed == 0 {
-            return Err(ComputerError::Refused(
-                CANNOT_DIRECT_INPUT_TO_EVIDENCED_WINDOW.to_string(),
-            ));
-        }
-        Ok(parsed)
     }
 
     #[cfg(target_os = "linux")]
@@ -1275,39 +1246,30 @@ impl VirtualDisplayBackend {
 
     #[cfg(target_os = "linux")]
     fn run_targeted_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
-        match self.evidenced_injection_window {
-            Some(bound) => self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest)),
-            None if self.backend_kind == target::BackendKind::RealDesktopX11 => Err(
-                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string()),
-            ),
-            None => {
-                // Evidence-less virtual displays are DISPLAY-isolated; there
-                // is no evidenced window to address. Physical X11 must not
-                // take this path.
-                let mut args = Vec::with_capacity(1 + rest.len());
-                args.push(OsString::from(command));
-                args.extend_from_slice(rest);
-                self.run_xdotool(&args)
-            }
-        }
+        let Some(bound) = self.evidenced_injection_window else {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        };
+        self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
     }
 
     #[cfg(target_os = "linux")]
     fn run_release_xdotool(&self, command: &str, rest: &[OsString]) -> Result<(), ComputerError> {
-        if let Some(bound) = self.evidenced_injection_window {
-            self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
-        } else {
-            let mut args = Vec::with_capacity(1 + rest.len());
-            args.push(OsString::from(command));
-            args.extend_from_slice(rest);
-            self.run_xdotool(&args)
-        }
+        let Some(bound) = self.evidenced_injection_window else {
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
+        };
+        self.run_xdotool(&xdotool_targeted_args(bound.x11, command, rest))
     }
 
     #[cfg(target_os = "linux")]
     fn window_relative_point(&self, point: PixelPoint) -> Result<PixelPoint, ComputerError> {
         let Some(bound) = self.evidenced_injection_window else {
-            return Ok(point);
+            return Err(ComputerError::Refused(
+                SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string(),
+            ));
         };
         let (origin_x, origin_y, width, height) = self.query_x11_window_geometry(bound.x11)?;
         pixel_point_in_window(point, origin_x, origin_y, width, height)
@@ -1950,6 +1912,10 @@ impl ComputerBackend for VirtualDisplayBackend {
     fn real_x11_display(&self) -> Option<&str> {
         self.real_x11_display()
     }
+    #[cfg(target_os = "linux")]
+    fn x11_display_name(&self) -> Option<&str> {
+        Some(&self.display)
+    }
     async fn geometry(&mut self) -> Result<DisplayGeometry, ComputerError> {
         #[cfg(target_os = "linux")]
         if self.backend_kind == target::BackendKind::RealDesktopX11 {
@@ -2048,7 +2014,8 @@ impl ComputerBackend for VirtualDisplayBackend {
             let Some(bound) = self.evidenced_injection_window else {
                 return Ok(());
             };
-            let live = self.query_active_x11_window()?;
+            let live = crate::computer::platform::x11_net_active_window(&self.display)
+                .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
             if live != bound.x11 {
                 return Err(ComputerError::Refused(
                     EVIDENCED_WINDOW_MISMATCH.to_string(),
@@ -5573,6 +5540,10 @@ mod tests {
         // path.
         let mut evidence = sample_virtual_evidence([4u8; 16], 1);
         evidence.focus_generation = 1;
+        evidence.focused_window_id = crate::computer::target::FieldEvidence::available(
+            crate::computer::platform::opaque_x11_window_id(1),
+            crate::computer::target::EvidenceSource::InjectedTest,
+        );
         let adapter = FakeTargetEvidenceAdapter::new(evidence);
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
@@ -6203,6 +6174,24 @@ mod tests {
         let fail_report = execute_backend_batch(&mut fail, &actions).await;
         assert_eq!(fail_report.failure.unwrap().error, ComputerError::Cancelled);
         assert_eq!(fail.release_count, 0);
+    }
+
+    #[test]
+    #[test]
+    fn x11_bind_refuses_non_x11_window_identities_instead_of_pinning_focus() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn bind_x11_injection_window")
+            .expect("bind_x11_injection_window");
+        let body = &src[start..start + 1200];
+        assert!(
+            !body.contains("query_active_x11_window"),
+            "binding must decode the evidenced X11 id, not pin the live active window"
+        );
+        assert!(
+            body.contains("x11_window_from_opaque"),
+            "binding must require an encoded X11 window identity"
+        );
     }
 
     #[test]

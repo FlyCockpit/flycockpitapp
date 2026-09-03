@@ -38,11 +38,12 @@ pub(in crate::computer) fn rollback_known_pre_post<T>(state: &mut T, previous: T
 use crate::computer::host_identity::{
     HostInstallationId, RealHostIdentityFs, SysHostIdentityRng, load_or_create_host_installation_id,
 };
+use crate::computer::target::OpaqueWindowId;
 #[cfg(target_os = "macos")]
 use crate::computer::target::{
-    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, OpaqueWindowId,
-    RedactedHint, StableApplicationId, TargetEvidenceAdapter, TargetGeometry,
-    TargetIdentityEvidence, TargetUnavailableReason, empty_unavailable,
+    BackendKind, EvidenceSource, FieldEvidence, FocusGenerationReducer, RedactedHint,
+    StableApplicationId, TargetEvidenceAdapter, TargetGeometry, TargetIdentityEvidence,
+    TargetUnavailableReason, empty_unavailable,
 };
 
 /// Apple `AU_DEFAUDITSID` — audit session id zero is nondefault-required.
@@ -427,6 +428,43 @@ pub fn display_id_from_uuid_bytes(uuid: [u8; 16]) -> [u8; 32] {
     // all platforms share a 32-byte display slot; the raw 16 bytes are the
     // authoritative ColorSync evidence before hashing.
     domain_hash(b"cockpit.macos.display.uuid.v1", &[&uuid])
+}
+
+/// Encode the live macOS injection target into the platform-neutral window id.
+///
+/// PID and CoreGraphics window number occupy the first eight little-endian
+/// bytes so the backend can address that process and recheck that window
+/// without guessing current focus. The AX lifetime epoch occupies the
+/// remainder so a recycled PID/window-number pair is a different identity.
+pub fn opaque_macos_window_id(pid: u32, window_number: u32, lifetime_epoch: u64) -> OpaqueWindowId {
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&pid.to_le_bytes());
+    bytes[4..8].copy_from_slice(&window_number.to_le_bytes());
+    bytes[8..].copy_from_slice(&lifetime_epoch.to_le_bytes());
+    OpaqueWindowId::from_bytes(bytes)
+}
+
+/// PID and CoreGraphics window number stored by [`opaque_macos_window_id`].
+/// `None` when either targeting field is zero so callers refuse rather than
+/// post through the session-global HID tap.
+pub fn macos_injection_target_from_opaque(id: &OpaqueWindowId) -> Option<(u32, u32)> {
+    let bytes = id.as_bytes();
+    let pid = u32::from_le_bytes(bytes[..4].try_into().ok()?);
+    let window_number = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if pid == 0 || window_number == 0 {
+        return None;
+    }
+    Some((pid, window_number))
+}
+
+/// Live focused-window targeting fields observed independently of the
+/// adapter's AX lifetime epoch. The backend uses these to bind and recheck
+/// injection; coordinator identity still compares the full opaque id.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MacLiveFocusedWindow {
+    pub pid: u32,
+    pub window_number: u32,
 }
 
 /// Pure-logic facade used by table tests (injected OS answers).
@@ -1056,8 +1094,10 @@ impl MacOsTargetEvidenceAdapter {
         // window bounds or the recyclable CGWindowID. Keep the prior object
         // retained across snapshots: a destroyed AX element and a replacement
         // that happens to receive the same PID/window number compare unequal.
-        // The resulting epoch is mixed into the opaque ID consumed by both
-        // planning and pre-handoff generation checks.
+        // The resulting epoch occupies the remainder of the opaque ID so
+        // coordinator identity treats a recycled PID/window-number pair as a
+        // different window while the backend can still decode the targeting
+        // fields.
         let same_live_window = self
             .focused_window_lifetime
             .as_ref()
@@ -1220,17 +1260,6 @@ impl MacOsTargetEvidenceAdapter {
             return Err(TargetUnavailableReason::StaleTarget);
         }
 
-        let window_hash = domain_hash(
-            b"cockpit.macos.ax-window-lifetime.v1",
-            &[
-                &frontmost_pid.to_le_bytes(),
-                &window_number.to_le_bytes(),
-                &focused_window_lifetime_epoch.to_le_bytes(),
-            ],
-        );
-        let mut window_id = [0_u8; 16];
-        window_id.copy_from_slice(&window_hash[..16]);
-
         let mut snapshot = empty_unavailable(BackendKind::RealDesktopMacOs);
         snapshot.host_installation_id =
             FieldEvidence::available(self.host, EvidenceSource::MachAuditToken);
@@ -1243,7 +1272,7 @@ impl MacOsTargetEvidenceAdapter {
             EvidenceSource::ColorSyncDisplayUuid,
         );
         snapshot.focused_window_id = FieldEvidence::available(
-            OpaqueWindowId::from_bytes(window_id),
+            opaque_macos_window_id(frontmost_pid, window_number, focused_window_lifetime_epoch),
             EvidenceSource::CgWindowList,
         );
         snapshot.process_id =
@@ -1473,6 +1502,50 @@ fn cg_window_number_for_ax_window(
         [] => Err(TargetUnavailableReason::FocusIdentityUnavailable),
         _ => Err(TargetUnavailableReason::AmbiguousOutput),
     }
+}
+
+/// Live focused window the input backend can address and recheck.
+///
+/// This is the same AX/CG join the evidence adapter uses for targeting
+/// fields. The adapter additionally mixes the AX lifetime epoch into the
+/// opaque id; the backend compares pid and CGWindowID immediately before
+/// each process-directed post.
+#[cfg(target_os = "macos")]
+pub(crate) fn live_focused_macos_window() -> Result<MacLiveFocusedWindow, TargetUnavailableReason> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_application_services::AXUIElement;
+
+    let workspace = NSWorkspace::sharedWorkspace();
+    let frontmost = workspace
+        .frontmostApplication()
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)?;
+    let frontmost_pid = u32::try_from(frontmost.processIdentifier())
+        .map_err(|_| TargetUnavailableReason::FocusIdentityUnavailable)?;
+    // SAFETY: AX returns retained CF objects. `ax_attribute` validates the
+    // status and takes ownership of each +1 result before downcasting.
+    let system = unsafe { AXUIElement::new_system_wide() };
+    let application = ax_attribute(&system, MacAxAttribute::FocusedApplication)?
+        .downcast::<AXUIElement>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let mut ax_pid: libc::pid_t = 0;
+    let pid_status = unsafe { application.pid(std::ptr::NonNull::from(&mut ax_pid)) };
+    if pid_status != objc2_application_services::AXError::Success
+        || u32::try_from(ax_pid).ok() != Some(frontmost_pid)
+    {
+        return Err(TargetUnavailableReason::QueryMismatch);
+    }
+    let window = ax_attribute(&application, MacAxAttribute::FocusedWindow)?
+        .downcast::<AXUIElement>()
+        .map_err(|_| TargetUnavailableReason::QueryMismatch)?;
+    let (position, size) = ax_window_rect(&window)?;
+    let window_number = cg_window_number_for_ax_window(frontmost_pid, position, size)?;
+    if window_number == 0 {
+        return Err(TargetUnavailableReason::FocusIdentityUnavailable);
+    }
+    Ok(MacLiveFocusedWindow {
+        pid: frontmost_pid,
+        window_number,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1724,6 +1797,35 @@ mod authority_transaction_tests {
         assert!(state.pending);
         rollback_known_pre_post(&mut state, previous);
         assert_eq!(state, expected);
+    }
+}
+
+#[cfg(test)]
+mod opaque_window_tests {
+    use super::{macos_injection_target_from_opaque, opaque_macos_window_id};
+
+    #[test]
+    fn macos_window_id_round_trips_targeting_fields_and_rejects_zeros() {
+        let id = opaque_macos_window_id(4242, 99, 7);
+        assert_eq!(macos_injection_target_from_opaque(&id), Some((4242, 99)));
+        assert_eq!(id.as_bytes()[8..], 7_u64.to_le_bytes());
+        assert_eq!(
+            macos_injection_target_from_opaque(&opaque_macos_window_id(0, 99, 1)),
+            None
+        );
+        assert_eq!(
+            macos_injection_target_from_opaque(&opaque_macos_window_id(1, 0, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_lifetime_epoch_distinguishes_recycled_pid_window_pairs() {
+        let first = opaque_macos_window_id(8, 16, 1);
+        let recycled = opaque_macos_window_id(8, 16, 2);
+        assert_ne!(first, recycled);
+        assert_eq!(macos_injection_target_from_opaque(&first), Some((8, 16)));
+        assert_eq!(macos_injection_target_from_opaque(&recycled), Some((8, 16)));
     }
 }
 

@@ -962,10 +962,9 @@ pub fn sample_virtual_evidence(uuid: [u8; 16], generation: u64) -> TargetIdentit
         TargetUnavailableReason::VirtualDisplayNoPhysicalLease,
         Some(EvidenceSource::VirtualEngine),
     );
-    e.focused_window_id = FieldEvidence::available(
-        OpaqueWindowId::from_bytes(uuid),
-        EvidenceSource::VirtualEngine,
-    );
+    // Display UUID is `virtual_display_uuid`, not a window identity. A
+    // focused X11 window is captured by the production virtual adapter;
+    // fixtures that inject set `focused_window_id` explicitly.
     e.geometry = FieldEvidence::available(
         TargetGeometry {
             x: 0,

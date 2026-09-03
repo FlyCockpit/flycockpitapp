@@ -262,6 +262,11 @@ fn computer_target_platform_evidence() {
     let mut virt = sample_virtual_evidence([9u8; 16], 1);
     virt.host_installation_id = FieldEvidence::available(host_id, EvidenceSource::VirtualEngine);
     assert!(virt.physical_target_key().is_err());
+    assert!(
+        virt.focused_window_id_value().is_none(),
+        "virtual display UUID must not be used as a window identity"
+    );
+    assert_eq!(virt.virtual_display_uuid, Some([9u8; 16]));
 
     let desc = WaylandCapabilityDescriptor {
         kind: WaylandProviderKind::CompositorIntegration,

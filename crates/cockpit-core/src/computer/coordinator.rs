@@ -3945,6 +3945,11 @@ pub struct CoordinatorParams {
 pub struct VirtualTargetEvidenceAdapter {
     display_id: [u8; 16],
     generation: u64,
+    /// Isolated Xvfb `DISPLAY` when this adapter is composed with a live
+    /// virtual backend. Absent in hermetic tests, which must not invent a
+    /// window identity.
+    #[cfg(target_os = "linux")]
+    x11_display: Option<String>,
 }
 
 impl VirtualTargetEvidenceAdapter {
@@ -3952,6 +3957,17 @@ impl VirtualTargetEvidenceAdapter {
         Self {
             display_id,
             generation: 1,
+            #[cfg(target_os = "linux")]
+            x11_display: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_x11_display(display_id: [u8; 16], x11_display: impl Into<String>) -> Self {
+        Self {
+            display_id,
+            generation: 1,
+            x11_display: Some(x11_display.into()),
         }
     }
 }
@@ -3964,6 +3980,20 @@ impl TargetEvidenceAdapter for VirtualTargetEvidenceAdapter {
     fn capture_snapshot(&mut self) -> Result<TargetIdentityEvidence, TargetUnavailableReason> {
         // Virtual displays have no accessibility tree. Role/subrole stay
         // unavailable so TypeText fail-closes as Credential (issue #290).
+        #[cfg(target_os = "linux")]
+        {
+            let mut evidence =
+                super::target::sample_virtual_evidence(self.display_id, self.generation);
+            if let Some(display) = &self.x11_display {
+                let window = super::platform::x11_net_active_window(display)?;
+                evidence.focused_window_id = FieldEvidence::available(
+                    super::platform::opaque_x11_window_id(window),
+                    super::target::EvidenceSource::X11NetActiveWindow,
+                );
+            }
+            return Ok(evidence);
+        }
+        #[cfg(not(target_os = "linux"))]
         Ok(super::target::sample_virtual_evidence(
             self.display_id,
             self.generation,
@@ -4509,9 +4539,6 @@ impl ComputerActionCoordinator {
     fn bind_backend_target_window(&mut self, action: &ComputerAction) -> Result<(), ComputerError> {
         if !action.injects_synthetic_input() {
             return self.backend.recheck_evidenced_window();
-        }
-        if self.target_adapter.is_none() {
-            return Ok(());
         }
         let Some(window) = self.authorized_window_id else {
             return Err(ComputerError::Refused(
@@ -6865,8 +6892,8 @@ mod tests {
         LogicalSize, Modifiers, MouseButton, NormalizedComputerAction, OpenAiComputerAction,
         PixelSize, Point, ProviderPointerButton, Rect, ScaleFactor,
     };
-    use super::EVIDENCED_WINDOW_MISMATCH;
     use super::*;
+    use super::{EVIDENCED_WINDOW_MISMATCH, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -7426,7 +7453,7 @@ mod tests {
         backend: Box<dyn ComputerBackend>,
         authorizer: Arc<dyn ComputerAuthorizer>,
     ) -> ComputerActionCoordinator {
-        let params = make_coordinator_params(authorizer);
+        let params = make_coordinator_params_with_focus(authorizer);
         ComputerActionCoordinator::open(backend, params)
             .await
             .expect("coordinator open")
@@ -10946,7 +10973,7 @@ mod tests {
         };
         let _ = backend_recorded; // suppress unused
 
-        let params = make_coordinator_params(authorizer);
+        let params = make_coordinator_params_with_focus(authorizer);
         let mut coordinator = ComputerActionCoordinator::open(Box::new(counting), params)
             .await
             .expect("coordinator open");
@@ -11359,6 +11386,49 @@ mod tests {
             .execute_openai_call("call-type-no-focus", &actions)
             .await;
         assert!(matches!(outcome, CoordinatedOutcome::Invalidated { .. }));
+    }
+
+    #[tokio::test]
+    async fn computer_synthetic_input_without_evidenced_window_fails_closed() {
+        // Pointer actions do not use the type/key focus-generation gate.
+        // Adapter-less virtual coordinators must still refuse injection
+        // rather than targeting whatever currently has focus (issue #288).
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let input_actions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = CountingBackend::new(input_actions.clone());
+        let params = make_coordinator_params(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-unbound-move",
+                &[OpenAiComputerAction::Move {
+                    to: Point {
+                        x: 4.0,
+                        y: 5.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                }],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Failed { .. }),
+            "adapter-less synthetic input must fail closed, got {outcome:?}"
+        );
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[BatchItemOutcome::Failed {
+                error: ComputerError::Refused(
+                    SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string()
+                )
+            }]
+        );
+        assert_eq!(
+            input_actions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero backend input when no evidenced window is bound"
+        );
     }
 
     #[tokio::test]
@@ -13097,6 +13167,14 @@ mod tests {
             between < bind && bind < execute,
             "evidenced window must be bound after the per-item fence and before each item"
         );
+        let bind_fn = src
+            .find("fn bind_backend_target_window")
+            .expect("bind_backend_target_window");
+        let bind_body = &src[bind_fn..bind_fn + 900];
+        assert!(
+            !bind_body.contains("if self.target_adapter.is_none()"),
+            "synthetic input must not skip window binding when the adapter is absent"
+        );
     }
 
     #[tokio::test]
@@ -13342,7 +13420,7 @@ mod tests {
             },
         }];
         let mut first_params =
-            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+            make_coordinator_params_with_focus(Arc::new(FakeComputerAuthorizer::always_allow()));
         first_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         first_params.outcome_store = Some(store.clone());
         let mut first = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), first_params)
@@ -13365,7 +13443,7 @@ mod tests {
         drop(first);
 
         let mut second_params =
-            make_coordinator_params(Arc::new(FakeComputerAuthorizer::always_allow()));
+            make_coordinator_params_with_focus(Arc::new(FakeComputerAuthorizer::always_allow()));
         second_params.session_id = DURABLE_COMPUTER_SESSION_ID.to_string();
         second_params.outcome_store = Some(store);
         let mut second =

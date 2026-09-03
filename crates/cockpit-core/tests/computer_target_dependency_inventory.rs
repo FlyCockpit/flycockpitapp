@@ -601,6 +601,7 @@ impl<'ast> Visit<'ast> for StructuralCallAudit {
 enum PostBoundaryCall {
     SessionRecheck,
     CapabilityRecheck,
+    WindowRecheck,
     RawPost,
 }
 
@@ -640,6 +641,11 @@ impl<'ast> Visit<'ast> for PostBoundaryCallAudit {
                 _ => {}
             }
         }
+        if call.method == "require_live_injection_window"
+            || call.method == "require_evidenced_window"
+        {
+            self.0.push(PostBoundaryCall::WindowRecheck);
+        }
         syn::visit::visit_expr_method_call(self, call);
     }
 
@@ -651,7 +657,7 @@ impl<'ast> Visit<'ast> for PostBoundaryCallAudit {
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect::<Vec<_>>()
-                .ends_with(&["CGEvent".to_string(), "post".to_string()])
+                .ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()])
         {
             self.0.push(PostBoundaryCall::RawPost);
         }
@@ -701,6 +707,12 @@ impl<'ast> Visit<'ast> for CoreGraphicsPostAudit {
             .map(|segment| segment.ident.to_string())
             .collect::<Vec<_>>();
         if segments.ends_with(&["CGEvent".to_string(), "post".to_string()]) {
+            self.violations.push(
+                "session-global CGEvent::post is forbidden; post_to_pid is the sole post"
+                    .to_string(),
+            );
+        }
+        if segments.ends_with(&["CGEvent".to_string(), "post_to_pid".to_string()]) {
             self.associated_posts.push(self.current_function.clone());
         }
         for identifier in &segments {
@@ -822,7 +834,7 @@ fn physical_backend_irreversible_primitive_inventory() {
     );
     let mut calls = StructuralCallAudit::default();
     calls.visit_impl_item_fn(impl_method(&mac_syntax, "post_event"));
-    for required in ["prepare", "recheck", "CGEvent::post", "commit"] {
+    for required in ["prepare", "recheck", "CGEvent::post_to_pid", "commit"] {
         assert!(
             calls.0.iter().any(|call| call == required),
             "post_event AST lost required call {required}: {:?}",
@@ -836,9 +848,11 @@ fn physical_backend_irreversible_primitive_inventory() {
         vec![
             PostBoundaryCall::SessionRecheck,
             PostBoundaryCall::CapabilityRecheck,
+            PostBoundaryCall::WindowRecheck,
+            PostBoundaryCall::WindowRecheck,
             PostBoundaryCall::RawPost,
         ],
-        "post_event must structurally perform its exact session and physical-capability/lease rechecks before its sole raw post"
+        "post_event must structurally recheck session, capability, and evidenced window before its sole process-directed post"
     );
     assert!(
         calls
@@ -853,11 +867,28 @@ fn physical_backend_irreversible_primitive_inventory() {
         Some("post_event"),
         "the sole raw post must be structurally owned by post_event"
     );
-    let positions = ["prepare", "recheck", "CGEvent::post", "commit"]
+    let positions = ["prepare", "recheck", "CGEvent::post_to_pid", "commit"]
         .map(|required| calls.0.iter().position(|call| call == required).unwrap());
     assert!(
         positions.windows(2).all(|pair| pair[0] < pair[1]),
         "post_event's AST must prepare, recheck, post, then commit"
+    );
+
+    let mut windows_send = StructuralCallAudit::default();
+    windows_send.visit_impl_item_fn(impl_method(&windows_syntax, "send_input"));
+    let window_check = windows_send
+        .0
+        .iter()
+        .position(|call| call == "require_live_evidenced_window")
+        .expect("Windows send_input must recheck the evidenced window");
+    let raw_send = windows_send
+        .0
+        .iter()
+        .position(|call| call == "send_raw")
+        .expect("Windows send_input must use the sole SendInput wrapper");
+    assert!(
+        window_check < raw_send,
+        "Windows SendInput must recheck the evidenced window immediately before the syscall"
     );
 
     let driver = std::fs::read_to_string(core.join("engine/driver/computer_native.rs")).unwrap();

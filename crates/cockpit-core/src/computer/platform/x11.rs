@@ -41,6 +41,42 @@ pub fn x11_window_from_opaque(id: &OpaqueWindowId) -> Option<u32> {
     Some(u32::from_le_bytes(bytes[..4].try_into().ok()?))
 }
 
+/// Focused X11 client window on `display` (`_NET_ACTIVE_WINDOW`).
+///
+/// Virtual and physical injection both bind this identity. It is not the
+/// X server root and it is not a virtual-display UUID.
+#[cfg(target_os = "linux")]
+pub fn x11_net_active_window(display: &str) -> Result<u32, TargetUnavailableReason> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    fn unavailable<T>(_: T) -> TargetUnavailableReason {
+        TargetUnavailableReason::MissingCapability
+    }
+    let (connection, screen_index) = x11rb::connect(Some(display)).map_err(unavailable)?;
+    let screen = connection
+        .setup()
+        .roots
+        .get(screen_index)
+        .ok_or(TargetUnavailableReason::MissingCapability)?;
+    let root = screen.root;
+    let active_window_atom = connection
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .atom;
+    connection
+        .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .value32()
+        .and_then(|mut values| values.next())
+        .filter(|window| *window != x11rb::NONE && *window != 0)
+        .ok_or(TargetUnavailableReason::FocusIdentityUnavailable)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X11SessionParts {
     pub transport: String,

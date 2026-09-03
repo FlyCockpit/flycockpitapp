@@ -19,7 +19,10 @@ pub use macos::{
     AU_DEFAUDITSID, CgSessionKey, MacAxAttribute, MacAxNotification, MacCallbackGate,
     MacCallbackTerminalReason, MacNativeEvent, MacOsEvidenceLogic, MacProducerKind,
     TASK_AUDIT_TOKEN_COUNT_EXPECTED, extract_audit_session_id, join_ax_to_cg_window,
+    macos_injection_target_from_opaque, opaque_macos_window_id,
 };
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{MacLiveFocusedWindow, live_focused_macos_window};
 pub use wayland::{
     WaylandCapabilityDescriptor, WaylandFocusGuarantee, WaylandProviderKind,
     WaylandTargetEvidenceProvider, evaluate_wayland_provider,
@@ -31,6 +34,8 @@ pub use windows::{
 pub(crate) use windows_native::{WindowsDesktopBackend, WindowsTargetEvidenceAdapter};
 #[cfg(target_os = "linux")]
 pub use x11::X11TargetEvidenceAdapter;
+#[cfg(target_os = "linux")]
+pub use x11::x11_net_active_window;
 pub use x11::{
     EdidValidation, MirrorGroup, RandrOutputSnapshot, X11EvidenceLogic, X11SessionParts,
     opaque_x11_window_id, select_mirror_group, validate_edid, x11_physical_display_id,

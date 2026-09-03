@@ -225,11 +225,11 @@ impl WindowsDesktopBackend {
             key: key.key.0,
             extended: key.extended,
         })?;
-        send_key(key, false)
+        self.send_key(key, false)
     }
 
     fn key_up(&mut self, key: VirtualKeyInput) -> Result<(), ComputerError> {
-        send_key(key, true)?;
+        self.send_key(key, true)?;
         self.forget_held_keyboard_input(HeldKeyboardInput::VirtualKey {
             key: key.key.0,
             extended: key.extended,
@@ -238,11 +238,11 @@ impl WindowsDesktopBackend {
 
     fn unicode_down(&mut self, unit: u16) -> Result<(), ComputerError> {
         self.remember_held_keyboard_input(HeldKeyboardInput::Unicode(unit))?;
-        send_unicode(unit, false)
+        self.send_unicode(unit, false)
     }
 
     fn unicode_up(&mut self, unit: u16) -> Result<(), ComputerError> {
-        send_unicode(unit, true)?;
+        self.send_unicode(unit, true)?;
         self.forget_held_keyboard_input(HeldKeyboardInput::Unicode(unit))
     }
 
@@ -381,12 +381,90 @@ impl WindowsDesktopBackend {
         let (x, y) = (point.x, point.y);
         let width = self.geometry.physical.width.saturating_sub(1).max(1);
         let height = self.geometry.physical.height.saturating_sub(1).max(1);
-        send_mouse(
+        self.send_mouse(
             ((u64::from(x) * 65_535) / u64::from(width)) as i32,
             ((u64::from(y) * 65_535) / u64::from(height)) as i32,
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )
+    }
+
+    /// Sole irreversible `SendInput` primitive. Every keyboard, pointer, and
+    /// cleanup event rechecks the evidenced foreground window immediately
+    /// before the syscall so a mid-compound focus change cannot redirect
+    /// remaining events.
+    fn send_input(&self, inputs: &[INPUT]) -> Result<(), ComputerError> {
+        self.require_live_evidenced_window()?;
+        send_raw(inputs)
+    }
+
+    fn send_mouse(
+        &self,
+        dx: i32,
+        dy: i32,
+        data: u32,
+        flags: MOUSE_EVENT_FLAGS,
+    ) -> Result<(), ComputerError> {
+        self.send_input(&[INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: data,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }])
+    }
+
+    fn send_button(&self, button: MouseButton, up: bool) -> Result<(), ComputerError> {
+        let flags = match (button, up) {
+            (MouseButton::Left, false) => MOUSEEVENTF_LEFTDOWN,
+            (MouseButton::Left, true) => MOUSEEVENTF_LEFTUP,
+            (MouseButton::Right, false) => MOUSEEVENTF_RIGHTDOWN,
+            (MouseButton::Right, true) => MOUSEEVENTF_RIGHTUP,
+            (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEDOWN,
+            (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEUP,
+        };
+        self.send_mouse(0, 0, 0, flags)
+    }
+
+    fn send_key(&self, key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
+        self.send_input(&[INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key.key,
+                    wScan: 0,
+                    dwFlags: key_event_flags(key, up),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }])
+    }
+
+    fn send_unicode(&self, unit: u16, up: bool) -> Result<(), ComputerError> {
+        self.send_input(&[INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: KEYEVENTF_UNICODE
+                        | if up {
+                            KEYEVENTF_KEYUP
+                        } else {
+                            KEYBD_EVENT_FLAGS(0)
+                        },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }])
     }
 }
 
@@ -459,21 +537,21 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 self.send_modifiers(*modifiers, false)?;
                 for _ in 0..click_count(*count) {
-                    send_button(*button, false)?;
-                    send_button(*button, true)?;
+                    self.send_button(*button, false)?;
+                    self.send_button(*button, true)?;
                 }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseDown { button } => {
-                send_button(*button, false)?;
+                self.send_button(*button, false)?;
                 if !self.held_buttons.contains(button) {
                     self.held_buttons.push(*button);
                 }
                 Ok(ComputerActionOutcome::Completed)
             }
             NormalizedComputerEffect::MouseUp { button } => {
-                send_button(*button, true)?;
+                self.send_button(*button, true)?;
                 self.held_buttons.retain(|held| held != button);
                 Ok(ComputerActionOutcome::Completed)
             }
@@ -484,12 +562,12 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 self.send_modifiers(*modifiers, false)?;
                 move_with_timing(self, path[0].point, path[0].duration, path[0].easing)?;
-                send_button(*button, false)?;
+                self.send_button(*button, false)?;
                 self.held_buttons.push(*button);
                 for step in &path[1..] {
                     move_with_timing(self, step.point, step.duration, step.easing)?;
                 }
-                send_button(*button, true)?;
+                self.send_button(*button, true)?;
                 self.held_buttons.retain(|held| held != button);
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
@@ -525,10 +603,10 @@ impl ComputerBackend for WindowsDesktopBackend {
             } => {
                 self.send_modifiers(*modifiers, false)?;
                 if *delta_y != 0 {
-                    send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?;
+                    self.send_mouse(0, 0, (*delta_y * 120) as u32, MOUSEEVENTF_WHEEL)?;
                 }
                 if *delta_x != 0 {
-                    send_mouse(0, 0, (*delta_x * 120) as u32, MOUSEEVENTF_HWHEEL)?;
+                    self.send_mouse(0, 0, (*delta_x * 120) as u32, MOUSEEVENTF_HWHEEL)?;
                 }
                 self.send_modifiers(*modifiers, true)?;
                 Ok(ComputerActionOutcome::Completed)
@@ -547,14 +625,14 @@ impl ComputerBackend for WindowsDesktopBackend {
         }
         for input in self.held_keyboard_inputs.clone().into_iter().rev() {
             let released = match input {
-                HeldKeyboardInput::VirtualKey { key, extended } => send_key(
+                HeldKeyboardInput::VirtualKey { key, extended } => self.send_key(
                     VirtualKeyInput {
                         key: VIRTUAL_KEY(key),
                         extended,
                     },
                     true,
                 ),
-                HeldKeyboardInput::Unicode(unit) => send_unicode(unit, true),
+                HeldKeyboardInput::Unicode(unit) => self.send_unicode(unit, true),
             };
             match released {
                 Ok(()) => {
@@ -572,7 +650,7 @@ impl ComputerBackend for WindowsDesktopBackend {
             MouseButton::Right,
             MouseButton::Middle,
         ]) {
-            if let Err(error) = send_button(button, true) {
+            if let Err(error) = self.send_button(button, true) {
                 first.get_or_insert(error);
             }
         }
@@ -679,7 +757,7 @@ fn move_with_timing(
     Ok(())
 }
 
-fn send(inputs: &[INPUT]) -> Result<(), ComputerError> {
+fn send_raw(inputs: &[INPUT]) -> Result<(), ComputerError> {
     // SAFETY: INPUT is ABI-owned by the pinned windows binding; the slice stays live for the call.
     let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
     if sent == inputs.len() as u32 {
@@ -687,49 +765,6 @@ fn send(inputs: &[INPUT]) -> Result<(), ComputerError> {
     } else {
         Err(win32_error("SendInput"))
     }
-}
-
-fn send_mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> Result<(), ComputerError> {
-    send(&[INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx,
-                dy,
-                mouseData: data,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }])
-}
-
-fn send_button(button: MouseButton, up: bool) -> Result<(), ComputerError> {
-    let flags = match (button, up) {
-        (MouseButton::Left, false) => MOUSEEVENTF_LEFTDOWN,
-        (MouseButton::Left, true) => MOUSEEVENTF_LEFTUP,
-        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTDOWN,
-        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTUP,
-        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEDOWN,
-        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEUP,
-    };
-    send_mouse(0, 0, 0, flags)
-}
-
-fn send_key(key: VirtualKeyInput, up: bool) -> Result<(), ComputerError> {
-    send(&[INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: key.key,
-                wScan: 0,
-                dwFlags: key_event_flags(key, up),
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }])
 }
 
 fn key_event_flags(key: VirtualKeyInput, up: bool) -> KEYBD_EVENT_FLAGS {
@@ -742,26 +777,6 @@ fn key_event_flags(key: VirtualKeyInput, up: bool) -> KEYBD_EVENT_FLAGS {
     } else {
         KEYBD_EVENT_FLAGS(0)
     }
-}
-
-fn send_unicode(unit: u16, up: bool) -> Result<(), ComputerError> {
-    send(&[INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
-                wScan: unit,
-                dwFlags: KEYEVENTF_UNICODE
-                    | if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }])
 }
 
 fn virtual_key(key: &NormalizedKeyCode) -> VirtualKeyInput {

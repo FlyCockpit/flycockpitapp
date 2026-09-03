@@ -94,7 +94,7 @@ pub mod turn_socket_provider;
 #[cfg(windows)]
 pub(crate) mod windows_pipe;
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,7 +107,7 @@ use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
 #[cfg(unix)]
 use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::split_proc_cmdline;
 #[cfg(test)]
 use cockpit_host::daemon_lifecycle::write_pid_file;
@@ -718,22 +718,8 @@ async fn socket_responds(socket: &Path) -> Option<SocketHelloResponse> {
 
 #[cfg(windows)]
 async fn connect_windows_identity(socket: &Path) -> anyhow::Result<NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    const ERROR_PIPE_BUSY: i32 = 231;
     let pipe = cockpit_host::named_pipe::read_pipe_identity(socket)?;
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    loop {
-        match ClientOptions::new().open(pipe.as_str()) {
-            Ok(client) => return Ok(client),
-            Err(error)
-                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
+    Ok(cockpit_host::named_pipe::connect_client_pipe(&pipe).await?)
 }
 
 /// Platforms without a local daemon transport keep discovery intact but
@@ -775,14 +761,11 @@ fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
     }
     match cockpit_host::named_pipe::open_client_pipe_blocking(&pipe) {
         Ok(s) => {
-            let mut buf = String::new();
-            let mut r = BufReader::new(&s);
-            if r.read_line(&mut buf).is_ok() && !buf.is_empty() {
-                Some(SocketHelloResponse {
+            match cockpit_host::named_pipe::read_line_bounded(&s, Duration::from_millis(500)) {
+                Ok(buf) if !buf.is_empty() => Some(SocketHelloResponse {
                     hello: parse_socket_hello_line(socket, &buf),
-                })
-            } else {
-                None
+                }),
+                _ => None,
             }
         }
         Err(_) => None,
@@ -2449,9 +2432,18 @@ fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
                     anyhow::bail!("refusing to signal daemon: PID receipt could not be verified")
                 }
                 PidIdentity::VerifiedDaemon => {
-                    crate::daemon::ephemeral_guard::stop_daemon_blocking(&paths.socket);
+                    // Retry the graceful StopDaemon for the whole drain window.
+                    // A single-shot open loses the request to ERROR_PIPE_BUSY
+                    // (one pending instance) and would skip straight to
+                    // TerminateProcess. Once a request is delivered, keep
+                    // waiting for the process rather than sending more.
                     let deadline = std::time::Instant::now() + restart_release_timeout(None);
+                    let mut delivered = false;
                     while std::time::Instant::now() < deadline {
+                        if !delivered {
+                            delivered =
+                                crate::daemon::ephemeral_guard::stop_daemon_blocking(&paths.socket);
+                        }
                         if !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
                             || matches!(
                                 verify_cockpit_daemon_receipt_identity(&receipt),
@@ -2461,7 +2453,10 @@ fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
                             cleanup_receipt_metadata(paths, &receipt)?;
                             return Ok(true);
                         }
-                        std::thread::sleep(Duration::from_millis(100));
+                        std::thread::sleep(
+                            Duration::from_millis(100)
+                                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                        );
                     }
                     cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&receipt)?;
                     cleanup_receipt_metadata(paths, &receipt)?;
@@ -2503,7 +2498,7 @@ fn cleanup_receipt_metadata(paths: &DaemonPaths, receipt: &DaemonPidReceipt) -> 
     retire_metadata_if_receipt_matches(&paths.pid_file, &paths.socket, endpoint.as_deref(), receipt)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::client::temp_ephemeral_paths;
     use super::*;
@@ -2519,7 +2514,7 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn spawn_hello_socket(socket: PathBuf) -> std::thread::JoinHandle<()> {
         let hello = proto::Envelope::response(
             uuid::Uuid::nil(),
@@ -2549,10 +2544,38 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn spawn_hello_socket_with_line(socket: PathBuf, line: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("hello-pipe runtime");
+            rt.block_on(async move {
+                let mut listener =
+                    windows_pipe::NamedPipeListener::bind(&socket).expect("bind pipe");
+                let mut stream = listener.accept().await.expect("accept hello client");
+                use tokio::io::AsyncWriteExt;
+                let payload = format!("{line}\n");
+                let _ = stream.write_all(payload.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        })
+    }
+
+    #[cfg(any(unix, windows))]
     fn wait_for_socket(socket: &Path) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !socket.exists() {
+        loop {
+            #[cfg(unix)]
+            let ready = socket.exists();
+            #[cfg(windows)]
+            let ready = cockpit_host::named_pipe::read_pipe_identity(socket)
+                .ok()
+                .is_some_and(|pipe| cockpit_host::named_pipe::pipe_is_listening(&pipe));
+            if ready {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "hello socket was not bound"
@@ -2643,7 +2666,6 @@ mod tests {
         let _ = std::fs::remove_file(manifest_path);
     }
 
-    #[cfg(unix)]
     #[test]
     fn endpoint_record_cannot_redirect_discovery_to_a_different_runtime_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2672,7 +2694,6 @@ mod tests {
         assert_eq!(probe.paths.socket, runtime_b.join("cockpit/cockpit.sock"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn incompatible_protocol_probe_reports_incompatible_status() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2713,7 +2734,6 @@ mod tests {
         listener.join().expect("listener thread");
     }
 
-    #[cfg(unix)]
     #[test]
     fn no_endpoint_record_uses_explicit_canonical_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2725,7 +2745,6 @@ mod tests {
         assert_eq!(probe.paths.socket, paths.socket);
     }
 
-    #[cfg(unix)]
     #[test]
     fn stale_endpoint_without_bound_receipt_is_preserved_without_signaling() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2857,7 +2876,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn exact_path_probe_does_not_discover_shared_endpoint_record() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2949,7 +2967,6 @@ mod tests {
         assert_eq!(mode(&parent), 0o700);
     }
 
-    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_fails_closed_when_path_is_not_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3407,7 +3424,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     fn test_paths(dir: &tempfile::TempDir) -> DaemonPaths {
         DaemonPaths {
             socket: dir.path().join("daemon.sock"),
@@ -3445,7 +3461,6 @@ mod tests {
         assert!(paths.pid_file.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn receipt_cleanup_rejects_replaced_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -3468,7 +3483,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn unreachable_unverified_pid_is_not_reported_stale() {
         let status = status_for_pid_identity(PidIdentity::Unverified);
@@ -3533,7 +3547,6 @@ mod tests {
         assert!(paths.socket.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn restart_release_waits_for_old_pid_exit_not_just_unlinked_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -3545,7 +3558,6 @@ mod tests {
         assert!(restart_metadata_released(&paths, None));
     }
 
-    #[cfg(unix)]
     #[test]
     fn cmdline_identity_requires_cockpit_daemon_start() {
         assert!(argv_requests_daemon_start(&[

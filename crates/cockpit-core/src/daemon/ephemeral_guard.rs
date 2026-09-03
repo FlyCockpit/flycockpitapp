@@ -779,15 +779,17 @@ impl Drop for EphemeralDaemonGuard {
 }
 
 /// Best-effort synchronous `StopDaemon`. Connects to the daemon socket with
-/// the blocking std `UnixStream`, writes one NDJSON request, and returns —
+/// the blocking std transport, writes one NDJSON request, and returns —
 /// usable from synchronous teardown. Any failure (daemon already gone, socket
-/// removed) is swallowed.
-pub(crate) fn stop_daemon_blocking(socket: &Path) {
+/// removed, transient contention past the connect budget) is swallowed; the
+/// return value reports whether the request bytes were written so callers can
+/// retry instead of skipping to destructive teardown.
+pub(crate) fn stop_daemon_blocking(socket: &Path) -> bool {
     let Ok(envelope) = serde_json::to_string(&Envelope::request(
         uuid::Uuid::new_v4(),
         Request::StopDaemon { grace_secs: None },
     )) else {
-        return;
+        return false;
     };
     #[cfg(unix)]
     {
@@ -797,9 +799,12 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
         if let Ok(mut stream) = StdUnixStream::connect(socket) {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.write_all(envelope.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
+            if stream.write_all(envelope.as_bytes()).is_err()
+                || stream.write_all(b"\n").is_err()
+                || stream.flush().is_err()
+            {
+                return false;
+            }
             // Block briefly for the daemon's reply before dropping the
             // connection. Without this, an immediate close races the daemon's
             // per-client task: the daemon sends its hello *first*, and if the
@@ -811,24 +816,37 @@ pub(crate) fn stop_daemon_blocking(socket: &Path) {
             // discarded — we only need the daemon to have read.
             let mut sink = [0u8; 256];
             let _ = stream.read(&mut sink);
+            return true;
         }
+        false
     }
     #[cfg(windows)]
     {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
+        use std::time::Duration;
         if let Ok(pipe) = cockpit_host::named_pipe::read_pipe_identity(socket)
             && let Ok(mut stream) = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe)
         {
-            let _ = stream.write_all(envelope.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
+            if stream.write_all(envelope.as_bytes()).is_err()
+                || stream.write_all(b"\n").is_err()
+                || stream.flush().is_err()
+            {
+                return false;
+            }
             let mut sink = [0u8; 256];
-            let _ = stream.read(&mut sink);
+            let _ = cockpit_host::named_pipe::read_bounded(
+                &stream,
+                &mut sink,
+                Duration::from_millis(500),
+            );
+            return true;
         }
+        false
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (socket, envelope);
+        false
     }
 }
 

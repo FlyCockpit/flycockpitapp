@@ -7,11 +7,19 @@
 //! names that pipe; clients that see the file expect a live hello promptly,
 //! matching the Unix socket-file publication barrier.
 //!
-//! Stale-owner discovery is explicit: an identity file with no listening pipe
-//! is not "running". Callers must treat a missing pipe as stale rather than
-//! hanging on an unbounded connect.
+//! The pipe name is enumerable in `\\.\pipe\` and must be treated as public.
+//! Confidentiality and authenticity come from the owner-only DACL plus the
+//! client-side server-process SID check ([`named_pipe_server_is_current_user`]),
+//! not from name obscurity.
+//!
+//! Connecting to a published identity is a bounded operation that distinguishes
+//! busy (live owner, retry) from missing (stale owner). An identity file with
+//! no listening pipe, or a listening pipe whose server SID is not the current
+//! user, is not "running".
 
 use std::path::Path;
+#[cfg(windows)]
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -26,6 +34,16 @@ const SID_FINGERPRINT_HEX_LEN: usize = 16;
 const NONCE_LEN: usize = 16;
 const NONCE_HEX_LEN: usize = NONCE_LEN * 2;
 const LEAK_REVEAL_SUFFIX: &str = "-leak-reveal";
+
+/// Bound every client open against a published identity. Matches the Unix
+/// socket connect/hello budget used by status/doctor/attach probes.
+#[cfg(windows)]
+pub const CLIENT_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[cfg(windows)]
+const CLIENT_PIPE_BUSY_RETRY: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const CLIENT_PIPE_HELLO_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PipeIdentityRecord {
@@ -350,10 +368,8 @@ pub fn wait_pipe(pipe: &PipeName, timeout_ms: u32) -> WaitPipe {
 /// DACL: a connected client must present the daemon's user SID.
 #[cfg(windows)]
 pub fn named_pipe_peer_is_current_user(handle: std::os::windows::io::RawHandle) -> Result<()> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let mut client_pid = 0_u32;
     // SAFETY: `handle` is a connected named-pipe server end owned by the caller.
@@ -362,12 +378,41 @@ pub fn named_pipe_peer_is_current_user(handle: std::os::windows::io::RawHandle) 
         return Err(std::io::Error::last_os_error())
             .context("reading named-pipe client process id");
     }
-    // SAFETY: client_pid came from GetNamedPipeClientProcessId on a connected pipe.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) };
-    if process.is_null() || process == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error()).context("opening named-pipe client process");
+    named_pipe_pid_is_current_user(client_pid)
+        .context("named-pipe peer SID does not match the daemon owner")
+}
+
+/// Client-side counterpart of [`named_pipe_peer_is_current_user`]: the process
+/// serving this pipe must present the current user's SID. A mismatch is stale
+/// (pipe-name squat after crash, or a co-existing instance), not "running".
+#[cfg(windows)]
+pub fn named_pipe_server_is_current_user(handle: std::os::windows::io::RawHandle) -> Result<()> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let mut server_pid = 0_u32;
+    // SAFETY: `handle` is a connected named-pipe client end owned by the caller.
+    let got_pid = unsafe { GetNamedPipeServerProcessId(handle as HANDLE, &mut server_pid) };
+    if got_pid == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("reading named-pipe server process id");
     }
-    let client_sid = match process_user_sid(process) {
+    named_pipe_pid_is_current_user(server_pid)
+        .context("named-pipe server process SID does not match the current user")
+}
+
+#[cfg(windows)]
+fn named_pipe_pid_is_current_user(pid: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: pid came from GetNamedPipe{Client,Server}ProcessId on a connected pipe.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() || process == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).context("opening named-pipe peer process");
+    }
+    let peer_sid = match process_user_sid(process) {
         Ok(sid) => {
             // SAFETY: `process` is the handle OpenProcess returned.
             unsafe { CloseHandle(process) };
@@ -379,11 +424,11 @@ pub fn named_pipe_peer_is_current_user(handle: std::os::windows::io::RawHandle) 
             return Err(error);
         }
     };
-    let daemon_sid = current_user_sid_bytes()?;
+    let current_sid = current_user_sid_bytes()?;
     // SAFETY: both SID buffers are live TokenUser allocations.
-    let equal = unsafe { EqualSid(client_sid.as_ptr().cast(), daemon_sid.as_ptr().cast()) };
+    let equal = unsafe { EqualSid(peer_sid.as_ptr().cast(), current_sid.as_ptr().cast()) };
     if equal == 0 {
-        bail!("named-pipe peer SID does not match the daemon owner");
+        bail!("named-pipe process SID does not match the current user");
     }
     Ok(())
 }
@@ -477,13 +522,204 @@ fn token_user_bytes(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec
 }
 
 /// Blocking client open used by discovery probes that run before a Tokio
-/// runtime owns the thread.
+/// runtime owns the thread. Bounded busy-retry, stale-owner classification,
+/// and current-user server SID check are mandatory: a single-shot
+/// `CreateFileW` converts live-owner contention into a false "unreachable".
 #[cfg(windows)]
 pub fn open_client_pipe_blocking(pipe: &PipeName) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe.as_str())
+    use std::os::windows::io::AsRawHandle;
+
+    let file = retry_busy_open_blocking(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe.as_str())
+    })?;
+    named_pipe_server_is_current_user(file.as_raw_handle())
+        .map_err(impersonating_server_io_error)?;
+    Ok(file)
+}
+
+/// Async duplex client open. Same bounded/stale/SID contract as
+/// [`open_client_pipe_blocking`]; the handle is overlapped so Tokio can own it.
+#[cfg(windows)]
+pub async fn connect_client_pipe(
+    pipe: &PipeName,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use std::os::windows::io::AsRawHandle;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let client = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
+        ClientOptions::new().open(pipe.as_str())
+    })
+    .await?;
+    named_pipe_server_is_current_user(client.as_raw_handle())
+        .map_err(impersonating_server_io_error)?;
+    Ok(client)
+}
+
+/// Read one NDJSON hello line without blocking past `timeout`. `std::fs::File`
+/// cannot express a read timeout on a named pipe, so we `PeekNamedPipe` until
+/// a newline is buffered (or the deadline hits) and only then `read_line`.
+#[cfg(windows)]
+pub fn read_line_bounded(file: &std::fs::File, timeout: Duration) -> std::io::Result<String> {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let deadline = Instant::now() + timeout;
+    let mut peek = vec![0_u8; CLIENT_PIPE_HELLO_MAX_BYTES];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "named-pipe hello read timed out",
+            ));
+        }
+        let mut bytes_read = 0_u32;
+        let mut available = 0_u32;
+        // SAFETY: `file` is a live client pipe handle; peek buffer is
+        // `CLIENT_PIPE_HELLO_MAX_BYTES` bytes.
+        let ok = unsafe {
+            PeekNamedPipe(
+                file.as_raw_handle() as HANDLE,
+                peek.as_mut_ptr().cast(),
+                peek.len() as u32,
+                &mut bytes_read,
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if bytes_read > 0 && peek[..bytes_read as usize].contains(&b'\n') {
+            let mut line = String::new();
+            BufReader::new(file).read_line(&mut line)?;
+            return Ok(line);
+        }
+        let _ = available;
+        std::thread::sleep(CLIENT_PIPE_BUSY_RETRY);
+    }
+}
+
+/// Bounded `Read::read` for a connected client pipe. Used by stop to wait for
+/// the daemon hello without hanging a live-but-not-accepting owner.
+#[cfg(windows)]
+pub fn read_bounded(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> std::io::Result<usize> {
+    use std::io::Read as _;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "named-pipe read timed out",
+            ));
+        }
+        let mut available = 0_u32;
+        // SAFETY: `file` is a live client pipe handle; we only query availability.
+        let ok = unsafe {
+            PeekNamedPipe(
+                file.as_raw_handle() as HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if available > 0 {
+            return Read::read(&mut &*file, buf);
+        }
+        std::thread::sleep(CLIENT_PIPE_BUSY_RETRY);
+    }
+}
+
+#[cfg(windows)]
+fn classify_client_pipe_open_error(error: &std::io::Error) -> WaitPipe {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_PIPE_BUSY) => WaitPipe::Busy,
+        Some(ERROR_FILE_NOT_FOUND) => WaitPipe::Missing,
+        _ => WaitPipe::Failed,
+    }
+}
+
+#[cfg(windows)]
+fn stale_owner_io_error(pipe: &PipeName) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "stale named-pipe owner: no server is listening on {}",
+            pipe.as_str()
+        ),
+    )
+}
+
+#[cfg(windows)]
+fn impersonating_server_io_error(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, error)
+}
+
+#[cfg(windows)]
+fn retry_busy_open_blocking<T>(
+    pipe: &PipeName,
+    timeout: Duration,
+    mut open: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(error) => match classify_client_pipe_open_error(&error) {
+                WaitPipe::Busy if Instant::now() < deadline => {
+                    std::thread::sleep(CLIENT_PIPE_BUSY_RETRY);
+                }
+                WaitPipe::Missing => return Err(stale_owner_io_error(pipe)),
+                _ => return Err(error),
+            },
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn retry_busy_open_async<T>(
+    pipe: &PipeName,
+    timeout: Duration,
+    mut open: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(error) => match classify_client_pipe_open_error(&error) {
+                WaitPipe::Busy if Instant::now() < deadline => {
+                    tokio::time::sleep(CLIENT_PIPE_BUSY_RETRY).await;
+                }
+                WaitPipe::Missing => return Err(stale_owner_io_error(pipe)),
+                _ => return Err(error),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +762,30 @@ mod tests {
         assert_ne!(a, c);
         derive_pipe_name("S-1-5-21-1-2-3-1001", &[0; 16]).expect_err("zero nonce");
         derive_pipe_name("", &nonce).expect_err("empty sid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_pipe_open_errors_classify_busy_versus_stale() {
+        let busy = std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32,
+        );
+        let missing = std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32,
+        );
+        let other = std::io::Error::from_raw_os_error(5);
+        assert_eq!(classify_client_pipe_open_error(&busy), WaitPipe::Busy);
+        assert_eq!(classify_client_pipe_open_error(&missing), WaitPipe::Missing);
+        assert_eq!(classify_client_pipe_open_error(&other), WaitPipe::Failed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocking_open_of_a_missing_pipe_is_stale_owner() {
+        let pipe = derive_pipe_name("S-1-5-21-1-2-3-1001", &[0xcd; 16]).unwrap();
+        let error = open_client_pipe_blocking(&pipe).expect_err("missing pipe");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("stale named-pipe owner"));
     }
 
     #[test]

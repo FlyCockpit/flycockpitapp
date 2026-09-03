@@ -913,37 +913,13 @@ async fn connect_wire(socket: &Path) -> Result<WireStream> {
 
 #[cfg(windows)]
 async fn connect_named_pipe(identity: &Path) -> Result<NamedPipeClient> {
-    use std::time::Instant;
-    use tokio::net::windows::named_pipe::ClientOptions;
-
-    const ERROR_PIPE_BUSY: i32 = 231;
-    const ERROR_FILE_NOT_FOUND: i32 = 2;
-
+    // Bounded busy-retry, stale-owner classification, and server-SID check
+    // live in `cockpit_host::named_pipe` so every client open shares them.
     let pipe = cockpit_host::named_pipe::read_pipe_identity(identity)
         .with_context(|| format!("reading named-pipe identity {}", identity.display()))?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match ClientOptions::new().open(pipe.as_str()) {
-            Ok(client) => return Ok(client),
-            Err(error)
-                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => {
-                return Err(error).context(format!(
-                    "stale named-pipe owner: identity {} names {}, but no server is listening",
-                    identity.display(),
-                    pipe.as_str()
-                ));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("connecting to {} ({})", identity.display(), pipe.as_str())
-                });
-            }
-        }
-    }
+    cockpit_host::named_pipe::connect_client_pipe(&pipe)
+        .await
+        .with_context(|| format!("connecting to {} ({})", identity.display(), pipe.as_str()))
 }
 
 #[cfg(any(unix, windows))]

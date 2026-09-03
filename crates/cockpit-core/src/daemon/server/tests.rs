@@ -1746,7 +1746,6 @@ fn config_refreshed_is_exhaustively_redacted() {
     ));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn refresh_config_response_is_causally_terminal() {
     assert_worker_delivery_happy("refresh_config").await;
@@ -5556,7 +5555,6 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
     assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable() {
     use cockpit_db::media_attachments::{
@@ -6115,7 +6113,6 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
@@ -8159,11 +8156,10 @@ async fn owner_with_capability_is_allowed_secret_rpcs() {
     .expect("capability-bearing owner may call secret RPCs");
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
@@ -18393,7 +18389,20 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     ]
 }
 
-#[cfg(unix)]
+fn test_stream_pair() -> (
+    impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+) {
+    #[cfg(unix)]
+    {
+        UnixStream::pair().expect("socket pair")
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES)
+    }
+}
+
 async fn dispatch_matrix_request(
     ctx: &Arc<DaemonContext>,
     request: Request,
@@ -18401,7 +18410,6 @@ async fn dispatch_matrix_request(
     dispatch_matrix_request_after(ctx, Vec::new(), request).await
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_request_after(
     ctx: &Arc<DaemonContext>,
     prelude: Vec<Request>,
@@ -18436,7 +18444,6 @@ async fn dispatch_matrix_request_after(
     result
 }
 
-#[cfg(unix)]
 async fn dispatch_authz_request_after(
     ctx: &Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -18445,7 +18452,7 @@ async fn dispatch_authz_request_after(
     worker_rx_to_drop_after_prelude: Option<tokio::sync::mpsc::Receiver<SessionWork>>,
     request: Request,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     // Owner matrix cells keep the capability so they exercise the 284-row
     // table rather than the pre-launch capability fence. Remote principals
@@ -18510,7 +18517,10 @@ async fn dispatch_authz_request_after(
                 assert!(
                     text.contains("Connection reset by peer")
                         || text.contains("Connection reset")
-                        || text.contains("ended unexpectedly"),
+                        || text.contains("ended unexpectedly")
+                        || text.contains("broken pipe")
+                        || text.contains("Broken pipe")
+                        || text.contains("early eof"),
                     "server task succeeds: {text}"
                 );
             }
@@ -18520,7 +18530,6 @@ async fn dispatch_authz_request_after(
     result
 }
 
-#[cfg(unix)]
 async fn recv_dispatch_matrix_response_or_server<S>(
     client: &mut ProtoStream<S>,
     request_id: Uuid,
@@ -18543,7 +18552,6 @@ where
     }
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_request_after_collect_events(
     ctx: &Arc<DaemonContext>,
     prelude: Vec<Request>,
@@ -18552,7 +18560,7 @@ async fn dispatch_matrix_request_after_collect_events(
     std::result::Result<Response, ErrorPayload>,
     Vec<proto::Event>,
 ) {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -18623,7 +18631,10 @@ async fn dispatch_matrix_request_after_collect_events(
             assert!(
                 text.contains("Connection reset by peer")
                     || text.contains("Connection reset")
-                    || text.contains("ended unexpectedly"),
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
                 "server task succeeds: {text}"
             );
         }
@@ -18632,13 +18643,12 @@ async fn dispatch_matrix_request_after_collect_events(
     (result, events)
 }
 
-#[cfg(unix)]
 async fn dispatch_matrix_raw_line(
     ctx: &Arc<DaemonContext>,
     request_id: Uuid,
     line: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -18654,14 +18664,25 @@ async fn dispatch_matrix_raw_line(
         .expect("send raw dispatch request");
     let result = recv_dispatch_matrix_response(&mut client, request_id).await;
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("Connection reset by peer")
+                    || text.contains("Connection reset")
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
+                "server task succeeds: {text}"
+            );
+        }
+        Err(error) => panic!("server task joins: {error}"),
+    }
     result
 }
 
-#[cfg(unix)]
 async fn recv_dispatch_matrix_response<S>(
     proto: &mut ProtoStream<S>,
     request_id: Uuid,
@@ -18787,7 +18808,6 @@ async fn dispatch_matrix_readonly_coverage_is_complete() {
     assert_dispatch_matrix_coverage_complete();
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_matrix_readonly_cases_traverse_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18799,7 +18819,6 @@ async fn dispatch_matrix_readonly_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18811,7 +18830,7 @@ async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     assert_dispatch_matrix_coverage_complete();
@@ -18841,7 +18860,6 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
 // through the same socket transport and central authorization path. The
 // readonly/mutating matrix tests above retain the corresponding malformed and
 // invalid-state traversal for every dispatchable command.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     assert_dispatch_matrix_coverage_complete();
@@ -18894,7 +18912,7 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 struct AuthzSocketScenario {
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -18906,7 +18924,7 @@ struct AuthzSocketScenario {
     _tmp: tempfile::TempDir,
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 fn assert_authz_matrix_result(
     case: &AuthzDispatchCase,
     level: AuthzLevel,
@@ -18937,7 +18955,6 @@ fn assert_authz_matrix_result(
     }
 }
 
-#[cfg(unix)]
 fn assert_authz_allowed_outcome(
     kind: &str,
     level: AuthzLevel,
@@ -18966,7 +18983,7 @@ fn assert_authz_allowed_outcome(
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
     let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level).await;
     let result = dispatch_authz_request_after(
@@ -19012,7 +19029,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -19071,7 +19088,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 async fn authz_cross_session_paused_work_scenario(
     kind: &'static str,
     level: AuthzLevel,
@@ -19129,7 +19146,7 @@ async fn authz_cross_session_paused_work_scenario(
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(feature = "remote")]
 fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) -> ClientPrincipal {
     let project_root = project_root.to_string_lossy().into_owned();
     match level {
@@ -19200,7 +19217,6 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
     }
 }
 
-#[cfg(unix)]
 fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
     matches!(
         kind,
@@ -19280,7 +19296,6 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             && level.can_write())
 }
 
-#[cfg(unix)]
 fn authz_media_mutation_request(kind: &str) -> Request {
     use cockpit_db::media_attachments::{
         AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
@@ -19356,13 +19371,11 @@ fn authz_media_mutation_request(kind: &str) -> Request {
     }
 }
 
-#[cfg(unix)]
 fn authz_opaque_id() -> proto::OpaqueAsciiId128V1 {
     proto::OpaqueAsciiId128V1::new(Uuid::now_v7().to_string())
         .expect("generated authz matrix id is valid opaque ASCII")
 }
 
-#[cfg(unix)]
 fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
     proto::AcpForwardedMcpIngressV1 {
         version: proto::ACP_FORWARDED_MCP_VERSION_V1,
@@ -19372,7 +19385,6 @@ fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
     }
 }
 
-#[cfg(unix)]
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
@@ -20778,7 +20790,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
     }
 }
 
-#[cfg(unix)]
 impl ReadonlyDispatchCaseKind {
     async fn assert_happy_socket_case(self) {
         match self {
@@ -21667,7 +21678,6 @@ impl ReadonlyDispatchCaseKind {
     }
 }
 
-#[cfg(unix)]
 async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
     match case.effect_class {
         DispatchEffectClass::Durable
@@ -21940,7 +21950,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
     match case.kind {
         "attach" => {
@@ -22261,7 +22270,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
     }
 }
 
-#[cfg(unix)]
 async fn live_worker_with_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
@@ -22334,7 +22342,6 @@ async fn live_worker_with_receiver(
     (row.session_id, work_rx)
 }
 
-#[cfg(unix)]
 async fn dispatch_attached_worker_request(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
@@ -22343,7 +22350,7 @@ async fn dispatch_attached_worker_request(
     request: Request,
     observe: impl FnOnce(SessionWork),
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -22411,7 +22418,10 @@ async fn dispatch_attached_worker_request(
             assert!(
                 text.contains("Connection reset by peer")
                     || text.contains("Connection reset")
-                    || text.contains("ended unexpectedly"),
+                    || text.contains("ended unexpectedly")
+                    || text.contains("broken pipe")
+                    || text.contains("Broken pipe")
+                    || text.contains("early eof"),
                 "server task succeeds: {text}"
             );
         }
@@ -22420,7 +22430,6 @@ async fn dispatch_attached_worker_request(
     result
 }
 
-#[cfg(unix)]
 fn proto_queue_item(text: &str) -> proto::QueueItem {
     proto::QueueItem {
         id: Uuid::new_v4(),
@@ -22433,7 +22442,6 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
     }
 }
 
-#[cfg(unix)]
 async fn assert_worker_delivery_happy(kind: &str) {
     let state_root = tempfile::tempdir().unwrap();
     let ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
@@ -22975,7 +22983,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn send_user_message_propagates_exact_pre_acceptance_failure() {
     let ctx = test_ctx();
@@ -23035,7 +23042,6 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
     assert_eq!(error.message, "resume repair is required");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn remove_queued_message_propagates_terminal_receipt_failure() {
     let ctx = test_ctx();
@@ -23074,25 +23080,21 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
     assert_eq!(error.message, "queued payload was restored; retry removal");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_preflight_returns_preflight_state() {
     assert_worker_delivery_happy("set_preflight").await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_redaction_returns_redaction_state() {
     assert_worker_delivery_happy("set_redaction").await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_longcache_returns_longcache_state() {
     assert_worker_delivery_happy("set_longcache").await;
 }
 
-#[cfg(unix)]
 async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -23239,7 +23241,6 @@ async fn assert_attached_required_malformed(kind: &str) {
     assert_eq!(err.code, ErrorCode::NotAttached);
 }
 
-#[cfg(unix)]
 async fn assert_steer_delegation_malformed() {
     let ctx = test_ctx();
     let response = dispatch_matrix_request(
@@ -23259,7 +23260,6 @@ async fn assert_steer_delegation_malformed() {
     assert_eq!(result.status, proto::DelegationSteerStatus::NotSteerable);
 }
 
-#[cfg(unix)]
 async fn assert_fs_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23292,7 +23292,6 @@ async fn assert_fs_mutating_malformed(kind: &str) {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
-#[cfg(unix)]
 async fn assert_attachment_mutating_happy(kind: &str) {
     let mut ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23312,7 +23311,7 @@ async fn assert_attachment_mutating_happy(kind: &str) {
     let png = sample_png();
     let sha = sha256_hex(&png);
     let data = base64::engine::general_purpose::STANDARD.encode(&png);
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
@@ -23441,7 +23440,6 @@ async fn assert_attachment_mutating_happy(kind: &str) {
         .expect("server task succeeds");
 }
 
-#[cfg(unix)]
 async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -23493,7 +23491,6 @@ async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_assistant_inbox_human_read_happy() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -23512,7 +23509,6 @@ async fn assert_assistant_inbox_human_read_happy() {
     assert!(matches!(response, Response::Ack));
 }
 
-#[cfg(unix)]
 async fn assert_attachment_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -23574,7 +23570,6 @@ async fn assert_attachment_mutating_malformed(kind: &str) {
 /// drives the production `handle_request` dispatch path exactly as the
 /// `media_upload_production_dispatch_cancel_finalize_and_status` reference test
 /// does, so the coverage cases exercise the real durable media flow.
-#[cfg(unix)]
 struct MediaUploadHarness {
     ctx: Arc<DaemonContext>,
     state: MutableClientState,
@@ -23587,7 +23582,6 @@ struct MediaUploadHarness {
     _media_tmp: tempfile::TempDir,
 }
 
-#[cfg(unix)]
 async fn media_upload_harness() -> MediaUploadHarness {
     use sha2::{Digest as _, Sha256};
     let tmp = tempfile::tempdir().unwrap();
@@ -23633,7 +23627,6 @@ async fn media_upload_harness() -> MediaUploadHarness {
     }
 }
 
-#[cfg(unix)]
 impl MediaUploadHarness {
     async fn begin(&mut self, draft: Uuid) -> (Uuid, u64) {
         use cockpit_db::media_attachments::{
@@ -23876,7 +23869,6 @@ impl MediaUploadHarness {
 
 /// A fully materialized durable media attachment plus the handles needed to
 /// exercise every media read command against it.
-#[cfg(unix)]
 struct MaterializedMedia {
     harness: MediaUploadHarness,
     draft: Uuid,
@@ -23889,7 +23881,6 @@ struct MaterializedMedia {
     preview: cockpit_db::media_attachments::MediaAttachmentPreviewSummaryV1,
 }
 
-#[cfg(unix)]
 async fn fully_materialize_media() -> MaterializedMedia {
     use cockpit_db::media_attachments::{MediaAttachmentStatusDetailV1, MediaUploadStateDetailV1};
     let mut harness = media_upload_harness().await;
@@ -23941,7 +23932,6 @@ async fn fully_materialize_media() -> MaterializedMedia {
     }
 }
 
-#[cfg(unix)]
 fn media_read_request(kind: ReadonlyDispatchCaseKind) -> Request {
     use cockpit_db::media_attachments::{
         GetMediaAttachmentPreviewV1, GetMediaAttachmentStatusV1, GetMediaUploadStatusV1,
@@ -23984,7 +23974,6 @@ fn media_read_request(kind: ReadonlyDispatchCaseKind) -> Request {
     }
 }
 
-#[cfg(unix)]
 async fn assert_media_mutating_happy(kind: &str) {
     match kind {
         "begin_media_upload" => {
@@ -24052,7 +24041,6 @@ async fn assert_media_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_media_mutating_malformed(kind: &str) {
     // Each media mutation calls `require_attached` up front; a detached socket
     // connection therefore reaches the handler and is rejected with a typed
@@ -24137,7 +24125,6 @@ async fn assert_media_mutating_malformed(kind: &str) {
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn open_terminal_on_socket(
     ctx: &Arc<DaemonContext>,
     cwd: Option<String>,
@@ -24163,7 +24150,6 @@ async fn open_terminal_on_socket(
     (terminal_id, binding)
 }
 
-#[cfg(unix)]
 async fn assert_terminal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     match kind {
@@ -24181,7 +24167,7 @@ async fn assert_terminal_mutating_happy(kind: &str) {
         "close_terminal" => {
             // Open and close on the same connection so the dispatch layer
             // has the binding in terminal_views.
-            let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+            let (server_stream, client_stream) = test_stream_pair();
             let mut client = ProtoStream::new(client_stream);
             let server = tokio::spawn(handle_client_transport_as(
                 server_stream,
@@ -24234,7 +24220,6 @@ async fn assert_terminal_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_terminal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -24257,11 +24242,10 @@ async fn assert_terminal_mutating_malformed(kind: &str) {
     ));
 }
 
-#[cfg(unix)]
 async fn assert_terminal_ingress_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
@@ -24400,7 +24384,6 @@ async fn assert_terminal_ingress_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -24458,7 +24441,6 @@ async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
     let _ = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id }).await;
 }
 
-#[cfg(unix)]
 fn sha256_hex_terminal(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(bytes);
@@ -24469,7 +24451,6 @@ fn sha256_hex_terminal(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(unix)]
 async fn assert_paused_work_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24509,7 +24490,6 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_goal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24568,7 +24548,6 @@ async fn assert_goal_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_goal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24641,7 +24620,6 @@ async fn create_test_assistant(
     .expect("create assistant")
 }
 
-#[cfg(unix)]
 async fn assert_create_assistant_session_happy() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
@@ -24688,7 +24666,6 @@ async fn assert_create_assistant_session_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -24757,7 +24734,6 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -24796,7 +24772,6 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
     let _ = dispatch_matrix_request(&ctx, request).await;
 }
 
-#[cfg(unix)]
 async fn assert_auto_title_mutating_happy() {
     let project = tempfile::tempdir().unwrap();
     let url = auto_title_model_server(Some("Matrix Title".to_string())).await;
@@ -24837,7 +24812,6 @@ async fn assert_auto_title_mutating_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_auto_title_mutating_malformed() {
     let project = tempfile::tempdir().unwrap();
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
@@ -24875,7 +24849,6 @@ async fn assert_auto_title_mutating_malformed() {
     assert!(!row.user_renamed);
 }
 
-#[cfg(unix)]
 fn minimal_import_archive_base64() -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
@@ -24969,7 +24942,6 @@ fn archive_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
 }
 
 /// A staged chunk is retained and acknowledged with its next index.
-#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_happy() {
     let ctx = test_ctx();
     let body = b"bulk-transfer-chunk-body".to_vec();
@@ -25011,7 +24983,6 @@ async fn assert_write_bulk_transfer_chunk_happy() {
 }
 
 /// A chunk whose body is not valid base64 is refused.
-#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(
@@ -25027,7 +24998,6 @@ async fn assert_write_bulk_transfer_chunk_malformed() {
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn assert_import_session_archive_happy() {
     let ctx = test_ctx();
     let (session_id, archive_base64) = minimal_import_archive_base64();
@@ -25053,7 +25023,6 @@ async fn assert_import_session_archive_happy() {
     assert!(ctx.db.get_session(imported).await.unwrap().is_some());
 }
 
-#[cfg(unix)]
 async fn assert_import_session_archive_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(
@@ -25068,7 +25037,6 @@ async fn assert_import_session_archive_malformed() {
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
-#[cfg(unix)]
 async fn assert_curator_mutating_happy() {
     let project = tempfile::tempdir().unwrap();
     let skill_root = project.path().join(".agents").join("skills");
@@ -25108,7 +25076,6 @@ async fn assert_curator_mutating_happy() {
     );
 }
 
-#[cfg(unix)]
 async fn assert_session_db_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25343,7 +25310,6 @@ async fn assert_session_db_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_session_db_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -25416,7 +25382,6 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_promote_resource_happy() {
     let ctx = persistent_test_ctx();
     let scheduler = ctx
@@ -25452,7 +25417,6 @@ async fn assert_promote_resource_happy() {
     assert_eq!(status, proto::ResourcePromoteStatus::Promoted);
 }
 
-#[cfg(unix)]
 async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25468,7 +25432,6 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     );
 }
 
-#[cfg(unix)]
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -25524,7 +25487,6 @@ async fn assert_scheduler_dispatch_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
     match kind {
         "set_approval_mode" => {
@@ -25890,7 +25852,6 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
@@ -25990,7 +25951,6 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
 /// through the real dispatch path receives the `ConfigSnapshot` event
 /// without a separate request — the attach flow broadcasts it and the
 /// event traverses the socket to the client.
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_attach_delivers_config_snapshot_event() {
     let project = tempfile::tempdir().unwrap();
@@ -26046,7 +26006,6 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
 /// over a malformed layer, a dispatched client still holds the last good
 /// snapshot (no new `ConfigSnapshot` event) and receives a terminal error. Driven
 /// through the real `RefreshConfig` dispatch path.
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26121,14 +26080,12 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
     );
 }
 
-#[cfg(unix)]
 fn git_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     run_git(tmp.path(), &["init"]);
     tmp
 }
 
-#[cfg(unix)]
 fn run_git(cwd: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)
@@ -31198,7 +31155,6 @@ async fn set_model_favorite_idempotent_rejects_external_durable_drift() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn set_model_favorite_idempotent_rejects_replaced_workspace_authority() {
     let home = tempfile::tempdir().unwrap();
@@ -36755,12 +36711,17 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
     assert_eq!(active.generation, 0, "attach starts a new client epoch");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_answers_too_new_request_with_protocol_version_error() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.
@@ -36821,7 +36782,6 @@ async fn client_transport_only_accepts_clean_reader_exit() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatch_helper_reports_server_failure_before_client_eof() {
     let (_server_stream, client_stream) = tokio::io::duplex(64);
@@ -36867,12 +36827,17 @@ async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit()
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_responses_use_negotiated_client_protocol_version() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client =
         ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
 
@@ -36912,12 +36877,17 @@ async fn server_responses_use_negotiated_client_protocol_version() {
     server.await.unwrap().unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.
@@ -36974,12 +36944,17 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
     server.await.unwrap().unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_event_is_dropped_and_connection_survives() {
     let ctx = test_ctx();
-    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let (server_stream, client_stream) = test_stream_pair();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        false,
+    ));
     let mut client = ProtoStream::new(client_stream);
 
     // Initial hello.

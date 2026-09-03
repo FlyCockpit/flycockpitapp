@@ -34,9 +34,11 @@ use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 /// sub-millisecond in practice; a generous ceiling fails closed.
 const LEAK_REVEAL_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Bounded wait for a client to deliver its complete fixed-length request (and
-/// half-close), so a same-uid peer that opens a connection and stalls (or sends
-/// a short frame) can't pin a spawned handler forever (resource exhaustion).
+/// Bounded wait for a client to deliver its complete fixed-length request, so a
+/// same-uid peer that opens a connection and stalls (or sends a short frame)
+/// can't pin a spawned handler forever (resource exhaustion). The request is a
+/// closed 67-byte frame; the terminator is that length, not a write-side
+/// half-close (named pipes cannot express half-close).
 const LEAK_REVEAL_SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Serve the dedicated reveal socket until the daemon begins draining. Each
@@ -136,22 +138,30 @@ async fn handle_reveal_connection(mut stream: DaemonStream, ctx: Arc<DaemonConte
 
 /// Read exactly one fixed-length (67-byte) request frame. The request is a
 /// closed fixed-size frame, so we read EXACTLY that many bytes — never wait for
-/// EOF or an extra byte (the client keeps the connection open to read the
-/// response, so waiting for more would deadlock). Returns `None` on a short
-/// read, connection error, or malformed frame.
+/// EOF (the client keeps the connection open to read the response, and byte-mode
+/// named pipes produce no write-side EOF until the handle fully closes).
+/// Trailing bytes already sitting in the buffer are a protocol violation and
+/// fail closed; we do not wait for them. Returns `None` on a short read,
+/// connection error, extra buffered byte, or malformed frame.
 async fn read_request_frame<S>(stream: &mut S) -> Option<LeakRevealSocketRequest>
 where
     S: AsyncRead + Unpin,
 {
     let mut buf = [0u8; LEAK_REVEAL_REQUEST_FRAME_LEN];
     stream.read_exact(&mut buf).await.ok()?;
-    // Reject trailing bytes: a well-behaved client half-closes its write side
-    // after the fixed-length request, so the next read is a clean EOF (0 bytes).
-    // Any further byte (or a read error) is a protocol violation → fail closed.
+    // Reject extra bytes that are already readable. Do not wait for EOF or for
+    // a later byte: Unix half-close is not expressible on named pipes, and the
+    // client must keep the duplex handle open to read the response.
     let mut extra = [0u8; 1];
-    match stream.read(&mut extra).await {
-        Ok(0) => {}
-        _ => return None,
+    tokio::select! {
+        biased;
+        result = stream.read(&mut extra) => {
+            match result {
+                Ok(0) => {}
+                _ => return None,
+            }
+        }
+        _ = std::future::ready(()) => {}
     }
     crate::daemon::leak_reveal_frame::decode_request(&buf).ok()
 }
@@ -185,9 +195,9 @@ pub(crate) async fn reveal_leak_secret_over_socket(
             .await
             .map_err(|_| LeakRevealDenied::UnavailablePlatform)?;
         let _ = stream.flush().await;
-        // Half-close the write side: the request is a fixed-length frame, so
-        // this signals a clean end-of-request (EOF) to the server's trailing-
-        // byte check. The read half stays open to receive the response.
+        // Best-effort write-side shutdown. Unix delivers EOF to a waiter; byte-
+        // mode named pipes treat this as a no-op. The request terminator is the
+        // fixed 67-byte frame, so the exchange does not depend on half-close.
         let _ = stream.shutdown().await;
         // `None` here == structural read failure → fail closed as Internal.
         read_response_frame(&mut stream)
@@ -235,9 +245,8 @@ async fn connect_reveal(reveal_socket: &Path) -> Result<impl AsyncRead + AsyncWr
     }
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::ClientOptions;
         let pipe = cockpit_host::named_pipe::read_pipe_identity(reveal_socket)?;
-        Ok(ClientOptions::new().open(pipe.as_str())?)
+        Ok(cockpit_host::named_pipe::connect_client_pipe(&pipe).await?)
     }
 }
 

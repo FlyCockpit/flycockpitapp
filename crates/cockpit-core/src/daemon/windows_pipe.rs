@@ -3,7 +3,7 @@
 //! Publication is the owner-only identity file at `DaemonPaths.socket`. The
 //! listen name is never a well-known global pipe; see `cockpit_host::named_pipe`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use cockpit_host::named_pipe::{
@@ -13,7 +13,6 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 pub struct NamedPipeListener {
     pipe_name: PipeName,
-    identity_path: PathBuf,
     pending: Option<NamedPipeServer>,
     security: OwnerOnlyPipeSecurity,
 }
@@ -36,7 +35,6 @@ impl NamedPipeListener {
         write_pipe_identity(identity_path, &pipe_name)?;
         Ok(Self {
             pipe_name,
-            identity_path: identity_path.to_path_buf(),
             pending: Some(pending),
             security,
         })
@@ -44,10 +42,6 @@ impl NamedPipeListener {
 
     pub fn pipe_name(&self) -> &PipeName {
         &self.pipe_name
-    }
-
-    pub fn identity_path(&self) -> &Path {
-        &self.identity_path
     }
 
     pub async fn accept(&mut self) -> Result<NamedPipeServer> {
@@ -59,6 +53,11 @@ impl NamedPipeListener {
             .connect()
             .await
             .with_context(|| format!("accepting on {}", self.pipe_name.as_str()))?;
+        // Create the next pending instance before returning the connected
+        // handle. If this fails, `server` is dropped with the `?` and the
+        // just-connected client is disconnected; callers see the bind error
+        // rather than a half-published identity. Dropping `accept` mid-connect
+        // similarly destroys the only pending instance until the loop retries.
         self.pending = Some(create_server(&self.pipe_name, false, &mut self.security)?);
         Ok(server)
     }

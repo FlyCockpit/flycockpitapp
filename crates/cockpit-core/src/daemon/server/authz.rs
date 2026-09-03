@@ -294,7 +294,7 @@ pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,
     row: &crate::db::sessions::SessionRow,
 ) -> SessionAccess {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return SessionAccess::Owner;
     }
     let project_root = row.project_root.as_str();
@@ -319,7 +319,7 @@ pub(super) fn session_access_for_summary(
     principal: &ClientPrincipal,
     summary: &proto::SessionSummary,
 ) -> SessionAccess {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return SessionAccess::Owner;
     }
     let created_by_this_principal = principal
@@ -344,7 +344,7 @@ pub(super) async fn attached_session_access(
     state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<SessionAccess, ErrorPayload> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Ok(SessionAccess::Owner);
     }
     let att = require_attached(state)?;
@@ -417,7 +417,7 @@ pub(super) async fn require_remote_shared_session_writer(
     shared: &SharedClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Ok(());
     }
     let Some(att) = shared.attached.as_ref() else {
@@ -459,7 +459,7 @@ pub(super) async fn require_remote_shared_session_reader(
     shared: &SharedClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Ok(());
     }
     let Some(att) = shared.attached.as_ref() else {
@@ -670,7 +670,10 @@ pub(super) async fn authorize_attach(
             // message. Only the local daemon owner may reclaim that live
             // worker: there is no durable principal binding yet from which a
             // remote/shared client could be authorized safely.
-            Ok(None) if principal.is_owner() && ctx.registry.has_live_session(*session_id) => {
+            Ok(None)
+                if principal.has_owner_level_authority()
+                    && ctx.registry.has_live_session(*session_id) =>
+            {
                 Ok(())
             }
             Ok(None) => Err(ErrorPayload {
@@ -1447,16 +1450,23 @@ pub(super) async fn authorize_request(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
-    if principal.is_owner() {
-        // Issue #296: Owner-for-all is still assigned at the socket accept
-        // seam (follow-up #337). Secret-bearing rows additionally require
-        // the daemon-private capability a confined child cannot present.
+    if principal.has_owner_level_authority() {
         if principal::request_requires_owner_capability(request) && !state.has_owner_capability {
             return Err(authorization_error(
                 "request requires the daemon-private owner capability",
             ));
         }
         return Ok(());
+    }
+
+    if principal.is_local() {
+        return proto::command!(
+            command_authorize_request_match,
+            request,
+            state,
+            ctx,
+            principal
+        );
     }
 
     // An attempt-grant principal is authorized only against its verified
@@ -1559,13 +1569,23 @@ pub(super) async fn authorize_request_shared(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &shared.principal;
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         if principal::request_requires_owner_capability(request) && !shared.has_owner_capability {
             return Err(authorization_error(
                 "request requires the daemon-private owner capability",
             ));
         }
         return Ok(());
+    }
+
+    if principal.is_local() {
+        return proto::command!(
+            command_authorize_shared_request_match,
+            request,
+            shared,
+            ctx,
+            principal
+        );
     }
 
     // Attempt-grant principals: ceiling-only enforcement on the shared path too.

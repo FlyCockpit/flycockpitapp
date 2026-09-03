@@ -2625,8 +2625,9 @@ fn oauth_owner(state: &MutableClientState) -> String {
 ///
 /// Both inputs are assigned by the daemon, never by the caller:
 /// - `state.principal` is set at connection authentication from the transport
-///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
-///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
+///   (a local unix-domain socket yields `ClientPrincipal::Local` after peer
+///   credential exchange; a relay / attempt-grant connection yields
+///   `ClientPrincipal::Remote` via the daemon's
 ///   verified constructors). A caller cannot present itself as `Owner`.
 ///   Issue #296: socket Owner is still blanket; secret RPCs additionally
 ///   require the daemon-private capability. Follow-up #337 replaces this with
@@ -18172,6 +18173,33 @@ async fn handle_serialized_request_impl(
                 .unwrap_or_else(|| "<in-memory>".to_string()),
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
+
+        Request::ExchangeLocalPeerCredential => {
+            use crate::daemon::peer_authority::{
+                attest_local_client_role, default_agent_child_grants, proto_local_role,
+            };
+            use crate::daemon::principal::LocalClientRole;
+
+            let peer = state
+                .socket_peer
+                .ok_or_else(|| authorization_error("socket peer identity is required"))?;
+            let role = attest_local_client_role(peer)
+                .map_err(internal)?
+                .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
+            let grants = if role == LocalClientRole::AgentChild {
+                default_agent_child_grants()
+            } else {
+                Vec::new()
+            };
+            let token = ctx
+                .peer_credential_registry
+                .mint(peer, role, grants.clone());
+            state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
+            Ok(Response::LocalPeerCredential {
+                token: proto::OwnerCapabilityToken::new(token.0),
+                role: proto_local_role(role),
+            })
+        }
 
         Request::RefreshEnv { vars } => {
             let att = require_attached(state)?;

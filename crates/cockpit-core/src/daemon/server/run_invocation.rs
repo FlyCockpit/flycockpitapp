@@ -25,6 +25,7 @@ pub fn wall_ms_now() -> i64 {
 pub fn principal_digest(principal: &ClientPrincipal) -> String {
     let tag = match principal {
         ClientPrincipal::Owner => "owner".to_string(),
+        ClientPrincipal::Local(local) => format!("local:{}:{}", local.role_tag(), local.peer_pid),
         #[cfg(feature = "remote")]
         ClientPrincipal::Remote(remote) => format!("flycockpit:{}", remote.user_id),
     };

@@ -1,14 +1,8 @@
-//! Daemon-private owner capability for secret-bearing RPCs.
+//! Daemon-private owner capability for in-process clients.
 //!
-//! Pre-launch mitigation for issue #296: every wire-transport peer (Unix
-//! socket or Windows named pipe) is still granted `ClientPrincipal::Owner`.
-//! Secret-bearing (`owner_only`) RPCs and ACP stdio ingress
-//! additionally require this process-local token, which lives in a 0600 file
-//! next to the control socket. Confined children are denied that path.
-//!
-//! This is **not** authenticated per-peer identity. Follow-up #337
-//! ("Daemon socket: authenticated per-peer authority (peer-cred/mTLS)")
-//! replaces blanket Owner with a peer-bound credential.
+//! Pre-launch mitigation for issue #296: confined children are denied the
+//! control-plane paths. Issue #337 replaces the socket-side file token with
+//! peer-bound credentials minted for `SO_PEERCRED` / named-pipe client PIDs.
 
 use std::path::Path;
 

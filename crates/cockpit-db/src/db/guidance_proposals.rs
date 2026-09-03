@@ -137,10 +137,10 @@ impl GuidanceProposalCounterScope {
 // Receipt row
 // ---------------------------------------------------------------------------
 
-/// A content-free guidance-proposal receipt row. Holds IDs, three opaque
-/// scope digests (64-char lowercase hex), the config generation, the
-/// rule-kind bitmask, timestamps, and the terminal state — never typed rule
-/// values or rationale.
+/// A content-free guidance-proposal receipt row. Holds 32-char lowercase hex
+/// IDs (proposal, session, delegation), three opaque 64-char lowercase hex
+/// scope digests, the config generation, the rule-kind bitmask, timestamps,
+/// and the terminal state — never typed rule values or rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidanceProposalReceiptRow {
     pub proposal_id: String,
@@ -338,10 +338,15 @@ impl Db {
         insert: GuidanceProposalReceiptInsert<'_>,
     ) -> Result<(), CreateReceiptError> {
         // Validate opaque identifiers before crossing into the writer thread.
+        // Session and delegation ids are the same 32-char hex spelling the
+        // audit chain reconstructs; refuse anything that would later become a
+        // false zero identity.
         validate_hex16(insert.proposal_id, "proposal_id")
             .map_err(|e| CreateReceiptError::Storage(e.to_string()))?;
-        // The session/delegation ids are opaque strings here; the CHECK
-        // constraints enforce their length bounds.
+        validate_hex16(insert.session_id, "session_id")
+            .map_err(|e| CreateReceiptError::Storage(e.to_string()))?;
+        validate_hex16(insert.delegation_id, "delegation_id")
+            .map_err(|e| CreateReceiptError::Storage(e.to_string()))?;
         validate_hex64(insert.canonical_project_digest, "canonical_project_digest")
             .map_err(|e| CreateReceiptError::Storage(e.to_string()))?;
         validate_hex64(insert.provider_digest, "provider_digest")
@@ -636,9 +641,10 @@ impl Db {
         .await
     }
 
-    /// Undelivered audit events in stable creation/transition order. Joining
-    /// the receipt supplies the original safe metadata required to reconstruct
-    /// the event after a crash.
+    /// Undelivered audit events in lifecycle-causal order: `created` before
+    /// any terminal state (so a successor cannot chain before its predecessor),
+    /// then transition time. Joining the receipt supplies the original safe
+    /// metadata required to reconstruct the event after a crash.
     pub async fn pending_guidance_proposal_audits(&self) -> Result<Vec<PendingGuidanceAuditRow>> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -653,7 +659,9 @@ impl Db {
                  FROM guidance_proposal_audit_outbox o
                  JOIN guidance_proposal_receipts r USING (proposal_id)
                  WHERE o.delivered_at_unix_ms IS NULL
-                 ORDER BY o.transitioned_at_unix_ms, o.proposal_id",
+                 ORDER BY CASE o.terminal_state WHEN 'created' THEN 0 ELSE 1 END,
+                          o.transitioned_at_unix_ms,
+                          o.proposal_id",
             )?;
             let rows = stmt
                 .query_and_then([], |row| {
@@ -811,6 +819,14 @@ mod tests {
         format!("{n:016x}{n:016x}")
     }
 
+    fn sid() -> String {
+        hex16(0x51)
+    }
+
+    fn did(n: u8) -> String {
+        hex16(0x40_u8.saturating_add(n))
+    }
+
     fn insert<'a>(
         proposal: &'a str,
         session: &'a str,
@@ -851,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn receipt_insert_increments_counters_and_reads_back() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
         let row = db
@@ -862,13 +878,13 @@ mod tests {
         assert_eq!(row.state, GuidanceProposalReceiptState::Created);
         assert!(row.accepted_scope.is_none());
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Session, "s1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Session, &sid())
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
                 .await
                 .unwrap(),
             1
@@ -878,16 +894,16 @@ mod tests {
     #[tokio::test]
     async fn receipt_insert_rejects_second_created_receipt_for_the_same_scope() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
         let err = db
-            .insert_guidance_proposal_receipt(insert(&hex16(2), "s1", "d1"))
+            .insert_guidance_proposal_receipt(insert(&hex16(2), &sid(), &did(1)))
             .await
             .unwrap_err();
         assert_eq!(err, CreateReceiptError::AlreadyPendingScope);
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
                 .await
                 .unwrap(),
             1
@@ -908,11 +924,11 @@ mod tests {
         )
         .await
         .unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(2), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(2), &sid(), &did(1)))
             .await
             .unwrap();
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
                 .await
                 .unwrap(),
             2
@@ -936,8 +952,8 @@ mod tests {
             let proposal = hex16(n);
             db.insert_guidance_proposal_receipt(insert_with_model(
                 &proposal,
-                "s1",
-                "d1",
+                &sid(),
+                &did(1),
                 &models[(n - 1) as usize],
             ))
             .await
@@ -947,7 +963,7 @@ mod tests {
         let proposal = hex16(4);
         let model = digest64(4);
         let err = db
-            .insert_guidance_proposal_receipt(insert_with_model(&proposal, "s1", "d1", &model))
+            .insert_guidance_proposal_receipt(insert_with_model(&proposal, &sid(), &did(1), &model))
             .await
             .unwrap_err();
         assert_eq!(err, CreateReceiptError::DelegationCapExceeded(3));
@@ -959,7 +975,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
                 .await
                 .unwrap(),
             3
@@ -970,17 +986,17 @@ mod tests {
     async fn receipt_insert_rejects_eleventh_session_create() {
         let db = Db::open_in_memory().unwrap();
         for n in 1..=10u8 {
-            db.insert_guidance_proposal_receipt(insert(&hex16(n), "s1", &format!("d{n}")))
+            db.insert_guidance_proposal_receipt(insert(&hex16(n), &sid(), &did(n)))
                 .await
                 .unwrap();
         }
         let err = db
-            .insert_guidance_proposal_receipt(insert(&hex16(11), "s1", "d11"))
+            .insert_guidance_proposal_receipt(insert(&hex16(11), &sid(), &did(11)))
             .await
             .unwrap_err();
         assert_eq!(err, CreateReceiptError::SessionCapExceeded(10));
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Session, "s1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Session, &sid())
                 .await
                 .unwrap(),
             10
@@ -990,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn cas_transitions_state_and_sets_accepted_scope_only_on_accept() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
 
@@ -1041,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn accept_after_expiry_is_a_stable_conflict() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
         // Expire first.
@@ -1073,10 +1089,10 @@ mod tests {
     #[tokio::test]
     async fn list_stale_created_enumerates_only_created_receipts() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(2), "s1", "d2"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(2), &sid(), &did(2)))
             .await
             .unwrap();
         // Expire the first; the second remains created.
@@ -1100,11 +1116,11 @@ mod tests {
     #[tokio::test]
     async fn restart_reconcile_cas_to_expired_on_restart_without_counter_increment() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
         let before = db
-            .guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            .guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
             .await
             .unwrap();
         assert_eq!(before, 1);
@@ -1123,7 +1139,7 @@ mod tests {
         );
         // Counter NOT re-incremented.
         let after = db
-            .guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            .guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
             .await
             .unwrap();
         assert_eq!(after, 1);
@@ -1138,19 +1154,80 @@ mod tests {
     #[tokio::test]
     async fn duplicate_proposal_id_is_rejected_without_counter_increment() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap();
         let err = db
-            .insert_guidance_proposal_receipt(insert(&hex16(1), "s1", "d1"))
+            .insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
             .await
             .unwrap_err();
         assert!(matches!(err, CreateReceiptError::DuplicateProposalId(_)));
         assert_eq!(
-            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, "d1")
+            db.guidance_proposal_counter(GuidanceProposalCounterScope::Delegation, &did(1))
                 .await
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn accept_persistent_upserts_rules_and_survives_reload() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), &did(1)))
+            .await
+            .unwrap();
+        let project = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let provider = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let model = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let rule = [1u8, 1, 1];
+        assert!(
+            db.accept_persistent_guidance_proposal(
+                &hex16(1),
+                project,
+                provider,
+                model,
+                vec![rule],
+                4000,
+            )
+            .await
+            .unwrap()
+        );
+        let loaded = db.load_persistent_guidance_rules().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![(project.into(), provider.into(), model.into(), rule)]
+        );
+
+        let replacement = [1u8, 1, 2];
+        db.upsert_persistent_guidance_rule(project, provider, model, replacement, 5000)
+            .await
+            .unwrap();
+        let loaded = db.load_persistent_guidance_rules().await.unwrap();
+        assert_eq!(
+            loaded,
+            vec![(project.into(), provider.into(), model.into(), replacement)]
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_insert_rejects_malformed_session_id() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .insert_guidance_proposal_receipt(insert(&hex16(1), "s1", &did(1)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateReceiptError::Storage(_)));
+        assert!(err.to_string().contains("session_id"));
+    }
+
+    #[tokio::test]
+    async fn receipt_insert_rejects_malformed_delegation_id() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .insert_guidance_proposal_receipt(insert(&hex16(1), &sid(), "d1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateReceiptError::Storage(_)));
+        assert!(err.to_string().contains("delegation_id"));
     }
 }

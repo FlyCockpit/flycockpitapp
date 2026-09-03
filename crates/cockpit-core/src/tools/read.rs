@@ -170,29 +170,22 @@ impl Tool for ReadTool {
                     crate::engine::tool::CanonicalToolResultContents::text(updated.scrub(content));
             }
             if attached_knowledge_read {
-                let original = output.content.model_text();
-                let fenced = crate::knowledge::fence_knowledge_content_if_needed(original);
-                let retained_injection =
-                    output
-                        .text_artifact_capture
-                        .as_ref()
-                        .is_some_and(|capture| {
-                            crate::knowledge::knowledge_content_has_injection(&capture.content)
-                        });
-                if fenced != original || retained_injection {
-                    let delivered = if fenced != original {
-                        fenced
-                    } else {
-                        format!(
-                            "{original}\n[UNTRUSTED KNOWLEDGE DATA omitted: prompt injection was detected beyond the visible read limit; the retained artifact was withheld.]"
-                        )
-                    };
-                    output.content =
-                        crate::engine::tool::CanonicalToolResultContents::text(delivered);
-                    // The artifact capture holds the unfenced source body. Do
-                    // not retain a second retrieval path around this boundary.
-                    output.text_artifact_capture = None;
-                }
+                // Layered KB boundary (issue #273): the scan source is the
+                // delivered slice plus the retained raw artifact plus the
+                // file-level quarantine state, so a quarantined KB file
+                // fences every slice of it. The deterministic floor runs
+                // first (fencing the slice or withholding the retained
+                // artifact), then the utility-model second layer scans the
+                // floor-clean remainder when the guard is enabled.
+                let scan_source =
+                    crate::knowledge::attached_knowledge_read_scan_source(&output, &checked);
+                let guard = crate::knowledge::KbUtilityGuard::from_tool_ctx(ctx);
+                crate::knowledge::fence_knowledge_tool_output_layered(
+                    &mut output,
+                    &scan_source,
+                    &guard,
+                )
+                .await;
             }
             return Ok(output);
         }

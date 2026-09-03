@@ -967,8 +967,12 @@ impl ScheduleAuthority {
         // Probe the LIVE schedule context's redaction slot per truncation
         // instead of snapshotting the table at launch: a secret the session
         // registers mid-stream must elide this job's line-cap boundaries too
-        // (issue #294: stale-snapshot redaction identity).
+        // (issue #294: stale-snapshot redaction identity). The KB
+        // utility-model guard is probed the same way at delivery time
+        // (issue #273): the tail/completion renders resolve the guard current
+        // when the model-facing result is built.
         let live_ctx = self.ctx.clone();
+        let live_ctx_for_guard = self.ctx.clone();
         let (handle, task) = background::spawn(background::BackgroundSpawn {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -976,6 +980,15 @@ impl ScheduleAuthority {
             cwd,
             launch,
             redact_probe: Arc::new(move || live_ctx.snapshot().redact),
+            utility_guard_probe: Arc::new(move || {
+                let ctx = live_ctx_for_guard.snapshot();
+                crate::knowledge::KbUtilityGuard::new(
+                    &ctx.config.extended(),
+                    ctx.config.providers(),
+                    ctx.redact.clone(),
+                    &ctx.cwd,
+                )
+            }),
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cancel: cancel.clone(),

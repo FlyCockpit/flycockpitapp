@@ -23,10 +23,41 @@
 use crate::computer::ComputerToolContract;
 use crate::computer::coordinator::{ComputerActionCoordinator, NativeComputerContinuation};
 use crate::computer::live_loop::NativeComputerLiveLoop;
+use crate::computer::{ComputerError, DisplayTarget};
 use crate::engine::agent::Agent;
 use crate::session::Session;
 use futures::future::BoxFuture;
 use std::sync::Arc;
+
+pub(crate) fn computer_backend_open_remediation(
+    target: DisplayTarget,
+    error: &ComputerError,
+) -> &'static str {
+    match target {
+        DisplayTarget::Virtual => match error {
+            ComputerError::MissingTool { .. } => {
+                "Install the missing host tools listed above on this Linux host"
+            }
+            ComputerError::UnsupportedPlatform { .. } => {
+                "The isolated virtual display is supported on Linux only; use a Linux host or explicitly opt into real-desktop control with a machine grant"
+            }
+            _ => {
+                "Ensure this Linux host provides Xvfb, xdotool, and a capture tool (scrot or ImageMagick)"
+            }
+        },
+        DisplayTarget::RealDesktop => match error {
+            ComputerError::RealDesktopGrantMissing => {
+                "Real desktop control requires a stored machine-local grant for this host"
+            }
+            ComputerError::UnsupportedPlatform { .. } => {
+                "Real desktop control is unavailable on this platform or session; set `computer_target` to `virtual` for the isolated display or use a supported desktop session"
+            }
+            _ => {
+                "Set `computer_target` to `virtual` to use the isolated display instead, or obtain a machine grant for real-desktop control"
+            }
+        },
+    }
+}
 
 /// Open a selected delegation's native-computer capability before its first
 /// advertised request. This is shared by foreground and noninteractive
@@ -74,8 +105,9 @@ pub(crate) async fn open_native_computer_for_delegation(
             tracing::warn!(error = %error, "native computer backend open failed");
             agent.params.native_computer = None;
             if candidate.require_backend {
+                let remediation = computer_backend_open_remediation(candidate.target, &error);
                 anyhow::bail!(
-                    "Computer primary could not open its {} backend: {error}. Set `computer_target` to `virtual` to use the isolated display instead",
+                    "Computer primary could not open its {} backend: {error}. {remediation}",
                     match candidate.target {
                         crate::computer::DisplayTarget::Virtual => "virtual-display",
                         crate::computer::DisplayTarget::RealDesktop => "real-desktop",
@@ -705,6 +737,41 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn computer_backend_open_remediation_is_target_aware() {
+        let missing_tool = ComputerError::MissingTool {
+            tool: "Xvfb".to_string(),
+            install_hint: "the `xvfb` package".to_string(),
+        };
+        assert!(
+            computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool)
+                .contains("Install the missing host tools")
+        );
+        assert!(
+            !computer_backend_open_remediation(DisplayTarget::Virtual, &missing_tool)
+                .contains("computer_target")
+        );
+
+        let unsupported = ComputerError::UnsupportedPlatform {
+            platform: "linux".to_string(),
+        };
+        assert!(
+            computer_backend_open_remediation(DisplayTarget::Virtual, &unsupported)
+                .contains("Linux only")
+        );
+        assert!(
+            computer_backend_open_remediation(
+                DisplayTarget::RealDesktop,
+                &ComputerError::RealDesktopGrantMissing
+            )
+            .contains("machine-local grant")
+        );
+        assert!(
+            computer_backend_open_remediation(DisplayTarget::RealDesktop, &unsupported)
+                .contains("computer_target")
+        );
+    }
 
     /// A fake backend that yields a successful capture frame.
     struct CapturingFakeBackend {

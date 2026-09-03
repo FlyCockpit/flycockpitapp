@@ -756,7 +756,7 @@ impl RealDesktopGrantStore {
         let Ok(stored) = fs::read_to_string(&self.path) else {
             return false;
         };
-        current_machine_fingerprint().is_some_and(|fingerprint| stored.trim() == fingerprint)
+        grant_matches_fingerprint(&stored, current_machine_fingerprint().as_deref())
     }
 
     /// Resolve the existing machine-local real-desktop grant under Cockpit's
@@ -2652,6 +2652,39 @@ fn unsupported_platform() -> ComputerError {
     }
 }
 
+const LINUX_MACHINE_GRANT_DOMAIN: &[u8] = b"cockpit.linux.machine-grant.v1";
+const WINDOWS_MACHINE_GRANT_DOMAIN: &[u8] = b"cockpit.windows.machine-grant.v1";
+
+pub(crate) fn hashed_machine_grant_fingerprint(domain: &[u8], raw_id: &str) -> Option<String> {
+    let raw_id = raw_id.trim();
+    if raw_id.is_empty() {
+        return None;
+    }
+    Some(
+        crate::computer::host_identity::domain_hash(domain, &[raw_id.as_bytes()])
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+pub(crate) fn linux_machine_grant_fingerprint_from_id(machine_id: &str) -> Option<String> {
+    hashed_machine_grant_fingerprint(LINUX_MACHINE_GRANT_DOMAIN, machine_id)
+}
+
+pub(crate) fn windows_machine_grant_fingerprint_from_guid(machine_guid: &str) -> Option<String> {
+    hashed_machine_grant_fingerprint(WINDOWS_MACHINE_GRANT_DOMAIN, machine_guid)
+}
+
+pub(crate) fn macos_machine_grant_fingerprint_from_uuid(platform_uuid: &str) -> Option<String> {
+    let platform_uuid = platform_uuid.trim();
+    (!platform_uuid.is_empty()).then(|| format!("macos-ioplatformuuid:{platform_uuid}"))
+}
+
+pub(crate) fn grant_matches_fingerprint(stored: &str, fingerprint: Option<&str>) -> bool {
+    fingerprint.is_some_and(|fingerprint| stored.trim() == fingerprint)
+}
+
 #[cfg(target_os = "macos")]
 fn current_machine_fingerprint() -> Option<String> {
     // IOPlatformUUID is a hardware-backed IORegistry property. Do not
@@ -2670,12 +2703,14 @@ fn current_machine_fingerprint() -> Option<String> {
         let (_, value) = line.split_once("\"IOPlatformUUID\" = ")?;
         value.trim().strip_prefix('\"')?.strip_suffix('\"')
     })?;
-    (!uuid.is_empty()).then(|| format!("macos-ioplatformuuid:{uuid}"))
+    macos_machine_grant_fingerprint_from_uuid(uuid)
 }
 
-/// A roaming `%APPDATA%` grant cannot authorize input on another Windows
-/// machine: the comparison is bound to the OS-owned, machine-local MachineGuid
-/// and fails closed if the registry value is inaccessible or malformed.
+/// Grant comparison is bound to the OS-owned, machine-local `MachineGuid`
+/// (hashed before storage). The value is not caller-settable and the check
+/// fails closed when the registry value is inaccessible or malformed. Cloned
+/// disk or VM images that duplicate `MachineGuid` will share grant
+/// authorization.
 #[cfg(target_os = "windows")]
 fn current_machine_fingerprint() -> Option<String> {
     use windows::Win32::System::Registry::{
@@ -2741,41 +2776,22 @@ fn current_machine_fingerprint() -> Option<String> {
                 .position(|unit| *unit == 0)
                 .unwrap_or(units.len());
             let machine_guid = String::from_utf16(&units[..end]).ok()?;
-            (!machine_guid.is_empty()).then(|| {
-                crate::computer::host_identity::domain_hash(
-                    b"cockpit.windows.machine-grant.v1",
-                    &[machine_guid.as_bytes()],
-                )
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
-            })
+            windows_machine_grant_fingerprint_from_guid(&machine_guid)
         })();
         let _ = RegCloseKey(key);
         value
     }
 }
 
-/// A roaming grant file cannot authorize input on another Linux host: the
-/// comparison is bound to the OS-owned `/etc/machine-id` and fails closed if
-/// that value is inaccessible or empty.
+/// Grant comparison is bound to the OS-owned `/etc/machine-id` (hashed before
+/// storage). The value is not caller-settable and the check fails closed when
+/// it is inaccessible or empty. Cloned disk or container images that duplicate
+/// `/etc/machine-id` will share grant authorization.
 #[cfg(target_os = "linux")]
 fn current_machine_fingerprint() -> Option<String> {
-    // Do not fall back to an environment variable or a shared sentinel: copied
-    // consent files must not authorize a different host.
-    let machine_id = fs::read_to_string("/etc/machine-id")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
-    Some(
-        crate::computer::host_identity::domain_hash(
-            b"cockpit.linux.machine-grant.v1",
-            &[machine_id.as_bytes()],
-        )
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect(),
-    )
+    // Do not fall back to an environment variable or a shared sentinel.
+    let machine_id = fs::read_to_string("/etc/machine-id").ok()?;
+    linux_machine_grant_fingerprint_from_id(&machine_id)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -5495,6 +5511,93 @@ mod tests {
         };
 
         assert_eq!(err, ComputerError::RealDesktopGrantMissing);
+    }
+
+    #[test]
+    fn hashed_machine_grant_fingerprint_fails_closed_on_empty() {
+        assert_eq!(linux_machine_grant_fingerprint_from_id(""), None);
+        assert_eq!(linux_machine_grant_fingerprint_from_id("   \n"), None);
+        assert_eq!(windows_machine_grant_fingerprint_from_guid(""), None);
+        assert_eq!(macos_machine_grant_fingerprint_from_uuid(""), None);
+    }
+
+    #[test]
+    fn linux_machine_grant_fingerprint_is_deterministic_and_domain_separated() {
+        let fingerprint =
+            linux_machine_grant_fingerprint_from_id("abc-def").expect("non-empty machine id");
+        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(
+            fingerprint,
+            linux_machine_grant_fingerprint_from_id("abc-def").unwrap()
+        );
+        assert_ne!(
+            fingerprint,
+            linux_machine_grant_fingerprint_from_id("other-id").unwrap()
+        );
+        assert_ne!(
+            fingerprint,
+            windows_machine_grant_fingerprint_from_guid("abc-def").unwrap()
+        );
+    }
+
+    #[test]
+    fn linux_grant_fingerprint_uses_only_supplied_machine_id() {
+        // Regression guard: no env-derived fallback or shared sentinel for missing identity.
+        assert_ne!(
+            linux_machine_grant_fingerprint_from_id("id-a").unwrap(),
+            linux_machine_grant_fingerprint_from_id("id-b").unwrap()
+        );
+        assert_eq!(linux_machine_grant_fingerprint_from_id(""), None);
+    }
+
+    #[test]
+    fn grant_matches_fingerprint_fails_closed_without_identity() {
+        assert!(!grant_matches_fingerprint("anything", None));
+    }
+
+    #[test]
+    fn grant_matches_fingerprint_accepts_trimmed_match() {
+        let fingerprint = "deadbeef";
+        assert!(grant_matches_fingerprint("deadbeef\n", Some(fingerprint)));
+        assert!(!grant_matches_fingerprint("cafebabe", Some(fingerprint)));
+    }
+
+    #[test]
+    fn has_current_machine_grant_requires_matching_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let grant_path = tmp.path().join("real-desktop-grant");
+        let store = RealDesktopGrantStore::new(&grant_path);
+        assert!(!store.has_current_machine_grant());
+
+        let fixture = linux_machine_grant_fingerprint_from_id("fixture-machine-id").unwrap();
+        fs::write(&grant_path, format!("{fixture}\n")).unwrap();
+        assert!(!store.has_current_machine_grant());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_linux_fingerprint_matches_pure_function_from_machine_id() {
+        let machine_id =
+            fs::read_to_string("/etc/machine-id").expect("linux test host exposes /etc/machine-id");
+        assert_eq!(
+            current_machine_fingerprint(),
+            linux_machine_grant_fingerprint_from_id(&machine_id)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_current_machine_grant_accepts_matching_linux_fingerprint() {
+        let machine_id =
+            fs::read_to_string("/etc/machine-id").expect("linux test host exposes /etc/machine-id");
+        let Some(fingerprint) = linux_machine_grant_fingerprint_from_id(&machine_id) else {
+            panic!("machine-id must hash to a grant fingerprint");
+        };
+        let tmp = TempDir::new().unwrap();
+        let grant_path = tmp.path().join("real-desktop-grant");
+        fs::write(&grant_path, fingerprint).unwrap();
+        let store = RealDesktopGrantStore::new(grant_path);
+        assert!(store.has_current_machine_grant());
     }
 
     #[test]

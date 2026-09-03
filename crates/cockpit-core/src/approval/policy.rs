@@ -1,5 +1,37 @@
 use super::*;
 
+/// Maximum typed-text characters rendered in the computer-action approval
+/// prompt (issue #286). The bound applies AFTER secret-shaped withholding
+/// and redaction-table scrubbing: truncating first would leak the surviving
+/// prefix of a registered secret spanning the bound, because the truncated
+/// fragment no longer literal-matches the table entry.
+const MAX_PROMPT_TYPED_TEXT_CHARS: usize = 200;
+
+/// Flatten a model-controlled fragment for interpolation into the one-line
+/// approval prompt (issue #286). Control characters (newlines and ANSI
+/// escape sequences included) become single spaces, and the prompt's own
+/// structural punctuation — the backtick that delimits the action clause
+/// and the double quote that delimits the typed-text display — is replaced
+/// with a typographic lookalike. The provider chooses this content, so
+/// without flattening it could visually terminate the action clause or
+/// forge a second prompt line ("risk class: destructive", a pseudo
+/// question). Structured option ids keep the decision itself unforgeable;
+/// this keeps the *display* honest too.
+fn flatten_prompt_fragment(fragment: &str) -> String {
+    fragment
+        .chars()
+        .map(|ch| {
+            if ch.is_control() {
+                ' '
+            } else if ch == '`' || ch == '"' {
+                '\''
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// Governed-network approvals are exact interactive host decisions. The
 /// durable operation kind and canonical input classify them; no generic grant
 /// class is exposed to noninteractive clients.
@@ -1121,16 +1153,32 @@ impl Approver {
     }
 
     /// Render the typed-text clause of a computer-action approval prompt
-    /// (issue #286). Secret-shaped text never renders: credential-shaped
-    /// text is withheld by the coordinator (it never reaches this seam), and
-    /// all other text is scrubbed through the live redaction table before it
-    /// reaches the prompt. With no redaction table available (a headless
-    /// approver without a session), the text is withheld rather than shown
-    /// unredacted.
+    /// (issue #286). This seam is the last fence before the rendered prompt
+    /// is persisted in the interrupt record and broadcast to owner clients,
+    /// so the full disclosure pipeline runs here, in this order:
+    ///
+    /// 1. secret-shaped text is withheld outright — novel credential
+    ///    shapes (`ghp_…`, `sk-…`, JWTs, opaque token runs) never render
+    ///    regardless of redaction-table presence, and the coordinator
+    ///    withholds them too, so the invariant cannot depend on the far
+    ///    side of the in-memory boundary;
+    /// 2. registered literals are scrubbed from the FULL text through the
+    ///    live redaction table;
+    /// 3. control characters and the prompt's structural punctuation are
+    ///    flattened; and
+    /// 4. only then is the render bounded to
+    ///    [`MAX_PROMPT_TYPED_TEXT_CHARS`] (scrub before bound, never bound
+    ///    before scrub).
+    ///
+    /// With no redaction table available (a headless approver without a
+    /// session), non-secret text is withheld rather than shown unredacted.
     fn computer_typed_text_display(&self, typed_text: Option<&str>) -> String {
         let Some(text) = typed_text else {
             return String::new();
         };
+        if crate::redact::text_is_secret_shaped(text) {
+            return " [text withheld: secret-shaped]".to_string();
+        }
         let Some(redact) = self.redact.as_ref().map(|slot| {
             slot.read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1138,7 +1186,16 @@ impl Approver {
         }) else {
             return " [text withheld: no redaction table]".to_string();
         };
-        format!(" \"{}\"", redact.scrub(text))
+        let scrubbed = redact.scrub(text);
+        let flattened = flatten_prompt_fragment(&scrubbed);
+        let mut bounded: String = flattened
+            .chars()
+            .take(MAX_PROMPT_TYPED_TEXT_CHARS)
+            .collect();
+        if flattened.chars().count() > MAX_PROMPT_TYPED_TEXT_CHARS {
+            bounded.push('…');
+        }
+        format!(" \"{}\"", bounded)
     }
 
     /// Central authorization for every canonical computer-use action.
@@ -1196,8 +1253,14 @@ impl Approver {
         // The prompt must show what is actually being approved (issue #286),
         // never just an opaque `openai_call:N` batch label.
         let typed_display = self.computer_typed_text_display(typed_text);
+        // Every interpolated fragment is either engine-generated from safe
+        // enum data (`action_detail`, `batch_detail`, `backend_kind`,
+        // `action_class`, `action_label`) or flattened here: the typed
+        // text and the OS-derived window title hint are the two fragments
+        // a provider or the desktop controls, so they can never carry a
+        // newline, backtick, or quote into the one-line prompt.
         let target_line = match target_window {
-            Some(window) => format!(" Target window: {window}."),
+            Some(window) => format!(" Target window: {}.", flatten_prompt_fragment(window)),
             None => format!(" Target: {backend_kind} display."),
         };
         let batch_line = batch_detail

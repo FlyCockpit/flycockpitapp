@@ -384,10 +384,14 @@ pub enum AuthorizationRequest<'a> {
     /// central variant. It carries only engine-owned session/delegation/action
     /// IDs, tier, host lease token, target/focus/observation generations, and
     /// safe metadata. No pixel bytes or raw titles are carried. The one
-    /// deliberate payload fragment is the bounded typed text of a pending
-    /// TypeText action (issue #286), which travels solely so the approval
-    /// seam can render it after secret redaction; it never enters interrupt
-    /// metadata or a durable record. Ask pauses on this seam; Yolo emits no
+    /// deliberate payload fragment is the typed text of a pending TypeText
+    /// action (issue #286), which travels in memory solely so the approval
+    /// seam can render it after the disclosure fence: secret-shaped text is
+    /// withheld, registered literals are scrubbed against the live redaction
+    /// table, control characters are flattened, and only then is the render
+    /// bounded. The raw text never enters interrupt metadata or a durable
+    /// record; the rendered, redacted copy in the approval prompt is what
+    /// persists with the interrupt. Ask pauses on this seam; Yolo emits no
     /// human request and imposes no semantic action/target denial.
     ComputerAction {
         session_id: &'a str,
@@ -426,10 +430,13 @@ pub enum AuthorizationRequest<'a> {
         /// approval prompt (issue #286): action kind, coordinates, keys,
         /// scroll deltas. Typed text is excluded; it travels in `typed_text`.
         action_detail: &'a str,
-        /// Bounded typed text of a pending TypeText action, rendered in the
-        /// approval prompt only after secret redaction. `None` for every
-        /// other action kind and for secret-shaped (credential-class) text,
-        /// which is never shown in a prompt.
+        /// Typed text of a pending TypeText action, rendered in the
+        /// approval prompt only after the disclosure fence at the approval
+        /// seam (secret-shaped withhold, redaction-table scrub, control
+        /// flattening, then bounding). The full, untruncated text travels
+        /// so the seam can scrub before it bounds. `None` for every other
+        /// action kind and for secret-shaped text, which is never shown in
+        /// a prompt.
         typed_text: Option<&'a str>,
         /// One bounded line summarizing every action of the batch (issue
         /// #286), present only for multi-action batches.
@@ -2564,6 +2571,10 @@ mod tests {
 
     /// Issue #286: typed text renders in the prompt only after scrubbing
     /// through the live redaction table; a table-known secret never appears.
+    /// The fixture is deliberately below the `sk-` shape-detector floor, so
+    /// this exercises the table half of the fence only — the novel-shape
+    /// half is covered by
+    /// `computer_action_prompt_withholds_novel_secret_shaped_typed_text`.
     #[tokio::test]
     async fn computer_action_prompt_scrubs_secret_typed_text() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2590,11 +2601,145 @@ mod tests {
         let prompt = single_prompt(&questions[0]);
         assert!(
             !prompt.contains("sk-live-abc123"),
-            "secret-shaped typed text must be redacted in the prompt, got: {prompt}"
+            "a table-known secret must be redacted in the prompt, got: {prompt}"
         );
         assert!(
             prompt.contains("deploy key"),
             "non-secret typed text survives redaction, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: novel secret-shaped typed text — a credential the live
+    /// redaction table has no entry for and that names no credential word —
+    /// is withheld outright at the approval seam, in the live-session shape
+    /// (`Approver::new_for_session` with an empty table: a first-time
+    /// secret). The coordinator withholds these before the text travels; this
+    /// asserts the seam's own fence so the invariant cannot depend on the far
+    /// side of the in-memory boundary.
+    #[tokio::test]
+    async fn computer_action_prompt_withholds_novel_secret_shaped_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Assembled from fragments so the source never contains a
+        // contiguous detector-shaped token for the CI secret scanner.
+        let novel_shapes = [
+            ["ghp", "_", "16CharMinimumTokenAbCdEfGhIjKlMn"].concat(),
+            ["sk-live-", "0123456789abcdefghijklmnopqrstuv"].concat(),
+        ];
+        for novel in &novel_shapes {
+            let approver =
+                approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+            let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+            let action_detail = format!("type text ({} chars)", novel.chars().count());
+            let decision = approver
+                .authorize(computer_action_request_with_prompt_detail(
+                    "call-1",
+                    &action_detail,
+                    Some(novel.as_str()),
+                    None,
+                    None,
+                    "state_changing",
+                ))
+                .await
+                .unwrap();
+            let questions = resolver.await.unwrap();
+            assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+            let prompt = single_prompt(&questions[0]);
+            assert!(
+                !prompt.contains(novel.as_str()),
+                "novel secret-shaped typed text must never render in the prompt, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("[text withheld: secret-shaped]"),
+                "the secret-shaped withhold marker must render instead, got: {prompt}"
+            );
+        }
+    }
+
+    /// Issue #286: scrubbing happens BEFORE the render bound. A registered
+    /// secret longer than the bound used to leak its surviving prefix (the
+    /// truncated fragment no longer literal-matches the table entry); the
+    /// seam must scrub the full text first and only then bound the render.
+    #[tokio::test]
+    async fn computer_action_prompt_scrubs_before_bounding_long_registered_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately not detector-shaped (spaces and punctuation break the
+        // opaque runs, no credential words): only the table entry redacts
+        // it, and it is longer than the 200-character render bound.
+        let long_secret = "a quiet, unhurried table-known value. "
+            .repeat(7)
+            .trim_end()
+            .to_string();
+        let typed_text = format!("see note: {long_secret}");
+        let approver = approver_with_redaction(
+            tmp.path(),
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(long_secret, "$test:forced".to_string())
+                .unwrap(),
+        );
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let action_detail = format!("type text ({} chars)", typed_text.chars().count());
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                &action_detail,
+                Some(&typed_text),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            prompt.contains("see note:"),
+            "non-secret text around the secret survives, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("unhurried"),
+            "no prefix of a registered secret may survive the render bound, got: {prompt}"
+        );
+    }
+
+    /// Issue #286: the provider chooses the typed text, so structural
+    /// punctuation (backticks, quotes, newlines, control characters) is
+    /// flattened before interpolation — the payload can never visually
+    /// terminate the action clause or forge a second prompt line.
+    #[tokio::test]
+    async fn computer_action_prompt_flattens_structural_typed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_redaction(tmp.path(), crate::redact::RedactionTable::empty());
+        let payload =
+            "finish the note `rm -rf /` now \"quoted\" and\n forged (risk class: destructive)?";
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let action_detail = format!("type text ({} chars)", payload.chars().count());
+        let decision = approver
+            .authorize(computer_action_request_with_prompt_detail(
+                "call-1",
+                &action_detail,
+                Some(payload),
+                None,
+                None,
+                "state_changing",
+            ))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        let prompt = single_prompt(&questions[0]);
+        assert!(
+            !prompt.contains('`') && !prompt.contains('\n'),
+            "typed text must not carry structural characters into the prompt, got: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches('"').count(),
+            2,
+            "only the typed-display wrapper quotes may appear, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("risk class: state_changing"),
+            "the real risk class still renders, got: {prompt}"
         );
     }
 

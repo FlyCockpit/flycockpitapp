@@ -372,11 +372,6 @@ fn canonical_computer_action_payload_digest(actions: &[ComputerAction]) -> Strin
         .collect()
 }
 
-/// Maximum typed-text characters carried to the approval prompt seam
-/// (issue #286). Longer text is truncated; the full text still enters the
-/// one-way payload digest.
-const MAX_PROMPT_TYPED_TEXT_CHARS: usize = 200;
-
 /// Maximum batch actions summarized in one approval prompt (issue #286).
 /// Larger batches summarize the first actions and count the rest.
 const MAX_PROMPT_BATCH_ACTIONS: usize = 8;
@@ -559,21 +554,18 @@ pub(crate) fn computer_batch_summary(actions: &[ComputerAction]) -> Option<Strin
     Some(parts.join("; "))
 }
 
-/// The typed text of a TypeText action, bounded to
-/// [`MAX_PROMPT_TYPED_TEXT_CHARS`], carried to the approval seam so the
-/// prompt can render it after redaction (issue #286). `None` for every other
-/// action kind and for secret-shaped (credential-class) text, which is never
-/// shown in a prompt at all.
+/// The typed text of a TypeText action, carried to the approval seam so the
+/// prompt can render it after redaction (issue #286). The **full**,
+/// untruncated text travels: the seam must scrub registered literals before
+/// it bounds the rendered copy, so any earlier truncation could leak the
+/// surviving prefix of a registered secret that spans the bound. `None` for
+/// every other action kind and for secret-shaped text — novel credential
+/// shapes (`ghp_…`, `sk-…`, JWTs, opaque token runs) or prose naming a
+/// credential — which is never shown in a prompt at all.
 pub(crate) fn computer_typed_text_for_prompt(action: &ComputerAction) -> Option<String> {
     match action {
-        ComputerAction::TypeText { text }
-            if ActionRiskClass::classify(action) != ActionRiskClass::CredentialEntry =>
-        {
-            let mut bounded: String = text.chars().take(MAX_PROMPT_TYPED_TEXT_CHARS).collect();
-            if text.chars().count() > MAX_PROMPT_TYPED_TEXT_CHARS {
-                bounded.push('…');
-            }
-            Some(bounded)
+        ComputerAction::TypeText { text } if !crate::redact::text_is_secret_shaped(text) => {
+            Some(text.clone())
         }
         _ => None,
     }
@@ -723,7 +715,7 @@ mod computer_action_prompt_summary_tests {
     }
 
     #[test]
-    fn typed_text_is_bounded_and_secret_shaped_text_withheld() {
+    fn typed_text_secret_shaped_withheld_and_plain_text_carried_in_full() {
         let plain = ComputerAction::TypeText {
             text: "hello world".to_string(),
         };
@@ -733,24 +725,63 @@ mod computer_action_prompt_summary_tests {
             Some("hello world")
         );
 
-        let secret_shaped = ComputerAction::TypeText {
+        // Credential words withhold even without a recognizable token
+        // shape: an unknown password typed into a password field must
+        // never render.
+        let secret_words = ComputerAction::TypeText {
             text: "my password is hunter2".to_string(),
         };
         assert!(
-            computer_action_summary(&secret_shaped).contains("secret-shaped: withheld"),
+            computer_action_summary(&secret_words).contains("secret-shaped: withheld"),
             "credential-shaped typed text must never render in the summary"
         );
         assert!(
-            computer_typed_text_for_prompt(&secret_shaped).is_none(),
+            computer_typed_text_for_prompt(&secret_words).is_none(),
             "credential-shaped typed text must never travel to the prompt seam"
         );
 
+        // Detector-shaped fixtures are assembled from fragments so the
+        // source never contains a contiguous token for the CI secret
+        // scanner to flag; the fence sees the assembled value exactly as
+        // the provider would send it.
+        let novel_shapes = [
+            ["ghp", "_", "16CharMinimumTokenAbCdEfGhIjKlMn"].concat(),
+            ["sk-live-", "0123456789abcdefghijklmnopqrstuv"].concat(),
+            [
+                "eyJ",
+                "hbGciOiJIUzI1NiJ9",
+                ".",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ".",
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6JVQ",
+            ]
+            .concat(),
+            ["dQw4w9WgXcQ", "dQw4w9WgXcQ", "dQw4w9"].concat(),
+        ];
+        for novel in &novel_shapes {
+            let action = ComputerAction::TypeText {
+                text: novel.clone(),
+            };
+            assert!(
+                computer_action_summary(&action).contains("secret-shaped: withheld"),
+                "novel credential-shaped typed text ({novel}) must never render in the summary"
+            );
+            assert!(
+                computer_typed_text_for_prompt(&action).is_none(),
+                "novel credential-shaped typed text ({novel}) must never travel to the prompt seam"
+            );
+        }
+
+        // Long non-secret text is carried in full and untruncated: the
+        // approval seam must scrub before it bounds, so any earlier
+        // truncation could leak the prefix of a registered secret
+        // spanning the render bound.
+        let long_text = "lorem ipsum dolor sit amet. ".repeat(10);
         let long = ComputerAction::TypeText {
-            text: "a".repeat(MAX_PROMPT_TYPED_TEXT_CHARS + 50),
+            text: long_text.clone(),
         };
-        let bounded = computer_typed_text_for_prompt(&long).expect("plain text is carried");
-        assert_eq!(bounded.chars().count(), MAX_PROMPT_TYPED_TEXT_CHARS + 1);
-        assert!(bounded.ends_with('…'));
+        let carried = computer_typed_text_for_prompt(&long).expect("plain text is carried");
+        assert_eq!(carried, long_text);
 
         let not_text = ComputerAction::Wait {
             duration: Duration::from_millis(1),
@@ -2091,9 +2122,13 @@ pub enum ComputerApprovalTier {
 /// engine-owned session/delegation/action IDs, tier, host lease token,
 /// target/focus/observation generations, and safe metadata. No pixel bytes
 /// or raw titles are carried. The one deliberate payload fragment is the
-/// bounded typed text of a pending TypeText action (issue #286), which
-/// travels solely so the approval seam can render it after secret
-/// redaction; it never enters interrupt metadata or a durable record.
+/// typed text of a pending TypeText action (issue #286), which travels
+/// in memory solely so the approval seam can render it after the
+/// disclosure fence: secret-shaped text is withheld, registered literals
+/// are scrubbed against the live redaction table, control characters are
+/// flattened, and only then is the render bounded. The raw text never
+/// enters interrupt metadata or a durable record; the rendered, redacted
+/// copy in the approval prompt is what persists with the interrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerActionAuthorization {
     /// Engine-owned session ID.
@@ -2141,11 +2176,14 @@ pub struct ComputerActionAuthorization {
     /// prompt (issue #286): action kind, coordinates, keys, scroll deltas.
     /// Typed text is excluded; it travels in `typed_text`.
     pub action_detail: String,
-    /// Bounded typed text of a pending TypeText action, for prompt rendering
-    /// after redaction at the approval seam. `None` for every other action
-    /// kind and for secret-shaped (credential-class) text, which is never
-    /// shown in a prompt. Never placed in interrupt metadata or durable
-    /// records.
+    /// Typed text of a pending TypeText action, for prompt rendering at the
+    /// approval seam (issue #286). The full, untruncated text travels so the
+    /// seam can scrub registered literals before bounding the render;
+    /// truncating here would leak the surviving prefix of a registered
+    /// secret spanning the render bound. `None` for every other action kind
+    /// and for secret-shaped text, which is never shown in a prompt. The
+    /// raw text never enters interrupt metadata or durable records — only
+    /// the seam's withheld-or-scrubbed, flattened, bounded render does.
     pub typed_text: Option<String>,
     /// One bounded line summarizing every action of the batch (issue #286),
     /// present only for multi-action batches.
@@ -2304,14 +2342,14 @@ impl ActionRiskClass {
             | ComputerAction::HoldKey { .. } => Self::StateChanging,
             ComputerAction::TypeText { text } => {
                 // Heuristic advisory classification: never used for denial.
+                // Credential entry reuses the shared secret-shape detector
+                // (novel credential shapes plus credential words) so the
+                // audit class and the prompt disclosure fence
+                // (`computer_typed_text_for_prompt`) agree on what counts as
+                // a credential instead of carrying two divergent keyword
+                // lists.
                 let lower = text.to_ascii_lowercase();
-                if lower.contains("password")
-                    || lower.contains("passwd")
-                    || lower.contains("token")
-                    || lower.contains("secret")
-                    || lower.contains("api_key")
-                    || lower.contains("apikey")
-                {
+                if crate::redact::text_is_secret_shaped(text) {
                     Self::CredentialEntry
                 } else if lower.contains("rm -rf")
                     || lower.contains("delete")

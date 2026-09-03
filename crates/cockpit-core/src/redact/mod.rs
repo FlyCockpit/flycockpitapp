@@ -635,6 +635,32 @@ pub(crate) fn credential_shaped_key(name: &str) -> bool {
         || upper.ends_with("_SECRET")
 }
 
+/// `true` when model-controlled text is secret-shaped and must never
+/// render in a human-facing approval prompt (issue #286). This is the
+/// disclosure fence behind the computer-use typed-text prompt: it decides
+/// whether the text is withheld outright rather than scrubbed and shown.
+/// Two halves, deliberately conservative in the withhold direction:
+///
+/// - the **shape** half reuses the command-output novel-secret shape
+///   family (well-known credential formats, AWS access-key ids, JWTs, and
+///   opaque token runs) — position- and composition-independent, so a
+///   `ghp_…` token embedded in prose classifies exactly like a bare one,
+///   and a value no live table has an entry for is still caught by its
+///   shape; and
+/// - the **word** half withholds prose that names a credential
+///   (`my password is hunter2` names one without carrying its shape), so
+///   an unknown password value typed into a password field never renders
+///   either.
+pub(crate) fn text_is_secret_shaped(text: &str) -> bool {
+    const CREDENTIAL_WORDS: &[&str] =
+        &["password", "passwd", "token", "secret", "api_key", "apikey"];
+    if command_output::contains_keyless_credential_shape(text) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    CREDENTIAL_WORDS.iter().any(|word| lower.contains(word))
+}
+
 /// `true` when `name` is in the built-in allowlist (exact match or any
 /// prefix family) or in the user's per-config `allowlist`.
 fn is_allowlisted(name: &str, user_allowlist: &[String]) -> bool {

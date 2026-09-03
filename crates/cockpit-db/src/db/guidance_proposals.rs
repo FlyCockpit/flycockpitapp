@@ -824,7 +824,7 @@ mod tests {
     }
 
     fn did(n: u8) -> String {
-        hex16(0x40.saturating_add(n))
+        hex16(0x40_u8.saturating_add(n))
     }
 
     fn insert<'a>(

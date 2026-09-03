@@ -2020,7 +2020,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_does_not_mark_delivered_when_authenticated_event_diverges() {
-        use crate::computer::audit::{ComputerAuditEntryV1, TestAuditHarness};
+        use crate::computer::audit::{AuditVerifyStatus, ComputerAuditEntryV1, TestAuditHarness};
 
         let harness = TestAuditHarness::new().await;
         let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
@@ -2186,7 +2186,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened =
             crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
                 .await
@@ -2249,7 +2249,7 @@ mod tests {
                 .len(),
             1
         );
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened =
             crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
                 .await
@@ -2289,7 +2289,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened =
             crate::computer::audit::ComputerAuditChain::try_open(harness.db.clone(), handle)
                 .await

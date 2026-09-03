@@ -221,19 +221,19 @@ impl ComputerAuditChain {
         event: GuidanceAuditAppend,
     ) -> Result<(), GuidanceAppendError> {
         if !self.is_available() {
-            return Err(GuidanceAppendError::absent(
-                "computer audit chain is not available",
-            ));
+            return Err(GuidanceAppendError::absent(anyhow!(
+                "computer audit chain is not available"
+            )));
         }
         if !is_guidance_kind(event.kind) {
-            return Err(GuidanceAppendError::absent(
-                "audit chain guidance append requires a guidance-proposal event kind",
-            ));
+            return Err(GuidanceAppendError::absent(anyhow!(
+                "audit chain guidance append requires a guidance-proposal event kind"
+            )));
         }
         let mut guard = self.inner.lock().await;
-        let inner = guard
-            .as_mut()
-            .ok_or_else(|| GuidanceAppendError::absent("computer audit chain is not available"))?;
+        let inner = guard.as_mut().ok_or_else(|| {
+            GuidanceAppendError::absent(anyhow!("computer audit chain is not available"))
+        })?;
         match self.append_locked(inner, &event).await {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -432,10 +432,9 @@ impl ComputerAuditChain {
                 }
             }
 
-            let sequence = head
-                .confirmed_sequence
-                .checked_add(1)
-                .ok_or_else(|| GuidanceAppendError::absent("computer audit sequence overflow"))?;
+            let sequence = head.confirmed_sequence.checked_add(1).ok_or_else(|| {
+                GuidanceAppendError::absent(anyhow!("computer audit sequence overflow"))
+            })?;
             let monotonic = next_monotonic(inner.last_monotonic);
             let wall_unix_millis = chrono::Utc::now().timestamp_millis();
             let entry = build_guidance_entry(
@@ -451,7 +450,9 @@ impl ComputerAuditChain {
             let hmac_key = inner
                 .hmac_keys
                 .get(&inner.current_key_version)
-                .ok_or_else(|| GuidanceAppendError::absent("computer audit HMAC key missing"))?;
+                .ok_or_else(|| {
+                    GuidanceAppendError::absent(anyhow!("computer audit HMAC key missing"))
+                })?;
             let mac = super::entry_mac(hmac_key.as_ref(), &entry_bytes);
 
             let pending = ComputerAuditSealedHeadV1::with_pending(
@@ -490,9 +491,9 @@ impl ComputerAuditChain {
 
             #[cfg(test)]
             if self.take_append_fault(AppendFault::AfterPendingHeadUnaborted) {
-                return Err(GuidanceAppendError::unknown(
-                    "injected fault after pending head without abort",
-                ));
+                return Err(GuidanceAppendError::unknown(anyhow!(
+                    "injected fault after pending head without abort"
+                )));
             }
 
             let row = ComputerAuditEntryRow {
@@ -541,9 +542,9 @@ impl ComputerAuditChain {
                 }
             }
         }
-        Err(GuidanceAppendError::unknown(
-            "computer audit chain CAS retries exhausted",
-        ))
+        Err(GuidanceAppendError::unknown(anyhow!(
+            "computer audit chain CAS retries exhausted"
+        )))
     }
 
     /// Revert a pending head that has no matching database body so an
@@ -1042,6 +1043,13 @@ impl TestAuditHarness {
             actor: Some(actor),
         }
     }
+
+    pub fn handle(&self) -> SecureKeyHandle {
+        self.actor
+            .as_ref()
+            .expect("computer audit test actor")
+            .handle()
+    }
 }
 
 #[cfg(test)]
@@ -1314,7 +1322,7 @@ mod tests {
             .append_guidance(sample_event(AuditEventKind::GuidanceProposalExpired, 4))
             .await
             .unwrap();
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened = ComputerAuditChain::try_open(harness.db.clone(), handle)
             .await
             .unwrap();
@@ -1525,7 +1533,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened = ComputerAuditChain::try_open(harness.db.clone(), handle)
             .await
             .unwrap();
@@ -1613,7 +1621,7 @@ mod tests {
                 .len(),
             1
         );
-        let handle = harness.actor.as_ref().unwrap().handle();
+        let handle = harness.handle();
         let reopened = ComputerAuditChain::try_open(harness.db.clone(), handle)
             .await
             .unwrap();

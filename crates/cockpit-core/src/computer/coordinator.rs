@@ -3886,7 +3886,10 @@ pub struct ComputerActionCoordinator {
     /// (review cycle 2, finding 2) only actions whose delivery the batch
     /// outcomes prove are folded after dispatch. A receiver that predates
     /// this coordinator opens untracked (review cycle 2, finding 4): see
-    /// [`TypedInputLineModel::untracked`].
+    /// [`TypedInputLineModel::untracked`]. Receiver identity, once lost,
+    /// stays unproven: `ctrl+c` resets line contents of the currently
+    /// focused receiver and does not rebind (issue #289 remaining
+    /// finding 2).
     typed_input_line: TypedInputLineModel,
 }
 
@@ -6045,9 +6048,16 @@ impl ComputerActionCoordinator {
                 | Some(BatchItemOutcome::SubmissionUnknown) => {
                     // Ambiguous delivery: never fold the speculative
                     // effect; untrack only if the action could inject
-                    // input into the receiver's line.
+                    // input into the receiver's line. An action that can
+                    // change focus (wait, capture, pointer motion,
+                    // scroll) also leaves the receiving object unproven
+                    // even when it injects no text (issue #289 remaining
+                    // finding 2).
                     if action.injects_synthetic_input() {
                         self.typed_input_line.mark_untracked();
+                    }
+                    if action.can_change_receiver_identity() {
+                        self.typed_input_line.mark_receiver_unproven();
                     }
                     break;
                 }
@@ -9350,15 +9360,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_typed_line_model_untracks_after_pointer_motion() {
-        // Review cycle 3, finding 3: the modeled line must describe the
-        // *receiving object*, not merely the coordinator. Pointer motion
-        // can move focus to a different terminal, tab, window, or field
-        // (focus-follows-mouse desktops), leaving text in receiver A
-        // while receiver B takes subsequent keys — so after a move the
-        // line is unclaimable for any specific receiver and a commit is
-        // refused until a proven `ctrl+c`. A benign assignment is used
-        // so the untracking — not the command fence — is what refuses.
+    async fn computer_typed_line_model_refuses_assembled_assignment_commits() {
+        // Issue #289 remaining finding 1: assignment-only input mutates
+        // interactive-shell state. Fragments that are not assignments
+        // alone pass typing; the coordinator's pre-dispatch simulation
+        // classifies the assembled line and refuses Enter before
+        // authorization or backend input.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        for (call_id, text) in [
+            ("call-assign-name", "PROMPT_COMMAND"),
+            ("call-assign-eq", "="),
+            ("call-assign-value", "x"),
+        ] {
+            let outcome = coordinator
+                .execute_openai_call(
+                    call_id,
+                    &vec![OpenAiComputerAction::TypeText(text.to_string())],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "assignment fragment {text:?} must dispatch: {outcome:?}"
+            );
+        }
+        let authorized_before_enter = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-assign-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!("an assignment-only line must not be submitted, got {other:?}"),
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("run tool")),
+            "the refusal must name the sanctioned alternative: {:?}",
+            failure.error
+        );
+        assert_eq!(
+            authorizer.call_count(),
+            authorized_before_enter,
+            "the refusal must precede authorization"
+        );
+        assert_eq!(
+            coordinator.batch_item_outcomes(),
+            &[BatchItemOutcome::NotDispatched][..]
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_does_not_restore_receiver_identity_without_proof() {
+        // Review cycle 3, finding 3 + remaining finding 2: the modeled
+        // line must describe the *receiving object*. Pointer motion,
+        // wait, scroll, and capture can change focus, so after any of
+        // them a commit is refused. `ctrl+c` cancels only the currently
+        // focused receiver and does not restore the binding. A comment
+        // is used so the identity fence — not the command fence — is
+        // what refuses. The pre-dispatch simulation (execute path)
+        // applies this state transition before authorization.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let mut coordinator =
             make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
@@ -9366,12 +9432,12 @@ mod tests {
         let outcome = coordinator
             .execute_openai_call(
                 "call-focus-type",
-                &vec![OpenAiComputerAction::TypeText("FOO=bar".to_string())],
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
             )
             .await;
         assert!(
             matches!(outcome, CoordinatedOutcome::Completed { .. }),
-            "typing an assignment stays usable: {outcome:?}"
+            "typing a comment stays usable: {outcome:?}"
         );
         let outcome = coordinator
             .execute_openai_call(
@@ -9389,9 +9455,6 @@ mod tests {
             matches!(outcome, CoordinatedOutcome::Completed { .. }),
             "pointer motion stays usable: {outcome:?}"
         );
-        // The refusal must precede authorization: the Enter commit is
-        // refused by the untracked model before the authorizer is asked,
-        // so its call count does not move.
         let authorized_before_enter = authorizer.call_count();
         let outcome = coordinator
             .execute_openai_call(
@@ -9403,11 +9466,11 @@ mod tests {
             .await;
         let failure = match outcome {
             CoordinatedOutcome::Failed { failure, .. } => failure,
-            other => panic!("a moved pointer makes the receiving object unknowable, got {other:?}"),
+            other => panic!("a moved pointer makes the receiving object unproven, got {other:?}"),
         };
         assert!(
-            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("ctrl+c")),
-            "the refusal must name the reset gesture: {:?}",
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "the refusal must name the unproven receiver: {:?}",
             failure.error
         );
         assert_eq!(
@@ -9416,7 +9479,6 @@ mod tests {
             "the refusal must precede authorization"
         );
 
-        // A proven `ctrl+c` reset restores commits on the empty line.
         let outcome = coordinator
             .execute_openai_call(
                 "call-focus-cancel",
@@ -9434,10 +9496,153 @@ mod tests {
                 })],
             )
             .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => {
+                panic!("ctrl+c must not restore commits after identity was lost, got {other:?}")
+            }
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not rebind an unproven receiver: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_wait_capture_and_scroll() {
+        // Remaining finding 2: wait, capture, and scroll took the
+        // identity-preserving catch-all. A wait does not establish that
+        // focus remained stable, so the execute-path simulation must
+        // leave the receiving object unproven and refuse a later Enter
+        // even after ctrl+c.
+        async fn assert_identity_lost(
+            coordinator: &mut ComputerActionCoordinator,
+            authorizer: &FakeComputerAuthorizer,
+            enter_id: &str,
+            cancel_id: &str,
+            after_id: &str,
+        ) {
+            let authorized_before_enter = authorizer.call_count();
+            let outcome = coordinator
+                .execute_openai_call(
+                    enter_id,
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => panic!("an unproven receiver must not submit, got {other:?}"),
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "the refusal must name the unproven receiver: {:?}",
+                failure.error
+            );
+            assert_eq!(
+                authorizer.call_count(),
+                authorized_before_enter,
+                "the refusal must precede authorization"
+            );
+            let outcome = coordinator
+                .execute_openai_call(
+                    cancel_id,
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["ctrl".to_string(), "c".to_string()],
+                    })],
+                )
+                .await;
+            assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+            let outcome = coordinator
+                .execute_openai_call(
+                    after_id,
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => {
+                    panic!("ctrl+c must not restore commits after identity was lost, got {other:?}")
+                }
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "ctrl+c must not rebind an unproven receiver: {:?}",
+                failure.error
+            );
+        }
+
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-scroll",
+                &vec![OpenAiComputerAction::Scroll {
+                    at: None,
+                    delta_x: 0,
+                    delta_y: 10,
+                    modifiers: Modifiers::default(),
+                }],
+            )
+            .await;
         assert!(
             matches!(outcome, CoordinatedOutcome::Completed { .. }),
-            "a provably reset line commits nothing: {outcome:?}"
+            "scroll stays usable: {outcome:?}"
         );
+        assert_identity_lost(
+            &mut coordinator,
+            authorizer.as_ref(),
+            "call-scroll-enter",
+            "call-scroll-cancel",
+            "call-scroll-after",
+        )
+        .await;
+
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+        let outcome = coordinator
+            .execute_openai_call("call-capture", &vec![OpenAiComputerAction::Screenshot])
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "capture stays usable: {outcome:?}"
+        );
+        assert_identity_lost(
+            &mut coordinator,
+            authorizer.as_ref(),
+            "call-capture-enter",
+            "call-capture-cancel",
+            "call-capture-after",
+        )
+        .await;
+
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+        let outcome = coordinator
+            .execute_anthropic_20251124_call(
+                "call-wait",
+                &Anthropic20251124ComputerAction::Wait(std::time::Duration::from_millis(1)),
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "wait stays usable: {outcome:?}"
+        );
+        assert_identity_lost(
+            &mut coordinator,
+            authorizer.as_ref(),
+            "call-wait-enter",
+            "call-wait-cancel",
+            "call-wait-after",
+        )
+        .await;
     }
 
     /// Backend that fails the delivery of the `fail_at_seen`-th (0-based)

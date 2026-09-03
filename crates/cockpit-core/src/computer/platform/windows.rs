@@ -294,37 +294,131 @@ pub const UIA_EDIT_CONTROL_TYPE_ID: i32 = 50004;
 /// UIA `Document` control type (`UIA_DocumentControlTypeId`).
 pub const UIA_DOCUMENT_CONTROL_TYPE_ID: i32 = 50030;
 
+/// Observed UIA `IsPassword` result. Query failure is [`Self::Unknown`],
+/// never coerced to "not a password".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiaPasswordEvidence {
+    Password,
+    NotPassword,
+    Unknown,
+}
+
+impl UiaPasswordEvidence {
+    /// Map a `CurrentIsPassword` query. `query_ok` false is [`Self::Unknown`]
+    /// even when `is_password` is false — a failed query must not become an
+    /// ordinary-field classification.
+    pub fn from_query(query_ok: bool, is_password: bool) -> Self {
+        if !query_ok {
+            Self::Unknown
+        } else if is_password {
+            Self::Password
+        } else {
+            Self::NotPassword
+        }
+    }
+}
+
+/// Classification fingerprint for one Windows UIA snapshot.
+///
+/// Ordinary-text roles are coherent only when this fingerprint is bound to
+/// the foreground window and the synchronous recheck observes the same
+/// window id, focused-element id, role, and subrole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiaWidgetFingerprint {
+    pub window_runtime_id: [u8; 16],
+    pub focused_runtime_id: Option<[u8; 16]>,
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+}
+
+/// Whether a widget native handle belongs to the snapshot's foreground window.
+///
+/// `same_as_foreground` is identity with the top-level HWND.
+/// `is_child_of_foreground` is Win32 `IsChild`.
+/// `root_ancestor_is_foreground` is `GetAncestor(..., GA_ROOT)`.
+pub fn native_hwnd_belongs_to_foreground(
+    same_as_foreground: bool,
+    is_child_of_foreground: bool,
+    root_ancestor_is_foreground: bool,
+) -> bool {
+    same_as_foreground || is_child_of_foreground || root_ancestor_is_foreground
+}
+
+impl UiaWidgetFingerprint {
+    pub fn window_only(window_runtime_id: [u8; 16]) -> Self {
+        Self {
+            window_runtime_id,
+            focused_runtime_id: None,
+            role: None,
+            subrole: None,
+        }
+    }
+
+    /// Widget roles may be published only with a recheckable focused-element
+    /// identity. Missing identity drops the roles so TypeText fail-closes.
+    pub fn with_bound_widget(
+        window_runtime_id: [u8; 16],
+        focused_runtime_id: [u8; 16],
+        role: Option<String>,
+        subrole: Option<String>,
+    ) -> Self {
+        Self {
+            window_runtime_id,
+            focused_runtime_id: Some(focused_runtime_id),
+            role,
+            subrole,
+        }
+    }
+}
+
 /// Map a focused UIA control to classifier vocabulary (issue #290).
 ///
-/// Window/pane/custom types stay as `uia.control_type.{id}` (ambiguous,
-/// fail-closed as Credential for TypeText). `IsPassword` always wins so
+/// Ordinary-text roles (`EditText`, `TextArea`) require
+/// [`UiaPasswordEvidence::NotPassword`]. [`UiaPasswordEvidence::Unknown`]
+/// keeps the raw `uia.control_type.{id}` so TypeText fail-closes as
+/// Credential — a failed `IsPassword` query must not classify a password
+/// Edit as ordinary text. [`UiaPasswordEvidence::Password`] always wins so
 /// an ordinary Edit control type cannot mask a password box.
 pub fn uia_focused_widget_roles(
     control_type: Option<i32>,
-    is_password: bool,
+    password: UiaPasswordEvidence,
 ) -> (Option<String>, Option<String>) {
-    if is_password {
-        return (
+    match password {
+        UiaPasswordEvidence::Password => (
             Some("PasswordBox".to_string()),
             Some("password".to_string()),
-        );
-    }
-    match control_type {
-        Some(UIA_EDIT_CONTROL_TYPE_ID) => (Some("EditText".to_string()), None),
-        Some(UIA_DOCUMENT_CONTROL_TYPE_ID) => (Some("TextArea".to_string()), None),
-        Some(id) => (Some(format!("uia.control_type.{id}")), None),
-        None => (None, None),
+        ),
+        UiaPasswordEvidence::Unknown => match control_type {
+            Some(id) => (Some(format!("uia.control_type.{id}")), None),
+            None => (None, None),
+        },
+        UiaPasswordEvidence::NotPassword => match control_type {
+            Some(UIA_EDIT_CONTROL_TYPE_ID) => (Some("EditText".to_string()), None),
+            Some(UIA_DOCUMENT_CONTROL_TYPE_ID) => (Some("TextArea".to_string()), None),
+            Some(id) => (Some(format!("uia.control_type.{id}")), None),
+            None => (None, None),
+        },
     }
 }
 
 #[cfg(test)]
 mod uia_focused_widget_roles_tests {
-    use super::{UIA_DOCUMENT_CONTROL_TYPE_ID, UIA_EDIT_CONTROL_TYPE_ID, uia_focused_widget_roles};
+    use super::{
+        UIA_DOCUMENT_CONTROL_TYPE_ID, UIA_EDIT_CONTROL_TYPE_ID, UiaPasswordEvidence,
+        UiaWidgetFingerprint, native_hwnd_belongs_to_foreground, uia_focused_widget_roles,
+    };
 
     #[test]
     fn password_property_wins_over_edit_control_type() {
         assert_eq!(
-            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), true),
+            UiaPasswordEvidence::from_query(true, true),
+            UiaPasswordEvidence::Password
+        );
+        assert_eq!(
+            uia_focused_widget_roles(
+                Some(UIA_EDIT_CONTROL_TYPE_ID),
+                UiaPasswordEvidence::Password
+            ),
             (Some("PasswordBox".into()), Some("password".into()))
         );
     }
@@ -332,12 +426,52 @@ mod uia_focused_widget_roles_tests {
     #[test]
     fn ordinary_edit_and_document_map_to_unambiguous_text_roles() {
         assert_eq!(
-            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), false),
+            UiaPasswordEvidence::from_query(true, false),
+            UiaPasswordEvidence::NotPassword
+        );
+        assert_eq!(
+            uia_focused_widget_roles(
+                Some(UIA_EDIT_CONTROL_TYPE_ID),
+                UiaPasswordEvidence::NotPassword
+            ),
             (Some("EditText".into()), None)
         );
         assert_eq!(
-            uia_focused_widget_roles(Some(UIA_DOCUMENT_CONTROL_TYPE_ID), false),
+            uia_focused_widget_roles(
+                Some(UIA_DOCUMENT_CONTROL_TYPE_ID),
+                UiaPasswordEvidence::NotPassword
+            ),
             (Some("TextArea".into()), None)
+        );
+    }
+
+    #[test]
+    fn unknown_password_query_does_not_map_edit_to_ordinary_text() {
+        assert_eq!(
+            UiaPasswordEvidence::from_query(false, false),
+            UiaPasswordEvidence::Unknown
+        );
+        assert_eq!(
+            UiaPasswordEvidence::from_query(false, true),
+            UiaPasswordEvidence::Unknown
+        );
+        assert_eq!(
+            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), UiaPasswordEvidence::Unknown),
+            (Some("uia.control_type.50004".into()), None)
+        );
+        assert_eq!(
+            uia_focused_widget_roles(
+                Some(UIA_DOCUMENT_CONTROL_TYPE_ID),
+                UiaPasswordEvidence::Unknown
+            ),
+            (Some("uia.control_type.50030".into()), None)
+        );
+        assert_ne!(
+            uia_focused_widget_roles(Some(UIA_EDIT_CONTROL_TYPE_ID), UiaPasswordEvidence::Unknown),
+            uia_focused_widget_roles(
+                Some(UIA_EDIT_CONTROL_TYPE_ID),
+                UiaPasswordEvidence::NotPassword
+            )
         );
     }
 
@@ -345,9 +479,52 @@ mod uia_focused_widget_roles_tests {
     fn window_and_unknown_types_stay_ambiguous() {
         // UIA Window = 50032. Must not be treated as a text field.
         assert_eq!(
-            uia_focused_widget_roles(Some(50032), false),
+            uia_focused_widget_roles(Some(50032), UiaPasswordEvidence::NotPassword),
             (Some("uia.control_type.50032".into()), None)
         );
-        assert_eq!(uia_focused_widget_roles(None, false), (None, None));
+        assert_eq!(
+            uia_focused_widget_roles(None, UiaPasswordEvidence::NotPassword),
+            (None, None)
+        );
+        assert_eq!(
+            uia_focused_widget_roles(None, UiaPasswordEvidence::Unknown),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn widget_fingerprint_requires_same_focused_identity_and_roles() {
+        let window = [1u8; 16];
+        let focused = [2u8; 16];
+        let captured =
+            UiaWidgetFingerprint::with_bound_widget(window, focused, Some("EditText".into()), None);
+        assert_eq!(captured, captured.clone());
+        assert_ne!(
+            captured,
+            UiaWidgetFingerprint::with_bound_widget(
+                window,
+                [3u8; 16],
+                Some("EditText".into()),
+                None,
+            )
+        );
+        assert_ne!(
+            captured,
+            UiaWidgetFingerprint::with_bound_widget(
+                window,
+                focused,
+                Some("uia.control_type.50004".into()),
+                None,
+            )
+        );
+        assert_ne!(captured, UiaWidgetFingerprint::window_only(window));
+    }
+
+    #[test]
+    fn widget_hwnd_belongs_to_foreground_when_same_child_or_root() {
+        assert!(native_hwnd_belongs_to_foreground(true, false, false));
+        assert!(native_hwnd_belongs_to_foreground(false, true, false));
+        assert!(native_hwnd_belongs_to_foreground(false, false, true));
+        assert!(!native_hwnd_belongs_to_foreground(false, false, false));
     }
 }

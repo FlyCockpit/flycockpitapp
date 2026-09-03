@@ -2492,6 +2492,12 @@ impl TargetWidgetContext {
     /// True only for an explicit ordinary text-input role with no credential
     /// marker. Generic roles such as `edit` (Windows UIA covers password
     /// boxes) and window/group roles are ambiguous.
+    ///
+    /// Producers may emit these ordinary roles only when the focused widget
+    /// is bound to the snapshot window and password/secure evidence was
+    /// successfully observed as false (or the platform uses a distinct
+    /// secure role such as `AXSecureTextField`). A failed password-property
+    /// query must not map to an ordinary role.
     fn is_unambiguous_non_credential_text_field(&self) -> bool {
         if self.is_missing() || self.is_known_credential_field() {
             return false;
@@ -10442,6 +10448,8 @@ mod tests {
         let ambiguous_edit = TargetWidgetContext::from_roles(Some("edit"), None);
         let window_role = TargetWidgetContext::from_roles(Some("AXWindow"), None);
         let edit_text = TargetWidgetContext::from_roles(Some("EditText"), None);
+        let unknown_password_edit =
+            TargetWidgetContext::from_roles(Some("uia.control_type.50004"), None);
         assert_eq!(
             ActionRiskClass::classify_with_widget(&benign, Some(&text_field)),
             ActionRiskClass::StateChanging,
@@ -10451,6 +10459,11 @@ mod tests {
             ActionRiskClass::classify_with_widget(&benign, Some(&edit_text)),
             ActionRiskClass::StateChanging,
             "Windows ordinary Edit (mapped to EditText) is StateChanging"
+        );
+        assert_eq!(
+            ActionRiskClass::classify_with_widget(&benign, Some(&unknown_password_edit)),
+            ActionRiskClass::CredentialEntry,
+            "Windows Edit whose IsPassword query failed stays ambiguous"
         );
         assert_eq!(
             ActionRiskClass::classify_with_widget(&benign, Some(&password_field)),

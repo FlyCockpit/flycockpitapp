@@ -86,7 +86,7 @@ pub fn export(cwd: &Path) -> Result<String> {
     let mut providers = crate::secret_ref::load_effective(cwd);
     providers.active_model = None;
     sanitize_providers(&mut providers);
-    let extended_path = crate::config::dirs::most_specific_config_write_target(cwd)
+    let extended_path = crate::config::dirs::most_specific_existing_config_write_target(cwd)
         .unwrap_or_else(|| cwd.join(".cockpit").join(crate::config::dirs::CONFIG_FILE));
     let extended = ExtendedConfigDoc::load(&extended_path)
         .map(|doc| PortableExtendedPolicy::from_config(&doc.config()))
@@ -268,7 +268,11 @@ fn sanitize_imported_provider_urls(providers: &mut ProvidersConfig) {
 }
 
 fn policy_write_target(cwd: &Path) -> Result<PathBuf> {
-    if let Some(path) = crate::config::dirs::most_specific_config_write_target(cwd) {
+    // Workspace-bound: import into a discovered layer, else the cwd-scoped
+    // creatable dirs (project `.cockpit/` then machine-local). Never the
+    // user-level global fallback — a fresh-install import must not become
+    // every project's default policy.
+    if let Some(path) = crate::config::dirs::most_specific_existing_config_write_target(cwd) {
         return Ok(path);
     }
     let dir = crate::config::dirs::cwd_scoped_creatable_dirs(cwd)
@@ -387,6 +391,29 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_install_policy_write_target_is_cwd_scoped_not_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let global = crate::config::dirs::global_config_file().unwrap();
+        assert!(
+            !global.parent().unwrap().is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+        let target = policy_write_target(&cwd).unwrap();
+        assert_ne!(
+            target, global,
+            "workspace-bound policy import must not fall back to the missing global layer"
+        );
+        assert!(
+            target.starts_with(&cwd) || target.to_string_lossy().contains("local-configs"),
+            "fresh-install policy target must be project or machine-local: {}",
+            target.display()
+        );
+    }
 
     /// A secret embedded inline in a provider base URL (user-info or query
     /// string) must not survive into the exported policy bundle. This drives

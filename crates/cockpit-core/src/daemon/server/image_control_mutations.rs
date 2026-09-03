@@ -608,8 +608,14 @@ fn authoritative_image_layer_trusted(
 
     let paths = config_file_paths_for_load(project_root);
     let defining = most_specific_authored_registry(&paths)?;
+    // Workspace-bound: the secret-bearing image-generation registry stays on
+    // a discovered layer or a project `.cockpit/` scaffold. The user-level
+    // global fallback would leak credentials into the home layer on a fresh
+    // install.
     let selected = defining
-        .or_else(|| cockpit_config::config::dirs::most_specific_config_write_target(project_root))
+        .or_else(|| {
+            cockpit_config::config::dirs::most_specific_existing_config_write_target(project_root)
+        })
         .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
     let target = exact_target_path(&selected)?;
     let raw = read_document(&target)?;
@@ -978,6 +984,9 @@ pub(crate) async fn dispatch_image_control_mutation(
 
     let cwd = std::fs::canonicalize(&project_root)
         .map_err(|_| bad_request("project_root must identify an existing canonical workspace"))?;
+    // Workspace-bound: the registry write target scaffolds project `.cockpit/`
+    // when no layer exists. Do not use the user-level IgnoreConfig fallback —
+    // that would author secrets into an untrusted project layer.
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;

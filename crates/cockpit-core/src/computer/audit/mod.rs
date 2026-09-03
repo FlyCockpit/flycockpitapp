@@ -25,7 +25,10 @@
 //! The confirmed-only form is exactly 110 bytes. The maximum
 //! confirmed-plus-pending form is exactly 626 bytes.
 
-#![allow(dead_code)] // Wired through the daemon coordinator in follow-up prompts.
+#![allow(dead_code)] // Extra event kinds and record digests are consumed as the live loop lands.
+
+mod chain;
+pub use chain::{ComputerAuditChain, GuidanceAuditAppend};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -1709,3 +1712,5 @@ const _: () = {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use chain::TestAuditHarness;

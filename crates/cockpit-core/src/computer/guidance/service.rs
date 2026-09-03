@@ -14,15 +14,17 @@
 //! - accepted session/persistent rules are compiled into new model contexts via
 //!   [`super::compose_and_compile`] (AC9).
 //!
-//! ## Audit emission (blocked on `computer-audit-chain-completion`)
+//! ## Audit emission
 //!
 //! The four `guidance_proposal_*` audit events are emitted through the
-//! [`GuidanceAuditWriter`] trait. The real tamper-evident audit-chain writer is
-//! a separate pending decision (not yet filed as an issue); until it lands a
-//! Until the tamper-evident chain is installed, production uses
-//! [`StubGuidanceAuditWriter`] and proposal creation fails closed.
+//! [`GuidanceAuditWriter`] trait. Production installs
+//! [`ChainGuidanceAuditWriter`] (the tamper-evident computer-use audit chain)
+//! once the secure-key actor is attached. Until that install, the writer is
+//! unavailable and create/accept/reject fail closed.
 
 use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use super::enablement::resolve_guidance_enablement_pinned;
 use super::lifecycle::{PendingProposalStore, ProposalId, ProposalScopeKey};
@@ -30,7 +32,10 @@ use super::{
     ComputerGuidanceRuleV1, EnablementResolution, PROPOSAL_EXPIRY_SECS_MILLIS, normalize_rationale,
     validate_proposal,
 };
-use crate::computer::audit::{AuditEventKind, Disposition, GuidanceScope, domain_digest, domains};
+use crate::computer::audit::{
+    AuditEventKind, ComputerAuditChain, Disposition, GuidanceAuditAppend, GuidanceScope,
+    domain_digest, domains,
+};
 use cockpit_db::Db;
 use cockpit_db::db::guidance_proposals::{
     CreateReceiptError, GuidanceProposalAcceptedScope, GuidanceProposalCounterScope,
@@ -117,7 +122,7 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 }
 
 // ---------------------------------------------------------------------------
-// Audit writer (stub pending computer-audit-chain-completion)
+// Audit writer
 // ---------------------------------------------------------------------------
 
 /// The safe fields for a guidance-proposal audit event. Typed rule values and
@@ -137,11 +142,29 @@ pub struct GuidanceAuditEvent {
     pub scope: Option<GuidanceScope>,
 }
 
+impl From<&GuidanceAuditEvent> for GuidanceAuditAppend {
+    fn from(event: &GuidanceAuditEvent) -> Self {
+        Self {
+            kind: event.kind,
+            proposal_id: event.proposal_id,
+            session_id: event.session_id,
+            delegation_id: event.delegation_id,
+            canonical_project_digest: event.canonical_project_digest,
+            provider_digest: event.provider_digest,
+            model_digest: event.model_digest,
+            config_generation: event.config_generation,
+            rule_kind_bits: event.rule_kind_bits,
+            disposition: event.disposition,
+            scope: event.scope,
+        }
+    }
+}
+
 /// Append-only audit writer for the four `guidance_proposal_*` event kinds.
 ///
-/// The real implementation is the tamper-evident computer-audit chain from
-/// `computer-audit-chain-completion` (pending). Until it lands, the
-/// [`StubGuidanceAuditWriter`] is used.
+/// Production installs [`ChainGuidanceAuditWriter`]. Tests may inject a
+/// recording or fail-closed double.
+#[async_trait]
 pub trait GuidanceAuditWriter: Send + Sync {
     /// Whether the writer can currently accept an append. Lifecycle methods
     /// check this before changing durable state; `append` remains authoritative
@@ -160,23 +183,67 @@ pub trait GuidanceAuditWriter: Send + Sync {
     /// Append one guidance-proposal audit event. Returns `Err` when the writer
     /// is unavailable so the orchestrator can fail closed (no silent undurable
     /// proposals).
-    fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
 }
 
-/// Fail-closed writer used until the real audit-chain writer lands.
-///
-/// TODO(computer-audit-chain-completion): replace with the real tamper-evident
-/// writer. No lifecycle mutation may be presented as audited while the writer
-/// is unavailable.
+/// Production writer: HMAC-chained, sealed-head computer-use audit log.
+pub struct ChainGuidanceAuditWriter {
+    chain: Arc<ComputerAuditChain>,
+}
+
+impl ChainGuidanceAuditWriter {
+    pub fn new(chain: Arc<ComputerAuditChain>) -> Self {
+        Self { chain }
+    }
+
+    pub fn chain(&self) -> &Arc<ComputerAuditChain> {
+        &self.chain
+    }
+}
+
+#[async_trait]
+impl GuidanceAuditWriter for ChainGuidanceAuditWriter {
+    fn is_available(&self) -> bool {
+        self.chain.is_available()
+    }
+
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        self.chain.append_guidance(event.into()).await
+    }
+}
+
+/// Fail-closed placeholder used only between registry construction and
+/// secure-key attach. Production replaces this with
+/// [`ChainGuidanceAuditWriter`] before the socket is published.
+struct UninstalledGuidanceAuditWriter;
+
+#[async_trait]
+impl GuidanceAuditWriter for UninstalledGuidanceAuditWriter {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "computer guidance audit chain is not installed for {:?} proposal {}",
+            event.kind,
+            hex16(&event.proposal_id)
+        )
+    }
+}
+
+/// Fail-closed writer for tests that need an explicit unavailable audit
+/// adapter. Not used on the production path.
 #[derive(Debug, Default)]
 pub struct StubGuidanceAuditWriter;
 
+#[async_trait]
 impl GuidanceAuditWriter for StubGuidanceAuditWriter {
     fn is_available(&self) -> bool {
         false
     }
 
-    fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+    async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
         anyhow::bail!(
             "computer guidance audit writer unavailable for {:?} proposal {}",
             event.kind,
@@ -208,11 +275,10 @@ struct PersistentRuleKey {
     model_digest: [u8; 32],
 }
 
-/// In-memory custody of accepted rules. Session rules live until session end;
-/// persistent rules are machine-local and never roam.
-///
-/// TODO: durable persistence of persistent rules (a future local-only table) so
-/// they survive restart. Session rules are intentionally memory-only.
+/// In-memory custody of accepted rules. Session rules live until session end
+/// and are intentionally memory-only. Persistent rules are machine-local
+/// (`accepted_persistent_guidance_rules`), never roam, and are rehydrated
+/// into this map on daemon start via [`GuidanceProposalService::reload_persistent_rules`].
 #[derive(Debug, Default)]
 pub struct AcceptedRulesStore {
     session:
@@ -373,9 +439,9 @@ pub enum TransitionProposalError {
 /// memory store; the daemon coordinator holds it behind `&mut`-style
 /// serialization. Holds:
 /// - the daemon-memory pending-proposal store,
-/// - the in-memory accepted-rules store,
+/// - the in-memory accepted-rules store (persistent half rehydrated from SQLite),
 /// - a handle to the durable receipt/counter database,
-/// - the audit writer (stub until the real chain lands).
+/// - the audit writer (the tamper-evident chain after boot install).
 pub struct GuidanceProposalService {
     pending: PendingProposalStore,
     accepted: Arc<AcceptedRulesStore>,
@@ -514,18 +580,20 @@ impl GuidanceProposalService {
             }
         }
     }
-    /// Construct a service backed by `db` and the stub audit writer.
+    /// Construct a service backed by `db`. Production replaces the fail-closed
+    /// placeholder with [`ChainGuidanceAuditWriter`] via
+    /// [`Self::install_audit_writer`] after the secure-key actor attaches.
     pub fn new(db: Arc<Db>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
             accepted: Arc::new(AcceptedRulesStore::new()),
             db,
-            audit: Arc::new(StubGuidanceAuditWriter),
+            audit: Arc::new(UninstalledGuidanceAuditWriter),
         }
     }
 
-    /// Construct a service with an explicit audit writer (for tests / the real
-    /// writer when it lands).
+    /// Construct a service with an explicit audit writer (tests and the
+    /// production chain).
     pub fn with_audit_writer(db: Arc<Db>, audit: Arc<dyn GuidanceAuditWriter>) -> Self {
         Self {
             pending: PendingProposalStore::new(),
@@ -533,6 +601,13 @@ impl GuidanceProposalService {
             db,
             audit,
         }
+    }
+
+    /// Install the production tamper-evident audit writer. Replaces the
+    /// fail-closed placeholder used between registry construction and
+    /// secure-key attach.
+    pub fn install_audit_writer(&mut self, audit: Arc<dyn GuidanceAuditWriter>) {
+        self.audit = audit;
     }
 
     pub fn compiler(
@@ -634,7 +709,7 @@ impl GuidanceProposalService {
                     None => None,
                 },
             };
-            self.audit.append(&event)?;
+            self.audit.append(&event).await?;
             self.db
                 .mark_guidance_proposal_audit_delivered(
                     &row.proposal_id,
@@ -803,7 +878,7 @@ impl GuidanceProposalService {
             scope: None,
         };
         if self.audit.delivers_immediately() {
-            if let Err(audit_error) = self.audit.append(&audit_event) {
+            if let Err(audit_error) = self.audit.append(&audit_event).await {
                 let proposal_id = hex16(&proposal_id);
                 let rollback = self
                     .db
@@ -1024,7 +1099,7 @@ impl GuidanceProposalService {
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
-            match self.audit.append(&audit_event) {
+            match self.audit.append(&audit_event).await {
                 Ok(()) => {
                     if let Err(error) = self
                         .db
@@ -1128,7 +1203,7 @@ impl GuidanceProposalService {
         let audit_error = if !self.audit.delivers_immediately() {
             None
         } else {
-            match self.audit.append(&audit_event) {
+            match self.audit.append(&audit_event).await {
                 Ok(()) => {
                     if let Err(error) = self
                         .db
@@ -1399,7 +1474,7 @@ impl GuidanceProposalService {
                 _ => None,
             },
         };
-        if self.audit.delivers_immediately() && self.audit.append(&event).is_ok() {
+        if self.audit.delivers_immediately() && self.audit.append(&event).await.is_ok() {
             if let Err(error) = self
                 .db
                 .mark_guidance_proposal_audit_delivered(proposal_id_str, to, now_unix_ms)
@@ -1426,16 +1501,18 @@ mod tests {
 
     struct RecordingAuditWriter;
 
+    #[async_trait]
     impl GuidanceAuditWriter for RecordingAuditWriter {
-        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        async fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
             Ok(())
         }
     }
 
     struct FailingAuditWriter;
 
+    #[async_trait]
     impl GuidanceAuditWriter for FailingAuditWriter {
-        fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+        async fn append(&self, _event: &GuidanceAuditEvent) -> anyhow::Result<()> {
             anyhow::bail!("audit transport failed")
         }
     }
@@ -1833,8 +1910,9 @@ mod tests {
         // stale receipt.
         let recorded: Arc<Mutex<Vec<AuditEventKind>>> = Arc::new(Mutex::new(vec![]));
         struct Recording(Arc<Mutex<Vec<AuditEventKind>>>);
+        #[async_trait]
         impl GuidanceAuditWriter for Recording {
-            fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
+            async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
                 self.0.lock().unwrap().push(event.kind);
                 Ok(())
             }
@@ -1874,5 +1952,123 @@ mod tests {
         );
         // No counter re-increment.
         assert_eq!(svc2.delegation_counter(&id16(2)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_chain_create_accept_reject_verifies() {
+        use crate::computer::audit::{AuditVerifyStatus, TestAuditHarness};
+
+        let harness = TestAuditHarness::new().await;
+        let writer = Arc::new(ChainGuidanceAuditWriter::new(harness.chain.clone()));
+        let mut svc =
+            GuidanceProposalService::with_audit_writer(harness.db.clone(), writer.clone());
+        assert!(svc.audit.is_available());
+
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        let scope = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(create, id16(1), id16(2), id16(9), vec![rule()], None, 1000)
+            .await
+            .unwrap();
+        svc.accept_session(&scope, id16(9), 2000).await.unwrap();
+
+        let create = snapshot(&svc, &providers_enabled(), "m2", b"proj");
+        let scope2 = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(3),
+            project_digest: create.project_digest,
+            provider_digest: create.provider_digest,
+            model_digest: create.model_digest,
+        };
+        svc.create_proposal(create, id16(1), id16(3), id16(8), vec![rule()], None, 3000)
+            .await
+            .unwrap();
+        svc.reject(&scope2, id16(8), 4000).await.unwrap();
+
+        let result = writer.chain().verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
+        assert_eq!(result.confirmed_sequence, 4);
+        assert_eq!(result.entry_count, 4);
+    }
+
+    #[tokio::test]
+    async fn persistent_rule_survives_restart_session_rule_does_not() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut svc =
+            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(RecordingAuditWriter));
+        let project = canonical_project_digest(b"proj");
+        let provider = provider_digest("p");
+        let model = model_digest("p", "m");
+
+        let scope_session = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(2),
+            project_digest: project,
+            provider_digest: provider,
+            model_digest: model,
+        };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(2),
+            id16(9),
+            vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 2 }],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        svc.accept_session(&scope_session, id16(9), 2000)
+            .await
+            .unwrap();
+
+        let scope_persistent = ProposalScopeKey {
+            session_id: id16(1),
+            delegation_id: id16(3),
+            project_digest: project,
+            provider_digest: provider,
+            model_digest: model,
+        };
+        let create = snapshot(&svc, &providers_enabled(), "m", b"proj");
+        svc.create_proposal(
+            create,
+            id16(1),
+            id16(3),
+            id16(8),
+            vec![ComputerGuidanceRuleV1::MaxReversibleBatch { max_actions: 5 }],
+            None,
+            3000,
+        )
+        .await
+        .unwrap();
+        svc.accept_persistent(&scope_persistent, id16(8), 4000)
+            .await
+            .unwrap();
+
+        let before = svc.compile_guidance_for_context(&id16(1), &project, &provider, &model);
+        let before_str = std::str::from_utf8(&before).unwrap();
+        assert!(before_str.contains("two"));
+        assert!(!before_str.contains("five"));
+
+        drop(svc);
+        let restarted =
+            GuidanceProposalService::with_audit_writer(db.clone(), Arc::new(RecordingAuditWriter));
+        assert!(
+            restarted
+                .compile_guidance_for_context(&id16(1), &project, &provider, &model)
+                .is_empty()
+        );
+        let loaded = restarted.reload_persistent_rules().await.unwrap();
+        assert_eq!(loaded, 1);
+        let after = restarted.compile_guidance_for_context(&id16(1), &project, &provider, &model);
+        let after_str = std::str::from_utf8(&after).unwrap();
+        assert!(after_str.contains("five"));
+        assert!(!after_str.contains("two"));
     }
 }

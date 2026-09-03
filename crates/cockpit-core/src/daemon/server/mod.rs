@@ -4533,8 +4533,27 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     // Guidance-proposal `expired_on_restart` reconciliation (issue #59, AC6):
     // every receipt still `created` has unrecoverable memory-only values, so
     // CAS each to `expired_on_restart` with exactly one expired audit append
-    // and no counter re-increment (creation already counted). The audit
-    // writer is stubbed until computer-audit-chain-completion lands.
+    // and no counter re-increment (creation already counted). The tamper-evident
+    // audit chain must be installed first so those appends are durable.
+    if let Some(handle) = ctx.secure_key.clone() {
+        let chain =
+            crate::computer::audit::ComputerAuditChain::open(Arc::new(ctx.db.clone()), handle)
+                .await;
+        let writer = Arc::new(
+            crate::computer::guidance::service::ChainGuidanceAuditWriter::new(Arc::new(chain)),
+        );
+        if !writer.chain().is_available() {
+            tracing::error!(
+                "computer audit chain failed closed; guidance proposals remain unavailable"
+            );
+        }
+        ctx.guidance_proposals
+            .lock()
+            .await
+            .install_audit_writer(writer);
+    } else {
+        tracing::warn!("computer audit chain not installed: secure-key actor is not attached");
+    }
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let guidance_svc = ctx.guidance_proposals.lock().await;
     guidance_svc

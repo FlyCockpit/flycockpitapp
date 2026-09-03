@@ -17,6 +17,12 @@ pub const LEAK_REPORT_V1_NAMESPACE: &str = "leak-report/v1";
 /// keys (`harden-and-wire-protected-redaction-history`).
 pub const REDACTION_HISTORY_V1_NAMESPACE: &str = "redaction-history/v1";
 
+/// HMAC signing key for the computer-use audit chain (issue #271).
+pub const COMPUTER_AUDIT_V1_NAMESPACE: &str = "computer-audit/v1";
+
+/// Sealed/checkpointed computer-use audit-chain head (issue #271).
+pub const COMPUTER_AUDIT_HEAD_V1_NAMESPACE: &str = "computer-audit-head/v1";
+
 /// Max encoded length for any single account component before joining.
 /// Sized for a full 64-char namespace with worst-case percent-encoding (×3).
 pub const ACCOUNT_COMPONENT_MAX_ENCODED: usize = 192;
@@ -144,6 +150,22 @@ mod tests {
         let acct = version_account("aabbccddeeff00112233445566778899", &ns, 1).unwrap();
         assert!(acct.ends_with("/v00000001"));
         assert!(acct.contains("%2F")); // slash in namespace encoded
+    }
+
+    #[test]
+    fn accepts_computer_audit_namespaces() {
+        assert_eq!(
+            Namespace::parse(COMPUTER_AUDIT_V1_NAMESPACE)
+                .unwrap()
+                .as_str(),
+            "computer-audit/v1"
+        );
+        assert_eq!(
+            Namespace::parse(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
+                .unwrap()
+                .as_str(),
+            "computer-audit-head/v1"
+        );
     }
 
     #[test]

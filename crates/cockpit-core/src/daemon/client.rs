@@ -88,10 +88,10 @@ pub enum OwnedSessionMode {
 }
 
 /// Acquire the shareable ledger owner for an ACP process. ACP is multi-window,
-/// so this path always resolves a discoverable socket owner and never selects
-/// the one-shot in-process optimization. The background-agents setting chooses
-/// only the lifetime when this call must start a new owner; an existing owner
-/// is always reused.
+/// so this path always resolves a discoverable wire owner (Unix socket or
+/// Windows named-pipe identity) and never selects the one-shot in-process
+/// optimization. The background-agents setting chooses only the lifetime when
+/// this call must start a new owner; an existing owner is always reused.
 pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<DaemonClient> {
     let mode = if background_agents {
         LifecycleMode::AttachOrPersistent
@@ -101,12 +101,7 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
     let connected = probe_or_spawn(mode).await?;
     #[cfg(any(unix, windows))]
     {
-        if !matches!(&connected.endpoint, cockpit_client::ClientEndpoint::Wire(_)) {
-            anyhow::bail!("ACP requires a discoverable socket ledger owner");
-        }
-        if !connected.client.has_owner_capability() {
-            anyhow::bail!("ACP stdio ingress requires the daemon-private owner capability");
-        }
+        validate_acp_connected_daemon(&connected)?;
         // Reuse the already-attached client. When the user prefers background
         // agents, promote the shared ephemeral owner in place so closing the
         // ACP subprocess cannot reap live work. This is not a re-acquire and
@@ -119,8 +114,20 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
     #[cfg(not(any(unix, windows)))]
     {
         let _ = connected;
-        anyhow::bail!("ACP socket ledger ownership is unavailable on this platform")
+        anyhow::bail!("ACP wire ledger ownership is unavailable on this platform")
     }
+}
+
+/// ACP stdio ingress requires a discoverable wire owner with the daemon-private
+/// owner capability. In-process auto-promote is intentionally excluded.
+fn validate_acp_connected_daemon(connected: &ConnectedDaemon) -> Result<()> {
+    if !connected.endpoint.is_discoverable_wire_owner() {
+        anyhow::bail!("ACP requires a discoverable wire ledger owner");
+    }
+    if !connected.client.has_owner_capability() {
+        anyhow::bail!("ACP stdio ingress requires the daemon-private owner capability");
+    }
+    Ok(())
 }
 
 /// Request in-place promotion of the owner this client is already talking to.
@@ -1404,6 +1411,220 @@ pub(super) fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> super:
         socket: root.join(format!("{stem}.sock")),
         pid_file: root.join(format!("{stem}.pid")),
         ephemeral: true,
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod acp_wire_owner_tests {
+    use super::*;
+    use cockpit_client::{ClientEndpoint, InProcessConnection, InProcessEndpoint};
+
+    fn connected_with_endpoint(
+        client: cockpit_client::DaemonClient,
+        endpoint: ClientEndpoint,
+    ) -> ConnectedDaemon {
+        ConnectedDaemon {
+            client,
+            endpoint,
+            owns_daemon: false,
+            ephemeral_owner: false,
+            socket: PathBuf::from("daemon.sock"),
+            startup_notice: None,
+            promoted_from_ephemeral: false,
+        }
+    }
+
+    #[test]
+    fn validate_acp_connected_daemon_rejects_in_process_owner() {
+        let (requests, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (_events_tx, events) = tokio::sync::mpsc::channel(1);
+        let (connections, _connection_rx) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _sensitive_rx) = tokio::sync::mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let connected = connected_with_endpoint(
+            cockpit_client::DaemonClient::from_in_process(InProcessConnection { requests, events }),
+            endpoint,
+        );
+
+        let error = validate_acp_connected_daemon(&connected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ACP requires a discoverable wire ledger owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_acp_connected_daemon_accepts_wire_owner_with_capability() {
+        let (dir, socket, mut listener) = bind_test_pipe_listener().await;
+        let capability_path = cockpit_client::owner_capability_path(&socket);
+        std::fs::write(&capability_path, b"test-owner-capability-token").unwrap();
+
+        let server = tokio::spawn(async move {
+            let stream = accept_test_pipe(&mut listener).await;
+            let mut daemon = cockpit_proto::ProtoStream::new(stream);
+            send_test_daemon_hello(&mut daemon).await;
+            confirm_test_client_lifetime(&mut daemon).await;
+        });
+
+        let client = cockpit_client::DaemonClient::connect(&socket)
+            .await
+            .expect("wire connect");
+        let connected = connected_with_endpoint(client, ClientEndpoint::Wire(socket.clone()));
+
+        validate_acp_connected_daemon(&connected).expect("wire owner with capability");
+
+        drop(connected);
+        server.await.expect("server");
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn validate_acp_connected_daemon_rejects_wire_owner_without_capability() {
+        let (dir, socket, mut listener) = bind_test_pipe_listener().await;
+
+        let server = tokio::spawn(async move {
+            let stream = accept_test_pipe(&mut listener).await;
+            let mut daemon = cockpit_proto::ProtoStream::new(stream);
+            send_test_daemon_hello(&mut daemon).await;
+            confirm_test_client_lifetime(&mut daemon).await;
+        });
+
+        let client = cockpit_client::DaemonClient::connect(&socket)
+            .await
+            .expect("wire connect");
+        let connected = connected_with_endpoint(client, ClientEndpoint::Wire(socket.clone()));
+
+        let error = validate_acp_connected_daemon(&connected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("daemon-private owner capability")
+        );
+
+        drop(connected);
+        server.await.expect("server");
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    async fn bind_test_pipe_listener() -> (tempfile::TempDir, PathBuf, tokio::net::UnixListener) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        (dir, socket, listener)
+    }
+
+    #[cfg(unix)]
+    async fn accept_test_pipe(listener: &tokio::net::UnixListener) -> tokio::net::UnixStream {
+        listener.accept().await.expect("accept").0
+    }
+
+    #[cfg(windows)]
+    struct TestPipeListener {
+        pending: tokio::net::windows::named_pipe::NamedPipeServer,
+        name: String,
+    }
+
+    #[cfg(windows)]
+    impl TestPipeListener {
+        async fn accept(&mut self) -> tokio::net::windows::named_pipe::NamedPipeServer {
+            self.pending.connect().await.expect("pipe connect");
+            let connected = std::mem::replace(
+                &mut self.pending,
+                tokio::net::windows::named_pipe::ServerOptions::new()
+                    .create(&self.name)
+                    .expect("next pipe instance"),
+            );
+            connected
+        }
+    }
+
+    #[cfg(windows)]
+    async fn bind_test_pipe_listener() -> (tempfile::TempDir, PathBuf, TestPipeListener) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let sid = cockpit_host::named_pipe::current_user_sid().expect("sid");
+        let pipe = cockpit_host::named_pipe::allocate_pipe_name(&sid).expect("pipe name");
+        cockpit_host::named_pipe::write_pipe_identity(&socket, &pipe).expect("identity");
+        let pending = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(pipe.as_str())
+            .expect("bind named pipe");
+        (
+            dir,
+            socket,
+            TestPipeListener {
+                pending,
+                name: pipe.as_str().to_string(),
+            },
+        )
+    }
+
+    #[cfg(windows)]
+    async fn accept_test_pipe(
+        listener: &mut TestPipeListener,
+    ) -> tokio::net::windows::named_pipe::NamedPipeServer {
+        listener.accept().await
+    }
+
+    async fn send_test_daemon_hello<S>(daemon: &mut cockpit_proto::ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        use cockpit_proto::{Envelope, Response};
+        daemon
+            .send(&Envelope::response(
+                uuid::Uuid::nil(),
+                Response::DaemonStatus {
+                    pid: 1,
+                    uptime_secs: 0,
+                    active_sessions: 0,
+                    socket_path: "daemon.sock".into(),
+                    daemon_version: "0.1.acp".into(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                    paused_sessions: 0,
+                    database_path: "test.db".into(),
+                    schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                },
+            ))
+            .await
+            .expect("hello");
+    }
+
+    async fn confirm_test_client_lifetime<S>(daemon: &mut cockpit_proto::ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        use cockpit_proto::{Body, Envelope, RecvFrame, Request, Response};
+        let id = match daemon.recv().await.expect("recv").expect("frame") {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: Request::DaemonStatus,
+                    ..
+                } => id,
+                other => panic!("expected lifetime confirmation, got {other:?}"),
+            },
+            other => panic!("expected envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(
+                id,
+                Response::DaemonStatus {
+                    pid: 1,
+                    uptime_secs: 0,
+                    active_sessions: 0,
+                    socket_path: "daemon.sock".into(),
+                    daemon_version: "0.1.acp".into(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                    paused_sessions: 0,
+                    database_path: "test.db".into(),
+                    schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                },
+            ))
+            .await
+            .expect("lifetime confirmation");
     }
 }
 

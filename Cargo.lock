@@ -1297,6 +1297,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cockpit-db",
+ "cockpit-host",
  "cockpit-test-support",
  "cockpit-tokenizer",
  "dirs",

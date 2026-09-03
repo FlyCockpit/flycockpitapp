@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read},
+    io::Cursor,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,11 +32,8 @@ use cockpit_db::db::{
     },
 };
 
-// Current exports may emit one sidecar per tool or inference event; 16,384 permits
-// realistic long-lived session bundles while the independent 1GiB decompressed cap
-// bounds archive resource use.
-const MAX_IMPORT_ENTRIES: usize = 16_384;
-const MAX_IMPORT_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+use crate::resource_limits::ResourceLimits;
+
 const EXPORT_SCHEMA: &str = "cockpit-session-export/4";
 const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
@@ -166,14 +163,42 @@ fn update_imported_tool_projection_blob_path(
 }
 
 pub fn read_archive(path: &Path) -> Result<ImportArchive> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading import archive {}", path.display()))?;
+    let limits = ResourceLimits::defaults();
+    let bytes = cockpit_host::bounded::read_at_most(path, limits.archive_compressed_bytes)
+        .map_err(|error| match error {
+            cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. } => {
+                anyhow!("import archive exceeds the {limit} byte compressed limit ({actual} bytes)")
+            }
+            other => anyhow!(other).context(format!("reading import archive {}", path.display())),
+        })?;
     read_archive_bytes(&bytes)
 }
 
 pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
+    read_archive_bytes_with_caps(
+        bytes,
+        ResourceLimits::defaults().archive_compressed_bytes,
+        ResourceLimits::defaults().archive_decompressed_bytes,
+        ResourceLimits::defaults().archive_entry_bytes,
+        ResourceLimits::defaults().archive_entry_count,
+    )
+}
+
+fn read_archive_bytes_with_caps(
+    bytes: &[u8],
+    compressed_cap: u64,
+    decompressed_cap: u64,
+    entry_cap: u64,
+    entry_count: usize,
+) -> Result<ImportArchive> {
+    if bytes.len() as u64 > compressed_cap {
+        bail!(
+            "import archive exceeds the {compressed_cap} byte compressed limit ({} bytes)",
+            bytes.len()
+        );
+    }
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("opening import ZIP")?;
-    if archive.len() > MAX_IMPORT_ENTRIES {
+    if archive.len() > entry_count {
         bail!("import archive has too many entries");
     }
     let mut total = 0_u64;
@@ -193,11 +218,16 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
         total = total
             .checked_add(entry.size())
             .ok_or_else(|| anyhow!("import archive decompressed byte accounting overflow"))?;
-        if total > MAX_IMPORT_UNCOMPRESSED_BYTES {
+        if total > decompressed_cap {
             bail!("import archive is too large when decompressed");
         }
     }
-    let manifest = read_json_entry(&mut archive, "manifest.json")?;
+    let mut archive = BoundedZip {
+        inner: archive,
+        remaining: decompressed_cap,
+        entry_cap,
+    };
+    let manifest = archive.read_json("manifest.json")?;
     if manifest.get("schema").and_then(Value::as_str) != Some(EXPORT_SCHEMA) {
         bail!("unsupported session export schema");
     }
@@ -217,7 +247,8 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
     if sessions.is_empty() {
         bail!("import archive contains no sessions");
     }
-    let events = read_json_entry(&mut archive, "events.json")?
+    let events = archive
+        .read_json("events.json")?
         .as_array()
         .ok_or_else(|| anyhow!("import events must be a JSON array"))?
         .iter()
@@ -255,7 +286,7 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
     })
 }
 
-fn optional_index(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, path: &str) -> Result<Vec<Value>> {
+fn optional_index(archive: &mut BoundedZip<'_>, path: &str) -> Result<Vec<Value>> {
     match read_json_entry(archive, path) {
         Ok(Value::Array(entries)) => Ok(entries),
         Ok(_) => bail!("import {path} must be a JSON array"),
@@ -264,9 +295,7 @@ fn optional_index(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, path: &str) -> R
     }
 }
 
-fn parse_delegation_jobs(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Result<Vec<ImportedDelegationJob>> {
+fn parse_delegation_jobs(archive: &mut BoundedZip<'_>) -> Result<Vec<ImportedDelegationJob>> {
     optional_index(archive, "delegations/index.json")?
         .iter()
         .map(|value| {
@@ -329,7 +358,7 @@ fn parse_delegation_child(value: &Value) -> Result<ImportedDelegationChild> {
 }
 
 fn parse_delegation_payloads(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    archive: &mut BoundedZip<'_>,
 ) -> Result<Vec<ImportedDelegationPayload>> {
     optional_index(archive, "delegation_payloads/index.json")?
         .iter()
@@ -378,9 +407,7 @@ fn parse_delegation_payloads(
         .collect()
 }
 
-fn parse_delegation_steers(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Result<Vec<ImportedDelegationSteer>> {
+fn parse_delegation_steers(archive: &mut BoundedZip<'_>) -> Result<Vec<ImportedDelegationSteer>> {
     optional_index(archive, "delegation_steers/index.json")?
         .iter()
         .map(|value| {
@@ -409,7 +436,7 @@ fn parse_delegation_steers(
 }
 
 fn parse_text_artifacts(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    archive: &mut BoundedZip<'_>,
     archive_paths: &BTreeSet<String>,
 ) -> Result<Vec<ImportedTextArtifact>> {
     let index = read_json_entry(archive, "text_artifacts/index.json")?;
@@ -1171,22 +1198,42 @@ fn validate_tool_artifact_projection_state(
     }
 }
 
-fn read_text_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<String> {
-    let mut raw = String::new();
-    archive
-        .by_name(name)
-        .with_context(|| format!("import archive lacks {name}"))?
-        .read_to_string(&mut raw)?;
-    Ok(raw)
+struct BoundedZip<'a> {
+    inner: zip::ZipArchive<Cursor<&'a [u8]>>,
+    remaining: u64,
+    entry_cap: u64,
 }
 
-fn read_json_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Value> {
-    let mut raw = String::new();
-    archive
-        .by_name(name)
-        .with_context(|| format!("import archive lacks {name}"))?
-        .read_to_string(&mut raw)?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing import {name}"))
+impl BoundedZip<'_> {
+    fn read_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
+        let file = self
+            .inner
+            .by_name(name)
+            .with_context(|| format!("import archive lacks {name}"))?;
+        let cap = self.remaining.min(self.entry_cap);
+        let bytes = cockpit_host::bounded::read_reader_at_most(file, cap, "import ZIP entry")
+            .map_err(|error| anyhow!("{error}"))?;
+        self.remaining = self.remaining.saturating_sub(bytes.len() as u64);
+        Ok(bytes)
+    }
+
+    fn read_text(&mut self, name: &str) -> Result<String> {
+        let bytes = self.read_bytes(name)?;
+        String::from_utf8(bytes).with_context(|| format!("import {name} is not UTF-8"))
+    }
+
+    fn read_json(&mut self, name: &str) -> Result<Value> {
+        let raw = self.read_text(name)?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing import {name}"))
+    }
+}
+
+fn read_text_entry(archive: &mut BoundedZip<'_>, name: &str) -> Result<String> {
+    archive.read_text(name)
+}
+
+fn read_json_entry(archive: &mut BoundedZip<'_>, name: &str) -> Result<Value> {
+    archive.read_json(name)
 }
 
 fn parse_session(value: &Value) -> Result<ImportedSession> {
@@ -1258,10 +1305,7 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
     })
 }
 
-fn parse_event(
-    value: &Value,
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Result<ImportedEvent> {
+fn parse_event(value: &Value, archive: &mut BoundedZip<'_>) -> Result<ImportedEvent> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("import event must be an object"))?;
@@ -1997,6 +2041,46 @@ mod tests {
         assert!(restored.provider.is_none());
         assert!(restored.model.is_none());
         assert!(restored.model_selection_json.is_none());
+    }
+
+    #[test]
+    fn import_rejects_decompression_over_the_read_cap() {
+        let id = Uuid::new_v4();
+        let archive = archive_bytes(vec![session(id, None)], vec![], false);
+        let error = read_archive_bytes_with_caps(&archive, 512 * 1024 * 1024, 64, 32, 16_384)
+            .expect_err("tiny decompressed cap must fail closed")
+            .to_string();
+        assert!(
+            error.contains("import ZIP entry")
+                || error.contains("byte limit")
+                || error.contains("too large"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_compressed_archive_over_the_cap() {
+        let id = Uuid::new_v4();
+        let archive = archive_bytes(vec![session(id, None)], vec![], false);
+        let error = read_archive_bytes_with_caps(&archive, 8, 1024 * 1024 * 1024, 1024, 16_384)
+            .expect_err("tiny compressed cap must fail closed")
+            .to_string();
+        assert!(error.contains("compressed limit"), "{error}");
+    }
+
+    #[test]
+    fn read_archive_rejects_a_file_over_the_compressed_cap_during_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let over = ResourceLimits::defaults().archive_compressed_bytes + 1;
+        file.set_len(over).unwrap();
+        drop(file);
+        let error = read_archive(&path)
+            .expect_err("over-cap archive must not load")
+            .to_string();
+        assert!(error.contains("compressed limit"), "{error}");
+        assert!(error.contains(&over.to_string()), "{error}");
     }
 
     #[test]

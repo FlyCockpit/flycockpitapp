@@ -369,8 +369,9 @@ impl ArtifactStore {
     pub fn load_patch(&self, row: &TaskArtifactRow) -> Result<UncommittedPatch> {
         let id = row.artifact_id;
         let dir = self.artifact_dir(id);
-        let diff = std::fs::read_to_string(dir.join("patch.diff"))
-            .with_context(|| format!("loading patch for artifact `{id}`"))?;
+        let diff = crate::resource_limits::read_project_text(&dir.join("patch.diff"))
+            .with_context(|| format!("loading patch for artifact `{id}`"))?
+            .ok_or_else(|| anyhow::anyhow!("loading patch for artifact `{id}`"))?;
         let touched = read_path_list(&dir.join("touched.json"))?;
         let untracked = read_path_list(&dir.join("untracked.json"))?;
         let patch = UncommittedPatch {
@@ -549,6 +550,7 @@ pub fn assert_no_transcripts(visible: &[ParentVisibleArtifact]) -> Result<()> {
 }
 
 fn read_path_list(path: &Path) -> Result<Vec<String>> {
-    let raw = std::fs::read(path).with_context(|| format!("reading `{}`", path.display()))?;
+    let raw = crate::resource_limits::read_for_tool(path)
+        .with_context(|| format!("reading `{}`", path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("decoding `{}`", path.display()))
 }

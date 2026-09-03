@@ -3025,6 +3025,55 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     );
 }
 
+#[tokio::test]
+async fn turn_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let env_path = tmp.path().join(".env");
+    let handle = std::fs::File::create(&env_path).unwrap();
+    handle
+        .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+        .unwrap();
+    drop(handle);
+    let session = Session::create_for_test(
+        Db::open_in_memory().unwrap(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (event_tx, _event_rx) = broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let (driver_tx, mut driver_rx) = mpsc::channel(1);
+    let mut notified = HashSet::new();
+
+    let outcome = crate::config::trust::scope_workspace_trust_policy(
+        trusted_test_policy(tmp.path()),
+        refresh_redaction_for_turn(
+            &session,
+            session.id,
+            tmp.path(),
+            crate::config::extended::RedactConfig::default(),
+            &RedactionSourceOverrides::default(),
+            &mut notified,
+            &redaction,
+            &crate::engine::interrupt::InterruptHub::detached(),
+            &event_tx,
+            &driver_tx,
+            &HashMap::new(),
+        ),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, RedactionRefreshOutcome::Refused(ref message) if message.contains("exceeds the daemon file size limit")),
+        "got {outcome:?}"
+    );
+    assert!(
+        driver_rx.try_recv().is_err(),
+        "over-cap must not push a stale table onto the driver"
+    );
+}
+
 async fn persisted_notice_text(session: &Session) -> String {
     let events = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(events.len(), 1);

@@ -402,7 +402,7 @@ pub(crate) fn list_file_metas(
 }
 
 pub(super) fn count_lines(abs: &Path) -> usize {
-    match std::fs::read(abs) {
+    match crate::resource_limits::read_for_tool(abs) {
         Ok(b) if !b.contains(&0u8) => bytecount(&b),
         _ => 0,
     }

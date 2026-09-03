@@ -6946,6 +6946,7 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
         b"raw archive with s3cr3t",
         proto::bulk_transfer::BulkMimeClass::Export,
         raw_id,
+        &crate::resource_limits::ClientQuotaKey::for_test(1),
     )
     .expect("stage raw export");
 
@@ -7005,6 +7006,7 @@ async fn redacted_export_reader_rejects_non_export_transfer() {
         b"PK\x03\x04 import archive",
         proto::bulk_transfer::BulkMimeClass::Archive,
         archive_id,
+        &crate::resource_limits::ClientQuotaKey::for_test(1),
     )
     .expect("stage archive");
 
@@ -15577,8 +15579,14 @@ fn stage_opaque_user_transfer(
         .chunks(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES)
         .enumerate()
     {
-        crate::daemon::bulk_staging::write_chunk_owned(&reference, owner, index as u32, chunk)
-            .expect("stage opaque user chunk");
+        crate::daemon::bulk_staging::write_chunk_owned(
+            &reference,
+            owner,
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+            index as u32,
+            chunk,
+        )
+        .expect("stage opaque user chunk");
     }
     reference
 }
@@ -24915,12 +24923,23 @@ fn stage_archive_transfer(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef
     let reference = archive_transfer_ref(bytes);
     let chunk_size = crate::daemon::bulk_staging::STAGED_CHUNK_BYTES;
     if bytes.is_empty() {
-        crate::daemon::bulk_staging::write_chunk(&reference, 0, &[]).expect("stage empty archive");
+        crate::daemon::bulk_staging::write_chunk(
+            &reference,
+            0,
+            &[],
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+        )
+        .expect("stage empty archive");
         return reference;
     }
     for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-        crate::daemon::bulk_staging::write_chunk(&reference, index as u32, chunk)
-            .expect("stage chunk");
+        crate::daemon::bulk_staging::write_chunk(
+            &reference,
+            index as u32,
+            chunk,
+            &crate::resource_limits::ClientQuotaKey::for_test(1),
+        )
+        .expect("stage chunk");
     }
     reference
 }

@@ -3099,6 +3099,11 @@ impl Driver {
         }
     }
 
+    /// Rebuild the live redaction table from disk for this turn.
+    ///
+    /// Any failure refuses the send: the previous table stays live only as a
+    /// parked copy, not as permission to proceed. Over-cap env files, store
+    /// open failures, persist/union errors, and join errors all take this path.
     async fn refresh_redaction_table_for_turn(
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,

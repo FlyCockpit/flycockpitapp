@@ -80,9 +80,11 @@ impl ContainmentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
-    LinuxCgroup,
+    /// Native Linux process-group boundary (`ProcessTreeGuard`).
+    LinuxProcessGroup,
     WindowsJob,
-    MacosUnsupported,
+    /// Native macOS process-group boundary (`ProcessTreeGuard`).
+    MacosProcessGroup,
     Docker,
     Podman,
     Fake,
@@ -92,9 +94,9 @@ pub enum PlatformKind {
 impl PlatformKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::LinuxCgroup => "linux_cgroup",
+            Self::LinuxProcessGroup => "linux_process_group",
             Self::WindowsJob => "windows_job",
-            Self::MacosUnsupported => "macos_unsupported",
+            Self::MacosProcessGroup => "macos_process_group",
             Self::Docker => "docker",
             Self::Podman => "podman",
             Self::Fake => "fake",
@@ -104,9 +106,9 @@ impl PlatformKind {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "linux_cgroup" => Some(Self::LinuxCgroup),
+            "linux_process_group" => Some(Self::LinuxProcessGroup),
             "windows_job" => Some(Self::WindowsJob),
-            "macos_unsupported" => Some(Self::MacosUnsupported),
+            "macos_process_group" => Some(Self::MacosProcessGroup),
             "docker" => Some(Self::Docker),
             "podman" => Some(Self::Podman),
             "fake" => Some(Self::Fake),
@@ -115,6 +117,14 @@ impl PlatformKind {
         }
     }
 }
+
+/// Unix empty-oracle reason: SIGKILL delivered, the process group still has
+/// members. Not a terminal Uncertain — a later probe can observe Empty.
+pub const PROCESS_GROUP_STILL_POPULATED: &str = "process_group_still_populated";
+
+/// Windows empty-oracle reason: job terminate delivered, ActiveProcesses > 0.
+/// Not a terminal Uncertain — a later probe can observe Empty.
+pub const JOB_ACTIVE_PROCESSES_NONZERO: &str = "active_processes_nonzero";
 
 /// Result of await_empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +135,21 @@ pub enum EmptyOutcome {
     Uncertain { generation: u64, reason: String },
     /// Platform cannot provide Proven containment.
     Unsupported { reason: String },
+}
+
+impl EmptyOutcome {
+    /// True when terminate has been applied but the platform empty oracle
+    /// still sees members. This is not a terminal Uncertain: a later probe
+    /// can still observe Empty. Callers that need ProvenEmpty must re-probe
+    /// until this is false or their deadline fires.
+    pub fn is_drain_in_progress(&self) -> bool {
+        match self {
+            Self::Uncertain { reason, .. } => {
+                reason == PROCESS_GROUP_STILL_POPULATED || reason == JOB_ACTIVE_PROCESSES_NONZERO
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Typed errors from the containment actor.
@@ -156,9 +181,9 @@ pub enum ContainmentError {
     Internal(String),
 }
 
-/// Non-serializable lease token. Callers must not spawn user code outside the
-/// actor that issued this lease. Dropping does not terminate the group;
-/// cancellation drives Stopping + reconciliation.
+/// Non-serializable lease token. Callers spawn user code only into this
+/// lease's process-tree guard when the adapter provides one. Dropping does
+/// not terminate the group; cancellation drives Stopping + reconciliation.
 #[derive(Clone)]
 pub struct ContainmentLease {
     pub(crate) containment_id: Uuid,
@@ -280,13 +305,14 @@ pub enum ContainmentEvent {
         now_wall_ms: i64,
     },
     /// Platform allocation succeeded; membership not yet proven.
-    #[allow(dead_code)]
+    /// Durable state stays `Creating` with `pending_command = await_membership`.
     PlatformAllocated {
         generation: u64,
         locator: SafeLocator,
         now_wall_ms: i64,
     },
-    /// Spawn membership proven → Active.
+    /// Kernel membership proven → Active. Illegal unless `PlatformAllocated`
+    /// has already set `pending_command = await_membership`.
     MembershipProven {
         generation: u64,
         locator: SafeLocator,

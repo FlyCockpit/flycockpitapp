@@ -674,6 +674,7 @@ pub enum ActiveModelWriteMode {
 /// Read+write a provider config layer while preserving fields cockpit
 /// doesn't model. Global provider metadata lives in `config.json`; provider
 /// entries live in sibling `providers/*.json` files.
+#[derive(Debug)]
 pub struct ConfigDoc {
     pub path: PathBuf,
     pub(crate) raw: Value,
@@ -1064,9 +1065,12 @@ impl ConfigDoc {
         let path = config_path_for_layer_path(path);
         let raw_str = match mask {
             Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            None if path.exists() => std::fs::read_to_string(&path)
-                .with_context(|| format!("reading config.json at {}", path.display()))?,
-            None => "{}".to_string(),
+            None => match crate::config::files::read_workspace_config_text(&path)
+                .with_context(|| format!("reading config.json at {}", path.display()))?
+            {
+                Some(raw) => raw,
+                None => "{}".to_string(),
+            },
         };
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
@@ -1336,25 +1340,24 @@ impl ConfigDoc {
 
     fn provider_raw_object(&self, provider_id: &str) -> Result<Map<String, Value>> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
-        if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading provider config at {}", path.display()))?;
-            let value: Value = if raw.trim().is_empty() {
-                Value::Object(Map::new())
-            } else {
-                serde_json::from_str(&raw)
-                    .with_context(|| format!("parsing provider config at {}", path.display()))?
-            };
-            return match value {
-                Value::Object(map) => Ok(map),
-                other => anyhow::bail!(
-                    "expected provider config root to be an object at {}, found {other:?}",
-                    path.display()
-                ),
-            };
+        let Some(raw) = crate::config::files::read_workspace_config_text(&path)
+            .with_context(|| format!("reading provider config at {}", path.display()))?
+        else {
+            return Ok(Map::new());
+        };
+        let value: Value = if raw.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parsing provider config at {}", path.display()))?
+        };
+        match value {
+            Value::Object(map) => Ok(map),
+            other => anyhow::bail!(
+                "expected provider config root to be an object at {}, found {other:?}",
+                path.display()
+            ),
         }
-
-        Ok(Map::new())
     }
 
     fn persist_provider_raw_unlocked(
@@ -1817,8 +1820,14 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
 }
 
 pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading provider config at {}", path.display()))?;
+    let raw = crate::config::files::read_workspace_config_text(path)
+        .with_context(|| format!("reading provider config at {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "reading provider config at {}: file not found",
+                path.display()
+            )
+        })?;
     let value: Value = if raw.trim().is_empty() {
         Value::Object(Map::new())
     } else {
@@ -2034,6 +2043,40 @@ mod atomic_write_tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("non-empty executable"));
+    }
+
+    #[test]
+    fn load_fails_closed_when_config_json_exceeds_the_workspace_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let handle = std::fs::File::create(&path).unwrap();
+        handle
+            .set_len(crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+            .unwrap();
+        drop(handle);
+        let err = super::ConfigDoc::load(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exceeds the") && text.contains("byte limit"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn load_provider_raw_file_fails_closed_when_over_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.json");
+        let handle = std::fs::File::create(&path).unwrap();
+        handle
+            .set_len(crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+            .unwrap();
+        drop(handle);
+        let err = super::load_provider_raw_file(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exceeds the") && text.contains("byte limit"),
+            "{text}"
+        );
     }
 
     #[test]

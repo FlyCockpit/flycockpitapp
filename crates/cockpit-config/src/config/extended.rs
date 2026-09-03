@@ -2624,6 +2624,7 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
 /// metadata in the same file): the raw `Value` is held alongside the typed view
 /// so a write only overwrites the keys it models and never destroys the
 /// sibling layer/provider metadata (or fields a future cockpit version added).
+#[derive(Debug)]
 pub struct ExtendedConfigDoc {
     pub path: PathBuf,
     raw: Value,
@@ -2801,11 +2802,11 @@ impl ExtendedConfigDoc {
     /// [`ConfigLayerOrigin::Remote`] and `image_generation` is stripped at
     /// construction. See the [`ConfigLayerOrigin`] invariant.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw_str = if path.exists() {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("reading config.json at {}", path.display()))?
-        } else {
-            "{}".to_string()
+        let raw_str = match crate::config::files::read_workspace_config_text(path)
+            .with_context(|| format!("reading config.json at {}", path.display()))?
+        {
+            Some(raw) => raw,
+            None => "{}".to_string(),
         };
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())

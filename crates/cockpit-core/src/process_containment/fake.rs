@@ -11,8 +11,8 @@ use super::adapter::{
     NativeSpawnRequest,
 };
 use super::types::{
-    ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
-    SafeLocator,
+    ContainmentError, ContainmentGuarantee, EmptyOutcome, PROCESS_GROUP_STILL_POPULATED,
+    PlatformKind, SafeContainmentMetadata, SafeLocator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,6 +35,9 @@ struct FakeInner {
     /// kill fails once
     kill_fail_once: bool,
     empty_mode: FakeEmptyMode,
+    /// Remaining await_empty probes that report drain-in-progress Uncertain
+    /// even after terminate, then ProvenEmpty. Exercises post-SIGKILL re-poll.
+    drain_probes_remaining: u32,
     /// recovered locators seen
     recover_log: Vec<(String, u64)>,
     /// container full ids by generation
@@ -74,6 +77,10 @@ impl FakeProvenAdapter {
 
     pub fn set_empty_mode(&self, mode: FakeEmptyMode) {
         self.inner.lock().unwrap().empty_mode = mode;
+    }
+
+    pub fn set_drain_probes(&self, n: u32) {
+        self.inner.lock().unwrap().drain_probes_remaining = n;
     }
 
     pub fn force_unsupported(&self, reason: impl Into<String>) {
@@ -211,6 +218,24 @@ impl ContainmentAdapter for FakeProvenAdapter {
         })
     }
 
+    async fn prove_membership(
+        &self,
+        handle: &AdapterHandle,
+        generation: u64,
+    ) -> Result<(), ContainmentError> {
+        let g = self.inner.lock().unwrap();
+        match g.groups.get(&handle.key) {
+            Some((entry_gen, _)) if *entry_gen == generation => Ok(()),
+            Some((entry_gen, _)) => Err(ContainmentError::GenerationMismatch {
+                expected: *entry_gen,
+                got: generation,
+            }),
+            None => Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: "fake_group_missing_membership_unproven".into(),
+            }),
+        }
+    }
+
     async fn terminate(
         &self,
         handle: &AdapterHandle,
@@ -239,7 +264,7 @@ impl ContainmentAdapter for FakeProvenAdapter {
         handle: &AdapterHandle,
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         match g.empty_mode {
             FakeEmptyMode::Hang => {
                 return Ok(EmptyOutcome::Uncertain {
@@ -255,13 +280,20 @@ impl ContainmentAdapter for FakeProvenAdapter {
             }
             FakeEmptyMode::ProvenEmpty => {}
         }
+        if g.drain_probes_remaining > 0 {
+            g.drain_probes_remaining -= 1;
+            return Ok(EmptyOutcome::Uncertain {
+                generation,
+                reason: PROCESS_GROUP_STILL_POPULATED.into(),
+            });
+        }
         match g.groups.get(&handle.key) {
             Some((entry_gen, populated)) if *entry_gen == generation && !*populated => {
                 Ok(EmptyOutcome::ProvenEmpty { generation })
             }
             Some((entry_gen, true)) if *entry_gen == generation => Ok(EmptyOutcome::Uncertain {
                 generation,
-                reason: "still_populated".into(),
+                reason: PROCESS_GROUP_STILL_POPULATED.into(),
             }),
             Some((entry_gen, _)) => Ok(EmptyOutcome::Uncertain {
                 generation,
@@ -321,14 +353,14 @@ impl FakeUnsupportedAdapter {
     pub fn macos() -> Self {
         Self {
             reason: "macos_no_unprivileged_descendant_container".into(),
-            kind: PlatformKind::MacosUnsupported,
+            kind: PlatformKind::MacosProcessGroup,
         }
     }
 
     pub fn management_boundary() -> Self {
         Self {
             reason: "management_boundary_unavailable".into(),
-            kind: PlatformKind::LinuxCgroup,
+            kind: PlatformKind::LinuxProcessGroup,
         }
     }
 }
@@ -362,6 +394,16 @@ impl ContainmentAdapter for FakeUnsupportedAdapter {
         req: NativeSpawnRequest,
     ) -> Result<AllocatedContainment, ContainmentError> {
         let _ = req;
+        Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: self.reason.clone(),
+        })
+    }
+
+    async fn prove_membership(
+        &self,
+        _handle: &AdapterHandle,
+        _generation: u64,
+    ) -> Result<(), ContainmentError> {
         Err(ContainmentError::DescendantContainmentUnavailable {
             reason: self.reason.clone(),
         })

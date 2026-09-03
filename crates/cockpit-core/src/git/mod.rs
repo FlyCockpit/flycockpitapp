@@ -695,7 +695,7 @@ pub(crate) fn path_content_digest(
         return Ok(digest_path_identity(b"symlink", b"120000", &payload));
     }
     if file_type.is_file() {
-        let payload = std::fs::read(&path)
+        let payload = crate::resource_limits::read_for_tool(&path)
             .with_context(|| format!("reading `{}` for receipt", path.display()))?;
         let mode = worktree_regular_file_mode(dir, relative, &metadata)?;
         return Ok(digest_path_identity(b"file", mode, &payload));
@@ -1269,6 +1269,26 @@ mod path_identity_tests {
         assert_eq!(
             head_manifest_digest(repo, ["tool.sh"]).unwrap(),
             manifest_digest(repo, ["tool.sh"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn path_content_digest_refuses_an_oversized_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        let path = repo.join("huge.bin");
+        let handle = std::fs::File::create(&path).unwrap();
+        handle
+            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
+            .unwrap();
+        drop(handle);
+        let err = path_content_digest(repo, "huge.bin")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("byte limit") || err.contains("receipt"),
+            "{err}"
         );
     }
 }

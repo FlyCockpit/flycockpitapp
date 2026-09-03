@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -312,59 +312,14 @@ where
 
     /// Read one `\n`-terminated line from the child's stdout into `buf`,
     /// failing if the line would exceed `STDIO_LINE_MAX_BYTES`.
-    ///
-    /// This replaces `AsyncBufReadExt::read_line`, whose accumulator grows
-    /// without bound: a malicious or broken stdio MCP server could emit a
-    /// single newline-free line and OOM the host. We drain the underlying
-    /// `BufReader` a chunk at a time (each chunk bounded by the reader's
-    /// capacity) and abort once the accumulated line crosses the cap. Return
-    /// value matches `read_line`: the number of bytes appended, `0` at EOF.
     async fn read_line_capped(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        let mut bytes: Vec<u8> = Vec::new();
-        loop {
-            let available = loop {
-                match self.stdout.fill_buf().await {
-                    Ok(chunk) => break chunk,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-            if available.is_empty() {
-                // EOF: return whatever we accumulated before the stream closed
-                // (may be a final unterminated line, exactly as `read_line`).
-                break;
-            }
-            let newline = available.iter().position(|&b| b == b'\n');
-            let take = newline.map(|pos| pos + 1).unwrap_or(available.len());
-            bytes.extend_from_slice(&available[..take]);
-            self.stdout.consume(take);
-            if bytes.len() > STDIO_LINE_MAX_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "stdio MCP line exceeded {STDIO_LINE_MAX_BYTES} bytes; \
-                         treating server as hostile"
-                    ),
-                ));
-            }
-            if newline.is_some() {
-                break;
-            }
-        }
-        // Validate UTF-8 in place rather than via `String::from_utf8`, which
-        // would allocate a second full copy of a large line before `push_str`
-        // copies it a third time — keeping peak memory to `bytes` + `buf`.
-        match std::str::from_utf8(&bytes) {
-            Ok(line) => {
-                buf.push_str(line);
-                Ok(line.len())
-            }
-            // Mirror `read_line`, which rejects non-UTF-8 with `InvalidData`.
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )),
-        }
+        cockpit_host::bounded::read_line_capped(
+            &mut self.stdout,
+            buf,
+            STDIO_LINE_MAX_BYTES,
+            "stdio MCP line",
+        )
+        .await
     }
 
     async fn request_unbounded(

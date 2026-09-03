@@ -93,8 +93,8 @@ impl Tool for OutlineTool {
                 crate::tools::shell_sandbox::SandboxPathAccess::Read,
             )
             .await?;
-            let body = match std::fs::read_to_string(&checked) {
-                Ok(b) => b,
+            let body = match crate::resource_limits::read_for_tool(&checked) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(e) => {
                     return Err(invalid_input(format!("read `{rel}`: {e}")));
                 }

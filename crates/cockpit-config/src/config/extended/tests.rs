@@ -1192,6 +1192,23 @@ fn redact_dotenv_patterns_round_trip_and_default_when_absent() {
 }
 
 #[test]
+fn load_fails_closed_when_config_json_exceeds_the_workspace_cap() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    let handle = std::fs::File::create(&path).unwrap();
+    handle
+        .set_len(crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES as u64 + 1)
+        .unwrap();
+    drop(handle);
+    let err = ExtendedConfigDoc::load(&path).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("exceeds the") && text.contains("byte limit"),
+        "{text}"
+    );
+}
+
+#[test]
 fn new_keys_round_trip_through_extended_doc() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

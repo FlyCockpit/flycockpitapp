@@ -618,6 +618,22 @@ mod input_policy {
         let err = transform_bytes(&oversized, None, None, None, OutputFormat::Png).unwrap_err();
         assert!(err.to_string().contains("decompression bomb"));
     }
+
+    #[test]
+    fn read_image_transform_rejects_dimensions_over_the_central_limit() {
+        let limits = crate::resource_limits::ResourceLimits::defaults();
+        let bomb = crate::media_image::encode_solid_rgb_png(limits.image_max_width + 1, 8);
+        let mut unbounded = crate::media_image::ImageProfile::read_image();
+        unbounded.max_width = None;
+        unbounded.max_height = None;
+        unbounded.max_pixels = None;
+        unbounded.max_alloc = None;
+        crate::media_image::decode_and_orient(&bomb, &unbounded)
+            .expect("fixture must decode when dimension bounds are absent");
+        let err = transform_bytes(&bomb, None, None, None, OutputFormat::Png).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("resource_limit"), "{text}");
+    }
 }
 
 // ===========================================================================

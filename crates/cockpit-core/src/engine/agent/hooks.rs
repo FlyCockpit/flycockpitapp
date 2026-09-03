@@ -117,9 +117,10 @@ pub(crate) const REASON_UNKNOWN_OR_MISSING_DECISION: &str = "unknown or missing 
 /// never launched because attached KB access is read-only.
 pub(crate) const REASON_LOCAL_KNOWLEDGE_WRITE_FENCE: &str = "local_knowledge_write_fence";
 
-/// Bounded deadline for the post-run empty barrier. A single `terminate` +
-/// single `await_empty` actor round-trip already bounds the common case; this
-/// deadline guarantees that even a stuck platform oracle can never hang the
+/// Bounded deadline for the post-run empty barrier. `terminate` plus
+/// re-probes of `await_empty` until ProvenEmpty or a terminal Uncertain
+/// run under this cap so a delivered SIGKILL that has not yet drained has
+/// a path to ProvenEmpty, while a stuck actor/platform can never hang the
 /// turn — on elapse the outcome is treated as uncertain (recovery row kept),
 /// never as proven-empty settlement.
 pub(crate) const CONTAINMENT_EMPTY_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -918,12 +919,16 @@ async fn terminate_and_await_empty(
     handle: &ProcessContainmentHandle,
     lease: ContainmentLease,
 ) -> EmptyBarrier {
-    // A single terminate + single await_empty actor round-trip — NOT a busy
-    // loop. The WHOLE sequence (both `terminate` and `await_empty`) is under one
-    // deadline so a stuck actor/platform on EITHER call can never hang the turn.
+    // Terminate once, then re-probe await_empty while the oracle reports
+    // drain-in-progress. Adapter `await_empty` is a short probe (~100ms on
+    // Unix); a delivered SIGKILL that has not yet drained must still reach
+    // ProvenEmpty inside this deadline. The WHOLE sequence is under one
+    // timeout so a stuck actor/platform can never hang the turn.
     let sequence = async {
         handle.terminate(lease.clone()).await?;
-        handle.await_empty(lease).await
+        handle
+            .await_empty_until(lease, CONTAINMENT_EMPTY_BARRIER_TIMEOUT)
+            .await
     };
     match tokio::time::timeout(CONTAINMENT_EMPTY_BARRIER_TIMEOUT, sequence).await {
         Ok(Ok(EmptyOutcome::ProvenEmpty { .. })) => EmptyBarrier::ProvenEmpty,
@@ -968,8 +973,7 @@ impl Drop for HookLeaseGuard {
             return;
         };
         // A dropped future cannot await; hand the SAME bounded terminate +
-        // await_empty to a detached task if a runtime is available. This is a
-        // single terminate + single await — never a busy loop.
+        // drain re-probe to a detached task if a runtime is available.
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let handle = self.handle.clone();
             rt.spawn(async move {
@@ -987,8 +991,10 @@ impl Drop for HookLeaseGuard {
 ///    [`REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED`] WITHOUT running the child.
 /// 2. Run the real child (`spawn_child`) under the lease, guarded so a dropped
 ///    future still terminates it.
-/// 3. Bounded `terminate` + `await_empty`. Only `EmptyOutcome::ProvenEmpty`
-///    settles the real outcome; `Uncertain`/`Unsupported`-after-spawn yields
+/// 3. Bounded `terminate` + re-probed `await_empty` until ProvenEmpty, a
+///    terminal Uncertain, or [`CONTAINMENT_EMPTY_BARRIER_TIMEOUT`]. Only
+///    `EmptyOutcome::ProvenEmpty` settles the real outcome;
+///    `Uncertain`/`Unsupported`-after-spawn yields
 ///    [`REASON_DESCENDANT_CONTAINMENT_UNCERTAIN`] (recovery row kept) and an
 ///    actor error yields [`REASON_DESCENDANT_CONTAINMENT_FAILED`].
 ///
@@ -1008,9 +1014,10 @@ where
     F: FnOnce(ContainmentLease) -> Fut,
     Fut: Future<Output = ChildRunOutcome>,
 {
-    // Transient program/args/cwd for the lease. They are NOT persisted: the
-    // actor records only `operation_id` + content-free `SafeLocator`; env and
-    // stdin never reach the lease at all.
+    // Transient program/args/cwd for the lease identity. They are NOT
+    // persisted and MUST NOT be executed by the adapter: the actor records
+    // only `operation_id` + content-free `SafeLocator`; env and stdin never
+    // reach the lease at all. This runner is the only spawn of user code.
     let operation_id = format!("hook-{}", Uuid::new_v4());
     let lease = match handle
         .create_and_spawn(session_id, operation_id, program, args, cwd, true)
@@ -1073,11 +1080,17 @@ where
 
 /// Spawn the real hook child via `tokio::process` and capture bounded output.
 ///
-/// This is the production execution seam — a plain cross-platform
+/// This is the production execution seam — a cross-platform
 /// `tokio::process::Command` with `env_clear`, piped stdio, an independent
 /// stdout cap, and `kill_on_drop(true)` (in addition to the lease terminate +
-/// empty barrier that owns cancellation). It is invoked from inside
-/// [`run_hook_child_contained`] only after a proven lease exists.
+/// empty barrier that owns cancellation). When `tree` is present (Windows Job
+/// Object or Unix process-group lease), spawn flags are applied, the child
+/// is assigned, and membership is proven on the actor. Windows then
+/// `ResumeThread`s after this function is already running under
+/// [`HookLeaseGuard`]; Unix `process_group(0)` already contained the child
+/// at exec, so resume is a no-op. It is invoked from inside
+/// [`run_hook_child_contained`] only after an allocated lease exists.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_real_hook_child(
     executable: &Path,
     args: &[String],
@@ -1085,6 +1098,8 @@ async fn spawn_real_hook_child(
     working_directory: &HookWorkingDirectory,
     stdin: &str,
     timeout: Duration,
+    tree: Option<&cockpit_host::process::ProcessTreeGuard>,
+    membership: Option<(&ProcessContainmentHandle, &ContainmentLease)>,
 ) -> ChildRunOutcome {
     // Keep the existing `Command::new(executable)` dispatch on Windows. Rust's
     // Windows implementation recognizes `.cmd` / `.bat`, resolves the system
@@ -1143,6 +1158,9 @@ async fn spawn_real_hook_child(
     // Drop-safety for the local child handle, IN ADDITION TO the lease
     // terminate + empty barrier (never the sole authority).
     cmd.kill_on_drop(true);
+    if let Some(tree) = tree {
+        tree.apply_spawn_flags(&mut cmd);
+    }
 
     #[cfg(windows)]
     if let Some(directory) = &retained_windows_cwd {
@@ -1170,6 +1188,52 @@ async fn spawn_real_hook_child(
             };
         }
     };
+    if let Some(tree) = tree {
+        if tree.assign(&child).is_err() {
+            // assign marks the guard Unattributable so the empty oracle cannot
+            // settle ProvenEmpty for a lease that already ran user code.
+            let _ = tree.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+        if !prove_lease_membership(membership).await {
+            let _ = tree.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+        if tree.resume(&child).is_err() {
+            let _ = tree.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+    } else if !prove_lease_membership(membership).await {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return ChildRunOutcome {
+            stdout: String::new(),
+            exit_code: None,
+            spawn_failed: true,
+            timed_out: false,
+        };
+    }
 
     // Take all three pipes so stdin write, stdout capture, and stderr drain run
     // CONCURRENTLY. Writing the whole stdin before reading (or never reading
@@ -1237,8 +1301,27 @@ async fn spawn_real_hook_child(
     // kills the whole containment group (descendants included), which is the real
     // authority for closing inherited pipes.
     let interaction = async {
+        let wait_fut = async {
+            // Unix: observe exit without reaping so the leader PID still pins
+            // the process-group identity while terminate SIGKILLs the group.
+            // Terminate while that pin is held, even if observation fails: a
+            // failed waitid is not permission to reap-then-signal. Reap only
+            // afterward. Windows Job handles are kernel objects and do not
+            // have this recycled-identity constraint. The guard itself also
+            // refuses to signal a Unix pgid without the pin.
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id() {
+                    let _ = cockpit_host::process::wait_for_exit_without_reaping(pid).await;
+                }
+                if let Some(tree) = tree {
+                    let _ = tree.terminate();
+                }
+            }
+            child.wait().await
+        };
         let (_stdin_done, stdout_result, _stderr_drained, wait_res) =
-            tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait());
+            tokio::join!(stdin_fut, stdout_fut, stderr_fut, wait_fut);
         (stdout_result, wait_res)
     };
 
@@ -1261,14 +1344,18 @@ async fn spawn_real_hook_child(
             }
         }
         Err(_elapsed) => {
-            // Deadline hit. Kill+reap the direct child, but keep the reap itself
-            // BOUNDED: an uninterruptible (D-state) child, or a `start_kill` that
-            // does not immediately take, must not turn this into another
-            // unbounded await that stalls the caller's lease teardown. The
-            // `kill_on_drop(true)` handle plus the caller's
-            // `terminate_and_await_empty` (which kills the whole containment
-            // group) are the ultimate authority. Partial stdout is intentionally
-            // dropped: the caller maps `timeout` to Failed and never parses it.
+            // Deadline hit. SIGKILL the containment group while the leader is
+            // still unreaped (pinning the Unix pgid), then reap the direct
+            // child under a bound. An uninterruptible (D-state) child, or a
+            // `start_kill` that does not immediately take, must not turn this
+            // into another unbounded await that stalls the caller's lease
+            // teardown. The `kill_on_drop(true)` handle plus the caller's
+            // `terminate_and_await_empty` are the ultimate authority. Partial
+            // stdout is intentionally dropped: the caller maps `timeout` to
+            // Failed and never parses it.
+            if let Some(tree) = tree {
+                let _ = tree.terminate();
+            }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(HOOK_CHILD_REAP_GRACE, child.wait()).await;
             ChildRunOutcome {
@@ -1295,9 +1382,68 @@ pub(crate) async fn spawn_real_hook_child_for_test(
     stdin: &str,
     timeout: Duration,
 ) -> (String, bool, bool) {
-    let output =
-        spawn_real_hook_child(executable, args, env, working_directory, stdin, timeout).await;
+    let output = spawn_real_hook_child(
+        executable,
+        args,
+        env,
+        working_directory,
+        stdin,
+        timeout,
+        None,
+        None,
+    )
+    .await;
     (output.stdout, output.spawn_failed, output.timed_out)
+}
+
+fn spawn_failed_outcome() -> ChildRunOutcome {
+    ChildRunOutcome {
+        stdout: String::new(),
+        exit_code: None,
+        spawn_failed: true,
+        timed_out: false,
+    }
+}
+
+async fn prove_lease_membership(
+    membership: Option<(&ProcessContainmentHandle, &ContainmentLease)>,
+) -> bool {
+    let Some((handle, lease)) = membership else {
+        return true;
+    };
+    handle.prove_membership(lease).await.is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_hook_child_for_lease(
+    handle: &ProcessContainmentHandle,
+    lease: &ContainmentLease,
+    executable: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    working_directory: &HookWorkingDirectory,
+    stdin: &str,
+    timeout: Duration,
+) -> ChildRunOutcome {
+    let tree = match handle.process_tree_guard(lease).await {
+        Ok(tree) => tree,
+        Err(_) => return spawn_failed_outcome(),
+    };
+    if tree.is_none() {
+        // A Proven native lease without a process-tree guard would spawn uncontained.
+        return spawn_failed_outcome();
+    }
+    spawn_real_hook_child(
+        executable,
+        args,
+        env,
+        working_directory,
+        stdin,
+        timeout,
+        tree.as_deref(),
+        Some((handle, lease)),
+    )
+    .await
 }
 
 /// Production command runner using tokio::process under a containment lease.
@@ -1363,6 +1509,7 @@ impl CommandRunner for TokioCommandRunner {
         let working_directory = HookWorkingDirectory::Path(cwd.to_path_buf());
         let env_owned = env.clone();
         let stdin_owned = stdin.to_string();
+        let tree_handle = handle.clone();
         run_hook_child_contained(
             &handle,
             session_id,
@@ -1370,8 +1517,10 @@ impl CommandRunner for TokioCommandRunner {
             args_owned.clone(),
             cwd.to_path_buf(),
             start,
-            move |_lease| async move {
-                spawn_real_hook_child(
+            move |lease| async move {
+                spawn_hook_child_for_lease(
+                    &tree_handle,
+                    &lease,
                     &program,
                     &args_owned,
                     &env_owned,
@@ -1411,6 +1560,7 @@ impl CommandRunner for TokioCommandRunner {
         // label / grouping input. It never determines the child's cwd: the
         // spawn closure below performs capability-backed fchdir on Unix.
         let containment_cwd = ambient_workspace_root.to_path_buf();
+        let tree_handle = handle.clone();
         run_hook_child_contained(
             &handle,
             session_id,
@@ -1418,8 +1568,10 @@ impl CommandRunner for TokioCommandRunner {
             args_owned.clone(),
             containment_cwd,
             start,
-            move |_lease| async move {
-                spawn_real_hook_child(
+            move |lease| async move {
+                spawn_hook_child_for_lease(
+                    &tree_handle,
+                    &lease,
                     &program,
                     &args_owned,
                     &env_owned,

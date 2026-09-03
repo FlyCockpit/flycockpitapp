@@ -1075,12 +1075,7 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
     if trimmed.is_empty() {
         return "[skill command error: empty command]".to_string();
     }
-    let (shell, shell_arg) = bang_command_shell();
-    let output = Command::new(shell)
-        .arg(shell_arg)
-        .arg(trimmed)
-        .current_dir(cwd)
-        .output();
+    let output = bang_command_invocation(trimmed).current_dir(cwd).output();
     match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1126,14 +1121,40 @@ fn scrub_bang_output(redact: &RedactionTable, text: &str) -> String {
     redact.scrub_novel_command_output_secrets(&redact.scrub(text))
 }
 
-#[cfg(windows)]
-fn bang_command_shell() -> (&'static str, &'static str) {
-    ("cmd", "/C")
+/// The fixed `!`-command shell invocation (owner-adopted design, Windows
+/// launch decision): the platform's executable shell with no profile, no
+/// interactive state, and explicit UTF-8.  The skill command text is passed
+/// as the whole script argument — there is no implicit command-shell string
+/// interpolation beyond the documented skill syntax, and the shell choice
+/// is deliberately not a config knob.
+#[cfg(not(windows))]
+fn bang_command_invocation(command: &str) -> Command {
+    let mut invocation = Command::new("sh");
+    invocation.arg("-c").arg(command);
+    invocation
 }
 
-#[cfg(not(windows))]
-fn bang_command_shell() -> (&'static str, &'static str) {
-    ("sh", "-c")
+#[cfg(windows)]
+fn bang_command_invocation(command: &str) -> Command {
+    let mut invocation = Command::new("powershell");
+    invocation
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(windows_bang_script(command));
+    invocation
+}
+
+/// One PowerShell script: an explicit UTF-8 preamble (console and pipeline
+/// encodings), the verbatim skill command, and `exit $LASTEXITCODE` so a
+/// failing native command reports its exit status the way `sh -c` does.
+#[cfg(windows)]
+fn windows_bang_script(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         $OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         {command}; exit $LASTEXITCODE"
+    )
 }
 
 /// Locate a discovered skill by exact `name`. Used by the `skill` tool's
@@ -1820,16 +1841,35 @@ mod tests {
         assert_eq!(out, body);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(not(windows))]
-    async fn bang_command_shell_uses_sh_on_unix_like_platforms() {
-        assert_eq!(bang_command_shell(), ("sh", "-c"));
+    fn bang_command_invocation_uses_sh_on_unix_like_platforms() {
+        let invocation = bang_command_invocation("echo hi");
+        assert_eq!(invocation.get_program(), "sh");
+        let args: Vec<_> = invocation.get_args().collect();
+        assert_eq!(args, ["-c", "echo hi"]);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(windows)]
-    async fn bang_command_shell_uses_cmd_on_windows() {
-        assert_eq!(bang_command_shell(), ("cmd", "/C"));
+    fn bang_command_invocation_uses_powershell_with_no_profile_and_explicit_utf8() {
+        let invocation = bang_command_invocation("Write-Output ok");
+        assert_eq!(invocation.get_program(), "powershell");
+        let args: Vec<_> = invocation.get_args().collect();
+        assert_eq!(args[0], "-NoProfile");
+        assert!(args.contains(&"-NonInteractive"));
+        assert!(args.contains(&"-Command"));
+        let script = args
+            .last()
+            .expect("the script is the final argument")
+            .to_string_lossy()
+            .into_owned();
+        assert!(script.contains("UTF8Encoding"), "{script:?}");
+        assert!(script.contains("exit $LASTEXITCODE"), "{script:?}");
+        assert!(script.contains("Write-Output ok"), "{script:?}");
+        // The command is the whole script, not interpolated into an
+        // implicit command shell.
+        assert!(!args.iter().any(|arg| *arg == "cmd"), "{script:?}");
     }
 
     #[test]
@@ -1932,6 +1972,65 @@ mod tests {
         assert!(!out.contains("novel-stderr-secret-77aa"), "got {out:?}");
         assert!(out.contains("[skill command"), "got {out:?}");
         assert!(out.contains("DB_PASSWORD="), "got {out:?}");
+    }
+
+    // Windows twins of the `!`-command scrub proofs above, exercised through
+    // the PowerShell invocation: the C5 substitution-site scrub must cover
+    // the Windows path identically (issue #283).
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_redacts_novel_secret_read_from_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("leak.env"),
+            "AWS_SESSION_TOKEN=freshly-minted-novel-token-8842\n",
+        )
+        .unwrap();
+        // `cat` is the PowerShell alias for Get-Content.
+        let body = "env dump: !`cat leak.env`";
+        let out = trusted_render_body(body, tmp.path(), true, &no_redact());
+        assert!(
+            !out.contains("freshly-minted-novel-token-8842"),
+            "got {out:?}"
+        );
+        assert!(
+            out.contains("AWS_SESSION_TOKEN=") && out.contains("REDACTED"),
+            "key is preserved and the value redacted, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_scrubs_table_known_secret_in_error_marker() {
+        let cfg = RedactConfig {
+            denylist: vec!["TABLESTDERRSECRET7".to_string()],
+            scan_ssh_keys: false,
+            ..Default::default()
+        };
+        let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
+        let body = "x !`Write-Error TABLESTDERRSECRET7; exit 1` y";
+        let out = render_body(body, Path::new("."), true, false, &redact);
+        assert!(!out.contains("TABLESTDERRSECRET7"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_redacts_novel_secret_in_error_marker_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("err.env"),
+            "DB_PASSWORD=novel-stderr-secret-77aa\n",
+        )
+        .unwrap();
+        let body = "x !`$s = Get-Content err.env; [Console]::Error.WriteLine($s); exit 1` y";
+        let out = render_body(body, tmp.path(), true, false, &no_redact());
+        assert!(!out.contains("novel-stderr-secret-77aa"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+        assert!(
+            out.contains("DB_PASSWORD=") && out.contains("REDACTED"),
+            "key is preserved and the value redacted, got {out:?}"
+        );
     }
 
     #[test]

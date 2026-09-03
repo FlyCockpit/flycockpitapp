@@ -178,10 +178,7 @@ unsafe extern "system" {
         flags: u32,
         template: Handle,
     ) -> Handle;
-    fn GetFileInformationByHandle(
-        file: Handle,
-        information: *mut ByHandleFileInformation,
-    ) -> i32;
+    fn GetFileInformationByHandle(file: Handle, information: *mut ByHandleFileInformation) -> i32;
     fn FlushFileBuffers(file: Handle) -> i32;
 }
 
@@ -201,7 +198,10 @@ fn io_from_status(status: i32) -> io::Error {
         STATUS_ACCESS_DENIED => io::ErrorKind::PermissionDenied,
         _ => io::ErrorKind::Other,
     };
-    io::Error::new(kind, format!("NT syscall failed with NTSTATUS {status:#010x}"))
+    io::Error::new(
+        kind,
+        format!("NT syscall failed with NTSTATUS {status:#010x}"),
+    )
 }
 
 fn invalid_input(message: &str) -> io::Error {
@@ -219,7 +219,9 @@ fn invalid_input(message: &str) -> io::Error {
 fn component_units(name: &OsStr) -> io::Result<Vec<u16>> {
     let units = name.encode_wide().collect::<Vec<_>>();
     if units.is_empty() || units.len() > (u16::MAX as usize / 2) {
-        return Err(invalid_input("held Windows component name is empty or too long"));
+        return Err(invalid_input(
+            "held Windows component name is empty or too long",
+        ));
     }
     if name == std::ffi::OsStr::new(".")
         || name == std::ffi::OsStr::new("..")
@@ -388,7 +390,9 @@ pub fn open_volume_root(path: &Path) -> io::Result<std::fs::File> {
         }
     };
     if !matches!(components.next(), Some(Component::RootDir)) {
-        return Err(invalid_input("Windows held skill root requires a rooted path"));
+        return Err(invalid_input(
+            "Windows held skill root requires a rooted path",
+        ));
     }
     let root = format!("{}:\\", char::from(drive));
     let wide = std::ffi::OsStr::new(&root)
@@ -508,10 +512,7 @@ pub fn create_file_exclusive_child(
 /// proven directory open first and falls back to the proven regular-file
 /// open, so only exercised open modes are used; a reparse point of either
 /// shape is opened as itself and reported as [`EntryKind::ReparsePoint`].
-pub fn entry_kind_nofollow(
-    parent: &std::fs::File,
-    name: &OsStr,
-) -> io::Result<Option<EntryKind>> {
+pub fn entry_kind_nofollow(parent: &std::fs::File, name: &OsStr) -> io::Result<Option<EntryKind>> {
     let directory_open = create_relative(
         parent,
         name,
@@ -554,7 +555,9 @@ pub fn entry_kind_nofollow(
 }
 
 fn is_status(error: &io::Error, status: i32) -> bool {
-    error.to_string().contains(&format!("NTSTATUS {status:#010x}"))
+    error
+        .to_string()
+        .contains(&format!("NTSTATUS {status:#010x}"))
 }
 
 // ------------------------------------------------------------------------
@@ -597,7 +600,13 @@ pub fn rename_child_noreplace(
     destination_parent: &std::fs::File,
     destination: &OsStr,
 ) -> io::Result<()> {
-    rename_child(source_parent, source, destination_parent, destination, false)
+    rename_child(
+        source_parent,
+        source,
+        destination_parent,
+        destination,
+        false,
+    )
 }
 
 /// Rename a child between held parents, replacing an existing regular
@@ -705,7 +714,9 @@ fn delete_child(
         ));
     };
     if kind != expected {
-        return Err(invalid_input("held Windows delete subject has the wrong kind"));
+        return Err(invalid_input(
+            "held Windows delete subject has the wrong kind",
+        ));
     }
     let object_attributes = if enumerated {
         OBJ_DONT_REPARSE
@@ -843,6 +854,7 @@ pub fn list_children(dir: &std::fs::File) -> io::Result<Vec<OsString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::OpenOptionsExt as _;
 
     /// Open the test directory itself as a held handle through plain std
     /// APIs: `FILE_FLAG_BACKUP_SEMANTICS` as a custom flag is what lets
@@ -865,11 +877,8 @@ mod tests {
         assert!(open_dir_child(&root, std::ffi::OsStr::new("leaf")).is_err());
         assert!(open_file_child(&root, std::ffi::OsStr::new("missing")).is_err());
         std::fs::create_dir(temp.path().join("target")).unwrap();
-        if std::os::windows::fs::symlink_dir(
-            temp.path().join("target"),
-            temp.path().join("alias"),
-        )
-        .is_ok()
+        if std::os::windows::fs::symlink_dir(temp.path().join("target"), temp.path().join("alias"))
+            .is_ok()
         {
             assert!(open_dir_child(&root, std::ffi::OsStr::new("alias")).is_err());
             assert_eq!(
@@ -918,8 +927,7 @@ mod tests {
             .kind(),
             io::ErrorKind::NotFound
         );
-        let mut file =
-            create_file_exclusive_child(&root, std::ffi::OsStr::new("data")).unwrap();
+        let mut file = create_file_exclusive_child(&root, std::ffi::OsStr::new("data")).unwrap();
         use std::io::Write as _;
         file.write_all(b"held").unwrap();
         drop(file);

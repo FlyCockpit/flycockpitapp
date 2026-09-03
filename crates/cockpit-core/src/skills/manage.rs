@@ -44,6 +44,17 @@ type PreparedRootCapability = UnixPreparedSkillRoot;
 #[cfg(windows)]
 type PreparedRootCapability = WindowsPreparedSkillRoot;
 
+/// The retained identity of the prepared skill package that later
+/// mutations compare a freshly no-follow-opened package against.  Unix
+/// keeps the open descriptor; Windows keeps the volume-serial plus
+/// file-index value and closes the handle, because a Windows disposition
+/// delete completes only when the last handle closes — a retained live
+/// handle would block the tombstone deletion in the delete path.
+#[cfg(unix)]
+type RetainedPackageIdentity = std::fs::File;
+#[cfg(windows)]
+type RetainedPackageIdentity = cockpit_host::private_fs::held_nt::HandleIdentity;
+
 /// What a no-follow entry probe reported beneath a held parent.  On Windows
 /// a reparse point (junction / symlink / mount point) is the twin of the
 /// Unix symlink refusal.
@@ -710,18 +721,28 @@ impl<'a> SkillMutationService<'a> {
         }
         let writable_root = PreparedSkillRoot::open_existing(&writable_root)?;
         let package_parent = writable_root.package_parent(&package)?;
-        let package_name = component_buf_os(
-            package
-                .file_name()
-                .context("skill package has no name")?,
-        )?;
+        let package_name =
+            component_buf_os(package.file_name().context("skill package has no name")?)?;
         // Capture and retain the package descriptor while preflight is still
         // under its native read fence.  The final mutation later compares a
         // freshly no-follow-opened package to this identity before staging;
         // an already-swapped package or symlink is rejected rather than
-        // silently receiving a prepared operation.
+        // silently receiving a prepared operation.  On Windows only the
+        // stable identity is retained (see `RetainedPackageIdentity`).
+        #[cfg(unix)]
         let package_directory = open_directory_child(&package_parent, &package_name)
             .with_context(|| format!("opening prepared skill package {}", package.display()))?;
+        #[cfg(windows)]
+        let package_directory = {
+            let held = open_directory_child(&package_parent, &package_name)
+                .with_context(|| format!("opening prepared skill package {}", package.display()))?;
+            cockpit_host::private_fs::held_nt::handle_identity(&held).with_context(|| {
+                format!(
+                    "reading prepared skill package identity {}",
+                    package.display()
+                )
+            })?
+        };
         Ok(ManagedTarget {
             skill,
             package,
@@ -808,9 +829,9 @@ impl PreparedSkillRoot {
     }
 
     fn open_existing(path: &Path) -> Result<Self> {
-        let canonical = path.canonicalize().with_context(|| {
-            format!("canonicalizing writable skills root {}", path.display())
-        })?;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing writable skills root {}", path.display()))?;
         let capability = PreparedRootCapability::open_existing(&canonical)?;
         Ok(Self {
             diagnostic_path: canonical,
@@ -1135,7 +1156,7 @@ impl ManagedTarget {
         let current = open_directory_child(&self.package_parent, &self.package_name)
             .with_context(|| format!("opening current skill package {}", self.package.display()))?;
         ensure!(
-            same_directory_identity(&current, &self.package_directory)?,
+            matches_retained_package(&current, &self.package_directory)?,
             "skill package changed after preparation; refusing mutation"
         );
         Ok(current)
@@ -1210,6 +1231,12 @@ impl ManagedTarget {
             );
             return Err(error).context("removing staged skill package");
         }
+        // Release the handles onto the staged package before removing the
+        // entry: a Windows disposition delete completes only once the last
+        // handle to the object closes.  Unix does not need this, but closing
+        // early changes nothing there.
+        drop(staged);
+        drop(package);
         remove_dir_child(&self.package_parent, &tombstone)
             .context("removing empty staged skill package")?;
         Ok(())
@@ -1226,7 +1253,10 @@ impl ManagedTarget {
         // support-parent descriptor below is the actual authority for every
         // rename/unlink, so a later `references` symlink swap cannot redirect
         // either staging or deletion.
+        #[cfg(unix)]
         let _package = self.open_verified_package()?;
+        #[cfg(windows)]
+        let package = self.open_verified_package()?;
         validate_directory_bindings(&parent.bindings)?;
         let leaf = component_buf(leaf)?;
         let staged = component_buf(staged)?;
@@ -1251,7 +1281,18 @@ impl ManagedTarget {
             let _ = move_noreplace(&parent.directory, &staged, &parent.directory, &leaf);
             return Err(error).context("removing staged support file");
         }
-        atomic_write_at(&self.package_directory, PROVENANCE_FILE, provenance)
+        // Unix writes provenance through the retained prepared package
+        // descriptor.  Windows retains only the package identity (a live
+        // handle would block the delete path), so the just-verified current
+        // package handle is the write authority there.
+        #[cfg(unix)]
+        {
+            atomic_write_at(&self.package_directory, PROVENANCE_FILE, provenance)
+        }
+        #[cfg(windows)]
+        {
+            atomic_write_at(&package, PROVENANCE_FILE, provenance)
+        }
     }
 }
 
@@ -1605,6 +1646,25 @@ fn same_directory_identity(left: &std::fs::File, right: &std::fs::File) -> Resul
     Ok(left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino())
 }
 
+/// Compare a freshly no-follow-opened package against the retained prepared
+/// identity (see [`RetainedPackageIdentity`]).
+#[cfg(unix)]
+fn matches_retained_package(current: &std::fs::File, retained: &std::fs::File) -> Result<bool> {
+    same_directory_identity(current, retained)
+}
+
+#[cfg(windows)]
+fn matches_retained_package(
+    current: &std::fs::File,
+    retained: &cockpit_host::private_fs::held_nt::HandleIdentity,
+) -> Result<bool> {
+    let directory = cockpit_host::private_fs::held_nt::handle_is_directory(current)
+        .context("reading held skill directory identity")?;
+    let identity = cockpit_host::private_fs::held_nt::handle_identity(current)
+        .context("reading prepared skill directory identity")?;
+    Ok(directory && identity == *retained)
+}
+
 #[cfg(windows)]
 fn same_directory_identity(left: &std::fs::File, right: &std::fs::File) -> Result<bool> {
     let left_directory = cockpit_host::private_fs::held_nt::handle_is_directory(left)
@@ -1710,8 +1770,7 @@ fn move_replace(
 /// Create one directory child beneath a held parent.
 #[cfg(unix)]
 fn create_directory_child(parent: &std::fs::File, name: &std::ffi::CStr) -> Result<()> {
-    cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), name, 0o755)
-        .map_err(Into::into)
+    cockpit_host::private_fs::held_fd::mkdirat(parent.as_raw_fd(), name, 0o755).map_err(Into::into)
 }
 
 #[cfg(windows)]
@@ -1953,21 +2012,25 @@ fn remove_tree_nofollow(directory: &std::fs::File) -> Result<()> {
                 match cockpit_host::private_fs::held_nt::open_dir_child_enumerated(directory, &name)
                     .context("opening held skill child without following links")
                 {
-                    Ok(child) => remove_tree_nofollow(&child).and_then(|_| {
-                        cockpit_host::private_fs::held_nt::remove_dir_child_enumerated(
-                            directory,
-                            &name,
-                        )
-                        .map_err(anyhow::Error::from)
-                    }),
+                    Ok(child) => {
+                        let recursion = remove_tree_nofollow(&child);
+                        // Release the child handle before removing the entry:
+                        // a Windows disposition delete completes only once
+                        // the last handle to the object closes.
+                        drop(child);
+                        recursion.and_then(|_| {
+                            cockpit_host::private_fs::held_nt::remove_dir_child_enumerated(
+                                directory, &name,
+                            )
+                            .map_err(anyhow::Error::from)
+                        })
+                    }
                     Err(error) => Err(error),
                 }
             }
-            Some(cockpit_host::private_fs::held_nt::EntryKind::ReparsePoint) => {
-                Err(anyhow::anyhow!(
-                    "refusing to traverse reparse point while deleting skill package"
-                ))
-            }
+            Some(cockpit_host::private_fs::held_nt::EntryKind::ReparsePoint) => Err(
+                anyhow::anyhow!("refusing to traverse reparse point while deleting skill package"),
+            ),
             _ => cockpit_host::private_fs::held_nt::unlink_child_enumerated(directory, &name)
                 .map_err(anyhow::Error::from),
         };
@@ -2017,7 +2080,7 @@ struct ManagedTarget {
     pinned: bool,
     package_parent: std::fs::File,
     package_name: SkillComponentBuf,
-    package_directory: std::fs::File,
+    package_directory: RetainedPackageIdentity,
 }
 
 fn required<'a>(value: &'a Option<String>, message: &str) -> Result<&'a str> {

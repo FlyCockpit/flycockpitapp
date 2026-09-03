@@ -64,6 +64,7 @@ pub mod media_egress_authority;
 #[cfg(feature = "remote")]
 pub mod org_sync;
 pub(crate) mod owner_capability;
+pub(crate) mod peer_authority;
 pub mod principal;
 pub mod proto;
 pub mod registry;
@@ -3928,6 +3929,34 @@ mod windows_pipe_tests {
             .expect("lifetime confirmation");
     }
 
+    async fn complete_wire_connect_handshake<S>(daemon: &mut proto::ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        confirm_client_lifetime(daemon).await;
+        let id = match daemon.recv().await.expect("recv").expect("frame") {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: proto::Request::ExchangeLocalPeerCredential,
+                    ..
+                } => id,
+                other => panic!("expected peer credential exchange, got {other:?}"),
+            },
+            other => panic!("expected envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(
+                id,
+                proto::Response::LocalPeerCredential {
+                    token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                    role: proto::LocalClientRole::Cli,
+                },
+            ))
+            .await
+            .expect("peer credential exchange");
+    }
+
     #[test]
     fn identity_file_without_a_listening_pipe_is_stale_not_running() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3967,7 +3996,7 @@ mod windows_pipe_tests {
             .expect("owner ACL peer");
             let mut proto = proto::ProtoStream::new(stream);
             send_daemon_hello(&mut proto, "0.1.pipe").await;
-            confirm_client_lifetime(&mut proto).await;
+            complete_wire_connect_handshake(&mut proto).await;
         });
 
         let client = cockpit_client::DaemonClient::connect(&socket)

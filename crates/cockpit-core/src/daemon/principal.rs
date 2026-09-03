@@ -8,11 +8,40 @@ use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProj
 
 use crate::daemon::proto::{self, Request};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalClientRole {
+    Tui,
+    Cli,
+    Acp,
+    AgentChild,
+    /// Socket peer that has not yet exchanged a peer-bound credential.
+    Unauthenticated,
+}
+
+impl LocalClientRole {
+    pub fn is_owner_class(self) -> bool {
+        matches!(self, Self::Tui | Self::Cli | Self::Acp)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalPrincipal {
+    pub role: LocalClientRole,
+    pub peer_pid: u32,
+    pub peer_uid: u32,
+    pub peer_gid: u32,
+    #[serde(default)]
+    pub grants: Vec<PrincipalGrant>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // large_enum_variant: the oversized variant is intentional here; not boxed to keep the value owned inline.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientPrincipal {
+    /// In-process endpoint possession. Never assigned to wire socket peers.
     Owner,
+    Local(LocalPrincipal),
     #[cfg(feature = "remote")]
     Remote(RemotePrincipal),
 }
@@ -163,6 +192,55 @@ impl ClientPrincipal {
         Self::Owner
     }
 
+    pub fn local_unauthenticated(peer: cockpit_host::peer_cred::PeerIdentity) -> Self {
+        Self::Local(LocalPrincipal {
+            role: LocalClientRole::Unauthenticated,
+            peer_pid: peer.pid,
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            grants: Vec::new(),
+        })
+    }
+
+    pub fn local_authenticated(
+        peer: cockpit_host::peer_cred::PeerIdentity,
+        role: LocalClientRole,
+        grants: Vec<PrincipalGrant>,
+    ) -> Self {
+        Self::Local(LocalPrincipal {
+            role,
+            peer_pid: peer.pid,
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            grants,
+        })
+    }
+
+    pub fn as_local(&self) -> Option<&LocalPrincipal> {
+        match self {
+            Self::Local(local) => Some(local),
+            _ => None,
+        }
+    }
+
+    pub fn peer_identity(&self) -> Option<cockpit_host::peer_cred::PeerIdentity> {
+        self.as_local()
+            .map(|local| cockpit_host::peer_cred::PeerIdentity {
+                pid: local.peer_pid,
+                uid: local.peer_uid,
+                gid: local.peer_gid,
+            })
+    }
+
+    pub fn has_owner_level_authority(&self) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Local(local) => local.role.is_owner_class(),
+            #[cfg(feature = "remote")]
+            Self::Remote(_) => false,
+        }
+    }
+
     /// Construct a daemon-verified remote principal from transport-neutral
     /// fields.
     ///
@@ -214,6 +292,7 @@ impl ClientPrincipal {
                 RemoteAuthorization::LegacyRelayScopes(_) => None,
             },
             Self::Owner => None,
+            Self::Local(_) => None,
         }
     }
 
@@ -221,9 +300,14 @@ impl ClientPrincipal {
         matches!(self, Self::Owner)
     }
 
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
     pub fn tag(&self) -> Option<String> {
         match self {
             Self::Owner => None,
+            Self::Local(local) => Some(format!("local:{}:{}", local.role_tag(), local.peer_pid)),
             #[cfg(feature = "remote")]
             Self::Remote(remote) => Some(format!("flycockpit:{}", remote.user_id)),
         }
@@ -232,13 +316,15 @@ impl ClientPrincipal {
     pub fn steer_origin(&self) -> String {
         match self {
             Self::Owner => format!("local:{}", local_principal_name()),
+            Self::Local(local) => format!("local:{}:{}", local.role_tag(), local.peer_pid),
             #[cfg(feature = "remote")]
             Self::Remote(remote) => format!("flycockpit:{}", remote.user_id),
         }
     }
 
     pub fn can_agent_write_project(&self, project_root: &str) -> bool {
-        self.is_owner() || self.has_project_scope(PrincipalScope::Agent, project_root)
+        self.has_owner_level_authority()
+            || self.has_project_scope(PrincipalScope::Agent, project_root)
     }
 
     pub fn can_agent_read_project(&self, project_root: &str) -> bool {
@@ -247,17 +333,27 @@ impl ClientPrincipal {
     }
 
     pub fn has_project_files(&self, project_root: &str) -> bool {
-        self.is_owner() || self.has_project_scope(PrincipalScope::ProjectFiles, project_root)
+        self.has_owner_level_authority()
+            || self.has_project_scope(PrincipalScope::ProjectFiles, project_root)
     }
 
     pub fn has_terminal(&self) -> bool {
-        self.is_owner() || self.has_scope(PrincipalScope::Terminal)
+        self.has_owner_level_authority() || self.has_scope(PrincipalScope::Terminal)
     }
 
     #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn has_project_scope(&self, scope: PrincipalScope, project_root: &str) -> bool {
         match self {
             Self::Owner => true,
+            Self::Local(local) => {
+                if local.role.is_owner_class() {
+                    return true;
+                }
+                local
+                    .grants
+                    .iter()
+                    .any(|grant| grant.scope == scope && grant.matches_project(project_root))
+            }
             #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => grants
@@ -276,6 +372,12 @@ impl ClientPrincipal {
     fn has_scope(&self, scope: PrincipalScope) -> bool {
         match self {
             Self::Owner => true,
+            Self::Local(local) => {
+                if local.role.is_owner_class() {
+                    return true;
+                }
+                local.grants.iter().any(|grant| grant.scope == scope)
+            }
             #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => {
@@ -287,8 +389,19 @@ impl ClientPrincipal {
     }
 }
 
+impl LocalPrincipal {
+    pub(crate) fn role_tag(&self) -> &'static str {
+        match self.role {
+            LocalClientRole::Tui => "tui",
+            LocalClientRole::Cli => "cli",
+            LocalClientRole::Acp => "acp",
+            LocalClientRole::AgentChild => "agent-child",
+            LocalClientRole::Unauthenticated => "unauthenticated",
+        }
+    }
+}
+
 impl PrincipalGrant {
-    #[cfg(feature = "remote")]
     fn matches_project(&self, project_root: &str) -> bool {
         match self.project_root.as_deref() {
             // An `ImageGenerationAdmin` grant NEVER inherits the rootless

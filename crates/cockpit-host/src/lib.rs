@@ -12,6 +12,8 @@ pub mod goal_scratch;
 pub mod jitter;
 pub mod named_pipe;
 pub mod path_containment;
+#[cfg(any(unix, windows))]
+pub mod peer_cred;
 pub mod private_fs;
 pub mod process;
 pub mod sysinfo;

@@ -220,6 +220,8 @@ pub fn hold_config_mutation_lock(
 /// left behind by another process would prevent clients from reaching the
 /// daemon's diagnostic and settlement APIs. `Ok(None)` means the lock remained
 /// busy through the deadline; callers must retain their durable pending work.
+/// A missing parent is uncontended (`Ok(Some(_))`) and is not created, so a
+/// first-write target on a fresh install can pass the publication lock.
 pub fn try_hold_config_mutation_lock_until(
     target: &std::path::Path,
     deadline: std::time::Instant,

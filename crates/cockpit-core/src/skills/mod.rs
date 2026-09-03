@@ -1075,12 +1075,19 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
     if trimmed.is_empty() {
         return "[skill command error: empty command]".to_string();
     }
-    let (shell, shell_arg) = bang_command_shell();
-    let output = Command::new(shell)
-        .arg(shell_arg)
-        .arg(trimmed)
-        .current_dir(cwd)
-        .output();
+    // Shell selection can itself fail closed: an unresolvable system shell
+    // on Windows is an inline error marker, never a fallback to an
+    // unqualified program name that the session directory could hijack.
+    let mut invocation = match bang_command_invocation(trimmed) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            return redact.scrub(&format!(
+                "[skill command `{}` failed to run: {error}]",
+                scrub_bang_output(redact, trimmed)
+            ));
+        }
+    };
+    let output = invocation.current_dir(cwd).output();
     match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1126,14 +1133,74 @@ fn scrub_bang_output(redact: &RedactionTable, text: &str) -> String {
     redact.scrub_novel_command_output_secrets(&redact.scrub(text))
 }
 
-#[cfg(windows)]
-fn bang_command_shell() -> (&'static str, &'static str) {
-    ("cmd", "/C")
+/// The fixed `!`-command shell invocation (owner-adopted design, Windows
+/// launch decision): the platform's executable shell with no profile, no
+/// interactive state, and explicit UTF-8.  The skill command text is passed
+/// as the whole script argument — there is no implicit command-shell string
+/// interpolation beyond the documented skill syntax, and the shell choice
+/// is deliberately not a config knob.
+#[cfg(not(windows))]
+fn bang_command_invocation(command: &str) -> Result<Command, String> {
+    let mut invocation = Command::new("sh");
+    invocation.arg("-c").arg(command);
+    Ok(invocation)
 }
 
-#[cfg(not(windows))]
-fn bang_command_shell() -> (&'static str, &'static str) {
-    ("sh", "-c")
+#[cfg(windows)]
+fn bang_command_invocation(command: &str) -> Result<Command, String> {
+    let mut invocation = Command::new(windows_powershell_exe()?);
+    invocation
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(windows_bang_script(command));
+    Ok(invocation)
+}
+
+/// The absolute path of the system Windows PowerShell binary, anchored under
+/// `%SystemRoot%`.  `Command` on Windows passes the program name to
+/// `CreateProcessW` with a null application name, so the operating system
+/// resolves an unqualified `powershell` through the *parent process's
+/// current directory* and `PATH` before System32: a `powershell.exe`
+/// planted in trusted workspace content (cloned repo files, build output)
+/// would execute in place of the system shell for every skill `!`-command,
+/// turning file-write access into code execution.  Anchoring the exact
+/// system binary closes that boundary; a missing `SystemRoot` fails closed
+/// with an error marker rather than falling back to an unqualified name.
+#[cfg(windows)]
+fn windows_powershell_exe() -> Result<PathBuf, String> {
+    let system_root = std::env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| {
+            "the SystemRoot environment variable is not set; refusing to \
+             resolve the skill command shell by an unqualified name"
+                .to_string()
+        })?;
+    Ok(PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe"))
+}
+
+/// One PowerShell script: an explicit UTF-8 preamble (console output and
+/// error encodings plus the pipeline encoding), the verbatim skill command,
+/// and an exit-status ladder so failure propagates the way `sh -c` does.
+/// The ladder runs on its own lines because a trailing `#` comment in the
+/// skill command would swallow a same-line tail.  `$LASTEXITCODE` carries a
+/// *native* command's exit status; a failed cmdlet never sets it, so the
+/// `$?`/null ladder turns a non-terminating cmdlet error (which would
+/// otherwise leave the process exiting 0) into a nonzero exit.
+#[cfg(windows)]
+fn windows_bang_script(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         [Console]::ErrorEncoding = [System.Text.UTF8Encoding]::new(); \
+         $OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         {command}\n\
+         if ($null -eq $LASTEXITCODE) {{ if ($?) {{ exit 0 }} else {{ exit 1 }} }}\n\
+         exit $LASTEXITCODE"
+    )
 }
 
 /// Locate a discovered skill by exact `name`. Used by the `skill` tool's
@@ -1820,16 +1887,51 @@ mod tests {
         assert_eq!(out, body);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(not(windows))]
-    async fn bang_command_shell_uses_sh_on_unix_like_platforms() {
-        assert_eq!(bang_command_shell(), ("sh", "-c"));
+    fn bang_command_invocation_uses_sh_on_unix_like_platforms() {
+        let invocation = bang_command_invocation("echo hi").unwrap();
+        assert_eq!(invocation.get_program(), "sh");
+        let args: Vec<_> = invocation.get_args().collect();
+        assert_eq!(args, ["-c", "echo hi"]);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(windows)]
-    async fn bang_command_shell_uses_cmd_on_windows() {
-        assert_eq!(bang_command_shell(), ("cmd", "/C"));
+    fn bang_command_invocation_uses_powershell_with_no_profile_and_explicit_utf8() {
+        let invocation = bang_command_invocation("Write-Output ok").unwrap();
+        let program = invocation.get_program();
+        // The shell is the absolute system binary anchored under
+        // `%SystemRoot%`, never an unqualified name that the session
+        // directory or PATH could hijack with a planted powershell.exe.
+        let expected = windows_powershell_exe().unwrap();
+        assert_eq!(program, expected.as_os_str());
+        assert!(expected.is_absolute());
+        assert!(
+            expected.ends_with(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "{expected:?}"
+        );
+        let args: Vec<_> = invocation.get_args().collect();
+        assert_eq!(args[0], "-NoProfile");
+        assert!(args.contains(&"-NonInteractive"));
+        assert!(args.contains(&"-Command"));
+        let script = args
+            .last()
+            .expect("the script is the final argument")
+            .to_string_lossy()
+            .into_owned();
+        assert!(script.contains("UTF8Encoding"), "{script:?}");
+        assert!(script.contains("exit $LASTEXITCODE"), "{script:?}");
+        // A failed cmdlet never sets $LASTEXITCODE, so the ladder must turn
+        // its failure into a nonzero exit instead of exiting 0.
+        assert!(
+            script.contains("if ($null -eq $LASTEXITCODE)"),
+            "{script:?}"
+        );
+        assert!(script.contains("Write-Output ok"), "{script:?}");
+        // The command is the whole script, not interpolated into an
+        // implicit command shell.
+        assert!(!args.iter().any(|arg| *arg == "cmd"), "{script:?}");
     }
 
     #[test]
@@ -1932,6 +2034,82 @@ mod tests {
         assert!(!out.contains("novel-stderr-secret-77aa"), "got {out:?}");
         assert!(out.contains("[skill command"), "got {out:?}");
         assert!(out.contains("DB_PASSWORD="), "got {out:?}");
+    }
+
+    // Windows twins of the `!`-command scrub proofs above, exercised through
+    // the PowerShell invocation: the C5 substitution-site scrub must cover
+    // the Windows path identically (issue #283).
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_redacts_novel_secret_read_from_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("leak.env"),
+            "AWS_SESSION_TOKEN=freshly-minted-novel-token-8842\n",
+        )
+        .unwrap();
+        // `cat` is the PowerShell alias for Get-Content.
+        let body = "env dump: !`cat leak.env`";
+        let out = trusted_render_body(body, tmp.path(), true, &no_redact());
+        assert!(
+            !out.contains("freshly-minted-novel-token-8842"),
+            "got {out:?}"
+        );
+        assert!(
+            out.contains("AWS_SESSION_TOKEN=") && out.contains("REDACTED"),
+            "key is preserved and the value redacted, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_error_marker_on_failed_cmdlet() {
+        // A failing PowerShell cmdlet never sets $LASTEXITCODE; without the
+        // exit-status ladder the process would exit 0 and a failed
+        // verification/data step would be reported as success with empty
+        // output (the fail-open twin of the Unix `exit 3` proof above).
+        let body = "x !`cat missing-file.env` y";
+        let out = trusted_render_body(body, Path::new("."), true, &no_redact());
+        assert!(
+            out.contains("[skill command") && out.contains("exit 1"),
+            "expected an inline error marker, got {out:?}"
+        );
+        // The turn never crashes — surrounding text survives.
+        assert!(out.starts_with("x ") && out.ends_with(" y"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_scrubs_table_known_secret_in_error_marker() {
+        let cfg = RedactConfig {
+            denylist: vec!["TABLESTDERRSECRET7".to_string()],
+            scan_ssh_keys: false,
+            ..Default::default()
+        };
+        let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
+        let body = "x !`Write-Error TABLESTDERRSECRET7; exit 1` y";
+        let out = render_body(body, Path::new("."), true, false, &redact);
+        assert!(!out.contains("TABLESTDERRSECRET7"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_render_body_claude_mode_redacts_novel_secret_in_error_marker_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("err.env"),
+            "DB_PASSWORD=novel-stderr-secret-77aa\n",
+        )
+        .unwrap();
+        let body = "x !`$s = Get-Content err.env; [Console]::Error.WriteLine($s); exit 1` y";
+        let out = render_body(body, tmp.path(), true, false, &no_redact());
+        assert!(!out.contains("novel-stderr-secret-77aa"), "got {out:?}");
+        assert!(out.contains("[skill command"), "got {out:?}");
+        assert!(
+            out.contains("DB_PASSWORD=") && out.contains("REDACTED"),
+            "key is preserved and the value redacted, got {out:?}"
+        );
     }
 
     #[test]

@@ -238,7 +238,7 @@ fn record_notice_event_with_agent(
         }
     };
     let agent = agent.map(str::to_owned);
-    let session_id = session.id;
+    let session_id = session.live_id();
     if let Err(error) = session.db.blocking_write_for_sync_event(move |conn| {
         crate::db::Db::insert_session_event_json_conn(
             conn,
@@ -331,7 +331,7 @@ fn record_code_root_state_transition(session: &Session, event: &proto::Event) ->
     };
     let source_key = code_root_transition_source_key(event);
     let now = crate::db::session_log::now_ms();
-    let session_id = session.id;
+    let session_id = session.live_id();
     if let Err(error) = session.db.blocking_write_for_sync_event(move |conn| {
         crate::db::Db::append_code_root_projection_delivery_conn(
             conn,

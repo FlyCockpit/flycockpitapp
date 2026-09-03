@@ -78,6 +78,7 @@ pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
 pub mod image_sidecar_authority;
+pub mod media_egress_authority;
 pub use image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
@@ -2241,6 +2242,8 @@ pub enum ErrorCode {
     UnknownSession,
     /// Interrupt id unknown / already resolved.
     UnknownInterrupt,
+    /// Requested resource was not found.
+    NotFound,
     /// Daemon is shutting down.
     Shutdown,
     /// Principal is not authorized for the requested operation.
@@ -2351,6 +2354,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "not_attached" => Self::NotAttached,
             "unknown_session" => Self::UnknownSession,
             "unknown_interrupt" => Self::UnknownInterrupt,
+            "not_found" => Self::NotFound,
             "shutdown" => Self::Shutdown,
             "authorization" => Self::Authorization,
             "read_only" => Self::ReadOnly,
@@ -2399,6 +2403,7 @@ impl std::fmt::Display for ErrorCode {
             Self::NotAttached => "not_attached",
             Self::UnknownSession => "unknown_session",
             Self::UnknownInterrupt => "unknown_interrupt",
+            Self::NotFound => "not_found",
             Self::Shutdown => "shutdown",
             Self::Authorization => "authorization",
             Self::ReadOnly => "read_only",
@@ -2641,6 +2646,10 @@ pub use cockpit_db::wire::{
     SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
+pub use cockpit_db::db::conversation_rules::{
+    ConversationRule, ConversationRuleCreatedBy, ConversationRuleSourceTrust,
+    MAX_CONVERSATION_RULE_TEXT_BYTES, MAX_CONVERSATION_RULES_PER_LINEAGE,
+};
 pub use cockpit_db::db::session_goals::{
     GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };
@@ -3998,6 +4007,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_org_sync_status"
                 | "list_failed_tool_calls"
                 | "get_session_compactions"
+                | "list_media_egress_verdicts"
+                | "revoke_media_egress_verdict"
                 | "purge_ended_sessions"
                 | "get_assistant"
                 | "diagnose_media_reservation"
@@ -7574,6 +7585,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             },
         };
@@ -7601,6 +7613,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: None,
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,
@@ -7617,6 +7630,7 @@ mod tests {
                     project_id: None,
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
+                    compaction_lineage_root_id: None,
                 },
             })
             .0,

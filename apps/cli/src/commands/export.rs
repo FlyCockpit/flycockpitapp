@@ -143,6 +143,7 @@ async fn resolve_target_session(
             project_id: None,
             parent_session_id: None,
             assistant_id: None,
+            compaction_lineage_root_id: None,
         })
         .await
         .context("requesting session list from daemon")?;

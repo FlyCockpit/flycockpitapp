@@ -700,6 +700,18 @@ impl App {
             return false;
         }
 
+        if self.rules_review.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.rules_review_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.rules_review_down(),
+                KeyCode::Char('d') | KeyCode::Char(' ') => self.rules_review_revoke_selected(),
+                KeyCode::Char('p') => self.rules_review_promote_selected(),
+                KeyCode::Esc => self.close_rules_review(),
+                _ => {}
+            }
+            return false;
+        }
+
         if self.handle_footer_control_key(key) {
             return false;
         }
@@ -3930,6 +3942,7 @@ impl App {
             && self.fork_pick.is_none()
             && self.copy_pick.is_none()
             && self.pins_review.is_none()
+            && self.rules_review.is_none()
             && self.keys_overlay.is_none()
             && self.transcript_find.is_none()
     }

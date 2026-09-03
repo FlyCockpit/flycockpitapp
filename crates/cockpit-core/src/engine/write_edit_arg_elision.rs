@@ -141,7 +141,11 @@ pub async fn reconcile_deferred_signed_turns_and_elide(
         return elide_applied_write_edit_args_with_upcoming(history, upcoming_result);
     }
 
-    let rows = match session.db.list_tool_calls_for_session(session.id).await {
+    let rows = match session
+        .db
+        .list_tool_calls_for_session(session.live_id())
+        .await
+    {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(

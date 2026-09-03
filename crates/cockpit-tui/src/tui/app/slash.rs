@@ -591,6 +591,22 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "rules",
+        description: "Review conversation rules (↑/↓, d revoke, p promote, esc close)",
+        takes_args: false,
+        run: run_rules,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
+        name: "rule",
+        description: "Set an advisory conversation rule that survives /compact (arg: text)",
+        takes_args: true,
+        run: run_rule,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "pin-context",
         description: "Pin verbatim text so it survives /compact (arg: text)",
         takes_args: true,
@@ -1070,6 +1086,16 @@ fn run_pin(app: &mut App, _: &str) -> bool {
 
 fn run_pins(app: &mut App, _: &str) -> bool {
     app.enter_pins_review_mode();
+    false
+}
+
+fn run_rules(app: &mut App, _: &str) -> bool {
+    app.enter_rules_review_mode();
+    false
+}
+
+fn run_rule(app: &mut App, args: &str) -> bool {
+    app.handle_rule_command(args);
     false
 }
 

@@ -774,7 +774,7 @@ async fn toolbox_with_retrieval_if_needed(
     }
     if session
         .db
-        .session_has_task_delegation_payloads(session.id)
+        .session_has_task_delegation_payloads(session.live_id())
         .await
         .unwrap_or(false)
     {
@@ -1351,7 +1351,12 @@ async fn record_redaction_placeholder_notice(ctx: &ToolCtx) {
     if !ctx.session.claim_redaction_placeholder_notice() {
         return;
     }
-    match ctx.session.db.list_session_events(ctx.session.id).await {
+    match ctx
+        .session
+        .db
+        .list_session_events(ctx.session.live_id())
+        .await
+    {
         Ok(events)
             if events.iter().any(|event| {
                 event.kind == "notice"

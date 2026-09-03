@@ -211,6 +211,12 @@ pub enum StoreError {
     /// (the cwd isn't inside a git worktree).
     #[error("no project root for the current directory; cannot store a project grant")]
     NoProjectRoot,
+    /// No live allow/reject row matched the exact purpose and digest tuple.
+    #[error("no active media-egress verdict for purpose `{purpose}` and digest `{request_digest}`")]
+    MediaEgressVerdictNotFound {
+        purpose: String,
+        request_digest: String,
+    },
     /// An I/O / serialization failure while reading or writing a grant.
     #[error(transparent)]
     Io(#[from] anyhow::Error),
@@ -329,6 +335,16 @@ pub struct GrantStore {
     /// unreadable/invalid policy can never fall open to a more permissive
     /// outcome than the last known good one (security requirement).
     last_good_policy: Mutex<ApprovalPolicyConfig>,
+}
+
+/// One live session-scoped media-egress verdict row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaEgressVerdictRow {
+    pub grant_id: String,
+    pub purpose: String,
+    pub request_digest: String,
+    pub verdict: String,
+    pub granted_at_unix_ms: i64,
 }
 
 /// Whether an approval policy is well-formed enough to adopt. Scope *values*
@@ -982,6 +998,216 @@ impl GrantStore {
             }
             Scope::Project | Scope::Global => Err(StoreError::HarnessSessionScopeOnly),
         }
+    }
+
+    // ---- media-egress grants ---------------------------------------------
+
+    /// Exact digest lookup for transcription media egress. A matching session
+    /// grant lets Manual/Auto short-circuit without re-prompting the human.
+    pub(super) async fn media_egress_grant_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<bool, StoreError> {
+        self.media_egress_verdict_matches(purpose, request_digest, "allow")
+            .await
+    }
+
+    /// Standing reject lookup for transcription media egress. A matching
+    /// session reject auto-denies without re-prompting the human.
+    pub(super) async fn media_egress_reject_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<bool, StoreError> {
+        self.media_egress_verdict_matches(purpose, request_digest, "reject")
+            .await
+    }
+
+    async fn media_egress_verdict_matches(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+        verdict: &str,
+    ) -> Result<bool, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        let verdict = verdict.to_owned();
+        self.db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = ?4 AND revoked_at_unix_ms IS NULL)",
+                    rusqlite::params![session_id, purpose, request_digest, verdict],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    pub(super) async fn record_media_egress_grant(
+        &self,
+        project_id: &str,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'reject'",
+                    rusqlite::params![session_id, purpose, request_digest],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO media_egress_grants (grant_id,session_id,project_id,purpose,request_digest,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'allow',?6,NULL)",
+                    rusqlite::params![
+                        uuid::Uuid::now_v7().to_string(),
+                        session_id,
+                        project_id,
+                        purpose,
+                        request_digest,
+                        now_epoch_seconds() * 1000
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Record a session-scoped media-egress **reject** for an exact digest.
+    /// Revokes any standing allow for the same tuple first, then writes the
+    /// reject row.
+    pub(super) async fn record_media_egress_reject(
+        &self,
+        project_id: &str,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        let session_id = self.session_id.to_string();
+        let project_id = project_id.to_owned();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        let revoked_at = now_epoch_seconds() * 1000;
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE media_egress_grants SET revoked_at_unix_ms = ?1 WHERE session_id = ?2 AND purpose = ?3 AND request_digest = ?4 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                    rusqlite::params![revoked_at, session_id, purpose, request_digest],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO media_egress_grants (grant_id,session_id,project_id,purpose,request_digest,verdict,granted_at_unix_ms,revoked_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'reject',?6,NULL)",
+                    rusqlite::params![
+                        uuid::Uuid::now_v7().to_string(),
+                        session_id,
+                        project_id,
+                        purpose,
+                        request_digest,
+                        now_epoch_seconds() * 1000
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Revoke every live allow grant for one exact session/purpose/digest tuple.
+    pub(super) async fn revoke_media_egress_grant(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<usize, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| Ok(conn.execute(
+                "UPDATE media_egress_grants SET revoked_at_unix_ms = ?1 WHERE session_id = ?2 AND purpose = ?3 AND request_digest = ?4 AND verdict = 'allow' AND revoked_at_unix_ms IS NULL",
+                rusqlite::params![
+                    now_epoch_seconds() * 1000,
+                    session_id,
+                    purpose,
+                    request_digest
+                ],
+            )?))
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Drop every live reject row for one exact session/purpose/digest tuple.
+    pub(super) async fn revoke_media_egress_reject(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<usize, StoreError> {
+        let session_id = self.session_id.to_string();
+        let purpose = purpose.to_owned();
+        let request_digest = request_digest.to_owned();
+        self.db
+            .write(move |conn| Ok(conn.execute(
+                "DELETE FROM media_egress_grants WHERE session_id = ?1 AND purpose = ?2 AND request_digest = ?3 AND verdict = 'reject'",
+                rusqlite::params![session_id, purpose, request_digest],
+            )?))
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// List every live session-scoped media-egress verdict for this store's
+    /// session. Revoked allows and deleted rejects are omitted.
+    pub async fn list_media_egress_verdicts(
+        &self,
+    ) -> Result<Vec<MediaEgressVerdictRow>, StoreError> {
+        let session_id = self.session_id.to_string();
+        self.db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT grant_id, purpose, request_digest, verdict, granted_at_unix_ms \
+                     FROM media_egress_grants \
+                     WHERE session_id = ?1 AND revoked_at_unix_ms IS NULL \
+                     ORDER BY granted_at_unix_ms DESC",
+                )?;
+                let rows = stmt
+                    .query_map([session_id], |row| {
+                        Ok(MediaEgressVerdictRow {
+                            grant_id: row.get(0)?,
+                            purpose: row.get(1)?,
+                            request_digest: row.get(2)?,
+                            verdict: row.get(3)?,
+                            granted_at_unix_ms: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(StoreError::Io)
+    }
+
+    /// Clear every live standing verdict for one exact session/purpose/digest
+    /// tuple so the next authorization re-prompts the human.
+    pub async fn revoke_media_egress_verdict(
+        &self,
+        purpose: &str,
+        request_digest: &str,
+    ) -> Result<(), StoreError> {
+        let grant_rows = self
+            .revoke_media_egress_grant(purpose, request_digest)
+            .await?;
+        let reject_rows = self
+            .revoke_media_egress_reject(purpose, request_digest)
+            .await?;
+        if grant_rows + reject_rows == 0 {
+            return Err(StoreError::MediaEgressVerdictNotFound {
+                purpose: purpose.to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     // ---- image-generation grants -----------------------------------------
@@ -2755,10 +2981,12 @@ fn open_approvals_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// the live path. Acquisition verifies, through the held handle, that
 /// the pathname still refers to the object just locked, and re-acquires
 /// from scratch (bounded) when it does not. A path that keeps being
-/// replaced fails closed.
+/// replaced fails closed. Creating `dir` refuses when it is the missing
+/// global Cockpit config directory: that layer is created only by
+/// [`crate::config::dirs::ensure_global_config_dir`].
 #[cfg(unix)]
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::config::dirs::create_dir_all_except_missing_global(dir)?;
     const ACQUIRE_ATTEMPTS: u32 = 8;
     for attempt in 0..ACQUIRE_ATTEMPTS {
         let file = open_approvals_dir(dir).with_context(|| format!("opening {}", dir.display()))?;
@@ -2794,7 +3022,7 @@ fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
 /// Non-unix exclusion: serialize on `approvals.json.lock` via `LockFileEx`.
 #[cfg(not(unix))]
 fn lock_approvals(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::config::dirs::create_dir_all_except_missing_global(dir)?;
     let lock_path = dir.join(APPROVALS_LOCK_FILE);
     const ACQUIRE_ATTEMPTS: u32 = 8;
     for attempt in 0..ACQUIRE_ATTEMPTS {
@@ -2843,6 +3071,20 @@ fn mutate_approvals<R>(
     dir: &Path,
     mutate: impl FnOnce(&mut ApprovalsFile) -> (bool, R),
 ) -> Result<R> {
+    if crate::config::dirs::path_is_under_missing_global_config_dir(dir) {
+        // The approvals store must not materialize `~/.config/cockpit` as a
+        // side effect of a grant, opposite-polarity clear, or permissions
+        // delete. A missing global layer is an empty store: no-op mutations
+        // succeed so session-scoped recording can clear a key that was never
+        // persisted; a write fails closed with the same refusal the mkdir
+        // layer uses.
+        let mut file = ApprovalsFile::default();
+        let (changed, value) = mutate(&mut file);
+        if changed {
+            anyhow::bail!("{}", crate::config::dirs::MISSING_GLOBAL_CONFIG_DIR_MESSAGE);
+        }
+        return Ok(value);
+    }
     let _lock = lock_approvals(dir)?;
     // The lock is already held here, so the load must take the locked
     // entry point directly (never [`load_approvals`], which would block
@@ -5983,6 +6225,88 @@ mod tests {
         // The static policy resolves to the same value on every read.
         assert_eq!(store.approval_policy(), store.approval_policy());
     }
+
+    #[tokio::test]
+    async fn global_approvals_mutation_does_not_create_a_missing_global_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = crate::config::dirs::global_config_dir().unwrap();
+        assert!(
+            !global.is_dir(),
+            "fresh-install fixture must not pre-create the global layer"
+        );
+
+        let lock_error = lock_approvals(&global).unwrap_err();
+        assert!(
+            lock_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "lock_approvals must refuse a missing global layer: {lock_error:#}"
+        );
+        assert!(
+            !global.is_dir(),
+            "lock_approvals must not materialize the global config directory"
+        );
+
+        mutate_approvals(&global, |file| {
+            (file.commands.remove("absent").is_some(), ())
+        })
+        .expect("a no-op remove against a missing global store must not fail");
+        assert!(
+            !global.is_dir(),
+            "a no-op approvals mutation must not create the global layer"
+        );
+
+        let write_error = mutate_approvals(&global, |file| {
+            file.commands.insert(
+                "always-allow".to_string(),
+                CommandGrantRecord::new(RiskTier::Ordinary),
+            );
+            (true, ())
+        })
+        .unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "a global grant write must fail closed: {write_error:#}"
+        );
+        assert!(!global.is_dir());
+
+        let project = tmp.path().join("work");
+        std::fs::create_dir_all(&project).unwrap();
+        let (store, _) = test_store(&project, global.clone());
+        store
+            .record_command(
+                &cmd_info("ls", None, false),
+                RiskTier::Ordinary,
+                Scope::Session,
+            )
+            .await
+            .expect("session grants must not require creating the global layer");
+        assert!(
+            !global.is_dir(),
+            "clearing opposite polarity at the missing global scope must not mkdir it"
+        );
+
+        let global_error = store
+            .record_command(
+                &cmd_info("ls", None, false),
+                RiskTier::Ordinary,
+                Scope::Global,
+            )
+            .await
+            .expect_err("a global grant must fail closed when the layer is missing");
+        assert!(
+            global_error
+                .to_string()
+                .contains("ephemeral daemons cannot create the global Cockpit config directory"),
+            "global grant insert must surface the mkdir refusal: {global_error}"
+        );
+        assert!(!global.is_dir());
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
 }
 
 #[cfg(test)]
@@ -6160,5 +6484,136 @@ mod image_generation_grant_tests {
                 .await,
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod media_egress_grant_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn media_egress_grant_matches_exact_digest_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_grant_matches(
+                    "transcription",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_egress_reject_revoke_and_polarity_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        store
+            .record_media_egress_reject(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_reject_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_reject_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+
+        store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .media_egress_grant_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .media_egress_reject_matches("transcription", digest)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_egress_list_verdicts_omits_revoked_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        store
+            .record_media_egress_grant(&project_id, "transcription", digest)
+            .await
+            .unwrap();
+        let listed = store.list_media_egress_verdicts().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_digest, digest);
+        assert_eq!(listed[0].verdict, "allow");
+        store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap();
+        assert!(store.list_media_egress_verdicts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_egress_revoke_unknown_digest_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _sid, _project_id) =
+            super::tests::test_store_with_project_id(tmp.path(), tmp.path().join("global"));
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = store
+            .revoke_media_egress_verdict("transcription", digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::MediaEgressVerdictNotFound { .. }));
     }
 }

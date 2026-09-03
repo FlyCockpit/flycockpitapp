@@ -306,6 +306,8 @@ impl App {
             KeyContext::Settings
         } else if let Some(context) = self.overlay.key_context() {
             context
+        } else if self.rules_review.is_some() {
+            KeyContext::Rules
         } else if self.pins_review.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()

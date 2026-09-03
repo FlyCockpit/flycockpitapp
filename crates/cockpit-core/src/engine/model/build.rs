@@ -1183,6 +1183,11 @@ pub enum UtilityCallSite {
     /// ArtifactWrite adjudicator (verification profiles). Turn-blocking;
     /// temperature is pinned to 0.
     VerificationAdjudication,
+    /// KB/dream prompt-injection second-layer scan (issue #273). A
+    /// non-persisting utility completion: the scan and its verdict never
+    /// reach a durable session event or stream. Turn-blocking; temperature
+    /// is pinned to 0.
+    KnowledgeInjectionScan,
     AdHocBackground,
 }
 
@@ -1203,6 +1208,7 @@ impl UtilityCallSite {
         match self {
             Self::SafetyGate
             | Self::InjectionCheck
+            | Self::KnowledgeInjectionScan
             | Self::PreflightRewrite
             | Self::CompactionBrief
             | Self::DelegationShrink
@@ -1230,7 +1236,10 @@ impl UtilityCallSite {
     pub fn pins_temperature_zero(self) -> bool {
         matches!(
             self,
-            Self::SafetyGate | Self::InjectionCheck | Self::VerificationAdjudication
+            Self::SafetyGate
+                | Self::InjectionCheck
+                | Self::KnowledgeInjectionScan
+                | Self::VerificationAdjudication
         )
     }
 }

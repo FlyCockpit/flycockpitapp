@@ -450,12 +450,17 @@ fn settings_config_mutations_stay_daemon_owned() {
         "doc.write(&self.extended)",
         "scaffold_config_dir(",
         "remove_raw_path_and_save",
+        "std::fs::create_dir_all(directory)",
     ] {
         assert!(
             !source.contains(forbidden),
             "settings tests must not retain local authority substitute `{forbidden}`"
         );
     }
+    assert!(
+        source.contains("ensure_config_layer_dir"),
+        "CreateConfig/CreateScopedConfig must scaffold through the config-layer funnel"
+    );
     assert!(source.contains("trait SettingsDaemonEffect"));
     assert!(source.contains("with_settings_daemon_effect"));
     assert!(source.contains("settings_daemon_request(Request::ApplyExtendedConfigPatch"));

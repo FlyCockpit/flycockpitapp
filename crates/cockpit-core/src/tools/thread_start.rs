@@ -56,7 +56,7 @@ impl Tool for ThreadStartTool {
         let thread = crate::session::lifecycle::persist_fork_with_redaction_custody(
             &ctx.session.db,
             ctx.session.secret_vault(),
-            ctx.session.id,
+            ctx.session.live_id(),
             Some(seq.to_string()),
             false,
             true,

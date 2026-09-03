@@ -337,7 +337,7 @@ async fn refresh_session_config_explicit_once_with_publication(
             ExplicitConfigRefreshError::Internal
         })?,
         Err(_) => {
-            tracing::warn!(session_id = %handle.session_id, "explicit config refresh delivery timed out");
+            tracing::warn!(session_id = %handle.session_id(), "explicit config refresh delivery timed out");
             drop(config_publication);
             stop_exact_worker_after_replacement_timeout(handle).await;
             return Err(ExplicitConfigRefreshError::Internal);
@@ -354,7 +354,7 @@ async fn refresh_session_config_explicit_once_with_publication(
             ExplicitConfigRefreshError::Internal
         })?,
         Err(_) => {
-            tracing::warn!(session_id = %handle.session_id, "explicit config refresh publication acknowledgement timed out");
+            tracing::warn!(session_id = %handle.session_id(), "explicit config refresh publication acknowledgement timed out");
             stop_exact_worker_after_replacement_timeout(handle).await;
             return Err(ExplicitConfigRefreshError::Internal);
         }

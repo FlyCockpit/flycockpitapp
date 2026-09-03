@@ -747,6 +747,8 @@ fn lifecycle_authority_findings(source: &str) -> Vec<String> {
         "spawn_detached",
         "spawn_detached_ephemeral",
         "stop_daemon_blocking",
+        "stop_daemon_blocking_unbound",
+        "send_stop_daemon_blocking",
     ];
 
     fn collect_use(
@@ -1200,10 +1202,6 @@ const ALLOWED_LINES: &[(&str, &str)] = &[
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
         "std::fs::create_dir_all(&dir)?;",
-    ),
-    (
-        "crates/cockpit-tui/src/tui/settings/mod.rs",
-        "match std::fs::create_dir_all(directory) {",
     ),
     (
         "crates/cockpit-tui/src/tui/async_action.rs",
@@ -1931,10 +1929,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
             "std::fs::create_dir_all(&dir)?;",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/settings/mod.rs",
-            "match std::fs::create_dir_all(directory) {",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -2776,6 +2770,8 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         "reveal_leak_secret_over_socket",
         "registered_in_process_endpoint",
         "stop_daemon_blocking",
+        "stop_daemon_blocking_unbound",
+        "send_stop_daemon_blocking",
     ] {
         let source = format!("macro_rules! hidden {{ () => {{ {name}() }} }}");
         assert!(

@@ -104,7 +104,7 @@ pub(crate) async fn turn_start_advert_message(
     let mut adverts = Vec::new();
     if session
         .db
-        .current_session_goal(session.id, false)
+        .current_session_goal(session.live_id(), false)
         .await
         .ok()
         .flatten()

@@ -729,7 +729,13 @@ pub enum TurnEvent {
     /// context tags) for the TUI to drop into the composer, plus the
     /// new session id the daemon created and the context-tag count. The
     /// old session stays recoverable in SQLite.
+    ///
+    /// `predecessor_session_id` is the window the client currently
+    /// filters on; wire `CompactReady.session_id` is stamped with it so
+    /// the handoff is delivered before the client retargets to
+    /// `new_session_id`.
     CompactReady {
+        predecessor_session_id: uuid::Uuid,
         new_session_id: uuid::Uuid,
         handoff: String,
         brief: String,

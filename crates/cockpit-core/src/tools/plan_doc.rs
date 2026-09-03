@@ -45,7 +45,7 @@ impl Tool for StartBuildTool {
             .session
             .db
             .get_session_plan_doc_for_trust(
-                ctx.session.id,
+                ctx.session.live_id(),
                 crate::tools::session_search::caller_history_trust(ctx),
             )
             .await?
@@ -63,7 +63,7 @@ impl Tool for StartBuildTool {
 
         if !force
             && let Some(existing) =
-                find_existing_build_handoff(&ctx.session.db, ctx.session.id).await?
+                find_existing_build_handoff(&ctx.session.db, ctx.session.live_id()).await?
         {
             let build_ref = existing.short_id.as_deref().unwrap_or("unknown");
             return Ok(ToolOutput::text(format!(
@@ -86,7 +86,7 @@ impl Tool for StartBuildTool {
         let plan_ref = ctx.session.short_id();
         insert_note(
             &ctx.session.db,
-            ctx.session.id,
+            ctx.session.live_id(),
             "Plan",
             &format!("Handed off to `Build` in session `{build_ref}`."),
             Some(serde_json::json!({ "build_session_id": row.session_id })),
@@ -136,6 +136,22 @@ fn parse_start_build_force(args: &Value) -> Result<bool> {
 }
 
 async fn find_existing_build_handoff(
+    db: &crate::db::Db,
+    plan_session_id: Uuid,
+) -> Result<Option<crate::db::sessions::SessionRow>> {
+    let mut ids = db.compaction_lineage_sessions(plan_session_id).await?;
+    if ids.is_empty() {
+        ids.push(plan_session_id);
+    }
+    for id in ids.into_iter().rev() {
+        if let Some(row) = find_existing_build_handoff_in_session(db, id).await? {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+async fn find_existing_build_handoff_in_session(
     db: &crate::db::Db,
     plan_session_id: Uuid,
 ) -> Result<Option<crate::db::sessions::SessionRow>> {

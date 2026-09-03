@@ -409,6 +409,15 @@ pub enum Response {
     PinState {
         state: PinState,
     },
+    ConversationRules {
+        rules: Vec<ConversationRule>,
+    },
+    ConversationRuleChanged {
+        rule: ConversationRule,
+    },
+    ConversationRuleRemoved {
+        removed: bool,
+    },
     // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
     // The plaintext literal appears ONLY on `SealedOwnerOperationApplied` for a
     // recover success (`revealed_literal`); every other response below is
@@ -1301,6 +1310,11 @@ pub enum Response {
         session_id: Uuid,
         compactions_json: String,
     },
+    /// Live session-scoped media-egress verdict rows.
+    MediaEgressVerdicts {
+        session_id: Uuid,
+        verdicts: Vec<crate::media_egress_authority::MediaEgressVerdictV1>,
+    },
     /// Result of purging ended sessions.
     EndedSessionsPurged {
         purged: u32,
@@ -1674,6 +1688,9 @@ macro_rules! response_variants {
             (Response::PinSeqs { .. }, "pin_seqs");
             (Response::PinsWithText { .. }, "pins_with_text");
             (Response::PinState { .. }, "pin_state");
+            (Response::ConversationRules { .. }, "conversation_rules");
+            (Response::ConversationRuleChanged { .. }, "conversation_rule_changed");
+            (Response::ConversationRuleRemoved { .. }, "conversation_rule_removed");
             (Response::SealedOwnerOperationBegun { .. }, "sealed_owner_operation_begun");
             (Response::SealedOwnerOperationApplied { .. }, "sealed_owner_operation_applied");
             (Response::SealedOwnerOperationCancelled { .. }, "sealed_owner_operation_cancelled");
@@ -1817,6 +1834,7 @@ macro_rules! response_variants {
             (Response::OrgSyncStatus { .. }, "org_sync_status");
             (Response::FailedToolCalls { .. }, "failed_tool_calls");
             (Response::SessionCompactions { .. }, "session_compactions");
+            (Response::MediaEgressVerdicts { .. }, "media_egress_verdicts");
             (Response::EndedSessionsPurged { .. }, "ended_sessions_purged");
             (Response::Assistant { .. }, "assistant");
             (Response::AssistantDeleted { .. }, "assistant_deleted");

@@ -1449,7 +1449,7 @@ pub enum Event {
         cache_break: bool,
     },
 
-    /// A `/compact` handoff was assembled and applied in place.
+    /// A `/compact` handoff was assembled and seeded into a linked successor window.
     CompactReady {
         session_id: Uuid,
         new_session_id: Uuid,

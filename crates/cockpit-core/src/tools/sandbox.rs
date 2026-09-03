@@ -470,7 +470,7 @@ pub async fn check_gitignore_read(
             // (implementation note). Full-list
             // replace; only the allow-set is broadcast (never the reject-memory).
             ctx.interrupts
-                .emit_gitignore_allow(ctx.session.id, ctx.session.gitignore_session_allow());
+                .emit_gitignore_allow(ctx.session.live_id(), ctx.session.gitignore_session_allow());
             Ok(None)
         }
         crate::approval::GitignoreReadOutcome::ApproveProject { glob } => {

@@ -6,7 +6,7 @@ impl Session {
     pub(crate) async fn title_progress_snapshot(&self) -> Result<TitleProgressSnapshot> {
         let row = self
             .db
-            .get_session(self.id)
+            .get_session(self.live_id())
             .await?
             .context("loading session title progress for retract")?;
         Ok(TitleProgressSnapshot {
@@ -34,7 +34,7 @@ impl Session {
         // before this rollback is called; restore the consumed prelude even if
         // a concurrent manual title update wins the separate title rollback.
         *self.last_time_prelude.lock().unwrap() = snapshot.last_time_prelude.clone();
-        let session_id = self.id;
+        let session_id = self.live_id();
         let prior_title = snapshot.title.clone();
         let generated_title = generated_title.map(str::to_owned);
         let tokens = snapshot.user_content_tokens as i64;
@@ -99,7 +99,7 @@ impl Session {
         expected_user_content_tokens: usize,
         expected_metadata_fork_generation: i64,
     ) -> Result<bool> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let title_for_db = title.to_string();
         let description_for_db = description.to_string();
         let updated = self
@@ -125,7 +125,7 @@ impl Session {
     /// Apply an auto-generated title. No-ops (and returns false) if the
     /// user has manually renamed this session.
     pub fn set_auto_title(&self, title: &str) -> Result<bool> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let title_for_db = title.to_string();
         let updated = self
             .db
@@ -139,12 +139,30 @@ impl Session {
         Ok(updated)
     }
 
+    /// Agent-invoked title write. The live window's `user_renamed` and
+    /// `ephemeral` bits are the write-time fence: a user's manual rename on
+    /// the successor cannot be overwritten from a predecessor-row guard.
+    pub fn set_agent_session_title(&self, title: &str) -> Result<bool> {
+        let session_id = self.live_id();
+        let title_for_db = title.to_string();
+        let updated = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::set_agent_session_title_conn(conn, session_id, &title_for_db)
+            })
+            .context("setting agent session title")?;
+        if updated {
+            *self.title.lock().unwrap() = Some(title.to_string());
+        }
+        Ok(updated)
+    }
+
     /// Apply an explicitly user-requested generated title (`/rename` with no
     /// argument). Unlike scheduled auto-titles, this clears the manual-title
     /// guard because the user asked the utility model to replace the current
     /// title.
     pub fn set_explicit_auto_title(&self, title: &str) -> Result<bool> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let title_for_db = title.to_string();
         let updated = self
             .db
@@ -163,7 +181,7 @@ impl Session {
     /// still untitled. The DB update is atomic so competing daemon requests
     /// produce exactly one winner.
     pub fn set_explicit_auto_title_if_untitled(&self, title: &str) -> Result<bool> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let title_for_db = title.to_string();
         let updated = self
             .db
@@ -188,7 +206,7 @@ impl Session {
     /// DB transition helper — an ineligible session arms nothing. Best-effort: a
     /// DB error is logged and dropped so a title pass never fails the turn.
     pub(crate) async fn arm_title_recovery_nudge(&self) {
-        if let Err(e) = self.db.arm_title_recovery_nudge(self.id).await {
+        if let Err(e) = self.db.arm_title_recovery_nudge(self.live_id()).await {
             tracing::warn!(error = %e, "auto_title: arming title recovery nudge failed");
         }
     }
@@ -209,7 +227,7 @@ impl Session {
         if !root_agent_frame || !mcp_present {
             return None;
         }
-        match self.db.claim_title_recovery_nudge(self.id).await {
+        match self.db.claim_title_recovery_nudge(self.live_id()).await {
             Ok(true) => Some(
                 "Automatic titling didn't produce a name for this session. Name it now with mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"short-title\"})."
                     .to_string(),
@@ -231,7 +249,7 @@ impl Session {
     }
 
     pub(crate) fn agent_rename_session_available(&self, auto_title_configured: bool) -> bool {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let Ok(Some(row)) = self.db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::get_session_conn(conn, session_id)
         }) else {
@@ -254,7 +272,7 @@ impl Session {
     }
 
     pub(crate) fn agent_rename_session_invoke_allowed(&self, auto_title_configured: bool) -> bool {
-        let session_id = self.id;
+        let session_id = self.live_id();
         let Ok(Some(row)) = self.db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::get_session_conn(conn, session_id)
         }) else {
@@ -284,7 +302,7 @@ impl Session {
         if !mcp_present {
             return None;
         }
-        let session_id = self.id;
+        let session_id = self.live_id();
         let row = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -398,7 +416,7 @@ impl Session {
     /// foreground request whose prefix it will reuse. A newer claim or a
     /// cancellation/drain revocation invalidates this exact work item.
     pub(crate) fn activate_metadata_fork(&self, mut work: MetadataWork) -> Result<MetadataWork> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         work.expected_metadata_fork_generation = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -411,7 +429,7 @@ impl Session {
     /// Revoke only the currently owning generation. The conditional update is
     /// safe when a newer foreground request has already claimed its own fork.
     pub(crate) fn revoke_metadata_fork(&self, expected_generation: i64) -> Result<bool> {
-        let session_id = self.id;
+        let session_id = self.live_id();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::revoke_metadata_fork_conn(conn, session_id, expected_generation)
@@ -498,7 +516,7 @@ impl Session {
     fn persist_title_progress(&self) {
         let tokens = self.user_content_tokens.load(Ordering::Relaxed) as i64;
         let stage = self.title_stage.load(Ordering::Relaxed) as i64;
-        let session_id = self.id;
+        let session_id = self.live_id();
         if let Err(e) = self.db.blocking_write_for_sync_maintenance(move |conn| {
             conn.execute(
                 "UPDATE sessions

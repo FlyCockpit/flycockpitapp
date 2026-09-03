@@ -179,12 +179,14 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
     },
     #[cfg_attr(not(test), allow(dead_code))]
     StoreTextArtifacts(String),
+    SeedSuccessor(String),
 }
 
 #[derive(Debug)]
 pub(in crate::engine::driver) enum PrepareCompactionError {
     Budget(crate::engine::compact::CompactBudgetError),
     Draft(crate::engine::compact_draft::CompactDraftOutcome),
+    ConversationRules(String),
 }
 
 impl From<crate::engine::compact::CompactBudgetError> for PrepareCompactionError {
@@ -213,6 +215,9 @@ impl std::fmt::Display for PrepareCompactionError {
                 f.write_str("compact model returned an unusably short brief twice")
             }
             Self::Draft(O::Success(_)) => f.write_str("unexpected successful draft outcome"),
+            Self::ConversationRules(error) => {
+                write!(f, "listing conversation rules failed ({error})")
+            }
         }
     }
 }
@@ -348,7 +353,7 @@ impl Driver {
         if let Err(error) = self
             .session
             .db
-            .delete_compaction_shadow(self.session.id)
+            .delete_compaction_shadow(self.session.live_id())
             .await
         {
             tracing::warn!(error = %error, "compact shadow: deleting durable shadow failed");
@@ -372,7 +377,7 @@ impl Driver {
         if let Err(error) = self
             .session
             .db
-            .upsert_compaction_shadow(self.session.id, &payload_json)
+            .upsert_compaction_shadow(self.session.live_id(), &payload_json)
             .await
         {
             tracing::warn!(error = %error, "compact shadow: persisting durable shadow failed");
@@ -386,7 +391,12 @@ impl Driver {
             self.delete_durable_shadow_brief().await;
             return;
         }
-        let row = match self.session.db.compaction_shadow(self.session.id).await {
+        let row = match self
+            .session
+            .db
+            .compaction_shadow(self.session.live_id())
+            .await
+        {
             Ok(row) => row,
             Err(error) => {
                 tracing::warn!(error = %error, "compact shadow: loading durable shadow failed");
@@ -465,7 +475,7 @@ impl Driver {
         }
         let Ok(entries) = crate::engine::rehydrate::history_snapshot(
             &self.session.db,
-            self.session.id,
+            self.session.live_id(),
             self.active_agent(),
         )
         .await
@@ -554,7 +564,7 @@ impl Driver {
         let mut projection_calls = match self
             .session
             .db
-            .text_artifact_projection_call_ids(self.session.id)
+            .text_artifact_projection_call_ids(self.session.live_id())
             .await
         {
             Ok(calls) => Some(calls),
@@ -1444,6 +1454,7 @@ impl Driver {
                     "resume compaction snapshot is no longer exact".to_string()
                 }
                 PreparedCompactionApplyError::StoreTextArtifacts(error) => error,
+                PreparedCompactionApplyError::SeedSuccessor(error) => error,
             })?;
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PostCompact,
@@ -1531,10 +1542,75 @@ impl Driver {
 
     /// Assemble and apply a `/compact` handoff for the foreground agent.
     /// Prune-first (fixed ordering), draft the model brief, append the
-    /// deterministic appendix, derive context tags, then reset the foreground
-    /// context window in this same session.
+    /// deterministic appendix, derive context tags, then seed a new linked
+    /// session as the next context window.
     pub(in crate::engine::driver) async fn do_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         self.do_compact_with_source(tx, "manual").await;
+    }
+
+    pub(in crate::engine::driver) async fn do_promote_conversation_rule(
+        &mut self,
+        rule_id: uuid::Uuid,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        match self.promote_conversation_rule_inner(rule_id, tx).await {
+            Ok((target_path, report)) => {
+                let mut text = format!("/rules: promoted into {target_path}");
+                if !report.trim().is_empty() {
+                    text.push('\n');
+                    text.push_str(&report);
+                }
+                let _ = tx.send(TurnEvent::Notice { text }).await;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/rules: promote failed: {error}"),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn promote_conversation_rule_inner(
+        &mut self,
+        rule_id: uuid::Uuid,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> std::result::Result<(String, String), String> {
+        let rule = crate::conversation_rules::load_rule_for_session(&self.session, rule_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let target = crate::conversation_rules::resolve_instructions_target(&self.session)
+            .await
+            .map_err(|error| error.to_string())?;
+        let brief = crate::conversation_rules::promote_brief(&rule, &target, self.redact.as_ref());
+        let mut args = self.spawn_args(false);
+        args.write_scope = Some(target.write_scope.clone());
+        args.delegated = true;
+        let child = crate::engine::builtin::builder(&args);
+        let report = run_noninteractive(
+            child,
+            brief,
+            self.session.clone(),
+            self.locks.clone(),
+            self.redact.clone(),
+            self.cwd.clone(),
+            self.config.clone(),
+            self.guidance_compiler.clone(),
+            self.interrupts.clone(),
+            self.live_or_session_cancel(),
+            self.approver.clone(),
+            self.resource_scheduler.clone(),
+            self.loop_guard_threshold,
+            24,
+            self.vnext_local_installation_resolver.clone(),
+            None,
+            Some(tx.clone()),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok((target.path.display().to_string(), report))
     }
 
     /// Compaction `preCompact` / `postCompact` hook contract (asymmetric BY
@@ -1618,6 +1694,11 @@ impl Driver {
                     PreparedCompactionApplyError::StoreTextArtifacts(error) => {
                         format!(
                             "/compact: recording prepared artifacts failed: {error}; history was left unchanged"
+                        )
+                    }
+                    PreparedCompactionApplyError::SeedSuccessor(error) => {
+                        format!(
+                            "/compact: seeding successor window failed: {error}; history was left unchanged"
                         )
                     }
                 };
@@ -1723,14 +1804,29 @@ impl Driver {
         let calls = self
             .session
             .db
-            .list_tool_calls_for_session(self.session.id)
+            .list_tool_calls_for_session(self.session.live_id())
             .await
             .unwrap_or_default();
         let pins = self.session.pinned_messages();
+        let conversation_rules = match self
+            .session
+            .db
+            .list_conversation_rules(self.session.compaction_lineage_root())
+            .await
+        {
+            Ok(rules) => rules,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "conversation rules: listing rules failed; aborting compact"
+                );
+                return Err(PrepareCompactionError::ConversationRules(error.to_string()));
+            }
+        };
         let active_goal = self
             .session
             .db
-            .current_session_goal(self.session.id, false)
+            .current_session_goal(self.session.live_id(), false)
             .await
             .ok()
             .flatten()
@@ -1748,10 +1844,14 @@ impl Driver {
                 )
             });
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
+        appendix.conversation_rules = crate::conversation_rules::compact_appendix_lines(
+            &conversation_rules,
+            self.redact.as_ref(),
+        );
         if let Ok(overview) = self
             .session
             .db
-            .task_todo_overview(self.session.id, 24)
+            .task_todo_overview(self.session.live_id(), 24)
             .await
         {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
@@ -1916,7 +2016,49 @@ impl Driver {
             });
         }
 
-        // 5. Reset the foreground model context in place.
+        // 5. Seed a new linked session (one context window) instead of
+        // resetting this session in place. The predecessor is preserved
+        // whole; the successor's event log starts at the handoff.
+        let predecessor_id = self.session.live_id();
+        let predecessor_short_id = self.session.short_id();
+        let successor_id = uuid::Uuid::new_v4();
+        self.session
+            .begin_compaction_successor(successor_id)
+            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
+        let vault = self.session.secret_vault().clone();
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let successor_row = match self
+            .session
+            .db
+            .transaction(move |conn| {
+                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
+                    conn,
+                    &vault,
+                    predecessor_id,
+                    successor_id,
+                )?;
+                crate::db::Db::create_compaction_successor_conn(
+                    conn,
+                    predecessor_id,
+                    successor_id,
+                    now_unix_ms,
+                )
+            })
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                self.session.abort_compaction_successor(successor_id);
+                return Err(PreparedCompactionApplyError::SeedSuccessor(
+                    error.to_string(),
+                ));
+            }
+        };
+        let successor_short_id = successor_row
+            .short_id
+            .clone()
+            .unwrap_or_else(|| successor_row.session_id.to_string());
+
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers().await;
         // Keep the one live schedule authority attached to the compacted
@@ -1945,17 +2087,10 @@ impl Driver {
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 
-        // Timeline boundary: `/compact` reset this session in place. The record
-        // embeds the drafting model's brief/handoff text and the retained tail,
-        // so journal it through the frame-carrying path against the AUTHORING
-        // model's trust (K1, decision 10.3): a trusted author's session-table
-        // literal journals (or fail-closed scrubs) rather than persisting raw.
-        // A shadow written before the authoring id existed leaves both ids empty
-        // (`#[serde(default)]`); `resolve_trust` of an empty pair falls to the
-        // default (untrusted) so the frame journals nothing — the record still
-        // persists. `self.config` is the turn-pinned snapshot; `self.redact` is
-        // the session's pre-policy table (same shape the SubagentReport finalizer
-        // uses).
+        // Timeline boundary on the predecessor, then a window-seed event on
+        // the successor. The record embeds the drafting model's brief/handoff
+        // text and the retained tail, so journal it through the frame-carrying
+        // path against the AUTHORING model's trust (K1, decision 10.3).
         let compaction_frame = (!prepared.authoring_provider_id.is_empty()
             && !prepared.authoring_model_id.is_empty())
         .then_some(crate::session::SessionEventModelFrame {
@@ -1964,46 +2099,81 @@ impl Driver {
             config: &self.config,
             session_table: self.redact.as_ref(),
         });
+        let tail_messages = prepared.history[1..].to_vec();
+        let record = crate::session::SessionCompactionRecord {
+            predecessor_session_id: predecessor_id,
+            predecessor_short_id: &predecessor_short_id,
+            successor_session_id: successor_row.session_id,
+            successor_short_id: &successor_short_id,
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
+        if let Err(e) = self
+            .session
+            .record_session_compacted_with_source(&prepared.agent_name, record, compaction_frame)
+            .await
+        {
+            tracing::warn!(error = %e, "record predecessor session_compacted event failed");
+        } else {
+            #[cfg(test)]
+            self.trace_compaction_apply("timeline_recorded");
+        }
+
+        self.session
+            .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone());
+
+        let seed_record = crate::session::SessionCompactionRecord {
+            predecessor_session_id: predecessor_id,
+            predecessor_short_id: &predecessor_short_id,
+            successor_session_id: successor_row.session_id,
+            successor_short_id: &successor_short_id,
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
         if let Err(e) = self
             .session
             .record_session_compacted_with_source(
                 &prepared.agent_name,
-                crate::session::SessionCompactionRecord {
-                    successor_session_id: self.session.id,
-                    successor_short_id: &self.session.short_id(),
-                    seed_tool_count: prepared.seed_tags.len(),
-                    brief_text: &prepared.brief,
-                    handoff_text: &prepared.handoff,
-                    source: &prepared.source,
-                    trigger_ctx_pct: prepared.trigger_ctx_pct,
-                    tokens_before: prepared.tokens_before,
-                    tokens_after: prepared.tokens_after,
-                    turns_summarized: prepared.turns_summarized,
-                    tail_kept: prepared.tail_kept,
-                    tail_trimmed: prepared.tail_trimmed,
-                    tail_messages: &prepared.history[1..],
-                },
+                seed_record,
                 compaction_frame,
             )
             .await
         {
-            tracing::warn!(error = %e, "record session_compacted event failed");
-        } else {
-            #[cfg(test)]
-            self.trace_compaction_apply("timeline_recorded");
+            tracing::warn!(error = %e, "record successor window-seed event failed");
         }
 
         self.session.reset_compact_self_nudge_latch();
         // A retained rolling brief was intentionally cloned for a resume
         // offer. Once its prepared compaction has actually replaced history,
         // that source snapshot no longer describes the live conversation and
-        // must not survive to a later exactness check.
+        // must not survive to a later exactness check. The predecessor keeps
+        // its own window's last shadow; this delete is keyed by live_id, so
+        // the successor starts without one.
         self.shadow_brief = None;
         self.delete_durable_shadow_brief().await;
         self.auto_compact_gate.mark_committed();
         let _ = tx
             .send(TurnEvent::CompactReady {
-                new_session_id: self.session.id,
+                predecessor_session_id: predecessor_id,
+                new_session_id: successor_row.session_id,
                 handoff: prepared.handoff,
                 brief: prepared.brief,
                 source: prepared.source,

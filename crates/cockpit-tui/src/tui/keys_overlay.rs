@@ -146,6 +146,8 @@ pub enum KeyContext {
     Diff,
     /// `/pins` review or `/pin` pick mode.
     Pins,
+    /// `/rules` review panel.
+    Rules,
     /// Embedded `$EDITOR` / `lazygit` pane.
     EmbeddedPane,
     /// `/btw` side conversation pane.
@@ -626,6 +628,32 @@ const PINS: KeyGroup = KeyGroup {
     ],
 };
 
+const RULES: KeyGroup = KeyGroup {
+    title: "Rules",
+    bindings: &[
+        KeyBinding {
+            key: "↑/↓ · j/k",
+            action: "move",
+            desc: "scan conversation rules",
+        },
+        KeyBinding {
+            key: "d · Space",
+            action: "revoke",
+            desc: "revoke the highlighted rule",
+        },
+        KeyBinding {
+            key: "p",
+            action: "promote",
+            desc: "promote the rule into the instructions file",
+        },
+        KeyBinding {
+            key: "Esc",
+            action: "close",
+            desc: "leave rules, refocus the composer",
+        },
+    ],
+};
+
 /// The ordered list of groups to show for `context`: the context group
 /// first, then [`GLOBAL`]. Pane-owned groups come from each pane's
 /// `keybindings()` descriptor so the source of truth lives next to the
@@ -657,6 +685,7 @@ fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> V
         KeyContext::Scratchpad => crate::tui::notes_pane::NotesPane::keybindings().into(),
         KeyContext::Diff => crate::tui::diff_pane::DiffPane::keybindings().into(),
         KeyContext::Pins => PINS.into(),
+        KeyContext::Rules => RULES.into(),
         KeyContext::EmbeddedPane => EMBEDDED_PANE.into(),
         KeyContext::BtwPane => BTW_PANE.into(),
     };
@@ -816,6 +845,7 @@ impl KeysOverlay {
             KeyContext::Scratchpad => "Scratchpad",
             KeyContext::Diff => "Diff",
             KeyContext::Pins => "Pins",
+            KeyContext::Rules => "Rules",
             KeyContext::EmbeddedPane => "Embedded pane",
             KeyContext::BtwPane => "BTW pane",
             KeyContext::QuestionDialog => "Question",
@@ -1012,6 +1042,7 @@ mod tests {
             KeyContext::QuickSettings,
             KeyContext::Scratchpad,
             KeyContext::Pins,
+            KeyContext::Rules,
             KeyContext::EmbeddedPane,
             KeyContext::QuestionDialog,
             KeyContext::ApprovalDialog,
@@ -1092,6 +1123,7 @@ mod tests {
             KeyContext::Scratchpad,
             KeyContext::Diff,
             KeyContext::Pins,
+            KeyContext::Rules,
             KeyContext::EmbeddedPane,
             KeyContext::BtwPane,
             KeyContext::QuestionDialog,

@@ -348,7 +348,7 @@ pub(super) async fn attached_session_access(
         return Ok(SessionAccess::Owner);
     }
     let att = require_attached(state)?;
-    match ctx.db.get_session(att.handle.session_id).await {
+    match ctx.db.get_session(att.handle.session_id()).await {
         Ok(Some(row)) => Ok(session_access_for_row(principal, &row)),
         Ok(None) => {
             let project_root = att.handle.project_root.to_string_lossy();
@@ -520,7 +520,7 @@ macro_rules! command_session_id_value {
         None
     };
     ($state:expr, attached) => {
-        $state.attached.as_ref().map(|att| att.handle.session_id)
+        $state.attached.as_ref().map(|att| att.handle.session_id())
     };
     ($state:expr, field($field:ident)) => {
         Some(*$field)
@@ -1128,7 +1128,7 @@ async fn attempt_grant_require_attached_session_capability(
     capability: RemoteProjectCapabilityV1,
 ) -> std::result::Result<(), ErrorPayload> {
     let att = require_attached(state)?;
-    let raw_root = match ctx.db.get_session(att.handle.session_id).await {
+    let raw_root = match ctx.db.get_session(att.handle.session_id()).await {
         Ok(Some(row)) => row.project_root,
         // Fail closed if the attached session row is gone: never authorize against
         // the stale cached attachment root (a deleted session must not remain
@@ -1136,7 +1136,7 @@ async fn attempt_grant_require_attached_session_capability(
         Ok(None) => {
             return Err(ErrorPayload {
                 code: ErrorCode::UnknownSession,
-                message: format!("unknown session {}", att.handle.session_id),
+                message: format!("unknown session {}", att.handle.session_id()),
             });
         }
         Err(e) => return Err(internal(e)),

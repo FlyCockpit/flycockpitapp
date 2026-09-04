@@ -3494,6 +3494,7 @@ pub(crate) async fn run_turn(
         cancel,
         shutdown_gate: agent.model.shutdown_gate(),
         approver,
+        #[cfg(feature = "extended")]
         image_generation_dispatch: session.image_generation_dispatch(),
         transcription_dispatch: session.transcription_dispatch(
             agent.model.provider_id(),
@@ -4605,6 +4606,7 @@ mod tests {
                 cancel: tokio_util::sync::CancellationToken::new(),
                 shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
                 approver: None,
+                #[cfg(feature = "extended")]
                 image_generation_dispatch: None,
                 transcription_dispatch: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),

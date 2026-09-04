@@ -2091,105 +2091,108 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
     );
     assert_eq!(with_session[0].value, session_id.as_bytes());
 
-    let scheduled = Request::CreateScheduledJob {
-        job: proto::ScheduledJobCreate {
-            id: "job-1".into(),
-            owner: "system:test".into(),
-            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
-            payload: proto::ScheduledJobPayload::RunPrompt {
-                assistant: "Build".into(),
-                prompt: "run".into(),
-                project_root: root.path().join(".").to_string_lossy().into_owned(),
+    #[cfg(feature = "extended")]
+    {
+        let scheduled = Request::CreateScheduledJob {
+            job: proto::ScheduledJobCreate {
+                id: "job-1".into(),
+                owner: "system:test".into(),
+                schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                payload: proto::ScheduledJobPayload::RunPrompt {
+                    assistant: "Build".into(),
+                    prompt: "run".into(),
+                    project_root: root.path().join(".").to_string_lossy().into_owned(),
+                },
+                enabled: true,
+                missed_run_policy: proto::MissedRunPolicy::Skip,
             },
-            enabled: true,
-            missed_run_policy: proto::MissedRunPolicy::Skip,
-        },
-    };
-    let resources = authorize_request_context(&scheduled, &state, &ctx)
-        .await
-        .unwrap()
-        .fcor_resources;
-    assert_eq!(
-        resources
-            .iter()
-            .map(|resource| resource.kind)
-            .collect::<Vec<_>>(),
-        vec![Kind::SchedulerId, Kind::ProjectRoot]
-    );
-    assert_eq!(resources[0].value, b"job-1");
-    assert_eq!(
-        resources[1].value,
-        root.path()
-            .canonicalize()
+        };
+        let resources = authorize_request_context(&scheduled, &state, &ctx)
+            .await
             .unwrap()
-            .to_str()
-            .unwrap()
-            .as_bytes()
-    );
-    if let Request::CreateScheduledJob { job } = &scheduled {
-        use proto::remote_operation_fcor::CanonicalFcorValueV1;
-        let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
-        job.encode_fcor_value_v1(&mut params).unwrap();
-        let params = params.into_bytes();
-        assert!(
-            !params
-                .windows(job.id.len())
-                .any(|window| window == job.id.as_bytes())
+            .fcor_resources;
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            vec![Kind::SchedulerId, Kind::ProjectRoot]
         );
-        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+        assert_eq!(resources[0].value, b"job-1");
+        assert_eq!(
+            resources[1].value,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes()
+        );
+        if let Request::CreateScheduledJob { job } = &scheduled {
+            use proto::remote_operation_fcor::CanonicalFcorValueV1;
+            let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
+            job.encode_fcor_value_v1(&mut params).unwrap();
+            let params = params.into_bytes();
             assert!(
                 !params
-                    .windows(project_root.len())
-                    .any(|window| window == project_root.as_bytes())
+                    .windows(job.id.len())
+                    .any(|window| window == job.id.as_bytes())
             );
+            if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+                assert!(
+                    !params
+                        .windows(project_root.len())
+                        .any(|window| window == project_root.as_bytes())
+                );
+            }
         }
-    }
 
-    let callback = Request::CreateScheduledJob {
-        job: proto::ScheduledJobCreate {
-            id: "callback-1".into(),
-            owner: "system:test".into(),
-            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
-            payload: proto::ScheduledJobPayload::Callback {
-                subsystem: "test".into(),
+        let callback = Request::CreateScheduledJob {
+            job: proto::ScheduledJobCreate {
+                id: "callback-1".into(),
+                owner: "system:test".into(),
+                schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                payload: proto::ScheduledJobPayload::Callback {
+                    subsystem: "test".into(),
+                },
+                enabled: true,
+                missed_run_policy: proto::MissedRunPolicy::Skip,
             },
-            enabled: true,
-            missed_run_policy: proto::MissedRunPolicy::Skip,
-        },
-    };
-    let callback_resources = authorize_request_context(&callback, &state, &ctx)
-        .await
-        .unwrap()
-        .fcor_resources;
-    assert_eq!(
-        callback_resources
-            .iter()
-            .map(|resource| resource.kind)
-            .collect::<Vec<_>>(),
-        vec![Kind::SchedulerId]
-    );
-
-    let resolver_calls = ctx
-        .fcor_resolver_calls
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let denied = MutableClientState::detached_with_principal(
-        ctx.upload_accounting.clone(),
-        remote_principal(),
-        None,
-        ctx.terminal_host.clone(),
-        Uuid::new_v4(),
-        next_terminal_connection_epoch(),
-    );
-    assert!(
-        authorize_request_context(&scheduled, &denied, &ctx)
+        };
+        let callback_resources = authorize_request_context(&callback, &state, &ctx)
             .await
-            .is_err()
-    );
-    assert_eq!(
-        ctx.fcor_resolver_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        resolver_calls
-    );
+            .unwrap()
+            .fcor_resources;
+        assert_eq!(
+            callback_resources
+                .iter()
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            vec![Kind::SchedulerId]
+        );
+
+        let resolver_calls = ctx
+            .fcor_resolver_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let denied = MutableClientState::detached_with_principal(
+            ctx.upload_accounting.clone(),
+            remote_principal(),
+            None,
+            ctx.terminal_host.clone(),
+            Uuid::new_v4(),
+            next_terminal_connection_epoch(),
+        );
+        assert!(
+            authorize_request_context(&scheduled, &denied, &ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ctx.fcor_resolver_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            resolver_calls
+        );
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -4171,7 +4174,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
 }
 
 #[tokio::test]
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
     let ctx = test_ctx();
     ctx.db
@@ -8144,8 +8147,10 @@ fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
     // Write fails before activation; rollback must stay a no-op.
     ctx.deactivate_persistent_services();
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
+    #[cfg(feature = "extended")]
     assert!(ctx.registry.scheduler().is_none());
     assert!(ctx.registry.resource_scheduler().is_none());
     assert!(ctx.active_media_storage_recovery().is_none());
@@ -8194,6 +8199,7 @@ fn remote_principal_cannot_promote_daemon_lifetime() {
         "owner-only promotion must fail closed, got {error}"
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -8472,6 +8478,7 @@ async fn remote_reader_assistant_attach_cannot_promote_ephemeral_owner() {
         error.message
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -13887,6 +13894,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
 /// `BadRequest` by the `ImageGenerationConfig::new` funnel before anything is
 /// written or the generation is bumped.
 #[tokio::test]
+#[cfg(feature = "extended")]
 async fn image_control_mutation_rejects_malformed_payload_after_generation_cas() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -21848,6 +21856,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             request_id: "missing".into(),
             session_id: None,
         },
+        #[cfg(feature = "extended")]
         "create_scheduled_job" => Request::CreateScheduledJob {
             job: proto::ScheduledJobCreate {
                 id: "job-authz".into(),
@@ -21860,14 +21869,18 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 missed_run_policy: proto::MissedRunPolicy::Skip,
             },
         },
+        #[cfg(feature = "extended")]
         "list_scheduled_jobs" => Request::ListScheduledJobs { owner: None },
+        #[cfg(feature = "extended")]
         "delete_scheduled_job" => Request::DeleteScheduledJob {
             id: "job-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "set_scheduled_job_enabled" => Request::SetScheduledJobEnabled {
             id: "job-authz".into(),
             enabled: true,
         },
+        #[cfg(feature = "extended")]
         "run_scheduled_job" => Request::RunScheduledJob {
             id: "job-authz".into(),
         },
@@ -22261,33 +22274,40 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_list" => Request::ImageEndpointList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_get" => Request::ImageEndpointGet {
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_target_list" => Request::ImageTargetList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_target_get" => Request::ImageTargetGet {
             project_root: root.clone(),
             target_id: "t-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_list" => Request::ImageWorkflowList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_workflow_get" => Request::ImageWorkflowGet {
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_create" => Request::ImageEndpointCreate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22299,6 +22319,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_update" => Request::ImageEndpointUpdate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22311,6 +22332,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_delete" => Request::ImageEndpointDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22322,6 +22344,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_create" => Request::ImageTargetCreate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22333,6 +22356,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_update" => Request::ImageTargetUpdate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22345,6 +22369,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_delete" => Request::ImageTargetDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22356,6 +22381,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_set_default" => Request::ImageTargetSetDefault {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22367,6 +22393,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_upload" => Request::ImageWorkflowUpload {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22378,6 +22405,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_bind" => Request::ImageWorkflowBind {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -22390,6 +22418,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_delete" => Request::ImageWorkflowDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -23732,6 +23761,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "record_session_note"
         | "delete_session" => assert_session_db_mutating_happy(case.kind).await,
         "promote_resource" => assert_promote_resource_happy().await,
+        #[cfg(feature = "extended")]
         "create_scheduled_job"
         | "delete_scheduled_job"
         | "set_scheduled_job_enabled"
@@ -24007,6 +24037,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             };
             assert_eq!(status, proto::ResourcePromoteStatus::NotFound);
         }
+        #[cfg(feature = "extended")]
         "create_scheduled_job"
         | "delete_scheduled_job"
         | "set_scheduled_job_enabled"
@@ -27380,6 +27411,7 @@ async fn assert_promote_resource_happy() {
     assert_eq!(status, proto::ResourcePromoteStatus::Promoted);
 }
 
+#[cfg(feature = "extended")]
 async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -27395,6 +27427,7 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     );
 }
 
+#[cfg(feature = "extended")]
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -28305,7 +28338,7 @@ async fn pending_host_capability_refresh_does_not_block_same_client_interrupt_re
     ));
 }
 
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
@@ -36341,6 +36374,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -36566,6 +36600,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,

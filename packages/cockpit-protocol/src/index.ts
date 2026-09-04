@@ -2781,6 +2781,7 @@ export const knownEventKindSchema = z.enum([
   "session_ended",
   "session_persist_failed",
   "skill_auto_injected",
+  "subagent_compacted",
   "subagent_report",
   "subagent_routing",
   "subagent_spawned",

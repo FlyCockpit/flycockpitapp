@@ -49,7 +49,9 @@ mod descriptor;
 pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
+#[cfg(feature = "extended")]
 mod image_generation;
+#[cfg(feature = "extended")]
 mod image_sidecar;
 #[cfg(feature = "extended")]
 mod image_spend;
@@ -1396,6 +1398,7 @@ enum PendingSettingsOperation {
         committed_denylist: Vec<cockpit_proto::CommittedDenylistEntry>,
         warning: Option<String>,
     },
+    #[cfg(feature = "extended")]
     SidecarAuthority {
         target: SettingsEffectTarget,
         expected_daemon_instance_id: Option<String>,
@@ -1474,8 +1477,9 @@ impl PendingSettingsOperation {
             | Self::ExtendedLoad { .. }
             | Self::ProviderCatalog { .. }
             | Self::ProjectShadowSnapshot { .. }
-            | Self::SidecarAuthority { .. }
             | Self::ExtendedRefresh { .. } => false,
+            #[cfg(feature = "extended")]
+            Self::SidecarAuthority { .. } => false,
             #[cfg(feature = "extended")]
             Self::ImageSpendLoad { .. } => false,
             _ => true,
@@ -1508,7 +1512,6 @@ impl PendingSettingsOperation {
                 revision: Some(expected_revision.clone()),
             },
             Self::ExtendedRefresh { target, .. }
-            | Self::SidecarAuthority { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
@@ -1518,6 +1521,8 @@ impl PendingSettingsOperation {
             | Self::TypedDocumentEdit { target, .. }
             | Self::CategoryExternalPrepare { target, .. }
             | Self::CategoryExternalRead { target, .. } => target.clone(),
+            #[cfg(feature = "extended")]
+            Self::SidecarAuthority { target, .. } => target.clone(),
             #[cfg(feature = "extended")]
             Self::ImageSpendLoad { target, .. } => target.clone(),
             Self::ProviderCatalog {
@@ -2628,29 +2633,50 @@ pub(super) enum SettingsPointerSurfaceKind {
     Mcp,
     Lsp,
     Dependencies,
+    #[cfg(feature = "extended")]
     GenerationList,
+    #[cfg(feature = "extended")]
     EndpointEditor,
+    #[cfg(feature = "extended")]
     TargetEditor,
+    #[cfg(feature = "extended")]
     WorkflowEditor,
+    #[cfg(feature = "extended")]
     BudgetEditor,
+    #[cfg(feature = "extended")]
     GrantList,
+    #[cfg(feature = "extended")]
     JobList,
+    #[cfg(feature = "extended")]
     JobDetail,
+    #[cfg(feature = "extended")]
     LateResultAction,
+    #[cfg(feature = "extended")]
     SidecarOverview,
+    #[cfg(feature = "extended")]
     SidecarModeEditor,
+    #[cfg(feature = "extended")]
     SidecarDefaultEditor,
+    #[cfg(feature = "extended")]
     SidecarOverrideEditor,
+    #[cfg(feature = "extended")]
     SidecarCentralPolicyEditor,
+    #[cfg(feature = "extended")]
     SidecarResolverDetail,
+    #[cfg(feature = "extended")]
     SidecarHealthDetail,
+    #[cfg(feature = "extended")]
     SidecarGrantList,
+    #[cfg(feature = "extended")]
     SidecarGrantEditor,
+    #[cfg(feature = "extended")]
     SidecarInvocationList,
+    #[cfg(feature = "extended")]
     SidecarInvocationDetail,
 }
 
 impl SettingsPointerSurfaceKind {
+    #[cfg(feature = "extended")]
     pub(super) const ALL: [Self; 34] = [
         Self::Root,
         Self::DefaultModel,
@@ -2686,6 +2712,23 @@ impl SettingsPointerSurfaceKind {
         Self::SidecarGrantEditor,
         Self::SidecarInvocationList,
         Self::SidecarInvocationDetail,
+    ];
+    #[cfg(not(feature = "extended"))]
+    pub(super) const ALL: [Self; 14] = [
+        Self::Root,
+        Self::DefaultModel,
+        Self::Agents,
+        Self::Tools,
+        Self::Harnesses,
+        Self::Providers,
+        Self::Category,
+        Self::Instructions,
+        Self::RedactPatterns,
+        Self::StringList,
+        Self::Skills,
+        Self::Mcp,
+        Self::Lsp,
+        Self::Dependencies,
     ];
 }
 
@@ -2955,15 +2998,25 @@ pub(crate) enum TestPageRef<'a> {
     Skills(&'a SkillsPage),
     Mcp(&'a McpPage),
     Lsp(&'a LspPage),
+    #[cfg(feature = "extended")]
     GenerationList(&'a image_generation::GenerationListPage),
+    #[cfg(feature = "extended")]
     EndpointEditor(&'a image_generation::EndpointEditorPage),
+    #[cfg(feature = "extended")]
     TargetEditor(&'a image_generation::TargetEditorPage),
+    #[cfg(feature = "extended")]
     WorkflowEditor(&'a image_generation::WorkflowEditorPage),
+    #[cfg(feature = "extended")]
     BudgetEditor(&'a image_generation::BudgetEditorPage),
+    #[cfg(feature = "extended")]
     GrantList(&'a image_generation::GrantListPage),
+    #[cfg(feature = "extended")]
     JobList(&'a image_generation::JobListPage),
+    #[cfg(feature = "extended")]
     JobDetail(&'a image_generation::JobDetailPage),
+    #[cfg(feature = "extended")]
     LateResultAction(&'a image_generation::LateResultActionPage),
+    #[cfg(feature = "extended")]
     Sidecar(&'a image_sidecar::SidecarPage),
 }
 
@@ -2985,15 +3038,25 @@ enum TestPageMut<'a> {
     Skills(&'a mut SkillsPage),
     Mcp(&'a mut McpPage),
     Lsp(&'a mut LspPage),
+    #[cfg(feature = "extended")]
     GenerationList(&'a mut image_generation::GenerationListPage),
+    #[cfg(feature = "extended")]
     EndpointEditor(&'a mut image_generation::EndpointEditorPage),
+    #[cfg(feature = "extended")]
     TargetEditor(&'a mut image_generation::TargetEditorPage),
+    #[cfg(feature = "extended")]
     WorkflowEditor(&'a mut image_generation::WorkflowEditorPage),
+    #[cfg(feature = "extended")]
     BudgetEditor(&'a mut image_generation::BudgetEditorPage),
+    #[cfg(feature = "extended")]
     GrantList(&'a mut image_generation::GrantListPage),
+    #[cfg(feature = "extended")]
     JobList(&'a mut image_generation::JobListPage),
+    #[cfg(feature = "extended")]
     JobDetail(&'a mut image_generation::JobDetailPage),
+    #[cfg(feature = "extended")]
     LateResultAction(&'a mut image_generation::LateResultActionPage),
+    #[cfg(feature = "extended")]
     Sidecar(&'a mut image_sidecar::SidecarPage),
 }
 
@@ -3016,15 +3079,25 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            #[cfg(feature = "extended")]
             Self::GenerationList(_) => f.write_str("GenerationList"),
+            #[cfg(feature = "extended")]
             Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            #[cfg(feature = "extended")]
             Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            #[cfg(feature = "extended")]
             Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            #[cfg(feature = "extended")]
             Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            #[cfg(feature = "extended")]
             Self::GrantList(_) => f.write_str("GrantList"),
+            #[cfg(feature = "extended")]
             Self::JobList(_) => f.write_str("JobList"),
+            #[cfg(feature = "extended")]
             Self::JobDetail(_) => f.write_str("JobDetail"),
+            #[cfg(feature = "extended")]
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            #[cfg(feature = "extended")]
             Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
@@ -3048,15 +3121,25 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            #[cfg(feature = "extended")]
             Self::GenerationList(_) => f.write_str("GenerationList"),
+            #[cfg(feature = "extended")]
             Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            #[cfg(feature = "extended")]
             Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            #[cfg(feature = "extended")]
             Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            #[cfg(feature = "extended")]
             Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            #[cfg(feature = "extended")]
             Self::GrantList(_) => f.write_str("GrantList"),
+            #[cfg(feature = "extended")]
             Self::JobList(_) => f.write_str("JobList"),
+            #[cfg(feature = "extended")]
             Self::JobDetail(_) => f.write_str("JobDetail"),
+            #[cfg(feature = "extended")]
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            #[cfg(feature = "extended")]
             Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }
@@ -3080,7 +3163,9 @@ pub struct SettingsCx {
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
+    #[cfg(feature = "extended")]
     completed_image_spend: Option<ImageSpendCompletion>,
+    #[cfg(feature = "extended")]
     completed_image_sidecar: Vec<SidecarAuthorityCompletion>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
@@ -3203,6 +3288,7 @@ pub struct SettingsCx {
     pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+#[cfg(feature = "extended")]
 enum ImageSpendCompletion {
     Loaded {
         page_instance_id: uuid::Uuid,
@@ -3220,6 +3306,7 @@ enum ImageSpendCompletion {
     },
 }
 
+#[cfg(feature = "extended")]
 struct SidecarAuthorityCompletion {
     target: SettingsEffectTarget,
     expected_daemon_instance_id: Option<String>,
@@ -3299,18 +3386,6 @@ impl SettingsCx {
         );
     }
 
-    #[cfg(not(feature = "extended"))]
-    pub(super) fn queue_image_spend_load(
-        &mut self,
-        _project_key: String,
-        page_instance_id: uuid::Uuid,
-    ) {
-        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
-            page_instance_id,
-            message: "image-generation budgets require the extended build profile".into(),
-        });
-    }
-
     #[cfg(feature = "extended")]
     fn queue_image_spend_save(
         &mut self,
@@ -3354,17 +3429,6 @@ impl SettingsCx {
             },
         );
         Ok(())
-    }
-
-    #[cfg(not(feature = "extended"))]
-    fn queue_image_spend_save(
-        &mut self,
-        _project_key: String,
-        _settings: cockpit_config::config::image_spend::ImageSpendSettings,
-        _expected_policy_version: Option<u64>,
-        _page_instance_id: uuid::Uuid,
-    ) -> Result<(), String> {
-        Err("image-generation budgets require the extended build profile".into())
     }
 
     fn enqueue_settlement_effect(
@@ -3697,6 +3761,7 @@ impl SettingsCx {
         );
     }
 
+    #[cfg(feature = "extended")]
     pub(crate) fn queue_image_sidecar_authority(
         &mut self,
         request: Request,
@@ -3744,12 +3809,14 @@ impl SettingsCx {
         true
     }
 
+    #[cfg(feature = "extended")]
     pub(super) fn sidecar_authority_pending(&self) -> bool {
         self.pending_settings
             .values()
             .any(|pending| matches!(pending, PendingSettingsOperation::SidecarAuthority { .. }))
     }
 
+    #[cfg(feature = "extended")]
     pub(crate) fn take_image_sidecar_completion(
         &mut self,
         project_root: &str,
@@ -3778,6 +3845,7 @@ impl SettingsCx {
         matching
     }
 
+    #[cfg(feature = "extended")]
     pub(crate) fn image_sidecar_config_generation(&self) -> Option<u64> {
         self.extended_base
             .get("__cockpit_settings_generation")
@@ -4526,6 +4594,7 @@ impl SettingsCx {
                     })],
                 }
             }
+            #[cfg(feature = "extended")]
             PendingSettingsOperation::SidecarAuthority {
                 target,
                 expected_daemon_instance_id,
@@ -6967,6 +7036,7 @@ impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
+                #[cfg(feature = "extended")]
                 let sidecar_completion = self.cx.take_image_sidecar_completion(
                     self.page
                         .downcast_ref::<image_sidecar::SidecarPage>()
@@ -6981,6 +7051,7 @@ impl SettingsDialog {
                         .downcast_ref::<image_sidecar::SidecarPage>()
                         .map_or("", |page| page.session.reducer.session_id.as_str()),
                 );
+                #[cfg(feature = "extended")]
                 if let Some(page) = self.page.downcast_mut::<image_sidecar::SidecarPage>() {
                     page.apply_authoritative_settings_completion(&mut self.cx, sidecar_completion);
                 }
@@ -7017,9 +7088,9 @@ impl SettingsDialog {
                         prompt.setting.descriptor().label
                     ));
                 }
+                #[cfg(feature = "extended")]
                 if let Some(completion) = self.cx.completed_image_spend.take() {
                     let mut completion = Some(completion);
-                    #[cfg(feature = "extended")]
                     if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
                         page.apply_daemon_completion(completion.take().unwrap());
                     }
@@ -7194,51 +7265,62 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<LspPage>() {
             return TestPageRef::Lsp(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::GenerationListPage>()
         {
             return TestPageRef::GenerationList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::EndpointEditorPage>()
         {
             return TestPageRef::EndpointEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::TargetEditorPage>()
         {
             return TestPageRef::TargetEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::WorkflowEditorPage>()
         {
             return TestPageRef::WorkflowEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::BudgetEditorPage>()
         {
             return TestPageRef::BudgetEditor(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::GrantListPage>() {
             return TestPageRef::GrantList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::JobListPage>() {
             return TestPageRef::JobList(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_generation::JobDetailPage>() {
             return TestPageRef::JobDetail(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self
             .page
             .downcast_ref::<image_generation::LateResultActionPage>()
         {
+            #[cfg(feature = "extended")]
             return TestPageRef::LateResultAction(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_sidecar::SidecarPage>() {
             return TestPageRef::Sidecar(p);
         }
@@ -7298,6 +7380,7 @@ impl SettingsDialog {
         if self.page.as_any().is::<LspPage>() {
             return TestPageMut::Lsp(self.page.downcast_mut::<LspPage>().unwrap());
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7309,6 +7392,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7320,6 +7404,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7331,6 +7416,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7342,6 +7428,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7353,6 +7440,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::GrantListPage>() {
             return TestPageMut::GrantList(
                 self.page
@@ -7360,6 +7448,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::JobListPage>() {
             return TestPageMut::JobList(
                 self.page
@@ -7367,6 +7456,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_generation::JobDetailPage>() {
             return TestPageMut::JobDetail(
                 self.page
@@ -7374,6 +7464,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self
             .page
             .as_any()
@@ -7385,6 +7476,7 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_sidecar::SidecarPage>() {
             return TestPageMut::Sidecar(
                 self.page
@@ -7442,7 +7534,9 @@ impl SettingsDialog {
                 pending_provider_mutation_navigation: None,
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
+                #[cfg(feature = "extended")]
                 completed_image_spend: None,
+                #[cfg(feature = "extended")]
                 completed_image_sidecar: Vec::new(),
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
@@ -7959,6 +8053,7 @@ impl SettingsDialog {
                 // page-local presentation: return the child session to its
                 // sidecar parent before restoring it so edits and daemon
                 // projections cannot disappear on Back.
+                #[cfg(feature = "extended")]
                 if let (Some(child), Some(parent_sidecar)) = (
                     current.downcast_ref::<image_sidecar::SidecarPage>(),
                     parent.downcast_mut::<image_sidecar::SidecarPage>(),
@@ -8470,10 +8565,12 @@ impl SettingsPage for RootPage {
                     }
                     #[cfg(feature = "extended")]
                     "Generation" => Some(image_generation::generation_list_page(
+                        #[cfg(feature = "extended")]
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
                         ),
                     )),
+                    #[cfg(feature = "extended")]
                     "Image Sidecar" => {
                         let project_id = cx
                             .active_project_root
@@ -8656,7 +8753,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 #[cfg(feature = "extended")]
 const ROOT_NODE_COUNT: usize = 17;
 #[cfg(not(feature = "extended"))]
-const ROOT_NODE_COUNT: usize = 15;
+const ROOT_NODE_COUNT: usize = 14;
 
 fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
@@ -8702,6 +8799,7 @@ fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
             title: "Generation",
             description: "Image-generation endpoints, targets, workflows, budget, destination grants, and job management. Visibility follows the control-plane authorization matrix.",
         },
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::ImageSidecar,
             title: "Image Sidecar",
@@ -8887,6 +8985,7 @@ impl SettingsCx {
     /// is the launch/session project root this dialog is scoped to; remote grant
     /// scopes and ceilings are left empty here and MUST be populated from the
     /// control-plane grant snapshot the day a remote settings surface exists.
+    #[cfg(feature = "extended")]
     pub(super) fn image_generation_session_snapshot(
         &self,
     ) -> image_generation::SessionCapabilitySnapshot {

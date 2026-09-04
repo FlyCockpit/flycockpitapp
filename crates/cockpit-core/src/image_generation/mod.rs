@@ -10,6 +10,7 @@
 //! (`crate::image_generation_job`) owns immutable plans, attempts, artifacts,
 //! spend, and effect recovery.
 
+#[cfg(feature = "extended")]
 pub mod adapters;
 pub mod http_transport;
 pub mod transport;

@@ -61,9 +61,11 @@ pub mod filesystem_identity;
 pub mod guidance;
 pub mod guidance_proposals;
 pub mod history_scope;
+#[cfg(feature = "extended")]
 pub mod image_generation;
 pub mod image_generation_plan;
 pub mod image_sidecar;
+#[cfg(feature = "extended")]
 pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
@@ -92,6 +94,7 @@ pub mod remote_attachment_operations;
 pub mod remote_audit_upload;
 pub mod retention;
 pub mod run_invocations;
+#[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod sealed_actions;
 pub mod sealed_scope;

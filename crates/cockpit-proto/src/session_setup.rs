@@ -140,7 +140,7 @@ pub struct SessionSetupSnapshotV1 {
     #[serde(default)]
     pub override_revision: u64,
     /// False when an interactive subagent holds the foreground.
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub root_foreground: bool,
     #[serde(default)]
     pub model: crate::AgentModelControlV1,
@@ -148,8 +148,4 @@ pub struct SessionSetupSnapshotV1 {
     pub tools: Vec<SessionSetupToolV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcps: Vec<SessionSetupMcpV1>,
-}
-
-fn default_true() -> bool {
-    true
 }

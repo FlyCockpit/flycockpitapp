@@ -798,6 +798,7 @@ pub enum Event {
     /// committed a new config generation. SECURITY: the carried
     /// [`ImageControlEventV1`](crate::image_control::ImageControlEventV1) holds
     /// only safe projections — never a raw credential, header, or workflow blob.
+    #[cfg(feature = "extended")]
     ImageControlConfigChanged {
         event: crate::image_control::ImageControlEventV1,
     },
@@ -1252,6 +1253,32 @@ pub enum Event {
         model_trusted: bool,
         #[serde(default)]
         routing: serde_json::Value,
+    },
+
+    /// A noninteractive subagent autocompacted into a new linked window in its
+    /// own delegation lineage. Parent-visible signal only; never enters model
+    /// context.
+    SubagentCompacted {
+        session_id: Uuid,
+        agent: String,
+        task_call_id: String,
+        label: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        trigger_ctx_pct: Option<f64>,
+        #[serde(default)]
+        tokens_before: u64,
+        #[serde(default)]
+        tokens_after: u64,
+        #[serde(default)]
+        turns_summarized: usize,
+        #[serde(default)]
+        tail_kept: usize,
+        #[serde(default)]
+        tail_trimmed: usize,
+        #[serde(default)]
+        window_index: u32,
     },
 
     /// A noninteractive child event forwarded through the parent session
@@ -1741,6 +1768,7 @@ macro_rules! event_variants {
             (Event::ActiveModelState { .. }, "active_model_state");
             (Event::ModelSelectionResult { .. }, "model_selection_result");
             (Event::DefaultModelUpdateResult { .. }, "default_model_update_result");
+            #[cfg(feature = "extended")]
             (Event::ImageControlConfigChanged { .. }, "image_control_config_changed");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");
@@ -1778,6 +1806,7 @@ macro_rules! event_variants {
             (Event::SubagentSpawned { .. }, "subagent_spawned");
             (Event::SubagentRouting { .. }, "subagent_routing");
             (Event::SubagentReport { .. }, "subagent_report");
+            (Event::SubagentCompacted { .. }, "subagent_compacted");
             (Event::NestedTurn { .. }, "nested_turn");
             (Event::Usage { .. }, "usage");
             (Event::InterruptRaised { .. }, "interrupt_raised");

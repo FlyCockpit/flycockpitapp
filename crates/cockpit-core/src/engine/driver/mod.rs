@@ -28,6 +28,7 @@ mod skills_seed;
 mod swap;
 
 use crate::engine::compact_draft::wire_token_total;
+pub(crate) use context_reduction::NoninteractiveAutoCompactOutcome;
 #[cfg(test)]
 use context_reduction::*;
 use context_reduction::{AutoCompactGate, PruneEffectiveness};
@@ -1430,6 +1431,7 @@ pub struct Driver {
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     /// Shared daemon scheduler handle cell. The worker installs the registry's
     /// cell rather than a snapshot so late `set_scheduler` calls are visible.
+    #[cfg(feature = "extended")]
     daemon_scheduler:
         Option<Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>>,
     /// Durable write-scope authority cell, installed by the worker. Held as the
@@ -1586,6 +1588,10 @@ pub struct Driver {
     /// fail — but are not reachable from a black-box unit test).
     #[cfg(test)]
     test_compact_force_failure: Option<CompactForceFailure>,
+    #[cfg(test)]
+    test_compaction_ignore_forward_progress: bool,
+    #[cfg(test)]
+    test_compact_brief_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -1678,6 +1684,41 @@ struct TestCompactBriefCall {
 pub(in crate::engine::driver) enum CompactForceFailure {
     Prepare,
     Apply,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(in crate::engine::driver) struct NestedLaneTestHooks {
+    pub test_compact_brief_script:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    pub test_providers_override:
+        Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    /// No-progress compaction charges applied to the lane budget after allot.
+    pub lane_compact_guard_precharge: u32,
+    /// When true, subagent compaction apply ignores lane forward progress.
+    pub compaction_ignore_forward_progress: bool,
+    /// Usage recorded into the lane when a test compact brief succeeds without
+    /// a provider call.
+    pub compact_brief_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
+}
+
+#[cfg(test)]
+pub(in crate::engine::driver) mod nested_lane_test_hooks {
+    use std::cell::RefCell;
+
+    use super::NestedLaneTestHooks;
+
+    thread_local! {
+        static HOOKS: RefCell<Option<NestedLaneTestHooks>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(hooks: NestedLaneTestHooks) {
+        HOOKS.with(|slot| *slot.borrow_mut() = Some(hooks));
+    }
+
+    pub fn take() -> Option<NestedLaneTestHooks> {
+        HOOKS.with(|slot| slot.borrow_mut().take())
+    }
 }
 
 #[cfg(test)]
@@ -2429,6 +2470,7 @@ impl Driver {
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            #[cfg(feature = "extended")]
             daemon_scheduler: self.daemon_scheduler.clone(),
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
@@ -2468,6 +2510,10 @@ impl Driver {
             test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
             #[cfg(test)]
             test_compact_force_failure: self.test_compact_force_failure,
+            #[cfg(test)]
+            test_compaction_ignore_forward_progress: self.test_compaction_ignore_forward_progress,
+            #[cfg(test)]
+            test_compact_brief_lane_charge: self.test_compact_brief_lane_charge,
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -2819,6 +2865,7 @@ impl Driver {
             approver: None,
             lsp: None,
             resource_scheduler: None,
+            #[cfg(feature = "extended")]
             daemon_scheduler: None,
             write_scope: None,
             dream_read_scope,
@@ -2859,6 +2906,10 @@ impl Driver {
             test_compaction_apply_trace: None,
             #[cfg(test)]
             test_compact_force_failure: None,
+            #[cfg(test)]
+            test_compaction_ignore_forward_progress: false,
+            #[cfg(test)]
+            test_compact_brief_lane_charge: None,
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
@@ -3542,6 +3593,7 @@ impl Driver {
         self.resource_scheduler = Some(scheduler);
     }
 
+    #[cfg(feature = "extended")]
     pub fn set_daemon_scheduler_source(
         &mut self,
         scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
@@ -3563,6 +3615,7 @@ impl Driver {
             .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
     }
 
+    #[cfg(feature = "extended")]
     pub fn daemon_scheduler_handle(
         &self,
     ) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -4922,6 +4975,7 @@ impl Driver {
             cancel: self.live_or_session_cancel(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: self.session.transcription_dispatch(
                 agent.model.provider_id(),
@@ -5110,6 +5164,7 @@ impl Driver {
             cancel,
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: self.session.image_generation_dispatch(),
             transcription_dispatch: None,
             deferred_log: self
@@ -10404,6 +10459,42 @@ impl Driver {
         Self::context_config_from(self.active_providers_config().as_ref())
     }
 
+    /// Context-threshold config for the active stack frame's model.
+    pub(in crate::engine::driver) fn frame_context_config(
+        &self,
+    ) -> crate::config::providers::ContextConfig {
+        Self::context_config_from(self.frame_providers_config().as_ref())
+    }
+
+    /// Load providers config for the active stack frame's endpoint.
+    fn frame_providers_config(
+        &self,
+    ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_providers_override {
+            return Some(o.clone());
+        }
+        let frame = self.stack.last()?;
+        let providers = self.config.providers();
+        Some((
+            providers,
+            frame.agent.model.provider_id().to_string(),
+            frame.agent.model.model_id_ref().to_string(),
+        ))
+    }
+
+    /// Effective context window for the active stack frame's model.
+    pub(in crate::engine::driver) fn frame_model_context_length(&self) -> Option<u32> {
+        let (providers, provider, model) = self.frame_providers_config()?;
+        providers
+            .resolve_effective_model_capabilities(
+                &provider,
+                &model,
+                providers.resolution_generation,
+            )
+            .context_tokens
+    }
+
     /// Evaluate one observed-hit-gated keep-warm opportunity at an idle root
     /// boundary. The scheduler owns the later one-shot execution; this method
     /// only records the decision and never changes user activity.
@@ -10456,39 +10547,47 @@ impl Driver {
                 }
             }
             crate::keep_warm::KeepWarmDecision::Schedule(schedule) => {
-                let Some(scheduler) = self.daemon_scheduler_handle() else {
+                #[cfg(not(feature = "extended"))]
+                {
+                    let _ = schedule;
                     tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
                     return;
-                };
-                let Some(cache_send_identity) = self.session.last_send_identity() else {
-                    // An observed cache hit necessarily follows a foreground
-                    // send in production. If that in-memory send marker is
-                    // absent (for example after a worker restart), fail
-                    // closed rather than inventing a later idle origin.
-                    return;
-                };
-                let job = crate::daemon::proto::ScheduledJobCreate {
-                    id: crate::keep_warm::format_job_id(
-                        self.session.live_id(),
-                        cache_send_identity,
-                        schedule.after_secs,
-                        schedule.idle_window_secs,
-                    ),
-                    owner: "system:keep_warm".to_string(),
-                    schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
-                        at: cache_send_identity
-                            .unix_millis
-                            .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
-                            .saturating_add(999)
-                            .div_euclid(1_000),
-                    },
-                    payload: crate::daemon::proto::ScheduledJobPayload::Callback {
-                        subsystem: "keep_warm".to_string(),
-                    },
-                    enabled: true,
-                    missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
-                };
-                match scheduler.create_system_callback_job(job).await {
+                }
+                #[cfg(feature = "extended")]
+                {
+                    let Some(scheduler) = self.daemon_scheduler_handle() else {
+                        tracing::debug!(session_id = %self.session.id, "keep-warm skipped: daemon scheduler unavailable");
+                        return;
+                    };
+                    let Some(cache_send_identity) = self.session.last_send_identity() else {
+                        // An observed cache hit necessarily follows a foreground
+                        // send in production. If that in-memory send marker is
+                        // absent (for example after a worker restart), fail
+                        // closed rather than inventing a later idle origin.
+                        return;
+                    };
+                    let job = crate::daemon::proto::ScheduledJobCreate {
+                        id: crate::keep_warm::format_job_id(
+                            self.session.live_id(),
+                            cache_send_identity,
+                            schedule.after_secs,
+                            schedule.idle_window_secs,
+                        ),
+                        owner: "system:keep_warm".to_string(),
+                        schedule: crate::daemon::proto::ScheduledJobSchedule::Once {
+                            at: cache_send_identity
+                                .unix_millis
+                                .saturating_add((schedule.after_secs as i64).saturating_mul(1_000))
+                                .saturating_add(999)
+                                .div_euclid(1_000),
+                        },
+                        payload: crate::daemon::proto::ScheduledJobPayload::Callback {
+                            subsystem: "keep_warm".to_string(),
+                        },
+                        enabled: true,
+                        missed_run_policy: crate::daemon::proto::MissedRunPolicy::Skip,
+                    };
+                    match scheduler.create_system_callback_job(job).await {
                     Ok(_) => {
                         if let Err(error) = self
                             .session
@@ -10516,6 +10615,7 @@ impl Driver {
                     Err(error) => {
                         tracing::warn!(%error, session_id = %self.session.id, "scheduling keep-warm failed");
                     }
+                }
                 }
             }
         }
@@ -10744,13 +10844,27 @@ impl Driver {
         AUTO_COMPACT_DEFAULT_PCT
     }
 
+    fn effective_frame_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+        frame: Option<&AgentSession>,
+    ) -> u8 {
+        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
+        self.effective_auto_compact_pct(ctx_cfg, policy)
+    }
+
     fn effective_root_auto_compact_pct(
         &self,
         ctx_cfg: &crate::config::providers::ContextConfig,
     ) -> u8 {
-        let frame = self.stack.first();
-        let policy = frame.and_then(|f| f.agent.context_policy.as_ref());
-        self.effective_auto_compact_pct(ctx_cfg, policy)
+        self.effective_frame_auto_compact_pct(ctx_cfg, self.stack.first())
+    }
+
+    fn effective_active_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+    ) -> u8 {
+        self.effective_frame_auto_compact_pct(ctx_cfg, self.stack.last())
     }
 
     /// Last provider-reported input usage, with a debug-build-only threshold
@@ -12836,6 +12950,7 @@ impl Driver {
                         // same admission interval as ordinary ingress.
                         let idle_activity_gate = self.schedule.idle_activity_gate();
                         let _idle_activity_admission = idle_activity_gate.lock().await;
+                        #[cfg(feature = "extended")]
                         if let Some(scheduler) = self.daemon_scheduler_handle() {
                             scheduler.record_user_activity_after_acceptance().await;
                         }

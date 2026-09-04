@@ -330,6 +330,7 @@ impl Driver {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: None,
             transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),

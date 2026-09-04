@@ -778,9 +778,10 @@ pub(super) fn session_work_error(error: anyhow::Error) -> ErrorPayload {
     internal(error)
 }
 
+#[cfg(feature = "extended")]
 pub(super) fn require_scheduler(
     ctx: &DaemonContext,
-) -> std::result::Result<DaemonSchedulerHandle, ErrorPayload> {
+) -> std::result::Result<crate::daemon::scheduler::DaemonSchedulerHandle, ErrorPayload> {
     ctx.scheduler().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),

@@ -39,6 +39,7 @@ use crate::daemon::proto::{
     RecvFrame, Request, Response,
 };
 use crate::daemon::registry::SessionRegistry;
+#[cfg(feature = "extended")]
 use crate::daemon::scheduler::DaemonSchedulerHandle;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle, UserMessageProbeResult};
 use crate::daemon::shutdown::ShutdownPhase;
@@ -68,41 +69,34 @@ const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
+#[cfg(feature = "extended")]
 fn start_persistent_scheduler(
     db: &Db,
     registry: &SessionRegistry,
     shutdown: &crate::daemon::shutdown::ShutdownSignal,
     start_gate: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Option<DaemonSchedulerHandle> {
-    #[cfg(feature = "extended")]
-    {
-        let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+    let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+        db.clone(),
+        registry.clone(),
+    ));
+    // Keep daemon-owned callbacks next to the production executor so every
+    // durable scheduler startup path (initial boot and in-place promotion)
+    // has the same callback inventory before it can dispatch work.
+    let keep_warm_registry = registry.clone();
+    executor.register_callback("keep_warm", move |job| {
+        let registry = keep_warm_registry.clone();
+        async move { registry.run_keep_warm_job(job).await }
+    });
+    let callbacks = executor.callback_registry();
+    Some(
+        Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
             db.clone(),
-            registry.clone(),
-        ));
-        // Keep daemon-owned callbacks next to the production executor so every
-        // durable scheduler startup path (initial boot and in-place promotion)
-        // has the same callback inventory before it can dispatch work.
-        let keep_warm_registry = registry.clone();
-        executor.register_callback("keep_warm", move |job| {
-            let registry = keep_warm_registry.clone();
-            async move { registry.run_keep_warm_job(job).await }
-        });
-        let callbacks = executor.callback_registry();
-        Some(
-            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
-                db.clone(),
-                Arc::new(crate::daemon::scheduler::SystemClock),
-                executor,
-            ))
-            .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
-        )
-    }
-    #[cfg(not(feature = "extended"))]
-    {
-        let _ = (db, registry, shutdown, start_gate);
-        None
-    }
+            Arc::new(crate::daemon::scheduler::SystemClock),
+            executor,
+        ))
+        .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
+    )
 }
 
 fn daemon_process_env() -> HashMap<String, String> {
@@ -633,13 +627,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(message, redact);
             scrub_resource_scheduler_snapshot(snapshot, redact);
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJob { job } => scrub_scheduled_job_summary(job, redact),
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobs { jobs } => {
             for job in jobs {
                 scrub_scheduled_job_summary(job, redact);
             }
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobRunQueued { id: _ } => {}
         proto::Response::FsList {
             entries,
@@ -979,12 +977,14 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // secret material and is likewise not re-scrubbed. The remaining strings
         // are non-secret config identifiers (display names, model names,
         // origins).
+        #[cfg(feature = "extended")]
         proto::Response::ImageControlRead(..) => {}
         // Redacted image-control config-mutation reply. Its change set carries
         // only `cockpit_proto::image_control` safe projections (credential_ref/
         // headers/graph_json/source_urls are dropped at the projection funnel,
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
+        #[cfg(feature = "extended")]
         proto::Response::ImageControlMutated(..) => {}
         // Image-sidecar authority projections contain only daemon-generated
         // ids, normalized destinations, closed enums, and timestamps.
@@ -1065,13 +1065,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             done: _,
             total: _,
         }
-        // Redacted LOCAL image-control `config_changed` event. Its change set
-        // carries only the `cockpit_proto::image_control` safe projections
-        // (every secret-bearing field — credential_ref/headers/graph_json/
-        // source_url — is dropped at the projection funnel, exactly like the
-        // sibling `ImageControlRead` response above), so there is no free text
-        // to scrub.
-        | proto::Event::ImageControlConfigChanged { event: _ }
         | proto::Event::ContextProjection {
             session_id: _,
             prunable_tokens: _,
@@ -1130,9 +1123,9 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             dropped: _,
         }
         | proto::Event::DaemonDraining { forced: _ }
-        | proto::Event::DaemonLifetimeChanged {
-            ephemeral_owner: _,
-        } => {}
+        | proto::Event::DaemonLifetimeChanged { ephemeral_owner: _ } => {}
+        #[cfg(feature = "extended")]
+        proto::Event::ImageControlConfigChanged { event: _ } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -1237,7 +1230,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             seq: _,
             client_submission_ids: _,
-        } => {},
+        } => {}
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
             text,
@@ -1416,6 +1409,23 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_string(label, redact);
             scrub_string(report, redact);
             scrub_json_strings(routing, redact);
+        }
+        proto::Event::SubagentCompacted {
+            session_id: _,
+            agent: _,
+            task_call_id: _,
+            label,
+            source,
+            trigger_ctx_pct: _,
+            tokens_before: _,
+            tokens_after: _,
+            turns_summarized: _,
+            tail_kept: _,
+            tail_trimmed: _,
+            window_index: _,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(source, redact);
         }
         proto::Event::NestedTurn {
             session_id: _,
@@ -2132,6 +2142,7 @@ fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable)
     scrub_option_string(display_name, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &RedactionTable) {
     let proto::ScheduledJobSummary {
         id: _,
@@ -2164,6 +2175,7 @@ fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &Re
     scrub_option_string(disabled_notice, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_last_result(
     result: &mut proto::ScheduledJobLastResult,
     redact: &RedactionTable,
@@ -2620,6 +2632,7 @@ pub struct DaemonContext {
     remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
     /// The durable scheduler is absent for an ephemeral owner and installed
     /// atomically before an in-place promotion publishes a persistent owner.
+    #[cfg(feature = "extended")]
     scheduler: Arc<StdMutex<Option<DaemonSchedulerHandle>>>,
     /// Services provisioned by an in-place ephemeral-to-persistent promotion.
     /// They are installed and removed under `restart_decision` with endpoint
@@ -2848,6 +2861,7 @@ impl DaemonContext {
 
     /// Return the currently installed durable scheduler without retaining the
     /// installation lock across an async scheduler operation.
+    #[cfg(feature = "extended")]
     pub(crate) fn scheduler(&self) -> Option<DaemonSchedulerHandle> {
         // Prepared promotion services are deliberately not observable while
         // this owner still has ephemeral lifetime. This makes the lifetime
@@ -2873,6 +2887,7 @@ impl DaemonContext {
     /// Install the durable scheduler with a closed start gate. Its loop opens
     /// only from `start_persistent_service_tasks` after the lifetime store,
     /// so the scheduler cannot dispatch until admission is published.
+    #[cfg(feature = "extended")]
     fn install_persistent_scheduler(&self, start_gate: tokio::sync::watch::Receiver<bool>) {
         let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
         if scheduler.is_some() {
@@ -2930,6 +2945,7 @@ impl DaemonContext {
     fn activate_persistent_services(&self, services: PreparedPersistentServices) {
         self.registry
             .set_resource_scheduler(Some(services.resource_scheduler));
+        #[cfg(feature = "extended")]
         self.install_persistent_scheduler(services.service_start_gate.subscribe());
         self.registry
             .set_media_storage_recovery(Some(services.media_storage_recovery.clone()));
@@ -2974,7 +2990,9 @@ impl DaemonContext {
     /// of a never-published owner.
     fn deactivate_persistent_services(&self) {
         self.registry.set_resource_scheduler(None);
+        #[cfg(feature = "extended")]
         self.registry.clear_scheduler();
+        #[cfg(feature = "extended")]
         if let Some(scheduler) = crate::sync::lock_or_recover(&self.scheduler).take() {
             scheduler.abort();
         }
@@ -3194,9 +3212,11 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
+        #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral)
             .then(|| start_persistent_scheduler(&db, &registry, &shutdown, None))
             .flatten();
+        #[cfg(feature = "extended")]
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -3237,6 +3257,7 @@ impl DaemonContext {
             boot_id: image_generation_boot_id,
             started_at,
         });
+        #[cfg(feature = "extended")]
         let image_generation_dispatch_registry = registry.image_generation_dispatch_registry();
         #[cfg(feature = "extended")]
         let image_generation_artifact_root = (!paths.ephemeral).then(|| {
@@ -3326,6 +3347,7 @@ impl DaemonContext {
             connector_wake,
             #[cfg(feature = "remote")]
             remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "extended")]
             scheduler: Arc::new(StdMutex::new(scheduler)),
             promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
             image_generation_boot_id,
@@ -4783,6 +4805,7 @@ pub(crate) async fn boot_with_db(
         tracing::warn!("media admission is closed until durable reservations are recovered");
         timer.phase("media_reservation_admission_blocked");
     }
+    #[cfg(feature = "extended")]
     if let Some(handle) = ctx.scheduler()
         && let Err(error) =
             crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
@@ -4911,16 +4934,22 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup onboarding-agent publication recovery failed")?;
-    let recovered_image_config =
-        image_control_mutations::recover_image_config_mutation_journals(ctx, config_publication)
+    #[cfg(feature = "extended")]
+    {
+        let recovered_image_config =
+            image_control_mutations::recover_image_config_mutation_journals(
+                ctx,
+                config_publication,
+            )
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup image-config mutation journal recovery failed")?;
-    if recovered_image_config > 0 {
-        tracing::info!(
-            count = recovered_image_config,
-            "reconciled committed image configuration before socket publication"
-        );
+        if recovered_image_config > 0 {
+            tracing::info!(
+                count = recovered_image_config,
+                "reconciled committed image configuration before socket publication"
+            );
+        }
     }
     crate::daemon::agent_management::recover_known_workspace_resets(ctx, config_publication)
         .await
@@ -7666,7 +7695,9 @@ pub(crate) use dispatch::validate_and_normalize_mcp_credentials;
 mod remote_dispatch;
 #[cfg(feature = "remote")]
 pub(crate) use remote_dispatch::RemoteOperationContext;
+#[cfg(feature = "extended")]
 mod image_control_mutations;
+#[cfg(feature = "extended")]
 mod image_control_reads;
 mod run_invocation;
 mod sealed_capabilities;

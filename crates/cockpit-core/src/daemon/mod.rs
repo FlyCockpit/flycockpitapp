@@ -51,8 +51,11 @@ pub mod effective_default_recovery;
 pub mod egress;
 pub(crate) mod ephemeral_guard;
 pub mod fs_api;
+#[cfg(feature = "extended")]
 pub(crate) mod image_generation_adapters;
+#[cfg(feature = "extended")]
 pub mod image_generation_worker;
+#[cfg(feature = "extended")]
 pub mod image_runtime;
 pub mod image_sidecar_authority;
 pub mod leak_reveal;
@@ -78,6 +81,7 @@ pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
 #[cfg(feature = "remote")]
 pub mod remote_project_resolver;
+#[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
 #[cfg(feature = "remote")]

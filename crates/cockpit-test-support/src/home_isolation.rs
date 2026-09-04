@@ -14,6 +14,27 @@
 //!
 //! Set [`COCKPIT_TEST_ALLOW_REAL_HOME_ENV`] to `1` to opt into real developer
 //! paths (manual smokes only).
+//!
+//! ## Which "developer profile" is enforced
+//!
+//! The real developer roots are captured from the *build* environment
+//! (`option_env!` at compile time), not from the process environment at first
+//! use. Runtime capture cannot work for the `cockpit` binary that e2e tests
+//! spawn as a child process: feature unification gives that binary the
+//! `test-support` resolvers too, and its inherited XDG/HOME environment is
+//! exactly the per-test isolated environment the harness installed. Runtime
+//! capture would therefore classify the harness's own isolated roots as "the
+//! developer profile" and redirect every explicit e2e override away, breaking
+//! all spawned-child path expectations. Compile-time capture sees the true
+//! developer shell that produced this test build and is immune to any
+//! harness-provided environment, so an explicit XDG/HOME override in a spawned
+//! child is honored (it never points at the real developer profile), while an
+//! unguarded in-process test that resolves the real profile is still
+//! redirected. When the build environment did not define the profile (no
+//! compile-time `HOME`), the roots fall back to a first-use runtime capture,
+//! which is correct for in-process tests because
+//! [`ensure_real_developer_roots_captured`] runs before any [`TestEnvGuard`]
+//! mutation.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -51,10 +72,59 @@ struct ProcessIsolatedHome {
 static REAL_DEVELOPER_COCKPIT_ROOTS: OnceLock<RealDeveloperCockpitRoots> = OnceLock::new();
 static PROCESS_ISOLATED_HOME: OnceLock<ProcessIsolatedHome> = OnceLock::new();
 
-/// Record the developer-owned Cockpit roots once, before any test mutates
-/// `HOME` / XDG variables through [`TestEnvGuard`].
-pub fn ensure_real_developer_roots_captured() {
-    REAL_DEVELOPER_COCKPIT_ROOTS.get_or_init(|| {
+// Compile-time capture of the developer profile that produced this test
+// build. See the module docs: runtime capture cannot distinguish the real
+// profile from the per-test environment an e2e harness hands a spawned
+// `cockpit` child, but the build-time shell is always the true profile.
+#[cfg(unix)]
+const BUILD_HOME: Option<&str> = option_env!("HOME");
+#[cfg(unix)]
+const BUILD_XDG_CONFIG_HOME: Option<&str> = option_env!("XDG_CONFIG_HOME");
+#[cfg(unix)]
+const BUILD_XDG_DATA_HOME: Option<&str> = option_env!("XDG_DATA_HOME");
+#[cfg(unix)]
+const BUILD_XDG_STATE_HOME: Option<&str> = option_env!("XDG_STATE_HOME");
+
+impl RealDeveloperCockpitRoots {
+    /// Roots derived from the build environment, mirroring the platform
+    /// defaults the `dirs`-based resolvers would produce in that shell.
+    /// `None` when the build environment did not define a home.
+    #[cfg(unix)]
+    fn from_build_environment() -> Option<Self> {
+        let build_home = BUILD_HOME?;
+        if build_home.trim().is_empty() {
+            return None;
+        }
+        let home = PathBuf::from(build_home);
+        let non_empty = |value: Option<&str>| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        };
+        let config_base = non_empty(BUILD_XDG_CONFIG_HOME).unwrap_or_else(|| home.join(".config"));
+        let data_base = non_empty(BUILD_XDG_DATA_HOME).unwrap_or_else(|| home.join(".local/share"));
+        let state_base =
+            non_empty(BUILD_XDG_STATE_HOME).unwrap_or_else(|| home.join(".local/state"));
+        Some(Self {
+            home,
+            xdg_data: data_base.clone(),
+            config: config_base.join("cockpit"),
+            data: data_base.join("cockpit"),
+            state: state_base.join("cockpit"),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_build_environment() -> Option<Self> {
+        // `dirs` on Windows resolves known folders, not env vars, so a
+        // compile-time env capture cannot reconstruct the profile there.
+        None
+    }
+
+    /// First-use runtime capture, used only when the build environment did
+    /// not define the profile. Correct for in-process tests because it runs
+    /// before any [`TestEnvGuard`] mutation.
+    fn capture_at_runtime() -> Self {
         let home = dirs::home_dir().expect("locate real developer home dir");
         let xdg_data = dirs::data_dir().expect("locate real developer data dir");
         let config_base = dirs::config_dir().expect("locate real developer config dir");
@@ -65,6 +135,16 @@ pub fn ensure_real_developer_roots_captured() {
             data: xdg_data.join("cockpit"),
             state: real_developer_state_dir(),
         }
+    }
+}
+
+/// Record the developer-owned Cockpit roots once. In-process tests capture
+/// before any test mutates `HOME` / XDG variables through [`TestEnvGuard`];
+/// see the module docs for why the build environment is preferred.
+pub fn ensure_real_developer_roots_captured() {
+    REAL_DEVELOPER_COCKPIT_ROOTS.get_or_init(|| {
+        RealDeveloperCockpitRoots::from_build_environment()
+            .unwrap_or_else(RealDeveloperCockpitRoots::capture_at_runtime)
     });
 }
 

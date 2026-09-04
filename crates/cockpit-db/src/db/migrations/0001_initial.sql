@@ -460,9 +460,10 @@ BEGIN
 END;
 
 -- ---- typed media attachments ----------------------------------------------
--- Full-range monotonic values are canonical decimal text because SQLite's
--- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
--- values outside u64 before any mutation.
+-- Monotonic versions, generations, and byte lengths are positive integers
+-- bounded by SQLite's signed i64. Application codecs reject zero and values
+-- outside i64 before any mutation, so a value at the i64 ceiling is the
+-- overflow boundary (see AvailabilityGenerationOverflow in the discard path).
 CREATE TABLE media_attachments (
     attachment_id                  TEXT PRIMARY KEY CHECK (
         length(attachment_id) = 36 AND attachment_id = lower(attachment_id)
@@ -8157,6 +8158,8 @@ CREATE TABLE onboarding_agent_publication_journals (
     previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     created_at_unix_ms           INTEGER NOT NULL
 );
+CREATE INDEX idx_onboarding_agent_publication_journals_previous
+    ON onboarding_agent_publication_journals (previous_default_installation_id);
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,

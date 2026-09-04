@@ -28,7 +28,10 @@
 #![allow(dead_code)] // Extra event kinds and record digests are consumed as the live loop lands.
 
 mod chain;
-pub use chain::{ComputerAuditChain, GuidanceAppendError, GuidanceAuditAppend};
+pub use chain::{
+    ComputerAuditChain, GuidanceAppendError, GuidanceAuditAppend, ReceiverReproofAppendError,
+    ReceiverReproofAuditAppend,
+};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -456,6 +459,19 @@ pub fn domain_digest(domain: &str, value: &[u8]) -> [u8; 32] {
     h.update((value.len() as u32).to_be_bytes());
     h.update(value);
     h.finalize().into()
+}
+
+/// Parse a hyphenated RFC 4122 session or delegation id into network-order
+/// bytes for audit entries. Non-UUID test labels fall back to a truncated
+/// SHA-256 digest so hermetic fixtures can still journal when needed.
+pub fn audit_rfc4122_id_bytes(label: &str) -> [u8; 16] {
+    if let Ok(id) = Uuid::parse_str(label) {
+        return *id.as_bytes();
+    }
+    let digest = Sha256::digest(label.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
 }
 
 /// The eight closed digest domains.

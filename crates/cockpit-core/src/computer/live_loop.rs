@@ -232,6 +232,7 @@ mod tests {
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         ComputerActionCoordinator::open(backend, params)
             .await

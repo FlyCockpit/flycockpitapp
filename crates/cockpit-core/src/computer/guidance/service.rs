@@ -268,6 +268,12 @@ pub trait GuidanceAuditWriter: Send + Sync {
     /// is unavailable so the orchestrator can fail closed (no silent undurable
     /// proposals).
     async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()>;
+
+    /// When this writer shares the daemon-wide tamper-evident chain, return it
+    /// so receiver re-proof receipts can journal on the same log (issue #374).
+    fn shared_computer_audit_chain(&self) -> Option<Arc<ComputerAuditChain>> {
+        None
+    }
 }
 
 /// Production writer: HMAC-chained, sealed-head computer-use audit log.
@@ -289,6 +295,10 @@ impl ChainGuidanceAuditWriter {
 impl GuidanceAuditWriter for ChainGuidanceAuditWriter {
     fn is_available(&self) -> bool {
         self.chain.is_available()
+    }
+
+    fn shared_computer_audit_chain(&self) -> Option<Arc<ComputerAuditChain>> {
+        Some(Arc::clone(&self.chain))
     }
 
     async fn append(&self, event: &GuidanceAuditEvent) -> anyhow::Result<()> {
@@ -693,6 +703,12 @@ impl GuidanceProposalService {
     /// secure-key attach.
     pub fn install_audit_writer(&mut self, audit: Arc<dyn GuidanceAuditWriter>) {
         self.audit = audit;
+    }
+
+    /// Shared tamper-evident chain used by guidance and receiver re-proof
+    /// receipts when the production writer is installed (issue #374).
+    pub fn computer_audit_chain(&self) -> Option<Arc<ComputerAuditChain>> {
+        self.audit.shared_computer_audit_chain()
     }
 
     pub fn compiler(

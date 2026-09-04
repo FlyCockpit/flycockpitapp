@@ -84,6 +84,7 @@ pub(crate) async fn open_native_computer_for_delegation(
     session: &Arc<Session>,
     approver: Option<Arc<crate::approval::Approver>>,
     delegation_id: String,
+    audit_chain: Option<Arc<crate::computer::audit::ComputerAuditChain>>,
 ) -> anyhow::Result<Option<ComputerActionCoordinator>> {
     let Some(candidate) = agent.params.native_computer.clone() else {
         return Ok(None);
@@ -256,6 +257,7 @@ pub(crate) async fn open_native_computer_for_delegation(
             crate::computer::outcome_store::SqliteOutcomeStore::new(session.db.clone()),
         )),
         handoff_journal,
+        audit_chain,
     };
     match ComputerActionCoordinator::open(backend, params).await {
         Ok(coordinator) => {
@@ -297,8 +299,10 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
     coordinator_config: &mut Option<crate::computer::NativeComputerCoordinatorConfig>,
     pending_continuations: &mut Vec<serde_json::Value>,
     sticky_ask_denial: &mut Option<String>,
+    audit_chain: Option<Arc<crate::computer::audit::ComputerAuditChain>>,
 ) -> anyhow::Result<()> {
     let session = Arc::clone(session);
+    let audit_chain = audit_chain.clone();
     reconcile_native_computer_for_delegation_with_opener(
         agent,
         coordinator,
@@ -310,8 +314,16 @@ pub(crate) async fn reconcile_native_computer_for_delegation(
             let session = Arc::clone(&session);
             let approver = approver.clone();
             let delegation_id = delegation_id.clone();
+            let audit_chain = audit_chain.clone();
             Box::pin(async move {
-                open_native_computer_for_delegation(agent, &session, approver, delegation_id).await
+                open_native_computer_for_delegation(
+                    agent,
+                    &session,
+                    approver,
+                    delegation_id,
+                    audit_chain,
+                )
+                .await
             })
         },
     )
@@ -980,6 +992,7 @@ mod tests {
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         }
     }
 
@@ -1036,6 +1049,7 @@ mod tests {
             model_id: ModelId("gpt-4o".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         ComputerActionCoordinator::open(Box::new(CapturingFakeBackend::new()), params)
             .await
@@ -1287,9 +1301,14 @@ mod tests {
             )
             .unwrap(),
         );
-        let opened =
-            open_native_computer_for_delegation(&mut agent, &session, None, "delegation-1".into())
-                .await;
+        let opened = open_native_computer_for_delegation(
+            &mut agent,
+            &session,
+            None,
+            "delegation-1".into(),
+            None,
+        )
+        .await;
         assert!(opened.unwrap().is_none());
         assert!(
             agent.params.native_computer.is_none(),

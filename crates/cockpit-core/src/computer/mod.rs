@@ -24,6 +24,7 @@ mod macos_backend;
 pub mod observation;
 pub mod outcome_store;
 pub mod platform;
+pub mod receiver_reproof;
 pub mod target;
 
 #[cfg(test)]
@@ -400,6 +401,65 @@ impl ComputerAction {
             _ => true,
         }
     }
+
+    /// True when this action is an Enter-class commit on the modeled terminal
+    /// line (bare Enter, ctrl+j/m, or held Enter).
+    pub(crate) fn is_enter_class_commit(&self) -> bool {
+        match self {
+            Self::KeyChord { chord } => chord_is_enter_class_commit(chord),
+            Self::HoldKey { key, .. } => key.as_str() == "ENTER",
+            _ => false,
+        }
+    }
+
+    /// True when a successfully delivered action commits the modeled terminal
+    /// line. Broader than [`Self::is_enter_class_commit`]: `ctrl+shift+j`
+    /// prompts as Enter-class but untracks without committing.
+    pub(crate) fn delivers_terminal_line_commit(&self) -> bool {
+        match self {
+            Self::KeyChord { chord } => {
+                let keys = chord.keys();
+                let has_control = keys.iter().any(key_is_control);
+                let has_alt = keys.iter().any(key_is_alt);
+                let has_shift = keys.iter().any(|key| key.as_str() == "SHIFT");
+                let plain: Vec<&KeyCode> = keys
+                    .iter()
+                    .filter(|key| {
+                        !key_is_control(key)
+                            && !key_is_alt(key)
+                            && !key_is_meta(key)
+                            && key.as_str() != "SHIFT"
+                    })
+                    .collect();
+                if plain.iter().any(|key| key.as_str() == "ENTER") {
+                    return true;
+                }
+                has_control
+                    && !has_alt
+                    && !has_shift
+                    && plain.len() == 1
+                    && matches!(plain[0].as_str(), "J" | "M")
+            }
+            Self::HoldKey { key, .. } => key.as_str() == "ENTER",
+            _ => false,
+        }
+    }
+
+    /// True when delivering this action commits the modeled terminal line:
+    /// Enter-class keys/holds or typed text containing an embedded line feed.
+    pub(crate) fn commits_typed_line(&self) -> bool {
+        match self {
+            Self::TypeText { text } => text.contains(['\n', '\r']),
+            _ => self.delivers_terminal_line_commit(),
+        }
+    }
+
+    /// True when delivered keyboard input can change receiver identity per the
+    /// closed allowlist (issue #373).
+    pub(crate) fn marks_keyboard_identity_dirty(&self) -> bool {
+        matches!(self, Self::KeyChord { .. } | Self::HoldKey { .. })
+            && self.can_change_receiver_identity()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +592,22 @@ fn chord_preserves_receiver_identity(chord: &CanonicalKeyChord) -> bool {
 /// of presses and is identity-changing.
 fn held_key_preserves_receiver_identity(key: &KeyCode) -> bool {
     key.as_str() == "ENTER"
+}
+
+fn chord_is_enter_class_commit(chord: &CanonicalKeyChord) -> bool {
+    let keys = chord.keys();
+    let has_control = keys.iter().any(key_is_control);
+    let has_alt = keys.iter().any(key_is_alt);
+    let plain: Vec<&KeyCode> = keys
+        .iter()
+        .filter(|key| {
+            !key_is_control(key) && !key_is_alt(key) && !key_is_meta(key) && key.as_str() != "SHIFT"
+        })
+        .collect();
+    if plain.iter().any(|key| key.as_str() == "ENTER") {
+        return true;
+    }
+    has_control && !has_alt && plain.len() == 1 && matches!(plain[0].as_str(), "J" | "M")
 }
 
 /// True when a canonical key chord spawns a terminal from a non-terminal
@@ -964,6 +1040,16 @@ impl TypedInputLineModel {
     /// does not clear this flag.
     pub(crate) fn mark_receiver_unproven(&mut self) {
         self.receiver_unproven = true;
+    }
+
+    pub(crate) fn is_receiver_unproven(&self) -> bool {
+        self.receiver_unproven
+    }
+
+    /// Clear `receiver_unproven` only from the coordinator evidence re-proof
+    /// choke point (issue #374). No other code path may call this.
+    pub(crate) fn prove_receiver_on_evidence(&mut self) {
+        self.receiver_unproven = false;
     }
 
     /// Fold one about-to-dispatch action into the model, refusing the
@@ -4215,7 +4301,7 @@ pub(crate) fn normalize_backend_batch(
     Ok(normalized)
 }
 
-fn normalize_action(
+pub(crate) fn normalize_action(
     action: &ComputerAction,
     geometry: &DisplayGeometry,
 ) -> Result<NormalizedComputerAction, ComputerError> {
@@ -7077,6 +7163,7 @@ mod tests {
             model_id: ModelId("gpt-5".to_string()),
             outcome_store: None,
             handoff_journal: None,
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await

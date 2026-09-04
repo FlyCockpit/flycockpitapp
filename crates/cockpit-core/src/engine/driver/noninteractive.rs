@@ -11957,6 +11957,15 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             .unwrap_or(session.id)
             .hyphenated()
             .to_string();
+        let computer_audit_chain = if let Some(compiler) = guidance_compiler.as_ref() {
+            if let Some(service) = compiler.proposal_service() {
+                service.lock().await.computer_audit_chain()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Err(error) = super::computer_native::reconcile_native_computer_for_delegation(
             Arc::make_mut(&mut agent),
             &session,
@@ -11967,6 +11976,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             &mut computer_coordinator_config,
             &mut pending_computer_continuations,
             &mut computer_ask_denial,
+            computer_audit_chain,
         )
         .await
         {

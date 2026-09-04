@@ -408,8 +408,8 @@ struct ImageSecurityRecoveryDeleteTriggerGuard<'a> {
     quarantined: bool,
 }
 
-impl ImageSecurityRecoveryDeleteTriggerGuard<'_> {
-    fn acquire(conn: &Connection) -> Result<Self> {
+impl<'a> ImageSecurityRecoveryDeleteTriggerGuard<'a> {
+    fn acquire(conn: &'a Connection) -> Result<Self> {
         let mut dropped = 0usize;
         for (trigger_name, _) in IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS {
             match conn

@@ -8,7 +8,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{ErrorCode, OptionalExtension, params};
 
 use crate::db::{AppendOnlyDeleteFenceViolation, Db};

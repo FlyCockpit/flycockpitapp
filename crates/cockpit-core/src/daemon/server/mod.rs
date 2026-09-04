@@ -173,7 +173,7 @@ fn scrub_event_for_principal(
     principal: &ClientPrincipal,
     envelope: EventEnvelope,
 ) -> Option<proto::Event> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Some(envelope.event);
     }
     scrub_proto_event(envelope.event, &envelope.redact)
@@ -199,7 +199,7 @@ fn scrub_history_for_principal(
     history: Vec<proto::HistoryEntry>,
     redact: &RedactionTable,
 ) -> Vec<proto::HistoryEntry> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return history;
     }
     history
@@ -2556,6 +2556,8 @@ pub struct DaemonContext {
     /// Legacy boot-local owner capability file (issue #296 fence). Socket peers
     /// authenticate with [`peer_credential_registry`] instead of this file.
     pub(crate) owner_capability: crate::daemon::owner_capability::OwnerCapability,
+    /// Canonical cockpit executable identity used to attest local socket peers.
+    pub(crate) approved_client_executable: PathBuf,
     /// Minted peer-bound credentials for local socket clients (issue #337).
     pub(crate) peer_credential_registry: Arc<crate::daemon::peer_authority::PeerCredentialRegistry>,
     /// Canonical process cwd captured once at daemon construction. Remote
@@ -2767,7 +2769,7 @@ impl DaemonContext {
     /// cannot race the user choice. Promotion is owner-only: weaker-authz
     /// requests must not reach this effect as a side path.
     pub(crate) fn promote_to_persistent(&self, principal: &ClientPrincipal) -> Result<bool> {
-        if !principal.is_owner() {
+        if !principal.has_owner_level_authority() {
             anyhow::bail!("promoting daemon lifetime requires the local owner");
         }
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
@@ -3288,6 +3290,8 @@ impl DaemonContext {
             )),
             paths,
             owner_capability: crate::daemon::owner_capability::OwnerCapability::mint(),
+            approved_client_executable: std::env::current_exe()
+                .context("resolving approved local client executable")?,
             peer_credential_registry: Arc::new(
                 crate::daemon::peer_authority::PeerCredentialRegistry::default(),
             ),
@@ -5306,6 +5310,9 @@ struct MutableClientState {
     /// Whether this connection has presented a valid peer-bound owner
     /// credential. In-process clients start true; socket peers start false.
     has_owner_capability: bool,
+    /// Set when a socket peer presents the daemon-private file capability for
+    /// the one-shot `ExchangeLocalPeerCredential` exchange.
+    exchange_file_capability_verified: bool,
     terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -5416,6 +5423,7 @@ impl MutableClientState {
             principal,
             socket_peer,
             has_owner_capability: false,
+            exchange_file_capability_verified: false,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
                 client_instance_id,
@@ -6227,6 +6235,7 @@ enum ClientEventCommand {
         rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
     },
     Detach,
+    PrincipalChanged(ClientPrincipal),
 }
 
 async fn send_writer_envelope(
@@ -6390,7 +6399,7 @@ async fn run_client_writer<W>(
 
 async fn run_client_event_forwarder(
     ctx: Arc<DaemonContext>,
-    principal: ClientPrincipal,
+    mut principal: ClientPrincipal,
     mut global_rx: EventReceiver,
     mut event_cmd_rx: mpsc::Receiver<ClientEventCommand>,
     executor_tx: mpsc::Sender<ClientExecutorInput>,
@@ -6420,6 +6429,9 @@ async fn run_client_event_forwarder(
                         session_id = None;
                         session_event_rx = None;
                         rendered_interrupts = None;
+                    }
+                    Some(ClientEventCommand::PrincipalChanged(updated)) => {
+                        principal = updated;
                     }
                     None => return,
                 }
@@ -6549,6 +6561,9 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
+                    if let Some(peer) = state.socket_peer {
+                        ctx.peer_credential_registry.revoke_for_peer(peer);
+                    }
                     if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
                         tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
                     }
@@ -6671,6 +6686,23 @@ async fn handle_envelope(
                         state.has_owner_capability = role.is_owner_class();
                         state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
                         *shared = state.shared_snapshot();
+                        let _ = event_cmd_tx
+                            .send(ClientEventCommand::PrincipalChanged(
+                                state.principal.clone(),
+                            ))
+                            .await;
+                    } else if ctx.owner_capability.verify(token.as_str()) {
+                        state.exchange_file_capability_verified = true;
+                    } else {
+                        state.has_owner_capability = false;
+                        state.exchange_file_capability_verified = false;
+                        state.principal = ClientPrincipal::local_unauthenticated(peer);
+                        *shared = state.shared_snapshot();
+                        let _ = event_cmd_tx
+                            .send(ClientEventCommand::PrincipalChanged(
+                                state.principal.clone(),
+                            ))
+                            .await;
                     }
                 } else if ctx.owner_capability.verify(token.as_str()) {
                     state.has_owner_capability = true;
@@ -6764,6 +6796,15 @@ async fn handle_envelope(
             );
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
+            }
+            let principal_changed = matches!(&result, Ok(Response::LocalPeerCredential { .. }));
+            if principal_changed {
+                *shared = state.shared_snapshot();
+                let _ = event_cmd_tx
+                    .send(ClientEventCommand::PrincipalChanged(
+                        state.principal.clone(),
+                    ))
+                    .await;
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);
@@ -7106,7 +7147,7 @@ fn response_envelope_for_shared(
 ) -> Envelope {
     match result {
         Ok(response) => {
-            let response = if shared.principal.is_owner() {
+            let response = if shared.principal.has_owner_level_authority() {
                 // Owner responses are trusted, but still pass through the
                 // daemon-global redaction table as defense in depth: any known
                 // vault/env secret value that leaked into a response (for
@@ -7422,7 +7463,7 @@ fn scrub_replay_event_for_principal(
     shared: &SharedClientState,
     event: proto::Event,
 ) -> Option<proto::Event> {
-    if shared.principal.is_owner() {
+    if shared.principal.has_owner_level_authority() {
         return Some(event);
     }
     let Some(attached) = shared.attached.as_ref() else {

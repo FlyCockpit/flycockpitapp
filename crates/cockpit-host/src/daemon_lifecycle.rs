@@ -1021,7 +1021,7 @@ pub fn cmdline_is_cockpit_daemon(
 }
 
 #[cfg(any(unix, windows, test))]
-fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
+pub fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
     let Ok(observed) = std::fs::canonicalize(observed) else {
         return false;
     };

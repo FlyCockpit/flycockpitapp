@@ -653,7 +653,9 @@ impl DaemonClient {
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
             let initial_events = confirm_client_lifetime(&mut proto, negotiated.version).await?;
-            let owner_capability = exchange_peer_credential(&mut proto, negotiated.version).await?;
+            let file_capability = load_owner_capability(socket);
+            let owner_capability =
+                exchange_peer_credential(&mut proto, negotiated.version, file_capability).await?;
             Ok(Self::from_proto_negotiated(
                 proto,
                 negotiated,
@@ -974,16 +976,18 @@ where
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
     version: u32,
+    owner_capability: Option<proto::OwnerCapabilityToken>,
 ) -> Result<Option<proto::OwnerCapabilityToken>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let id = Uuid::now_v7();
     proto_stream
-        .send(&Envelope::request_at(
+        .send(&Envelope::request_with_owner_capability_at(
             version,
             id,
             Request::ExchangeLocalPeerCredential,
+            owner_capability,
         ))
         .await
         .context("sending peer credential exchange")?;

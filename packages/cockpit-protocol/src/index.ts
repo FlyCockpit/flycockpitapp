@@ -907,6 +907,9 @@ export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSche
 export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
 export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 
+export const localClientRoleSchema = z.enum(["tui", "cli", "acp", "agent_child"]);
+export type LocalClientRole = z.infer<typeof localClientRoleSchema>;
+
 const requestParamSchemas = {
   get_storage_report: z.undefined(),
   get_app_flag: z
@@ -1145,6 +1148,7 @@ const requestParamSchemas = {
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
   promote_to_persistent: z.undefined(),
+  exchange_local_peer_credential: z.undefined(),
   cancel_all_session_work: z.undefined(),
   exit_guard_status: z.undefined(),
   release_exit_guard: z.undefined(),
@@ -1487,6 +1491,7 @@ const clientRequestVariants = [
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("promote_to_persistent"),
+  requestVariantNoParams("exchange_local_peer_credential"),
   requestVariantNoParams("cancel_all_session_work"),
   requestVariantNoParams("exit_guard_status"),
   requestVariantNoParams("release_exit_guard"),
@@ -1535,8 +1540,6 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       // Daemon-private owner capability. Optional; required for `owner_only`
       // RPCs on the Unix-socket path. Absent on in-process and remote
       // connections. Mirrors Rust `Body::Request.owner_capability`.
-      // TODO(#337 TS): add `exchange_local_peer_credential` request/response and
-      // peer-bound credential exchange to the TypeScript protocol mirror.
       owner_capability: z.string().optional(),
       ...variant.shape,
     })
@@ -1655,6 +1658,7 @@ export const responseNameSchema = z.enum([
   "run_invocation_status",
   "remote_operation_status",
   "run_invocation_cancel_result",
+  "local_peer_credential",
   "session_messages",
   "session_live_status",
   "storage_report",
@@ -2316,6 +2320,15 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         oldest_seq: safeI64NumberSchema.nullable().optional(),
       })
       .passthrough(),
+  ),
+  responseVariant(
+    "local_peer_credential",
+    z
+      .object({
+        token: z.string().min(1),
+        role: localClientRoleSchema,
+      })
+      .strict(),
   ),
   responseVariant(
     "subagent_history_page",

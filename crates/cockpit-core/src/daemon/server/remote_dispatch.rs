@@ -58,7 +58,7 @@ pub(super) async fn admit(
     operation: Option<proto::RemoteOperationIdentityV1>,
     request: &Request,
 ) -> std::result::Result<Option<RemoteOperationContext>, ErrorPayload> {
-    if principal.is_owner() {
+    if principal.is_owner() || principal.is_local() {
         return Ok(None);
     }
     let class = request.remote_operation_class().map_err(|_| denied())?;

@@ -39,9 +39,12 @@ pub fn principal_local_role(role: cockpit_proto::LocalClientRole) -> LocalClient
 
 /// How long a minted peer credential remains valid. PIDs are recycled; keep
 /// this short enough that a stale binding cannot outlive the originating peer.
-const PEER_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const PEER_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Hard cap on concurrently registered peer credentials.
+const MAX_PEER_CREDENTIAL_RECORDS: usize = 64;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerCredentialToken(pub String);
 
 impl PeerCredentialToken {
@@ -94,6 +97,23 @@ impl PeerCredentialRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
+        records.retain(|_, existing| existing.peer != peer);
+        if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+            records.retain(|_, existing| {
+                existing.expires_at_unix_ms
+                    > now_unix_ms() + PEER_CREDENTIAL_TTL.as_millis() as i64 / 2
+            });
+            while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+                let Some(oldest_key) = records
+                    .iter()
+                    .min_by_key(|(_, existing)| existing.expires_at_unix_ms)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                records.remove(&oldest_key);
+            }
+        }
         records.insert(token.0.clone(), record);
         token
     }
@@ -103,6 +123,9 @@ impl PeerCredentialRegistry {
         peer: PeerIdentity,
         presented: &str,
     ) -> Option<(LocalClientRole, Vec<PrincipalGrant>)> {
+        if !peer_identity_matches_live_process(peer) {
+            return None;
+        }
         let mut records = self
             .records
             .lock()
@@ -131,29 +154,54 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Attest the connecting peer's local client role from its live process image.
-pub fn attest_local_client_role(peer: PeerIdentity) -> Result<Option<LocalClientRole>> {
+/// True when the peer identity still refers to a live process with matching
+/// credentials. Fails closed when the pid cannot be probed.
+pub fn peer_identity_matches_live_process(peer: PeerIdentity) -> bool {
     if peer.pid == 0 {
+        return false;
+    }
+    if !cockpit_host::daemon_lifecycle::process_exists(peer.pid) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if let Ok((uid, gid)) = read_process_uid_gid(peer.pid) {
+            return uid == peer.uid && gid == peer.gid;
+        }
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
+
+/// Attest the connecting peer's local client role from its live process image.
+pub fn attest_local_client_role(
+    peer: PeerIdentity,
+    approved_executable: &Path,
+) -> Result<Option<LocalClientRole>> {
+    if peer.pid == 0 || !peer_identity_matches_live_process(peer) {
         return Ok(None);
     }
     let exe = read_process_exe(peer.pid)?;
-    if !is_cockpit_executable(&exe) {
-        return Ok(attest_agent_child_role(peer));
+    if !exact_executable_identity(&exe, approved_executable) {
+        return Ok(attest_agent_child_role(peer, approved_executable));
     }
     let cmdline = read_process_cmdline(peer.pid)?;
     Ok(Some(classify_cockpit_cmdline(&cmdline)))
 }
 
-fn attest_agent_child_role(peer: PeerIdentity) -> Option<LocalClientRole> {
-    if std::env::var("COCKPIT_AGENT_CHILD_PEER")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Some(LocalClientRole::AgentChild);
-    }
+fn attest_agent_child_role(
+    peer: PeerIdentity,
+    approved_executable: &Path,
+) -> Option<LocalClientRole> {
     let parent_pid = read_parent_pid(peer.pid).ok()??;
+    if parent_pid == 0 || !cockpit_host::daemon_lifecycle::process_exists(parent_pid) {
+        return None;
+    }
     let parent_exe = read_process_exe(parent_pid).ok()?;
-    if is_cockpit_executable(&parent_exe) {
+    if exact_executable_identity(&parent_exe, approved_executable) {
         return Some(LocalClientRole::AgentChild);
     }
     None
@@ -183,15 +231,33 @@ fn classify_cockpit_cmdline(cmdline: &[String]) -> LocalClientRole {
     LocalClientRole::Cli
 }
 
-fn is_cockpit_executable(exe: &Path) -> bool {
-    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let base = name.strip_suffix(".exe").unwrap_or(name);
-    matches!(
-        base,
-        "cockpit" | "cockpit-cli" | "daemon_spawn_harness" | "cockpit-test-daemon"
-    ) || base.starts_with("cockpit-")
+fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
+    cockpit_host::daemon_lifecycle::exact_executable_identity(observed, approved)
+}
+
+#[cfg(unix)]
+fn read_process_uid_gid(pid: u32) -> Result<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .with_context(|| format!("reading /proc/{pid}/status"))?;
+    let mut uid = None;
+    let mut gid = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("Uid:\t") {
+            uid = value
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.parse().ok());
+        } else if let Some(value) = line.strip_prefix("Gid:\t") {
+            gid = value
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.parse().ok());
+        }
+    }
+    match (uid, gid) {
+        (Some(uid), Some(gid)) => Ok((uid, gid)),
+        _ => bail!("missing uid/gid in /proc/{pid}/status"),
+    }
 }
 
 #[cfg(unix)]
@@ -332,11 +398,12 @@ mod tests {
     #[test]
     fn peer_credential_registry_binds_to_peer_identity() {
         let registry = PeerCredentialRegistry::default();
-        let peer = PeerIdentity {
-            pid: 42,
-            uid: 1000,
-            gid: 1000,
-        };
+        let pid = std::process::id();
+        #[cfg(unix)]
+        let (uid, gid) = read_process_uid_gid(pid).expect("uid/gid");
+        #[cfg(windows)]
+        let (uid, gid) = (0_u32, 0_u32);
+        let peer = PeerIdentity { pid, uid, gid };
         let token = registry.mint(peer, LocalClientRole::Cli, Vec::new());
         assert!(
             registry
@@ -347,9 +414,9 @@ mod tests {
             registry
                 .verify(
                     PeerIdentity {
-                        pid: 43,
-                        uid: 1000,
-                        gid: 1000,
+                        pid: peer.pid.saturating_add(1),
+                        uid,
+                        gid,
                     },
                     token.as_str()
                 )

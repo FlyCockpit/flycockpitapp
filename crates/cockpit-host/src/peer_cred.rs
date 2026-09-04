@@ -57,9 +57,61 @@ fn peer_ucred(fd: std::os::fd::RawFd) -> Result<(u32, u32, u32)> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error()).context("reading unix socket peer uid");
         }
-        // Non-Linux Unix exposes uid/gid via `getpeereid` only. Peer-bound
-        // credentials on those platforms match uid/gid with pid `0`.
-        Ok((uid, gid, 0))
+        let pid = peer_pid_from_unix_socket(fd)?;
+        Ok((uid, gid, pid))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_pid_from_unix_socket(fd: std::os::fd::RawFd) -> Result<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `getsockopt` writes at most `len` bytes into `pid`.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading unix socket LOCAL_PEERPID");
+        }
+        return u32::try_from(pid).context("unix socket peer pid out of range");
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::mem::MaybeUninit;
+
+        let mut cred = MaybeUninit::<libc::xucred>::uninit();
+        let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        // SAFETY: `getsockopt` writes at most `len` bytes into the valid storage.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERCRED,
+                cred.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading unix socket LOCAL_PEERCRED");
+        }
+        // SAFETY: `getsockopt` succeeded and initialized the `xucred` struct.
+        let cred = unsafe { cred.assume_init() };
+        return u32::try_from(cred.cr_pid).context("unix socket peer pid out of range");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    {
+        let _ = fd;
+        Ok(0)
     }
 }
 

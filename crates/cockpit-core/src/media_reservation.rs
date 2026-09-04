@@ -1490,7 +1490,7 @@ impl MediaReservationLedger {
         request: AccountingRepairRequest,
         principal: &crate::daemon::principal::ClientPrincipal,
     ) -> Result<AccountingRepairOutcome, LedgerError> {
-        if !principal.is_owner() {
+        if !principal.has_owner_level_authority() {
             return self.record_unauthorized_repair(request).await;
         }
         validate_repair_scope(&request.scope_kind)?;

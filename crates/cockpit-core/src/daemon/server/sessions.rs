@@ -45,7 +45,7 @@ pub(super) async fn list_sessions(
             .collect::<std::collections::HashSet<_>>();
         sessions.retain(|summary| matching_ids.contains(&summary.session_id));
     }
-    if !principal.is_owner() {
+    if !principal.has_owner_level_authority() {
         sessions.retain(|summary| {
             session_access_for_summary(principal, summary) != SessionAccess::None
         });

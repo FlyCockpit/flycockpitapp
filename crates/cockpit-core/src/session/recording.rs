@@ -113,6 +113,7 @@ fn event_kind_is_model_authored(kind: crate::db::session_log::SessionEventKind) 
             | SessionEventKind::SubagentSpawned
             | SessionEventKind::SubagentRouting
             | SessionEventKind::SubagentReport
+            | SessionEventKind::SubagentCompacted
             | SessionEventKind::SessionCompacted
             | SessionEventKind::ToolRejected
             | SessionEventKind::PrimarySwap
@@ -820,19 +821,20 @@ impl Session {
         usage: crate::tokens::TokenUsage,
         is_utility: bool,
     ) -> Result<()> {
-        *self.last_usage.lock().unwrap() = Some(usage);
         let priced_cost = self.cost_microusd_for_usage(&usage);
-        {
-            let mut uncharged = self.uncharged_budget.lock().unwrap();
-            let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
-            if let Some(cost) = priced_cost {
-                charge = charge.with_cost(cost);
-            }
-            *uncharged += charge;
+        let mut charge = crate::engine::delegation_budget::BudgetCharge::from_usage(usage);
+        if let Some(cost) = priced_cost {
+            charge = charge.with_cost(cost);
         }
-        if !is_utility {
-            self.pending_forward_progress
-                .store(true, std::sync::atomic::Ordering::Release);
+        if crate::engine::delegation_budget::lane_budget_active() {
+            crate::engine::delegation_budget::note_lane_budget_usage(charge, !is_utility);
+        } else {
+            *self.last_usage.lock().unwrap() = Some(usage);
+            *self.uncharged_budget.lock().unwrap() += charge;
+            if !is_utility {
+                self.pending_forward_progress
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
 
         let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
@@ -2117,6 +2119,73 @@ impl Session {
         // committed event `seq` (or fail-closed scrubs the body).
         self.record_event_with_origin_and_frame(
             crate::db::session_log::SessionEventKind::SessionCompacted,
+            Some(agent),
+            None,
+            None,
+            frame,
+            &data,
+        )
+        .await
+    }
+
+    /// Record a `subagent_compacted` boundary for one noninteractive delegation
+    /// lineage. The record embeds model-authored brief/handoff text and must
+    /// route through the frame-carrying path when the authoring model is
+    /// trusted (K1).
+    pub async fn record_subagent_compacted_with_source(
+        &self,
+        agent: &str,
+        record: SubagentCompactionRecord<'_>,
+        frame: Option<SessionEventModelFrame<'_>>,
+    ) -> Result<i64> {
+        const INLINE_HANDOFF_MAX_BYTES: usize = 16 * 1024;
+        let data = serde_json::json!({
+            "kind": "subagent_compaction",
+            "predecessor_window_index": record.predecessor_window_index,
+            "successor_window_index": record.successor_window_index,
+            "seed_tool_count": record.seed_tool_count,
+            "brief_text": record.brief_text,
+            "handoff_text": record.handoff_text,
+            "source": record.source,
+            "trigger_ctx_pct": record.trigger_ctx_pct,
+            "tokens_before": record.tokens_before,
+            "tokens_after": record.tokens_after,
+            "turns_summarized": record.turns_summarized,
+            "tail_kept": record.tail_kept,
+            "tail_trimmed": record.tail_trimmed,
+            "tail_messages": record.tail_messages,
+        });
+        if data.to_string().len() > INLINE_HANDOFF_MAX_BYTES {
+            let handoff_id = Uuid::new_v4();
+            self.store_compaction_payload_journaled(handoff_id, &data, frame)
+                .await?;
+            let trimmed = serde_json::json!({
+                "kind": "subagent_compaction",
+                "predecessor_window_index": record.predecessor_window_index,
+                "successor_window_index": record.successor_window_index,
+                "seed_tool_count": record.seed_tool_count,
+                "source": record.source,
+                "trigger_ctx_pct": record.trigger_ctx_pct,
+                "tokens_before": record.tokens_before,
+                "tokens_after": record.tokens_after,
+                "turns_summarized": record.turns_summarized,
+                "tail_kept": record.tail_kept,
+                "tail_trimmed": record.tail_trimmed,
+                "handoff_ref": handoff_id.to_string(),
+            });
+            return self
+                .record_event_with_origin_and_frame(
+                    crate::db::session_log::SessionEventKind::SubagentCompacted,
+                    Some(agent),
+                    None,
+                    None,
+                    frame,
+                    &trimmed,
+                )
+                .await;
+        }
+        self.record_event_with_origin_and_frame(
+            crate::db::session_log::SessionEventKind::SubagentCompacted,
             Some(agent),
             None,
             None,

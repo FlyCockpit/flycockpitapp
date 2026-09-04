@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoninteractiveAutoCompactOutcome {
+    NoOp,
+    PrepareFailed,
+    Compacted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(in crate::engine::driver) enum CompactionAppendixScope {
+    #[default]
+    Session,
+    /// Subagent autocompact: appendix scoped to one `(task_call_id, label)` lineage.
+    SubagentLineage(crate::session::SessionEventLineage),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::engine::driver) struct BoundaryKey {
     activity_epoch: u64,
@@ -237,6 +252,8 @@ pub(in crate::engine::driver) struct CompactBriefDraft {
     test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
     #[cfg(test)]
     test_script: Option<Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    #[cfg(test)]
+    test_lane_charge: Option<crate::engine::delegation_budget::BudgetCharge>,
 }
 
 #[derive(Debug, Default)]
@@ -1356,7 +1373,7 @@ impl Driver {
         if !exact {
             return Ok(None);
         }
-        self.prepare_compaction_with_source(tx, "resume")
+        self.prepare_compaction_with_source(tx, "resume", CompactionAppendixScope::Session)
             .await
             .map(Some)
     }
@@ -1669,7 +1686,10 @@ impl Driver {
             tracing::warn!("compact deferred: persist-on-re-entry owns keep-parked siblings");
             return;
         }
-        let prepared = match self.prepare_compaction_with_source(tx, source).await {
+        let prepared = match self
+            .prepare_compaction_with_source(tx, source, CompactionAppendixScope::Session)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 if source == "auto" {
@@ -1746,6 +1766,7 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
+        appendix_scope: CompactionAppendixScope,
     ) -> Result<PreparedCompaction, PrepareCompactionError> {
         use crate::engine::compact;
 
@@ -1766,8 +1787,16 @@ impl Driver {
             .clone();
         let coverage = prepared_compaction_coverage(&live_history);
         let tokens_before = wire_token_total(&live_history);
-        let context_window = self.active_model_context_length();
-        let ctx_cfg = self.resolve_context_config();
+        let (context_window, ctx_cfg) = match appendix_scope {
+            CompactionAppendixScope::Session => (
+                self.active_model_context_length(),
+                self.resolve_context_config(),
+            ),
+            CompactionAppendixScope::SubagentLineage(_) => (
+                self.frame_model_context_length(),
+                self.frame_context_config(),
+            ),
+        };
         // Resolve shadow ownership before mutating history with the private
         // prune. An unfinished task is cancelled and falls back to the full
         // synchronous path; a stale ready draft is discarded likewise.
@@ -1803,11 +1832,23 @@ impl Driver {
             && shadow.as_ref().is_some_and(|ready| {
                 ready.input_coverage == crate::engine::compact_draft::CompactInputCoverage::Full
             });
-        let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {
-            (Some(used), Some(window)) if window > 0 => {
-                Some(used as f64 / f64::from(window) * 100.0)
+        let trigger_ctx_pct = match appendix_scope {
+            CompactionAppendixScope::Session => {
+                match (self.context_input_tokens(context_window), context_window) {
+                    (Some(used), Some(window)) if window > 0 => {
+                        Some(used as f64 / f64::from(window) * 100.0)
+                    }
+                    _ => None,
+                }
             }
-            _ => None,
+            CompactionAppendixScope::SubagentLineage(_) => {
+                match (Some(wire_token_total(&live_history)), context_window) {
+                    (Some(used), Some(window)) if window > 0 => {
+                        Some(used as f64 / f64::from(window) * 100.0)
+                    }
+                    _ => None,
+                }
+            }
         };
 
         // 0. Prune-first (lossless; denser transcript → tighter brief). This
@@ -1836,58 +1877,66 @@ impl Driver {
             100,
         )?;
         // 2. Deterministic appendix from the runtime ledger.
-        let calls = self
-            .session
-            .db
-            .list_tool_calls_for_session(self.session.live_id())
-            .await
-            .unwrap_or_default();
-        let pins = self.session.pinned_messages();
-        let conversation_rules = match self
-            .session
-            .db
-            .list_conversation_rules(self.session.compaction_lineage_root())
-            .await
-        {
-            Ok(rules) => rules,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "conversation rules: listing rules failed; aborting compact"
-                );
-                return Err(PrepareCompactionError::ConversationRules(error.to_string()));
-            }
+        let calls = self.compaction_appendix_tool_calls(&appendix_scope).await;
+        let pins = match appendix_scope {
+            CompactionAppendixScope::Session => self.session.pinned_messages(),
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
         };
-        let active_goal = self
-            .session
-            .db
-            .current_session_goal(self.session.live_id(), false)
-            .await
-            .ok()
-            .flatten()
-            .map(|g| {
-                let snapshot = g.compaction_snapshot();
-                format!(
-                    "- lifecycle: {} / {:?}\n- objective: {}\n- tokens: {}/{}\n- contract: {}\n- latest gap: {}",
-                    snapshot.disposition.as_str(),
-                    snapshot.phase,
-                    snapshot.objective,
-                    snapshot.tokens_used,
-                    snapshot.token_budget,
-                    snapshot.contract_reference.map(|id| id.to_string()).unwrap_or_else(|| "planning".to_string()),
-                    snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
-                )
-            });
+        let conversation_rules = match appendix_scope {
+            CompactionAppendixScope::Session => match self
+                .session
+                .db
+                .list_conversation_rules(self.session.compaction_lineage_root())
+                .await
+            {
+                Ok(rules) => rules,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "conversation rules: listing rules failed; aborting compact"
+                    );
+                    return Err(PrepareCompactionError::ConversationRules(error.to_string()));
+                }
+            },
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
+        };
+        let active_goal = match appendix_scope {
+            CompactionAppendixScope::Session => self
+                .session
+                .db
+                .current_session_goal(self.session.live_id(), false)
+                .await
+                .ok()
+                .flatten()
+                .map(|g| {
+                    let snapshot = g.compaction_snapshot();
+                    format!(
+                        "- lifecycle: {} / {:?}\n- objective: {}\n- tokens: {}/{}\n- contract: {}\n- latest gap: {}",
+                        snapshot.disposition.as_str(),
+                        snapshot.phase,
+                        snapshot.objective,
+                        snapshot.tokens_used,
+                        snapshot.token_budget,
+                        snapshot.contract_reference.map(|id| id.to_string()).unwrap_or_else(|| "planning".to_string()),
+                        snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
+                    )
+                }),
+            CompactionAppendixScope::SubagentLineage(_) => None,
+        };
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
-        appendix.conversation_rules = crate::conversation_rules::compact_appendix_lines(
-            &conversation_rules,
-            self.redact.as_ref(),
-        );
-        if let Ok(overview) = self
-            .session
-            .db
-            .task_todo_overview(self.session.live_id(), 24)
-            .await
+        appendix.conversation_rules = match appendix_scope {
+            CompactionAppendixScope::Session => crate::conversation_rules::compact_appendix_lines(
+                &conversation_rules,
+                self.redact.as_ref(),
+            ),
+            CompactionAppendixScope::SubagentLineage(_) => Vec::new(),
+        };
+        if matches!(appendix_scope, CompactionAppendixScope::Session)
+            && let Ok(overview) = self
+                .session
+                .db
+                .task_todo_overview(self.session.live_id(), 24)
+                .await
         {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
         }
@@ -1977,7 +2026,7 @@ impl Driver {
                 &handoff,
                 keep,
                 context_window,
-                self.effective_root_auto_compact_pct(&ctx_cfg),
+                self.effective_active_auto_compact_pct(&ctx_cfg),
             ) {
                 Ok(plan) => plan,
                 Err(error) => return Err(error.into()),
@@ -2228,6 +2277,231 @@ impl Driver {
         Ok(())
     }
 
+    /// Threshold-based autocompaction for noninteractive subagent executors
+    /// (#314). Compacts into a new linked window in the subagent's own
+    /// `(task_call_id, label)` lineage without touching the parent session's
+    /// compaction cadence or foreground history.
+    pub(in crate::engine::driver) async fn compaction_appendix_tool_calls(
+        &self,
+        appendix_scope: &CompactionAppendixScope,
+    ) -> Vec<crate::db::tool_calls::ToolCallEvent> {
+        let all = self
+            .session
+            .db
+            .list_tool_calls_for_session(self.session.live_id())
+            .await
+            .unwrap_or_default();
+        match appendix_scope {
+            CompactionAppendixScope::Session => all,
+            CompactionAppendixScope::SubagentLineage(lineage) => {
+                let lineage_call_ids = self.lineage_tool_call_ids(lineage).await;
+                all.into_iter()
+                    .filter(|call| lineage_call_ids.contains(&call.call_id))
+                    .collect()
+            }
+        }
+    }
+
+    async fn lineage_tool_call_ids(
+        &self,
+        lineage: &crate::session::SessionEventLineage,
+    ) -> std::collections::HashSet<String> {
+        self.session
+            .db
+            .list_session_events(self.session.live_id())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ev| {
+                ev.task_call_id.as_deref() == Some(lineage.task_call_id.as_str())
+                    && ev.label.as_deref() == Some(lineage.label.as_str())
+                    && ev.kind == "tool_call"
+            })
+            .filter_map(|ev| ev.call_id)
+            .collect()
+    }
+
+    pub(in crate::engine::driver) async fn maybe_noninteractive_auto_compact(
+        &mut self,
+        history: &mut Vec<Message>,
+        budget: &crate::engine::delegation_budget::BudgetPool,
+        steer_target: &super::NoninteractiveSteerTarget,
+        window_index: &mut u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<
+        NoninteractiveAutoCompactOutcome,
+        crate::engine::delegation_budget::CompactLoopExhausted,
+    > {
+        let ctx_cfg = self.frame_context_config();
+        let context_length = self.frame_model_context_length();
+        let input_tokens = Some(crate::engine::compact_draft::wire_token_total(history));
+        let Some(metrics) = context_metrics(context_length, input_tokens, 0) else {
+            return Ok(NoninteractiveAutoCompactOutcome::NoOp);
+        };
+        let auto_compact_pct = self.effective_active_auto_compact_pct(&ctx_cfg);
+        if metrics.ctx_pct < f64::from(auto_compact_pct) {
+            return Ok(NoninteractiveAutoCompactOutcome::NoOp);
+        }
+        let saved_history = std::mem::replace(&mut self.stack[0].history, history.clone());
+        let prepared = match self
+            .prepare_compaction_with_source(
+                tx,
+                "auto",
+                CompactionAppendixScope::SubagentLineage(steer_target.lineage()),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.stack[0].history = saved_history;
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/compact: {error}; subagent history was left unchanged"),
+                    })
+                    .await;
+                return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
+            }
+        };
+        let outcome = self
+            .apply_subagent_prepared_compaction(prepared, budget, steer_target, window_index, tx)
+            .await;
+        *history = self.stack[0].history.clone();
+        self.stack[0].history = saved_history;
+        outcome
+    }
+
+    async fn apply_subagent_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+        budget: &crate::engine::delegation_budget::BudgetPool,
+        steer_target: &super::NoninteractiveSteerTarget,
+        window_index: &mut u32,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<
+        NoninteractiveAutoCompactOutcome,
+        crate::engine::delegation_budget::CompactLoopExhausted,
+    > {
+        let actual = prepared_compaction_coverage(&self.stack[0].history);
+        if actual != prepared.coverage {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "/compact: prepared subagent compaction is stale; history was left unchanged"
+                        .to_string(),
+                })
+                .await;
+            return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
+        }
+
+        let forward_progress = {
+            #[cfg(test)]
+            {
+                if self.test_compaction_ignore_forward_progress {
+                    false
+                } else {
+                    crate::engine::delegation_budget::take_lane_forward_progress()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                crate::engine::delegation_budget::take_lane_forward_progress()
+            }
+        };
+        if let Err(error) = budget.record_compaction(prepared.tokens_after, forward_progress) {
+            return Err(error);
+        }
+
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PreCompact,
+            &prepared.source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(prepared.source.as_str()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let predecessor_window_index = *window_index;
+        let compaction_frame = (!prepared.authoring_provider_id.is_empty()
+            && !prepared.authoring_model_id.is_empty())
+        .then_some(crate::session::SessionEventModelFrame {
+            provider_id: &prepared.authoring_provider_id,
+            model_id: &prepared.authoring_model_id,
+            config: &self.config,
+            session_table: self.redact.as_ref(),
+        });
+        let tail_messages = prepared.history[1..].to_vec();
+        let record = crate::session::SubagentCompactionRecord {
+            predecessor_window_index,
+            successor_window_index: predecessor_window_index.saturating_add(1),
+            seed_tool_count: prepared.seed_tags.len(),
+            brief_text: &prepared.brief,
+            handoff_text: &prepared.handoff,
+            source: &prepared.source,
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            tail_messages: &tail_messages,
+        };
+        let lineage = steer_target.lineage();
+        let record_result = crate::session::with_session_event_lineage(
+            Some(lineage),
+            self.session.record_subagent_compacted_with_source(
+                &prepared.agent_name,
+                record,
+                compaction_frame,
+            ),
+        )
+        .await;
+        if let Err(error) = record_result {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "/compact: recording subagent compaction failed: {error}; subagent history was left unchanged"
+                    ),
+                })
+                .await;
+            return Ok(NoninteractiveAutoCompactOutcome::PrepareFailed);
+        }
+
+        *window_index = predecessor_window_index.saturating_add(1);
+        let successor_window_index = *window_index;
+
+        self.stack[0].history = prepared.history.clone();
+
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PostCompact,
+            &prepared.source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(prepared.source.as_str()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let signal = TurnEvent::SubagentCompacted {
+            agent: prepared.agent_name.clone(),
+            task_call_id: steer_target.task_call_id().to_string(),
+            label: steer_target.label().to_string(),
+            source: prepared.source.clone(),
+            trigger_ctx_pct: prepared.trigger_ctx_pct,
+            tokens_before: prepared.tokens_before,
+            tokens_after: prepared.tokens_after,
+            turns_summarized: prepared.turns_summarized,
+            tail_kept: prepared.tail_kept,
+            tail_trimmed: prepared.tail_trimmed,
+            window_index: successor_window_index,
+        };
+        let _ = tx.send(signal).await;
+        Ok(NoninteractiveAutoCompactOutcome::Compacted)
+    }
+
     pub(in crate::engine::driver) async fn compact_brief_draft(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -2312,6 +2586,8 @@ impl Driver {
             test_calls: self.test_compact_brief_calls.clone(),
             #[cfg(test)]
             test_script: self.test_compact_brief_script.clone(),
+            #[cfg(test)]
+            test_lane_charge: self.test_compact_brief_lane_charge,
         }
     }
 
@@ -2554,6 +2830,15 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
         CompactDraftOutcome as O, CompactDraftSuccess, CompactSampleClass,
         MAX_WIRE_SAMPLES_PER_NODE,
     };
+
+    #[cfg(test)]
+    fn maybe_record_test_compact_lane_charge(draft: &CompactBriefDraft) {
+        if let Some(charge) = draft.test_lane_charge
+            && !charge.is_empty()
+        {
+            crate::engine::delegation_budget::note_lane_budget_usage(charge, false);
+        }
+    }
     if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_node() {
         return O::ContextOverflow { diagnostic };
     }
@@ -2596,6 +2881,8 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                     &draft, purpose, attempt, fit_rung, "success", None,
                 )
                 .await;
+                #[cfg(test)]
+                maybe_record_test_compact_lane_charge(&draft);
                 return O::Success(CompactDraftSuccess {
                     brief: "test compact brief".to_string(),
                     fit_rung,
@@ -2627,6 +2914,8 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         &draft, purpose, attempt, fit_rung, "success", None,
                     )
                     .await;
+                    #[cfg(test)]
+                    maybe_record_test_compact_lane_charge(&draft);
                     return O::Success(CompactDraftSuccess {
                         brief: text,
                         fit_rung,

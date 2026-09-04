@@ -51,7 +51,7 @@
     }
   ],
   "counts": {
-    "event": 86,
+    "event": 87,
     "request": 289,
     "response": 202
   },
@@ -320,6 +320,12 @@
         "inlinePayloadBound": "truncated_by_cap",
         "lane": "interactive",
         "tag": "subagent_report"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "subagent_compacted"
       },
       {
         "class": "bounded_event",
@@ -3801,6 +3807,10 @@
     {
       "kind": "event",
       "tag": "subagent_report"
+    },
+    {
+      "kind": "event",
+      "tag": "subagent_compacted"
     },
     {
       "kind": "event",

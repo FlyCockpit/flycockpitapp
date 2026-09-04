@@ -1411,6 +1411,23 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_string(report, redact);
             scrub_json_strings(routing, redact);
         }
+        proto::Event::SubagentCompacted {
+            session_id: _,
+            agent: _,
+            task_call_id: _,
+            label,
+            source,
+            trigger_ctx_pct: _,
+            tokens_before: _,
+            tokens_after: _,
+            turns_summarized: _,
+            tail_kept: _,
+            tail_trimmed: _,
+            window_index: _,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(source, redact);
+        }
         proto::Event::NestedTurn {
             session_id: _,
             task_call_id: _,

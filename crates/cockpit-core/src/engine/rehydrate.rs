@@ -257,6 +257,16 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
             event.data = serde_json::from_str(&payload)
                 .context("decoding stored compaction payload for rehydration")?;
         }
+        if event.kind == "subagent_compacted"
+            && let Some(reference) = event
+                .data
+                .get("handoff_ref")
+                .and_then(|value| value.as_str())
+            && let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)?
+        {
+            event.data = serde_json::from_str(&payload)
+                .context("decoding stored subagent compaction payload for rehydration")?;
+        }
     }
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
@@ -1571,6 +1581,10 @@ pub(crate) fn history_snapshot_from_events_conn(
                     detail,
                 });
             }
+            "subagent_compacted" if visible_lineage(ev) => {
+                let data = resolve_subagent_compaction_data(conn, session_id, &ev.data)?;
+                snapshot.push(subagent_compaction_compact_boundary(ev, &data));
+            }
             "subagent_spawned" => {
                 let Some(active) = active_subagent else {
                     continue;
@@ -1681,12 +1695,17 @@ pub fn subagent_history_snapshot_conn(
         .map_err(|e| anyhow!("loading session events for subagent history snapshot: {e}"))?;
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for subagent history snapshot: {e}"))?;
-    let owned_events = events
+    let mut owned_events = events
         .into_iter()
         .filter(|ev| {
             ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
         })
         .collect::<Vec<_>>();
+    for event in &mut owned_events {
+        if event.kind == "subagent_compacted" {
+            event.data = resolve_subagent_compaction_data(conn, session_id, &event.data)?;
+        }
+    }
     Ok(subagent_history_entries_from_events(
         &owned_events,
         &tool_calls,
@@ -1713,10 +1732,189 @@ pub fn subagent_history_page_before_conn(
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for subagent history page: {e}"))?;
     Ok(HistoryPage {
-        entries: subagent_history_entries_from_events(&page.events, &tool_calls),
+        entries: {
+            let mut events = page.events;
+            for event in &mut events {
+                if event.kind == "subagent_compacted" {
+                    event.data = resolve_subagent_compaction_data(conn, session_id, &event.data)?;
+                }
+            }
+            subagent_history_entries_from_events(&events, &tool_calls)
+        },
         has_more: page.has_more,
         oldest_seq: page.oldest_seq,
     })
+}
+
+/// Resumed noninteractive lane state derived from durable `subagent_compacted`
+/// rows for one `(task_call_id, label)` lineage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentLaneCompactionState {
+    /// Successor window index of the latest durable compaction boundary.
+    pub window_index: u32,
+    /// Forward-progress flag replayed for each durable compaction, in seq order.
+    pub compaction_forward_progress: Vec<bool>,
+    /// Productive lineage work after the last compaction resets the guard.
+    pub forward_progress_since_last_compaction: bool,
+}
+
+fn subagent_compaction_successor_window_index(data: &serde_json::Value) -> u32 {
+    data.get("successor_window_index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32
+}
+
+fn subagent_lineage_event_is_forward_progress(kind: &str) -> bool {
+    matches!(
+        kind,
+        "assistant_message"
+            | "tool_call"
+            | "tool_call_started"
+            | "tool_call_completed"
+            | "inference_request"
+    )
+}
+
+fn lineage_events_forward_progress_between(
+    events: &[SessionEventRow],
+    after_seq_exclusive: i64,
+    before_seq_exclusive: Option<i64>,
+) -> bool {
+    events.iter().any(|ev| {
+        ev.seq > after_seq_exclusive
+            && before_seq_exclusive.is_none_or(|bound| ev.seq < bound)
+            && subagent_lineage_event_is_forward_progress(&ev.kind)
+    })
+}
+
+/// Derive lane window identity and compact-guard replay from lineage-scoped
+/// session events (already filtered to one `(task_call_id, label)`).
+pub fn subagent_lane_compaction_state_from_lineage_events(
+    events: &[SessionEventRow],
+) -> SubagentLaneCompactionState {
+    let mut compaction_seqs = Vec::new();
+    let mut window_index = 0_u32;
+    for ev in events {
+        if ev.kind != "subagent_compacted" {
+            continue;
+        }
+        let successor = subagent_compaction_successor_window_index(&ev.data);
+        window_index = window_index.max(successor);
+        compaction_seqs.push(ev.seq);
+    }
+
+    let mut compaction_forward_progress = Vec::with_capacity(compaction_seqs.len());
+    let mut previous_seq = 0_i64;
+    for seq in &compaction_seqs {
+        compaction_forward_progress.push(lineage_events_forward_progress_between(
+            events,
+            previous_seq,
+            Some(*seq),
+        ));
+        previous_seq = *seq;
+    }
+
+    let forward_progress_since_last_compaction = compaction_seqs
+        .last()
+        .is_some_and(|last_seq| lineage_events_forward_progress_between(events, *last_seq, None));
+
+    SubagentLaneCompactionState {
+        window_index,
+        compaction_forward_progress,
+        forward_progress_since_last_compaction,
+    }
+}
+
+pub fn subagent_lane_compaction_state_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    task_call_id: &str,
+    label: &str,
+) -> Result<SubagentLaneCompactionState> {
+    let events = Db::list_session_events_conn(conn, session_id)
+        .map_err(|e| anyhow!("loading session events for subagent lane compaction state: {e}"))?;
+    let lineage_events = events
+        .into_iter()
+        .filter(|ev| {
+            ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
+        })
+        .collect::<Vec<_>>();
+    Ok(subagent_lane_compaction_state_from_lineage_events(
+        &lineage_events,
+    ))
+}
+
+fn subagent_compaction_compact_boundary(
+    ev: &SessionEventRow,
+    data: &serde_json::Value,
+) -> proto::HistoryEntry {
+    let predecessor_window_index = data
+        .get("predecessor_window_index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let seed_tool_count = data
+        .get("seed_tool_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let brief = data
+        .get("brief_text")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let handoff = data
+        .get("handoff_text")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| brief.clone());
+    proto::HistoryEntry::CompactBoundary {
+        seq: ev.seq,
+        predecessor_short_id: format!("w{predecessor_window_index}"),
+        seed_tool_count,
+        seed_tool_tokens: 0,
+        source: data
+            .get("source")
+            .and_then(|value| value.as_str())
+            .unwrap_or("auto")
+            .to_string(),
+        trigger_ctx_pct: data
+            .get("trigger_ctx_pct")
+            .and_then(serde_json::Value::as_f64),
+        tokens_before: data
+            .get("tokens_before")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        tokens_after: data
+            .get("tokens_after")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        turns_summarized: data
+            .get("turns_summarized")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        tail_kept: data
+            .get("tail_kept")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        tail_trimmed: data
+            .get("tail_trimmed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        brief,
+        handoff,
+    }
+}
+
+fn resolve_subagent_compaction_data(
+    conn: &Connection,
+    session_id: Uuid,
+    data: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let Some(reference) = data.get("handoff_ref").and_then(serde_json::Value::as_str) else {
+        return Ok(data.clone());
+    };
+    let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)? else {
+        anyhow::bail!("missing stored subagent compaction payload for `{reference}`");
+    };
+    serde_json::from_str(&payload).context("decoding stored subagent compaction payload")
 }
 
 fn subagent_history_entries_from_events(
@@ -1914,6 +2112,9 @@ fn subagent_history_entries_from_events(
                     summary,
                     detail,
                 });
+            }
+            "subagent_compacted" => {
+                snapshot.push(subagent_compaction_compact_boundary(ev, &ev.data));
             }
             "subagent_spawned" => {
                 let parent = ev.data.get("parent").and_then(|v| v.as_str()).unwrap_or("");
@@ -7725,6 +7926,90 @@ mod tests {
                 ..
             }] if source == "auto" && handoff == "full handoff"
         ));
+    }
+
+    fn test_subagent_lineage_event(
+        seq: i64,
+        kind: &str,
+        data: serde_json::Value,
+    ) -> SessionEventRow {
+        SessionEventRow {
+            seq,
+            session_id: Uuid::nil(),
+            ts_ms: 0,
+            kind: kind.to_string(),
+            agent: None,
+            call_id: None,
+            task_call_id: Some("task-1".into()),
+            label: Some("default".into()),
+            origin_principal: None,
+            provider_id: None,
+            model_id: None,
+            model_trust: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn subagent_lane_compaction_state_empty_lineage() {
+        let state = subagent_lane_compaction_state_from_lineage_events(&[]);
+        assert_eq!(state.window_index, 0);
+        assert!(state.compaction_forward_progress.is_empty());
+        assert!(!state.forward_progress_since_last_compaction);
+    }
+
+    #[test]
+    fn subagent_lane_compaction_state_advances_window_index() {
+        let events = vec![test_subagent_lineage_event(
+            10,
+            "subagent_compacted",
+            serde_json::json!({
+                "predecessor_window_index": 0,
+                "successor_window_index": 1,
+            }),
+        )];
+        let state = subagent_lane_compaction_state_from_lineage_events(&events);
+        assert_eq!(state.window_index, 1);
+        assert_eq!(state.compaction_forward_progress, vec![false]);
+        assert!(!state.forward_progress_since_last_compaction);
+    }
+
+    #[test]
+    fn subagent_lane_compaction_state_replays_guard_and_post_compact_progress() {
+        let events = vec![
+            test_subagent_lineage_event(
+                10,
+                "subagent_compacted",
+                serde_json::json!({
+                    "predecessor_window_index": 0,
+                    "successor_window_index": 1,
+                }),
+            ),
+            test_subagent_lineage_event(
+                20,
+                "subagent_compacted",
+                serde_json::json!({
+                    "predecessor_window_index": 1,
+                    "successor_window_index": 2,
+                }),
+            ),
+            test_subagent_lineage_event(
+                25,
+                "assistant_message",
+                serde_json::json!({ "text": "more" }),
+            ),
+        ];
+        let state = subagent_lane_compaction_state_from_lineage_events(&events);
+        assert_eq!(state.window_index, 2);
+        assert_eq!(state.compaction_forward_progress, vec![false, false]);
+        assert!(state.forward_progress_since_last_compaction);
+
+        let budget = crate::engine::delegation_budget::BudgetPool::unlimited();
+        budget.rehydrate_subagent_compact_guard(
+            &state.compaction_forward_progress,
+            state.forward_progress_since_last_compaction,
+        );
+        assert_eq!(budget.compact_guard_consecutive(), 0);
     }
 
     #[tokio::test]

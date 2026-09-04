@@ -8709,6 +8709,21 @@ impl NoninteractiveSteerTarget {
         self.late_user_steer_continuation_id = continuation_id;
         self
     }
+
+    pub(in crate::engine::driver) fn task_call_id(&self) -> &str {
+        &self.task_call_id
+    }
+
+    pub(in crate::engine::driver) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(in crate::engine::driver) fn lineage(&self) -> crate::session::SessionEventLineage {
+        crate::session::SessionEventLineage {
+            task_call_id: self.task_call_id.clone(),
+            label: self.label.clone(),
+        }
+    }
 }
 
 async fn terminalize_recursive_noninteractive_agent(
@@ -8760,15 +8775,6 @@ async fn terminalize_recursive_noninteractive_agent(
                 tracing::warn!(%error, %agent_instance_id, "terminalizing recursive child lifecycle row failed");
                 return;
             }
-        }
-    }
-}
-
-impl NoninteractiveSteerTarget {
-    fn lineage(&self) -> crate::session::SessionEventLineage {
-        crate::session::SessionEventLineage {
-            task_call_id: self.task_call_id.clone(),
-            label: self.label.clone(),
         }
     }
 }
@@ -10645,6 +10651,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     parent_budget: Option<crate::engine::delegation_budget::BudgetPool>,
     per_delegation: Option<cockpit_config::config::delegation_budget::DelegationBudgetSpec>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
+    crate::engine::delegation_budget::LaneBudgetScope::run(async {
     use crate::engine::agent::turn_with_backup;
 
     let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);
@@ -10755,6 +10762,22 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     };
     scheduled_lane_driver.budget = budget.clone();
     scheduled_lane_driver.bind_active_retry_budget();
+    let _lane_exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);
+    #[cfg(test)]
+    if let Some(hooks) = super::nested_lane_test_hooks::take() {
+        if let Some(script) = hooks.test_compact_brief_script {
+            scheduled_lane_driver.test_compact_brief_script = Some(script);
+        }
+        if let Some(override_) = hooks.test_providers_override {
+            scheduled_lane_driver.test_providers_override = Some(override_);
+        }
+        for _ in 0..hooks.lane_compact_guard_precharge {
+            let _ = budget.record_compaction(100, false);
+        }
+        scheduled_lane_driver.test_compaction_ignore_forward_progress =
+            hooks.compaction_ignore_forward_progress;
+        scheduled_lane_driver.test_compact_brief_lane_charge = hooks.compact_brief_lane_charge;
+    }
     if let Some(compiler) = guidance_compiler.clone() {
         if let Some(service) = compiler.proposal_service() {
             scheduled_lane_driver.set_guidance_proposal_service(service.clone());
@@ -11118,6 +11141,42 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         .as_ref()
         .and_then(|target| target.late_user_steer_continuation_id);
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
+    let mut subagent_compaction_window_index = 0_u32;
+    if let Some(target) = steer_target.as_ref() {
+        match session
+            .db
+            .read({
+                let task_call_id = target.task_call_id().to_string();
+                let label = target.label().to_string();
+                let session_id = session.live_id();
+                move |conn| {
+                    crate::engine::rehydrate::subagent_lane_compaction_state_conn(
+                        conn,
+                        session_id,
+                        &task_call_id,
+                        &label,
+                    )
+                }
+            })
+            .await
+        {
+            Ok(state) => {
+                subagent_compaction_window_index = state.window_index;
+                budget.rehydrate_subagent_compact_guard(
+                    &state.compaction_forward_progress,
+                    state.forward_progress_since_last_compaction,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    task_call_id = %target.task_call_id(),
+                    label = %target.label(),
+                    "rehydrating subagent lane compaction state failed"
+                );
+            }
+        }
+    }
     'turns: for _ in 0..max_turns {
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the swarm/schedule loops.
@@ -12284,7 +12343,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             // this loop without another provider turn.
         }
         let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
-        let usage_charge = session.take_uncharged_budget_charge();
+        let usage_charge = crate::engine::delegation_budget::take_lane_budget_charge();
         if !usage_charge.is_empty()
             && let Err(exhaustion) = budget.charge(usage_charge)
         {
@@ -12312,6 +12371,89 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         }
         match outcome {
             TurnOutcome::Continue => {
+                if !parked_replay {
+                    let persist_owns_unsettled_started = pending_scheduled_turn
+                        .as_ref()
+                        .is_some_and(|plan| plan.has_unsettled_started_calls());
+                    if !persist_owns_unsettled_started
+                        && let Some(target) = steer_target.as_ref()
+                    {
+                        match scheduled_lane_driver
+                            .maybe_noninteractive_auto_compact(
+                                &mut history,
+                                &budget,
+                                target,
+                                &mut subagent_compaction_window_index,
+                                &child_tx,
+                            )
+                            .await
+                        {
+                            Ok(crate::engine::driver::NoninteractiveAutoCompactOutcome::Compacted) => {
+                                let compact_usage =
+                                    crate::engine::delegation_budget::take_lane_budget_charge();
+                                if !compact_usage.is_empty()
+                                    && let Err(exhaustion) = budget.charge(compact_usage)
+                                {
+                                    drop(child_tx);
+                                    let _ = forwarder.await;
+                                    let partial = history
+                                        .iter()
+                                        .rev()
+                                        .find_map(|message| match message {
+                                            Message::Assistant { content, .. } => {
+                                                let text =
+                                                    crate::engine::message::extract_text(content);
+                                                (!text.trim().is_empty()).then_some(text)
+                                            }
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    return Ok(NoninteractiveOutcome {
+                                        report:
+                                            crate::engine::delegation_budget::budget_exhausted_report(
+                                                &partial,
+                                                &exhaustion,
+                                            ),
+                                        history,
+                                        fallback_decision,
+                                    });
+                                }
+                                next_prompt = Message::user(
+                                    "Continue the delegated task using the compacted context above.",
+                                );
+                                continue 'turns;
+                            }
+                            Ok(_) => {}
+                            Err(_exhaustion) => {
+                                drop(child_tx);
+                                let _ = forwarder.await;
+                                let partial = history
+                                    .iter()
+                                    .rev()
+                                    .find_map(|message| match message {
+                                        Message::Assistant { content, .. } => {
+                                            let text =
+                                                crate::engine::message::extract_text(content);
+                                            (!text.trim().is_empty()).then_some(text)
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                return Ok(NoninteractiveOutcome {
+                                    report: if partial.trim().is_empty() {
+                                        "Subagent compact-and-continue blocked after repeated compactions with no forward progress.".to_string()
+                                    } else {
+                                        format!(
+                                            "{partial}\n\nSubagent compact-and-continue blocked after repeated compactions with no forward progress."
+                                        )
+                                    },
+                                    history,
+                                    fallback_decision,
+                                });
+                            }
+                        }
+                    }
+                }
                 next_prompt = history
                     .pop()
                     .expect("Continue with empty history is unreachable");
@@ -13836,6 +13978,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         fallback_decision,
         fallback_tried,
     ))
+    }).await
 }
 
 #[cfg(test)]

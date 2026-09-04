@@ -385,17 +385,20 @@ impl ComputerAction {
     }
 
     /// True when performing this action can change which window, tab,
-    /// field, or widget subsequently receives keystrokes. Modeled
-    /// keyboard actions target whoever is already focused. Observation,
-    /// pointer motion, and scroll are not identity-preserving: wait and
-    /// capture let applications and window management restack focus, and
-    /// pointer motion or scroll can move it (issue #289 remaining
-    /// finding 2).
+    /// field, or widget subsequently receives keystrokes. Typed text and
+    /// keyboard input outside [`chord_preserves_receiver_identity`] /
+    /// [`held_key_preserves_receiver_identity`] are identity-changing.
+    /// Observation, pointer motion, and scroll are not identity-preserving
+    /// either: wait and capture let applications and window management
+    /// restack focus, and pointer motion or scroll can move it (issue
+    /// #289 remaining finding 2).
     pub(crate) fn can_change_receiver_identity(&self) -> bool {
-        !matches!(
-            self,
-            Self::TypeText { .. } | Self::KeyChord { .. } | Self::HoldKey { .. }
-        )
+        match self {
+            Self::TypeText { .. } => false,
+            Self::KeyChord { chord } => !chord_preserves_receiver_identity(chord),
+            Self::HoldKey { key, .. } => !held_key_preserves_receiver_identity(key),
+            _ => true,
+        }
     }
 }
 
@@ -425,6 +428,110 @@ fn key_is_function(key: &KeyCode) -> bool {
         .strip_prefix('F')
         .and_then(|number| number.parse::<u8>().ok())
         .is_some_and(|number| (1..=12).contains(&number))
+}
+
+/// Minimal control-family chords that edit the focused receiver's line
+/// without moving keyboard focus (issue #289).
+///
+/// Members and why each is safe:
+/// - `C`: aborts/intruits the foreground line (readline `SIGINT` binding);
+///   does not close the shell tab/pane/window.
+/// - `J`/`M`: line feed/carriage return the terminal treats as Enter on the
+///   same receiver.
+/// - `E`: end-of-line cursor motion (readline).
+/// - `L`: clear screen within the same shell session.
+/// - `U`: kill line backward (readline).
+/// - `W`: delete word backward (readline).
+/// - `R`: reverse-search history within the same shell.
+///
+/// Deliberately excluded:
+/// - `D`: EOF on an empty line exits the shell; every audited terminal
+///   closes the tab/pane/window on shell exit, moving keyboard focus.
+/// - `Z`: suspend (`SIGTSTP`); excluded even though it does not move focus.
+/// - `\`: quit (`SIGQUIT`); not on this list.
+/// - `A`/`B`: GNU screen / tmux multiplexer prefixes.
+/// - `S`/`Q`: XON/XOFF flow control.
+/// - space/`@`: multiplexer/window-manager bindings.
+/// Any other control chord is identity-changing by construction.
+fn control_plain_key_preserves_receiver_identity(plain: &str) -> bool {
+    matches!(plain, "C" | "J" | "M" | "E" | "L" | "U" | "W" | "R")
+}
+
+/// True when one key press stays inside the focused receiver's line
+/// discipline and cannot move keyboard focus. Only unmodified navigation
+/// keys, line-editing keys, and plain alphanumerics are allowed; shift
+/// modifies only uppercase letters. Everything else — shift+navigation,
+/// shift+function keys, bare function keys, tab/page keys, lock keys,
+/// PrintScreen/Apps/Menu, Insert/Escape, and alt/meta/super chords — is
+/// identity-changing by construction (issue #289).
+fn single_key_preserves_receiver_identity(key: &KeyCode, shift: bool) -> bool {
+    if shift {
+        let name = key.as_str();
+        return name.len() == 1
+            && name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric());
+    }
+    match key.as_str() {
+        "ENTER" | "BACKSPACE" | "SPACE" => true,
+        "ARROWUP" | "ARROWDOWN" | "ARROWLEFT" | "ARROWRIGHT" => true,
+        "HOME" | "END" | "DELETE" => true,
+        name if name.len() == 1
+            && name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric()) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Closed positive set of keyboard chords that cannot move keyboard focus
+/// to a different receiver. Membership is explicit: typed text, the
+/// [`control_plain_key_preserves_receiver_identity`] allowlist,
+/// unmodified line-editing keys from [`single_key_preserves_receiver_identity`],
+/// and shift-only uppercase letters. Every other chord — tab-family,
+/// page-up/down, shift+navigation, function keys, alt/meta chords, and
+/// multi-modifier combinations — is identity-changing. Ambiguous delivery
+/// of an identity-changing chord must mark the receiver unproven at least
+/// as conservatively as delivered delivery (issue #289).
+fn chord_preserves_receiver_identity(chord: &CanonicalKeyChord) -> bool {
+    let keys = chord.keys();
+    let has_control = keys.iter().any(key_is_control);
+    let has_alt = keys.iter().any(key_is_alt);
+    let has_shift = keys.iter().any(|key| key.as_str() == "SHIFT");
+    if keys.iter().any(key_is_meta) || has_alt {
+        return false;
+    }
+    let plain: Vec<&KeyCode> = keys
+        .iter()
+        .filter(|key| {
+            !key_is_control(key) && !key_is_alt(key) && !key_is_meta(key) && key.as_str() != "SHIFT"
+        })
+        .collect();
+    if plain.iter().any(|key| key.as_str() == "ENTER") {
+        return !has_control && plain.len() == 1;
+    }
+    if has_control {
+        if has_shift || plain.len() != 1 {
+            return false;
+        }
+        return control_plain_key_preserves_receiver_identity(plain[0].as_str());
+    }
+    if plain.len() == 1 {
+        return single_key_preserves_receiver_identity(plain[0], has_shift);
+    }
+    plain.is_empty()
+}
+
+/// True when holding one key down cannot move keyboard focus. Only Enter
+/// is modeled; every other hold can auto-repeat into an unbounded stream
+/// of presses and is identity-changing.
+fn held_key_preserves_receiver_identity(key: &KeyCode) -> bool {
+    key.as_str() == "ENTER"
 }
 
 /// True when a canonical key chord spawns a terminal from a non-terminal
@@ -630,8 +737,9 @@ const TERMINAL_INPUT_UNTRACKED_REFUSAL: &str = "computer use cannot press Enter 
 /// object, so it cannot restore this state (issue #289 remaining
 /// finding 2).
 const TERMINAL_INPUT_RECEIVER_UNPROVEN_REFUSAL: &str = "computer use cannot press Enter after the receiving object became unproven at launch: \
-     pointer motion, wait, scroll, or capture can change focus, and leftover text may remain in a \
-     previously focused receiver; use the run tool for shell commands instead";
+     pointer motion, wait, scroll, capture, or keyboard chords outside the identity-preserving \
+     set can change focus, and leftover text may remain in a previously focused receiver; use the \
+     run tool for shell commands instead";
 
 /// Upper bound for one `TypeText` action and for the typed-line model's
 /// pending buffer: POSIX `LINE_MAX` (4096). Bounds classifier/parser cost
@@ -771,14 +879,20 @@ pub(crate) fn check_terminal_input_policy(action: &ComputerAction) -> Result<(),
 ///
 /// **Receiver identity (review cycle 3, finding 3; remaining finding
 /// 2):** modeled state must describe the *receiving object*, not merely
-/// one coordinator. Pointer motion, wait, scroll, and capture can
-/// change which terminal, tab, window, or field has focus (focus-
-/// follows-mouse desktops, window management, asynchronous UI),
-/// leaving typed text in receiver A while receiver B takes subsequent
-/// keys. Those actions mark the receiving object **unproven**. `ctrl+c`
-/// cancels only the currently focused receiver — not leftover text in a
-/// previously focused one — and does not prove subsequent keys will go
-/// to the same object, so it cannot restore a proven binding.
+/// one coordinator. Pointer motion, wait, scroll, and capture can change
+/// which terminal, tab, window, or field has focus (focus-follows-mouse
+/// desktops, window management, asynchronous UI), leaving typed text in
+/// receiver A while receiver B takes subsequent keys. Keyboard chords
+/// outside the closed identity-preserving set — tab-family chords,
+/// page-up/down with control or shift, alt/meta chords, function keys,
+/// window-manager chords, and every [`ComputerAction::HoldKey`] except
+/// Enter — can move focus too. ANY action that can move keyboard focus,
+/// whether delivered, failed, or ambiguously delivered, leaves the
+/// receiver **unproven** until positive re-authentication; ambiguous
+/// delivery must never be treated less conservatively than delivered.
+/// `ctrl+c` cancels only the currently focused receiver — not leftover
+/// text in a previously focused one — and does not prove subsequent keys
+/// will go to the same object, so it cannot restore a proven binding.
 /// Synthetic mouse button *presses* are refused outright by the
 /// per-action policy above (review cycle 3, finding 4): a click can
 /// drive an application menu's Paste item or a Run button to inject or
@@ -1019,6 +1133,9 @@ impl TypedInputLineModel {
     }
 
     fn absorb_chord(&mut self, chord: &CanonicalKeyChord) -> Result<(), ComputerError> {
+        if !chord_preserves_receiver_identity(chord) {
+            self.receiver_unproven = true;
+        }
         let keys = chord.keys();
         let has_control = keys.iter().any(key_is_control);
         let has_alt = keys.iter().any(key_is_alt);
@@ -1069,9 +1186,11 @@ impl TypedInputLineModel {
                 // terminal line discipline treats as Enter.
                 "J" | "M" => self.commit_pending()?,
                 // `ctrl+v` is paste and is refused by the per-action policy;
-                // every other control combination (`ctrl+a`, `ctrl+w`,
-                // `ctrl+d`, ...) edits the line in ways this model cannot
-                // represent.
+                // every other control combination on the preserving allowlist
+                // (`ctrl+w`, `ctrl+u`, ...) edits the line in ways this model
+                // cannot represent; `ctrl+d` (EOF/shell exit) and multiplexer
+                // prefixes (`ctrl+a`, `ctrl+b`, ...) are identity-changing and
+                // were already unproven above.
                 _ => self.untracked = true,
             }
             return Ok(());
@@ -1142,6 +1261,9 @@ impl TypedInputLineModel {
     }
 
     fn absorb_held_key(&mut self, key: &KeyCode) -> Result<(), ComputerError> {
+        if !held_key_preserves_receiver_identity(key) {
+            self.receiver_unproven = true;
+        }
         // A hold is one keydown + keyup over a duration; OS auto-repeat
         // makes the number of delivered presses uncertain, so only Enter
         // is modeled (a repeated commit of an unchanged line is
@@ -7884,14 +8006,14 @@ mod tests {
 
     #[test]
     fn typed_line_model_fails_closed_on_untracked_input() {
-        // Keys whose line effect cannot be modeled (`ctrl+a`) taint the
+        // Keys whose line effect cannot be modeled (`ctrl+w`) taint the
         // line: a later Enter is refused until a provable `ctrl+c` reset.
         let mut model = TypedInputLineModel::default();
         model
             .absorb_action(&ComputerAction::KeyChord {
-                chord: chord(&["ctrl", "a"]),
+                chord: chord(&["ctrl", "w"]),
             })
-            .expect("ctrl+a itself dispatches");
+            .expect("ctrl+w itself dispatches");
         let error = model
             .absorb_action(&ComputerAction::KeyChord {
                 chord: chord(&["enter"]),
@@ -8186,6 +8308,194 @@ mod tests {
                 "ctrl+c must not rebind an unproven receiver, got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn typed_line_model_unproves_receiver_on_focus_switching_chords() {
+        // Issue #289 remaining finding: tab-family, page-up/down, Konsole
+        // shift+arrow tab chords, GNU screen's `ctrl+a` prefix, shift+F10,
+        // and PrintScreen can move keyboard focus. Delivered focus changes
+        // leave the receiver unproven; ctrl+c cannot restore commits.
+        let comment = ComputerAction::TypeText {
+            text: "# note".to_string(),
+        };
+        let enter = ComputerAction::KeyChord {
+            chord: chord(&["enter"]),
+        };
+        let cancel = ComputerAction::KeyChord {
+            chord: chord(&["ctrl", "c"]),
+        };
+        for focus_chord in [
+            chord(&["ctrl", "PAGEUP"]),
+            chord(&["ctrl", "PAGEDOWN"]),
+            chord(&["ctrl", "TAB"]),
+            chord(&["ctrl", "shift", "TAB"]),
+            chord(&["TAB"]),
+            chord(&["alt", "TAB"]),
+            chord(&["shift", "ARROWLEFT"]),
+            chord(&["shift", "ARROWRIGHT"]),
+            chord(&["ctrl", "a"]),
+            chord(&["ctrl", "d"]),
+            chord(&["shift", "F10"]),
+            chord(&["PRINTSCREEN"]),
+        ] {
+            let mut model = TypedInputLineModel::default();
+            model.absorb_action(&comment).expect("typing dispatches");
+            model
+                .absorb_action(&ComputerAction::KeyChord {
+                    chord: focus_chord.clone(),
+                })
+                .expect("focus-switching chords still dispatch");
+            let error = model
+                .absorb_action(&enter)
+                .expect_err("a focus switch must leave the receiver unproven");
+            assert!(
+                matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "the refusal must name the unproven receiver for {focus_chord:?}, got {error:?}"
+            );
+            model
+                .absorb_action(&cancel)
+                .expect("ctrl+c still cancels the currently focused line");
+            let error = model
+                .absorb_action(&enter)
+                .expect_err("ctrl+c must not restore commits after a focus switch");
+            assert!(
+                matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "ctrl+c must not rebind an unproven receiver for {focus_chord:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_line_model_preserves_receiver_identity_for_line_editing_chords() {
+        // The closed identity-preserving set must not over-reach: unmodified
+        // arrows and a proven ctrl+c reset still allow benign commits.
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "hello".to_string(),
+            })
+            .expect("typing dispatches");
+        for key in ["ARROWLEFT", "ARROWRIGHT"] {
+            model
+                .absorb_action(&ComputerAction::KeyChord {
+                    chord: chord(&[key]),
+                })
+                .expect("arrow chords still dispatch");
+        }
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["ctrl", "c"]),
+            })
+            .expect("ctrl+c provably cancels the receiver's line");
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["enter"]),
+            })
+            .expect("a provably empty line commits while identity is preserved");
+    }
+
+    #[test]
+    fn chord_preserves_receiver_identity_matches_focus_and_line_editing_sets() {
+        assert!(!chord_preserves_receiver_identity(&chord(&[
+            "ctrl", "PAGEUP"
+        ])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "TAB"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["alt", "TAB"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["TAB"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&[
+            "shift",
+            "ARROWLEFT"
+        ])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "a"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["ctrl", "d"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&[
+            "shift", "F10"
+        ])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["PRINTSCREEN"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["F10"])));
+        assert!(!chord_preserves_receiver_identity(&chord(&["APPS"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["ctrl", "c"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["ctrl", "w"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["ARROWLEFT"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["enter"])));
+        assert!(chord_preserves_receiver_identity(&chord(&["shift", "H"])));
+    }
+
+    #[test]
+    fn typed_line_model_unproves_receiver_on_non_enter_hold() {
+        // Issue #289: every HoldKey except Enter is identity-changing because
+        // auto-repeat makes delivered press counts uncertain.
+        let enter = ComputerAction::KeyChord {
+            chord: chord(&["enter"]),
+        };
+        let cancel = ComputerAction::KeyChord {
+            chord: chord(&["ctrl", "c"]),
+        };
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "# note".to_string(),
+            })
+            .expect("typing dispatches");
+        model
+            .absorb_action(&ComputerAction::HoldKey {
+                key: KeyCode::parse("A").unwrap(),
+                duration: Duration::from_millis(10),
+            })
+            .expect("non-Enter holds still dispatch");
+        let error = model
+            .absorb_action(&enter)
+            .expect_err("a non-Enter hold must leave the receiver unproven");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "the refusal must name the unproven receiver, got {error:?}"
+        );
+        model
+            .absorb_action(&cancel)
+            .expect("ctrl+c still cancels the currently focused line");
+        let error = model
+            .absorb_action(&enter)
+            .expect_err("ctrl+c must not restore commits after a non-Enter hold");
+        assert!(
+            matches!(&error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not rebind an unproven receiver, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn typed_line_model_enter_hold_commits_through_choke_point() {
+        // Enter holds must still funnel through commit_pending like bare Enter.
+        let mut model = TypedInputLineModel::default();
+        model
+            .absorb_action(&ComputerAction::TypeText {
+                text: "hello".to_string(),
+            })
+            .expect("typing dispatches");
+        model
+            .absorb_action(&ComputerAction::KeyChord {
+                chord: chord(&["ctrl", "c"]),
+            })
+            .expect("ctrl+c provably cancels the receiver's line");
+        model
+            .absorb_action(&ComputerAction::HoldKey {
+                key: KeyCode::parse("ENTER").unwrap(),
+                duration: Duration::from_millis(10),
+            })
+            .expect("an Enter hold commits a proven empty line");
+    }
+
+    #[test]
+    fn held_key_preserves_receiver_identity_matches_enter_only() {
+        assert!(held_key_preserves_receiver_identity(
+            &KeyCode::parse("ENTER").unwrap()
+        ));
+        assert!(!held_key_preserves_receiver_identity(
+            &KeyCode::parse("A").unwrap()
+        ));
+        assert!(!held_key_preserves_receiver_identity(
+            &KeyCode::parse("ARROWLEFT").unwrap()
+        ));
     }
 
     #[test]

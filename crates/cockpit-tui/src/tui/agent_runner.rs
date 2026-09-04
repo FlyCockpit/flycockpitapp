@@ -4002,6 +4002,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SubagentSpawned { session_id, .. }
         | SubagentRouting { session_id, .. }
         | SubagentReport { session_id, .. }
+        | SubagentCompacted { session_id, .. }
         | NestedTurn { session_id, .. }
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
@@ -4806,6 +4807,32 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             failed,
             model_trusted,
             routing,
+        },
+        SubagentCompacted {
+            agent,
+            task_call_id,
+            label,
+            source,
+            trigger_ctx_pct,
+            tokens_before,
+            tokens_after,
+            turns_summarized,
+            tail_kept,
+            tail_trimmed,
+            window_index,
+            ..
+        } => TurnEvent::SubagentCompacted {
+            agent,
+            task_call_id,
+            label,
+            source,
+            trigger_ctx_pct,
+            tokens_before,
+            tokens_after,
+            turns_summarized,
+            tail_kept,
+            tail_trimmed,
+            window_index,
         },
         NestedTurn {
             task_call_id,

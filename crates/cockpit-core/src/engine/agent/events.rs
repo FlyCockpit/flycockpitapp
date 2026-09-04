@@ -559,6 +559,22 @@ pub enum TurnEvent {
         model_trusted: bool,
         routing: serde_json::Value,
     },
+    /// A noninteractive subagent autocompacted into a new linked window in its
+    /// own delegation lineage. Forwarded to the parent as a `NestedTurn` so the
+    /// author sees repeated compaction; never enters the parent's model context.
+    SubagentCompacted {
+        agent: String,
+        task_call_id: String,
+        label: String,
+        source: String,
+        trigger_ctx_pct: Option<f64>,
+        tokens_before: u64,
+        tokens_after: u64,
+        turns_summarized: usize,
+        tail_kept: usize,
+        tail_trimmed: usize,
+        window_index: u32,
+    },
     /// A noninteractive child turn event forwarded through its parent
     /// session stream with delegation lineage.
     NestedTurn {

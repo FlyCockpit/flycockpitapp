@@ -497,6 +497,34 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 routing,
             }]
         }
+        TurnEvent::SubagentCompacted {
+            agent,
+            task_call_id,
+            label,
+            source,
+            trigger_ctx_pct,
+            tokens_before,
+            tokens_after,
+            turns_summarized,
+            tail_kept,
+            tail_trimmed,
+            window_index,
+        } => {
+            vec![Event::SubagentCompacted {
+                session_id,
+                agent,
+                task_call_id,
+                label,
+                source,
+                trigger_ctx_pct,
+                tokens_before,
+                tokens_after,
+                turns_summarized,
+                tail_kept,
+                tail_trimmed,
+                window_index,
+            }]
+        }
         TurnEvent::NestedTurn {
             task_call_id,
             label,

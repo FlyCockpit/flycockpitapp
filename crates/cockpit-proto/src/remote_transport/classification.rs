@@ -2974,6 +2974,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
     row(
+        "subagent_compacted",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
         "nested_turn",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::TruncatedByCap,
@@ -3283,6 +3288,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Event, "tool_error"),
     (RemoteMessageKind::Event, "subagent_spawned"),
     (RemoteMessageKind::Event, "subagent_report"),
+    (RemoteMessageKind::Event, "subagent_compacted"),
     (RemoteMessageKind::Event, "nested_turn"),
     (RemoteMessageKind::Event, "interrupt_raised"),
     (RemoteMessageKind::Event, "history_replay"),
@@ -3489,9 +3495,9 @@ mod tests {
         #[cfg(not(feature = "extended"))]
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 194);
         #[cfg(feature = "extended")]
-        assert_eq!(EVENT_CLASSIFICATION.len(), 86);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 87);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(EVENT_CLASSIFICATION.len(), 85);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 86);
     }
 
     #[test]
@@ -3547,9 +3553,9 @@ mod tests {
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
         #[cfg(feature = "extended")]
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 108);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 110);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 105);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 107);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

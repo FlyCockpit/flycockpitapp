@@ -63,7 +63,10 @@ function collectPrefixedTests(summary) {
     if (!suite || typeof suite !== "object") {
       fail(`malformed suite entry: ${suiteKey}`);
     }
-    const binaryId = suite["binary-id"] ?? suiteKey;
+    const binaryName = suite["binary-name"];
+    if (typeof binaryName !== "string" || binaryName.length === 0) {
+      fail(`unknown schema: missing binary-name in suite ${suiteKey}`);
+    }
     const testcases = suite.testcases;
     if (!testcases || typeof testcases !== "object" || Array.isArray(testcases)) {
       continue;
@@ -72,14 +75,14 @@ function collectPrefixedTests(summary) {
       if (typeof name !== "string" || !name.startsWith(PREFIX)) {
         continue;
       }
-      if (binaryId !== EXPECTED_BINARY) {
-        fail(`wrong binary: expected ${EXPECTED_BINARY} got ${binaryId} for ${name}`);
+      if (binaryName !== EXPECTED_BINARY) {
+        fail(`wrong binary: expected ${EXPECTED_BINARY} got ${binaryName} for ${name}`);
       }
       if (seen.has(name)) {
         fail(`duplicate name: ${name}`);
       }
       const ignored = meta && typeof meta === "object" && meta.ignored === true;
-      seen.set(name, { ignored, binary: binaryId });
+      seen.set(name, { ignored, binary: binaryName });
     }
   }
   return seen;

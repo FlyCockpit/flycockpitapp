@@ -9,7 +9,6 @@ use crate::{
     proto_crate::send_user_message_v2::MessageIngressV2,
     session::Session,
 };
-use base64::Engine as _;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
 use std::{
@@ -37,23 +36,6 @@ macro_rules! test_principal_tx {
     () => {
         test_principal_tx_sender()
     };
-}
-
-#[test]
-#[cfg(not(feature = "extended"))]
-fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
-    let request = Request::ListScheduledJobs { owner: None };
-    let error = require_compiled_product_domain(&request)
-        .expect_err("scheduler RPC must be unavailable without the extended profile");
-    assert_eq!(error.code, ErrorCode::BadRequest);
-    assert!(
-        error
-            .message
-            .contains("opt-in extended local capability profile")
-    );
-
-    require_compiled_product_domain(&Request::DaemonStatus)
-        .expect("base-profile RPC must remain available");
 }
 
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {

@@ -18181,28 +18181,26 @@ async fn handle_serialized_request_impl(
             };
             use crate::daemon::principal::LocalClientRole;
 
-            if !state.exchange_file_capability_verified {
-                return Err(authorization_error(
-                    "exchange requires the daemon-private owner capability",
-                ));
-            }
-            state.exchange_file_capability_verified = false;
             let peer = state
                 .socket_peer
                 .ok_or_else(|| authorization_error("socket peer identity is required"))?;
             let role = attest_local_client_role(peer, &ctx.approved_client_executable)
-                .map_err(internal)?
                 .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
             let grants = if role == LocalClientRole::AgentChild {
                 default_agent_child_grants()
             } else {
                 Vec::new()
             };
-            let token = ctx
-                .peer_credential_registry
-                .mint(peer, role, grants.clone());
+            let connection_id = state.terminal_context.client_instance_id;
+            let token =
+                ctx.peer_credential_registry
+                    .mint(peer, connection_id, role, grants.clone());
             state.has_owner_capability = role.is_owner_class();
             state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
+            state.active_peer_credential = Some(token.as_str().to_string());
+            state.peer_credential_expires_at_unix_ms = ctx
+                .peer_credential_registry
+                .expires_at_unix_ms(connection_id, token.as_str());
             Ok(Response::LocalPeerCredential {
                 token: proto::OwnerCapabilityToken::new(token.0),
                 role: proto_local_role(role),

@@ -601,35 +601,37 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
 }
 
 #[cfg(target_os = "macos")]
-fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
-    #[repr(C)]
-    struct ProcBsdInfo {
-        flags: u32,
-        status: u32,
-        xstatus: u32,
-        pid: u32,
-        ppid: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        svuid: u32,
-        svgid: u32,
-        rfu_1: u32,
-        comm: [libc::c_char; 16],
-        name: [libc::c_char; 32],
-        nfiles: u32,
-        pgid: u32,
-        pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        nice: i32,
-        start_sec: u64,
-        start_usec: u64,
-    }
-    const _: () = assert!(std::mem::size_of::<ProcBsdInfo>() == 136);
-    const _: () = assert!(std::mem::offset_of!(ProcBsdInfo, start_sec) == 120);
-    const _: () = assert!(std::mem::offset_of!(ProcBsdInfo, start_usec) == 128);
+#[repr(C)]
+struct MacosProcBsdInfo {
+    flags: u32,
+    status: u32,
+    xstatus: u32,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    ruid: u32,
+    rgid: u32,
+    svuid: u32,
+    svgid: u32,
+    rfu_1: u32,
+    comm: [libc::c_char; 16],
+    name: [libc::c_char; 32],
+    nfiles: u32,
+    pgid: u32,
+    pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    nice: i32,
+    start_sec: u64,
+    start_usec: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_proc_bsd_info(pid: u32) -> std::io::Result<MacosProcBsdInfo> {
+    const _: () = assert!(std::mem::size_of::<MacosProcBsdInfo>() == 136);
+    const _: () = assert!(std::mem::offset_of!(MacosProcBsdInfo, start_sec) == 120);
+    const _: () = assert!(std::mem::offset_of!(MacosProcBsdInfo, start_usec) == 128);
     #[link(name = "proc")]
     unsafe extern "C" {
         fn proc_pidinfo(
@@ -640,8 +642,8 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
             size: libc::c_int,
         ) -> libc::c_int;
     }
-    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
-    let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+    let mut info = std::mem::MaybeUninit::<MacosProcBsdInfo>::zeroed();
+    let size = std::mem::size_of::<MacosProcBsdInfo>() as libc::c_int;
     let read = unsafe { proc_pidinfo(pid as libc::c_int, 3, 0, info.as_mut_ptr().cast(), size) };
     if read != size {
         return if read <= 0 {
@@ -653,7 +655,12 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
             ))
         };
     }
-    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+    let info = read_macos_proc_bsd_info(pid)?;
     Ok(ProcessStartIdentity {
         primary: info.start_sec,
         secondary: info.start_usec,
@@ -701,7 +708,10 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
     })
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
 fn read_process_start_identity(_pid: u32) -> std::io::Result<ProcessStartIdentity> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -709,13 +719,174 @@ fn read_process_start_identity(_pid: u32) -> std::io::Result<ProcessStartIdentit
     ))
 }
 
+#[cfg(target_os = "freebsd")]
+fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+    let proc = read_kinfo_proc(pid)?;
+    Ok(ProcessStartIdentity {
+        primary: proc.ki_start.tv_sec as u64,
+        secondary: proc.ki_start.tv_usec as u64,
+    })
+}
+
+#[cfg(target_os = "freebsd")]
+fn read_kinfo_proc(pid: u32) -> std::io::Result<libc::kinfo_proc> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
+    let mut proc = std::mem::MaybeUninit::<libc::kinfo_proc>::zeroed();
+    let mut size = std::mem::size_of::<libc::kinfo_proc>();
+    // SAFETY: sysctl writes at most `size` bytes into `proc`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            proc.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: sysctl succeeded and initialized the struct.
+    Ok(unsafe { proc.assume_init() })
+}
+
 #[cfg(target_os = "linux")]
-fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+pub fn read_process_credentials(pid: u32) -> std::io::Result<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let mut uid = None;
+    let mut gid = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("Uid:\t") {
+            uid = value
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.parse().ok());
+        } else if let Some(value) = line.strip_prefix("Gid:\t") {
+            gid = value
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.parse().ok());
+        }
+    }
+    match (uid, gid) {
+        (Some(uid), Some(gid)) => Ok((uid, gid)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("missing uid/gid in /proc/{pid}/status"),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_process_credentials(pid: u32) -> std::io::Result<(u32, u32)> {
+    let info = read_macos_proc_bsd_info(pid)?;
+    Ok((info.uid, info.gid))
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn read_process_credentials(pid: u32) -> std::io::Result<(u32, u32)> {
+    let proc = read_kinfo_proc(pid)?;
+    Ok((proc.ki_uid, proc.ki_gid))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+pub fn read_process_credentials(_pid: u32) -> std::io::Result<(u32, u32)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process credential verification is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+pub fn read_process_credentials(_pid: u32) -> std::io::Result<(u32, u32)> {
+    Ok((0, 0))
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_parent_process_id(pid: u32) -> std::io::Result<Option<u32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    for line in status.lines() {
+        if let Some(ppid) = line.strip_prefix("PPid:\t") {
+            return Ok(ppid.trim().parse().ok());
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_parent_process_id(pid: u32) -> std::io::Result<Option<u32>> {
+    let info = read_macos_proc_bsd_info(pid)?;
+    Ok(Some(info.ppid))
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn read_parent_process_id(pid: u32) -> std::io::Result<Option<u32>> {
+    let proc = read_kinfo_proc(pid)?;
+    Ok(u32::try_from(proc.ki_ppid).ok())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+pub fn read_parent_process_id(_pid: u32) -> std::io::Result<Option<u32>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "parent process identity is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+pub fn read_parent_process_id(pid: u32) -> std::io::Result<Option<u32>> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: snapshot APIs are used with valid stack structs.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            return Ok(None);
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..std::mem::zeroed()
+        };
+        let mut found = None;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    found = Some(entry.th32ParentProcessID);
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        Ok(found)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
 }
 
 #[cfg(target_os = "macos")]
-fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+pub fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
     #[link(name = "proc")]
     unsafe extern "C" {
@@ -737,8 +908,42 @@ fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
+#[cfg(target_os = "freebsd")]
+pub fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PATHNAME,
+        pid as libc::c_int,
+    ];
+    let mut path = vec![0_u8; libc::PATH_MAX as usize];
+    let mut size = path.len();
+    // SAFETY: sysctl writes at most `size` bytes into `path`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            path.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    path.truncate(size);
+    while path.last() == Some(&0) {
+        path.pop();
+    }
+    Ok(PathBuf::from(String::from_utf8_lossy(&path).into_owned()))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+pub fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "executable identity verification is unsupported on this platform",
@@ -746,7 +951,7 @@ fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+pub fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
@@ -933,7 +1138,63 @@ pub fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     parse_macos_procargs2(&bytes)
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(unix, target_os = "freebsd"))]
+pub fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_ARGS,
+        pid as libc::c_int,
+    ];
+    let mut bytes = vec![0_u8; 64 * 1024];
+    let mut len = bytes.len();
+    // SAFETY: sysctl writes at most `len` bytes into `bytes`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    bytes.truncate(len);
+    parse_freebsd_procargs(&bytes)
+}
+
+#[cfg(all(unix, target_os = "freebsd"))]
+fn parse_freebsd_procargs(bytes: &[u8]) -> std::io::Result<Vec<String>> {
+    let Some((executable, rest)) = bytes.split_once(|byte| *byte == 0) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "KERN_PROC_ARGS data is missing executable path terminator",
+        ));
+    };
+    let executable = String::from_utf8_lossy(executable);
+    if executable.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "KERN_PROC_ARGS executable path is empty",
+        ));
+    }
+    let mut args = vec![executable.into_owned()];
+    for part in rest
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        args.push(String::from_utf8_lossy(part).into_owned());
+    }
+    Ok(args)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
 pub fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

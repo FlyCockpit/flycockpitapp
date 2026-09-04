@@ -8373,17 +8373,3 @@ CREATE INDEX idx_task_artifacts_agent_session
     ON task_artifacts(agent_instance_id, session_id);
 CREATE INDEX idx_agent_profile_snapshots_installation
     ON agent_profile_snapshots(installation_id);
-
--- Daemon-minted peer credentials bound to local socket peer identity (issue #337).
--- Rows are ephemeral pid-scoped bindings; the daemon purges expired rows during mint.
-CREATE TABLE daemon_peer_credentials (
-    credential_id       TEXT PRIMARY KEY,
-    peer_uid              INTEGER NOT NULL,
-    peer_pid              INTEGER NOT NULL,
-    peer_gid              INTEGER NOT NULL,
-    role                  TEXT NOT NULL CHECK (role IN ('tui', 'cli', 'acp', 'agent_child')),
-    minted_at_unix_ms     INTEGER NOT NULL,
-    expires_at_unix_ms    INTEGER NOT NULL
-);
-CREATE INDEX daemon_peer_credentials_peer
-    ON daemon_peer_credentials(peer_uid, peer_pid);

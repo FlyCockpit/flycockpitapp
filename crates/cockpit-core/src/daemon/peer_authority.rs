@@ -1,18 +1,19 @@
 //! Authenticated per-peer authority for local socket clients (issue #337).
 //!
 //! Peers are identified with `SO_PEERCRED` / `getpeereid` (or the Windows named-
-//! pipe client PID) and receive daemon-minted credentials bound to that identity.
-//! Secret-bearing RPCs require a live peer-bound credential held in the
-//! connecting process, not a world-readable file next to the socket.
+//! pipe client PID) and receive daemon-minted credentials bound to that identity
+//! and the minting connection. Secret-bearing RPCs require a live peer-bound
+//! credential held in the connecting process, not a world-readable file next to
+//! the socket.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use cockpit_host::peer_cred::PeerIdentity;
 
@@ -62,6 +63,7 @@ impl std::fmt::Debug for PeerCredentialToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerCredentialRecord {
     peer: PeerIdentity,
+    connection_id: Uuid,
     role: LocalClientRole,
     grants: Vec<PrincipalGrant>,
     expires_at_unix_ms: i64,
@@ -76,6 +78,7 @@ impl PeerCredentialRegistry {
     pub fn mint(
         &self,
         peer: PeerIdentity,
+        connection_id: Uuid,
         role: LocalClientRole,
         grants: Vec<PrincipalGrant>,
     ) -> PeerCredentialToken {
@@ -88,6 +91,7 @@ impl PeerCredentialRegistry {
             .unwrap_or(i64::MAX);
         let record = PeerCredentialRecord {
             peer,
+            connection_id,
             role,
             grants,
             expires_at_unix_ms,
@@ -97,7 +101,6 @@ impl PeerCredentialRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
-        records.retain(|_, existing| existing.peer != peer);
         if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
             records.retain(|_, existing| {
                 existing.expires_at_unix_ms
@@ -121,6 +124,7 @@ impl PeerCredentialRegistry {
     pub fn verify(
         &self,
         peer: PeerIdentity,
+        connection_id: Uuid,
         presented: &str,
     ) -> Option<(LocalClientRole, Vec<PrincipalGrant>)> {
         if !peer_identity_matches_live_process(peer) {
@@ -132,18 +136,29 @@ impl PeerCredentialRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
         let record = records.get(presented)?;
-        if record.peer != peer {
+        if record.peer != peer || record.connection_id != connection_id {
             return None;
         }
         Some((record.role, record.grants.clone()))
     }
 
-    pub fn revoke_for_peer(&self, peer: PeerIdentity) {
+    pub fn expires_at_unix_ms(&self, connection_id: Uuid, presented: &str) -> Option<i64> {
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        records
+            .get(presented)
+            .filter(|record| record.connection_id == connection_id)
+            .map(|record| record.expires_at_unix_ms)
+    }
+
+    pub fn revoke_for_connection(&self, connection_id: Uuid) {
         let mut records = self
             .records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        records.retain(|_, record| record.peer != peer);
+        records.retain(|_, record| record.connection_id != connection_id);
     }
 }
 
@@ -165,10 +180,10 @@ pub fn peer_identity_matches_live_process(peer: PeerIdentity) -> bool {
     }
     #[cfg(unix)]
     {
-        if let Ok((uid, gid)) = read_process_uid_gid(peer.pid) {
-            return uid == peer.uid && gid == peer.gid;
+        match cockpit_host::daemon_lifecycle::read_process_credentials(peer.pid) {
+            Ok((uid, gid)) => uid == peer.uid && gid == peer.gid,
+            Err(_) => false,
         }
-        return false;
     }
     #[cfg(windows)]
     {
@@ -180,28 +195,28 @@ pub fn peer_identity_matches_live_process(peer: PeerIdentity) -> bool {
 pub fn attest_local_client_role(
     peer: PeerIdentity,
     approved_executable: &Path,
-) -> Result<Option<LocalClientRole>> {
+) -> Option<LocalClientRole> {
     if peer.pid == 0 || !peer_identity_matches_live_process(peer) {
-        return Ok(None);
+        return None;
     }
-    let exe = read_process_exe(peer.pid)?;
-    if !exact_executable_identity(&exe, approved_executable) {
-        return Ok(attest_agent_child_role(peer, approved_executable));
+    let exe = cockpit_host::daemon_lifecycle::read_process_executable(peer.pid).ok()?;
+    if !cockpit_host::daemon_lifecycle::exact_executable_identity(&exe, approved_executable) {
+        return attest_agent_child_role(peer, approved_executable);
     }
-    let cmdline = read_process_cmdline(peer.pid)?;
-    Ok(Some(classify_cockpit_cmdline(&cmdline)))
+    let cmdline = cockpit_host::daemon_lifecycle::read_process_cmdline(peer.pid).ok()?;
+    Some(classify_cockpit_cmdline(&cmdline))
 }
 
 fn attest_agent_child_role(
     peer: PeerIdentity,
     approved_executable: &Path,
 ) -> Option<LocalClientRole> {
-    let parent_pid = read_parent_pid(peer.pid).ok()??;
+    let parent_pid = cockpit_host::daemon_lifecycle::read_parent_process_id(peer.pid).ok()??;
     if parent_pid == 0 || !cockpit_host::daemon_lifecycle::process_exists(parent_pid) {
         return None;
     }
-    let parent_exe = read_process_exe(parent_pid).ok()?;
-    if exact_executable_identity(&parent_exe, approved_executable) {
+    let parent_exe = cockpit_host::daemon_lifecycle::read_process_executable(parent_pid).ok()?;
+    if cockpit_host::daemon_lifecycle::exact_executable_identity(&parent_exe, approved_executable) {
         return Some(LocalClientRole::AgentChild);
     }
     None
@@ -229,142 +244,6 @@ fn classify_cockpit_cmdline(cmdline: &[String]) -> LocalClientRole {
         return LocalClientRole::Tui;
     }
     LocalClientRole::Cli
-}
-
-fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
-    cockpit_host::daemon_lifecycle::exact_executable_identity(observed, approved)
-}
-
-#[cfg(unix)]
-fn read_process_uid_gid(pid: u32) -> Result<(u32, u32)> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .with_context(|| format!("reading /proc/{pid}/status"))?;
-    let mut uid = None;
-    let mut gid = None;
-    for line in status.lines() {
-        if let Some(value) = line.strip_prefix("Uid:\t") {
-            uid = value
-                .split_whitespace()
-                .next()
-                .and_then(|part| part.parse().ok());
-        } else if let Some(value) = line.strip_prefix("Gid:\t") {
-            gid = value
-                .split_whitespace()
-                .next()
-                .and_then(|part| part.parse().ok());
-        }
-    }
-    match (uid, gid) {
-        (Some(uid), Some(gid)) => Ok((uid, gid)),
-        _ => bail!("missing uid/gid in /proc/{pid}/status"),
-    }
-}
-
-#[cfg(unix)]
-fn read_process_exe(pid: u32) -> Result<PathBuf> {
-    let path = format!("/proc/{pid}/exe");
-    std::fs::read_link(&path).with_context(|| format!("reading {path}"))
-}
-
-#[cfg(windows)]
-fn read_process_exe(pid: u32) -> Result<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-    // SAFETY: pid is a live peer captured at accept time.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() || process == INVALID_HANDLE_VALUE {
-        bail!("opening peer process {pid}");
-    }
-    let mut buffer = vec![0u16; 32_768];
-    let mut size = buffer.len() as u32;
-    // SAFETY: `process` is valid and `buffer` is writable for `size` UTF-16 units.
-    let ok = unsafe {
-        windows_sys::Win32::System::Threading::QueryFullProcessImageNameW(
-            process,
-            0,
-            buffer.as_mut_ptr(),
-            &mut size,
-        )
-    };
-    // SAFETY: `process` was opened above.
-    unsafe { CloseHandle(process) };
-    if ok == 0 {
-        bail!("reading peer process image name for {pid}");
-    }
-    buffer.truncate(size as usize);
-    Ok(PathBuf::from(OsString::from_wide(&buffer)))
-}
-
-#[cfg(unix)]
-fn read_process_cmdline(pid: u32) -> Result<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .with_context(|| format!("reading /proc/{pid}/cmdline"))?;
-    Ok(bytes
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect())
-}
-
-#[cfg(windows)]
-fn read_process_cmdline(pid: u32) -> Result<Vec<String>> {
-    let exe = read_process_exe(pid)?;
-    Ok(vec![
-        exe.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("cockpit")
-            .to_string(),
-    ])
-}
-
-#[cfg(unix)]
-fn read_parent_pid(pid: u32) -> Result<Option<u32>> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .with_context(|| format!("reading /proc/{pid}/status"))?;
-    for line in status.lines() {
-        if let Some(ppid) = line.strip_prefix("PPid:\t") {
-            return Ok(ppid.trim().parse().ok());
-        }
-    }
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn read_parent_pid(pid: u32) -> Result<Option<u32>> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-
-    // SAFETY: snapshot APIs are used with valid stack structs.
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_null() {
-            return Ok(None);
-        }
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..std::mem::zeroed()
-        };
-        let mut found = None;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                if entry.th32ProcessID == pid {
-                    found = Some(entry.th32ParentProcessID);
-                    break;
-                }
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-        Ok(found)
-    }
 }
 
 pub fn default_agent_child_grants() -> Vec<PrincipalGrant> {
@@ -396,18 +275,20 @@ mod tests {
     }
 
     #[test]
-    fn peer_credential_registry_binds_to_peer_identity() {
+    fn peer_credential_registry_binds_to_peer_identity_and_connection() {
         let registry = PeerCredentialRegistry::default();
         let pid = std::process::id();
         #[cfg(unix)]
-        let (uid, gid) = read_process_uid_gid(pid).expect("uid/gid");
+        let (uid, gid) =
+            cockpit_host::daemon_lifecycle::read_process_credentials(pid).expect("uid/gid");
         #[cfg(windows)]
         let (uid, gid) = (0_u32, 0_u32);
         let peer = PeerIdentity { pid, uid, gid };
-        let token = registry.mint(peer, LocalClientRole::Cli, Vec::new());
+        let connection_id = Uuid::new_v4();
+        let token = registry.mint(peer, connection_id, LocalClientRole::Cli, Vec::new());
         assert!(
             registry
-                .verify(peer, token.as_str())
+                .verify(peer, connection_id, token.as_str())
                 .is_some_and(|(role, _)| role == LocalClientRole::Cli)
         );
         assert!(
@@ -418,8 +299,14 @@ mod tests {
                         uid,
                         gid,
                     },
+                    connection_id,
                     token.as_str()
                 )
+                .is_none()
+        );
+        assert!(
+            registry
+                .verify(peer, Uuid::new_v4(), token.as_str())
                 .is_none()
         );
     }

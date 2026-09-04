@@ -8678,11 +8678,12 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
     let peer = test_socket_peer();
+    let client_instance_id = Uuid::new_v4();
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
         ClientPrincipal::local_unauthenticated(peer),
-        Uuid::new_v4(),
+        client_instance_id,
         false,
         Some(peer),
     ));
@@ -8721,6 +8722,7 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let allowed_id = Uuid::now_v7();
     let token = ctx.peer_credential_registry.mint(
         peer,
+        client_instance_id,
         crate::daemon::principal::LocalClientRole::Cli,
         Vec::new(),
     );

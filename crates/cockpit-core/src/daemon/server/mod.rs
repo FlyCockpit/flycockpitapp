@@ -5310,9 +5310,10 @@ struct MutableClientState {
     /// Whether this connection has presented a valid peer-bound owner
     /// credential. In-process clients start true; socket peers start false.
     has_owner_capability: bool,
-    /// Set when a socket peer presents the daemon-private file capability for
-    /// the one-shot `ExchangeLocalPeerCredential` exchange.
-    exchange_file_capability_verified: bool,
+    /// Active peer-bound credential presented by this connection, if any.
+    active_peer_credential: Option<String>,
+    /// Wall-clock expiry for [`active_peer_credential`], when installed.
+    peer_credential_expires_at_unix_ms: Option<i64>,
     terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -5423,7 +5424,8 @@ impl MutableClientState {
             principal,
             socket_peer,
             has_owner_capability: false,
-            exchange_file_capability_verified: false,
+            active_peer_credential: None,
+            peer_credential_expires_at_unix_ms: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
                 client_instance_id,
@@ -5894,6 +5896,8 @@ async fn run_in_process_client(
             "cancelled sealed capabilities at in-process client teardown"
         );
     }
+    ctx.peer_credential_registry
+        .revoke_for_connection(client_instance_id);
 }
 
 #[derive(Default)]
@@ -6167,6 +6171,8 @@ where
             "cancelled sealed capabilities at client transport teardown"
         );
     }
+    ctx.peer_credential_registry
+        .revoke_for_connection(client_instance_id);
     completed.result?;
     Ok(())
 }
@@ -6551,9 +6557,22 @@ async fn run_client_executor(
     state.has_owner_capability = has_owner_capability;
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut credential_expiry =
+        peer_credential_expiry_sleep(state.peer_credential_expires_at_unix_ms);
     loop {
         tokio::select! {
             biased;
+            () = async {
+                if let Some(sleep) = credential_expiry.as_mut() {
+                    sleep.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if credential_expiry.is_some() => {
+                ctx.peer_credential_registry.revoke_for_connection(client_instance_id);
+                downgrade_expired_peer_authority(&mut state, &mut shared, &event_cmd_tx);
+                credential_expiry = None;
+            }
             Some(joined) = concurrent.join_next(), if !concurrent.is_empty() => {
                 if let Err(error) = joined {
                     tracing::warn!(%error, "concurrent request task failed");
@@ -6561,9 +6580,6 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
-                    if let Some(peer) = state.socket_peer {
-                        ctx.peer_credential_registry.revoke_for_peer(peer);
-                    }
                     if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
                         tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
                     }
@@ -6584,6 +6600,9 @@ async fn run_client_executor(
                         {
                             return Ok(());
                         }
+                        credential_expiry = peer_credential_expiry_sleep(
+                            state.peer_credential_expires_at_unix_ms,
+                        );
                     }
                     ClientExecutorInput::SessionEventsClosed => {
                         state.attached = None;
@@ -6593,6 +6612,39 @@ async fn run_client_executor(
             }
         }
     }
+}
+
+fn peer_credential_expiry_sleep(expires_at_unix_ms: Option<i64>) -> Option<tokio::time::Sleep> {
+    expires_at_unix_ms.and_then(|expires_at_unix_ms| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let delay_ms = expires_at_unix_ms.saturating_sub(now_ms);
+        Some(tokio::time::sleep(std::time::Duration::from_millis(
+            delay_ms.max(0) as u64,
+        )))
+    })
+}
+
+fn downgrade_expired_peer_authority(
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
+    event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
+) {
+    if state.active_peer_credential.is_none() {
+        return;
+    }
+    state.active_peer_credential = None;
+    state.peer_credential_expires_at_unix_ms = None;
+    state.has_owner_capability = false;
+    if let Some(peer) = state.socket_peer {
+        state.principal = ClientPrincipal::local_unauthenticated(peer);
+    }
+    *shared = state.shared_snapshot();
+    let _ = event_cmd_tx.try_send(ClientEventCommand::PrincipalChanged(
+        state.principal.clone(),
+    ));
 }
 
 async fn handle_client_frame(
@@ -6680,22 +6732,27 @@ async fn handle_envelope(
         } => {
             if let Some(token) = owner_capability {
                 if let Some(peer) = state.socket_peer {
+                    let connection_id = state.terminal_context.client_instance_id;
                     if let Some((role, grants)) =
-                        ctx.peer_credential_registry.verify(peer, token.as_str())
+                        ctx.peer_credential_registry
+                            .verify(peer, connection_id, token.as_str())
                     {
                         state.has_owner_capability = role.is_owner_class();
                         state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
+                        state.active_peer_credential = Some(token.as_str().to_string());
+                        state.peer_credential_expires_at_unix_ms = ctx
+                            .peer_credential_registry
+                            .expires_at_unix_ms(connection_id, token.as_str());
                         *shared = state.shared_snapshot();
                         let _ = event_cmd_tx
                             .send(ClientEventCommand::PrincipalChanged(
                                 state.principal.clone(),
                             ))
                             .await;
-                    } else if ctx.owner_capability.verify(token.as_str()) {
-                        state.exchange_file_capability_verified = true;
                     } else {
                         state.has_owner_capability = false;
-                        state.exchange_file_capability_verified = false;
+                        state.active_peer_credential = None;
+                        state.peer_credential_expires_at_unix_ms = None;
                         state.principal = ClientPrincipal::local_unauthenticated(peer);
                         *shared = state.shared_snapshot();
                         let _ = event_cmd_tx

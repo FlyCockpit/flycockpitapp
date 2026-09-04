@@ -652,10 +652,11 @@ impl DaemonClient {
             let mut proto = ProtoStream::new(stream);
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
-            let initial_events = confirm_client_lifetime(&mut proto, negotiated.version).await?;
-            let file_capability = load_owner_capability(socket);
-            let owner_capability =
-                exchange_peer_credential(&mut proto, negotiated.version, file_capability).await?;
+            let mut initial_events =
+                confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            let (exchange_events, owner_capability) =
+                exchange_peer_credential(&mut proto, negotiated.version).await?;
+            initial_events.extend(exchange_events);
             Ok(Self::from_proto_negotiated(
                 proto,
                 negotiated,
@@ -976,8 +977,7 @@ where
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
     version: u32,
-    owner_capability: Option<proto::OwnerCapabilityToken>,
-) -> Result<Option<proto::OwnerCapabilityToken>>
+) -> Result<(Vec<proto::Event>, Option<proto::OwnerCapabilityToken>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -987,12 +987,13 @@ where
             version,
             id,
             Request::ExchangeLocalPeerCredential,
-            owner_capability,
+            None,
         ))
         .await
         .context("sending peer credential exchange")?;
 
     let exchange = async {
+        let mut initial_events = Vec::new();
         loop {
             let frame = proto_stream.recv().await?;
             let Some(frame) = frame else {
@@ -1002,11 +1003,14 @@ where
             };
             match frame {
                 RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Event { event } => initial_events.push(event),
                     Body::Response {
                         id: response_id,
                         response,
                     } if response_id == id => match *response {
-                        Response::LocalPeerCredential { token, .. } => return Ok(Some(token)),
+                        Response::LocalPeerCredential { token, .. } => {
+                            return Ok((initial_events, Some(token)));
+                        }
                         _ => {
                             return Err(protocol_handshake_error(
                                 "daemon returned an invalid peer credential exchange response",
@@ -1017,7 +1021,11 @@ where
                         id: Some(response_id),
                         error,
                     } if response_id == id => return Err(anyhow::Error::new(error)),
-                    _ => {}
+                    _ => {
+                        return Err(protocol_handshake_error(
+                            "daemon sent an invalid peer credential exchange frame",
+                        ));
+                    }
                 },
                 RecvFrame::Unknown { .. } | RecvFrame::VersionMismatch { .. } => {
                     return Err(protocol_handshake_error(

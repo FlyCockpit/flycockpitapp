@@ -34,6 +34,46 @@ pub fn process_launch_ticket() -> Option<String> {
         .clone()
 }
 
+/// Resolve the launch ticket for a socket connect: the in-memory ticket minted
+/// by this process when it spawned the daemon, otherwise the daemon-private
+/// persisted ticket for follower cockpit CLI processes on the same uid.
+pub fn resolve_launch_ticket(socket: &std::path::Path) -> Option<String> {
+    if let Some(ticket) = process_launch_ticket() {
+        return Some(ticket);
+    }
+    load_persisted_launch_ticket(socket)
+}
+
+fn load_persisted_launch_ticket(socket: &std::path::Path) -> Option<String> {
+    let path = launch_ticket_path(socket);
+    let bytes = std::fs::read(&path).ok()?;
+    let ticket = String::from_utf8(bytes).ok()?;
+    let ticket = ticket.trim();
+    if ticket.len() == 64
+        && ticket
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Some(ticket.to_string())
+    } else {
+        None
+    }
+}
+
+/// Same derivation the daemon uses: `{stem}.launch-ticket` next to the
+/// control socket. Confined children are denied this path.
+pub fn launch_ticket_path(control_socket: &std::path::Path) -> std::path::PathBuf {
+    let stem = control_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cockpit");
+    let file_name = format!("{stem}.launch-ticket");
+    match control_socket.parent() {
+        Some(parent) => parent.join(file_name),
+        None => std::path::PathBuf::from(file_name),
+    }
+}
+
 /// Test-only: restore the unset state so a test-installed ticket never
 /// leaks into other client tests running in the same process.
 #[cfg(test)]

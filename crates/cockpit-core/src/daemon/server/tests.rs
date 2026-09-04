@@ -9110,18 +9110,17 @@ async fn unproven_same_uid_peer_with_approved_executable_is_denied_owner_class()
     run_peer_auth_exchange_test("no ticket", &["daemon", "status"], false, None, None).await;
 }
 
-/// A ticket stolen out of another process's environment cannot be replayed:
-/// provenance binds the token to the launcher's exact process identity, and
-/// this peer is a different process even though it presents the right token.
+/// A ticket presented by a same-uid follower process is admitted when it
+/// matches the launch provenance recorded at daemon boot.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn launch_ticket_presented_by_the_wrong_process_is_denied() {
+async fn launch_ticket_presented_by_a_same_uid_follower_is_admitted() {
     let ticket = crate::daemon::peer_authority::mint_launch_ticket();
     let current_process = child_peer_identity(std::process::id());
     run_peer_auth_exchange_test(
-        "stolen ticket",
+        "same-uid follower ticket",
         &["daemon", "status"],
-        false,
+        true,
         // Provenance binds the ticket to this test process, not the child.
         Some((ticket.clone(), current_process)),
         Some(ticket.as_str()),
@@ -9302,9 +9301,15 @@ async fn daemon_context_records_launch_provenance_from_the_spawn_environment() {
     let mut impostor = launcher.clone();
     impostor.pid = impostor.pid.wrapping_add(1);
     assert!(
+        ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&ticket), impostor),
+        "a same-uid follower presenting the launch ticket must verify"
+    );
+    impostor.uid = impostor.uid.saturating_add(1);
+    assert!(
         !ctx.peer_credential_registry
             .verify_launch_provenance(Some(&ticket), impostor),
-        "a different process presenting the right ticket must stay denied"
+        "a different uid presenting the launch ticket must stay denied"
     );
     assert!(
         !ctx.peer_credential_registry

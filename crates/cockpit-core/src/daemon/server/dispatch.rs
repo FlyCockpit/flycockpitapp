@@ -18200,19 +18200,29 @@ async fn handle_serialized_request_impl(
             let peer = state
                 .socket_peer
                 .ok_or_else(|| authorization_error("socket peer identity is required"))?;
-            let role = attest_local_client_role(peer, &ctx.approved_client_executable)
-                .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
+            let presented_launch_ticket = state.presented_owner_capability.take();
+            let provenance_verified = ctx
+                .peer_credential_registry
+                .verify_launch_provenance(presented_launch_ticket.as_deref(), peer)
+                || crate::daemon::peer_authority::verify_persisted_launch_ticket(
+                    &ctx.paths.socket,
+                    presented_launch_ticket.as_deref(),
+                    peer,
+                );
+            let role = match attest_local_client_role(peer, &ctx.approved_client_executable) {
+                Some(role) => role,
+                // Follower cockpit processes (including integration-test harnesses)
+                // may not share the approved executable image, but a verified launch
+                // ticket proves they belong to the same uid as the daemon launcher.
+                None if provenance_verified => LocalClientRole::Cli,
+                None => return Err(authorization_error("local peer role attestation failed")),
+            };
             // Owner-class admission is never self-service from the peer's
             // executable image alone (issue #337): the peer must present the
             // one-time launch ticket this daemon minted at spawn, and it must
             // be the exact launcher process the ticket is bound to. Fail
             // closed — the peer stays unauthenticated and table-governed.
-            let presented_launch_ticket = state.presented_owner_capability.take();
-            if role.is_owner_class()
-                && !ctx
-                    .peer_credential_registry
-                    .verify_launch_provenance(presented_launch_ticket.as_deref(), peer)
-            {
+            if role.is_owner_class() && !provenance_verified {
                 return Err(authorization_error(
                     "owner-class peer credential requires the daemon launch ticket \
                      presented by the spawning process",

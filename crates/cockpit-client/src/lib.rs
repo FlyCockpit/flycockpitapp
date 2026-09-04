@@ -656,7 +656,7 @@ impl DaemonClient {
             let mut initial_events =
                 confirm_client_lifetime(&mut proto, negotiated.version).await?;
             let (exchange_events, owner_capability) =
-                exchange_peer_credential(&mut proto, negotiated.version).await?;
+                exchange_peer_credential(&mut proto, negotiated.version, socket).await?;
             initial_events.extend(exchange_events);
             Ok(Self::from_proto_negotiated(
                 proto,
@@ -983,13 +983,14 @@ where
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
     version: u32,
+    socket: &Path,
 ) -> Result<(Vec<proto::Event>, Option<proto::OwnerCapabilityToken>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let id = Uuid::now_v7();
     let launch_ticket =
-        launch_provenance::process_launch_ticket().map(proto::OwnerCapabilityToken::new);
+        launch_provenance::resolve_launch_ticket(socket).map(proto::OwnerCapabilityToken::new);
     proto_stream
         .send(&Envelope::request_with_owner_capability_at(
             version,

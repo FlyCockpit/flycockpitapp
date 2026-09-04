@@ -7373,10 +7373,12 @@ fn logged_in_oauth_enter_advances_add_wizard() {
 }
 
 fn template_cursor(template_id: &str) -> usize {
-    templates::TEMPLATES
-        .iter()
-        .position(|t| t.id == template_id)
-        .unwrap()
+    let mut ordered: Vec<_> = templates::TEMPLATES.iter().collect();
+    ordered.sort_by_key(|template| match template.id {
+        "codex-oauth" | "copilot" | "grok-oauth" => 0,
+        _ => 1,
+    });
+    ordered.iter().position(|t| t.id == template_id).unwrap()
 }
 
 /// Every template — including the frontier-defaults ones — now goes through
@@ -7385,11 +7387,23 @@ fn template_cursor(template_id: &str) -> usize {
 #[test]
 fn all_templates_offer_edit_id_step() {
     for t in templates::TEMPLATES {
+        if t.is_disabled() {
+            continue;
+        }
         let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let mut state = AddState::new();
         state.enter_template_for_test(template_cursor(t.id));
 
         dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+
+        if t.id == "openai-compatible" || t.default_wire_api.is_auto() {
+            assert!(
+                state.is_step("wire-api"),
+                "{} should land on the wire-api step",
+                t.id
+            );
+            dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        }
 
         assert!(
             state.is_step("id"),

@@ -177,6 +177,12 @@ fn feature_gated_tests_are_mapped_to_executing_gates() {
         "remote lockstep must not be a manual opt-in"
     );
     assert!(lockstep.contains("cargo nextest run --locked"));
+    assert!(
+        lockstep.lines().any(|line| {
+            line.trim() == "run: bash scripts/check-tenant-authority-acceptance-manifest.sh"
+        }),
+        "remote-lockstep must run the tenant-authority acceptance-manifest ratchet as an unconditional `run:` step"
+    );
 }
 
 #[test]

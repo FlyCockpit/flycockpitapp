@@ -1,11 +1,9 @@
-//! The eleven and only eleven public mTLS routes exposed by the service.
+//! The eleven and only eleven public mTLS routes (**reference contract**).
 //!
 //! No raw sign/JWS/JWK endpoint exists. The routes map 1:1 to the protocol
-//! package's [`TenantAuthorityOperation`] discriminants. The wire service is
-//! exact HTTP/2 over TLS 1.3 with mandatory client certificates; HTTP/1.1,
-//! TLS ≤1.2, renegotiation, cleartext upgrade, redirects, query strings,
-//! cookies, form/JSON bodies, response compression, and WebSocket/gRPC
-//! surfaces are disabled.
+//! package's [`TenantAuthorityOperation`] discriminants. The intended wire service
+//! is exact HTTP/2 over TLS 1.3 with mandatory client certificates; **no listener
+//! is bound and these routes are not served**.
 
 use cockpit_proto::remote_tenant_authority_protocol::TenantAuthorityOperation;
 

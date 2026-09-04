@@ -2,10 +2,13 @@
 //!
 //! All nine named acceptance suites live as exact top-level Rust tests in
 //! this file. The checked-in parser
-//! `verify_tenant_authority_acceptance_manifest.mjs` consumes the
-//! prefix-wide `cargo nextest list --message-format json` stream and
-//! compares the complete lexicographically sorted `tenant_authority_*`
-//! manifest to exactly the nine names here, each with `ignored=false`.
+//! `scripts/check-tenant-authority-acceptance-manifest.sh` (CI-bound) runs
+//! `verify_tenant_authority_acceptance_manifest.mjs` on the package-scoped
+//! `cargo nextest list -p tenant-authority --features remote
+//! --message-format json` stream and compares the complete lexicographically
+//! sorted `tenant_authority_*` manifest to exactly the nine names here, each
+//! with `ignored=false`. Every `tenant_authority_*` name in that stream must
+//! come from this binary.
 //!
 //! These tests prove the closed-handler surface, the submit-credential-
 //! insufficient guarantee, portable WebAuthn registry verification,
@@ -18,8 +21,8 @@
 use cockpit_proto::remote_tenant_authority_protocol as proto;
 use tenant_authority::key_provider::TenantKeyProvider;
 use tenant_authority::{
-    UnsupportedPlatform, config, handlers, identity_status, key_provider, mtls, policy_reducer,
-    routes, service,
+    ServiceListenError, UnsupportedPlatform, config, handlers, identity_status, key_provider, mtls,
+    policy_reducer, routes, service,
 };
 
 use proto::{
@@ -382,8 +385,11 @@ fn tenant_authority_pkcs11_conformance() {
         &SigningDomain::ALL,
     );
 
-    // Conformance passes for a nonempty module path.
-    provider.conformance().unwrap();
+    // Conformance is not wired: nonempty path fails closed like sign_fixed.
+    assert!(matches!(
+        provider.conformance(),
+        Err(key_provider::KeyProviderError::UnsupportedOperation)
+    ));
 
     // The durable object address components.
     assert_eq!(provider.module_digest(), [0xAB; 32]);
@@ -576,6 +582,18 @@ fn tenant_authority_offline_bootstrap_contract() {
     // The unsupported-platform error is typed.
     let err = UnsupportedPlatform;
     assert!(!err.to_string().is_empty());
+
+    // `serve` does not silently pretend to bind a listener.
+    let listen_err = service::Service::new()
+        .listen("127.0.0.1:8443")
+        .unwrap_err();
+    #[cfg(unix)]
+    assert_eq!(listen_err, ServiceListenError::NotImplemented);
+    #[cfg(not(unix))]
+    assert_eq!(
+        listen_err,
+        ServiceListenError::UnsupportedPlatform(UnsupportedPlatform)
+    );
 }
 
 // =========================================================================

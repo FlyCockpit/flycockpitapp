@@ -1,10 +1,11 @@
 //! Service readiness and the platform-gated listener.
 //!
-//! Production deployment is Linux: the peer-credential/admin-socket adapter is
-//! `cfg(unix)`. Non-Unix workspace builds retain every codec, validator, pure
-//! state-machine test and bootstrap parser, but the service binary exits
-//! before opening a listener with typed [`UnsupportedPlatform`]; this boundary
-//! must compile on the workspace MSRV and Windows CI target.
+//! **Reference-only:** the submit-only mTLS listener is not wired. On Unix the
+//! `serve` subcommand fails with [`ServiceListenError::NotImplemented`]; on
+//! non-Unix targets it fails with [`ServiceListenError::UnsupportedPlatform`].
+//! Non-Unix workspace builds retain every codec, validator, pure state-machine
+//! test and bootstrap parser so the contract surface stays compilable on the
+//! workspace MSRV and Windows CI target.
 
 use thiserror::Error;
 
@@ -15,6 +16,17 @@ use thiserror::Error;
     "unsupported platform: tenant-authority service requires a Unix peer-credential/admin-socket adapter"
 )]
 pub struct UnsupportedPlatform;
+
+/// Why `serve` cannot open the submit-only mTLS listener.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ServiceListenError {
+    #[error(transparent)]
+    UnsupportedPlatform(UnsupportedPlatform),
+    #[error(
+        "not implemented: tenant-authority serve does not bind a submit-only mTLS listener yet"
+    )]
+    NotImplemented,
+}
 
 /// Service readiness state. Replicas fail readiness on epoch, registry,
 /// policy or key divergence/rollback.
@@ -30,8 +42,9 @@ pub enum ServiceReadiness {
     NotReady,
 }
 
-/// The tenant-authority service. Owns the closed handler table, key provider,
-/// mTLS selection, and durable stores. The listener is platform-gated.
+/// The tenant-authority service. Tracks readiness state only; the closed
+/// handler table, key provider, mTLS selection, and durable stores are not
+/// wired yet. [`Self::listen`] fails closed on every target.
 #[derive(Debug)]
 pub struct Service {
     readiness: ServiceReadiness,
@@ -57,19 +70,18 @@ impl Service {
         self.readiness = ServiceReadiness::Ready;
     }
 
-    /// Open the submit-only mTLS listener. On non-Unix targets this returns
-    /// [`UnsupportedPlatform`] before binding.
+    /// Open the submit-only mTLS listener. Not implemented on Unix; on non-Unix
+    /// targets returns [`ServiceListenError::UnsupportedPlatform`].
     #[cfg(unix)]
-    pub fn listen(&self, _addr: &str) -> Result<(), UnsupportedPlatform> {
-        // The production listener binds HTTP/2 over TLS 1.3 with mandatory
-        // client certificates. The actual TLS listener is bound behind the
-        // audited rustls/hyper adapter; this stub confirms the platform gate.
-        Ok(())
+    pub fn listen(&self, _addr: &str) -> Result<(), ServiceListenError> {
+        // TODO(#378): bind HTTP/2 over TLS 1.3 with mandatory client
+        // certificates via the audited rustls/hyper adapter.
+        Err(ServiceListenError::NotImplemented)
     }
 
     #[cfg(not(unix))]
-    pub fn listen(&self, _addr: &str) -> Result<(), UnsupportedPlatform> {
-        Err(UnsupportedPlatform)
+    pub fn listen(&self, _addr: &str) -> Result<(), ServiceListenError> {
+        Err(ServiceListenError::UnsupportedPlatform(UnsupportedPlatform))
     }
 }
 
@@ -97,12 +109,15 @@ mod tests {
     }
 
     #[test]
-    fn listen_respects_platform_gate() {
+    fn listen_fails_closed() {
         let s = Service::new();
         let res = s.listen("127.0.0.1:8443");
         #[cfg(unix)]
-        assert!(res.is_ok());
+        assert_eq!(res, Err(ServiceListenError::NotImplemented));
         #[cfg(not(unix))]
-        assert_eq!(res, Err(UnsupportedPlatform));
+        assert_eq!(
+            res,
+            Err(ServiceListenError::UnsupportedPlatform(UnsupportedPlatform))
+        );
     }
 }

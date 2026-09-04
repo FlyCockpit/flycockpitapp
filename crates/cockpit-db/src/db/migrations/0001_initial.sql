@@ -865,7 +865,10 @@ CREATE TABLE media_security_recovery_operations (
     attachment_version     TEXT NOT NULL,
     request_digest         TEXT NOT NULL,
     affected_set_digest    TEXT NOT NULL,
-    receipt_json           TEXT NOT NULL,
+    receipt_json           TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ),
     committed_at_unix_ms   INTEGER NOT NULL,
     CHECK (length(owner_principal_digest) = 64 AND owner_principal_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
@@ -883,7 +886,10 @@ CREATE TABLE media_local_path_registration_operations (
     request_binding_digest   TEXT NOT NULL,
     operation_request_digest TEXT NOT NULL,
     semantic_command_digest  TEXT NOT NULL,
-    receipt_json             TEXT NOT NULL,
+    receipt_json             TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ),
     committed_at_unix_ms     INTEGER NOT NULL,
     is_alias                 INTEGER NOT NULL CHECK (is_alias IN (0,1))
 );
@@ -917,7 +923,10 @@ CREATE TABLE media_retained_https_operations (
     request_binding_digest     TEXT NOT NULL,
     operation_request_digest   TEXT NOT NULL,
     semantic_command_digest    TEXT NOT NULL,
-    receipt_json               TEXT NOT NULL,
+    receipt_json               TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ),
     committed_at_unix_ms       INTEGER NOT NULL,
     is_alias                   INTEGER NOT NULL CHECK (is_alias IN (0,1)),
     CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
@@ -932,7 +941,11 @@ WHERE is_alias = 0;
 CREATE TABLE media_retained_https_evidence (
     attachment_id             TEXT PRIMARY KEY,
     source_evidence_digest    TEXT NOT NULL,
-    redirect_classes_json     TEXT NOT NULL,
+    redirect_classes_json     TEXT NOT NULL CHECK (
+        json_valid(redirect_classes_json)
+        AND json_type(redirect_classes_json) = 'array'
+        AND length(CAST(redirect_classes_json AS BLOB)) <= 65536
+    ),
     path_segment_count        INTEGER NOT NULL CHECK(path_segment_count >= 0),
     safe_basename             TEXT,
     fetched_at_unix_ms        INTEGER NOT NULL,
@@ -988,7 +1001,11 @@ CREATE TABLE media_attachment_processing_security_evidence (
 );
 CREATE TABLE media_attachment_processing_publication_intents (
     job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    output_ids_json TEXT NOT NULL,
+    output_ids_json TEXT NOT NULL CHECK (
+        json_valid(output_ids_json)
+        AND json_type(output_ids_json) = 'array'
+        AND length(CAST(output_ids_json AS BLOB)) <= 65536
+    ),
     created_at_unix_ms INTEGER NOT NULL
 );
 CREATE TABLE media_attachment_processing_cleanup_evidence (
@@ -1021,7 +1038,11 @@ CREATE TABLE media_attachment_processing_failure_evidence (
 CREATE TABLE media_attachment_processing_output_security_evidence (
     job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
-    output_ids_json TEXT NOT NULL,
+    output_ids_json TEXT NOT NULL CHECK (
+        json_valid(output_ids_json)
+        AND json_type(output_ids_json) = 'array'
+        AND length(CAST(output_ids_json AS BLOB)) <= 65536
+    ),
     reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -1031,10 +1052,16 @@ CREATE TABLE media_uploads (
     upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),
     state TEXT NOT NULL CHECK(state IN ('open','finalizing','materialized','cancelled','expired','failed')),
-    upload_generation TEXT NOT NULL, declared_total_bytes TEXT NOT NULL, acknowledged_chunks INTEGER NOT NULL,
-    acknowledged_bytes TEXT NOT NULL, next_chunk_index INTEGER, expires_at_unix_ms INTEGER NOT NULL,
+    upload_generation INTEGER NOT NULL CHECK (upload_generation >= 1), declared_total_bytes INTEGER NOT NULL CHECK (declared_total_bytes > 0), acknowledged_chunks INTEGER NOT NULL,
+    acknowledged_bytes INTEGER NOT NULL CHECK (acknowledged_bytes >= 0), next_chunk_index INTEGER, expires_at_unix_ms INTEGER NOT NULL,
     reservation_id TEXT NOT NULL UNIQUE, reservation_digest TEXT NOT NULL, temporary_storage_id TEXT NOT NULL UNIQUE,
-    attachment_id TEXT, attachment_version TEXT, terminal_reason TEXT, cleanup_evidence_digest TEXT, last_transition_json TEXT NOT NULL,
+    attachment_id TEXT, attachment_version INTEGER CHECK (attachment_version IS NULL OR attachment_version >= 1), terminal_reason TEXT, cleanup_evidence_digest TEXT,
+    last_transition_json TEXT NOT NULL CHECK (
+        typeof(last_transition_json) = 'text'
+        AND length(CAST(last_transition_json AS BLOB)) <= 4096
+        AND json_valid(last_transition_json)
+        AND json_type(last_transition_json) = 'object'
+    ),
     creation_sequence INTEGER NOT NULL UNIQUE, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE(session_id,canonical_project_digest,client_draft_id),
     CHECK(length(canonical_project_digest)=64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
@@ -1042,7 +1069,7 @@ CREATE TABLE media_uploads (
 );
 CREATE TABLE media_upload_chunks (
     upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, byte_length INTEGER NOT NULL,
-    sha256 TEXT NOT NULL, storage_offset TEXT NOT NULL, acknowledged_at_unix_ms INTEGER NOT NULL,
+    sha256 TEXT NOT NULL, storage_offset INTEGER NOT NULL CHECK (storage_offset >= 0), acknowledged_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK(byte_length>0 AND byte_length<=262144), CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
@@ -1053,13 +1080,16 @@ BEGIN
     DELETE FROM media_storage_publication_intents WHERE upload_id=NEW.upload_id;
 END;
 CREATE TABLE media_attachment_upload_origins(
-    attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation TEXT NOT NULL,
+    attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation INTEGER NOT NULL CHECK (upload_generation >= 1),
     FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE local_media_operations (
     local_operation_id TEXT PRIMARY KEY, authoritative_operation_id TEXT NOT NULL, action TEXT NOT NULL,
     domain_key TEXT NOT NULL, operation_request_digest TEXT NOT NULL, semantic_command_digest TEXT NOT NULL,
-    receipt_json TEXT NOT NULL, is_alias INTEGER NOT NULL CHECK(is_alias IN(0,1)), committed_at_unix_ms INTEGER NOT NULL
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ), is_alias INTEGER NOT NULL CHECK(is_alias IN(0,1)), committed_at_unix_ms INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX uq_local_media_operation_domain ON local_media_operations(action,domain_key) WHERE is_alias=0;
 CREATE TABLE local_media_operation_audit(local_operation_id TEXT PRIMARY KEY,outcome TEXT NOT NULL,committed_at_unix_ms INTEGER NOT NULL);
@@ -1130,7 +1160,10 @@ BEGIN SELECT RAISE(ABORT, 'illegal media reservation state transition'); END;
 CREATE TABLE media_reservation_plan_facts (
     reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dimension TEXT NOT NULL,
-    plan_json TEXT NOT NULL,
+    plan_json TEXT NOT NULL CHECK (
+        json_valid(plan_json)
+        AND length(CAST(plan_json AS BLOB)) <= 65536
+    ),
     PRIMARY KEY(reservation_id, dimension)
 );
 CREATE TRIGGER media_plan_fact_immutable_update BEFORE UPDATE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
@@ -1417,8 +1450,14 @@ CREATE TABLE tool_call_events (
     sandbox_unavailable_reason TEXT DEFAULT NULL,
 
     -- audit: the two projections live on the same row (GOALS §14a)
-    original_input_json TEXT    NOT NULL,
-    wire_input_json     TEXT    NOT NULL,
+    original_input_json TEXT    NOT NULL CHECK (
+        json_valid(original_input_json)
+        AND length(CAST(original_input_json AS BLOB)) <= 8388608
+    ),
+    wire_input_json     TEXT    NOT NULL CHECK (
+        json_valid(wire_input_json)
+        AND length(CAST(wire_input_json AS BLOB)) <= 8388608
+    ),
 
     output              TEXT    NOT NULL DEFAULT '',
     truncated           INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
@@ -1494,6 +1533,14 @@ CREATE TABLE inference_calls (
 CREATE INDEX idx_ic_session_ts ON inference_calls (session_id, timestamp);
 CREATE INDEX idx_ic_project_ts ON inference_calls (project_id, timestamp);
 CREATE INDEX idx_ic_model_ts   ON inference_calls (model, timestamp);
+
+-- Leading-timestamp indexes for retention sweeps (issue #308). Deletes filter on
+-- timestamp alone for closed sessions; session_id-leading indexes cannot satisfy
+-- those predicates without a full scan.
+CREATE INDEX idx_session_events_retention_ts ON session_events (ts_ms);
+CREATE INDEX idx_inference_requests_retention_ts ON inference_requests (ts_ms);
+CREATE INDEX idx_tool_call_events_retention_ts ON tool_call_events (timestamp);
+CREATE INDEX idx_inference_calls_retention_ts ON inference_calls (timestamp);
 
 -- ---- file-lock mirror (plan §4.1) -------------------------------------------
 
@@ -1719,9 +1766,24 @@ CREATE TABLE decision_requests (
     -- identity already bound to the owner.
     task_call_id_ref TEXT,
     workspace_ref TEXT,
-    options_contract_json TEXT NOT NULL,
-    free_text_contract_json TEXT,
-    recommendation_json TEXT,
+    options_contract_json TEXT NOT NULL CHECK (
+        json_valid(options_contract_json)
+        AND json_type(options_contract_json) = 'object'
+        AND length(CAST(options_contract_json AS BLOB)) <= 1048576
+    ),
+    free_text_contract_json TEXT CHECK (
+        free_text_contract_json IS NULL OR (
+            json_valid(free_text_contract_json)
+            AND json_type(free_text_contract_json) = 'object'
+            AND length(CAST(free_text_contract_json AS BLOB)) <= 65536
+        )
+    ),
+    recommendation_json TEXT CHECK (
+        recommendation_json IS NULL OR (
+            json_valid(recommendation_json)
+            AND length(CAST(recommendation_json AS BLOB)) <= 65536
+        )
+    ),
     rationale_redaction_class TEXT NOT NULL CHECK (rationale_redaction_class IN ('public', 'sensitive', 'secret')),
     -- Host-classified decision category.  The resolver never accepts an
     -- agent-authored risk label as permission to auto-resolve.
@@ -1733,7 +1795,10 @@ CREATE TABLE decision_requests (
     -- the trusted daemon host and checked again in the terminal CAS.
     host_approval_operation_id TEXT UNIQUE,
     deadline_unix_ms INTEGER,
-    policy_receipt_json TEXT NOT NULL,
+    policy_receipt_json TEXT NOT NULL CHECK (
+        json_valid(policy_receipt_json)
+        AND length(CAST(policy_receipt_json AS BLOB)) <= 65536
+    ),
     resolver_route TEXT CHECK (resolver_route IN (
         'user', 'warm_parent', 'policy', 'utility', 'timeout', 'cancellation'
     )),
@@ -1777,10 +1842,18 @@ CREATE TABLE decision_receipts (
     session_id TEXT NOT NULL,
     terminal_state TEXT NOT NULL CHECK (terminal_state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')),
     terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
-    receipt_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ),
     -- The approved answer envelope is an internal durable continuation input.
     -- It is never projected through Attention or event APIs.
-    resume_payload_json TEXT,
+    resume_payload_json TEXT CHECK (
+        resume_payload_json IS NULL OR (
+            json_valid(resume_payload_json)
+            AND length(CAST(resume_payload_json AS BLOB)) <= 1048576
+        )
+    ),
     session_event_seq INTEGER,
     created_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
@@ -1794,7 +1867,10 @@ CREATE TABLE agent_transition_receipts (
     terminal_state TEXT NOT NULL CHECK (terminal_state IN ('completed', 'failed', 'cancelled')),
     session_id TEXT NOT NULL,
     terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
-    receipt_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL CHECK (
+        json_valid(receipt_json)
+        AND length(CAST(receipt_json AS BLOB)) <= 1048576
+    ),
     session_event_seq INTEGER,
     created_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (agent_instance_id, terminal_state),
@@ -1868,7 +1944,12 @@ CREATE TABLE agent_host_approval_effect_handoffs (
     state TEXT NOT NULL CHECK (state IN ('ready', 'dispatching', 'succeeded', 'rejected', 'submission_unknown')),
     dispatch_started_at_unix_ms INTEGER NOT NULL,
     completed_at_unix_ms INTEGER,
-    completion_receipt_json TEXT,
+    completion_receipt_json TEXT CHECK (
+        completion_receipt_json IS NULL OR (
+            json_valid(completion_receipt_json)
+            AND length(CAST(completion_receipt_json AS BLOB)) <= 1048576
+        )
+    ),
     FOREIGN KEY (operation_id) REFERENCES agent_host_approval_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -2352,7 +2433,10 @@ CREATE TABLE agent_decision_steers (
     agent_instance_id TEXT NOT NULL,
     decision_request_id TEXT NOT NULL UNIQUE,
     origin_principal TEXT NOT NULL CHECK (origin_principal = 'user'),
-    payload_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (
+        json_valid(payload_json)
+        AND length(CAST(payload_json AS BLOB)) <= 1048576
+    ),
     -- A post-auto user steer is ordered after the exact parked QuestionTool
     -- replay that consumed the automatic terminal result.  This is a durable
     -- predecessor identity, not an advisory worker flag: recovery cannot
@@ -2377,7 +2461,12 @@ CREATE TABLE agent_decision_steers (
     -- and its immutable checkpoint before it can reattach a model turn.
     accepted_agent_revision INTEGER,
     payload_bytes INTEGER,
-    continuation_checkpoint_json TEXT,
+    continuation_checkpoint_json TEXT CHECK (
+        continuation_checkpoint_json IS NULL OR (
+            json_valid(continuation_checkpoint_json)
+            AND length(CAST(continuation_checkpoint_json AS BLOB)) <= 1048576
+        )
+    ),
     completed_at_unix_ms INTEGER,
     rejected_at_unix_ms INTEGER,
     rejection_reason TEXT,
@@ -2496,17 +2585,53 @@ CREATE TABLE needs_attention (
     agent_instance_id TEXT,
     description    TEXT    NOT NULL,
     state          TEXT    NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'parked', 'executing', 'interrupted', 'resolved')),
-    question_json  TEXT,                            -- serialized proto::InterruptQuestion or NULL
+    question_json  TEXT CHECK (
+        question_json IS NULL OR (
+            json_valid(question_json)
+            AND length(CAST(question_json AS BLOB)) <= 65536
+        )
+    ),                            -- serialized proto::InterruptQuestion or NULL
     raised_at      INTEGER NOT NULL,
     resolved_at    INTEGER,
-    response_json  TEXT,                            -- serialized proto::ResolveResponse, NULL if unresolved
-    questions_json TEXT,                            -- serialized proto::InterruptQuestionSet or NULL
+    response_json  TEXT CHECK (
+        response_json IS NULL OR (
+            json_valid(response_json)
+            AND length(CAST(response_json AS BLOB)) <= 65536
+        )
+    ),                            -- serialized proto::ResolveResponse, NULL if unresolved
+    questions_json TEXT CHECK (
+        questions_json IS NULL OR (
+            json_valid(questions_json)
+            AND json_type(questions_json) = 'array'
+            AND length(CAST(questions_json AS BLOB)) <= 262144
+        )
+    ),                            -- serialized proto::InterruptQuestionSet or NULL
     parked_tool    TEXT,                            -- wire tool name for parked replay, or NULL
-    parked_args_json TEXT,                          -- verbatim replay wire args; same exposure boundary as session_events.wire_input_json
+    parked_args_json TEXT CHECK (
+        parked_args_json IS NULL OR (
+            json_valid(parked_args_json)
+            AND length(CAST(parked_args_json AS BLOB)) <= 1048576
+        )
+    ),                          -- verbatim replay wire args; same exposure boundary as session_events.wire_input_json
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
-    parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
-    parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
-    parked_verification_json TEXT,                  -- serialized verification replay memo, or NULL
+    parked_resume_json TEXT CHECK (
+        parked_resume_json IS NULL OR (
+            json_valid(parked_resume_json)
+            AND length(CAST(parked_resume_json AS BLOB)) <= 1048576
+        )
+    ),                        -- serialized resume anchor, or NULL
+    parked_gate_json TEXT CHECK (
+        parked_gate_json IS NULL OR (
+            json_valid(parked_gate_json)
+            AND length(CAST(parked_gate_json AS BLOB)) <= 65536
+        )
+    ),                          -- serialized per-call gate replay memo, or NULL
+    parked_verification_json TEXT CHECK (
+        parked_verification_json IS NULL OR (
+            json_valid(parked_verification_json)
+            AND length(CAST(parked_verification_json AS BLOB)) <= 65536
+        )
+    ),                  -- serialized verification replay memo, or NULL
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2908,7 +3033,10 @@ CREATE TABLE inference_requests (
     ordinal        INTEGER NOT NULL DEFAULT 0,  -- dispatched-target attempt index
     session_id     TEXT    NOT NULL,
     ts_ms          INTEGER NOT NULL,            -- epoch milliseconds (dispatch)
-    payload_json   TEXT    NOT NULL,            -- immutable post-render request body
+    payload_json   TEXT    NOT NULL CHECK (
+        json_valid(payload_json)
+        AND length(CAST(payload_json AS BLOB)) <= 16777216
+    ),            -- immutable post-render request body
     status         TEXT    NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
     provider       TEXT,                        -- per-attempt provider id
     model          TEXT,                        -- per-attempt model id
@@ -3104,7 +3232,10 @@ CREATE TABLE verification_candidates (
     artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
     canonical_call_digest TEXT NOT NULL CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
     artifact_union_digest TEXT NOT NULL CHECK (length(artifact_union_digest) = 64 AND artifact_union_digest NOT GLOB '*[^0-9a-f]*'),
-    redacted_summary_json TEXT NOT NULL,
+    redacted_summary_json TEXT NOT NULL CHECK (
+        json_valid(redacted_summary_json)
+        AND length(CAST(redacted_summary_json AS BLOB)) <= 262144
+    ),
     reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens >= 0),
     reserved_cost_microunits INTEGER NOT NULL CHECK (reserved_cost_microunits >= 0),
     state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'valid', 'invalid', 'cancelled', 'timed_out', 'malformed')),
@@ -3169,7 +3300,10 @@ CREATE TABLE verification_syntheses (
     artifact_kind TEXT CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
     canonical_call_digest TEXT CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
     write_union_receipt_digest TEXT CHECK (length(write_union_receipt_digest) = 64 AND write_union_receipt_digest NOT GLOB '*[^0-9a-f]*'),
-    redacted_summary_json TEXT NOT NULL,
+    redacted_summary_json TEXT NOT NULL CHECK (
+        json_valid(redacted_summary_json)
+        AND length(CAST(redacted_summary_json AS BLOB)) <= 262144
+    ),
     revision INTEGER NOT NULL CHECK (revision >= 0),
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
@@ -3206,7 +3340,10 @@ CREATE TABLE verification_projection_envelopes (
     prepared_projection_digest TEXT NOT NULL CHECK (length(prepared_projection_digest) = 64 AND prepared_projection_digest NOT GLOB '*[^0-9a-f]*'),
     batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
     surrogate_kind TEXT NOT NULL CHECK (surrogate_kind IN ('selected_call', 'synthesized_write', 'normalized_original')),
-    model_visible_projection_json TEXT NOT NULL,
+    model_visible_projection_json TEXT NOT NULL CHECK (
+        json_valid(model_visible_projection_json)
+        AND length(CAST(model_visible_projection_json AS BLOB)) <= 131072
+    ),
     retention_state TEXT NOT NULL CHECK (retention_state IN ('retained', 'cleaned')),
     revision INTEGER NOT NULL CHECK (revision >= 0),
     created_at_unix_ms INTEGER NOT NULL,
@@ -3223,7 +3360,12 @@ CREATE TABLE verification_dispatch_attempts (
     host_idempotency_key TEXT NOT NULL UNIQUE,
     dispatch_digest TEXT NOT NULL CHECK (length(dispatch_digest) = 64 AND dispatch_digest NOT GLOB '*[^0-9a-f]*'),
     state TEXT NOT NULL CHECK (state IN ('reserved', 'executing', 'succeeded', 'failed', 'unknown', 'cancelled_no_submission')),
-    redacted_receipt_json TEXT,
+    redacted_receipt_json TEXT CHECK (
+        redacted_receipt_json IS NULL OR (
+            json_valid(redacted_receipt_json)
+            AND length(CAST(redacted_receipt_json AS BLOB)) <= 262144
+        )
+    ),
     receipt_digest TEXT CHECK (length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
     revision INTEGER NOT NULL CHECK (revision >= 0),
     created_at_unix_ms INTEGER NOT NULL,
@@ -3239,7 +3381,12 @@ CREATE TABLE verification_projections (
     session_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('suppressed', 'committed')),
     batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
-    redacted_result_json TEXT,
+    redacted_result_json TEXT CHECK (
+        redacted_result_json IS NULL OR (
+            json_valid(redacted_result_json)
+            AND length(CAST(redacted_result_json AS BLOB)) <= 262144
+        )
+    ),
     created_at_unix_ms INTEGER NOT NULL,
     UNIQUE (projection_id, session_id),
     UNIQUE (operation_id, session_id),
@@ -3431,7 +3578,11 @@ CREATE TABLE message_attachment_references (
 CREATE TABLE compaction_handoffs (
     handoff_id   TEXT PRIMARY KEY,
     session_id  TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (
+        json_valid(payload_json)
+        AND json_type(payload_json) = 'object'
+        AND length(CAST(payload_json AS BLOB)) <= 8388608
+    ),
     created_at   INTEGER NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -3443,7 +3594,11 @@ CREATE INDEX idx_compaction_handoffs_session ON compaction_handoffs(session_id);
 -- to a prepared compaction without another schema change.
 CREATE TABLE compaction_shadows (
     session_id   TEXT PRIMARY KEY,
-    payload_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (
+        json_valid(payload_json)
+        AND json_type(payload_json) = 'object'
+        AND length(CAST(payload_json AS BLOB)) <= 8388608
+    ),
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -3908,7 +4063,10 @@ CREATE TABLE subagent_handles (
     session_id      TEXT NOT NULL
         REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     agent           TEXT NOT NULL,
-    transcript_json TEXT NOT NULL,
+    transcript_json TEXT NOT NULL CHECK (
+        json_valid(transcript_json)
+        AND length(CAST(transcript_json AS BLOB)) <= 8388608
+    ),
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     cwd             TEXT
@@ -4007,7 +4165,11 @@ CREATE INDEX conversation_rules_lineage_idx
 CREATE TABLE prune_ledger (
     session_id  TEXT PRIMARY KEY
         REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    ledger_json TEXT NOT NULL,
+    ledger_json TEXT NOT NULL CHECK (
+        json_valid(ledger_json)
+        AND json_type(ledger_json) = 'object'
+        AND length(CAST(ledger_json AS BLOB)) <= 1048576
+    ),
     updated_at  INTEGER NOT NULL
 );
 
@@ -4031,9 +4193,23 @@ CREATE TABLE tandem_inference (
     provider      TEXT    NOT NULL,                 -- tandem provider id
     model         TEXT    NOT NULL,                 -- tandem model id
     ts_ms         INTEGER NOT NULL,                 -- epoch milliseconds (dispatch)
-    request_json  TEXT    NOT NULL,                 -- full post-redaction request body
-    response_json TEXT,                             -- full raw completion (text + tool calls)
-    usage_json    TEXT,                             -- provider-reported token usage
+    request_json  TEXT    NOT NULL CHECK (
+        json_valid(request_json)
+        AND length(CAST(request_json AS BLOB)) <= 16777216
+    ),                 -- full post-redaction request body
+    response_json TEXT CHECK (
+        response_json IS NULL OR (
+            json_valid(response_json)
+            AND length(CAST(response_json AS BLOB)) <= 65536
+        )
+    ),                             -- full raw completion (text + tool calls)
+    usage_json    TEXT CHECK (
+        usage_json IS NULL OR (
+            json_valid(usage_json)
+            AND json_type(usage_json) = 'object'
+            AND length(CAST(usage_json AS BLOB)) <= 65536
+        )
+    ),                             -- provider-reported token usage
     status        TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -4114,12 +4290,38 @@ CREATE TABLE session_goals (
     resume_phase TEXT CHECK (resume_phase IS NULL OR resume_phase IN ('planning', 'executing', 'evaluating', 'verifying')),
     pause_reason TEXT,
     attempt_generation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_generation >= 0),
-    contract_json TEXT,
-    resolved_policy_json TEXT NOT NULL,
-    evaluator_outcome_json TEXT,
-    verifier_outcome_json TEXT,
-    unresolved_gaps_json TEXT NOT NULL DEFAULT '[]',
-    gap_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    contract_json TEXT CHECK (
+        contract_json IS NULL OR (
+            json_valid(contract_json)
+            AND length(CAST(contract_json AS BLOB)) <= 1048576
+        )
+    ),
+    resolved_policy_json TEXT NOT NULL CHECK (
+        json_valid(resolved_policy_json)
+        AND length(CAST(resolved_policy_json AS BLOB)) <= 65536
+    ),
+    evaluator_outcome_json TEXT CHECK (
+        evaluator_outcome_json IS NULL OR (
+            json_valid(evaluator_outcome_json)
+            AND length(CAST(evaluator_outcome_json AS BLOB)) <= 262144
+        )
+    ),
+    verifier_outcome_json TEXT CHECK (
+        verifier_outcome_json IS NULL OR (
+            json_valid(verifier_outcome_json)
+            AND length(CAST(verifier_outcome_json AS BLOB)) <= 262144
+        )
+    ),
+    unresolved_gaps_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(unresolved_gaps_json)
+        AND json_type(unresolved_gaps_json) = 'array'
+        AND length(CAST(unresolved_gaps_json AS BLOB)) <= 262144
+    ),
+    gap_fingerprints_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(gap_fingerprints_json)
+        AND json_type(gap_fingerprints_json) = 'array'
+        AND length(CAST(gap_fingerprints_json AS BLOB)) <= 262144
+    ),
     previous_gap_set_hash TEXT,
     blocker_key TEXT,
     blocker_key_streak INTEGER NOT NULL DEFAULT 0,
@@ -4128,7 +4330,11 @@ CREATE TABLE session_goals (
     tokens_used INTEGER NOT NULL DEFAULT 0,
     elapsed_active_ms INTEGER NOT NULL DEFAULT 0 CHECK (elapsed_active_ms >= 0),
     active_since INTEGER,
-    lifecycle_history_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle_history_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(lifecycle_history_json)
+        AND json_type(lifecycle_history_json) = 'array'
+        AND length(CAST(lifecycle_history_json AS BLOB)) <= 262144
+    ),
     blocked_attempts INTEGER NOT NULL DEFAULT 0,
     completion_evidence TEXT,
     verification_rounds INTEGER NOT NULL DEFAULT 0,
@@ -4154,8 +4360,16 @@ CREATE TABLE goal_control_jobs (
     attempt_generation INTEGER NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('planner', 'evaluator', 'gatekeeper', 'cold_skeptic')),
     slot INTEGER NOT NULL CHECK (slot >= 0),
-    request_json TEXT NOT NULL,
-    result_json TEXT,
+    request_json TEXT NOT NULL CHECK (
+        json_valid(request_json)
+        AND length(CAST(request_json AS BLOB)) <= 1048576
+    ),
+    result_json TEXT CHECK (
+        result_json IS NULL OR (
+            json_valid(result_json)
+            AND length(CAST(result_json AS BLOB)) <= 1048576
+        )
+    ),
     state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'finished', 'cancelled')),
     lease_expires_at INTEGER,
     cancel_reason TEXT,
@@ -5002,7 +5216,12 @@ CREATE TABLE task_delegation_jobs (
     function_call_id TEXT,
     parent_session_id TEXT NOT NULL,
     parent_agent TEXT NOT NULL,
-    original_args_json TEXT,
+    original_args_json TEXT CHECK (
+        original_args_json IS NULL OR (
+            json_valid(original_args_json)
+            AND length(CAST(original_args_json AS BLOB)) <= 1048576
+        )
+    ),
     status TEXT NOT NULL CHECK (status IN (
         'created',
         'running',
@@ -5038,8 +5257,19 @@ CREATE TABLE task_delegation_children (
     )),
     report TEXT,
     output_dir TEXT,
-    todo_ids_json TEXT,
-    snapshot_json TEXT,
+    todo_ids_json TEXT CHECK (
+        todo_ids_json IS NULL OR (
+            json_valid(todo_ids_json)
+            AND json_type(todo_ids_json) = 'array'
+            AND length(CAST(todo_ids_json AS BLOB)) <= 65536
+        )
+    ),
+    snapshot_json TEXT CHECK (
+        snapshot_json IS NULL OR (
+            json_valid(snapshot_json)
+            AND length(CAST(snapshot_json AS BLOB)) <= 1048576
+        )
+    ),
     result_delivered INTEGER NOT NULL DEFAULT 0 CHECK (result_delivered IN (0, 1)),
     started_at INTEGER,
     finished_at INTEGER,
@@ -5396,7 +5626,10 @@ CREATE TABLE run_invocations (
     client_submission_id    TEXT PRIMARY KEY,
     origin_principal_digest TEXT NOT NULL,
     session_id              TEXT NOT NULL,
-    options_json            TEXT NOT NULL,
+    options_json            TEXT NOT NULL CHECK (
+        json_valid(options_json)
+        AND length(CAST(options_json AS BLOB)) <= 65536
+    ),
     options_digest          TEXT NOT NULL,
     content_digest          TEXT NOT NULL,
     state                   TEXT NOT NULL CHECK (state IN (
@@ -5507,7 +5740,11 @@ CREATE TABLE execution_containments (
         'creating', 'active', 'stopping', 'empty', 'uncertain'
     )),
     guarantee               TEXT NOT NULL CHECK (guarantee IN ('proven', 'unsupported')),
-    platform_locator_json   TEXT NOT NULL DEFAULT '{}',
+    platform_locator_json   TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(platform_locator_json)
+        AND json_type(platform_locator_json) = 'object'
+        AND length(CAST(platform_locator_json AS BLOB)) <= 65536
+    ),
     runtime_context_digest  TEXT,
     unsupported_reason      TEXT,
     created_at_wall_ms      INTEGER NOT NULL,
@@ -6012,7 +6249,10 @@ CREATE TABLE task_artifacts (
     untracked_manifest_digest   TEXT NOT NULL CHECK (length(untracked_manifest_digest) = 64 AND untracked_manifest_digest NOT GLOB '*[^0-9a-f]*'),
     ordered_patch_digest        TEXT NOT NULL CHECK (length(ordered_patch_digest) = 64 AND ordered_patch_digest NOT GLOB '*[^0-9a-f]*'),
     validation_receipt_digest   TEXT NOT NULL CHECK (length(validation_receipt_digest) = 64 AND validation_receipt_digest NOT GLOB '*[^0-9a-f]*'),
-    parent_result_json          TEXT NOT NULL,
+    parent_result_json          TEXT NOT NULL CHECK (
+        json_valid(parent_result_json)
+        AND length(CAST(parent_result_json AS BLOB)) <= 1048576
+    ),
     state                       TEXT NOT NULL CHECK (state IN ('produced', 'integrating', 'integrated', 'stale', 'conflict', 'cancelled', 'failed')),
     revision                    INTEGER NOT NULL CHECK (revision >= 0),
     created_at_unix_ms          INTEGER NOT NULL,
@@ -6294,6 +6534,15 @@ CREATE INDEX idx_external_journal_ops_unresolved
 CREATE INDEX idx_external_journal_ops_prepared
     ON external_journal_operations (created_at_wall_ms)
     WHERE state = 'prepared';
+
+CREATE INDEX idx_external_journal_ops_terminal_retention
+    ON external_journal_operations (COALESCE(terminal_at_wall_ms, updated_at_wall_ms))
+    WHERE state IN (
+        'rejected', 'cancelled', 'expired', 'completed_after_cancel', 'succeeded', 'failed'
+    );
+CREATE INDEX idx_intel_files_retention_ts ON intel_files (indexed_at);
+CREATE INDEX idx_decision_receipts_retention_ts ON decision_receipts (created_at_unix_ms);
+CREATE INDEX idx_agent_transition_receipts_retention_ts ON agent_transition_receipts (created_at_unix_ms);
 
 -- Append-only transition log. The partial unique index is the database-level
 -- proof that an operation emits at most one terminal event: a duplicate
@@ -6778,7 +7027,11 @@ CREATE TABLE sealed_action_instances (
     -- The serialized closed `SealedActionKind` (origins, credential placement,
     -- path template, projection, bounded params). Owner-authored; carries no
     -- literal and no credential value.
-    kind_json     TEXT    NOT NULL,
+    kind_json     TEXT    NOT NULL CHECK (
+        json_valid(kind_json)
+        AND json_type(kind_json) = 'object'
+        AND length(CAST(kind_json AS BLOB)) <= 65536
+    ),
     -- Model-visible safe description. Never a destination, never a literal.
     description   TEXT    NOT NULL,
     -- Canonical project key the instance is scoped to.
@@ -7196,12 +7449,19 @@ CREATE TABLE mcp_config_journals (
     terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
-    config_json       TEXT NOT NULL,
+    config_json       TEXT NOT NULL CHECK (
+        json_valid(config_json)
+        AND length(CAST(config_json AS BLOB)) <= 1048576
+    ),
     patch_intent_json TEXT NOT NULL CHECK (json_valid(patch_intent_json)),
     consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
     intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
     intended_config_generation INTEGER NOT NULL CHECK (intended_config_generation > 0),
-    cleanup_names_json TEXT NOT NULL,
+    cleanup_names_json TEXT NOT NULL CHECK (
+        json_valid(cleanup_names_json)
+        AND json_type(cleanup_names_json) = 'array'
+        AND length(CAST(cleanup_names_json AS BLOB)) <= 65536
+    ),
     phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
     settlement_phase  TEXT NOT NULL DEFAULT 'publication_pending'
         CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
@@ -7773,7 +8033,12 @@ CREATE TABLE installation_operations (
     operation_kind               TEXT NOT NULL CHECK (operation_kind IN ('install', 'update', 'bind', 'create')),
     canonical_workspace_id       TEXT,
     state                        TEXT NOT NULL CHECK (state IN ('pending_choice', 'running', 'terminal')),
-    terminal_receipt_json        TEXT,
+    terminal_receipt_json        TEXT CHECK (
+        terminal_receipt_json IS NULL OR (
+            json_valid(terminal_receipt_json)
+            AND length(CAST(terminal_receipt_json AS BLOB)) <= 1048576
+        )
+    ),
     created_at_unix_ms           INTEGER NOT NULL,
     updated_at_unix_ms           INTEGER NOT NULL,
     CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
@@ -7794,7 +8059,10 @@ CREATE TABLE onboarding_agent_publication_journals (
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,
     operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    choice_set_json              TEXT NOT NULL,
+    choice_set_json              TEXT NOT NULL CHECK (
+        json_valid(choice_set_json)
+        AND length(CAST(choice_set_json AS BLOB)) <= 65536
+    ),
     expires_at_unix_ms           INTEGER NOT NULL,
     submitted_choice_id          TEXT,
     state                        TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'expired', 'completed')),
@@ -7808,8 +8076,18 @@ CREATE TABLE installation_journals (
     journal_id                   TEXT PRIMARY KEY,
     operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     checkpoint                   TEXT NOT NULL CHECK (checkpoint IN ('staged', 'db_committed', 'file_renamed', 'complete')),
-    staged_file_metadata_json    TEXT,
-    prior_file_metadata_json     TEXT,
+    staged_file_metadata_json    TEXT CHECK (
+        staged_file_metadata_json IS NULL OR (
+            json_valid(staged_file_metadata_json)
+            AND length(CAST(staged_file_metadata_json AS BLOB)) <= 65536
+        )
+    ),
+    prior_file_metadata_json     TEXT CHECK (
+        prior_file_metadata_json IS NULL OR (
+            json_valid(prior_file_metadata_json)
+            AND length(CAST(prior_file_metadata_json AS BLOB)) <= 65536
+        )
+    ),
     expected_digest              TEXT NOT NULL,
     created_at_unix_ms           INTEGER NOT NULL,
     updated_at_unix_ms           INTEGER NOT NULL

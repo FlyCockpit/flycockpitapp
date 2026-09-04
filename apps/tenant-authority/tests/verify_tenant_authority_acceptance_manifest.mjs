@@ -3,7 +3,11 @@
 //
 // Consumes a package-scoped Nextest list stream and compares the complete
 // lexicographically sorted `tenant_authority_*` manifest to exactly the nine
-// names below. Required invocation (remote feature enabled):
+// names below. CI-bound executor (remote feature enabled):
+//
+//   bash scripts/check-tenant-authority-acceptance-manifest.sh
+//
+// Manual pipe (same check):
 //
 //   cargo nextest list -p tenant-authority --features remote \
 //     --message-format json \

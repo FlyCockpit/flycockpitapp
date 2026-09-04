@@ -22,6 +22,7 @@ name: CLI CI
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
+      - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -41,6 +42,7 @@ name: CLI CI
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
+      - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   # Weekly advisory sweep (issue #306): RustSec advisories and yanks can land
@@ -316,6 +318,8 @@ jobs:
   # Live-infra jobs (PKCS#11, coturn) stay workflow_dispatch opt-ins below;
   # `scripts/check-feature-gated-test-coverage.sh` is the ownership bound
   # between feature-gated test targets and these executing selections.
+  # `scripts/check-tenant-authority-acceptance-manifest.sh` is the ownership
+  # bound for the exact nine-suite `tenant_authority_*` acceptance manifest.
   remote-lockstep:
     name: Remote lockstep tests
     needs: runners
@@ -412,6 +416,9 @@ jobs:
       # request_variants! set the exhaustive classification test compares.
       # Package-specific features: tenant-authority has `remote` only,
       # cockpit-config has `extended` only.
+      - name: Check tenant-authority acceptance manifest
+        run: bash scripts/check-tenant-authority-acceptance-manifest.sh
+
       - name: Test remote-gated lockstep and conformance
         run: >
           cargo nextest run --locked

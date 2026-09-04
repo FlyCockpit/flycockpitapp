@@ -2,8 +2,9 @@
 //!
 //! All nine named acceptance suites live as exact top-level Rust tests in
 //! this file. The checked-in parser
-//! `verify_tenant_authority_acceptance_manifest.mjs` consumes the
-//! package-scoped `cargo nextest list -p tenant-authority --features remote
+//! `scripts/check-tenant-authority-acceptance-manifest.sh` (CI-bound) runs
+//! `verify_tenant_authority_acceptance_manifest.mjs` on the package-scoped
+//! `cargo nextest list -p tenant-authority --features remote
 //! --message-format json` stream and compares the complete lexicographically
 //! sorted `tenant_authority_*` manifest to exactly the nine names here, each
 //! with `ignored=false`. Every `tenant_authority_*` name in that stream must

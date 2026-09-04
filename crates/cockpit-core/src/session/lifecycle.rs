@@ -1654,9 +1654,15 @@ impl Session {
     /// session's vault handle. Cross-session readers must fold this table into
     /// their own redactor before returning any target-owned history.
     ///
-    /// A missing, malformed, or unloadable vault table is an error rather than
-    /// a reason to return target content unredacted. `Ok(None)` means the
-    /// target is not visible to `reader_project`, not that custody is absent.
+    /// `Ok(None)` means the target is not visible to `reader_project`, or the
+    /// target owns no durable redaction-table vault item — a target that never
+    /// established custody contributes no additional durable knowledge, and
+    /// the caller must still scrub with its own table. Production inserts
+    /// establish custody in the same transaction as the `sessions` row
+    /// (enforced at the database layer), so a durable production session
+    /// always carries its table here. Malformed or unloadable vault bytes
+    /// still fail closed: a corrupt custody item is never silently treated
+    /// as an empty table.
     pub(crate) async fn persisted_redaction_table_for_session(
         &self,
         reader_project: &str,
@@ -1672,11 +1678,10 @@ impl Session {
         {
             return Ok(None);
         }
-        let json = require_redaction_table_json_from_vault(
-            &self.secret_vault,
-            session_id,
-            "loading persisted target-session redaction table",
-        )?;
+        let json = match load_redaction_table_from_vault(&self.secret_vault, session_id)? {
+            Some(json) => json,
+            None => return Ok(None),
+        };
         crate::redact::RedactionTable::from_persisted_json(&json)
             .map(Some)
             .context("loading persisted target-session redaction table")

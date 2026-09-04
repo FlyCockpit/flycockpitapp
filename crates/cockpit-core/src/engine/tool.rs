@@ -460,6 +460,7 @@ struct ReviewCageState {
     viewed_skills: HashSet<String>,
     viewed_package_roots: HashSet<PathBuf>,
     preauthorized_package_roots: Vec<PathBuf>,
+    preauthorized_skills_roots: Vec<PathBuf>,
     auto_deny_approvals: bool,
     max_dispatches: u32,
     dispatches: u32,
@@ -480,6 +481,7 @@ impl ReviewCage {
                 viewed_skills: HashSet::new(),
                 viewed_package_roots: HashSet::new(),
                 preauthorized_package_roots: roots.into_iter().map(lexical_normalize).collect(),
+                preauthorized_skills_roots: Vec::new(),
                 auto_deny_approvals: true,
                 max_dispatches: SKILLS_REVIEW_MAX_DISPATCHES,
                 dispatches: 0,
@@ -560,6 +562,42 @@ impl ReviewCage {
             .preauthorized_package_roots
             .iter()
             .any(|root| path.starts_with(root) && path != *root)
+    }
+
+    /// Preauthorize a configured skills surface root for the mutation tool.
+    ///
+    /// [`Self::preauthorize_skills_root`] admits the root itself plus
+    /// everything under it: skill creation legitimately mutates the
+    /// directory that contains the packages. Only `skill_manage` calls this,
+    /// and only with the host-configured scan/mutation roots — an in-cage
+    /// agent cannot name arbitrary paths into the boundary this way.
+    pub fn preauthorize_skills_root(&self, root: &Path) {
+        let root = lexical_normalize(root);
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if !state
+            .preauthorized_skills_roots
+            .iter()
+            .any(|known| known == &root)
+        {
+            state.preauthorized_skills_roots.push(root);
+        }
+    }
+
+    /// True when `path` is a preauthorized skills root or lives under one.
+    pub fn preauthorizes_skills_root_path(&self, path: &Path) -> bool {
+        let path = lexical_normalize(path);
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .preauthorized_skills_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+
+    /// The full caged-path admission test used by the native-access gate: a
+    /// viewed skill package path or a host-configured skills surface root.
+    pub fn admits_caged_path(&self, path: &Path) -> bool {
+        self.preauthorizes_package_path(path) || self.preauthorizes_skills_root_path(path)
     }
 
     pub fn allowed_tools(&self) -> HashSet<String> {

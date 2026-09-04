@@ -16000,7 +16000,7 @@ mod tests {
             .find("pre_handoff_for_dispatch(actions_suffix, class_offset)")
             .expect("per-item widget class fence in execute_fenced_backend_one");
         let bind = fenced_body
-            .find("bind_backend_target_window(&actions_suffix[class_offset])")
+            .find("bind_backend_target_window(current_action)")
             .expect("per-item evidenced window bind in execute_fenced_backend_one");
         let handoff = fenced_body
             .find(".execute_normalized_one(normalized)")

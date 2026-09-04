@@ -54,6 +54,17 @@ impl Tool for SkillManageTool {
             )));
         }
         let extended = ctx.config.extended();
+        // A background skills review is caged to the skills surface, and the
+        // host-configured skills scan/mutation roots ARE that surface. The
+        // mutation tool preauthorizes exactly those roots (and nothing
+        // agent-named) into the cage before its preflight traverses them;
+        // every other caged path keeps failing the hard boundary.
+        if let Some(cage) = ctx.review_cage.as_ref() {
+            for root in SkillMutationService::new(&ctx.cwd, &extended.skills).preflight_scan_roots()
+            {
+                cage.preauthorize_skills_root(&root);
+            }
+        }
         // Discovery is a real filesystem traversal, including configured
         // `external_dirs` which are read-only as mutation destinations. Do
         // not let `skill_manage` inspect those roots merely because a config

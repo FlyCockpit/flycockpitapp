@@ -704,19 +704,25 @@ fn is_novel_opaque_credential(token: &str) -> bool {
         && !token.contains(char::is_whitespace)
         && token.chars().all(is_opaque_token_char)
         && token.chars().any(|c| c.is_ascii_alphanumeric())
-        // A run whose body is a secret-shaped key name is the key of an
-        // assignment — either raw (`KEY=<value>`, caught by the
-        // non-trailing-`=` rejection below) or one whose value an
-        // earlier pass already replaced with the placeholder (the
+        // A run ending at its own trailing `=` whose trimmed body is a
+        // secret-shaped key name is the key of an assignment whose value
+        // an earlier pass already replaced with the placeholder (the
         // placeholder is not an opaque character, so the key run now
-        // ends at its own `=`). Keys are structure and survive every
-        // scrub. The leading-dash trim mirrors the assignment pass's
-        // CLI-flag spelling (`--aws-secret-access-key=`).
-        && !command_output_key_qualifies(
-            token
-                .trim_end_matches('=')
-                .trim_start_matches('-'),
-        )
+        // ends at its own `=`; a raw `KEY=<value>` run never reaches this
+        // check — the non-trailing-`=` rejection below catches it).
+        // Keys are structure and survive every scrub. The gate fires
+        // ONLY for that key-suffix shape: a keyless credential that
+        // merely shares a key's secret-shaped vocabulary
+        // (`novel-passphrase-77aa1234xyz`) is a value, not a key, and
+        // must still be redacted wherever the command printed it.
+        // The leading-dash trim mirrors the assignment pass's CLI-flag
+        // spelling (`--aws-secret-access-key=`).
+        && !(token.ends_with('=')
+            && command_output_key_qualifies(
+                token
+                    .trim_end_matches('=')
+                    .trim_start_matches('-'),
+            ))
         // A non-trailing `=` makes the span an assignment shape, not a
         // bare token (trailing `=` is base64 padding).
         && !token.trim_end_matches('=').contains('=')

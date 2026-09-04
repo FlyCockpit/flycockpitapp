@@ -3673,8 +3673,15 @@ impl Driver {
                     let source_index = call.source_index();
                     let completion_tx = ordinary_tx.clone();
                     ordinary_active += 1;
+                    // Build the lane future here, before the spawn: the
+                    // acquisition task-local exists only in this task, and
+                    // the wrapper captures it at its call site.
+                    let lane_future =
+                        crate::tools::trusted_child_acquisition::with_inherited_acquisition_runtime(
+                            call.execute(),
+                        );
                     tokio::spawn(async move {
-                        let (messages, error, terminal_record, terminal) = crate::tools::trusted_child_acquisition::with_inherited_acquisition_runtime(call.execute()).await;
+                        let (messages, error, terminal_record, terminal) = lane_future.await;
                         let _ = completion_tx
                             .send((
                                 source_index,

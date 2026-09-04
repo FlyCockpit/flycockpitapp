@@ -117,6 +117,29 @@ impl Tool for GrepTool {
         .await?;
         let attached_knowledge_roots =
             crate::knowledge::attached_local_knowledge_roots(ctx).await?;
+        // Hard confinement, after the boundary admission and before any
+        // search: the search is hard-confined to the session boundary (the
+        // cwd root plus the session scratch dirs) and to attached local
+        // KB roots. Any other admitted root — one the escalate-on-miss
+        // path would have prompted for, or auto-approved under a Yolo
+        // approver — is refused here, never routed through the
+        // approval/escalation path. This mirrors the `confine` hard-deny
+        // stance the module docs promise: the search can never reach
+        // outside the root.
+        if let Some(effective) = sandbox::outside_session_boundary(
+            &search_root,
+            &ctx.cwd,
+            ctx.session.tmp_dir(),
+            Some(&ctx.session.workspace_scratch_dir()),
+        ) && !attached_knowledge_roots
+            .iter()
+            .any(|kb| cockpit_host::path_containment::contained_under(kb, &effective))
+        {
+            return Err(invalid_input(format!(
+                "`{}` resolves outside the package sandbox; access denied",
+                effective.display()
+            )));
+        }
         let canonical_root = sandbox::canonical_root(&search_root)?;
 
         if let Some(refusal) = sandbox::check_gitignore_read(ctx, &search_root).await? {

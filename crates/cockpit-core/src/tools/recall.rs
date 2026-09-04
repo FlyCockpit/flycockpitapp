@@ -86,7 +86,15 @@ pub async fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     // Scrub before selecting a page so a secret split across a page boundary
     // cannot leave a prefix or suffix in a later continuation.
     let source = redactor.scrub(&content);
-    let mut output = render_page(&source, path, args)?;
+    let mut output = match target {
+        // The plan pseudofile is one revision-stamped document: its read
+        // projection is the `[revision=N]` header directly above the plan
+        // body that the read/write revision contract promises, not a
+        // line-numbered page (paging would interleave a prefix between the
+        // header and the body).
+        RecallPath::Plan(_) => plan_document_output(&source),
+        _ => render_page(&source, path, args)?,
+    };
     crate::tools::session_search::fence_dream_read_scope_tool_output_layered(
         ctx,
         &mut output,
@@ -495,6 +503,20 @@ async fn redactor_for_target(
         .union(&target_table)
         .map(std::sync::Arc::new)
         .map_err(|error| anyhow::anyhow!("unioning target-session redaction table: {error:#}"))
+}
+
+/// Render the plan pseudofile as one document. The write contract reports
+/// revisions and the read contract shows the same `[revision=N]` header
+/// directly above the plan body; line-numbered paging would interleave a
+/// prefix between the two.
+fn plan_document_output(content: &str) -> ToolOutput {
+    const MARKER: &str = "\n... [truncated; plan exceeds the read output budget]\n";
+    if content.len() + MARKER.len() <= OUTPUT_BYTE_CAP {
+        return ToolOutput::text(content.to_string());
+    }
+    let mut out = utf8_prefix(content, OUTPUT_BYTE_CAP - MARKER.len()).to_string();
+    out.push_str(MARKER);
+    ToolOutput::truncated_text(out)
 }
 
 fn not_found(path: &str, target: RecallPath) -> ToolOutput {

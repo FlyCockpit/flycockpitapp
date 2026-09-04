@@ -516,8 +516,9 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
         Err(_panic) => Err(anyhow!("truncating computer audit prefix panicked")),
     };
     let restore = trigger_guard.restore();
+    let restore_failed = restore.is_err();
     let result = merge_truncation_and_restore_errors(truncation, restore);
-    if restore.is_err() {
+    if restore_failed {
         trigger_guard.acknowledge_quarantine();
     }
     result

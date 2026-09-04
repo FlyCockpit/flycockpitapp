@@ -379,6 +379,29 @@ BEGIN
 END;
 ";
 
+const IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "image_generation_security_recovery_component_delete_forbidden",
+        IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL,
+    ),
+    (
+        "image_generation_security_recovery_attempt_delete_forbidden",
+        IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL,
+    ),
+    (
+        "image_generation_security_recovery_audit_delete_forbidden",
+        IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL,
+    ),
+];
+
+fn restore_security_recovery_delete_triggers(conn: &Connection, count: usize) -> Result<()> {
+    for (_, sql) in IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS.iter().take(count) {
+        conn.execute_batch(sql)
+            .context("restoring image security recovery delete trigger")?;
+    }
+    Ok(())
+}
+
 struct ImageSecurityRecoveryDeleteTriggerGuard<'a> {
     conn: &'a Connection,
     restored: bool,
@@ -386,28 +409,44 @@ struct ImageSecurityRecoveryDeleteTriggerGuard<'a> {
 }
 
 impl ImageSecurityRecoveryDeleteTriggerGuard<'_> {
-    fn drop_triggers(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS image_generation_security_recovery_component_delete_forbidden;
-             DROP TRIGGER IF EXISTS image_generation_security_recovery_attempt_delete_forbidden;
-             DROP TRIGGER IF EXISTS image_generation_security_recovery_audit_delete_forbidden;",
-        )
-        .context("dropping image security recovery delete triggers")
+    fn acquire(conn: &Connection) -> Result<Self> {
+        let mut dropped = 0usize;
+        for (trigger_name, _) in IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS {
+            match conn
+                .execute(&format!("DROP TRIGGER IF EXISTS {trigger_name}"), [])
+                .with_context(|| format!("dropping {trigger_name}"))
+            {
+                Ok(_) => dropped += 1,
+                Err(drop_error) => {
+                    if dropped == 0 {
+                        return Err(drop_error);
+                    }
+                    return match restore_security_recovery_delete_triggers(conn, dropped) {
+                        Ok(()) => Err(drop_error),
+                        Err(restore_error) => Err(AppendOnlyDeleteFenceViolation {
+                            restore: restore_error,
+                            truncation: Some(drop_error),
+                        }
+                        .into()),
+                    };
+                }
+            }
+        }
+        Ok(Self {
+            conn,
+            restored: false,
+            quarantined: false,
+        })
     }
 
     fn restore(&mut self) -> Result<()> {
         if self.restored {
             return Ok(());
         }
-        self.conn
-            .execute_batch(IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL)
-            .context("restoring image security recovery component delete trigger")?;
-        self.conn
-            .execute_batch(IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL)
-            .context("restoring image security recovery attempt delete trigger")?;
-        self.conn
-            .execute_batch(IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL)
-            .context("restoring image security recovery audit delete trigger")?;
+        restore_security_recovery_delete_triggers(
+            self.conn,
+            IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS.len(),
+        )?;
         self.restored = true;
         Ok(())
     }
@@ -436,12 +475,7 @@ fn prune_image_security_recovery_ledgers_conn(
     cutoff_unix_ms: i64,
     batch: i64,
 ) -> Result<(u64, u64, u64)> {
-    ImageSecurityRecoveryDeleteTriggerGuard::drop_triggers(conn)?;
-    let mut trigger_guard = ImageSecurityRecoveryDeleteTriggerGuard {
-        conn,
-        restored: false,
-        quarantined: false,
-    };
+    let mut trigger_guard = ImageSecurityRecoveryDeleteTriggerGuard::acquire(conn)?;
     let pruning = catch_unwind(AssertUnwindSafe(|| -> Result<(u64, u64, u64)> {
         let image_security_recovery_components_deleted = delete_in_batches(batch, || {
             conn.execute(
@@ -508,6 +542,7 @@ fn prune_image_security_recovery_ledgers_conn(
         )),
     };
     let restore = trigger_guard.restore();
+    let restore_failed = restore.is_err();
     let result = match (pruning, restore) {
         (Ok(counts), Ok(())) => Ok(counts),
         (Err(pruning), Ok(())) => Err(pruning),
@@ -517,7 +552,7 @@ fn prune_image_security_recovery_ledgers_conn(
         }
         .into()),
     };
-    if restore.is_err() {
+    if restore_failed {
         trigger_guard.acknowledge_quarantine();
     }
     result

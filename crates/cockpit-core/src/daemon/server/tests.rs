@@ -8636,6 +8636,7 @@ fn remote_state_with_grants(
         has_owner_capability: false,
         active_peer_credential: None,
         peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8683,6 +8684,7 @@ fn owner_state() -> MutableClientState {
         has_owner_capability: true,
         active_peer_credential: None,
         peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8970,21 +8972,68 @@ fn peer_auth_admission_test_ctx(child_executable: std::path::PathBuf) -> Arc<Dae
     Arc::new(ctx)
 }
 
+/// Identity of a live child process, captured while it waits on its go-file.
 #[cfg(unix)]
-async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]) {
+fn child_peer_identity(child_id: u32) -> cockpit_host::peer_cred::PeerIdentity {
+    let (uid, gid) =
+        cockpit_host::daemon_lifecycle::read_process_credentials(child_id).expect("child uid/gid");
+    cockpit_host::peer_cred::PeerIdentity {
+        pid: child_id,
+        uid,
+        gid,
+        process_start: cockpit_host::daemon_lifecycle::process_start_identity(child_id)
+            .expect("child process start"),
+    }
+}
+
+/// Drive the production socket accept path (`handle_client`) plus the
+/// production client connect/exchange (`DaemonClient::connect` inside the
+/// peer-auth child) and assert the exchange outcome.
+///
+/// `provenance` installs daemon-side launch provenance `(ticket, launcher
+/// identity)` while the child waits on its go-file; `ticket_env` is the launch
+/// ticket the child itself presents. A legitimate launcher presents the
+/// ticket bound to its own process identity; an attacker presents nothing.
+#[cfg(unix)]
+async fn run_peer_auth_exchange_test(
+    label: &str,
+    child_args: &[&str],
+    expect_owner: bool,
+    provenance: Option<(String, cockpit_host::peer_cred::PeerIdentity)>,
+    ticket_env: Option<&str>,
+) {
     let child_executable =
         std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
     let ctx = peer_auth_admission_test_ctx(child_executable.clone());
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("peer-auth.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
-    let role_label = role.to_owned();
-    let child_args_label = child_args
-        .iter()
-        .map(|arg| (*arg).to_owned())
-        .collect::<Vec<_>>();
-    let role = role_label.clone();
-    let child_args = child_args_label.clone();
+    // The child blocks on the go-file until the test has installed the
+    // daemon-side registry state naming it as the launcher.
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut command = std::process::Command::new(&child_executable);
+    command
+        .args(child_args)
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env(
+            "COCKPIT_PEER_AUTH_EXPECT",
+            if expect_owner { "owner" } else { "denied" },
+        );
+    if let Some(ticket) = ticket_env {
+        command.env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", ticket);
+    }
+    if provenance.is_some() {
+        command.env("COCKPIT_PEER_AUTH_GO_FILE", &go_file);
+    }
+    let mut child = command.spawn().expect("spawn peer auth child");
+    if let Some((ticket, launcher)) = provenance {
+        ctx.peer_credential_registry
+            .record_launch_provenance(ticket, Some(launcher));
+        std::fs::write(&go_file, b"go").expect("release the child go-file");
+    }
 
     let server_ctx = ctx.clone();
     let server = tokio::spawn(async move {
@@ -8992,19 +9041,53 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
         handle_client(stream, server_ctx).await
     });
 
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(child_executable)
-            .args(&child_args)
-            .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
-            .env("COCKPIT_PEER_AUTH_EXPECTED_ROLE", &role)
-            .status()
-    })
-    .await
-    .expect("join peer auth child waiter")
-    .expect("spawn peer auth child");
+    let status = child.wait().expect("peer auth child exited");
     assert!(
         status.success(),
-        "peer auth child failed for role {role_label} with args {child_args_label:?}"
+        "peer auth child failed for {label} with args {child_args:?} (expected owner: {expect_owner})"
+    );
+
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]) {
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable.clone());
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("peer-auth.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut child = std::process::Command::new(&child_executable)
+        .args(child_args)
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env("COCKPIT_PEER_AUTH_EXPECT", "owner")
+        .env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", &ticket)
+        .env("COCKPIT_PEER_AUTH_GO_FILE", &go_file)
+        .spawn()
+        .expect("spawn peer auth child");
+    // The provenance launcher identity must be the live child itself: this
+    // is the production contract, the ticket is bound to the exact process
+    // that spawned the daemon and will present it.
+    ctx.peer_credential_registry
+        .record_launch_provenance(ticket, Some(child_peer_identity(child.id())));
+    std::fs::write(&go_file, b"go").expect("release the child go-file");
+
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let status = child.wait().expect("peer auth child exited");
+    assert!(
+        status.success(),
+        "peer auth child failed for role {role} with args {child_args:?}"
     );
 
     let _ = server.await;
@@ -9026,6 +9109,225 @@ async fn legitimate_cli_client_admitted_through_production_accept() {
 #[tokio::test(flavor = "multi_thread")]
 async fn legitimate_acp_client_admitted_through_production_accept() {
     run_legitimate_peer_auth_admission_test("acp", &["acp"]).await;
+}
+
+/// Issue #337 invariant, driven across the production accept and exchange
+/// paths: an unconfined same-uid peer that runs the approved executable
+/// with recognized arguments holds no launch ticket and must be denied an
+/// owner-class credential (the owner-only RPC must stay unreachable).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unproven_same_uid_peer_with_approved_executable_is_denied_owner_class() {
+    run_peer_auth_exchange_test("no ticket", &["daemon", "status"], false, None, None).await;
+}
+
+/// A ticket stolen out of another process's environment cannot be replayed:
+/// provenance binds the token to the launcher's exact process identity, and
+/// this peer is a different process even though it presents the right token.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_ticket_presented_by_the_wrong_process_is_denied() {
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let current_process = child_peer_identity(std::process::id());
+    run_peer_auth_exchange_test(
+        "stolen ticket",
+        &["daemon", "status"],
+        false,
+        // Provenance binds the ticket to this test process, not the child.
+        Some((ticket.clone(), current_process)),
+        Some(ticket.as_str()),
+    )
+    .await;
+}
+
+/// The launcher itself must present the token it was issued: any other token
+/// value is denied even for the bound launcher process.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_ticket_with_the_wrong_value_is_denied() {
+    let bound_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let wrong_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable.clone());
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("peer-auth.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut child = std::process::Command::new(&child_executable)
+        .args(["daemon", "status"])
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env("COCKPIT_PEER_AUTH_EXPECT", "denied")
+        .env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", &wrong_ticket)
+        .env("COCKPIT_PEER_AUTH_GO_FILE", &go_file)
+        .spawn()
+        .expect("spawn peer auth child");
+    ctx.peer_credential_registry
+        .record_launch_provenance(bound_ticket, Some(child_peer_identity(child.id())));
+    std::fs::write(&go_file, b"go").expect("release the child go-file");
+
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let status = child.wait().expect("peer auth child exited");
+    assert!(
+        status.success(),
+        "peer presenting the wrong token value must be denied owner-class admission"
+    );
+
+    let _ = server.await;
+}
+
+/// Production spawn boundary: `spawn_detached*` mints a one-time launch
+/// ticket, delivers it through the daemon child's spawn environment, and
+/// retains the matching ticket in the launcher process. Every spawn mints
+/// a fresh, well-formed ticket, and the daemon child holds the exact copy
+/// the launcher retained.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_spawn_mints_and_delivers_the_launch_ticket_to_the_child() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let first = crate::daemon::spawn_detached(false).expect("first daemon child");
+    let first_ticket = cockpit_client::launch_provenance::process_launch_ticket()
+        .expect("launcher retains the minted launch ticket");
+    // A second isolation root so the second daemon child owns its own
+    // lifecycle paths (the first child may hold them for its lifetime).
+    let second_root = tempfile::tempdir().expect("second isolated home root");
+    env.set_isolated_home(second_root.path());
+    let second = crate::daemon::spawn_detached(false).expect("second daemon child");
+    let second_ticket = cockpit_client::launch_provenance::process_launch_ticket()
+        .expect("launcher retains the minted launch ticket");
+    assert_ne!(
+        first_ticket, second_ticket,
+        "every daemon spawn must mint a fresh launch ticket"
+    );
+
+    for (child, ticket) in [(first, &first_ticket), (second, &second_ticket)] {
+        assert_eq!(ticket.len(), 64);
+        assert!(
+            ticket
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "launch tickets are 64 lowercase hex characters"
+        );
+        let prefix = format!(
+            "{}=",
+            crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV
+        );
+        // Poll briefly: `/proc/<pid>/environ` shows the parent's environment
+        // in the fork-before-exec window, and the daemon child may also exit
+        // immediately (for example when a sibling daemon already holds the
+        // lifecycle reservation).
+        let mut delivered = None;
+        for _ in 0..200 {
+            if let Ok(environ) = std::fs::read(format!("/proc/{child}/environ")) {
+                delivered = environ
+                    .split(|byte| *byte == 0)
+                    .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+                    .map(|value| value.to_vec());
+                if delivered.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let delivered = delivered
+            .expect("the daemon child receives the launch ticket in its spawn environment");
+        assert_eq!(
+            delivered,
+            ticket.as_bytes(),
+            "the child env carries the exact ticket the launcher retained"
+        );
+        kill_daemon_child(child);
+    }
+}
+
+/// Hard-kill a spawned daemon child and reap it so a test never leaves a
+/// detached foreground daemon (or a zombie) behind. The detach spawn path
+/// only moves the child into its own process group; it stays a direct
+/// child of this process, so a pid-specific waitpid reaps it without
+/// touching any other test-spawned child.
+#[cfg(unix)]
+fn kill_daemon_child(pid: u32) {
+    let pid = i32::try_from(pid).expect("daemon child pid fits i32");
+    // SAFETY: SIGKILL targets exactly the child this test spawned through
+    // the production detach path. A missing pid (ESRCH) is the happy path
+    // for an already-exited child.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid restricted to this child's pid; it cannot steal
+        // another test thread's child exit status.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid
+            || (rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Production boot recording boundary: `DaemonContext::new` records the
+/// launch ticket from the spawn environment, scrubs the environment slot
+/// so descendants never inherit it, and binds the ticket to the daemon's
+/// launcher. Only that launcher identity with that exact ticket verifies.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_context_records_launch_provenance_from_the_spawn_environment() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    env.set_var(
+        crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV,
+        &ticket,
+    );
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable);
+
+    // The boot path scrubs the environment slot before any descendant exists.
+    assert!(
+        std::env::var(crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV).is_err(),
+        "the launch ticket must not stay in the daemon environment"
+    );
+
+    let launcher = crate::daemon::peer_authority::capture_launcher_identity()
+        .expect("the daemon parent is observable at boot");
+    assert!(
+        ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&ticket), launcher.clone()),
+        "the recorded provenance must verify for the launcher presenting its ticket"
+    );
+    let mut impostor = launcher.clone();
+    impostor.pid = impostor.pid.wrapping_add(1);
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&ticket), impostor),
+        "a different process presenting the right ticket must stay denied"
+    );
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(None, launcher.clone()),
+        "the launcher without a ticket must stay denied"
+    );
+    let wrong_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&wrong_ticket), launcher),
+        "the launcher presenting any other ticket value must stay denied"
+    );
 }
 
 async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
@@ -17016,6 +17318,7 @@ async fn attached_state_with_worker_receiver(
             has_owner_capability: true,
             active_peer_credential: None,
             peer_credential_expires_at_unix_ms: None,
+            presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
                 client_instance_id: Uuid::new_v4(),
@@ -36675,6 +36978,7 @@ async fn btw_concurrent_with_parent_turn() {
         has_owner_capability: true,
         active_peer_credential: None,
         peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -36762,6 +37066,7 @@ async fn btw_concurrent_with_parent_turn() {
         has_owner_capability: true,
         active_peer_credential: None,
         peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),

@@ -1346,6 +1346,14 @@ fn spawn_detached_child(
     if ephemeral.is_some() {
         command.env(DAEMON_LIFETIME_ENV, EPHEMERAL_LIFETIME);
     }
+    // Trusted launch provenance (issue #337): the daemon child receives a
+    // one-time launch ticket through its spawn environment. The daemon
+    // records it at boot, bound to this process's exact identity, so only
+    // this launcher can exchange it for an owner-class peer credential. An
+    // unconfined same-uid process that merely runs the approved executable
+    // holds no ticket and stays table-governed.
+    let launch_ticket = peer_authority::mint_launch_ticket();
+    command.env(peer_authority::DAEMON_LAUNCH_TICKET_ENV, &launch_ticket);
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
@@ -1354,7 +1362,11 @@ fn spawn_detached_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    command.spawn().context("spawning daemon child")
+    let child = command.spawn().context("spawning daemon child")?;
+    // The child now exists, so this process is the daemon launcher: retain
+    // the matching launch ticket in memory for the peer-credential exchange.
+    cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);
+    Ok(child)
 }
 
 #[cfg(any(unix, windows))]

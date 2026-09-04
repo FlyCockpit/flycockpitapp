@@ -1768,14 +1768,20 @@ mod acp_wire_owner_tests {
                 .expect("deny peer credential exchange");
         });
 
-        let error = cockpit_client::DaemonClient::connect(&socket)
+        // An exchange denied for missing launch provenance keeps the client
+        // connected as an unauthenticated, table-governed peer (public RPCs
+        // stay reachable); it just never holds an owner-class credential.
+        let client = cockpit_client::DaemonClient::connect(&socket)
             .await
-            .expect_err("wire connect without peer credential must fail");
-        assert!(
-            error.to_string().contains("peer role attestation failed"),
-            "{error:#}"
-        );
+            .expect("authorization denial must not fail the wire connect");
+        let connected = connected_with_endpoint(client, ClientEndpoint::Wire(socket.clone()));
 
+        let error = validate_acp_connected_daemon(&connected)
+            .expect_err("ACP ingress requires the peer-bound owner credential");
+        assert!(error.to_string().contains("owner credential"), "{error:#}");
+        assert!(!connected.client.has_owner_capability());
+
+        drop(connected);
         server.await.expect("server");
         drop(dir);
     }

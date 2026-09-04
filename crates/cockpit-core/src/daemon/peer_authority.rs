@@ -5,6 +5,14 @@
 //! and the minting connection. Secret-bearing RPCs require a live peer-bound
 //! credential held in the connecting process, not a world-readable file next to
 //! the socket.
+//!
+//! Owner-class credentials are never self-service. The exchange mints them
+//! only against trusted launch provenance: the one-time launch ticket the
+//! spawning process passed to the daemon through the spawn environment,
+//! bound to the launcher's exact process identity. An unconfined same-uid
+//! process can run the approved executable with recognized arguments, but
+//! without the launch ticket it stays an unauthenticated, table-governed
+//! peer.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,6 +53,62 @@ const PEER_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
 /// Hard cap on concurrently registered peer credentials.
 const MAX_PEER_CREDENTIAL_RECORDS: usize = 64;
 
+/// Spawn-environment slot carrying the one-time daemon launch ticket from the
+/// spawning cockpit process to the daemon child. The launcher generates the
+/// ticket, passes it here at spawn, and retains it only in memory; the daemon
+/// records it at boot and scrubs it from its own environment so descendants
+/// never inherit it.
+pub(crate) const DAEMON_LAUNCH_TICKET_ENV: &str = "COCKPIT_DAEMON_LAUNCH_TICKET";
+
+/// Launch tickets are 32 random bytes, hex-encoded (64 lowercase hex chars).
+const LAUNCH_TICKET_HEX_LEN: usize = 64;
+
+/// Mint a fresh launch ticket for the daemon this process is about to spawn.
+/// The caller keeps one copy in memory and passes the other through the
+/// child's spawn environment.
+pub(crate) fn mint_launch_ticket() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill(&mut bytes);
+    crate::intel::hex_lower(&bytes)
+}
+
+fn launch_ticket_is_well_formed(ticket: &str) -> bool {
+    ticket.len() == LAUNCH_TICKET_HEX_LEN
+        && ticket
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Trusted launch provenance recorded once at daemon boot from the spawn
+/// environment. `launcher` is the exact process identity of the daemon's
+/// parent at boot; a launcher that already exited (or a human shell running
+/// `daemon start --foreground` without a ticket) leaves no usable anchor and
+/// owner-class exchange stays denied — fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonLaunchProvenance {
+    ticket: String,
+    launcher: Option<PeerIdentity>,
+}
+
+/// Capture the exact identity of this process's parent, if it is observable.
+pub(crate) fn capture_launcher_identity() -> Option<PeerIdentity> {
+    let pid = cockpit_host::daemon_lifecycle::read_parent_process_id(std::process::id()).ok()??;
+    if pid == 0 {
+        return None;
+    }
+    let process_start = cockpit_host::daemon_lifecycle::process_start_identity(pid).ok()?;
+    #[cfg(unix)]
+    let (uid, gid) = cockpit_host::daemon_lifecycle::read_process_credentials(pid).ok()?;
+    #[cfg(windows)]
+    let (uid, gid) = (0_u32, 0_u32);
+    Some(PeerIdentity {
+        pid,
+        uid,
+        gid,
+        process_start,
+    })
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerCredentialToken(pub String);
 
@@ -73,9 +137,78 @@ struct PeerCredentialRecord {
 pub struct PeerCredentialRegistry {
     records: Mutex<HashMap<String, PeerCredentialRecord>>,
     invalidation_hooks: Mutex<HashMap<Uuid, Box<dyn Fn() + Send + Sync>>>,
+    /// Trusted launch provenance recorded once at daemon boot. `None` means
+    /// this daemon was not spawned with a launch ticket (human foreground
+    /// start, in-process boot) and no socket peer can ever exchange for an
+    /// owner-class credential.
+    launch_provenance: Mutex<Option<DaemonLaunchProvenance>>,
 }
 
 impl PeerCredentialRegistry {
+    /// Record the launch provenance the spawning process passed through the
+    /// environment, capturing the launcher's exact process identity from the
+    /// daemon's parent at boot. Scrubs the environment slot so descendants
+    /// of this daemon never inherit the ticket.
+    pub fn record_launch_provenance_from_environment(&self) {
+        let Some(ticket) = std::env::var(DAEMON_LAUNCH_TICKET_ENV).ok() else {
+            return;
+        };
+        // SAFETY: the environment is process-global and this runs once during
+        // daemon boot, before worker tasks and spawned children exist.
+        unsafe {
+            std::env::remove_var(DAEMON_LAUNCH_TICKET_ENV);
+        }
+        self.record_launch_provenance(ticket, capture_launcher_identity());
+    }
+
+    /// Fail-closed recording: a malformed ticket or an unobservable launcher
+    /// installs no usable provenance.
+    pub fn record_launch_provenance(&self, ticket: String, launcher: Option<PeerIdentity>) {
+        if !launch_ticket_is_well_formed(&ticket) {
+            tracing::warn!(
+                "ignoring malformed daemon launch ticket; owner-class exchange stays denied"
+            );
+            return;
+        }
+        *self
+            .launch_provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(DaemonLaunchProvenance { ticket, launcher });
+    }
+
+    /// True when `presented` is exactly the launch ticket minted for this
+    /// daemon and `peer` is exactly the launcher process that spawned it.
+    /// The token alone is not enough: a ticket read out of another process's
+    /// environment cannot be replayed from a different process identity.
+    pub fn verify_launch_provenance(&self, presented: Option<&str>, peer: PeerIdentity) -> bool {
+        let Some(presented) = presented else {
+            return false;
+        };
+        let provenance = self
+            .launch_provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(provenance) = provenance.as_ref() else {
+            return false;
+        };
+        if provenance.launcher.as_ref() != Some(&peer) {
+            return false;
+        }
+        super::owner_capability::constant_time_eq(
+            provenance.ticket.as_bytes(),
+            presented.as_bytes(),
+        )
+    }
+
+    /// Test seam for the in-process daemon fixtures: install provenance
+    /// explicitly with the chosen launcher identity. Production only records
+    /// from the spawn environment at boot.
+    #[cfg(test)]
+    pub fn install_launch_provenance_for_test(&self, ticket: &str, launcher: PeerIdentity) {
+        self.record_launch_provenance(ticket.to_string(), Some(launcher));
+    }
+
     pub fn register_invalidation_hook(
         &self,
         connection_id: Uuid,
@@ -530,5 +663,86 @@ mod tests {
                 .verify(peer, Uuid::new_v4(), token.as_str())
                 .is_none()
         );
+    }
+
+    fn current_process_peer_identity() -> PeerIdentity {
+        let pid = std::process::id();
+        #[cfg(unix)]
+        let (uid, gid) =
+            cockpit_host::daemon_lifecycle::read_process_credentials(pid).expect("uid/gid");
+        #[cfg(windows)]
+        let (uid, gid) = (0_u32, 0_u32);
+        PeerIdentity {
+            pid,
+            uid,
+            gid,
+            process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+                .expect("process start"),
+        }
+    }
+
+    #[test]
+    fn mint_launch_ticket_is_well_formed_and_unique() {
+        let first = mint_launch_ticket();
+        let second = mint_launch_ticket();
+        assert!(launch_ticket_is_well_formed(&first));
+        assert!(launch_ticket_is_well_formed(&second));
+        assert_ne!(first, second);
+        assert!(!launch_ticket_is_well_formed(""));
+        assert!(!launch_ticket_is_well_formed(
+            "A".repeat(LAUNCH_TICKET_HEX_LEN).as_str()
+        ));
+        assert!(!launch_ticket_is_well_formed(
+            "0".repeat(LAUNCH_TICKET_HEX_LEN - 1).as_str()
+        ));
+        assert!(!launch_ticket_is_well_formed(
+            "g".repeat(LAUNCH_TICKET_HEX_LEN).as_str()
+        ));
+    }
+
+    #[test]
+    fn launch_provenance_admits_only_the_launcher_holding_the_ticket() {
+        let registry = PeerCredentialRegistry::default();
+        let launcher = current_process_peer_identity();
+        let ticket = mint_launch_ticket();
+
+        // No provenance recorded: fail closed for every presenter.
+        assert!(!registry.verify_launch_provenance(Some(&ticket), launcher));
+
+        registry.record_launch_provenance(ticket.clone(), Some(launcher));
+        // Exact launcher presenting the exact ticket is admitted.
+        assert!(registry.verify_launch_provenance(Some(&ticket), launcher));
+        // A different process presenting the stolen ticket is denied.
+        assert!(!registry.verify_launch_provenance(
+            Some(&ticket),
+            PeerIdentity {
+                pid: launcher.pid.saturating_add(1),
+                uid: launcher.uid,
+                gid: launcher.gid,
+                process_start: launcher.process_start,
+            },
+        ));
+        // The launcher presenting the wrong ticket is denied.
+        assert!(!registry.verify_launch_provenance(Some("0".repeat(64).as_str()), launcher));
+        // No presented token is denied.
+        assert!(!registry.verify_launch_provenance(None, launcher));
+    }
+
+    #[test]
+    fn launch_provenance_without_a_launcher_identity_denies_everyone() {
+        let registry = PeerCredentialRegistry::default();
+        let ticket = mint_launch_ticket();
+        // A launcher that could not be captured at boot (already exited, or
+        // unobservable) must not open self-service minting.
+        registry.record_launch_provenance(ticket.clone(), None);
+        assert!(!registry.verify_launch_provenance(Some(&ticket), current_process_peer_identity()));
+    }
+
+    #[test]
+    fn malformed_launch_ticket_is_never_recorded() {
+        let registry = PeerCredentialRegistry::default();
+        let launcher = current_process_peer_identity();
+        registry.record_launch_provenance("not-hex".to_string(), Some(launcher));
+        assert!(!registry.verify_launch_provenance(Some("not-hex"), launcher));
     }
 }

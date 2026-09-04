@@ -40,6 +40,7 @@ type WireStream = NamedPipeClient;
 
 pub mod bulk_upload;
 pub mod image_upload;
+pub mod launch_provenance;
 pub mod presentation;
 pub mod submission;
 
@@ -972,6 +973,12 @@ where
 
 /// Exchange a peer-bound credential after lifetime confirmation. Socket peers
 /// must present this token on secret-bearing RPCs (issue #337).
+///
+/// The exchange presents this process's daemon launch ticket in the
+/// envelope capability slot. The daemon mints an owner-class credential only
+/// for the exact launcher process holding the ticket; a denial is not a
+/// connect failure — the client stays connected as an unauthenticated,
+/// table-governed peer (public RPCs still work).
 #[cfg(any(unix, windows))]
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
@@ -981,12 +988,14 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let id = Uuid::now_v7();
+    let launch_ticket =
+        launch_provenance::process_launch_ticket().map(proto::OwnerCapabilityToken::new);
     proto_stream
         .send(&Envelope::request_with_owner_capability_at(
             version,
             id,
             Request::ExchangeLocalPeerCredential,
-            None,
+            launch_ticket,
         ))
         .await
         .context("sending peer credential exchange")?;
@@ -1019,7 +1028,19 @@ where
                     Body::Error {
                         id: Some(response_id),
                         error,
-                    } if response_id == id => return Err(anyhow::Error::new(error)),
+                    } if response_id == id => {
+                        if error.code == proto::ErrorCode::Authorization {
+                            // No trusted launch provenance: keep the
+                            // connection as an unauthenticated peer instead
+                            // of failing the public RPC surface.
+                            tracing::debug!(
+                                message = %error.message,
+                                "peer credential exchange denied; continuing unauthenticated"
+                            );
+                            return Ok((initial_events, None));
+                        }
+                        return Err(anyhow::Error::new(error));
+                    }
                     _ => {
                         return Err(protocol_handshake_error(
                             "daemon sent an invalid peer credential exchange frame",
@@ -1748,6 +1769,96 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(dir);
+    }
+
+    #[tokio::test]
+    async fn exchange_presents_the_process_launch_ticket() {
+        let ticket = "f".repeat(64);
+        launch_provenance::set_process_launch_ticket(ticket.clone());
+        let (_dir, socket, mut listener) = bind_test_socket();
+        let expected = ticket;
+        let server = tokio::spawn(async move {
+            let stream = accept_test(&mut listener).await;
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.ticket", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        owner_capability,
+                        request: Request::ExchangeLocalPeerCredential,
+                    } => {
+                        assert_eq!(
+                            owner_capability
+                                .as_ref()
+                                .map(proto::OwnerCapabilityToken::as_str),
+                            Some(expected.as_str()),
+                            "the exchange must present the process-held launch ticket"
+                        );
+                        id
+                    }
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    id,
+                    Response::LocalPeerCredential {
+                        token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                        role: proto::LocalClientRole::Cli,
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let client = DaemonClient::connect(&socket).await.unwrap();
+        assert!(client.has_owner_capability());
+        launch_provenance::clear_process_launch_ticket();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_authorization_denial_keeps_the_client_connected_unauthenticated() {
+        let (_dir, socket, mut listener) = bind_test_socket();
+        let server = tokio::spawn(async move {
+            let stream = accept_test(&mut listener).await;
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.denied", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::error(
+                    Some(id),
+                    ErrorPayload {
+                        code: proto::ErrorCode::Authorization,
+                        message: "owner-class credential requires a daemon launch ticket".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        // A peer without launch provenance is denied an owner-class credential
+        // but must keep the connection: public RPCs stay reachable for
+        // unauthenticated table-governed peers.
+        let client = DaemonClient::connect(&socket)
+            .await
+            .expect("authorization denial must not fail the connect");
+        assert!(!client.has_owner_capability());
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -3275,6 +3275,16 @@ impl DaemonContext {
         });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
+        let peer_credential_registry =
+            Arc::new(crate::daemon::peer_authority::PeerCredentialRegistry::default());
+        // Trusted launch provenance (issue #337): a daemon spawned by a
+        // cockpit launcher inherits a one-time launch ticket through the
+        // spawn environment. Record it here, once at boot, bound to the
+        // launcher's exact process identity; the recording also scrubs the
+        // environment slot so daemon descendants never inherit the ticket.
+        // Human foreground starts and in-process boots carry no ticket and
+        // record no provenance: owner-class exchange fails closed.
+        peer_credential_registry.record_launch_provenance_from_environment();
         let mut ctx = Self {
             guidance_proposals: registry.guidance_proposals(),
             db,
@@ -3292,9 +3302,7 @@ impl DaemonContext {
             approved_client_executable: std::env::current_exe()
                 .context("resolving approved local client executable")
                 .expect("resolving approved local client executable"),
-            peer_credential_registry: Arc::new(
-                crate::daemon::peer_authority::PeerCredentialRegistry::default(),
-            ),
+            peer_credential_registry,
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -5314,6 +5322,10 @@ struct MutableClientState {
     active_peer_credential: Option<String>,
     /// Wall-clock expiry for [`active_peer_credential`], when installed.
     peer_credential_expires_at_unix_ms: Option<i64>,
+    /// Raw capability token carried by the current request envelope, before
+    /// any verification. Only the peer-credential exchange consumes it (as
+    /// its launch-ticket presentation); every envelope overwrites it.
+    presented_owner_capability: Option<String>,
     terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -5429,6 +5441,7 @@ impl MutableClientState {
             has_owner_capability: false,
             active_peer_credential: None,
             peer_credential_expires_at_unix_ms: None,
+            presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
                 client_instance_id,
@@ -6783,6 +6796,12 @@ async fn handle_envelope(
             owner_capability,
             request,
         } => {
+            // The unverified token carried by THIS envelope. The exchange
+            // reads it as its launch-ticket presentation; every envelope
+            // overwrites it, so a stale token can never be replayed.
+            state.presented_owner_capability = owner_capability
+                .as_ref()
+                .map(|token| token.as_str().to_string());
             reconcile_socket_peer_owner_authority(state, shared, ctx, principal_tx);
             if let Some(token) = owner_capability {
                 if let Some(peer) = state.socket_peer {

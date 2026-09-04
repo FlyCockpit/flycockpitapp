@@ -18186,6 +18186,22 @@ async fn handle_serialized_request_impl(
                 .ok_or_else(|| authorization_error("socket peer identity is required"))?;
             let role = attest_local_client_role(peer, &ctx.approved_client_executable)
                 .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
+            // Owner-class admission is never self-service from the peer's
+            // executable image alone (issue #337): the peer must present the
+            // one-time launch ticket this daemon minted at spawn, and it must
+            // be the exact launcher process the ticket is bound to. Fail
+            // closed — the peer stays unauthenticated and table-governed.
+            let presented_launch_ticket = state.presented_owner_capability.take();
+            if role.is_owner_class()
+                && !ctx
+                    .peer_credential_registry
+                    .verify_launch_provenance(presented_launch_ticket.as_deref(), peer)
+            {
+                return Err(authorization_error(
+                    "owner-class peer credential requires the daemon launch ticket \
+                     presented by the spawning process",
+                ));
+            }
             let grants = if role == LocalClientRole::AgentChild {
                 default_agent_child_grants()
             } else {
